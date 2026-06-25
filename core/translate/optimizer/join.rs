@@ -1099,7 +1099,10 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     .is_some_and(|j| j.is_ordering_constrained())
             })
             .count();
-        if ordering_constrained_count == 0 {
+        let has_full_outer = joined_tables
+            .iter()
+            .any(|t| t.join_info.as_ref().is_some_and(|j| j.is_full_outer()));
+        if ordering_constrained_count == 0 && !has_full_outer {
             None
         } else {
             // map from rhs table index to lhs table index
@@ -1122,6 +1125,25 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                             mask.set(j)?;
                             left_join_illegal_map.insert(i, mask);
                         }
+                    }
+                }
+            }
+            // FULL OUTER acts as a reordering barrier in both directions: tables
+            // originally after a FULL OUTER table cannot be moved before it, or
+            // the planner produces e.g. `(t1 INNER t3) FULL OUTER t2` instead of
+            // the requested `(t1 FULL OUTER t2) INNER t3`, which can leak
+            // NULL-filled probe rows past the inner join.
+            for (k, t) in joined_tables.iter().enumerate() {
+                if !t.join_info.as_ref().is_some_and(|j| j.is_full_outer()) {
+                    continue;
+                }
+                for j in (k + 1)..joined_tables.len() {
+                    if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&k) {
+                        illegal_lhs.set(j)?;
+                    } else {
+                        let mut mask = TableMask::default();
+                        mask.set(j)?;
+                        left_join_illegal_map.insert(k, mask);
                     }
                 }
             }
@@ -1797,6 +1819,7 @@ mod tests {
     use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
 
     use super::*;
+    use crate::alloc::TursoSliceExt;
     use crate::{
         schema::{
             BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table,
@@ -2014,7 +2037,7 @@ mod tests {
             name: "sqlite_autoindex_test_table_1".to_string(),
             table_name: "test_table".to_string(),
             where_clause: None,
-            columns: vec![IndexColumn {
+            columns: crate::alloc::vec![IndexColumn {
                 name: "id".to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
@@ -2111,7 +2134,7 @@ mod tests {
             name: "index1".to_string(),
             table_name: "table1".to_string(),
             where_clause: None,
-            columns: vec![IndexColumn {
+            columns: crate::alloc::vec![IndexColumn {
                 name: "id".to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
@@ -2253,7 +2276,7 @@ mod tests {
                     name: index_name,
                     where_clause: None,
                     table_name: table_name.to_string(),
-                    columns: vec![IndexColumn {
+                    columns: crate::alloc::vec![IndexColumn {
                         name: "id".to_string(),
                         order: SortOrder::Asc,
                         pos_in_table: 0,
@@ -2278,7 +2301,7 @@ mod tests {
             name: "orders_customer_id_idx".to_string(),
             table_name: "orders".to_string(),
             where_clause: None,
-            columns: vec![IndexColumn {
+            columns: crate::alloc::vec![IndexColumn {
                 name: "customer_id".to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 1,
@@ -2297,7 +2320,7 @@ mod tests {
             name: "order_items_order_id_idx".to_string(),
             table_name: "order_items".to_string(),
             where_clause: None,
-            columns: vec![IndexColumn {
+            columns: crate::alloc::vec![IndexColumn {
                 name: "order_id".to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 1,
@@ -2787,7 +2810,7 @@ mod tests {
             name: "idx_xy".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
-            columns: vec![
+            columns: crate::alloc::vec![
                 IndexColumn {
                     name: "x".to_string(),
                     order: SortOrder::Asc,
@@ -2899,7 +2922,7 @@ mod tests {
             name: "idx1".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
-            columns: vec![
+            columns: crate::alloc::vec![
                 IndexColumn {
                     name: "c1".to_string(),
                     order: SortOrder::Asc,
@@ -3037,7 +3060,7 @@ mod tests {
             name: "idx1".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
-            columns: vec![
+            columns: crate::alloc::vec![
                 IndexColumn {
                     name: "c1".to_string(),
                     order: SortOrder::Asc,
@@ -3222,12 +3245,12 @@ mod tests {
         Arc::new(BTreeTable::new(
             1, // root_page, doesn't matter for tests
             name.to_string(),
-            vec![],
-            columns,
+            crate::alloc::vec![],
+            columns.try_to_vec().expect("TODO: fallible allocations"),
             BTreeCharacteristics::HAS_ROWID,
-            vec![],
-            vec![],
-            vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         ))
     }
@@ -3332,7 +3355,7 @@ mod tests {
             name: "idx_t2_a".to_string(),
             table_name: "t2".to_string(),
             where_clause: None,
-            columns: vec![IndexColumn {
+            columns: crate::alloc::vec![IndexColumn {
                 name: "a".to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 0,

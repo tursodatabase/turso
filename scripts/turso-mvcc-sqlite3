@@ -2,9 +2,9 @@
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Go to the project root (one level up from scripts/)
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-TURSODB="$PROJECT_ROOT/target/debug/tursodb"
+# Ask cargo where build artefacts live (honours CARGO_TARGET_DIR)
+TARGET_DIR="$("$SCRIPT_DIR/cargo-target-dir")"
+TURSODB="$TARGET_DIR/debug/tursodb"
 
 # Add experimental features for testing
 # Note: MVCC is enabled via PRAGMA journal_mode = 'mvcc'

@@ -59,7 +59,7 @@ class Database extends DatabasePromise {
     #db: any;
     constructor(opts: DatabaseOpts) {
         if (opts.url == null) {
-            const db = new NativeDatabase(opts.path, { tracing: opts.tracing }) as any;
+            const db = new NativeDatabase(opts.path, { tracing: opts.tracing, experimental: opts.experimental }) as any;
             super(
                 db,
                 () => ioNotifier.waitForCompletion(),
@@ -96,6 +96,7 @@ class Database extends DatabasePromise {
             longPollTimeoutMs: opts.longPollTimeoutMs,
             tracing: opts.tracing,
             bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
+            experimental: opts.experimental,
             remoteEncryption: opts.remoteEncryption?.cipher,
             partialSyncOpts: partialSyncOpts,
             pushOperationsThreshold: opts.pushOperationsThreshold,

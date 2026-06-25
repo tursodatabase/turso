@@ -43,7 +43,11 @@
 
 #![allow(clippy::arc_with_non_send_sync)]
 
-use crate::{turso_assert, turso_assert_eq, turso_assert_greater_than};
+use crate::{
+    io_yield_one, turso_assert, turso_assert_eq, turso_assert_greater_than,
+    types::{IOCompletions, IOResult},
+    util::IOExt as _,
+};
 use branches::{mark_unlikely, unlikely};
 use bytemuck::{Pod, Zeroable};
 use pack1::{I32BE, U16BE, U32BE};
@@ -1419,87 +1423,180 @@ pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
 
 /// Stream through frames in chunks, building frame_cache incrementally
 /// Track last valid commit frame for consistency
+/// Non-blocking driver for WAL recovery on open.
+///
+/// Created by [`BuildSharedWal::begin`] (which performs only synchronous
+/// setup and may complete immediately for an empty/headerless WAL), then
+/// driven via [`BuildSharedWal::poll`] until it returns `Done`. All recovery
+/// state lives in the [`StreamingWalReader`] (atomics + `RwLock<StreamingState>`)
+/// and is updated by the read completions' callbacks, so the only state this
+/// driver tracks is which phase/completion it's waiting on.
+pub struct BuildSharedWal {
+    reader: Option<Arc<StreamingWalReader>>,
+    wal_file_shared: Arc<RwLock<WalFileShared>>,
+    file_size: u64,
+    phase: BuildSharedWalPhase,
+}
+
+#[derive(Clone)]
+enum BuildSharedWalPhase {
+    /// Issue the WAL header read.
+    NeedHeaderRead,
+    /// Waiting on the header read completion.
+    AwaitHeader(Completion),
+    /// Decide whether to read the next chunk or finalize.
+    ChunkLoop,
+    /// Waiting on a chunk read that began at `offset`.
+    AwaitChunk { completion: Completion, offset: u64 },
+    /// Recovery complete.
+    Done,
+}
+
+impl BuildSharedWal {
+    /// Synchronous setup: read the file size, build the (initially unloaded)
+    /// `WalFileShared`, and decide the starting phase. For a WAL smaller than
+    /// the header it marks the shared state loaded and starts in `Done`.
+    pub fn begin(file: &Arc<dyn File>) -> Result<Self> {
+        let size = file.size()?;
+
+        let header = Arc::new(SpinLock::new(WalHeader::default()));
+        let read_locks = std::array::from_fn(|_| TursoRwLock::new());
+        for (i, l) in read_locks.iter().enumerate() {
+            l.write();
+            l.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
+            l.unlock();
+        }
+
+        let wal_file_shared = Arc::new(RwLock::new(WalFileShared {
+            metadata: WalSharedMetadata {
+                enabled: AtomicBool::new(true),
+                wal_header: header.clone(),
+                min_frame: AtomicU64::new(0),
+                max_frame: AtomicU64::new(0),
+                nbackfills: AtomicU64::new(0),
+                transaction_count: AtomicU64::new(0),
+                last_checksum: (0, 0),
+                loaded: AtomicBool::new(false),
+                loaded_from_disk_scan: AtomicBool::new(true),
+                initialized: AtomicBool::new(false),
+            },
+            runtime: WalSharedRuntime {
+                frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                file: Some(file.clone()),
+                read_locks,
+                vacuum_lock: TursoRwLock::new(),
+                write_lock: TursoRwLock::new(),
+                checkpoint_lock: TursoRwLock::new(),
+                epoch: AtomicU32::new(0),
+                overflow_fallback_coverage: Arc::new(SpinLock::new(
+                    OverflowFallbackCoverage::default(),
+                )),
+            },
+        }));
+
+        if size < WAL_HEADER_SIZE as u64 {
+            wal_file_shared
+                .write()
+                .metadata
+                .loaded
+                .store(true, Ordering::SeqCst);
+            return Ok(Self {
+                reader: None,
+                wal_file_shared,
+                file_size: size,
+                phase: BuildSharedWalPhase::Done,
+            });
+        }
+
+        let reader = Arc::new(StreamingWalReader::new(
+            file.clone(),
+            wal_file_shared.clone(),
+            header,
+            size,
+        ));
+
+        Ok(Self {
+            reader: Some(reader),
+            wal_file_shared,
+            file_size: size,
+            phase: BuildSharedWalPhase::NeedHeaderRead,
+        })
+    }
+
+    /// Drive the recovery state machine. Yields the in-flight read completion
+    /// when it must wait; returns `Done(wal_file_shared)` once the full WAL
+    /// has been scanned (or recovery short-circuited).
+    pub fn poll(&mut self) -> Result<IOResult<Arc<RwLock<WalFileShared>>>> {
+        loop {
+            match self.phase.clone() {
+                BuildSharedWalPhase::NeedHeaderRead => {
+                    let reader = self
+                        .reader
+                        .clone()
+                        .expect("reader must exist outside the Done phase");
+                    let c = reader.read_header()?;
+                    self.phase = BuildSharedWalPhase::AwaitHeader(c);
+                }
+                BuildSharedWalPhase::AwaitHeader(c) => {
+                    if !c.succeeded() {
+                        io_yield_one!(c);
+                    }
+                    self.phase = BuildSharedWalPhase::ChunkLoop;
+                }
+                BuildSharedWalPhase::ChunkLoop => {
+                    let reader = self
+                        .reader
+                        .clone()
+                        .expect("reader must exist outside the Done phase");
+                    if reader.done.load(Ordering::Acquire) {
+                        self.phase = BuildSharedWalPhase::Done;
+                        continue;
+                    }
+                    let offset = reader.off_atomic.load(Ordering::Acquire);
+                    if offset >= self.file_size {
+                        reader.finalize_loading();
+                        self.phase = BuildSharedWalPhase::Done;
+                        continue;
+                    }
+                    let (_read_size, c) = reader.submit_one_chunk(offset)?;
+                    self.phase = BuildSharedWalPhase::AwaitChunk {
+                        completion: c,
+                        offset,
+                    };
+                }
+                BuildSharedWalPhase::AwaitChunk { completion, offset } => {
+                    if !completion.succeeded() {
+                        io_yield_one!(completion);
+                    }
+                    let reader = self
+                        .reader
+                        .clone()
+                        .expect("reader must exist outside the Done phase");
+                    let new_off = reader.off_atomic.load(Ordering::Acquire);
+                    if new_off <= offset {
+                        // No forward progress — treat as end of valid log.
+                        reader.finalize_loading();
+                        self.phase = BuildSharedWalPhase::Done;
+                    } else {
+                        self.phase = BuildSharedWalPhase::ChunkLoop;
+                    }
+                }
+                BuildSharedWalPhase::Done => {
+                    return Ok(IOResult::Done(self.wal_file_shared.clone()));
+                }
+            }
+        }
+    }
+}
+
+/// Blocking shim over [`BuildSharedWal`]. Retained for the unit test and any
+/// caller not yet lifted to drive the recovery state machine directly.
 pub fn build_shared_wal(
     file: &Arc<dyn File>,
     io: &Arc<dyn crate::IO>,
 ) -> Result<Arc<RwLock<WalFileShared>>> {
-    let size = file.size()?;
-
-    let header = Arc::new(SpinLock::new(WalHeader::default()));
-    let read_locks = std::array::from_fn(|_| TursoRwLock::new());
-    for (i, l) in read_locks.iter().enumerate() {
-        l.write();
-        l.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
-        l.unlock();
-    }
-
-    let wal_file_shared = Arc::new(RwLock::new(WalFileShared {
-        metadata: WalSharedMetadata {
-            enabled: AtomicBool::new(true),
-            wal_header: header.clone(),
-            min_frame: AtomicU64::new(0),
-            max_frame: AtomicU64::new(0),
-            nbackfills: AtomicU64::new(0),
-            transaction_count: AtomicU64::new(0),
-            last_checksum: (0, 0),
-            loaded: AtomicBool::new(false),
-            loaded_from_disk_scan: AtomicBool::new(true),
-            initialized: AtomicBool::new(false),
-        },
-        runtime: WalSharedRuntime {
-            frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
-            file: Some(file.clone()),
-            read_locks,
-            vacuum_lock: TursoRwLock::new(),
-            write_lock: TursoRwLock::new(),
-            checkpoint_lock: TursoRwLock::new(),
-            epoch: AtomicU32::new(0),
-            overflow_fallback_coverage: Arc::new(
-                SpinLock::new(OverflowFallbackCoverage::default()),
-            ),
-        },
-    }));
-
-    if size < WAL_HEADER_SIZE as u64 {
-        wal_file_shared
-            .write()
-            .metadata
-            .loaded
-            .store(true, Ordering::SeqCst);
-        return Ok(wal_file_shared);
-    }
-
-    let reader = Arc::new(StreamingWalReader::new(
-        file.clone(),
-        wal_file_shared.clone(),
-        header,
-        size,
-    ));
-
-    let h = reader.clone().read_header()?;
-    io.wait_for_completion(h)?;
-
-    loop {
-        if reader.done.load(Ordering::Acquire) {
-            break;
-        }
-        let offset = reader.off_atomic.load(Ordering::Acquire);
-        if offset >= size {
-            reader.finalize_loading();
-            break;
-        }
-
-        let (_read_size, c) = reader.clone().submit_one_chunk(offset)?;
-        io.wait_for_completion(c)?;
-
-        let new_off = reader.off_atomic.load(Ordering::Acquire);
-        if new_off <= offset {
-            reader.finalize_loading();
-            break;
-        }
-    }
-
-    Ok(wal_file_shared)
+    let mut driver = BuildSharedWal::begin(file)?;
+    io.block(|| driver.poll())
 }
 
 pub(super) struct StreamingWalReader {

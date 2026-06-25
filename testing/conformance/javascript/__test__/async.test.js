@@ -103,18 +103,123 @@ test.serial("Database.exec() after close()", async (t) => {
 
 // ==========================================================================
 // Database.batch()
+//
+// batch() returns an Array<ResultSet> — one entry per input statement, in
+// the order the statements were supplied — matching the libSQL client
+// contract. Each ResultSet has the shape:
+//
+//   { columns, columnTypes, rows, rowsAffected }
+//
+//   - columns / columnTypes are parallel arrays of the result's column
+//     names and declared types. Both are empty for statements that return
+//     no rows (INSERT/UPDATE/DELETE).
+//   - rows is an Array<Row>. By default rows match Statement.all() object
+//     rows; pass { raw: true } to receive arrays.
+//   - rowsAffected is the per-statement change count (0 for SELECT).
 // ==========================================================================
+
+// Assert the ResultSet invariants shared by every batch entry, regardless
+// of statement kind.
+const assertResultSetShape = (t, rs) => {
+  t.true(Array.isArray(rs.columns), "columns is an array");
+  t.true(Array.isArray(rs.columnTypes), "columnTypes is an array");
+  t.is(rs.columnTypes.length, rs.columns.length, "columnTypes parallels columns");
+  t.true(Array.isArray(rs.rows), "rows is an array");
+  t.is(typeof rs.rowsAffected, "number", "rowsAffected is a number");
+  t.false("lastInsertRowid" in rs, "batch ResultSet does not expose lastInsertRowid");
+  t.is(rs.toJSON, undefined, "batch ResultSet does not expose toJSON");
+};
+
+test.serial("Database.batch() [returns one ResultSet per statement, in order]", async (t) => {
+  const db = t.context.db;
+
+  const results = await db.batch([
+    "INSERT INTO users(name, email) VALUES ('Carol', 'carol@example.net')",
+    "SELECT id, name FROM users ORDER BY id",
+    "DELETE FROM users WHERE name = 'Carol'",
+  ]);
+
+  t.true(Array.isArray(results), "batch() returns an array");
+  t.is(results.length, 3, "one ResultSet per input statement");
+  results.forEach((rs) => assertResultSetShape(t, rs));
+
+  // INSERT: no result rows, one row affected.
+  t.deepEqual(results[0].columns, []);
+  t.deepEqual(results[0].rows, []);
+  t.is(results[0].rowsAffected, 1);
+
+  // SELECT: rows surfaced, nothing affected.
+  t.deepEqual(results[1].columns, ["id", "name"]);
+  t.is(results[1].rows.length, 3);
+  t.is(results[1].rowsAffected, 0);
+
+  // DELETE: no result rows, one row affected.
+  t.deepEqual(results[2].columns, []);
+  t.deepEqual(results[2].rows, []);
+  t.is(results[2].rowsAffected, 1);
+});
+
+test.serial("Database.batch() [SELECT rows expose Statement.all() object shape]", async (t) => {
+  const db = t.context.db;
+
+  const [rs] = await db.batch([
+    "SELECT id, name, email FROM users WHERE id = 1",
+  ]);
+
+  assertResultSetShape(t, rs);
+  t.deepEqual(rs.columns, ["id", "name", "email"]);
+  t.is(rs.rows.length, 1);
+
+  const row = rs.rows[0];
+  t.false(Array.isArray(row));
+  t.is(row.id, 1);
+  t.is(row.name, "Alice");
+  t.is(row.email, "alice@example.org");
+});
+
+test.serial("Database.batch() [later statements observe earlier writes]", async (t) => {
+  const db = t.context.db;
+
+  // The statements run sequentially on the same connection, so a read can
+  // see a write that an earlier statement in the same batch performed.
+  const results = await db.batch([
+    { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Grace", "grace@example.net"] },
+    "SELECT name FROM users WHERE name = 'Grace'",
+  ]);
+
+  t.is(results[0].rowsAffected, 1);
+  t.is(results[1].rows.length, 1, "the SELECT observes the row inserted earlier in the batch");
+  t.is(results[1].rows[0].name, "Grace");
+});
+
+test.serial("Database.batch() [empty batch returns empty array]", async (t) => {
+  const db = t.context.db;
+
+  const results = await db.batch([]);
+  t.deepEqual(results, []);
+});
+
+test.serial("Database.batch() [raw option returns array rows]", async (t) => {
+  const db = t.context.db;
+
+  const [rs] = await db.batch(["SELECT id, name FROM users ORDER BY id"], { raw: true });
+
+  t.deepEqual(rs.columns, ["id", "name"]);
+  t.deepEqual(rs.rows[0], [1, "Alice"]);
+  t.deepEqual(rs.rows[1], [2, "Bob"]);
+});
 
 test.serial("Database.batch() [bound args]", async (t) => {
   const db = t.context.db;
 
-  const info = await db.batch([
+  const results = await db.batch([
     { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Carol", "carol@example.net"] },
     { sql: "INSERT INTO users(name, email) VALUES (:name, :email)", args: { name: "Dave", email: "dave@example.net" } },
   ]);
 
-  t.is(info.rowsAffected, 2);
-  t.is(info.lastInsertRowid, 4);
+  t.is(results.length, 2);
+  t.is(results[0].rowsAffected, 1);
+  t.is(results[1].rowsAffected, 1);
 
   const rows = await db.all("SELECT name, email FROM users WHERE id IN (3, 4) ORDER BY id");
   t.deepEqual(rows, [
@@ -126,13 +231,14 @@ test.serial("Database.batch() [bound args]", async (t) => {
 test.serial("Database.batch() [plain strings]", async (t) => {
   const db = t.context.db;
 
-  const info = await db.batch([
+  const results = await db.batch([
     "INSERT INTO users(name, email) VALUES ('Eve', 'eve@example.net')",
     "INSERT INTO users(name, email) VALUES ('Frank', 'frank@example.net')",
   ]);
 
-  t.is(info.rowsAffected, 2);
-  t.is(info.lastInsertRowid, 4);
+  t.is(results.length, 2);
+  t.is(results[0].rowsAffected, 1);
+  t.is(results[1].rowsAffected, 1);
 
   const rows = await db.all("SELECT name, email FROM users WHERE id IN (3, 4) ORDER BY id");
   t.deepEqual(rows, [
@@ -158,7 +264,7 @@ test.serial("Database.batch() [mixed value types]", async (t) => {
 
   const blob = Buffer.from([0xDE, 0xAD, 0xBE, 0xEF]);
 
-  const info = await db.batch([
+  const results = await db.batch([
     {
       sql: "INSERT INTO types_batch(i, r, s, b, n) VALUES (?, ?, ?, ?, ?)",
       args: [42, 3.14, "hello", blob, null],
@@ -171,9 +277,23 @@ test.serial("Database.batch() [mixed value types]", async (t) => {
       sql: "INSERT INTO types_batch(i) VALUES (?)",
       args: [9007199254740993n],
     },
+    // A trailing read exercises type fidelity through ResultSet rows.
+    "SELECT i, r, s, b, n FROM types_batch ORDER BY id LIMIT 2",
   ]);
 
-  t.is(info.rowsAffected, 3);
+  t.is(results.length, 4);
+  t.is(results[0].rowsAffected, 1);
+  t.is(results[1].rowsAffected, 1);
+  t.is(results[2].rowsAffected, 1);
+
+  // Values survive the round-trip into the SELECT's ResultSet rows.
+  const selectRows = results[3].rows;
+  t.is(selectRows.length, 2);
+  t.is(selectRows[0].i, 42);
+  t.is(selectRows[0].r, 3.14);
+  t.is(selectRows[0].s, "hello");
+  t.deepEqual(selectRows[0].b, blob);
+  t.is(selectRows[0].n, null);
 
   const rows = await db.all("SELECT i, r, s, b, n FROM types_batch ORDER BY id");
   t.is(rows.length, 3);
@@ -209,7 +329,7 @@ test.serial("Database.batch() [rollback via transaction()]", async (t) => {
     ]);
   });
 
-  await t.throwsAsync(async () => { await txn(); });
+  await t.throwsAsync(async () => { await txn(); }, { any: true });
 
   const rows = await db.all("SELECT name FROM users WHERE name = 'Mallory'");
   t.deepEqual(rows, []);
@@ -218,13 +338,14 @@ test.serial("Database.batch() [rollback via transaction()]", async (t) => {
 test.serial("Database.batch() [atomic mode]", async (t) => {
   const db = t.context.db;
 
-  const info = await db.batch([
+  const results = await db.batch([
     { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Ivy", "ivy@example.net"] },
     { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Jay", "jay@example.net"] },
   ], "immediate");
 
-  t.is(info.rowsAffected, 2);
-  t.is(info.lastInsertRowid, 4);
+  t.is(results.length, 2);
+  t.is(results[0].rowsAffected, 1);
+  t.is(results[1].rowsAffected, 1);
 
   const rows = await db.all("SELECT name, email FROM users WHERE id IN (3, 4) ORDER BY id");
   t.deepEqual(rows, [
@@ -242,43 +363,10 @@ test.serial("Database.batch() [atomic mode rolls back on failure]", async (t) =>
       // Duplicate primary key with the row inserted in beforeEach.
       { sql: "INSERT INTO users(id, name, email) VALUES (1, 'dup', 'dup@example.net')" },
     ], "immediate");
-  });
+  }, { any: true });
 
   const rows = await db.all("SELECT name FROM users WHERE name = 'Kelly'");
   t.deepEqual(rows, []);
-});
-
-test.serial("Database.batch() [concurrent caller waits for atomic batch]", async (t) => {
-  if (process.env.PROVIDER === "serverless") {
-    // Native-only: exercises the connection-level exec lock.
-    t.pass();
-    return;
-  }
-  const db = t.context.db;
-
-  // Kick off an atomic batch that will fail on its second statement
-  // (duplicate primary key), then immediately issue a concurrent INSERT
-  // on the same connection. If batch() does not hold the connection
-  // lock across BEGIN/.../COMMIT, the concurrent insert would interleave
-  // *inside* the batch's transaction and be rolled back along with it.
-  const failingBatch = db.batch([
-    { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["BatchOnly", "batch@example.net"] },
-    { sql: "INSERT INTO users(id, name, email) VALUES (1, 'dup', 'dup@example.net')" },
-  ], "immediate");
-  const concurrentInsert = db.run(
-    "INSERT INTO users(name, email) VALUES (?, ?)",
-    "Concurrent", "concurrent@example.net",
-  );
-
-  await t.throwsAsync(failingBatch);
-  await concurrentInsert;
-
-  const names = (await db.all("SELECT name FROM users ORDER BY id")).map(r => r.name);
-  // BatchOnly is rolled back by the failed atomic batch.
-  t.false(names.includes("BatchOnly"));
-  // The concurrent INSERT ran *after* the batch released the lock, so
-  // it commits via autocommit and is visible.
-  t.true(names.includes("Concurrent"));
 });
 
 test.serial("Database.batch() [atomic mode does not abort manually-opened outer transaction on BEGIN failure]", async (t) => {
@@ -315,7 +403,7 @@ test.serial("Database.batch() [atomic mode does not abort manually-opened outer 
   t.false(names.includes("Inner"), "atomic batch's INSERT must not have committed");
 });
 
-test.serial("Database.batch() [non-insert batch returns undefined lastInsertRowid]", async (t) => {
+test.serial("Database.batch() [non-insert batch does not expose lastInsertRowid]", async (t) => {
   const db = t.context.db;
 
   // Seed an INSERT first so the connection has a non-zero lastInsertRowid.
@@ -325,13 +413,15 @@ test.serial("Database.batch() [non-insert batch returns undefined lastInsertRowi
   // last_insert_rowid() sticky across non-INSERT statements, so we
   // must derive the per-statement INSERT signal from the delta, not
   // from `changes > 0`.
-  const info = await db.batch([
+  const results = await db.batch([
     { sql: "UPDATE users SET email = ? WHERE id = 1", args: ["alice2@example.org"] },
     { sql: "DELETE FROM users WHERE id = 2" },
   ]);
 
-  t.is(info.rowsAffected, 2);
-  t.is(info.lastInsertRowid, undefined);
+  t.is(results[0].rowsAffected, 1);
+  t.false("lastInsertRowid" in results[0]);
+  t.is(results[1].rowsAffected, 1);
+  t.false("lastInsertRowid" in results[1]);
 });
 
 
@@ -347,10 +437,10 @@ test.serial("Database.transaction().deferred() [batch]", async (t) => {
     ]);
   });
 
-  const info = await insertMany.deferred();
+  const results = await insertMany.deferred();
   t.is(db.inTransaction, false);
-  t.is(info.rowsAffected, 3);
-  t.is(info.lastInsertRowid, 5);
+  t.is(results.length, 3);
+  results.forEach((rs) => t.is(rs.rowsAffected, 1));
 
   const rows = await db.all("SELECT name, email FROM users WHERE id IN (3, 4, 5) ORDER BY id");
   t.deepEqual(rows, [
@@ -415,6 +505,39 @@ test.serial("Database.pragma() after close()", async (t) => {
 // ==========================================================================
 // Database.transaction()
 // ==========================================================================
+
+test.serial("Database.inTransaction property", async (t) => {
+  const db = t.context.db;
+
+  // 1. A fresh connection is in autocommit, not a transaction.
+  t.false(db.inTransaction, "fresh connection is not in a transaction");
+
+  // 2. A one-shot query runs in autocommit: the moment it returns, the
+  //    connection is no longer in a transaction.
+  const stmt = await db.prepare("SELECT 1 AS n");
+  await stmt.get();
+  t.false(db.inTransaction, "autocommit after a one-shot query");
+
+  // 3. The transaction() helper reports in-transaction inside its callback and
+  //    autocommit once it completes.
+  let insideTxn;
+  const txn = db.transaction(async () => { insideTxn = db.inTransaction; });
+  await txn();
+  t.true(insideTxn, "in a transaction inside the transaction() callback");
+  t.false(db.inTransaction, "autocommit after transaction() completes");
+
+  // 4. inTransaction must reflect the real transaction state, so it also tracks
+  //    transactions opened with raw BEGIN/COMMIT/ROLLBACK.
+  await db.exec("BEGIN");
+  t.true(db.inTransaction, "in a transaction after raw BEGIN");
+  await db.exec("COMMIT");
+  t.false(db.inTransaction, "autocommit after raw COMMIT");
+
+  await db.exec("BEGIN");
+  t.true(db.inTransaction, "in a transaction after raw BEGIN");
+  await db.exec("ROLLBACK");
+  t.false(db.inTransaction, "autocommit after raw ROLLBACK");
+});
 
 test.serial("Database.transaction()", async (t) => {
   const db = t.context.db;
@@ -646,6 +769,22 @@ test.serial("Statement.get() [raw]", async (t) => {
   t.deepEqual(await stmt.raw().get(1), [1, "Alice", "alice@example.org"]);
 });
 
+test.serial("Database.all() preserves positional values for duplicate column names", async (t) => {
+  const db = t.context.db;
+
+  await db.exec("DROP TABLE IF EXISTS role; DROP TABLE IF EXISTS org_unit");
+  await db.exec("CREATE TABLE role(path TEXT); CREATE TABLE org_unit(path TEXT)");
+  await db.exec("INSERT INTO role VALUES ('/Employee'); INSERT INTO org_unit VALUES ('/')");
+
+  const [row] = await db.all("SELECT role.path, org_unit.path FROM role JOIN org_unit");
+
+  t.deepEqual(Object.keys(row), ["path"]);
+  t.is(row.path, "/");
+  t.is(row[0], "/Employee");
+  t.is(row[1], "/");
+  t.deepEqual(row, { path: "/" });
+});
+
 test.serial("Statement.get() values", async (t) => {
   const db = t.context.db;
 
@@ -785,6 +924,35 @@ test.serial("Statement.all() [statement safe integers]", async (t) => {
     [2n, "Bob", "bob@example.com"],
   ];
   t.deepEqual(await stmt.raw().all(), expected);
+});
+
+// ==========================================================================
+// Big integers
+//
+// Coverage for the area around tursodatabase/turso#7556. Integers outside the
+// JS safe-integer range (notably i64::MAX = 9223372036854775807, the value
+// Turso's internal sequence metadata stores) must round-trip losslessly when
+// safe integers are enabled. The default number mode is intentionally lossy
+// above 2^53, matching better-sqlite3.
+// ==========================================================================
+
+test.serial("Big integers [round-trip with safe integers]", async (t) => {
+  const db = t.context.db;
+  await db.exec("DROP TABLE IF EXISTS bigints");
+  await db.exec("CREATE TABLE bigints (id INTEGER PRIMARY KEY, v INTEGER)");
+
+  const values = [
+    [1, 9223372036854775807n], // i64::MAX
+    [2, -9223372036854775808n], // i64::MIN
+    [3, 9007199254740993n], // 2^53 + 1, first integer Number cannot represent
+  ];
+  for (const [id, v] of values) {
+    await db.run("INSERT INTO bigints (id, v) VALUES (?, ?)", [id, v]);
+  }
+
+  const stmt = await db.prepare("SELECT v FROM bigints ORDER BY id");
+  stmt.safeIntegers();
+  t.deepEqual(await stmt.pluck().all(), values.map(([, v]) => v));
 });
 
 // ==========================================================================

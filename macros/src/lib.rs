@@ -82,6 +82,7 @@
 
 extern crate proc_macro;
 mod atomic_enum;
+mod codspeed;
 mod ext;
 mod test;
 
@@ -185,6 +186,16 @@ pub fn derive_description_from_doc(item: TokenStream) -> TokenStream {
         }
     }
     generate_get_description(enum_name, &variant_description_map, enum_variants)
+}
+
+#[proc_macro_attribute]
+pub fn codspeed_criterion_benchmark(attr: TokenStream, input: TokenStream) -> TokenStream {
+    codspeed::criterion_benchmark_attribute(attr, input)
+}
+
+#[proc_macro_attribute]
+pub fn divan_bench(attr: TokenStream, input: TokenStream) -> TokenStream {
+    codspeed::divan_bench_attribute(attr, input)
 }
 
 /// Processes a Rust docs to extract the description string.
@@ -318,6 +329,35 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn scalar(attr: TokenStream, input: TokenStream) -> TokenStream {
     ext::scalar(attr, input)
+}
+
+/// Derive a context-aware scalar function for your extension by deriving
+/// `ScalarDerive` on a struct that implements the `ScalarFunc` trait.
+///
+/// The associated `State` is built once per registration via `init`, shared by
+/// reference across every call, and dropped when the function is unregistered or
+/// the owning connection is dropped. The derived `register_<Struct>` entry point
+/// can be listed directly in the `scalars: { .. }` section of `register_extension!`.
+/// ```ignore
+/// use turso_ext::{register_extension, ScalarDerive, ScalarFunc, Value};
+///
+/// #[derive(ScalarDerive)]
+/// struct Multiply;
+///
+/// impl ScalarFunc for Multiply {
+///     type State = i64;
+///     const NAME: &'static str = "ctx_multiply";
+///     fn init() -> Self::State {
+///         3
+///     }
+///     fn call(state: &Self::State, args: &[Value]) -> Value {
+///         Value::from_integer(args[0].to_integer().unwrap_or_default() * *state)
+///     }
+/// }
+/// ```
+#[proc_macro_derive(ScalarDerive)]
+pub fn derive_scalar(input: TokenStream) -> TokenStream {
+    ext::derive_scalar(input)
 }
 
 /// Define an aggregate function for your extension by deriving
@@ -668,6 +708,24 @@ pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn trace_stack(attr: TokenStream, input: TokenStream) -> TokenStream {
     trace_stack_impl::trace_stack_attribute(attr, input)
+}
+
+/// Wrap a function body in an allocation-site scope.
+///
+/// The argument must be an expression that converts into
+/// `crate::alloc::AllocationSite`.
+#[proc_macro_attribute]
+pub fn allocation_site(attr: TokenStream, input: TokenStream) -> TokenStream {
+    let site: proc_macro2::TokenStream = attr.into();
+    let mut function = parse_macro_input!(input as syn::ItemFn);
+    let body = function.block;
+    function.block = Box::new(syn::parse_quote!({
+        #[cfg(feature = "allocation_metric")]
+        let _turso_allocation_site_guard =
+            crate::alloc::enter_allocation_site(#site);
+        #body
+    }));
+    TokenStream::from(quote!(#function))
 }
 
 /// Controls the `#[cfg(not(antithesis))]` fallback in "always" comparison macros.

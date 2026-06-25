@@ -52,6 +52,67 @@ function toBindArgs(params) {
   return [params];
 }
 
+export type BatchMode = "write" | "read" | "deferred" | "immediate" | "exclusive" | "concurrent" | string;
+
+export interface BatchOptions {
+  mode?: BatchMode;
+  raw?: boolean;
+}
+
+export type BatchRow = Record<string, any> | any[];
+
+export interface ResultSet {
+  columns: Array<string>;
+  columnTypes: Array<string>;
+  rows: Array<BatchRow>;
+  rowsAffected: number;
+}
+
+function normalizeBatchMode(mode: BatchMode): string {
+  switch (String(mode).toLowerCase()) {
+    case "write":
+      return "IMMEDIATE";
+    case "read":
+    case "deferred":
+      return "DEFERRED";
+    case "immediate":
+      return "IMMEDIATE";
+    case "exclusive":
+      return "EXCLUSIVE";
+    case "concurrent":
+      return "CONCURRENT";
+    default:
+      return String(mode).toUpperCase();
+  }
+}
+
+function normalizeBatchOptions(options?: BatchMode | BatchOptions): { mode?: BatchMode; raw: boolean } {
+  if (options != null && typeof options === "object") {
+    return {
+      mode: options.mode,
+      raw: options.raw === true,
+    };
+  }
+  return {
+    mode: options as BatchMode | undefined,
+    raw: false,
+  };
+}
+
+function makeResultSet(
+  columns: string[],
+  columnTypes: string[],
+  rows: any[],
+  rowsAffected: number,
+): ResultSet {
+  return {
+    columns,
+    columnTypes,
+    rows,
+    rowsAffected,
+  };
+}
+
 /**
  * Database represents a connection that can prepare and execute SQL statements.
  */
@@ -63,7 +124,6 @@ class Database {
   inTransaction: boolean;
 
   private db: NativeDatabase;
-  private _inTransaction: boolean = false;
 
   /**
    * Creates a new database connection. If the database file pointed to by `path` does not exists, it will be created.
@@ -85,7 +145,7 @@ class Database {
       readonly: { get: () => this.db.readonly },
       open: { get: () => this.db.open },
       memory: { get: () => this.db.memory },
-      inTransaction: { get: () => this._inTransaction },
+      inTransaction: { get: () => this.db.inTransaction() },
     });
   }
 
@@ -122,15 +182,12 @@ class Database {
     const wrapTxn = (mode) => {
       return (...bindParameters) => {
         db.exec("BEGIN " + mode);
-        db._inTransaction = true;
         try {
           const result = fn(...bindParameters);
           db.exec("COMMIT");
-          db._inTransaction = false;
           return result;
         } catch (err) {
           db.exec("ROLLBACK");
-          db._inTransaction = false;
           throw err;
         }
       };
@@ -226,6 +283,84 @@ class Database {
     } finally {
       exec.reset();
     }
+  }
+
+  batch(
+    statements: Array<string | { sql: string; args?: any[] | Record<string, any> }>,
+    options?: BatchMode | BatchOptions,
+  ): ResultSet[] {
+    if (!Array.isArray(statements)) {
+      throw new TypeError("Expected first argument to be an array of statements");
+    }
+    if (!this.open) {
+      throw new TypeError("The database connection is not open");
+    }
+
+    const { mode, raw } = normalizeBatchOptions(options);
+    const wrap = mode != null && !this.db.inTransaction();
+    if (wrap) {
+      this.exec(`BEGIN ${normalizeBatchMode(mode!)}`);
+    }
+
+    const results: ResultSet[] = [];
+    try {
+      for (const statement of statements) {
+        const sql = typeof statement === "string" ? statement : statement.sql;
+        const args = typeof statement === "string" ? undefined : statement.args;
+        const stmt = this.db.prepare(sql);
+        try {
+          if (args !== undefined) {
+            bindParams(stmt, [args]);
+          }
+          const cols = stmt.columns();
+          const columnNames = cols.map((c) => c.name);
+          const columnTypes = cols.map((c) => c.type ?? "");
+          if (columnNames.length > 0) {
+            stmt.raw(raw);
+          }
+
+          const totalChangesBefore = this.db.totalChanges();
+          const rows: any[] = [];
+          try {
+            while (true) {
+              const stepResult = stmt.stepSync();
+              if (stepResult === STEP_IO) {
+                this.db.ioLoopSync();
+                continue;
+              }
+              if (stepResult === STEP_DONE) {
+                break;
+              }
+              if (stepResult === STEP_ROW) {
+                rows.push(stmt.row());
+              }
+            }
+            const rowsAffected = columnNames.length > 0
+              ? 0
+              : this.db.totalChanges() !== totalChangesBefore ? this.db.changes() : 0;
+            results.push(makeResultSet(columnNames, columnTypes, rows, rowsAffected));
+          } finally {
+            stmt.reset();
+          }
+        } finally {
+          stmt.finalize();
+        }
+      }
+
+      if (wrap) {
+        this.exec("COMMIT");
+      }
+    } catch (err) {
+      if (wrap) {
+        try {
+          this.exec("ROLLBACK");
+        } catch {
+          // Keep the original statement error.
+        }
+      }
+      throw convertError(err);
+    }
+    return results;
   }
 
   /**

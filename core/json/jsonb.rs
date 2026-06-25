@@ -2594,6 +2594,22 @@ impl Jsonb {
                                 bail_parse_error!("Element with negative index not found")
                             }
                         }
+                        None => {
+                            if !mode.allows_insert() {
+                                bail_parse_error!("Cant insert")
+                            }
+                            let placeholder = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                            let placeholder_bytes = placeholder.as_bytes();
+                            self.data
+                                .splice(end_pos..end_pos, placeholder_bytes.iter().copied());
+
+                            return Ok(JsonTraversalResult::with_array_index(
+                                pos,
+                                JsonLocationKind::ArrayEntry,
+                                placeholder_bytes.len() as isize,
+                                end_pos,
+                            ));
+                        }
                         _ => unreachable!(),
                     }
                 } else {
@@ -2772,6 +2788,23 @@ impl Jsonb {
                             } else {
                                 bail_parse_error!("Element with negative index not found")
                             }
+                        }
+                        None => {
+                            if !mode.allows_insert() {
+                                bail_parse_error!("Cant insert")
+                            }
+                            let placeholder = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                            let placeholder_bytes = placeholder.as_bytes();
+
+                            self.data
+                                .splice(end_pos..end_pos, placeholder_bytes.iter().copied());
+
+                            return Ok(JsonTraversalResult::with_array_index(
+                                pos,
+                                JsonLocationKind::DocumentRoot,
+                                placeholder_bytes.len() as isize,
+                                end_pos,
+                            ));
                         }
                         _ => unreachable!(),
                     }
@@ -2956,6 +2989,14 @@ impl Jsonb {
                                 let insertion_point = value_idx + value_size + value_header_size;
 
                                 self.data.insert(insertion_point, placeholder_bytes[0]);
+                                let insertion_point = value_idx + value_size + value_header_size;
+
+                                return Ok(JsonTraversalResult::with_array_index(
+                                    value_idx,
+                                    JsonLocationKind::ObjectProperty(key_idx),
+                                    placeholder_bytes.len() as isize,
+                                    insertion_point,
+                                ));
                             } else {
                                 bail_parse_error!("Cant insert")
                             }

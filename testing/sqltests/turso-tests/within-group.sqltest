@@ -1,0 +1,760 @@
+@database :memory:
+
+# Ordered-set aggregates using the SQL-standard WITHIN GROUP (ORDER BY ...) syntax:
+# mode(), percentile_cont(fraction) and percentile_disc(fraction).
+# Expected values match PostgreSQL.
+
+setup nums {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3),(4),(5);
+}
+
+@setup nums
+test percentile-cont-median {
+    SELECT CAST(percentile_cont(0.5) WITHIN GROUP (ORDER BY x) AS TEXT) FROM t;
+}
+expect {
+    3.0
+}
+
+@setup nums
+test percentile-cont-quartile {
+    SELECT CAST(percentile_cont(0.25) WITHIN GROUP (ORDER BY x) AS TEXT) FROM t;
+}
+expect {
+    2.0
+}
+
+@setup nums
+test percentile-cont-zero {
+    SELECT CAST(percentile_cont(0.0) WITHIN GROUP (ORDER BY x) AS TEXT) FROM t;
+}
+expect {
+    1.0
+}
+
+@setup nums
+test percentile-cont-one {
+    SELECT CAST(percentile_cont(1.0) WITHIN GROUP (ORDER BY x) AS TEXT) FROM t;
+}
+expect {
+    5.0
+}
+
+# percentile_cont interpolates between adjacent values.
+setup pair {
+    CREATE TABLE p(x);
+    INSERT INTO p VALUES (1),(2);
+}
+
+@setup pair
+test percentile-cont-interpolates {
+    SELECT CAST(percentile_cont(0.5) WITHIN GROUP (ORDER BY x) AS TEXT) FROM p;
+}
+expect {
+    1.5
+}
+
+@setup nums
+test percentile-disc-median {
+    SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) FROM t;
+}
+expect {
+    3
+}
+
+# Smallest value whose cumulative distribution reaches 0.7 is 4 (not 3): this is the
+# PostgreSQL definition of percentile_disc.
+@setup nums
+test percentile-disc-07 {
+    SELECT percentile_disc(0.7) WITHIN GROUP (ORDER BY x) FROM t;
+}
+expect {
+    4
+}
+
+@setup nums
+test percentile-disc-zero {
+    SELECT percentile_disc(0.0) WITHIN GROUP (ORDER BY x) FROM t;
+}
+expect {
+    1
+}
+
+@setup nums
+test percentile-disc-one {
+    SELECT percentile_disc(1.0) WITHIN GROUP (ORDER BY x) FROM t;
+}
+expect {
+    5
+}
+
+setup modes {
+    CREATE TABLE m(x);
+    INSERT INTO m VALUES (1),(1),(2),(3),(3),(3);
+}
+
+@setup modes
+test mode-basic {
+    SELECT mode() WITHIN GROUP (ORDER BY x) FROM m;
+}
+expect {
+    3
+}
+
+# On a frequency tie, the smallest value is returned.
+setup ties {
+    CREATE TABLE m2(x);
+    INSERT INTO m2 VALUES (2),(2),(1),(1);
+}
+
+@setup ties
+test mode-tie-returns-smallest {
+    SELECT mode() WITHIN GROUP (ORDER BY x) FROM m2;
+}
+expect {
+    1
+}
+
+# Ordered-set aggregates work per group.
+setup grouped {
+    CREATE TABLE g(k,v);
+    INSERT INTO g VALUES ('a',1),('a',3),('b',10),('b',20),('b',30);
+}
+
+@setup grouped
+test percentile-cont-group-by {
+    SELECT k, CAST(percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS TEXT) FROM g GROUP BY k ORDER BY k;
+}
+expect {
+    a|2.0
+    b|20.0
+}
+
+@setup grouped
+test mode-group-by {
+    SELECT k, mode() WITHIN GROUP (ORDER BY v) FROM g GROUP BY k ORDER BY k;
+}
+expect {
+    a|1
+    b|10
+}
+
+# NULL inputs are ignored by ordered-set aggregates.
+setup withnulls {
+    CREATE TABLE n(x);
+    INSERT INTO n VALUES (1),(NULL),(2),(3),(NULL);
+}
+
+@setup withnulls
+test percentile-ignores-nulls {
+    SELECT CAST(percentile_cont(0.5) WITHIN GROUP (ORDER BY x) AS TEXT) FROM n;
+}
+expect {
+    2.0
+}
+
+# An empty (or all-NULL) ordered set yields NULL.
+setup emptytbl {
+    CREATE TABLE e(x);
+}
+
+@setup emptytbl
+test percentile-cont-empty-is-null {
+    SELECT typeof(percentile_cont(0.5) WITHIN GROUP (ORDER BY x)) FROM e;
+}
+expect {
+    null
+}
+
+@setup emptytbl
+test percentile-disc-empty-is-null {
+    SELECT typeof(percentile_disc(0.5) WITHIN GROUP (ORDER BY x)) FROM e;
+}
+expect {
+    null
+}
+
+@setup emptytbl
+test mode-empty-is-null {
+    SELECT typeof(mode() WITHIN GROUP (ORDER BY x)) FROM e;
+}
+expect {
+    null
+}
+
+# mode() and percentile_disc() return the element in its original type, so text works too.
+setup texts {
+    CREATE TABLE s(x);
+    INSERT INTO s VALUES ('banana'),('apple'),('apple'),('cherry');
+}
+
+@setup texts
+test mode-text {
+    SELECT mode() WITHIN GROUP (ORDER BY x) FROM s;
+}
+expect {
+    apple
+}
+
+@setup texts
+test percentile-disc-text {
+    SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) FROM s;
+}
+expect {
+    apple
+}
+
+# WITHIN is only a keyword right after `)` followed by GROUP; it stays usable as an identifier.
+test within-as-column-identifier {
+    SELECT 1 AS within;
+}
+expect {
+    1
+}
+
+# mode() has no plain-aggregate form; it requires WITHIN GROUP.
+@setup nums
+test mode-requires-within-group {
+    SELECT mode() FROM t;
+}
+expect error {
+}
+
+# WITHIN GROUP is rejected for ordinary aggregates.
+@setup nums
+test within-group-rejected-for-sum {
+    SELECT sum(x) WITHIN GROUP (ORDER BY x) FROM t;
+}
+expect error {
+}
+
+# A single ORDER BY expression is required.
+setup pairxy {
+    CREATE TABLE txy(x,y);
+    INSERT INTO txy VALUES (1,2),(3,4);
+}
+
+@setup pairxy
+test within-group-single-order-column {
+    SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x, y) FROM txy;
+}
+expect error {
+}
+
+# Percentile fractions must lie in [0, 1].
+@setup nums
+test percentile-fraction-out-of-range {
+    SELECT percentile_cont(2.0) WITHIN GROUP (ORDER BY x) FROM t;
+}
+expect error {
+}
+
+# --- Cases below have expected values validated against PostgreSQL 18 ---
+
+# Even-count interpolation vs discrete selection.
+setup even4 {
+    CREATE TABLE ev(x INTEGER);
+    INSERT INTO ev VALUES (10),(20),(30),(40);
+}
+
+@setup even4
+test percentile-cont-even-count {
+    SELECT CAST(percentile_cont(0.5) WITHIN GROUP (ORDER BY x) AS TEXT) FROM ev;
+}
+expect {
+    25.0
+}
+
+@setup even4
+test percentile-disc-even-count {
+    SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) FROM ev;
+}
+expect {
+    20
+}
+
+@setup even4
+test percentile-disc-quarter {
+    SELECT percentile_disc(0.25) WITHIN GROUP (ORDER BY x) FROM ev;
+}
+expect {
+    10
+}
+
+# Floating-point inputs: percentile_disc keeps the original REAL value; cont interpolates.
+setup floats {
+    CREATE TABLE fl(x DOUBLE PRECISION);
+    INSERT INTO fl VALUES (1.5),(2.5),(3.5),(10.0);
+}
+
+@setup floats
+test percentile-cont-floats {
+    SELECT CAST(percentile_cont(0.5) WITHIN GROUP (ORDER BY x) AS TEXT) FROM fl;
+}
+expect {
+    3.0
+}
+
+@setup floats
+test percentile-cont-floats-30 {
+    SELECT CAST(percentile_cont(0.3) WITHIN GROUP (ORDER BY x) AS TEXT) FROM fl;
+}
+expect {
+    2.4
+}
+
+@setup floats
+test percentile-disc-floats {
+    SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) FROM fl;
+}
+expect {
+    2.5
+}
+
+# Negatives and duplicates.
+setup negs {
+    CREATE TABLE ng(x INTEGER);
+    INSERT INTO ng VALUES (-5),(-1),(0),(0),(3),(100);
+}
+
+@setup negs
+test percentile-cont-negatives {
+    SELECT CAST(percentile_cont(0.5) WITHIN GROUP (ORDER BY x) AS TEXT) FROM ng;
+}
+expect {
+    0.0
+}
+
+@setup negs
+test percentile-disc-negatives {
+    SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) FROM ng;
+}
+expect {
+    0
+}
+
+@setup negs
+test mode-duplicates {
+    SELECT mode() WITHIN GROUP (ORDER BY x) FROM ng;
+}
+expect {
+    0
+}
+
+# Additional fractions over 1..5.
+@setup nums
+test percentile-cont-90 {
+    SELECT CAST(percentile_cont(0.9) WITHIN GROUP (ORDER BY x) AS TEXT) FROM t;
+}
+expect {
+    4.6
+}
+
+@setup nums
+test percentile-disc-60 {
+    SELECT percentile_disc(0.6) WITHIN GROUP (ORDER BY x) FROM t;
+}
+expect {
+    3
+}
+
+# Text ordered sets honor collation. By default that is BINARY (the SQLite-dialect default),
+# which matches PostgreSQL's `COLLATE "C"`: uppercase sorts before lowercase, so the discrete
+# minimum of this mixed-case set is 'Apple'.
+setup mixedcase {
+    CREATE TABLE mc(x TEXT);
+    INSERT INTO mc VALUES ('Banana'),('apple'),('Apple'),('cherry'),('apple');
+}
+
+@setup mixedcase
+test mode-mixed-case-text {
+    SELECT mode() WITHIN GROUP (ORDER BY x) FROM mc;
+}
+expect {
+    apple
+}
+
+@setup mixedcase
+test percentile-disc-binary-collation {
+    SELECT percentile_disc(0.0) WITHIN GROUP (ORDER BY x) FROM mc;
+}
+expect {
+    Apple
+}
+
+# An explicit COLLATE on the ORDER BY expression is honored: under NOCASE, 'apple' sorts
+# before 'Apple'/'Banana'/'cherry', so the discrete minimum is the lowercase 'apple'.
+@setup mixedcase
+test within-group-collate-nocase {
+    SELECT percentile_disc(0.0) WITHIN GROUP (ORDER BY x COLLATE NOCASE) FROM mc;
+}
+expect {
+    apple
+}
+
+# A column's declared collation is honored without an explicit COLLATE in the query.
+setup mixedcase_nocase {
+    CREATE TABLE mcn(x TEXT COLLATE NOCASE);
+    INSERT INTO mcn VALUES ('Banana'),('apple'),('Apple'),('cherry'),('apple');
+}
+
+@setup mixedcase_nocase
+test within-group-column-collation {
+    SELECT percentile_disc(0.0) WITHIN GROUP (ORDER BY x) FROM mcn;
+}
+expect {
+    apple
+}
+
+@setup mixedcase_nocase
+test within-group-column-collation-disc-max {
+    SELECT percentile_disc(1.0) WITHIN GROUP (ORDER BY x) FROM mcn;
+}
+expect {
+    cherry
+}
+
+# Several ordered-set aggregates (with different ORDER BY keys) plus an ordinary
+# aggregate can coexist in one query.
+@setup nums
+test multiple-ordered-set-aggregates {
+    SELECT CAST(percentile_cont(0.25) WITHIN GROUP (ORDER BY x) AS TEXT),
+           percentile_disc(0.5) WITHIN GROUP (ORDER BY x),
+           mode() WITHIN GROUP (ORDER BY x),
+           count(*)
+    FROM t;
+}
+expect {
+    2.0|3|1|5
+}
+
+# The direct argument (the fraction) may be a constant expression.
+@setup nums
+test percentile-cont-constant-expr-fraction {
+    SELECT CAST(percentile_cont(0.25 + 0.25) WITHIN GROUP (ORDER BY x) AS TEXT) FROM t;
+}
+expect {
+    3.0
+}
+
+# But it must not reference input columns (PostgreSQL rejects this too); otherwise the
+# result would silently depend on which row was stepped last.
+setup with_fraction {
+    CREATE TABLE pf(x, f);
+    INSERT INTO pf VALUES (1, 0.5), (2, 0.5), (3, 0.5);
+}
+
+@setup with_fraction
+test percentile-fraction-column-rejected {
+    SELECT percentile_cont(f) WITHIN GROUP (ORDER BY x) FROM pf;
+}
+expect error {
+}
+
+# percentile_cont ignores non-numeric values in the ordered set (columns are dynamically
+# typed here; percentile_disc, which returns the element itself, does not filter).
+setup mixed_types {
+    CREATE TABLE mx(x);
+    INSERT INTO mx VALUES (1), (2), ('not a number'), (3);
+}
+
+@setup mixed_types
+test percentile-cont-ignores-non-numeric {
+    SELECT CAST(percentile_cont(0.5) WITHIN GROUP (ORDER BY x) AS TEXT) FROM mx;
+}
+expect {
+    2.0
+}
+
+# --- Corner cases (subqueries, CTEs, FILTER, HAVING, correlated refs, expression keys).
+# --- All values validated against PostgreSQL 18.
+setup cg {
+    CREATE TABLE cg(g, x);
+    INSERT INTO cg VALUES (1,10),(1,20),(1,30),(1,40),(2,5),(2,15),(2,25),(3,100);
+}
+
+@setup cg
+test ordered-set-in-from-subquery {
+    SELECT p FROM (SELECT CAST(percentile_cont(0.5) WITHIN GROUP (ORDER BY x) AS TEXT) AS p FROM cg) s;
+}
+expect {
+    22.5
+}
+
+@setup cg
+test ordered-set-in-scalar-subquery {
+    SELECT (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) FROM cg);
+}
+expect {
+    20
+}
+
+@setup cg
+test ordered-set-in-having {
+    SELECT g FROM cg GROUP BY g
+    HAVING percentile_cont(0.5) WITHIN GROUP (ORDER BY x) > 20 ORDER BY g;
+}
+expect {
+    1
+    3
+}
+
+@setup cg
+test ordered-set-with-filter {
+    SELECT CAST(percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FILTER (WHERE x > 15) AS TEXT) FROM cg;
+}
+expect {
+    30.0
+}
+
+@setup cg
+test ordered-set-with-filter-grouped {
+    SELECT g, percentile_disc(0.5) WITHIN GROUP (ORDER BY x) FILTER (WHERE x >= 20)
+    FROM cg GROUP BY g ORDER BY g;
+}
+expect {
+    1|30
+    2|25
+    3|100
+}
+
+@setup cg
+test ordered-set-expression-order-key {
+    SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY -x) FROM cg;
+}
+expect {
+    -25
+}
+
+@setup cg
+test ordered-set-case-order-key {
+    SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY CASE WHEN x > 20 THEN x ELSE 0 END) FROM cg;
+}
+expect {
+    0
+}
+
+@setup cg
+test ordered-set-nested-in-cte {
+    SELECT CAST(percentile_cont(0.5) WITHIN GROUP (ORDER BY med) AS TEXT)
+    FROM (SELECT g, percentile_disc(0.5) WITHIN GROUP (ORDER BY x) AS med FROM cg GROUP BY g) per_g;
+}
+expect {
+    20.0
+}
+
+@setup cg
+test ordered-set-empty-subquery-null {
+    SELECT typeof((SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM cg WHERE g = 999));
+}
+expect {
+    null
+}
+
+# Correlated subqueries: the ORDER BY references the inner table, and the fraction may
+# reference an OUTER column (constant for the inner aggregate) — both match PostgreSQL.
+setup cg_oc {
+    CREATE TABLE cg(g, x);
+    INSERT INTO cg VALUES (1,10),(1,20),(1,30),(1,40),(2,5),(2,15),(2,25),(3,100);
+    CREATE TABLE oc(id, frac);
+    INSERT INTO oc VALUES (1,0.25),(2,0.75);
+}
+
+@setup cg_oc
+test ordered-set-correlated-mode {
+    SELECT oc.id, (SELECT mode() WITHIN GROUP (ORDER BY cg.x) FROM cg WHERE cg.g = oc.id)
+    FROM oc ORDER BY oc.id;
+}
+expect {
+    1|10
+    2|5
+}
+
+@setup cg_oc
+test ordered-set-correlated-outer-fraction {
+    SELECT oc.id, (SELECT CAST(percentile_cont(oc.frac) WITHIN GROUP (ORDER BY cg.x) AS TEXT) FROM cg WHERE cg.g = oc.id)
+    FROM oc ORDER BY oc.id;
+}
+expect {
+    1|17.5
+    2|20.0
+}
+
+# A fraction that references this query's own input columns is rejected (PostgreSQL too).
+@setup cg
+test ordered-set-local-column-fraction-rejected {
+    SELECT percentile_cont(x) WITHIN GROUP (ORDER BY x) FROM cg;
+}
+expect error {
+}
+
+# Ordered-set aggregates work over tables in an ATTACHed database (same results as a
+# main-database table; the data source is irrelevant).
+test ordered-set-over-attached-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t(g, x);
+    INSERT INTO aux.t VALUES (1,10),(1,20),(1,30),(2,5),(2,15),(2,25),(2,35);
+    SELECT CAST(percentile_cont(0.5) WITHIN GROUP (ORDER BY x) AS TEXT),
+           percentile_disc(0.5) WITHIN GROUP (ORDER BY x),
+           mode() WITHIN GROUP (ORDER BY x)
+    FROM aux.t;
+}
+expect {
+    20.0|20|5
+}
+
+# The fraction-must-be-constant rule also applies to columns of an attached table.
+test ordered-set-attached-column-fraction-rejected {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t(x);
+    INSERT INTO aux.t VALUES (1), (2), (3);
+    SELECT percentile_cont(x) WITHIN GROUP (ORDER BY x) FROM aux.t;
+}
+expect error {
+}
+
+# A fraction that reaches an input column through a subquery is also rejected (PostgreSQL:
+# "subquery uses ungrouped column"). Subqueries in the fraction are rejected conservatively
+# since their contents are not visible here after planning.
+@setup with_fraction
+test ordered-set-subquery-input-fraction-rejected {
+    SELECT percentile_cont((SELECT f)) WITHIN GROUP (ORDER BY x) FROM pf;
+}
+expect error {
+}
+
+# An out-of-range fraction is reported regardless of how many rows are aggregated, matching
+# PostgreSQL (which validates the fraction even over empty/all-NULL/all-filtered input).
+setup nulls_only {
+    CREATE TABLE no(x);
+    INSERT INTO no VALUES (NULL), (NULL);
+}
+
+@setup nulls_only
+test percentile-fraction-out-of-range-all-null {
+    SELECT percentile_cont(2.0) WITHIN GROUP (ORDER BY x) FROM no;
+}
+expect error {
+}
+
+@setup nums
+test percentile-fraction-out-of-range-empty {
+    SELECT percentile_cont(2.0) WITHIN GROUP (ORDER BY x) FROM t WHERE x > 1000;
+}
+expect error {
+}
+
+@setup nums
+test percentile-fraction-out-of-range-filtered {
+    SELECT percentile_cont(2.0) WITHIN GROUP (ORDER BY x) FILTER (WHERE x > 1000) FROM t;
+}
+expect error {
+}
+
+# A valid fraction over an empty input still yields NULL, not an error.
+@setup nums
+test percentile-valid-fraction-empty-is-null {
+    SELECT typeof(percentile_cont(0.5) WITHIN GROUP (ORDER BY x)) FROM t WHERE x > 1000;
+}
+expect {
+    null
+}
+
+# A constant-expression fraction is folded and range-checked at compile time, so it is
+# validated regardless of row count and accepted when valid (matching PostgreSQL, which
+# evaluates the direct argument once).
+@setup nums
+test percentile-constant-expr-fraction-valid {
+    SELECT CAST(percentile_cont(0.4 + 0.1) WITHIN GROUP (ORDER BY x) AS TEXT) FROM t;
+}
+expect {
+    3.0
+}
+
+@setup nums
+test percentile-constant-expr-fraction-divide {
+    SELECT CAST(percentile_cont(1.0 / 2.0) WITHIN GROUP (ORDER BY x) AS TEXT) FROM t;
+}
+expect {
+    3.0
+}
+
+@setup nums
+test percentile-constant-expr-fraction-out-of-range {
+    SELECT percentile_cont(1.0 + 1.0) WITHIN GROUP (ORDER BY x) FROM t;
+}
+expect error {
+}
+
+@setup nums
+test percentile-constant-expr-fraction-out-of-range-empty {
+    SELECT percentile_cont(1.0 + 1.0) WITHIN GROUP (ORDER BY x) FROM t WHERE x > 1000;
+}
+expect error {
+}
+
+# A NULL fraction propagates to a NULL result, matching PostgreSQL. This holds
+# for populated, empty, and correlated-empty input alike.
+@setup nums
+test percentile-cont-null-fraction-is-null {
+    SELECT typeof(percentile_cont(NULL) WITHIN GROUP (ORDER BY x)) FROM t;
+}
+expect {
+    null
+}
+
+@setup nums
+test percentile-disc-null-fraction-is-null {
+    SELECT typeof(percentile_disc(NULL) WITHIN GROUP (ORDER BY x)) FROM t;
+}
+expect {
+    null
+}
+
+@setup nums
+test percentile-null-fraction-empty-input-is-null {
+    SELECT typeof(percentile_cont(NULL) WITHIN GROUP (ORDER BY x)) FROM t WHERE x > 1000;
+}
+expect {
+    null
+}
+
+# A NULL fraction supplied via an outer (correlated) reference is also NULL.
+test percentile-correlated-null-fraction-is-null {
+    CREATE TABLE inner_t(g, x);
+    INSERT INTO inner_t VALUES (1, 10), (1, 20), (1, 30);
+    CREATE TABLE outer_t(id, frac);
+    INSERT INTO outer_t VALUES (1, NULL);
+    SELECT typeof((SELECT percentile_cont(outer_t.frac) WITHIN GROUP (ORDER BY x)
+                   FROM inner_t WHERE g = outer_t.id)) FROM outer_t;
+}
+expect {
+    null
+}
+
+# An out-of-range fraction supplied via a (correlated) outer reference errors
+# even when the inner aggregate sees zero rows. PG validates the direct
+# argument once per invocation, not per row.
+test percentile-correlated-bad-fraction-empty-inner-errors {
+    CREATE TABLE inner_t(g, x);
+    INSERT INTO inner_t VALUES (1, 10), (1, 20);
+    CREATE TABLE outer_t(id, bad);
+    INSERT INTO outer_t VALUES (1, 2.5);
+    SELECT (SELECT percentile_cont(outer_t.bad) WITHIN GROUP (ORDER BY x)
+            FROM inner_t WHERE g = 999) FROM outer_t;
+}
+expect error {
+}
+
+# Same with all-NULL inner values: the fraction is still validated.
+test percentile-correlated-bad-fraction-all-null-inner-errors {
+    CREATE TABLE inner_t(x);
+    INSERT INTO inner_t VALUES (NULL), (NULL);
+    CREATE TABLE outer_t(id, bad);
+    INSERT INTO outer_t VALUES (1, 2.5);
+    SELECT (SELECT percentile_cont(outer_t.bad) WITHIN GROUP (ORDER BY x) FROM inner_t)
+    FROM outer_t;
+}
+expect error {
+}

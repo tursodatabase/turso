@@ -7,11 +7,14 @@ import {
   type CursorResponse,
   type CursorEntry,
   type PipelineRequest,
+  type PipelineResponse,
   type SequenceRequest,
   type CloseRequest,
   type DescribeRequest,
   type DescribeResult,
+  type GetAutocommitRequest,
   type QueryOptions,
+  type HttpContext,
 } from './protocol.js';
 import { DatabaseError } from './error.js';
 import { encodeSqlArgs } from './args.js';
@@ -20,7 +23,25 @@ import { encodeSqlArgs } from './args.js';
  * Locking mode for atomic `batch()` execution. Accepts the same values
  * as the variants of `Connection.transaction(...)`.
  */
-export type BatchMode = 'deferred' | 'immediate' | 'exclusive' | 'concurrent';
+export type BatchMode = 'write' | 'read' | 'deferred' | 'immediate' | 'exclusive' | 'concurrent' | string;
+
+function normalizeBatchMode(mode: BatchMode): string {
+  switch (String(mode).toLowerCase()) {
+    case 'write':
+      return 'IMMEDIATE';
+    case 'read':
+    case 'deferred':
+      return 'DEFERRED';
+    case 'immediate':
+      return 'IMMEDIATE';
+    case 'exclusive':
+      return 'EXCLUSIVE';
+    case 'concurrent':
+      return 'CONCURRENT';
+    default:
+      return String(mode).toUpperCase();
+  }
+}
 
 /**
  * Configuration options for a session.
@@ -37,6 +58,13 @@ export interface SessionConfig {
   remoteEncryptionKey?: string;
   /** Default maximum query execution time in milliseconds before interruption. */
   defaultQueryTimeout?: number;
+  /**
+   * Extra HTTP headers attached to every request sent to the server.
+   * Applied after the standard headers, so they can override e.g.
+   * `Authorization`. Passing the `Host` key (case-insensitive) throws —
+   * fetch forbids setting it.
+   */
+  requestHeaders?: Record<string, string>;
 }
 
 function normalizeUrl(url: string): string {
@@ -57,10 +85,62 @@ export class Session {
   private config: SessionConfig;
   private baton: string | null = null;
   private baseUrl: string;
+  // Cached autocommit status from the server's last `get_autocommit` answer.
+  // A fresh connection is in autocommit (not in a transaction).
+  private autocommit: boolean = true;
 
   constructor(config: SessionConfig) {
+    for (const name of Object.keys(config.requestHeaders ?? {})) {
+      // `Host` is a forbidden fetch header and would be silently dropped —
+      // reject it up front so the caller learns the override never takes effect.
+      if (name.toLowerCase() === 'host') {
+        throw new DatabaseError("overwriting the 'Host' header is not supported");
+      }
+    }
     this.config = config;
     this.baseUrl = normalizeUrl(config.url);
+  }
+
+  private httpContext(): HttpContext {
+    return {
+      url: this.baseUrl,
+      authToken: this.config.authToken,
+      remoteEncryptionKey: this.config.remoteEncryptionKey,
+      requestHeaders: this.config.requestHeaders,
+    };
+  }
+
+  /**
+   * Whether the connection is currently inside a transaction.
+   *
+   * Derived from the server's authoritative `get_autocommit` answer (the same
+   * value as `sqlite3_get_autocommit()`), which we refresh on every pipeline
+   * request. This is the only reliable signal: a non-null baton does NOT imply
+   * a transaction — the server also keeps the stream open for stored SQL or
+   * pragma side effects.
+   */
+  get inTransaction(): boolean {
+    return !this.autocommit;
+  }
+
+  /**
+   * Refresh the cached autocommit status from a pipeline response, reading the
+   * answer to the `get_autocommit` request we append to every pipeline call.
+   */
+  private updateAutocommit(response: PipelineResponse): void {
+    if (!response.results) {
+      return;
+    }
+    for (const result of response.results) {
+      if (
+        result.type === 'ok' &&
+        result.response?.type === 'get_autocommit' &&
+        typeof result.response.is_autocommit === 'boolean'
+      ) {
+        this.autocommit = result.response.is_autocommit;
+        return;
+      }
+    }
   }
 
   private createAbortSignal(queryOptions?: QueryOptions): AbortSignal | undefined {
@@ -80,17 +160,18 @@ export class Session {
   async describe(sql: string, queryOptions?: QueryOptions): Promise<DescribeResult> {
     const request: PipelineRequest = {
       baton: this.baton,
-      requests: [{
-        type: "describe",
-        sql: sql
-      } as DescribeRequest]
+      requests: [
+        { type: "describe", sql: sql } as DescribeRequest,
+        { type: "get_autocommit" } as GetAutocommitRequest,
+      ]
     };
 
     let response;
     try {
-      response = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+      response = await executePipeline(this.httpContext(), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
+      this.autocommit = true;
       throw e;
     }
 
@@ -98,6 +179,7 @@ export class Session {
     if (response.base_url) {
       this.baseUrl = response.base_url;
     }
+    this.updateAutocommit(response);
 
     // Check for errors in the response
     if (response.results && response.results[0]) {
@@ -154,7 +236,7 @@ export class Session {
 
     let result;
     try {
-      result = await executeCursor(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+      result = await executeCursor(this.httpContext(), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
       throw e;
@@ -248,6 +330,14 @@ export class Session {
     return row;
   }
 
+  createObjectRow(values: any[], columns: string[]): any {
+    const row: any = {};
+    columns.forEach((column, index) => {
+      row[column] = values[index];
+    });
+    return row;
+  }
+
   /**
    * Execute multiple SQL statements in a batch.
    *
@@ -262,17 +352,23 @@ export class Session {
    * @param mode - Optional locking mode; when set, the batch executes
    *   atomically. Accepts the same values as `Database.transaction(...)`
    *   variants: `"deferred"`, `"immediate"`, `"exclusive"`, `"concurrent"`.
-   * @returns Promise resolving to batch execution results.
+   * @param safeIntegers - When true, integer column values are decoded as
+   *   BigInt rather than Number.
+   * @returns Promise resolving to an array of per-statement results — one
+   *   per input statement, in order — each carrying that statement's
+   *   `columns`, `columnTypes`, `rows`, and `rowsAffected`.
    */
   async batch(
     statements: Array<string | { sql: string; args?: any[] | Record<string, any> }>,
     mode?: BatchMode,
     queryOptions?: QueryOptions,
+    safeIntegers: boolean = false,
+    raw: boolean = false,
   ): Promise<any> {
     const userSteps: BatchStep[] = statements.map(statement => {
       if (typeof statement === 'string') {
         return {
-          stmt: { sql: statement, args: [], named_args: [], want_rows: false },
+          stmt: { sql: statement, args: [], named_args: [], want_rows: true },
         };
       }
       const encodedArgs = encodeSqlArgs(statement.args ?? []);
@@ -281,7 +377,7 @@ export class Session {
           sql: statement.sql,
           args: encodedArgs.args,
           named_args: encodedArgs.namedArgs,
-          want_rows: false,
+          want_rows: true,
         },
       };
     });
@@ -307,7 +403,7 @@ export class Session {
       commitIdx = lastUserStepIdx + 1;
       rollbackIdx = commitIdx + 1;
       steps = [
-        { stmt: { sql: `BEGIN ${mode.toUpperCase()}`, args: [], named_args: [], want_rows: false } },
+        { stmt: { sql: `BEGIN ${normalizeBatchMode(mode)}`, args: [], named_args: [], want_rows: false } },
         ...userSteps.map((step, i) => ({
           ...step,
           condition: { type: 'ok' as const, step: i === 0 ? beginIdx : firstUserStepIdx + i - 1 },
@@ -336,7 +432,7 @@ export class Session {
 
     let batchResult;
     try {
-      batchResult = await executeCursor(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+      batchResult = await executeCursor(this.httpContext(), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
       throw e;
@@ -348,41 +444,71 @@ export class Session {
       this.baseUrl = response.base_url;
     }
 
-    let totalRowsAffected = 0;
-    let lastInsertRowid: number | undefined;
+    // One result per user statement, in input order.
+    const results = userSteps.map(() => ({
+      columns: [] as string[],
+      columnTypes: [] as string[],
+      rows: [] as any[],
+      rowsAffected: 0,
+    }));
     let deferredError: DatabaseError | null = null;
 
-    // step_end entries don't carry a step index on the wire; the Hrana
-    // server only puts `step` on step_begin / step_error. Track the
-    // current step ourselves by watching step_begin so we know which
-    // step_end belongs to a user statement when running in atomic mode.
-    let currentStep: number | undefined;
-    const isUserStep = (step: number | undefined): boolean => {
+    // step_end / row entries don't carry a step index on the wire; the Hrana
+    // server only puts `step` on step_begin / step_error. Track the current
+    // step via step_begin so we know which user statement a row or step_end
+    // belongs to. Maps the wire step index to a slot in `results`, or
+    // undefined for the synthetic BEGIN/COMMIT/ROLLBACK steps.
+    let currentResultIdx: number | undefined;
+    // Fallback for responses that omit step_begin (e.g. simplified mocks):
+    // in non-atomic mode every step_end advances to the next user statement.
+    let nextNonAtomicIdx = 0;
+    const stepToResultIdx = (step: number | undefined): number | undefined => {
       if (mode === undefined) {
-        // Non-atomic batch: every step is a user step.
-        return true;
+        // Non-atomic batch: every step is a user step, in order.
+        return step ?? nextNonAtomicIdx;
       }
-      return step !== undefined && step >= firstUserStepIdx && step <= lastUserStepIdx;
+      if (step !== undefined && step >= firstUserStepIdx && step <= lastUserStepIdx) {
+        return step - firstUserStepIdx;
+      }
+      return undefined;
     };
 
     for await (const entry of entries) {
       switch (entry.type) {
         case 'step_begin':
-          currentStep = entry.step;
+          currentResultIdx = stepToResultIdx(entry.step);
+          if (currentResultIdx !== undefined && currentResultIdx < results.length && entry.cols) {
+            results[currentResultIdx].columns = entry.cols.map(col => col.name);
+            results[currentResultIdx].columnTypes = entry.cols.map(col => col.decltype || '');
+          }
           break;
-        case 'step_end':
-          if (isUserStep(currentStep)) {
+        case 'row':
+          if (currentResultIdx !== undefined && currentResultIdx < results.length && entry.row) {
+            const decodedRow = entry.row.map(value => decodeValue(value, safeIntegers));
+            const row = raw
+              ? decodedRow
+              : this.createObjectRow(decodedRow, results[currentResultIdx].columns);
+            results[currentResultIdx].rows.push(row);
+          }
+          break;
+        case 'step_end': {
+          let idx = currentResultIdx;
+          if (idx === undefined && mode === undefined) {
+            idx = nextNonAtomicIdx;
+          }
+          if (idx !== undefined && idx < results.length) {
             if (entry.affected_row_count !== undefined) {
-              totalRowsAffected += entry.affected_row_count;
-            }
-            if (entry.last_insert_rowid !== undefined && entry.last_insert_rowid !== null) {
-              lastInsertRowid = typeof entry.last_insert_rowid === 'number'
-                ? entry.last_insert_rowid
-                : parseInt(entry.last_insert_rowid, 10);
+              results[idx].rowsAffected = results[idx].columns.length > 0
+                ? 0
+                : entry.affected_row_count;
             }
           }
-          currentStep = undefined;
+          if (mode === undefined && idx !== undefined) {
+            nextNonAtomicIdx = idx + 1;
+          }
+          currentResultIdx = undefined;
           break;
+        }
         case 'step_error':
           if (mode === undefined) {
             throw new DatabaseError(entry.error?.message || 'Batch execution failed', entry.error?.code);
@@ -396,7 +522,7 @@ export class Session {
           if (deferredError === null && entry.step !== rollbackIdx) {
             deferredError = new DatabaseError(entry.error?.message || 'Batch execution failed', entry.error?.code);
           }
-          currentStep = undefined;
+          currentResultIdx = undefined;
           break;
         case 'error':
           throw new DatabaseError(entry.error?.message || 'Batch execution failed', entry.error?.code);
@@ -407,10 +533,7 @@ export class Session {
       throw deferredError;
     }
 
-    return {
-      rowsAffected: totalRowsAffected,
-      lastInsertRowid,
-    };
+    return results;
   }
 
   /**
@@ -422,17 +545,18 @@ export class Session {
   async sequence(sql: string, queryOptions?: QueryOptions): Promise<void> {
     const request: PipelineRequest = {
       baton: this.baton,
-      requests: [{
-        type: "sequence",
-        sql: sql
-      } as SequenceRequest]
+      requests: [
+        { type: "sequence", sql: sql } as SequenceRequest,
+        { type: "get_autocommit" } as GetAutocommitRequest,
+      ]
     };
 
     let seqResponse;
     try {
-      seqResponse = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+      seqResponse = await executePipeline(this.httpContext(), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
+      this.autocommit = true;
       throw e;
     }
 
@@ -440,6 +564,7 @@ export class Session {
     if (seqResponse.base_url) {
       this.baseUrl = seqResponse.base_url;
     }
+    this.updateAutocommit(seqResponse);
 
     // Check for errors in the response
     if (seqResponse.results && seqResponse.results[0]) {
@@ -467,7 +592,7 @@ export class Session {
           } as CloseRequest]
         };
 
-        await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey);
+        await executePipeline(this.httpContext(), request);
       } catch {
         // Ignore errors during close — the connection might already be closed
         // or the baton may be stale after a timeout.
@@ -477,5 +602,6 @@ export class Session {
     // Reset local state
     this.baton = null;
     this.baseUrl = '';
+    this.autocommit = true;
   }
 }

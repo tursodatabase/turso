@@ -302,7 +302,7 @@ fn execute_sql_inner(conn: &Arc<Connection>, sql: &str) -> WorkerResponse {
             Err(e) => {
                 return WorkerResponse::Error {
                     error_kind: protocol::limbo_error_to_kind(&e).to_string(),
-                    message: e.to_string(),
+                    message: protocol::limbo_error_to_message(&e),
                 };
             }
         };
@@ -362,7 +362,7 @@ fn execute_sql_inner(conn: &Arc<Connection>, sql: &str) -> WorkerResponse {
                         message: "Interrupted".to_string(),
                     };
                 }
-                Ok(StepResult::IO) => {
+                Ok(StepResult::IO | StepResult::Yield) => {
                     io_count += 1;
                     stmt.get_pager()
                         .io
@@ -384,12 +384,13 @@ fn execute_sql_inner(conn: &Arc<Connection>, sql: &str) -> WorkerResponse {
                             | turso_core::LimboError::BusySnapshot
                             | turso_core::LimboError::WriteWriteConflict
                             | turso_core::LimboError::CommitDependencyAborted
+                            | turso_core::LimboError::OutOfMemory
                     ) {
                         rollback_autocommit = true;
                     }
                     break WorkerResponse::Error {
                         error_kind: protocol::limbo_error_to_kind(&e).to_string(),
-                        message: e.to_string(),
+                        message: protocol::limbo_error_to_message(&e),
                     };
                 }
             }

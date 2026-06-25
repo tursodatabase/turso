@@ -1,12 +1,25 @@
-use super::{TryClone, TursoBoxExt, TursoNewExt, TursoTryNewExt};
-use crate::alloc::{AllocError, Box, TursoAllocator};
+use super::{TryClone, TursoBoxExt, TursoFromIterator, TursoNewExt, TursoTryNewExt};
+use crate::alloc::{AllocError, Box, TryReserveError};
 
 fn boxed<T>(value: T) -> Box<T> {
-    Box::new_in(value, TursoAllocator)
+    Box::new(value)
 }
 
 fn try_boxed<T>(value: T) -> Result<Box<T>, AllocError> {
-    Box::try_new_in(value, TursoAllocator)
+    Ok(Box::new(value))
+}
+
+fn collect_boxed_slice<T, I>(iter: I) -> Box<[T]>
+where
+    I: IntoIterator<Item = T>,
+{
+    iter.into_iter()
+        .collect::<std::vec::Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn empty_boxed_slice<T>() -> Box<[T]> {
+    std::vec::Vec::new().into_boxed_slice()
 }
 
 impl<T> TursoNewExt<T> for Box<T> {
@@ -23,14 +36,7 @@ impl<T> TursoTryNewExt<T> for Box<T> {
 
 impl<T> TursoBoxExt<T> for Box<T> {
     fn into_inner(self) -> T {
-        #[cfg(not(nightly))]
-        {
-            Box::into_inner(self)
-        }
-        #[cfg(nightly)]
-        {
-            *self
-        }
+        *self
     }
 }
 
@@ -38,14 +44,27 @@ impl<T: Clone> TryClone for Box<T> {
     type Error = AllocError;
 
     fn try_clone(&self) -> Result<Self, Self::Error> {
-        #[cfg(not(nightly))]
-        {
-            <Self as TursoTryNewExt<T>>::try_new((**self).clone())
-        }
-        #[cfg(nightly)]
-        {
-            let alloc = Self::allocator(self).clone();
-            Self::try_clone_from_ref_in(self, alloc)
-        }
+        <Self as TursoTryNewExt<T>>::try_new((**self).clone())
+    }
+}
+
+impl<T> TursoFromIterator<T> for Box<[T]> {
+    #[inline(always)]
+    fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        Ok(collect_boxed_slice(iter))
+    }
+
+    #[inline(always)]
+    fn try_extend<I>(&mut self, iter: I) -> Result<(), TryReserveError>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let mut values = std::mem::replace(self, empty_boxed_slice()).into_vec();
+        values.extend(iter);
+        *self = values.into_boxed_slice();
+        Ok(())
     }
 }

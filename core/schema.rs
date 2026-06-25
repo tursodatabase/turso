@@ -1,4 +1,6 @@
+use crate::alloc::vec;
 use crate::alloc::TursoFromIterator;
+use crate::alloc::*;
 use crate::function::{Deterministic, Func};
 use crate::incremental::view::IncrementalView;
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, operator::create_dbsp_state_index};
@@ -12,7 +14,7 @@ use crate::translate::expr::{
 };
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
-use crate::types::IOResult;
+use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
@@ -96,7 +98,7 @@ pub struct Trigger {
     pub event: turso_parser::ast::TriggerEvent,
     pub for_each_row: bool,
     pub when_clause: Option<turso_parser::ast::Expr>,
-    pub commands: Vec<turso_parser::ast::TriggerCmd>,
+    pub commands: std::vec::Vec<turso_parser::ast::TriggerCmd>,
     pub temporary: bool,
     /// For temp triggers that target a table in a specific database.
     /// - `None` — the trigger was created without a db qualifier and
@@ -122,7 +124,7 @@ impl Trigger {
         event: turso_parser::ast::TriggerEvent,
         for_each_row: bool,
         when_clause: Option<turso_parser::ast::Expr>,
-        commands: Vec<turso_parser::ast::TriggerCmd>,
+        commands: std::vec::Vec<turso_parser::ast::TriggerCmd>,
         temporary: bool,
         target_database_id: Option<usize>,
     ) -> Self {
@@ -178,6 +180,33 @@ pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
+pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
+// Prefix for the hidden sequence *name* owned by an AUTOINCREMENT table.
+// This is not itself a table name. Its physical backing table is still named
+// by applying SEQ_BACKING_TABLE_PREFIX to the full sequence name.
+pub const AUTOINCREMENT_SEQ_PREFIX: &str = "__turso_internal_autoincrement_";
+
+/// Name of the hidden sequence owned by an AUTOINCREMENT table.
+pub fn autoincrement_sequence_name(table_name: &str) -> String {
+    String::from(AUTOINCREMENT_SEQ_PREFIX) + table_name
+}
+
+struct SequenceBackingTableSource {
+    sequence_name: String,
+    root_page: i64,
+    num_columns: usize,
+}
+
+struct SequenceMetadata {
+    // is_called intentionally omitted from descriptor reconstruction —
+    // the runtime watermark (including is_called) is always read from
+    // the backing-table row at nextval time, not seeded from schema.
+    start: i64,
+    increment: i64,
+    min: i64,
+    max: i64,
+    cycle: bool,
+}
 
 use crate::util::quote_identifier as quote_ident;
 
@@ -231,11 +260,11 @@ pub struct UnionDef {
 #[derive(Debug, Clone)]
 pub enum TypeDefKind {
     Custom {
-        params: Vec<ast::TypeParam>,
+        params: std::vec::Vec<ast::TypeParam>,
         base: String,
         encode: Option<Box<ast::Expr>>,
         decode: Option<Box<ast::Expr>>,
-        operators: Vec<TypeOperator>,
+        operators: std::vec::Vec<TypeOperator>,
         default: Option<Box<ast::Expr>>,
     },
     Struct(StructDef),
@@ -283,7 +312,7 @@ pub struct TypeDef {
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
     /// Empty for regular CREATE TYPE definitions.
-    pub domain_checks: Vec<ast::DomainConstraint>,
+    pub domain_checks: std::vec::Vec<ast::DomainConstraint>,
     pub kind: TypeDefKind,
 }
 
@@ -409,7 +438,7 @@ impl TypeDef {
                 not_null: false,
                 is_domain: false,
                 sql,
-                domain_checks: Vec::new(),
+                domain_checks: std::vec::Vec::new(),
                 kind: TypeDefKind::Custom {
                     params: params.clone(),
                     base: base.clone(),
@@ -427,14 +456,14 @@ impl TypeDef {
                         base_affinity: Affinity::affinity(&f.field_type.name),
                         type_name: f.field_type.name.clone(),
                     })
-                    .collect();
+                    .try_collect()?;
                 Self {
                     name: type_name.to_string(),
                     is_builtin,
                     not_null: false,
                     is_domain: false,
                     sql,
-                    domain_checks: Vec::new(),
+                    domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
                         fields: struct_fields,
                     }),
@@ -456,20 +485,18 @@ impl TypeDef {
                         base_affinity: Affinity::affinity(&f.field_type.name),
                         type_name: f.field_type.name.clone(),
                     })
-                    .collect();
+                    .try_collect()?;
                 Self {
                     name: type_name.to_string(),
                     is_builtin,
                     not_null: false,
                     is_domain: false,
                     sql,
-                    domain_checks: Vec::new(),
+                    domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
-                        tag_names: variants
-                            .iter()
-                            .map(|v| v.tag_name.clone())
-                            .collect::<Vec<_>>()
-                            .into(),
+                        // Arc<[T]> is a shared-pointer boundary: collect directly,
+                        // skipping the intermediate allocator Vec.
+                        tag_names: variants.iter().map(|v| v.tag_name.clone()).collect(),
                         variants,
                     }),
                 }
@@ -495,11 +522,11 @@ impl TypeDef {
             sql,
             domain_checks: constraints.to_vec(),
             kind: TypeDefKind::Custom {
-                params: Vec::new(),
+                params: std::vec::Vec::new(),
                 base: base_type.to_string(),
                 encode: None,
                 decode: None,
-                operators: Vec::new(),
+                operators: std::vec::Vec::new(),
                 default,
             },
         }
@@ -550,6 +577,17 @@ pub enum MakeFromBtreePhase {
     Rewinding,
     FetchingRecord,
     Advancing,
+    /// After the sqlite_schema scan completes we walk each sequence's
+    /// backing table to reconstruct its descriptor (start / inc / min /
+    /// max / cycle). These two phases drive that scan via the
+    /// `sequence_cursor` field on the state, yielding `IOResult::IO` on
+    /// each cursor I/O — the previous implementation called the
+    /// synchronous `populate_sequences(pager)` helper at the EOF of
+    /// `FetchingRecord`, which blocked the pager inside an async state
+    /// machine (and inside whatever vdbe-level state machine was
+    /// driving the schema reparse).
+    PopulatingSequencesRewind,
+    PopulatingSequencesFetch,
     Done,
 }
 
@@ -559,6 +597,12 @@ pub struct MakeFromBtreeState {
     cursor: Option<BTreeCursor>,
     accumulators: Option<MakeFromBtreeAccumulators>,
     read_tx_active: bool,
+    /// Backing tables left to walk during the
+    /// `PopulatingSequencesRewind`/`PopulatingSequencesFetch` phases.
+    sequence_sources: Vec<SequenceBackingTableSource>,
+    /// Cursor for the source currently being scanned (the back of
+    /// `sequence_sources` is popped onto this when entering Rewind).
+    sequence_cursor: Option<BTreeCursor>,
 }
 
 impl Default for MakeFromBtreeState {
@@ -574,6 +618,8 @@ impl MakeFromBtreeState {
             cursor: None,
             accumulators: None,
             read_tx_active: false,
+            sequence_sources: vec![],
+            sequence_cursor: None,
         }
     }
 
@@ -610,6 +656,101 @@ pub fn allow_user_dml(table_name: &str) -> bool {
         || table_name.starts_with(TURSO_INTERNAL_PREFIX)) // internal name wouldn't be uppercase
 }
 
+// Sequence persistence design
+// ===========================
+//
+// Every sequence — user-created (CREATE SEQUENCE) and implicit
+// (AUTOINCREMENT) — is backed by a B-tree table
+// `__turso_internal_seq_<name>` with schema (value INTEGER PRIMARY KEY,
+// is_called, start, inc, min, max, cycle). The runtime watermark IS the
+// disk state: there is no in-memory counter. Every nextval/setval reads
+// the current watermark row inside the executing transaction, computes
+// the new value, and writes it back — nextval INSERTs a new row;
+// setval DELETEs every row then INSERTs one at the requested value.
+//
+// At commit time the backing table is compacted to one row at MAX(value)
+// for ascending sequences or MIN(value) for descending. AUTOINCREMENT
+// sequences additionally mirror their watermark into `sqlite_sequence` so
+// the high-water mark is readable by SQLite-compatible tools.
+//
+// Rollback semantics fall out of bundling the backing-table writes with
+// the user's transaction:
+//   * Commit → the sequence advance is on disk.
+//   * Rollback → the sequence advance is not on disk.
+// A value emitted only by rolled-back transactions may be re-emitted by a
+// later nextval — there is no allocator state retained outside the
+// committed row. This matches SQLite AUTOINCREMENT's behavior and does
+// not match PostgreSQL's "permanently burned" semantics; consumers
+// needing globally unique ids should pair nextval with an INSERT in the
+// same transaction.
+//
+// Cross-process correctness comes for free from the disk-only model:
+// under WAL the write lock serializes processes so the next holder
+// observes the latest committed watermark.
+/// Schema descriptor for a sequence. Pure data — the runtime state lives
+/// in the backing table `__turso_internal_seq_<name>` and is read from
+/// disk by `Insn::SequenceComputeNext` + surrounding cursor bytecode on
+/// every nextval/setval call. See `core/translate/sequence.rs` and the
+/// disk-only design notes above.
+///
+/// `Clone` is implemented so `Arc::make_mut` can in-place edit the `name`
+/// field during `ALTER TABLE … RENAME TO …` on an AUTOINCREMENT table —
+/// keeping the sequence's identity in sync with the parent table's new
+/// name without forcing a schema reparse.
+#[derive(Debug, Clone)]
+pub struct Sequence {
+    pub name: String,
+    pub start_value: i64,
+    pub increment_by: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+}
+
+impl Sequence {
+    pub fn new(
+        name: String,
+        start: Option<i64>,
+        increment: Option<i64>,
+        min_value: Option<i64>,
+        max_value: Option<i64>,
+        cycle: bool,
+    ) -> crate::Result<Self> {
+        let increment_by = increment.unwrap_or(1);
+        if increment_by == 0 {
+            return Err(crate::LimboError::ParseError(
+                "INCREMENT must not be zero".to_string(),
+            ));
+        }
+        let min_val = min_value.unwrap_or(if increment_by > 0 { 1 } else { i64::MIN });
+        let max_val = max_value.unwrap_or(if increment_by > 0 { i64::MAX } else { -1 });
+        if min_val >= max_val {
+            return Err(crate::LimboError::ParseError(format!(
+                "MINVALUE ({min_val}) must be less than MAXVALUE ({max_val})"
+            )));
+        }
+        let start_val = start.unwrap_or(if increment_by > 0 { min_val } else { max_val });
+        if start_val < min_val {
+            return Err(crate::LimboError::ParseError(format!(
+                "START value ({start_val}) cannot be less than MINVALUE ({min_val})"
+            )));
+        }
+        if start_val > max_val {
+            return Err(crate::LimboError::ParseError(format!(
+                "START value ({start_val}) cannot be greater than MAXVALUE ({max_val})"
+            )));
+        }
+        Ok(Self {
+            name,
+            start_value: start_val,
+            increment_by,
+            min_value: min_val,
+            max_value: max_val,
+            cycle,
+        })
+    }
+}
+
 /// Type of schema object for conflict checking
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaObjectType {
@@ -621,6 +762,8 @@ pub enum SchemaObjectType {
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
+    #[cfg(feature = "conn_raw_api")]
+    pub(crate) table_names_by_root_page: HashMap<i64, String>,
 
     /// Track which tables are actually materialized views
     pub materialized_view_names: HashSet<String>,
@@ -647,6 +790,12 @@ pub struct Schema {
     /// Track views that exist but have incompatible versions
     pub incompatible_views: HashSet<String>,
 
+    /// View rows in sqlite_schema whose stored SQL failed to parse (e.g.
+    /// older versions wrote view column lists without identifier quoting).
+    /// The rows are tolerated at load time so the database stays usable;
+    /// tracking the names lets DROP VIEW remove them.
+    pub broken_views: HashSet<String>,
+
     /// Root pages of tables/indexes that have been dropped but not yet checkpointed.
     /// In MVCC mode, when a table is dropped, the btree pages are not freed until checkpoint.
     /// integrity_check needs to know about these pages to avoid false positives about "page never used".
@@ -656,6 +805,8 @@ pub struct Schema {
     pub type_registry: HashMap<String, Arc<TypeDef>>,
 
     pub generated_columns_enabled: bool,
+    /// Named sequences (CREATE SEQUENCE)
+    pub sequences: HashMap<String, Arc<Sequence>>,
 }
 
 impl Default for Schema {
@@ -678,8 +829,16 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
         "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
         "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
-        "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE time(value) END DECODE value OPERATOR '<'",
-        "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE datetime(value) END DECODE value OPERATOR '<'",
+        // ENCODE preserves sub-second precision through strftime + a rtrim pair
+        // that strips trailing zeros and the dangling dot, matching PostgreSQL's
+        // text format: whole seconds render as `HH:MM:SS` (no .000), trailing
+        // zeros are dropped (`.500` -> `.5`), and the dot is removed when no
+        // fractional digits remain. `time(...)` / `datetime(...)` would truncate
+        // the fraction outright, silently dropping precision on insert.
+        // Caveat: Turso's `%f` directive is millisecond resolution, so PG's
+        // microsecond inputs are clamped to 3 digits (`.123456` -> `.123`).
+        "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
+        "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
         "CREATE TYPE smallint(value integer) BASE integer ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END DECODE value OPERATOR '<'",
         "CREATE TYPE bigint(value integer) BASE integer",
         "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
@@ -740,6 +899,8 @@ impl Schema {
 
     pub fn with_options(enable_custom_types: bool) -> crate::Result<Self> {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
+        #[cfg(feature = "conn_raw_api")]
+        let mut table_names_by_root_page = HashMap::default();
         let has_indexes = HashSet::default();
         let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
         #[allow(clippy::arc_with_non_send_sync)]
@@ -747,12 +908,8 @@ impl Schema {
             SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table().into())),
         );
-        for function in VirtualTable::builtin_functions(enable_custom_types) {
-            tables.insert(
-                function.name.to_owned(),
-                Arc::new(Table::Virtual(Arc::new((*function).clone()))),
-            );
-        }
+        #[cfg(feature = "conn_raw_api")]
+        table_names_by_root_page.insert(1, SCHEMA_TABLE_NAME.to_string());
         let materialized_view_names = HashSet::default();
         let materialized_view_sql = HashMap::default();
         let incremental_views = HashMap::default();
@@ -764,8 +921,10 @@ impl Schema {
         if enable_custom_types {
             bootstrap_builtin_types(&mut type_registry)?;
         }
-        Ok(Self {
+        let mut schema = Self {
             tables,
+            #[cfg(feature = "conn_raw_api")]
+            table_names_by_root_page,
             materialized_view_names,
             materialized_view_sql,
             incremental_views,
@@ -777,10 +936,35 @@ impl Schema {
             analyze_stats: AnalyzeStats::default(),
             table_to_materialized_views,
             incompatible_views,
+            broken_views: HashSet::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
             generated_columns_enabled: false,
-        })
+            sequences: HashMap::default(),
+        };
+        crate::dialect::sqlite::register_builtin_catalog(&mut schema, enable_custom_types)?;
+        Ok(schema)
+    }
+
+    /// Add an `InternalVirtualTable` to the schema's catalog. The wrapped
+    /// table appears under the name returned by its `name()` method and is
+    /// queryable like any other table. Returns the name actually inserted.
+    ///
+    /// Intended for callers that want to surface state as a queryable table
+    /// without going through `CREATE VIRTUAL TABLE` — for example, extensions
+    /// that contribute metadata tables or alternative-dialect catalogs.
+    pub fn register_internal_vtab<T>(&mut self, table: T) -> crate::Result<String>
+    where
+        T: crate::vtab::InternalVirtualTable + 'static,
+    {
+        let vtab = crate::vtab::VirtualTable::wrap_internal_table(table)?;
+        let name = vtab.name.clone();
+        let lookup_name = normalize_ident(&name);
+        self.tables.insert(
+            lookup_name,
+            Arc::new(Table::Virtual(Arc::new((*vtab).clone()))),
+        );
+        Ok(name)
     }
 
     /// Look up a custom type definition by name.
@@ -837,7 +1021,7 @@ impl Schema {
         &self,
         type_name: &str,
     ) -> crate::Result<(String, Vec<Arc<TypeDef>>)> {
-        let mut chain = Vec::new();
+        let mut chain = vec![];
         let mut visited = std::collections::HashSet::new();
         let mut current = type_name.to_lowercase();
 
@@ -849,7 +1033,7 @@ impl Schema {
             }
             match self.type_registry.get(&current) {
                 Some(td) => {
-                    chain.push(Arc::clone(td));
+                    chain.try_push(Arc::clone(td))?;
                     current = td.base().to_lowercase();
                 }
                 None => {
@@ -911,14 +1095,14 @@ impl Schema {
         for sql in type_sqls {
             self.add_type_from_sql(sql)?;
         }
-        self.resolve_all_custom_type_affinities();
+        self.resolve_all_custom_type_affinities()?;
         Ok(())
     }
 
     /// Resolve custom type affinities for all STRICT tables in the schema.
     /// Call this after loading user-defined types from __turso_internal_types
     /// so that columns declared with custom types use the BASE type's affinity.
-    pub fn resolve_all_custom_type_affinities(&mut self) {
+    pub fn resolve_all_custom_type_affinities(&mut self) -> Result<()> {
         let mut tables: SmallVec<[(String, Arc<Table>); 8]> = SmallVec::with_capacity(8);
         for (name, table) in self.tables.iter().filter(|(_, t)| {
             t.is_strict()
@@ -931,12 +1115,13 @@ impl Schema {
             let bt = table.btree().expect("checked btree table");
             let mut modified = (*bt).clone();
             modified.resolve_custom_type_affinities(self);
-            modified.propagate_domain_constraints(self);
+            modified.propagate_domain_constraints(self)?;
             tables.push((name.clone(), Arc::new(Table::BTree(Arc::new(modified)))));
         }
         for (name, table) in tables {
             self.tables.insert(name, table);
         }
+        Ok(())
     }
 
     pub fn is_unique_idx_name(&self, name: &str) -> bool {
@@ -950,6 +1135,8 @@ impl Schema {
         let name = normalize_ident(view.name());
 
         // Add to tables (so it appears as a regular table)
+        #[cfg(feature = "conn_raw_api")]
+        self.register_table_root_page(&name, table.as_ref());
         self.tables.insert(name.clone(), table);
 
         // Track that this is a materialized view
@@ -1005,11 +1192,11 @@ impl Schema {
             Ok(())
         } else if self.materialized_view_names.contains(&name) {
             // Remove from tables
-            self.tables.remove(&name);
+            self.remove_table(&name);
 
             // Remove DBSP state table and its indexes from in-memory schema
             let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}");
-            self.tables.remove(&dbsp_table_name);
+            self.remove_table(&dbsp_table_name);
             self.remove_indices_for_table(&dbsp_table_name);
 
             // Remove from materialized view tracking
@@ -1037,20 +1224,20 @@ impl Schema {
 
         self.table_to_materialized_views
             .entry(table_name)
-            .or_default()
+            .or_insert_with(|| vec![])
             .push(view_name);
     }
 
     /// Get all materialized views that depend on a given table
     pub fn get_dependent_materialized_views(&self, table_name: &str) -> Vec<String> {
         if self.table_to_materialized_views.is_empty() {
-            return Vec::new();
+            return vec![];
         }
         let table_name = normalize_ident(table_name);
         self.table_to_materialized_views
             .get(&table_name)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_else(|| vec![])
     }
 
     /// Add a regular (non-materialized) view
@@ -1170,6 +1357,9 @@ impl Schema {
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
         self.check_object_name_conflict(&table.name)?;
         let name = normalize_ident(&table.name);
+        #[cfg(feature = "conn_raw_api")]
+        self.table_names_by_root_page
+            .insert(table.root_page, name.clone());
         self.tables.insert(name, Table::BTree(table).into());
         Ok(())
     }
@@ -1186,15 +1376,46 @@ impl Schema {
         self.tables.get(&name).cloned()
     }
 
+    #[cfg(feature = "conn_raw_api")]
+    pub fn table_name_for_root_page(&self, root_page: i64) -> Option<&str> {
+        self.table_names_by_root_page
+            .get(&root_page)
+            .map(String::as_str)
+    }
+
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
-        self.tables.remove(&name);
+        #[cfg(feature = "conn_raw_api")]
+        {
+            if let Some(table) = self.tables.remove(&name) {
+                self.unregister_table_root_page(&table);
+            }
+        }
+        #[cfg(not(feature = "conn_raw_api"))]
+        {
+            self.tables.remove(&name);
+        }
         self.analyze_stats.remove_table(&name);
 
         // If this was a materialized view, also clean up the metadata
         if self.materialized_view_names.remove(&name) {
             self.incremental_views.remove(&name);
             self.materialized_view_sql.remove(&name);
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn register_table_root_page(&mut self, name: &str, table: &Table) {
+        if let Table::BTree(table) = table {
+            self.table_names_by_root_page
+                .insert(table.root_page, normalize_ident(name));
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn unregister_table_root_page(&mut self, table: &Table) {
+        if let Table::BTree(table) = table {
+            self.table_names_by_root_page.remove(&table.root_page);
         }
     }
 
@@ -1337,7 +1558,7 @@ impl Schema {
                     state.read_tx_active = true;
 
                     state.accumulators = Some(MakeFromBtreeAccumulators {
-                        from_sql_indexes: Vec::with_capacity(10),
+                        from_sql_indexes: Vec::try_with_capacity_ext(10)?,
                         automatic_indices: HashMap::with_capacity_and_hasher(10, FxBuildHasher),
                         dbsp_state_roots: HashMap::default(),
                         dbsp_state_index_roots: HashMap::default(),
@@ -1364,29 +1585,19 @@ impl Schema {
                     let row = return_if_io!(cursor.record());
 
                     let Some(row) = row else {
-                        // EOF - finalize
-                        pager.end_read_tx();
-                        state.read_tx_active = false;
-
-                        let acc = state
-                            .accumulators
-                            .take()
-                            .expect("accumulators must be initialized in Init phase");
-                        self.populate_indices(
-                            syms,
-                            acc.from_sql_indexes,
-                            acc.automatic_indices,
-                            mv_cursor.is_some(),
-                        )?;
-                        self.populate_materialized_views(
-                            acc.materialized_view_info,
-                            acc.dbsp_state_roots,
-                            acc.dbsp_state_index_roots,
-                        )?;
-
+                        // EOF on the sqlite_schema scan. Hand off to the
+                        // async sequence-descriptor walk — pulled out of
+                        // the prior synchronous `populate_sequences(pager)`
+                        // call so the schema state machine can yield
+                        // `IOResult::IO` on each cursor read instead of
+                        // blocking the pager. The Rewind/Fetch phases
+                        // below pop the back of `state.sequence_sources`,
+                        // install the descriptor, drop the cursor, and
+                        // repeat until empty.
+                        state.sequence_sources = self.sequence_backing_tables();
                         state.cursor = None;
-                        state.phase = MakeFromBtreePhase::Done;
-                        return Ok(IOResult::Done(()));
+                        state.phase = MakeFromBtreePhase::PopulatingSequencesRewind;
+                        continue;
                     };
 
                     // Process the row (no IO - CPU only)
@@ -1449,6 +1660,87 @@ impl Schema {
                         .expect("cursor must be initialized in Init phase");
                     return_if_io!(cursor.next());
                     state.phase = MakeFromBtreePhase::FetchingRecord;
+                }
+
+                MakeFromBtreePhase::PopulatingSequencesRewind => {
+                    // Either no sources left → finalize, or pop the next
+                    // source and rewind its cursor.
+                    if state.sequence_sources.is_empty() {
+                        pager.end_read_tx();
+                        state.read_tx_active = false;
+
+                        let acc = state
+                            .accumulators
+                            .take()
+                            .expect("accumulators must be initialized in Init phase");
+                        self.populate_indices(
+                            syms,
+                            acc.from_sql_indexes,
+                            acc.automatic_indices,
+                            mv_cursor.is_some(),
+                        )?;
+                        self.populate_materialized_views(
+                            acc.materialized_view_info,
+                            acc.dbsp_state_roots,
+                            acc.dbsp_state_index_roots,
+                        )?;
+
+                        state.phase = MakeFromBtreePhase::Done;
+                        return Ok(IOResult::Done(()));
+                    }
+                    // Drop any cursor from a previous source before opening
+                    // the new one (Drop logic on the BTreeCursor releases
+                    // its page pins).
+                    state.sequence_cursor = None;
+                    let source = state
+                        .sequence_sources
+                        .last()
+                        .expect("non-empty checked above");
+                    // MVCC backing tables that haven't been checkpointed
+                    // yet carry the negative-root sentinel; the pager
+                    // can't read them directly. Skip — the SQL fallback
+                    // (`Connection::populate_sequences_via_sql`) will
+                    // load them via the MVCC row layer.
+                    if source.root_page <= 0 {
+                        state.sequence_sources.pop();
+                        continue;
+                    }
+                    let cursor =
+                        BTreeCursor::new_table(pager.clone(), source.root_page, source.num_columns);
+                    state.sequence_cursor = Some(cursor);
+                    let cursor = state.sequence_cursor.as_mut().expect("just set");
+                    return_if_io!(cursor.rewind());
+                    state.phase = MakeFromBtreePhase::PopulatingSequencesFetch;
+                }
+
+                MakeFromBtreePhase::PopulatingSequencesFetch => {
+                    let cursor = state
+                        .sequence_cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in PopulatingSequencesRewind");
+                    let record = return_if_io!(cursor.record());
+                    let source = state.sequence_sources.pop().expect("at least one source");
+                    let record = record.ok_or_else(|| {
+                        LimboError::Corrupt(format!(
+                            "internal sequence backing table for \"{}\" is empty; \
+                             the descriptor metadata row must always be present",
+                            source.sequence_name
+                        ))
+                    })?;
+                    let metadata = Self::read_sequence_metadata(record).ok_or_else(|| {
+                        LimboError::Corrupt(format!(
+                            "internal sequence backing table for \"{}\" descriptor \
+                             row is malformed (expected integers for \
+                             start/inc/min/max/cycle)",
+                            source.sequence_name
+                        ))
+                    })?;
+                    self.install_sequence_descriptor(&source.sequence_name, metadata)?;
+                    // Drop the cursor before transitioning back so we
+                    // release its page pins before the next source's
+                    // rewind starts.
+                    state.sequence_cursor = None;
+                    state.phase = MakeFromBtreePhase::PopulatingSequencesRewind;
                 }
 
                 MakeFromBtreePhase::Done => {
@@ -1544,6 +1836,7 @@ impl Schema {
                             index_entry,
                             unique_set.columns.len(),
                             unique_set.conflict_clause,
+                            &unique_set.collations,
                         )?))?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
@@ -1558,7 +1851,7 @@ impl Schema {
                 } else {
                     // Add composite unique index
                     let mut column_indices_and_sort_orders =
-                        Vec::with_capacity(unique_set.columns.len());
+                        Vec::try_with_capacity_ext(unique_set.columns.len())?;
                     for (col_name, sort_order) in unique_set.columns.iter() {
                         let Some((pos_in_table, _)) = table.get_column(col_name) else {
                             return Err(crate::LimboError::ParseError(format!(
@@ -1566,6 +1859,7 @@ impl Schema {
                                 col_name, table.name
                             )));
                         };
+                        // preallocated enough to no use try_push
                         column_indices_and_sort_orders.push((pos_in_table, *sort_order));
                     }
                     if let Some(index_entry) = automatic_indexes.pop() {
@@ -1574,6 +1868,7 @@ impl Schema {
                             index_entry,
                             column_indices_and_sort_orders,
                             unique_set.conflict_clause,
+                            &unique_set.collations,
                         )?))?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
@@ -1661,7 +1956,7 @@ impl Schema {
                 name: view_name.clone(),
                 root_page: main_root,
                 columns: cols,
-                primary_key_columns: Vec::new(),
+                primary_key_columns: vec![],
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -1684,6 +1979,82 @@ impl Schema {
                 self.add_materialized_view_dependency(&table_name, &view_name);
             }
         }
+        Ok(())
+    }
+
+    /// Yield (backing_table_name, sequence_name) for every backing table
+    /// currently in the schema. Shared shape for the SQL-based descriptor
+    /// loader in `Connection` so the prefix-strip lives in one place.
+    pub fn sequence_backing_table_names(&self) -> Vec<(String, String)> {
+        self.tables
+            .keys()
+            .filter_map(|name| {
+                let seq_name = name.strip_prefix(SEQ_BACKING_TABLE_PREFIX)?;
+                Some((name.clone(), seq_name.to_string()))
+            })
+            .try_collect()
+            .expect("TODO: fallible allocations")
+    }
+
+    fn sequence_backing_tables(&self) -> Vec<SequenceBackingTableSource> {
+        self.tables
+            .iter()
+            .filter_map(|(name, table)| {
+                let bt = table.btree()?;
+                let sequence_name = name.strip_prefix(SEQ_BACKING_TABLE_PREFIX)?.to_string();
+                Some(SequenceBackingTableSource {
+                    sequence_name,
+                    root_page: bt.root_page,
+                    num_columns: bt.columns().len(),
+                })
+            })
+            .try_collect()
+            .expect("TODO: fallible allocations")
+    }
+
+    fn read_sequence_metadata(record: &ImmutableRecord) -> Option<SequenceMetadata> {
+        let mut values = [0i64; 6];
+        for (i, value) in values.iter_mut().enumerate() {
+            match record.get_value(i + 1) {
+                Ok(ValueRef::Numeric(crate::numeric::Numeric::Integer(v))) => {
+                    *value = v;
+                }
+                _ => return None,
+            }
+        }
+        let [_is_called, start, increment, min, max, cycle] = values;
+        Some(SequenceMetadata {
+            start,
+            increment,
+            min,
+            max,
+            cycle: cycle != 0,
+        })
+    }
+
+    fn install_sequence_descriptor(
+        &mut self,
+        sequence_name: &str,
+        metadata: SequenceMetadata,
+    ) -> crate::Result<()> {
+        let seq = Sequence::new(
+            sequence_name.to_string(),
+            Some(metadata.start),
+            Some(metadata.increment),
+            Some(metadata.min),
+            Some(metadata.max),
+            metadata.cycle,
+        )
+        .map_err(|err| {
+            LimboError::Corrupt(format!(
+                "internal sequence backing table for \"{sequence_name}\" \
+                 has invalid persisted metadata \
+                 (start={}, increment={}, min={}, max={}, cycle={}): {err}",
+                metadata.start, metadata.increment, metadata.min, metadata.max, metadata.cycle,
+            ))
+        })?;
+        self.sequences
+            .insert(normalize_ident(sequence_name), std::sync::Arc::new(seq));
         Ok(())
     }
 
@@ -1740,6 +2111,14 @@ impl Schema {
                         )));
                     }
 
+                    // Detect sequence-backing tables by name prefix.
+                    // Just add the table (for B-tree access); sequences are created by
+                    // AddSequence at CREATE time or initialize_sequences at open time.
+                    if table.name.starts_with(SEQ_BACKING_TABLE_PREFIX) {
+                        self.add_btree_table(Arc::new(table))?;
+                        return Ok(());
+                    }
+
                     // Check if this is a DBSP state table
                     if table.name.starts_with(DBSP_TABLE_PREFIX) {
                         // Extract version and view name from __turso_internal_dbsp_state_v<version>_<viewname>
@@ -1773,8 +2152,32 @@ impl Schema {
 
                     let mut table = table;
                     table.resolve_custom_type_affinities(self);
-                    table.propagate_domain_constraints(self);
+                    table.propagate_domain_constraints(self)?;
+                    let has_autoinc = table.has_autoincrement;
+                    let tbl_name = table.name.clone();
                     self.add_btree_table(Arc::new(table))?;
+
+                    // Create the hidden sequence object owned by this
+                    // AUTOINCREMENT table. The `__turso_internal_autoincrement_`
+                    // prefix is a sequence namespace marker, not a table name;
+                    // the physical table is the corresponding
+                    // `__turso_internal_seq_<sequence-name>` backing table.
+                    if has_autoinc {
+                        let seq_name = autoincrement_sequence_name(&tbl_name);
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            self.sequences.entry(normalize_ident(&seq_name))
+                        {
+                            let seq = Sequence::new(
+                                seq_name.clone(),
+                                Some(1),
+                                Some(1),
+                                None,
+                                None,
+                                false,
+                            )?;
+                            e.insert(Arc::new(seq));
+                        }
+                    }
                 }
             }
             "index" => {
@@ -1834,7 +2237,18 @@ impl Schema {
 
                 // Parse the SQL to determine if it's a regular or materialized view
                 let mut parser = Parser::new(sql.as_bytes());
-                if let Ok(Some(Cmd::Stmt(stmt))) = parser.next_cmd() {
+                let parsed = parser.next_cmd();
+                if !matches!(&parsed, Ok(Some(Cmd::Stmt(_)))) {
+                    // Tolerate view rows whose stored SQL no longer parses
+                    // (e.g. older versions wrote view column lists without
+                    // identifier quoting). The database stays usable; the
+                    // name is tracked so DROP VIEW can remove the row.
+                    tracing::warn!(
+                        "view '{view_name}' has unparseable SQL in sqlite_schema; \
+                         it is unavailable but can be removed with DROP VIEW: {sql}"
+                    );
+                    self.broken_views.insert(view_name);
+                } else if let Ok(Some(Cmd::Stmt(stmt))) = parsed {
                     match stmt {
                         Stmt::CreateMaterializedView { .. } => {
                             // Store materialized view info for later creation
@@ -1865,7 +2279,9 @@ impl Schema {
                             let mut final_columns = view_column_schema.flat_columns();
                             for (i, indexed_col) in column_names.iter().enumerate() {
                                 if let Some(col) = final_columns.get_mut(i) {
-                                    col.name = Some(indexed_col.col_name.to_string());
+                                    // as_str: Display would render the quoted form,
+                                    // embedding literal quote characters in the name
+                                    col.name = Some(indexed_col.col_name.as_str().to_string());
                                 }
                             }
 
@@ -1926,7 +2342,11 @@ impl Schema {
                     Trigger::new(
                         trigger_name,
                         sql.to_string(),
-                        tbl_name.name.to_string(),
+                        // Store the bare (unquoted) table name. `Name::to_string()`
+                        // renders the quoted form (`"t1"`), which then fails every
+                        // schema lookup since `normalize_ident` does not strip quotes.
+                        // This must match the bucket key used in `add_trigger` below.
+                        tbl_name.name.as_str().to_string(),
                         time,
                         event,
                         for_each_row,
@@ -1954,7 +2374,7 @@ impl Schema {
             .get_btree_table(&target)
             .ok_or_else(|| fk_mismatch_err("<unknown>", &target))?;
 
-        let mut out = Vec::with_capacity(4); // arbitrary estimate
+        let mut out = Vec::try_with_capacity_ext(4)?; // arbitrary estimate
         for t in self.tables.values() {
             let Some(child) = t.btree() else {
                 continue;
@@ -1963,12 +2383,12 @@ impl Schema {
                 if !fk.parent_table.eq_ignore_ascii_case(&target) {
                     continue;
                 }
-                out.push(self.resolve_fk(
+                out.try_push(self.resolve_fk(
                     fk,
                     &child,
                     &parent_tbl,
                     /*require_unique=*/ false,
-                )?);
+                )?)?;
             }
         }
         Ok(out)
@@ -1983,12 +2403,13 @@ impl Schema {
             .get_btree_table(&child_name)
             .ok_or_else(|| fk_mismatch_err(&child_name, "<unknown>"))?;
 
-        let mut out = Vec::with_capacity(child.foreign_keys.len());
+        let mut out = Vec::try_with_capacity_ext(child.foreign_keys.len())?;
         for fk in &child.foreign_keys {
             let parent_name = normalize_ident(&fk.parent_table);
             let parent_tbl = self
                 .get_btree_table(&parent_name)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))?;
+            // Preallocated enough to not use try_push
             out.push(self.resolve_fk(fk, &child, &parent_tbl, /*require_unique=*/ true)?);
         }
         Ok(out)
@@ -2010,11 +2431,12 @@ impl Schema {
             return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
         }
 
-        let mut child_pos: Vec<usize> = Vec::with_capacity(fk.child_columns.len());
+        let mut child_pos: Vec<usize> = Vec::try_with_capacity_ext(fk.child_columns.len())?;
         for cname in fk.child_columns.iter() {
             let (i, _) = child
                 .get_column(cname)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?;
+            // Preallocated enough to not use try_push
             child_pos.push(i);
         }
 
@@ -2027,7 +2449,7 @@ impl Schema {
                 .primary_key_columns
                 .iter()
                 .map(|(col, _)| col.clone())
-                .collect()
+                .try_collect()?
         } else {
             fk.parent_columns.clone()
         };
@@ -2036,7 +2458,7 @@ impl Schema {
             return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
         }
 
-        let mut parent_pos: Vec<usize> = Vec::with_capacity(parent_cols.len());
+        let mut parent_pos: Vec<usize> = Vec::try_with_capacity_ext(parent_cols.len())?;
         for pc in parent_cols.iter() {
             let pos = parent_tbl.get_column(pc).map(|(i, _)| i).or_else(|| {
                 ROWID_STRS
@@ -2047,6 +2469,7 @@ impl Schema {
             let Some(p) = pos else {
                 return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
             };
+            // Preallocated enough to not use try_push
             parent_pos.push(p);
         }
 
@@ -2131,6 +2554,18 @@ impl Schema {
         Ok(())
     }
 
+    pub fn get_sequence(&self, name: &str) -> Option<&Arc<Sequence>> {
+        self.sequences.get(&normalize_ident(name))
+    }
+
+    /// Remove a sequence and its backing table from the in-memory schema.
+    pub fn remove_sequence(&mut self, name: &str) {
+        let normalized = normalize_ident(name);
+        self.sequences.remove(&normalized);
+        let backing_table = crate::translate::sequence::sequence_backing_table_name(&normalized);
+        self.tables.remove(&backing_table);
+    }
+
     /// Returns the type of schema object with the given name, if one exists.
     /// Checks tables, views, and indexes.
     pub fn get_object_type(&self, name: &str) -> Option<SchemaObjectType> {
@@ -2185,7 +2620,8 @@ impl Clone for Schema {
                     ))),
                 ),
             })
-            .collect();
+            .try_collect()
+            .expect("TODO: Clone is supposed to be fallible");
         let indexes = self
             .indexes
             .iter()
@@ -2193,35 +2629,46 @@ impl Clone for Schema {
                 let indexes = indexes
                     .iter()
                     .map(|index| Arc::new((**index).clone()))
-                    .collect();
-                (name.clone(), indexes)
+                    .try_collect()?;
+                Ok::<_, LimboError>((name.clone(), indexes))
             })
-            .collect();
+            .try_collect::<Result<_>>()
+            .expect("TODO: Clone is supposed to be fallible")
+            .unwrap();
         let materialized_view_names = self.materialized_view_names.clone();
         let materialized_view_sql = self.materialized_view_sql.clone();
         let incremental_views = self
             .incremental_views
             .iter()
             .map(|(name, view)| (name.clone(), view.clone()))
-            .collect();
+            .try_collect()
+            .expect("TODO: Clone is supposed to be fallible");
         let views = self
             .views
             .iter()
             .map(|(name, view)| (name.clone(), Arc::new((**view).clone())))
-            .collect();
+            .try_collect()
+            .expect("TODO: Clone is supposed to be fallible");
         let triggers = self
             .triggers
             .iter()
             .map(|(table_name, triggers)| {
-                (
+                Ok::<_, LimboError>((
                     table_name.clone(),
-                    triggers.iter().map(|t| Arc::new((**t).clone())).collect(),
-                )
+                    triggers
+                        .iter()
+                        .map(|t| Arc::new((**t).clone()))
+                        .try_collect()?,
+                ))
             })
-            .collect();
+            .try_collect::<Result<_>>()
+            .expect("TODO: Clone is supposed to be fallible")
+            .unwrap();
         let incompatible_views = self.incompatible_views.clone();
         Self {
             tables,
+            #[cfg(feature = "conn_raw_api")]
+            table_names_by_root_page: self.table_names_by_root_page.clone(),
             materialized_view_names,
             materialized_view_sql,
             incremental_views,
@@ -2233,9 +2680,11 @@ impl Clone for Schema {
             analyze_stats: self.analyze_stats.clone(),
             table_to_materialized_views: self.table_to_materialized_views.clone(),
             incompatible_views,
+            broken_views: self.broken_views.clone(),
             dropped_root_pages: self.dropped_root_pages.clone(),
             type_registry: self.type_registry.clone(),
             generated_columns_enabled: self.generated_columns_enabled,
+            sequences: self.sequences.clone(),
         }
     }
 }
@@ -2426,7 +2875,7 @@ impl Table {
         }
     }
 
-    pub fn columns(&self) -> &Vec<Column> {
+    pub fn columns(&self) -> &[Column] {
         match self {
             Self::BTree(table) => &table.columns,
             Self::Virtual(table) => &table.columns,
@@ -2488,6 +2937,10 @@ impl PartialEq for Table {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct UniqueSet {
     pub columns: Vec<(String, SortOrder)>,
+    /// Per-column collation overrides from the constraint definition,
+    /// e.g. `PRIMARY KEY(a COLLATE NOCASE)`. Parallel to `columns`; `None`
+    /// falls back to the column definition's collation.
+    pub collations: Vec<Option<CollationSeq>>,
     pub is_primary_key: bool,
     pub conflict_clause: Option<ResolveType>,
 }
@@ -2580,14 +3033,14 @@ impl GeneratedColGraph {
         }
 
         // Kahn's algorithm (topological sort) over direct_deps.
-        let mut topological_sort: Vec<usize> = Vec::with_capacity(n);
-        let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+        let mut topological_sort: Vec<usize> = Vec::try_with_capacity_ext(n)?;
+        let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).try_collect()?;
         while let Some(i) = ready.pop() {
-            topological_sort.push(i);
+            topological_sort.try_push(i)?;
             for j in direct_dependents[i].iter() {
                 in_degree[j] -= 1;
                 if in_degree[j] == 0 {
-                    ready.push(j);
+                    ready.try_push(j)?;
                 }
             }
         }
@@ -2597,7 +3050,7 @@ impl GeneratedColGraph {
             let cycle_names: Vec<&str> = (0..n)
                 .filter(|i| in_degree[*i] > 0)
                 .filter_map(|i| columns[i].name.as_deref())
-                .collect();
+                .try_collect()?;
             bail_parse_error!(
                 "circular dependency in generated columns: {}",
                 cycle_names.join(", ")
@@ -2842,13 +3295,13 @@ impl BTreeTable {
     /// - Sets the column's NOT NULL flag if any domain in the chain has NOT NULL
     /// - Adds domain CHECK constraints (with `value` rewritten to the column name)
     ///   to the table's check_constraints list
-    pub fn propagate_domain_constraints(&mut self, schema: &Schema) {
+    pub fn propagate_domain_constraints(&mut self, schema: &Schema) -> Result<()> {
         if !self.is_strict {
-            return;
+            return Ok(());
         }
         // Collect new constraints and notnull flags to avoid borrowing issues
-        let mut new_checks = Vec::new();
-        let mut notnull_cols = Vec::new();
+        let mut new_checks = vec![];
+        let mut notnull_cols = vec![];
 
         for (col_idx, col) in self.columns.iter().enumerate() {
             let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) else {
@@ -2860,7 +3313,7 @@ impl BTreeTable {
             let col_name = col.name.as_deref().unwrap_or("").to_string();
             for td in &resolved.chain {
                 if td.not_null {
-                    notnull_cols.push(col_idx);
+                    notnull_cols.try_push(col_idx)?;
                 }
                 for (i, dc) in td.domain_checks.iter().enumerate() {
                     let rewritten = rewrite_value_to_column(&dc.check, &col_name);
@@ -2868,11 +3321,11 @@ impl BTreeTable {
                         .name
                         .clone()
                         .unwrap_or_else(|| format!("{}_{}", td.name, i));
-                    new_checks.push(CheckConstraint {
+                    new_checks.try_push(CheckConstraint {
                         name: Some(name),
                         expr: *rewritten,
                         column: Some(col_name.clone()),
-                    });
+                    })?;
                 }
             }
         }
@@ -2880,7 +3333,8 @@ impl BTreeTable {
         for col_idx in notnull_cols {
             self.columns[col_idx].set_notnull(true);
         }
-        self.check_constraints.extend(new_checks);
+        self.check_constraints.try_extend(new_checks)?;
+        Ok(())
     }
 
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
@@ -3106,11 +3560,12 @@ impl BTreeTable {
         !self.has_rowid && self.primary_key_columns.len() == 1 && column.primary_key()
     }
 
-    pub fn column_collations(&self) -> Vec<CollationSeq> {
-        self.columns
+    pub fn column_collations(&self) -> Result<Vec<CollationSeq>> {
+        Ok(self
+            .columns
             .iter()
             .map(|column| column.collation())
-            .collect()
+            .try_collect()?)
     }
 
     #[inline]
@@ -3230,7 +3685,7 @@ impl BTreeTable {
     /// columns in this order guarantees that all dependencies of generated columns are computed
     /// before the columns that reference them.
     pub(crate) fn columns_topo_sort(&self) -> Result<ColumnsTopologicalSort<'_>> {
-        let topo = self.column_graph()?.topological_sort.to_vec();
+        let topo = self.column_graph()?.topological_sort.try_to_vec()?;
         Ok(ColumnsTopologicalSort {
             columns: &self.columns,
             topological_sort: topo,
@@ -3630,6 +4085,24 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
     Ok(())
 }
 
+/// Peel an optional `COLLATE` wrapper off a PRIMARY KEY / UNIQUE table
+/// constraint column, e.g. `PRIMARY KEY(a COLLATE NOCASE)`, returning the
+/// inner expression and the resolved collation.
+fn constraint_column_collation(expr: &Expr) -> Result<(&Expr, Option<CollationSeq>)> {
+    match expr {
+        Expr::Collate(inner, collation_name) => {
+            let collation_seq = CollationSeq::new(collation_name.as_str())?;
+            if collation_seq.is_custom() {
+                crate::bail_parse_error!(
+                    "custom collations are not supported in schema definitions"
+                );
+            }
+            Ok((inner.as_ref(), Some(collation_seq)))
+        }
+        _ => Ok((expr, None)),
+    }
+}
+
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
@@ -3683,8 +4156,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         has_autoincrement = true;
                     }
 
+                    let mut pk_collations = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
-                        let col_name = match column.expr.as_ref() {
+                        let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
+                        let col_name = match expr {
                             Expr::Id(id) => normalize_ident(id.as_str()),
                             Expr::Literal(Literal::String(value)) => {
                                 value.trim_matches('\'').to_owned()
@@ -3695,9 +4170,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         };
                         primary_key_columns
                             .push((col_name, column.order.unwrap_or(SortOrder::Asc)));
+                        pk_collations.push(collation);
                     }
                     unique_sets_constraints.push(UniqueSet {
                         columns: primary_key_columns.clone(),
+                        collations: pk_collations,
                         is_primary_key: true,
                         conflict_clause: *conflict_clause,
                     });
@@ -3706,9 +4183,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     conflict_clause,
                 } = &c.constraint
                 {
-                    let mut unique_columns = Vec::with_capacity(columns.len());
+                    let mut unique_columns = Vec::try_with_capacity_ext(columns.len())?;
+                    let mut unique_collations = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
-                        match column.expr.as_ref() {
+                        let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
+                        // preallocated enough to not need try_push
+                        match expr {
                             Expr::Id(id) => unique_columns.push((
                                 id.as_str().to_string(),
                                 column.order.unwrap_or(SortOrder::Asc),
@@ -3721,9 +4201,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 bail_parse_error!("unsupported unique key expression: {}", expr)
                             }
                         }
+                        unique_collations.push(collation);
                     }
                     let unique_set = UniqueSet {
                         columns: unique_columns,
+                        collations: unique_collations,
                         is_primary_key: false,
                         conflict_clause: *conflict_clause,
                     };
@@ -3737,14 +4219,14 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     let child_columns: Box<[String]> = columns
                         .iter()
                         .map(|ic| normalize_ident(ic.col_name.as_str()))
-                        .collect();
+                        .try_collect()?;
                     // derive parent columns: explicit or default to parent PK
                     let parent_table = normalize_ident(clause.tbl_name.as_str());
                     let parent_columns: Box<[String]> = clause
                         .columns
                         .iter()
                         .map(|ic| normalize_ident(ic.col_name.as_str()))
-                        .collect();
+                        .try_collect()?;
 
                     // Only check arity if parent columns were explicitly listed
                     if !parent_columns.is_empty() && child_columns.len() != parent_columns.len() {
@@ -3829,16 +4311,16 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     .map(|ast::Type { name, .. }| name)
                     .unwrap_or_default();
 
-                let ty_params: Vec<Box<Expr>> = match col_type {
+                let ty_params: std::vec::Vec<Box<Expr>> = match col_type {
                     Some(ast::Type {
                         size: Some(ast::TypeSize::MaxSize(ref expr)),
                         ..
-                    }) => vec![expr.clone()],
+                    }) => std::vec![expr.clone()],
                     Some(ast::Type {
                         size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
                         ..
-                    }) => vec![e1.clone(), e2.clone()],
-                    _ => Vec::new(),
+                    }) => std::vec![e1.clone(), e2.clone()],
+                    _ => std::vec::Vec::new(),
                 };
 
                 let mut typename_exactly_integer = false;
@@ -3900,6 +4382,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             }
                             unique_sets_columns.push(UniqueSet {
                                 columns: vec![(name.clone(), order)],
+                                collations: vec![None],
                                 is_primary_key: true,
                                 conflict_clause: *conflict_clause,
                             });
@@ -3923,12 +4406,19 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             unique = true;
                             unique_sets_columns.push(UniqueSet {
                                 columns: vec![(name.clone(), order)],
+                                collations: vec![None],
                                 is_primary_key: false,
                                 conflict_clause: *conflict,
                             });
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
-                            collation = Some(CollationSeq::new(collation_name.as_str())?);
+                            let collation_seq = CollationSeq::new(collation_name.as_str())?;
+                            if collation_seq.is_custom() {
+                                crate::bail_parse_error!(
+                                    "custom collations are not supported in schema definitions"
+                                );
+                            }
+                            collation = Some(collation_seq);
                         }
                         ast::ColumnConstraint::ForeignKey {
                             clause,
@@ -3947,8 +4437,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     .columns
                                     .iter()
                                     .map(|c| normalize_ident(c.col_name.as_str()))
-                                    .collect::<Vec<_>>()
-                                    .into_boxed_slice(),
+                                    .try_collect()?,
                                 on_delete: clause
                                     .args
                                     .iter()
@@ -4095,7 +4584,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut unique_sets = unique_sets_columns
         .into_iter()
         .chain(unique_sets_constraints)
-        .collect::<Vec<_>>();
+        .try_collect::<Vec<_>>()?;
     // Capture PK conflict clause before the rowid-alias UniqueSet is removed.
     let rowid_alias_conflict_clause = unique_sets
         .iter()
@@ -4174,7 +4663,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         check_constraints,
         rowid_alias_conflict_clause,
         has_virtual_columns: false,
-        logical_to_physical_map: Vec::new(),
+        logical_to_physical_map: vec![],
         column_dependencies: Default::default(),
     };
     table.prepare_generated_columns()?;
@@ -4288,8 +4777,8 @@ pub struct ResolvedFkRef {
     /// empty, the parent table's PRIMARY KEY columns. Always non-empty.
     pub parent_cols: Box<[String]>,
     /// Column positions in the child/parent tables (pos_in_table)
-    pub child_pos: Box<[usize]>,
-    pub parent_pos: Box<[usize]>,
+    pub child_pos: BoxedSlice<usize>,
+    pub parent_pos: BoxedSlice<usize>,
 
     /// If the parent key is rowid or a rowid-alias (single-column only)
     pub parent_uses_rowid: bool,
@@ -4350,7 +4839,7 @@ impl ResolvedFkRef {
 pub struct Column {
     pub name: Option<String>,
     pub ty_str: String,
-    pub ty_params: Vec<Box<Expr>>,
+    pub ty_params: std::vec::Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
     generated_type: GeneratedType,
     raw: u32,
@@ -4512,7 +5001,7 @@ impl Column {
         Self {
             name,
             ty_str,
-            ty_params: Vec::new(),
+            ty_params: std::vec::Vec::new(),
             default,
             generated_type,
             raw,
@@ -4718,7 +5207,13 @@ impl TryFrom<&ColumnDefinition> for Column {
                     );
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
-                    collation.replace(CollationSeq::new(collation_name.as_str())?);
+                    let collation_seq = CollationSeq::new(collation_name.as_str())?;
+                    if collation_seq.is_custom() {
+                        crate::bail_parse_error!(
+                            "custom collations are not supported in schema definitions"
+                        );
+                    }
+                    collation.replace(collation_seq);
                 }
                 ast::ColumnConstraint::Generated { expr, .. } => {
                     generated = Some(expr.clone());
@@ -4738,16 +5233,16 @@ impl TryFrom<&ColumnDefinition> for Column {
             .map(|t| t.name.to_string())
             .unwrap_or_default();
 
-        let ty_params: Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
+        let ty_params: std::vec::Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
             Some(ast::Type {
                 size: Some(ast::TypeSize::MaxSize(ref expr)),
                 ..
-            }) => vec![expr.clone()],
+            }) => std::vec![expr.clone()],
             Some(ast::Type {
                 size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
                 ..
-            }) => vec![e1.clone(), e2.clone()],
-            _ => Vec::new(),
+            }) => std::vec![e1.clone(), e2.clone()],
+            _ => std::vec::Vec::new(),
         };
 
         let hidden = ty_str.contains("HIDDEN");
@@ -4972,14 +5467,15 @@ impl Index {
         auto_index: (String, i64), // name, root_page
         column_count: usize,
         conflict_clause: Option<ResolveType>,
+        collation_overrides: &[Option<CollationSeq>],
     ) -> Result<Index> {
         let has_primary_key_index =
             table.get_rowid_alias_column().is_none() && !table.primary_key_columns.is_empty();
         assert!(has_primary_key_index);
         let (index_name, root_page) = auto_index;
 
-        let mut primary_keys = Vec::with_capacity(column_count);
-        for (col_name, order) in table.primary_key_columns.iter() {
+        let mut primary_keys = Vec::try_with_capacity_ext(column_count)?;
+        for (i, (col_name, order)) in table.primary_key_columns.iter().enumerate() {
             let Some((pos_in_table, _)) = table.get_column(col_name) else {
                 return Err(crate::LimboError::ParseError(format!(
                     "Column {} not found in table {}",
@@ -4987,11 +5483,16 @@ impl Index {
                 )));
             };
             let (_, column) = table.get_column(col_name).unwrap();
+            // preallocated enough to not need try_push
             primary_keys.push(IndexColumn {
                 name: normalize_ident(col_name),
                 order: *order,
                 pos_in_table,
-                collation: column.collation_opt(),
+                collation: collation_overrides
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .or_else(|| column.collation_opt()),
                 default: column.default.clone(),
                 expr: None,
             });
@@ -5018,11 +5519,12 @@ impl Index {
         auto_index: (String, i64), // name, root_page
         column_indices_and_sort_orders: Vec<(usize, SortOrder)>,
         conflict_clause: Option<ResolveType>,
+        collation_overrides: &[Option<CollationSeq>],
     ) -> Result<Index> {
         let (index_name, root_page) = auto_index;
 
-        let mut unique_cols = Vec::with_capacity(column_indices_and_sort_orders.len());
-        for (pos, sort_order) in &column_indices_and_sort_orders {
+        let mut unique_cols = Vec::try_with_capacity_ext(column_indices_and_sort_orders.len())?;
+        for (i, (pos, sort_order)) in column_indices_and_sort_orders.iter().enumerate() {
             let Some((pos_in_table, col)) = table
                 .columns
                 .iter()
@@ -5034,11 +5536,16 @@ impl Index {
                     table.name
                 )));
             };
+            // preallocated enough to not need try_push
             unique_cols.push(IndexColumn {
                 name: normalize_ident(col.name.as_ref().unwrap()),
                 order: *sort_order,
                 pos_in_table,
-                collation: col.collation_opt(),
+                collation: collation_overrides
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .or_else(|| col.collation_opt()),
                 default: col.default.clone(),
                 expr: None,
             });
@@ -5190,6 +5697,7 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
 
     #[test]
     pub fn test_has_rowid_true() -> Result<()> {
@@ -5568,6 +6076,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             1,
             None,
+            &[],
         )
         .unwrap();
     }
@@ -5581,6 +6090,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             2,
             None,
+            &[],
         )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
@@ -5605,6 +6115,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             1,
             None,
+            &[],
         )
         .unwrap();
     }
@@ -5641,6 +6152,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             1,
             None,
+            &[],
         );
         assert!(result.is_err());
     }
@@ -5654,6 +6166,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             vec![(1, SortOrder::Asc)],
             None,
+            &[],
         )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
@@ -5676,12 +6189,14 @@ mod tests {
                 ("sqlite_autoindex_t1_1".to_string(), 2),
                 1,
                 None,
+                &[],
             )?,
             Index::automatic_from_unique(
                 &table,
                 ("sqlite_autoindex_t1_2".to_string(), 3),
                 vec![(1, SortOrder::Asc)],
                 None,
+                &[],
             )?,
         ];
 
@@ -5719,18 +6234,21 @@ mod tests {
                 ("sqlite_autoindex_t1_1".to_string(), 2),
                 1,
                 None,
+                &[],
             )?,
             Index::automatic_from_unique(
                 &table,
                 ("sqlite_autoindex_t1_2".to_string(), 3),
                 vec![(1, SortOrder::Asc)],
                 None,
+                &[],
             )?,
             Index::automatic_from_unique(
                 &table,
                 ("sqlite_autoindex_t1_3".to_string(), 4),
                 vec![(2, SortOrder::Asc), (3, SortOrder::Asc)],
                 None,
+                &[],
             )?,
         ];
 
@@ -5770,6 +6288,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             vec![(0, SortOrder::Asc), (1, SortOrder::Asc)],
             None,
+            &[],
         )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
@@ -5794,6 +6313,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             1,
             None,
+            &[],
         )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
@@ -5816,6 +6336,7 @@ mod tests {
             ("sqlite_autoindex_t1_1".to_string(), 2),
             2,
             None,
+            &[],
         )?;
 
         assert_eq!(index.name, "sqlite_autoindex_t1_1");
@@ -5922,12 +6443,14 @@ mod tests {
                 ("sqlite_autoindex_t1_1".to_string(), 2),
                 vec![(0, SortOrder::Asc)],
                 None,
+                &[],
             )?,
             Index::automatic_from_primary_key(
                 &table,
                 ("sqlite_autoindex_t1_2".to_string(), 3),
                 1,
                 None,
+                &[],
             )?,
         ];
 
@@ -5965,7 +6488,7 @@ mod tests {
             2,
             Some("CREATE TABLE t1(a INTEGER, b AS (a*2))"),
             &SymbolTable::default(),
-            &mut Vec::new(),
+            &mut vec![],
             &mut HashMap::default(),
             &mut HashMap::default(),
             &mut HashMap::default(),
@@ -5979,13 +6502,13 @@ mod tests {
     }
 
     fn indices(mask: &ColumnMask) -> Vec<usize> {
-        let mut v: Vec<usize> = mask.iter().collect();
+        let mut v: Vec<usize> = mask.iter().try_collect().unwrap();
         v.sort_unstable();
         v
     }
 
     fn stored(bits: &ColumnMask) -> Vec<usize> {
-        let mut v: Vec<usize> = bits.iter().collect();
+        let mut v: Vec<usize> = bits.iter().try_collect().unwrap();
         v.sort_unstable();
         v
     }
@@ -6233,5 +6756,37 @@ mod tests {
         let _ = t.columns_mut();
         assert!(t.peek_column_dependencies().is_none());
         Ok(())
+    }
+
+    /// `install_sequence_descriptor` must surface an error when the
+    /// persisted metadata is invalid (e.g. min > max) rather than
+    /// silently dropping the sequence. The internal backing table is
+    /// the only persistent record of the sequence; a silent drop would
+    /// manifest later as a misleading "sequence does not exist" on the
+    /// next nextval that masks real on-disk corruption.
+    #[test]
+    fn install_sequence_descriptor_rejects_invalid_metadata_with_corruption_error() {
+        let mut schema = Schema::new();
+        let bogus = SequenceMetadata {
+            // increment of zero is universally invalid; Sequence::new
+            // rejects it with a clear error.
+            start: 0,
+            increment: 0,
+            min: 0,
+            max: 100,
+            cycle: false,
+        };
+        let result = schema.install_sequence_descriptor("broken_seq", bogus);
+        let err = result.expect_err(
+            "invalid persisted descriptor must surface as an error, not be silently dropped",
+        );
+        assert!(
+            matches!(err, LimboError::Corrupt(_)),
+            "expected Corrupt error for unreadable internal backing table, got: {err:?}",
+        );
+        assert!(
+            !schema.sequences.contains_key("broken_seq"),
+            "rejected descriptor must not land in the sequences map",
+        );
     }
 }

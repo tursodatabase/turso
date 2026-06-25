@@ -1,13 +1,13 @@
 use crate::{
     alloc::{self, TursoIteratorExt},
-    function::{AggFunc, WindowFunc},
+    function::{AccumulatorFunc, AggFunc},
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table, Type, ROWID_SENTINEL,
     },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
-        expr::{as_binary_components, get_expr_affinity},
+        expr::{as_binary_components, expr_data_type, get_expr_affinity, StorageClassMask},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
@@ -34,7 +34,7 @@ use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
 
-/// Infer the Type and type name from an expression's affinity.
+/// Infer the Type from an expression's affinity.
 ///
 /// Used for subquery result columns. SQLite derives column affinity from:
 /// - Column references: the declared column type
@@ -43,17 +43,58 @@ use super::emitter::OperationMode;
 /// - Literals: BLOB affinity (no affinity)
 ///
 /// The affinity determines comparison behavior in IN expressions, etc.
-fn infer_type_from_expr(
-    expr: &ast::Expr,
-    tables: Option<&TableReferences>,
-) -> (Type, &'static str) {
+fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> Type {
     let affinity = get_expr_affinity(expr, tables, None);
+    affinity.to_type()
+}
+
+/// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
+/// subquery, matching SQLite's `sqlite3SubqueryColumnTypes` (select.c).
+///
+/// Scanning the arms left-to-right, the affinity is the first arm's affinity,
+/// skipping leading arms that have no affinity (adopting the next arm's). If
+/// every arm has no affinity the result is BLOB (none). Otherwise the column
+/// keeps that affinity unless a later arm yields a conflicting datatype class
+/// (TEXT affinity + a numeric arm, or numeric affinity + a text arm), in which
+/// case it is downgraded to BLOB (none) so the column is compared by storage
+/// class.
+fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
+    if arms.is_empty() {
+        return Affinity::Blob;
+    }
+    let col_affinity = |arm: &SelectPlan| {
+        arm.result_columns
+            .get(i)
+            .map(|rc| get_expr_affinity(&rc.expr, Some(&arm.table_references), None))
+            .unwrap_or(Affinity::Blob)
+    };
+    let col_data_type = |arm: &SelectPlan| {
+        arm.result_columns
+            .get(i)
+            .map(|rc| expr_data_type(&rc.expr, Some(&arm.table_references)))
+            .unwrap_or(StorageClassMask::from_null())
+    };
+
+    let mut affinity = col_affinity(arms[0]);
+    let mut data_types = StorageClassMask::from_null();
+    let mut idx = 0;
+    // Skip leading arms with no affinity, adopting the next arm's affinity.
+    while matches!(affinity, Affinity::Blob) && idx + 1 < arms.len() {
+        data_types |= col_data_type(arms[idx]);
+        idx += 1;
+        affinity = col_affinity(arms[idx]);
+    }
+    if matches!(affinity, Affinity::Blob) {
+        return Affinity::Blob;
+    }
+    // `affinity` is TEXT or numeric here; accumulate the remaining arms' classes.
+    for &arm in &arms[idx + 1..] {
+        data_types |= col_data_type(arm);
+    }
     match affinity {
-        Affinity::Integer => (Type::Integer, "INTEGER"),
-        Affinity::Real => (Type::Real, "REAL"),
-        Affinity::Text => (Type::Text, "TEXT"),
-        Affinity::Numeric => (Type::Numeric, "NUMERIC"),
-        Affinity::Blob => (Type::Blob, "BLOB"),
+        Affinity::Text if data_types.has_numeric() => Affinity::Blob,
+        a if a.is_numeric() && data_types.has_text() => Affinity::Blob,
+        a => a,
     }
 }
 
@@ -1717,7 +1758,7 @@ where
         } else {
             let overflow_idx = (index - Self::INLINE_BITS) / 64;
             let bit = (index - Self::INLINE_BITS) % 64;
-            let overflow = self.overflow.get_or_insert_with(alloc::Vec::new);
+            let overflow = self.overflow.get_or_insert_with(|| alloc::vec![]);
             if overflow_idx >= overflow.len() {
                 overflow.try_reserve(overflow_idx + 1 - overflow.len())?;
                 overflow.resize(overflow_idx + 1, 0);
@@ -1824,7 +1865,7 @@ where
     pub fn union_with(&mut self, other: &Self) -> Result<(), alloc::TryReserveError> {
         self.inline |= other.inline;
         if let Some(other_ov) = &other.overflow {
-            let self_ov = self.overflow.get_or_insert_with(alloc::Vec::new);
+            let self_ov = self.overflow.get_or_insert_with(|| alloc::vec![]);
             if self_ov.len() < other_ov.len() {
                 self_ov.try_reserve(other_ov.len() - self_ov.len())?;
                 self_ov.resize(other_ov.len(), 0);
@@ -2235,11 +2276,11 @@ impl JoinedTable {
             .result_columns
             .iter()
             .map(|rc| {
-                let (col_type, type_name) =
-                    infer_type_from_expr(&rc.expr, Some(&plan.table_references));
+                let col_type = infer_type_from_expr(&rc.expr, Some(&plan.table_references));
+                let type_name = col_type.to_string();
                 Column::new(
                     rc.name(&plan.table_references).map(String::from),
-                    type_name.to_string(),
+                    type_name,
                     None,
                     None,
                     col_type,
@@ -2247,7 +2288,8 @@ impl JoinedTable {
                     ColDef::default(),
                 )
             })
-            .collect::<Vec<_>>();
+            .try_collect::<alloc::Vec<_>>()
+            .expect("TODO: fallible allocations");
 
         for (i, column) in columns.iter_mut().enumerate() {
             if super::expr::expr_is_array(
@@ -2324,6 +2366,19 @@ impl JoinedTable {
         // actually referenced. Callers that represent actual CTE references should
         // validate the count before calling this method.
 
+        // For a compound select, a column's affinity is combined across every arm
+        // (not just the leftmost one), so collect the arms to fold over.
+        let compound_arms: Option<Vec<&SelectPlan>> = match &plan {
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                let mut arms: Vec<&SelectPlan> = left.iter().map(|(p, _)| p).collect();
+                arms.push(right_most);
+                Some(arms)
+            }
+            _ => None,
+        };
+
         let mut columns = result_columns
             .iter()
             .enumerate()
@@ -2332,10 +2387,14 @@ impl JoinedTable {
                 let col_name = explicit_columns
                     .and_then(|cols| cols.get(i).cloned())
                     .or_else(|| rc.name(table_references).map(String::from));
-                let (col_type, type_name) = infer_type_from_expr(&rc.expr, Some(table_references));
+                let col_type = match &compound_arms {
+                    Some(arms) => compound_column_affinity(arms, i).to_type(),
+                    None => infer_type_from_expr(&rc.expr, Some(table_references)),
+                };
+                let type_name = col_type.to_string();
                 Column::new(
                     col_name,
-                    type_name.to_string(),
+                    type_name,
                     None,
                     None,
                     col_type,
@@ -2343,7 +2402,8 @@ impl JoinedTable {
                     ColDef::default(),
                 )
             })
-            .collect::<Vec<_>>();
+            .try_collect::<alloc::Vec<_>>()
+            .expect("TODO: fallible allocations");
 
         for (i, column) in columns.iter_mut().enumerate() {
             if super::expr::expr_is_array(&result_columns[i].expr, Some(table_references)) {
@@ -2901,6 +2961,10 @@ pub struct Aggregate {
     pub original_expr: ast::Expr,
     pub distinctness: Distinctness,
     pub filter_expr: Option<ast::Expr>,
+    /// For `percentile_cont`/`percentile_disc`: register holding the fraction
+    /// after it has been evaluated and range-checked once per invocation,
+    /// before the aggregate row loop. Populated by `InitLoop::emit`.
+    pub fraction_reg: Option<usize>,
 }
 
 impl Aggregate {
@@ -2917,6 +2981,7 @@ impl Aggregate {
             original_expr: expr.clone(),
             distinctness,
             filter_expr,
+            fraction_reg: None,
         }
     }
 
@@ -3027,26 +3092,52 @@ impl Window {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum WindowFunctionKind {
-    Agg(AggFunc),
-    Window(WindowFunc),
-}
-
+/// One window function call belonging to a `Window`.
+///
+/// Window queries are planned by wrapping the original FROM/WHERE in a
+/// subquery, pushing each window function's arguments and FILTER predicate
+/// into that subquery as new output columns, and rewriting the call to read
+/// those columns instead of the original tables. See `plan_windows` in
+/// `translate/window.rs` for the full rewrite, including worked examples.
+/// "Source subquery" below refers to that wrapper subquery.
 #[derive(Debug, Clone)]
 pub struct WindowFunction {
     /// The resolved function. Aggregate window functions and specialized window
     /// functions such as ROW_NUMBER() are supported.
-    pub func: WindowFunctionKind,
+    pub func: AccumulatorFunc,
     /// The expression from which the function was resolved. Used as the lookup
-    /// key when locating this function during window-to-subquery rewriting.
+    /// key when matching SQL occurrences back to this entry during rewriting.
     pub original_expr: Expr,
-    /// The rewritten form of `original_expr`, with arguments and the OVER clause
-    /// remapped to reference the window's input subquery. Set the first time
-    /// `rewrite_terminal_expr` matches this function. Subsequent occurrences of
-    /// the same `original_expr` reuse this cached rewrite so they end up pointing
-    /// at the same registers as the first occurrence.
-    pub rewritten_expr: Option<Expr>,
+    /// Populated the first time `rewrite_terminal_expr` matches this function.
+    /// Later occurrences of the same call reuse this cached rewrite so they
+    /// resolve to the same result register.
+    pub rewritten: Option<RewrittenWindowCall>,
+}
+
+/// The rewritten form of a window function call, populated once `WindowFunction`
+/// has been mapped onto its source subquery.
+#[derive(Debug, Clone)]
+pub struct RewrittenWindowCall {
+    /// `WindowFunction::original_expr` with its arguments, FILTER predicate, and
+    /// OVER clause rewritten to reference the source subquery.
+    pub expr: Expr,
+    /// The FILTER predicate, rewritten to reference the source subquery's
+    /// output columns. AggStep evaluates this once per input row and skips
+    /// the step when it is false. A copy of the predicate already inside
+    /// `expr.filter_over`, lifted to a bare `Expr` so AggStep doesn't have to
+    /// pattern-match it back out on every row.
+    pub filter_expr: Option<Expr>,
+}
+
+impl WindowFunction {
+    /// The expression that downstream lookups should match against: the
+    /// rewritten form once available, otherwise the original.
+    pub fn current_expr(&self) -> &Expr {
+        self.rewritten
+            .as_ref()
+            .map(|r| &r.expr)
+            .unwrap_or(&self.original_expr)
+    }
 }
 
 #[derive(Debug, Clone)]

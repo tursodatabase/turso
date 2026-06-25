@@ -52,12 +52,13 @@
 //!     └─────────────────────────────────────────┘
 //! ```
 //!
-//! When encryption is enabled, only the payload is encrypted. The log header,
-//! TX header, and TX trailer are always written in plaintext. The log header's salt and TX header
-//! fields (op_count, commit_ts, and the final chunk's payload_size) are bound to the ciphertext
-//! as AEAD additional data, so tampering with them will cause decryption to fail.
-//! The CRC in the trailer covers the TX header and the payload as written on disk
-//! (i.e. the ciphertext when encrypted).
+//! When encryption is enabled, the recovery payload and any extension block are
+//! encrypted together. The log header, TX header, and TX trailer are always
+//! written in plaintext. The log header's salt and TX header fields (op_count,
+//! commit_ts, and the final chunk's encrypted plaintext size) are bound to the
+//! ciphertext as AEAD additional data, so tampering with them will cause
+//! decryption to fail. The CRC in the trailer covers the TX header and the body
+//! as written on disk (i.e. the ciphertext when encrypted).
 //!
 //! ### Header fields (56 bytes, little-endian)
 //! - `magic: u32` (`LOG_MAGIC`)
@@ -68,26 +69,37 @@
 //! - `reserved: [u8; 36]` (must be zero for current format)
 //! - `hdr_crc32c: u32` (CRC32C of the header with this field zeroed)
 //!
-//! ### TX Header (`TX_HEADER_SIZE = 24`)
-//! - `frame_magic: u32` (`FRAME_MAGIC`)
+//! ### TX Header (`TX_HEADER_SIZE = 24`, `TX_EXT_HEADER_SIZE = 40`)
+//! - `frame_magic: u32` (`FRAME_MAGIC` for compact recovery frames,
+//!   `EXT_FRAME_MAGIC` when a portable extension block precedes the recovery
+//!   payload)
 //! - `payload_size: u64` (total bytes of all op entries, pre-encryption)
 //! - `op_count: u32`
 //! - `commit_ts: u64`
+//! - `extension_size: u64` (extension frames only)
+//! - `extension_record_count: u32` (extension frames only)
+//! - `frame_flags: u32` (extension frames only)
 //!
 //! ### Payload
-//! - When **unencrypted**: `op_count` operation entries serialized directly:
+//! - When **unencrypted** and no extension block is present: `op_count` operation
+//!   entries serialized directly:
 //!   - `tag: u8` (`OP_*`)
-//!   - `flags: u8` (`OP_FLAG_BTREE_RESIDENT` currently defined)
+//!   - `flags: u8` (`OP_FLAG_BTREE_RESIDENT`, `OP_FLAG_PORTABLE_EXTENSION`)
 //!   - `table_id: i32` (must be negative)
 //!   - `payload_len: sqlite varint`
 //!   - `payload: [u8; payload_len]`
-//! - When **encrypted**: payload is split into fixed-size plaintext chunks
+//!   - if `OP_FLAG_PORTABLE_EXTENSION` is set:
+//!     `extension_len: sqlite varint || extension: [u8; extension_len]`
+//! - When an extension block is present, the transaction body is:
+//!   `extension_block || recovery_payload`
+//! - When **encrypted**: extension block plus recovery payload is split into
+//!   fixed-size plaintext chunks
 //!   (`ENCRYPTED_PAYLOAD_CHUNK_SIZE`, except the final remainder chunk)
 //!   - each chunk is written as `ciphertext(chunk_plain_len + tag_size) | nonce(nonce_size)`
 //!   - AEAD additional data:
-//!     `salt(8) || payload_size_or_zero(8) || op_count(4) || commit_ts(8) || chunk_index(4)` (little-endian)
-//!     where the payload-size slot is zero for non-final chunks and carries the real payload size
-//!     only in the final chunk
+//!     `salt(8) || plaintext_size_or_zero(8) || op_count(4) || commit_ts(8) || chunk_index(4)` (little-endian)
+//!     where the plaintext-size slot is zero for non-final chunks and carries the encrypted
+//!     plaintext size only in the final chunk
 //!
 //! ### TX Trailer (`TX_TRAILER_SIZE = 8`)
 //! - `crc32c: u32` (chained CRC32C: `crc32c_append(prev_frame_crc, tx_header || payload)`;
@@ -103,6 +115,10 @@
 //!
 //! `OP_FLAG_BTREE_RESIDENT` means the row existed in the B-tree before MVCC started tracking it.
 //! Recovery preserves this bit because checkpoint/GC logic depends on it.
+//!
+//! `OP_FLAG_PORTABLE_EXTENSION` means the op has protobuf-style extension bytes immediately after
+//! its main recovery payload. Recovery may ignore those bytes, but the parser must consume them as
+//! part of the op.
 //!
 //! ## Validation behavior
 //!
@@ -167,16 +183,17 @@
 //! Each chunk encrypted with AAD (32B):
 //! ```text
 //! ┌────────┬────────────────────┬──────────┬────────────┬─────────────┐
-//! │salt (8)│payload_size_or_0(8)│op_cnt (4)│commit_ts(8)│chunk_idx (4)│
+//! │salt (8)│plaintext_size_or_0 │op_cnt (4)│commit_ts(8)│chunk_idx (4)│
 //! └────────┴────────────────────┴──────────┴────────────┴─────────────┘
 //!           ↑
-//!           └── payload_size only in final chunk; zero for all others
+//!           └── encrypted plaintext size only in final chunk; zero for all others
 //! ```
 //!
 //! ### How Plaintext Payload Is Split Into Chunks
 //!
 //! ```text
-//! Plaintext payload (serialized ops, payload_size bytes):
+//! Plaintext payload for a frame without a transaction extension
+//! (serialized ops, payload_size bytes):
 //!
 //! ┌──────┬──────┬────────────┬──────────┬──────┬────────────┬──────┬──────┬──────┬───────┐
 //! │ Op₀  │ Op₁  │    Op₂     │   Op₃    │ Op₄  │    Op₅     │ Op₆  │ Op₇  │ Op₈  │ Op₉   │
@@ -214,17 +231,20 @@
 //! Frame-level atomicity only: torn tails are discarded; partially written frames are not salvaged.
 #![allow(dead_code)]
 
-use crate::io::FileSyncType;
+use crate::io::{FileSyncType, SharedBufferData};
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::turso_assert;
 use crate::{
-    io::ReadComplete,
+    io::{CompletionGroup, ReadComplete},
+    io_yield_one,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
+    return_if_io,
     storage::sqlite3_ondisk::{
         read_varint, read_varint_partial, varint_len, write_varint_to_vec, DatabaseHeader,
     },
-    types::IndexInfo,
+    types::{IOCompletions, IOResult, IndexInfo},
+    util::IOExt as _,
     Buffer, Completion, CompletionError, LimboError, Result,
 };
 
@@ -235,12 +255,14 @@ use crate::File;
 /// Default to the size of 1000 SQLite WAL frames; disable by setting a negative value.
 pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = 4120 * 1000;
 
-/// Optional callback invoked after serialization with a zero-copy reference to
-/// the serialized frame bytes and the running CRC, before the disk write.
-pub type OnSerializationComplete<'a> = Option<&'a dyn Fn(&[u8], u32) -> crate::Result<()>>;
+/// Optional callback invoked after serialization with shared ownership of the
+/// serialized frame bytes and the running CRC, before the disk write.
+pub type OnSerializationComplete<'a> =
+    Option<&'a dyn Fn(SharedBufferData, u32) -> crate::Result<()>>;
 
 const LOG_MAGIC: u32 = 0x4C4D4C32; // "LML2" in LE
-const LOG_VERSION: u8 = 2;
+const LOG_VERSION_V2: u8 = 2;
+const LOG_VERSION: u8 = 3;
 pub const LOG_HDR_SIZE: usize = 56;
 const LOG_HDR_SALT_START: usize = 8;
 const LOG_HDR_SALT_SIZE: usize = 8;
@@ -248,6 +270,7 @@ const LOG_HDR_RESERVED_START: usize = LOG_HDR_SALT_START + LOG_HDR_SALT_SIZE; //
 const LOG_HDR_CRC_START: usize = 52;
 const LOG_HDR_RESERVED_SIZE: usize = LOG_HDR_CRC_START - LOG_HDR_RESERVED_START; // 36
 pub(crate) const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
+pub(crate) const EXT_FRAME_MAGIC: u32 = 0x5845564D; // "MVEX" in LE
 const END_MAGIC: u32 = 0x4554564D; // "MVTE" in LE
 
 // Size of each chunk before encryption (i.e. before tag/nonce overhead is added)
@@ -264,10 +287,34 @@ const OP_DELETE_INDEX: u8 = 3;
 const OP_UPDATE_HEADER: u8 = 4;
 
 const OP_FLAG_BTREE_RESIDENT: u8 = 1 << 0;
+const OP_FLAG_PORTABLE_EXTENSION: u8 = 1 << 1;
+const OP_ALLOWED_FLAGS: u8 = OP_FLAG_BTREE_RESIDENT | OP_FLAG_PORTABLE_EXTENSION;
+const OP_EXT_FIELD_DELETE_IDENTITY_RECORD: u64 = 1;
+const OP_EXT_FIELD_DELETE_PK_RECORD: u64 = 2;
+const OP_EXT_FIELD_DELETE_ROWID: u64 = 3;
 
-const TX_HEADER_SIZE: usize = 24; // FRAME_MAGIC(4) + payload_size(8) + op_count(4) + commit_ts(8)
+#[derive(Default)]
+struct DeletePortableExtension {
+    identity_record: Vec<u8>,
+    pk_record: Vec<u8>,
+}
+
+const TX_HEADER_SIZE_V2: usize = 24; // FRAME_MAGIC(4) + payload_size(8) + op_count(4) + commit_ts(8)
+const TX_HEADER_SIZE: usize = TX_HEADER_SIZE_V2;
+// LML3 extension frames keep the recovery fields first, then append portable
+// metadata. Compact frames use the 24-byte recovery header and normal
+// FRAME_MAGIC; extension frames use EXT_FRAME_MAGIC and this 40-byte header.
+pub(crate) const TX_EXT_HEADER_SIZE: usize =
+    TX_HEADER_SIZE + 8 /* extension_size */ + 4 /* extension_record_count */ + 4 /* frame_flags */;
 const TX_TRAILER_SIZE: usize = 8; // crc32c(4) + END_MAGIC(4)
+const TX_MIN_FRAME_SIZE_V2: usize = TX_HEADER_SIZE_V2 + TX_TRAILER_SIZE; // 32
 const TX_MIN_FRAME_SIZE: usize = TX_HEADER_SIZE + TX_TRAILER_SIZE; // 32
+const TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
+const EXTENSION_RECORD_HEADER_SIZE: usize = 8; // type(u16) + flags(u16) + len(u32)
+const EXTENSION_TYPE_PORTABLE_CHANGES: u16 = 1;
+
+/// Total bytes pre-reserved at the front of a `LogRecord::buf`.
+pub(crate) const LOG_RECORD_PREFIX_SIZE: usize = LOG_HDR_SIZE + TX_HEADER_SIZE;
 
 fn encrypted_payload_chunk_count(payload_size: usize, chunk_size: usize) -> usize {
     if payload_size == 0 {
@@ -371,8 +418,16 @@ pub struct LogHeader {
 
 impl LogHeader {
     pub(crate) fn new(io: &Arc<dyn crate::IO>) -> Self {
+        Self::new_with_version(io, LOG_VERSION_V2)
+    }
+
+    fn new_with_version(io: &Arc<dyn crate::IO>, version: u8) -> Self {
+        turso_assert!(
+            version == LOG_VERSION_V2 || version == LOG_VERSION,
+            "unsupported logical log header version: {version}"
+        );
         Self {
-            version: LOG_VERSION,
+            version,
             flags: 0,
             hdr_len: LOG_HDR_SIZE as u16,
             salt: io.generate_random_number() as u64,
@@ -407,7 +462,7 @@ impl LogHeader {
             return Err(LimboError::Corrupt("Invalid logical log magic".to_string()));
         }
         let version = buf[4];
-        if version != LOG_VERSION {
+        if version != LOG_VERSION && version != LOG_VERSION_V2 {
             return Err(LimboError::Corrupt(format!(
                 "Unsupported logical log version {version}"
             )));
@@ -485,7 +540,6 @@ pub struct LogicalLog {
     pub file: Arc<dyn File>,
     io: Arc<dyn crate::IO>,
     pub offset: u64,
-    write_buf: Vec<u8>,
     header: Option<LogHeader>,
     /// Running CRC state for chained checksums. Seeded from the header salt;
     /// updated after each committed frame. The next frame's CRC is computed as
@@ -499,8 +553,6 @@ pub struct LogicalLog {
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
     encrypted_payload_chunk_size: usize,
-    /// Reusable scratch buffer for ops serialization on the encrypted write path.
-    encryption_scratch_buffer: Vec<u8>,
 }
 
 impl LogicalLog {
@@ -514,13 +566,11 @@ impl LogicalLog {
             file,
             io,
             offset: 0,
-            write_buf: Vec::new(),
             header: None,
             running_crc: 0,
             pending_running_crc: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
-            encryption_scratch_buffer: Vec::new(),
         }
     }
 
@@ -555,149 +605,153 @@ impl LogicalLog {
         self.encryption_ctx.as_ref()
     }
 
-    /// Serializes a transaction into `write_buf`, optionally calls
-    /// `on_serialization_complete` with a zero-copy reference to the frame bytes.
+    /// Wraps the pre-serialized payload (`tx.buf`) with the log/TX framing
+    /// — optional log header, TX header, optional chunked encryption, CRC
+    /// trailer — and pwrites the resulting frame to disk.
     ///
     /// `advance_offset_immediately`: when true, the writer offset advances right
     /// after the pwrite (checkpoint path). When false, the offset stays behind
     /// until `advance_offset_after_success` is called (MVCC commit path).
-    fn serialize_and_pwrite_tx(
+    fn frame_and_pwrite_tx(
         &mut self,
-        tx: &LogRecord,
+        mut tx: LogRecord,
         advance_offset_immediately: bool,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
-        self.write_buf.clear();
-
-        // 1. Serialize log header if it's first write
-        let is_first_write = self.offset == 0;
-        if is_first_write {
-            if self.header.is_none() {
-                let header = LogHeader::new(&self.io);
-                self.running_crc = derive_initial_crc(header.salt);
-                self.header = Some(header);
-            }
-            let header_bytes = self.header.as_ref().unwrap().encode();
-            self.write_buf.extend_from_slice(&header_bytes);
-        }
-
-        // 2. Serialize Transaction header.
-        // A header-only transaction is encoded as a single OP_UPDATE_HEADER op.
-        // payload_size is only known after serializing all ops. We reserve TX_HEADER_SIZE bytes
-        // as a placeholder and backfill all header fields in step 4.
-        let op_count = u32::try_from(tx.row_versions.len() + usize::from(tx.header.is_some()))
-            .map_err(|_| {
-                LimboError::InternalError("Logical log op_count exceeds u32".to_string())
-            })?;
+        let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
-        let tx_header_start = self.write_buf.len();
-        self.write_buf.resize(tx_header_start + TX_HEADER_SIZE, 0);
-
-        // 3. Serialize ops into write_buf (encrypted or plaintext).
-        let payload_size = self.serialize_ops_into_write_buf(tx, op_count, commit_ts)?;
-        let payload_end = self.write_buf.len();
-
-        // 4. Backfill TX HEADER: FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
-        self.write_buf[tx_header_start..tx_header_start + 4]
-            .copy_from_slice(&FRAME_MAGIC.to_le_bytes());
-        self.write_buf[tx_header_start + 4..tx_header_start + 12]
-            .copy_from_slice(&payload_size.to_le_bytes());
-        self.write_buf[tx_header_start + 12..tx_header_start + 16]
-            .copy_from_slice(&op_count.to_le_bytes());
-        self.write_buf[tx_header_start + 16..tx_header_start + 24]
-            .copy_from_slice(&commit_ts.to_le_bytes());
-
-        // 5. TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
-        // CRC is chained: seeded from running_crc (salt-derived, or previous frame's CRC),
-        // covers TX_HEADER (24 B) + payload (encrypted or plaintext).
-        let crc = crc32c::crc32c_append(
-            self.running_crc,
-            &self.write_buf[tx_header_start..payload_end],
+        // `tx.buf` is laid out as:
+        //   [LOG_HDR slot (56B, zeros)] [TX_HEADER slot (24B, zeros)] [payload]
+        debug_assert!(
+            tx.buf.len() >= LOG_RECORD_PREFIX_SIZE,
+            "LogRecord buf missing pre-reserved framing prefix"
         );
-        self.write_buf.extend_from_slice(&crc.to_le_bytes());
-        self.write_buf.extend_from_slice(&END_MAGIC.to_le_bytes());
+        let payload_size = tx.buf.len() - LOG_RECORD_PREFIX_SIZE;
+        let payload_size_u64 = payload_size as u64;
 
-        // 6. Call observer before writing — zero-copy reference into write_buf.
-        if let Some(cb) = on_serialization_complete {
-            cb(&self.write_buf, crc)?;
+        #[cfg(feature = "conn_raw_api")]
+        let has_portable_changes = !tx.portable_changes.is_empty();
+        #[cfg(not(feature = "conn_raw_api"))]
+        let has_portable_changes = false;
+        #[cfg(feature = "conn_raw_api")]
+        let portable_changes_enabled = tx.portable_changes_enabled || has_portable_changes;
+        #[cfg(not(feature = "conn_raw_api"))]
+        let portable_changes_enabled = false;
+
+        // 1. Ensure we have a log header object (created lazily on first write).
+        // Non-portable logs remain LML2 so a deployment that does not enable
+        // portable extensions can still roll back to readers that only know LML2.
+        let is_first_write = self.offset == 0;
+        if is_first_write && self.header.is_none() {
+            let version = if portable_changes_enabled {
+                LOG_VERSION
+            } else {
+                LOG_VERSION_V2
+            };
+            let header = LogHeader::new_with_version(&self.io, version);
+            self.running_crc = derive_initial_crc(header.salt);
+            self.header = Some(header);
+        }
+        if portable_changes_enabled {
+            let header = self
+                .header
+                .as_mut()
+                .expect("log header must be set before writing");
+            if header.version == LOG_VERSION_V2 {
+                if !is_first_write {
+                    return Err(LimboError::InternalError(
+                        "portable logical changes require logical log header upgrade before append"
+                            .to_string(),
+                    ));
+                }
+                header.version = LOG_VERSION;
+            }
+        }
+        if has_portable_changes {
+            tx.buf.splice(
+                LOG_RECORD_PREFIX_SIZE..LOG_RECORD_PREFIX_SIZE,
+                [0u8; TX_EXT_HEADER_SIZE - TX_HEADER_SIZE],
+            );
         }
 
-        // 7. Hand off the populated buffer to the I/O layer without copying.
-        // `to_vec()` would allocate a second N-byte buffer and memcpy, briefly
-        // holding two full copies in memory — fatal for million-row commits.
-        // `take` swaps in a fresh empty Vec; the next call grows from zero.
-        let buffer = Arc::new(Buffer::new(std::mem::take(&mut self.write_buf)));
-        let c = Completion::new_write({
-            let buffer_len = buffer.len();
-            move |res: Result<i32, CompletionError>| {
-                let Ok(bytes_written) = res else {
-                    return;
-                };
-                turso_assert!(
-                    bytes_written == buffer_len as i32,
-                    "wrote({bytes_written}) != expected({buffer_len})"
-                );
-            }
-        });
-
-        let buffer_len = buffer.len();
-        let c = self.file.pwrite(self.offset, buffer, c)?;
-        if advance_offset_immediately {
-            self.offset += buffer_len as u64;
-            self.running_crc = crc;
+        let tx_header_size = if has_portable_changes {
+            TX_EXT_HEADER_SIZE
         } else {
-            self.pending_running_crc = Some(crc);
+            TX_HEADER_SIZE
+        };
+        let frame_payload_start = LOG_HDR_SIZE + tx_header_size;
+
+        #[cfg(feature = "conn_raw_api")]
+        let extension_block = if !has_portable_changes {
+            Vec::new()
+        } else {
+            let encryption_overhead = self
+                .encryption_ctx
+                .as_ref()
+                .map(|enc_ctx| (enc_ctx.tag_size(), enc_ctx.nonce_size()));
+            let portable_changes = encode_portable_change_payload_with_stable_end_offset(
+                PortableEndOffsetCtx {
+                    write_offset: self.offset,
+                    includes_log_header: is_first_write,
+                    tx_header_size,
+                    recovery_payload_size: payload_size,
+                    encrypted_payload_chunk_size: self.encrypted_payload_chunk_size,
+                    encryption_overhead,
+                },
+                tx.tx_timestamp,
+                &tx.portable_changes,
+            )?;
+            encode_extension_record(EXTENSION_TYPE_PORTABLE_CHANGES, 0, &portable_changes)?
+        };
+        #[cfg(not(feature = "conn_raw_api"))]
+        let extension_block = Vec::new();
+
+        let extension_size = u64::try_from(extension_block.len()).map_err(|_| {
+            LimboError::InternalError("Logical log extension size exceeds u64".to_string())
+        })?;
+        if !extension_block.is_empty() {
+            tx.buf
+                .splice(frame_payload_start..frame_payload_start, extension_block);
         }
-        Ok((c, buffer_len as u64))
-    }
+        let plaintext_size = tx.buf.len() - frame_payload_start;
+        let plaintext_size_u64 = plaintext_size as u64;
 
-    /// Serializes ops into `write_buf`, encrypting if an encryption context is set.
-    /// Returns the plaintext payload size (used in the TX header's `payload_size` field).
-    ///
-    /// Encrypted on-disk payload layout: repeated
-    /// `ciphertext(chunk_plain_len + tag_size) | nonce(nonce_size)` chunks.
-    fn serialize_ops_into_write_buf(
-        &mut self,
-        tx: &LogRecord,
-        op_count: u32,
-        commit_ts: u64,
-    ) -> Result<u64> {
+        // 2. Build the on-disk payload. Unencrypted is the zero-shift fast
+        // path: plaintext is already after the TX header. Extension frames are
+        // laid out as `extension_block || recovery_payload`, so raw-log
+        // consumers can load transaction metadata before scanning recovery ops.
+        // Encrypted frames encrypt both parts as one authenticated body.
         if let Some(enc_ctx) = &self.encryption_ctx {
-            self.encryption_scratch_buffer.clear();
-            for row_version in &tx.row_versions {
-                serialize_op_entry(&mut self.encryption_scratch_buffer, row_version)?;
-            }
-            if let Some(hdr) = tx.header {
-                serialize_header_entry(&mut self.encryption_scratch_buffer, &hdr);
-            }
-            let payload_size = self.encryption_scratch_buffer.len();
-
             let salt = self
                 .header
                 .as_ref()
                 .expect("log header must be set before writing")
                 .salt;
-            let total_on_disk_size = encrypted_payload_blob_size(
-                payload_size,
+            let on_disk_payload_size = encrypted_payload_blob_size(
+                plaintext_size,
                 self.encrypted_payload_chunk_size,
                 enc_ctx.tag_size(),
                 enc_ctx.nonce_size(),
             )?;
-            let write_buf_start = self.write_buf.len();
-            self.write_buf.reserve(total_on_disk_size);
-            let chunk_count =
-                encrypted_payload_chunk_count(payload_size, self.encrypted_payload_chunk_size);
+            let total = frame_payload_start + on_disk_payload_size + TX_TRAILER_SIZE;
+            // Move the plaintext out (`split_off` returns the tail past the
+            // framing prefix; `tx.buf` is left with just the header prefix
+            // to grow back into with encrypted chunks).
+            let plaintext = tx.buf.split_off(frame_payload_start);
+            debug_assert_eq!(plaintext.len(), plaintext_size);
+            tx.buf.reserve(total - tx.buf.len());
 
-            let payload_size = payload_size as u64;
-            for (chunk_index, plaintext_chunk) in self
-                .encryption_scratch_buffer
+            let chunk_count =
+                encrypted_payload_chunk_count(plaintext_size, self.encrypted_payload_chunk_size);
+            let payload_start = tx.buf.len();
+            for (chunk_index, plaintext_chunk) in plaintext
                 .chunks(self.encrypted_payload_chunk_size)
                 .enumerate()
             {
                 let is_last_chunk = chunk_index + 1 == chunk_count;
                 let aad = build_encrypted_chunk_aad(
                     salt,
-                    is_last_chunk.then_some(payload_size),
+                    is_last_chunk.then_some(plaintext_size_u64),
                     op_count,
                     commit_ts,
                     u32::try_from(chunk_index).map_err(|_| {
@@ -706,7 +760,6 @@ impl LogicalLog {
                         )
                     })?,
                 );
-
                 let (ciphertext, nonce) = enc_ctx.encrypt_chunk(plaintext_chunk, &aad)?;
                 // encrypt_chunk returns ciphertext with the auth tag appended, so its
                 // length must be exactly plaintext_len + tag_size. The read path relies
@@ -719,46 +772,147 @@ impl LogicalLog {
                     enc_ctx.tag_size(),
                     ciphertext.len(),
                 );
-                self.write_buf.extend_from_slice(&ciphertext);
-                self.write_buf.extend_from_slice(&nonce);
+                tx.buf.extend_from_slice(&ciphertext);
+                tx.buf.extend_from_slice(&nonce);
             }
             turso_assert!(
-                self.write_buf.len() - write_buf_start == total_on_disk_size,
-                "encrypted write_buf size mismatch"
+                tx.buf.len() - payload_start == on_disk_payload_size,
+                "encrypted on-disk payload size mismatch"
             );
-            Ok(payload_size)
-        } else {
-            let payload_start = self.write_buf.len();
-            for row_version in &tx.row_versions {
-                serialize_op_entry(&mut self.write_buf, row_version)?;
-            }
-            if let Some(header) = tx.header {
-                serialize_header_entry(&mut self.write_buf, &header);
-            }
-            Ok((self.write_buf.len() - payload_start) as u64)
+            // `plaintext` is dropped here, freeing its allocation before pwrite.
         }
+        // Unencrypted: plaintext bytes are already in place after the TX header.
+
+        // 3. Backfill TX HEADER at offset LOG_HDR_SIZE:
+        //    FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
+        // Extension frames use EXT_FRAME_MAGIC and append:
+        //    | extension_size(8) | extension_record_count(4) | frame_flags(4)
+        let tx_header_start = LOG_HDR_SIZE;
+        let frame_magic = if has_portable_changes {
+            EXT_FRAME_MAGIC
+        } else {
+            FRAME_MAGIC
+        };
+        tx.buf[tx_header_start..tx_header_start + 4].copy_from_slice(&frame_magic.to_le_bytes());
+        tx.buf[tx_header_start + 4..tx_header_start + 12]
+            .copy_from_slice(&payload_size_u64.to_le_bytes());
+        tx.buf[tx_header_start + 12..tx_header_start + 16].copy_from_slice(&op_count.to_le_bytes());
+        tx.buf[tx_header_start + 16..tx_header_start + 24]
+            .copy_from_slice(&commit_ts.to_le_bytes());
+        if has_portable_changes {
+            tx.buf[tx_header_start + 24..tx_header_start + 32]
+                .copy_from_slice(&extension_size.to_le_bytes());
+            tx.buf[tx_header_start + 32..tx_header_start + 36].copy_from_slice(&1u32.to_le_bytes());
+            tx.buf[tx_header_start + 36..tx_header_start + 40]
+                .copy_from_slice(&TX_FRAME_FLAG_HAS_EXTENSION_BLOCK.to_le_bytes());
+        }
+
+        // 4. TX TRAILER (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
+        // CRC is chained: seeded from running_crc (salt-derived, or previous
+        // frame's CRC), covers TX_HEADER (24 B) + payload (encrypted or plain).
+        // The log header is NOT part of the CRC chain — it has its own header
+        // CRC stored within its 56 bytes.
+        let payload_end = tx.buf.len();
+        let crc = crc32c::crc32c_append(self.running_crc, &tx.buf[tx_header_start..payload_end]);
+        tx.buf.extend_from_slice(&crc.to_le_bytes());
+        tx.buf.extend_from_slice(&END_MAGIC.to_le_bytes());
+
+        // 5. Fill the LOG_HDR slot (first-write only). Non-first-write
+        // commits leave it as zeros; those bytes never reach disk because
+        // the shared view exposes only `data[LOG_HDR_SIZE..]` below.
+        if is_first_write {
+            let header_bytes = self.header.as_ref().unwrap().encode();
+            tx.buf[..LOG_HDR_SIZE].copy_from_slice(&header_bytes);
+        }
+
+        // 6. Observer hook: gets shared ownership of a zero-copy view into the
+        // on-disk bytes.
+        let raw = Arc::new(tx.buf.into_boxed_slice());
+        let shared = if is_first_write {
+            SharedBufferData::new(raw)
+        } else {
+            SharedBufferData::new_view(raw, LOG_HDR_SIZE)
+        };
+        if let Some(cb) = on_serialization_complete {
+            cb(shared.clone(), crc)?;
+        }
+
+        // 7. Hand off `tx.buf` to the I/O layer without copying. For
+        // non-first-write commits, the Buffer wrapper exposes only
+        // `data[LOG_HDR_SIZE..]` so the unused 56-byte prefix never reaches
+        // disk: a single pwrite, no shift.
+        let buffer = Arc::new(Buffer::new_shared_data(shared));
+        let buffer_len = buffer.len();
+        let c = Completion::new_write(move |res: Result<i32, CompletionError>| {
+            let Ok(bytes_written) = res else {
+                return;
+            };
+            turso_assert!(
+                bytes_written == buffer_len as i32,
+                "wrote({bytes_written}) != expected({buffer_len})"
+            );
+        });
+
+        let c = self.file.pwrite(self.offset, buffer, c)?;
+        if advance_offset_immediately {
+            self.offset += buffer_len as u64;
+            self.running_crc = crc;
+        } else {
+            self.pending_running_crc = Some(crc);
+        }
+        Ok((c, buffer_len as u64))
     }
 
     /// Writes a transaction to the log and immediately advances the writer offset.
     /// Used for checkpoint-initiated writes where no two-phase commit is needed.
-    pub fn log_tx(&mut self, tx: &LogRecord) -> Result<Completion> {
-        let (c, _) = self.serialize_and_pwrite_tx(tx, true, None)?;
+    pub fn log_tx(&mut self, tx: LogRecord) -> Result<Completion> {
+        let (c, _) = self.frame_and_pwrite_tx(tx, true, None)?;
         Ok(c)
+    }
+
+    pub fn upgrade_header_for_log_tx(&mut self, tx: &LogRecord) -> Result<Option<Completion>> {
+        #[cfg(feature = "conn_raw_api")]
+        let portable_changes_enabled =
+            tx.portable_changes_enabled || !tx.portable_changes.is_empty();
+        #[cfg(not(feature = "conn_raw_api"))]
+        let portable_changes_enabled = {
+            let _ = tx;
+            false
+        };
+
+        if !portable_changes_enabled || self.offset == 0 {
+            return Ok(None);
+        }
+
+        let upgraded_header = {
+            let header = self.header.as_mut().ok_or_else(|| {
+                LimboError::InternalError(
+                    "Logical log header not initialized before portable upgrade".to_string(),
+                )
+            })?;
+            if header.version != LOG_VERSION_V2 {
+                return Ok(None);
+            }
+            header.version = LOG_VERSION;
+            header.clone()
+        };
+
+        Ok(Some(self.write_header(upgraded_header)?))
     }
 
     /// Writes a transaction to the log but does NOT advance the writer offset.
     /// Returns `(completion, bytes_written)`. The caller must call
     /// `advance_offset_after_success(bytes)` after confirming the commit succeeded.
     ///
-    /// If `on_serialization_complete` is provided, it is called with a zero-copy
-    /// reference to the serialized frame bytes and the running CRC after
-    /// serialization but before the disk write.
+    /// If `on_serialization_complete` is provided, it is called with shared
+    /// ownership of the framed bytes and the running CRC after framing but
+    /// before the disk write.
     pub fn log_tx_deferred_offset(
         &mut self,
-        tx: &LogRecord,
+        tx: LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
-        self.serialize_and_pwrite_tx(tx, false, on_serialization_complete)
+        self.frame_and_pwrite_tx(tx, false, on_serialization_complete)
     }
 
     pub fn advance_offset_after_success(&mut self, bytes: u64) {
@@ -842,22 +996,56 @@ impl LogicalLog {
         self.offset = 0;
         Ok(c)
     }
+
+    /// Reset the log to a header-only file and return one completion for the
+    /// header write plus truncate.
+    ///
+    /// This intentionally truncates to `LOG_HDR_SIZE`, not zero, so the header
+    /// write and truncate can run as a group without an ordering dependency.
+    /// Either completion order leaves a header-sized file with the fresh header
+    /// bytes at offset zero.
+    pub fn reset_to_fresh_header(&mut self) -> Result<Completion> {
+        // Regenerate salt so stale frames from before the reset cannot validate
+        // against this new CRC chain.
+        let mut header = self.current_or_new_header()?;
+        header.salt = self.io.generate_random_number() as u64;
+        self.running_crc = derive_initial_crc(header.salt);
+        self.pending_running_crc = None;
+        self.header = Some(header.clone());
+
+        let header_c = self.write_header(header)?;
+        let truncate_c = self.file.truncate(
+            LOG_HDR_SIZE as u64,
+            Completion::new_trunc(move |result| {
+                if let Err(err) = result {
+                    tracing::error!("logical_log_truncate failed: {}", err);
+                }
+            }),
+        )?;
+        self.offset = 0;
+
+        let mut group = CompletionGroup::new(|_| {});
+        group.add(&header_c);
+        group.add(&truncate_c);
+        Ok(group.build())
+    }
 }
 
 /// Serialize one op into `buffer`.
 /// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
-fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<()> {
-    let is_delete = row_version.end.is_some();
-    let tag = match (&row_version.row.id.row_id, is_delete) {
-        (RowKey::Int(_), false) => OP_UPSERT_TABLE,
-        (RowKey::Int(_), true) => OP_DELETE_TABLE,
-        (RowKey::Record(_), false) => OP_UPSERT_INDEX,
-        (RowKey::Record(_), true) => OP_DELETE_INDEX,
-    };
+pub(crate) fn serialize_op_entry(
+    buffer: &mut Vec<u8>,
+    row_version: &RowVersion,
+    portable_extension: Option<&[u8]>,
+) -> Result<()> {
+    let is_delete = row_version.end().is_some();
 
     let mut flags = 0u8;
     if row_version.btree_resident {
         flags |= OP_FLAG_BTREE_RESIDENT;
+    }
+    if portable_extension.is_some_and(|extension| !extension.is_empty()) {
+        flags |= OP_FLAG_PORTABLE_EXTENSION;
     }
 
     let table_id_i64: i64 = row_version.row.id.table_id.into();
@@ -871,15 +1059,15 @@ fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<
     );
     let table_id_i32 = table_id_i64 as i32;
 
-    buffer.push(tag);
-    buffer.push(flags);
-    buffer.extend_from_slice(&table_id_i32.to_le_bytes());
+    let write_header = |buf: &mut Vec<u8>, tag: u8| {
+        buf.push(tag);
+        buf.push(flags);
+        buf.extend_from_slice(&table_id_i32.to_le_bytes());
+    };
 
-    match tag {
-        OP_UPSERT_TABLE => {
-            let RowKey::Int(rowid) = row_version.row.id.row_id else {
-                unreachable!("table ops must have RowKey::Int")
-            };
+    match (&row_version.row.id.row_id, is_delete) {
+        (&RowKey::Int(rowid), false) => {
+            write_header(buffer, OP_UPSERT_TABLE);
             let record_bytes = row_version.row.payload();
             let rowid_u64 = rowid as u64;
             let rowid_len = varint_len(rowid_u64);
@@ -888,31 +1076,39 @@ fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<
             write_varint_to_vec(rowid_u64, buffer);
             buffer.extend_from_slice(record_bytes);
         }
-        OP_DELETE_TABLE => {
-            let RowKey::Int(rowid) = row_version.row.id.row_id else {
-                unreachable!("table ops must have RowKey::Int")
-            };
+        (&RowKey::Int(rowid), true) => {
+            write_header(buffer, OP_DELETE_TABLE);
             let rowid_u64 = rowid as u64;
             let rowid_len = varint_len(rowid_u64);
             write_varint_to_vec(rowid_len as u64, buffer);
             write_varint_to_vec(rowid_u64, buffer);
         }
-        OP_UPSERT_INDEX | OP_DELETE_INDEX => {
+        (RowKey::Record(_), is_delete) => {
+            write_header(
+                buffer,
+                if is_delete {
+                    OP_DELETE_INDEX
+                } else {
+                    OP_UPSERT_INDEX
+                },
+            );
             let key_bytes = row_version.row.payload();
             write_varint_to_vec(key_bytes.len() as u64, buffer);
             buffer.extend_from_slice(key_bytes);
         }
-        _ => {
-            return Err(LimboError::InternalError(format!(
-                "invalid logical log op tag: {tag}"
-            )));
-        }
+    }
+
+    if let Some(portable_extension) =
+        portable_extension.filter(|portable_extension| !portable_extension.is_empty())
+    {
+        write_varint_to_vec(portable_extension.len() as u64, buffer);
+        buffer.extend_from_slice(portable_extension);
     }
 
     Ok(())
 }
 
-fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
+pub(crate) fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
     // Header op uses tag-only addressing (table_id=0, flags=0) and fixed payload length.
     buffer.push(OP_UPDATE_HEADER);
     buffer.push(0);
@@ -921,9 +1117,328 @@ fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
     buffer.extend_from_slice(bytemuck::bytes_of(header));
 }
 
+fn write_proto_varint(mut value: u64, buffer: &mut Vec<u8>) {
+    while value >= 0x80 {
+        buffer.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    buffer.push(value as u8);
+}
+
+fn write_proto_key(field: u64, wire_type: u64, buffer: &mut Vec<u8>) {
+    write_proto_varint((field << 3) | wire_type, buffer);
+}
+
+fn write_proto_sint64(field: u64, value: i64, buffer: &mut Vec<u8>) {
+    let zigzag = ((value << 1) ^ (value >> 63)) as u64;
+    write_proto_key(field, 0, buffer);
+    write_proto_varint(zigzag, buffer);
+}
+
+fn write_proto_bytes(field: u64, value: &[u8], buffer: &mut Vec<u8>) {
+    write_proto_key(field, 2, buffer);
+    write_proto_varint(value.len() as u64, buffer);
+    buffer.extend_from_slice(value);
+}
+
+pub(crate) fn encode_delete_portable_extension(
+    identity_record: Option<&[u8]>,
+    pk_record: Option<&[u8]>,
+    rowid: Option<i64>,
+) -> Vec<u8> {
+    let mut extension = Vec::new();
+    if let Some(identity_record) = identity_record.filter(|record| !record.is_empty()) {
+        write_proto_bytes(
+            OP_EXT_FIELD_DELETE_IDENTITY_RECORD,
+            identity_record,
+            &mut extension,
+        );
+    }
+    if let Some(pk_record) = pk_record.filter(|record| !record.is_empty()) {
+        write_proto_bytes(OP_EXT_FIELD_DELETE_PK_RECORD, pk_record, &mut extension);
+    }
+    if let Some(rowid) = rowid {
+        write_proto_sint64(OP_EXT_FIELD_DELETE_ROWID, rowid, &mut extension);
+    }
+    extension
+}
+
+fn read_proto_varint_from_buf(bytes: &[u8], offset: &mut usize) -> Result<u64> {
+    let mut value = 0u64;
+    let mut shift = 0;
+    while *offset < bytes.len() {
+        let byte = bytes[*offset];
+        *offset += 1;
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(LimboError::Corrupt("protobuf varint overflows u64".into()));
+        }
+    }
+    Err(LimboError::Corrupt("truncated protobuf varint".into()))
+}
+
+fn skip_proto_field(bytes: &[u8], offset: &mut usize, wire_type: u64) -> Result<()> {
+    match wire_type {
+        0 => {
+            let _ = read_proto_varint_from_buf(bytes, offset)?;
+        }
+        2 => {
+            let len = read_proto_varint_from_buf(bytes, offset)?;
+            let len = usize::try_from(len)
+                .map_err(|_| LimboError::Corrupt("protobuf field length overflows usize".into()))?;
+            let end = offset
+                .checked_add(len)
+                .ok_or_else(|| LimboError::Corrupt("protobuf field length overflow".into()))?;
+            if end > bytes.len() {
+                return Err(LimboError::Corrupt(
+                    "protobuf length-delimited field exceeds extension".into(),
+                ));
+            }
+            *offset = end;
+        }
+        other => {
+            return Err(LimboError::Corrupt(format!(
+                "unsupported protobuf wire type in op extension: {other}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn read_proto_sint64_from_buf(bytes: &[u8], offset: &mut usize) -> Result<i64> {
+    let value = read_proto_varint_from_buf(bytes, offset)?;
+    Ok(((value >> 1) as i64) ^ (-((value & 1) as i64)))
+}
+
+fn decode_delete_portable_extension(extension: &[u8]) -> Result<DeletePortableExtension> {
+    let mut offset = 0usize;
+    let mut decoded = DeletePortableExtension::default();
+    while offset < extension.len() {
+        let key = read_proto_varint_from_buf(extension, &mut offset)?;
+        let field = key >> 3;
+        let wire_type = key & 7;
+        match (field, wire_type) {
+            (OP_EXT_FIELD_DELETE_IDENTITY_RECORD, 2) => {
+                let len = read_proto_varint_from_buf(extension, &mut offset)?;
+                let len = usize::try_from(len).map_err(|_| {
+                    LimboError::Corrupt("delete identity record length overflows usize".into())
+                })?;
+                let end = offset.checked_add(len).ok_or_else(|| {
+                    LimboError::Corrupt("delete identity record length overflow".into())
+                })?;
+                if end > extension.len() {
+                    return Err(LimboError::Corrupt(
+                        "delete identity record exceeds op extension".into(),
+                    ));
+                }
+                decoded.identity_record = extension[offset..end].to_vec();
+                offset = end;
+            }
+            (OP_EXT_FIELD_DELETE_PK_RECORD, 2) => {
+                let len = read_proto_varint_from_buf(extension, &mut offset)?;
+                let len = usize::try_from(len).map_err(|_| {
+                    LimboError::Corrupt("delete PK record length overflows usize".into())
+                })?;
+                let end = offset.checked_add(len).ok_or_else(|| {
+                    LimboError::Corrupt("delete PK record length overflow".into())
+                })?;
+                if end > extension.len() {
+                    return Err(LimboError::Corrupt(
+                        "delete PK record exceeds op extension".into(),
+                    ));
+                }
+                decoded.pk_record = extension[offset..end].to_vec();
+                offset = end;
+            }
+            (OP_EXT_FIELD_DELETE_ROWID, 0) => {
+                let _ = read_proto_sint64_from_buf(extension, &mut offset)?;
+            }
+            _ => skip_proto_field(extension, &mut offset, wire_type)?,
+        }
+    }
+    Ok(decoded)
+}
+
+fn proto_varint_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        len += 1;
+        value >>= 7;
+    }
+    len
+}
+
+fn encode_portable_change_payload(
+    end_offset: u64,
+    commit_ts: u64,
+    encoded_metadata: &[u8],
+) -> Vec<u8> {
+    let body_len =
+        2 + proto_varint_len(end_offset) + proto_varint_len(commit_ts) + encoded_metadata.len();
+    let mut out = Vec::with_capacity(proto_varint_len(body_len as u64) + body_len);
+    write_proto_varint(body_len as u64, &mut out);
+    // PortableLogicalTxn.end_offset, field 1, varint.
+    write_proto_varint(1 << 3, &mut out);
+    write_proto_varint(end_offset, &mut out);
+    // PortableLogicalTxn.commit_ts, field 2, varint.
+    write_proto_varint(2 << 3, &mut out);
+    write_proto_varint(commit_ts, &mut out);
+    out.extend_from_slice(encoded_metadata);
+    out
+}
+
+/// Wraps commit-built logical op messages in one length-delimited
+/// portable MVCC logical transaction payload and iterates until the embedded
+/// `end_offset` matches the final frame size.
+///
+/// `end_offset` is part of the raw-log replay cursor, but its varint width can
+/// change the payload length. The fixed-point loop converges after the varint
+/// width stops changing.
+struct PortableEndOffsetCtx {
+    write_offset: u64,
+    includes_log_header: bool,
+    tx_header_size: usize,
+    recovery_payload_size: usize,
+    encrypted_payload_chunk_size: usize,
+    encryption_overhead: Option<(usize, usize)>,
+}
+
+fn encode_portable_change_payload_with_stable_end_offset(
+    ctx: PortableEndOffsetCtx,
+    tx_timestamp: u64,
+    portable_changes: &[u8],
+) -> Result<Vec<u8>> {
+    let frame_end_offset = |portable_payload_len: usize| -> Result<u64> {
+        let extension_size = EXTENSION_RECORD_HEADER_SIZE
+            .checked_add(portable_payload_len)
+            .ok_or_else(|| {
+                LimboError::InternalError("portable logical extension size overflow".to_string())
+            })?;
+        let plaintext_size = ctx
+            .recovery_payload_size
+            .checked_add(extension_size)
+            .ok_or_else(|| {
+                LimboError::InternalError("portable logical plaintext size overflow".to_string())
+            })?;
+        let body_size = if let Some((tag_size, nonce_size)) = ctx.encryption_overhead {
+            encrypted_payload_blob_size(
+                plaintext_size,
+                ctx.encrypted_payload_chunk_size,
+                tag_size,
+                nonce_size,
+            )?
+        } else {
+            plaintext_size
+        };
+        let prefix_size = if ctx.includes_log_header {
+            LOG_HDR_SIZE
+        } else {
+            0
+        };
+        let frame_bytes = prefix_size
+            .checked_add(ctx.tx_header_size)
+            .and_then(|value| value.checked_add(body_size))
+            .and_then(|value| value.checked_add(TX_TRAILER_SIZE))
+            .ok_or_else(|| {
+                LimboError::InternalError("portable logical frame size overflow".to_string())
+            })?;
+        ctx.write_offset
+            .checked_add(frame_bytes as u64)
+            .ok_or_else(|| {
+                LimboError::InternalError("portable logical frame offset overflow".to_string())
+            })
+    };
+
+    let mut end_offset = frame_end_offset(0)?;
+    loop {
+        let payload = encode_portable_change_payload(end_offset, tx_timestamp, portable_changes);
+        let next_end_offset = frame_end_offset(payload.len())?;
+        if next_end_offset == end_offset {
+            return Ok(payload);
+        }
+        end_offset = next_end_offset;
+    }
+}
+
+fn encode_extension_record(
+    extension_type: u16,
+    extension_flags: u16,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let payload_len = u32::try_from(payload.len()).map_err(|_| {
+        LimboError::InternalError("Logical log extension record exceeds u32".to_string())
+    })?;
+    let mut record = Vec::with_capacity(EXTENSION_RECORD_HEADER_SIZE + payload.len());
+    record.extend_from_slice(&extension_type.to_le_bytes());
+    record.extend_from_slice(&extension_flags.to_le_bytes());
+    record.extend_from_slice(&payload_len.to_le_bytes());
+    record.extend_from_slice(payload);
+    Ok(record)
+}
+
+fn find_extension_payload(
+    extension_block: &[u8],
+    extension_record_count: u32,
+    wanted_type: u16,
+) -> Result<Vec<u8>> {
+    let mut offset = 0usize;
+    let mut payload = Vec::new();
+    for _ in 0..extension_record_count {
+        let Some(header_end) = offset.checked_add(EXTENSION_RECORD_HEADER_SIZE) else {
+            return Err(LimboError::Corrupt(
+                "extension record header offset overflow".to_string(),
+            ));
+        };
+        if header_end > extension_block.len() {
+            return Err(LimboError::Corrupt(
+                "extension record header is truncated".to_string(),
+            ));
+        }
+        let extension_type =
+            u16::from_le_bytes(extension_block[offset..offset + 2].try_into().unwrap());
+        let extension_flags =
+            u16::from_le_bytes(extension_block[offset + 2..offset + 4].try_into().unwrap());
+        if extension_flags != 0 {
+            return Err(LimboError::Corrupt(format!(
+                "unsupported extension flags for type {extension_type}: {extension_flags:#x}"
+            )));
+        }
+        let extension_len = u32::from_le_bytes(
+            extension_block[offset + 4..offset + EXTENSION_RECORD_HEADER_SIZE]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let payload_start = header_end;
+        let Some(payload_end) = payload_start.checked_add(extension_len) else {
+            return Err(LimboError::Corrupt(
+                "extension record payload offset overflow".to_string(),
+            ));
+        };
+        if payload_end > extension_block.len() {
+            return Err(LimboError::Corrupt(
+                "extension record payload is truncated".to_string(),
+            ));
+        }
+        if extension_type == wanted_type {
+            payload.extend_from_slice(&extension_block[payload_start..payload_end]);
+        }
+        offset = payload_end;
+    }
+    if offset != extension_block.len() {
+        return Err(LimboError::Corrupt(
+            "extension block has trailing bytes".to_string(),
+        ));
+    }
+    Ok(payload)
+}
+
 /// Parse all ops from a decrypted plaintext buffer.
 /// Validates that `plaintext.len() == payload_size` and that every byte is consumed.
-fn parse_ops_from_plaintext(
+pub(crate) fn parse_ops_from_plaintext(
     plaintext: &[u8],
     payload_size: usize,
     op_count: u32,
@@ -975,7 +1490,7 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
 
     let table_id: Option<MVTableId> = match tag {
         OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX => {
-            if flags & !OP_FLAG_BTREE_RESIDENT != 0 || table_id_i32 >= 0 {
+            if flags & !OP_ALLOWED_FLAGS != 0 || table_id_i32 >= 0 {
                 return Err(LimboError::Corrupt(
                     "Invalid op flags or non-negative table_id".into(),
                 ));
@@ -1009,6 +1524,24 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
     }
 
     let payload = &buf[fixed..total];
+    let (extension, total) = if flags & OP_FLAG_PORTABLE_EXTENSION == 0 {
+        (&[][..], total)
+    } else {
+        let Some((extension_len_u64, extension_len_bytes)) = read_varint_partial(&buf[total..])?
+        else {
+            return Ok(None);
+        };
+        let extension_len = usize::try_from(extension_len_u64)
+            .map_err(|_| LimboError::Corrupt("op extension length overflows usize".into()))?;
+        let extension_start = total + extension_len_bytes;
+        let extension_end = extension_start
+            .checked_add(extension_len)
+            .ok_or_else(|| LimboError::Corrupt("op extension length overflow".into()))?;
+        if buf.len() < extension_end {
+            return Ok(None);
+        }
+        (&buf[extension_start..extension_end], extension_end)
+    };
 
     let parsed_op = match tag {
         OP_UPSERT_TABLE => {
@@ -1032,14 +1565,25 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
             let table_id = table_id.expect("table op must have table_id");
             let (rowid_u64, rowid_len) = read_varint(payload)
                 .map_err(|_| LimboError::Corrupt("Bad rowid varint in DELETE_TABLE".into()))?;
-            if rowid_len != payload.len() {
+            if rowid_len > payload.len() {
                 return Err(LimboError::Corrupt(
                     "DELETE_TABLE payload size mismatch".into(),
                 ));
             }
+            let mut record_bytes = payload[rowid_len..].to_vec();
+            let mut pk_record_bytes = Vec::new();
+            if !extension.is_empty() {
+                let decoded = decode_delete_portable_extension(extension)?;
+                if record_bytes.is_empty() {
+                    record_bytes = decoded.identity_record;
+                }
+                pk_record_bytes = decoded.pk_record;
+            }
             let rowid = RowID::new(table_id, RowKey::Int(rowid_u64 as i64));
             ParsedOp::DeleteTable {
                 rowid,
+                record_bytes,
+                pk_record_bytes,
                 commit_ts,
                 btree_resident,
             }
@@ -1108,14 +1652,115 @@ pub enum StreamingResult {
     Eof,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortableChangeFrame {
+    pub end_offset: u64,
+    pub commit_ts: u64,
+    pub extension_record_count: u32,
+    pub payload: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum StreamingState {
     NeedTransactionStart,
 }
 
+/// Phase of the in-progress transaction frame parse. Each phase corresponds to a
+/// re-entrant unit: the header (atomic), an optional unencrypted extension block,
+/// the payload, and the trailer. See [`FrameInProgress`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FramePhase {
+    Header,
+    ExtensionBlock,
+    Payload,
+    Trailer,
+}
+
+/// Progress carried across IO yields while parsing one transaction frame.
+///
+/// The reader yields mid-frame (any `try_consume_*` can need more data). Instead
+/// of re-parsing the whole frame from its start on every re-entry (the previous
+/// model), we checkpoint at unit boundaries: when a unit (header / extension
+/// block / one op / trailer) is fully consumed *and* its bytes are folded into
+/// `running_crc`, we record progress here and advance `frame_anchor` to the
+/// consume cursor. Re-entry then rewinds only to the latest checkpoint and
+/// re-parses just the in-flight unit, so the buffer compacts as units are
+/// consumed (memory bounded by the largest single op, not the whole frame) and
+/// no unit is parsed more than its own yields require.
+///
+/// `running_crc` is the chained CRC *up to and excluding* the in-flight unit; the
+/// in-flight unit folds onto a local copy that is committed back here only at its
+/// checkpoint. `frame_start` is captured once at frame open and is the value used
+/// for `last_valid_offset` when the frame turns out to be invalid — it must never
+/// be recomputed from the (mid-frame) consume cursor.
+struct FrameInProgress {
+    frame_start: usize,
+    phase: FramePhase,
+    // Header fields (filled once the Header phase completes):
+    payload_size: usize,
+    op_count: u32,
+    commit_ts: u64,
+    extension_size: usize,
+    extension_record_count: u32,
+    frame_flags: u32,
+    // Accumulators carried across op/unit yields:
+    running_crc: u32,
+    parsed_ops: Vec<ParsedOp>,
+    portable_changes: Vec<u8>,
+    payload_bytes_read: u64,
+    op_index: u32,
+}
+
+impl FrameInProgress {
+    fn new(frame_start: usize) -> Self {
+        Self {
+            frame_start,
+            phase: FramePhase::Header,
+            payload_size: 0,
+            op_count: 0,
+            commit_ts: 0,
+            extension_size: 0,
+            extension_record_count: 0,
+            frame_flags: 0,
+            running_crc: 0,
+            parsed_ops: Vec::new(),
+            portable_changes: Vec::new(),
+            payload_bytes_read: 0,
+            op_index: 0,
+        }
+    }
+}
+
+/// Parsed transaction-header fields returned by `parse_frame_header`.
+struct FrameHeader {
+    payload_size: usize,
+    op_count: u32,
+    commit_ts: u64,
+    extension_size: usize,
+    extension_record_count: u32,
+    frame_flags: u32,
+    /// Chained CRC seeded from `self.running_crc` and folded over the header bytes.
+    running_crc: u32,
+}
+
+/// Outcome of parsing the transaction header (a re-entrant atomic unit).
+enum HeaderParseOutcome {
+    Ok(FrameHeader),
+    Eof,
+    Invalid,
+}
+
+/// Outcome of parsing a payload phase. Corruption is signalled via
+/// `Err(LimboError::Corrupt(..))` and translated to `Invalid` by the caller,
+/// mirroring the previous control flow.
+enum PayloadOutcome {
+    Ok,
+    Eof,
+}
+
 /// Result of attempting to read and validate the logical log file header.
 #[derive(Debug, Clone)]
-pub(crate) enum HeaderReadResult {
+pub enum HeaderReadResult {
     /// Header is well-formed: magic, version, flags, reserved, and CRC all valid.
     Valid(LogHeader),
     /// File is smaller than `LOG_HDR_SIZE` — no log exists (first run or truncated to zero).
@@ -1123,6 +1768,30 @@ pub(crate) enum HeaderReadResult {
     /// Header exists but is corrupt (bad magic, version, flags, CRC, non-zero reserved, or truncated).
     Invalid,
 }
+
+/// In-flight read state for [`StreamingLogicalLogReader`]. Tracks a pread
+/// that has been issued but not yet completed, so the reader's IO-returning
+/// methods can yield through their completion and resume on re-entry without
+/// re-issuing the read.
+#[derive(Debug)]
+enum InFlightRead {
+    /// A `read_more_data` chunk read whose callback appends to `self.buffer`.
+    /// `pre_size` is the buffer length at the moment the read was issued, so
+    /// `bytes_read = buffer.len() - pre_size` once the completion finishes.
+    Chunk {
+        completion: Completion,
+        pre_size: usize,
+    },
+    /// A `read_exact_at` one-shot read whose callback appends to `out`.
+    Exact {
+        completion: Completion,
+        out: Arc<RwLock<Vec<u8>>>,
+        expected_len: usize,
+    },
+}
+
+/// Plaintext + crc32 result to appease clippy for type complexity
+type ReadEncryptedResult = Option<(Vec<u8>, u32)>;
 
 pub struct StreamingLogicalLogReader {
     file: Arc<dyn File>,
@@ -1134,11 +1803,16 @@ pub struct StreamingLogicalLogReader {
     buffer: Arc<RwLock<Vec<u8>>>,
     /// Position to read from loaded buffer
     buffer_offset: usize,
+    /// Buffer index of the start of the transaction frame currently being
+    /// parsed. The reader yields mid-frame (any `try_consume_*` can need more
+    /// data), and `next_frame`/`parse_next_transaction` restart from the top on
+    /// re-entry — so on each parse entry we rewind `buffer_offset` to this
+    /// anchor and re-parse the whole frame, and the buffer is only compacted
+    /// (drained) up to this anchor, never mid-frame. Advanced to the new frame
+    /// boundary only once a frame is fully validated.
+    frame_anchor: usize,
     file_size: usize,
     state: StreamingState,
-    /// Buffer of parsed ops from the current transaction frame. `parse_next_transaction`
-    /// fills this; `next_record` drains one op at a time. Empty between transactions.
-    pending_ops: std::collections::VecDeque<ParsedOp>,
     /// Byte offset of the end of the last fully validated transaction frame. Used during
     /// recovery to set the writer offset so that torn-tail bytes are overwritten on next append.
     last_valid_offset: usize,
@@ -1149,9 +1823,19 @@ pub struct StreamingLogicalLogReader {
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
     encrypted_payload_chunk_size: usize,
+    #[cfg(test)]
+    pending_ops: std::collections::VecDeque<ParsedOp>,
     // Reused scratch buffer for decrypted chunk plaintext. Kept on the reader so encrypted
     // recovery can reuse the allocation across chunks and transaction frames.
     decrypt_scratch: Vec<u8>,
+    /// Set when a read has been issued but its completion has not yet been
+    /// observed by the calling IOResult method. Cleared on completion.
+    in_flight_read: Option<InFlightRead>,
+    /// Progress of the transaction frame currently being parsed by
+    /// `parse_next_transaction`, carried across IO yields. `None` between frames.
+    /// See [`FrameInProgress`]. (The portable-changes reader uses the
+    /// rewind-and-rebuild model and does not populate this.)
+    frame_in_progress: Option<FrameInProgress>,
 }
 
 impl StreamingLogicalLogReader {
@@ -1171,14 +1855,18 @@ impl StreamingLogicalLogReader {
             header: None,
             buffer: Arc::new(RwLock::new(Vec::with_capacity(4096))),
             buffer_offset: 0,
+            frame_anchor: 0,
             file_size,
             state: StreamingState::NeedTransactionStart,
-            pending_ops: std::collections::VecDeque::new(),
             last_valid_offset: 0,
             running_crc: 0,
             encryption_ctx,
             encrypted_payload_chunk_size,
+            #[cfg(test)]
+            pending_ops: std::collections::VecDeque::new(),
             decrypt_scratch,
+            in_flight_read: None,
+            frame_in_progress: None,
         }
     }
 
@@ -1206,10 +1894,22 @@ impl StreamingLogicalLogReader {
         self.last_valid_offset
     }
 
+    #[cfg(test)]
+    pub fn has_pending_ops(&self) -> bool {
+        !self.pending_ops.is_empty()
+    }
+
     /// Returns the running CRC state after all validated frames. Used during recovery
     /// to hand off the chain state to the writer so it can continue appending.
     pub fn running_crc(&self) -> u32 {
         self.running_crc
+    }
+
+    fn tx_min_frame_size(&self) -> usize {
+        match self.header.as_ref().map(|header| header.version) {
+            Some(LOG_VERSION_V2) => TX_MIN_FRAME_SIZE_V2,
+            _ => TX_MIN_FRAME_SIZE,
+        }
     }
 
     pub fn read_header(&mut self, io: &Arc<dyn crate::IO>) -> Result<()> {
@@ -1224,17 +1924,27 @@ impl StreamingLogicalLogReader {
         }
     }
 
+    /// Blocking shim — retained for tests and the synchronous
+    /// `MvStore::bootstrap` callers that have not yet been lifted to
+    /// IOResult. The open state machine prefers
+    /// [`StreamingLogicalLogReader::try_read_header_nonblock`] so the
+    /// MVCC log-header read on open does not block.
     pub(crate) fn try_read_header(&mut self, io: &Arc<dyn crate::IO>) -> Result<HeaderReadResult> {
+        let io = io.clone();
+        io.block(|| self.try_read_header_nonblock())
+    }
+
+    pub(crate) fn try_read_header_nonblock(&mut self) -> Result<IOResult<HeaderReadResult>> {
         self.file_size = self.file.size()? as usize;
         if self.file_size < LOG_HDR_SIZE {
-            return Ok(HeaderReadResult::NoLog);
+            return Ok(IOResult::Done(HeaderReadResult::NoLog));
         }
 
-        let header_bytes = self.read_exact_at(io, 0, LOG_HDR_SIZE)?;
+        let header_bytes = return_if_io!(self.read_exact_at(0, LOG_HDR_SIZE));
         let hdr_len = u16::from_le_bytes([header_bytes[6], header_bytes[7]]) as usize;
         if hdr_len != LOG_HDR_SIZE {
             self.set_invalid_header_state();
-            return Ok(HeaderReadResult::Invalid);
+            return Ok(IOResult::Done(HeaderReadResult::Invalid));
         }
 
         match LogHeader::decode(&header_bytes) {
@@ -1244,12 +1954,14 @@ impl StreamingLogicalLogReader {
                 self.offset = hdr_len;
                 self.buffer.write().clear();
                 self.buffer_offset = 0;
+                self.frame_anchor = 0;
+                self.frame_in_progress = None;
                 self.last_valid_offset = hdr_len;
-                Ok(HeaderReadResult::Valid(header))
+                Ok(IOResult::Done(HeaderReadResult::Valid(header)))
             }
             Err(LimboError::Corrupt(_)) => {
                 self.set_invalid_header_state();
-                Ok(HeaderReadResult::Invalid)
+                Ok(IOResult::Done(HeaderReadResult::Invalid))
             }
             Err(err) => Err(err),
         }
@@ -1260,7 +1972,18 @@ impl StreamingLogicalLogReader {
         self.offset = LOG_HDR_SIZE;
         self.buffer.write().clear();
         self.buffer_offset = 0;
+        self.frame_anchor = 0;
+        self.frame_in_progress = None;
         self.last_valid_offset = LOG_HDR_SIZE;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn next_frame_blocking(
+        &mut self,
+        io: &Arc<dyn crate::IO>,
+    ) -> Result<Option<Vec<ParsedOp>>> {
+        let io = io.clone();
+        io.block(|| self.next_frame())
     }
 
     /// Reads the next complete transaction frame.
@@ -1268,29 +1991,36 @@ impl StreamingLogicalLogReader {
     /// Recovery needs the whole frame so it can decide which schema snapshot should decode each
     /// index op. Empty parsed frames are skipped, so callers that receive Some(frame) can
     /// rely on `frame` being non-empty.
-    pub(crate) fn next_frame(&mut self, io: &Arc<dyn crate::IO>) -> Result<Option<Vec<ParsedOp>>> {
-        if !self.pending_ops.is_empty() {
-            return Err(LimboError::InternalError(
-                "next_frame cannot be mixed with next_record on the same reader".to_string(),
-            ));
-        }
-
+    pub(crate) fn next_frame(&mut self) -> Result<IOResult<Option<Vec<ParsedOp>>>> {
         loop {
             match self.state {
                 StreamingState::NeedTransactionStart => {
-                    if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
-                        return Ok(None);
+                    // EOF fast-path, only meaningful when starting a fresh frame.
+                    // When a frame is in progress we must resume it regardless of
+                    // how few bytes remain from the latest checkpoint (e.g. only
+                    // the 8-byte trailer is left), so gate the guard on
+                    // `frame_in_progress.is_none()`. Rewind to the frame anchor
+                    // first so a mid-frame `buffer_offset` does not undercount
+                    // `remaining_bytes()`. `parse_next_transaction` rewinds again
+                    // (idempotent).
+                    if self.frame_in_progress.is_none() {
+                        self.buffer_offset = self.frame_anchor;
+                        if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
+                            return Ok(IOResult::Done(None));
+                        }
                     }
 
-                    let ops = match self.parse_next_transaction(io)? {
-                        ParseResult::Ops(ops) => ops,
-                        ParseResult::Eof | ParseResult::InvalidFrame => return Ok(None),
+                    let ops = match return_if_io!(self.parse_next_transaction()) {
+                        ParseResult::Frame(frame) => frame.ops,
+                        ParseResult::Eof | ParseResult::InvalidFrame => {
+                            return Ok(IOResult::Done(None))
+                        }
                     };
 
                     if ops.is_empty() {
                         continue;
                     }
-                    return Ok(Some(ops));
+                    return Ok(IOResult::Done(Some(ops)));
                 }
             }
         }
@@ -1307,6 +2037,7 @@ impl StreamingLogicalLogReader {
         mut get_index_info: impl FnMut(MVTableId) -> Result<Arc<IndexInfo>>,
     ) -> Result<StreamingResult> {
         let mut get_index_info = |index_id, _op_kind| get_index_info(index_id);
+        self.file_size = self.file.size()? as usize;
         if let Some(op) = self.pending_ops.pop_front() {
             return self.parsed_op_to_streaming(op, &mut get_index_info);
         }
@@ -1314,12 +2045,12 @@ impl StreamingLogicalLogReader {
         loop {
             match self.state {
                 StreamingState::NeedTransactionStart => {
-                    if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
+                    if self.remaining_bytes() < self.tx_min_frame_size() {
                         return Ok(StreamingResult::Eof);
                     }
 
-                    let ops = match self.parse_next_transaction(io)? {
-                        ParseResult::Ops(ops) => ops,
+                    let ops = match io.block(|| self.parse_next_transaction())? {
+                        ParseResult::Frame(frame) => frame.ops,
                         ParseResult::Eof | ParseResult::InvalidFrame => {
                             return Ok(StreamingResult::Eof);
                         }
@@ -1335,6 +2066,42 @@ impl StreamingLogicalLogReader {
                         .expect("ops queue should not be empty");
                     return self.parsed_op_to_streaming(op, &mut get_index_info);
                 }
+            }
+        }
+    }
+
+    /// Reads the next transaction frame and returns its portable logical-change
+    /// payload. This validates the LML3 frame envelope and chained CRC while
+    /// treating the recovery payload as opaque bytes.
+    ///
+    /// Empty payloads are returned because internal-only commits still
+    /// advance the logical-log offset even though clients have no operation to
+    /// apply.
+    pub fn next_portable_change_frame(&mut self) -> Result<IOResult<Option<PortableChangeFrame>>> {
+        self.file_size = self.file.size()? as usize;
+        match return_if_io!(self.parse_next_portable_changes_frame()) {
+            ParseResult::Frame(frame) => Ok(IOResult::Done(Some(PortableChangeFrame {
+                end_offset: frame.end_offset as u64,
+                commit_ts: frame.commit_ts,
+                extension_record_count: frame.extension_record_count,
+                payload: frame.portable_changes,
+            }))),
+            ParseResult::Eof | ParseResult::InvalidFrame => Ok(IOResult::Done(None)),
+        }
+    }
+
+    /// Reads the next portable logical-change payload, skipping internal-only
+    /// frames.
+    ///
+    /// Empty payloads are valid: internal-only commits still need recovery
+    /// log frames, but they do not produce client-visible logical operations.
+    pub fn next_portable_changes(&mut self) -> Result<IOResult<Option<PortableChangeFrame>>> {
+        loop {
+            let Some(frame) = return_if_io!(self.next_portable_change_frame()) else {
+                return Ok(IOResult::Done(None));
+            };
+            if !frame.payload.is_empty() {
+                return Ok(IOResult::Done(Some(frame)));
             }
         }
     }
@@ -1402,11 +2169,10 @@ impl StreamingLogicalLogReader {
     /// given the chunk index, read the chunk off the disk and decrypt it
     fn read_and_decrypt_encrypted_chunk(
         &mut self,
-        io: &Arc<dyn crate::IO>,
         payload_ctx: &EncryptedPayloadReadContext,
         chunk_index: usize,
         running_crc: u32,
-    ) -> Result<EncryptedChunkReadResult> {
+    ) -> Result<IOResult<EncryptedChunkReadResult>> {
         // first we gotta figure out, how many bytes to read off the disk, its either
         // `self.encrypted_payload_chunk_size` or the remainder in the last chunk
         let plaintext_len = encrypted_chunk_plaintext_len(
@@ -1433,9 +2199,9 @@ impl StreamingLogicalLogReader {
         );
 
         if self.remaining_bytes() < on_disk_size {
-            return Ok(EncryptedChunkReadResult::Eof);
+            return Ok(IOResult::Done(EncryptedChunkReadResult::Eof));
         }
-        self.read_more_data(io, on_disk_size)?;
+        return_if_io!(self.read_more_data(on_disk_size));
         let start = self.buffer_offset;
         let end = start + on_disk_size;
 
@@ -1467,9 +2233,9 @@ impl StreamingLogicalLogReader {
             )));
         }
 
-        Ok(EncryptedChunkReadResult::Ok {
+        Ok(IOResult::Done(EncryptedChunkReadResult::Ok {
             running_crc: next_crc,
-        })
+        }))
     }
 
     /// Extend the carried partial op with enough bytes from the current plaintext chunk to decode
@@ -1573,12 +2339,11 @@ impl StreamingLogicalLogReader {
     /// ciphertext(chunk_plain_len + tag_size) | nonce(nonce_size), one blob per chunk.
     fn parse_encrypted_payload(
         &mut self,
-        io: &Arc<dyn crate::IO>,
         op_count: u32,
         payload_size: usize,
         commit_ts: u64,
         running_crc: u32,
-    ) -> Result<PayloadParseResult> {
+    ) -> Result<IOResult<PayloadParseResult>> {
         let (nonce_size, tag_size) = {
             let enc = self
                 .encryption_ctx
@@ -1613,14 +2378,15 @@ impl StreamingLogicalLogReader {
 
         for chunk_index in 0..chunk_count {
             // lets decrypt the log file, chunk by chunk
-            running_crc = match self.read_and_decrypt_encrypted_chunk(
-                io,
+            running_crc = match return_if_io!(self.read_and_decrypt_encrypted_chunk(
                 &payload_ctx,
                 chunk_index,
                 running_crc,
-            )? {
+            )) {
                 EncryptedChunkReadResult::Ok { running_crc } => running_crc,
-                EncryptedChunkReadResult::Eof => return Ok(PayloadParseResult::Eof),
+                EncryptedChunkReadResult::Eof => {
+                    return Ok(IOResult::Done(PayloadParseResult::Eof))
+                }
             };
 
             let mut plaintext_start = 0usize;
@@ -1697,26 +2463,114 @@ impl StreamingLogicalLogReader {
             )));
         }
 
-        Ok(PayloadParseResult::Ok(parsed_ops, running_crc))
+        Ok(IOResult::Done(PayloadParseResult::Ok(
+            parsed_ops,
+            running_crc,
+        )))
+    }
+
+    fn read_encrypted_plaintext(
+        &mut self,
+        plaintext_size: usize,
+        op_count: u32,
+        commit_ts: u64,
+        running_crc: u32,
+    ) -> Result<IOResult<ReadEncryptedResult>> {
+        let (nonce_size, tag_size) = {
+            let enc = self
+                .encryption_ctx
+                .as_ref()
+                .expect("encryption_ctx must be set for encrypted payload");
+            (enc.nonce_size(), enc.tag_size())
+        };
+        let salt = self
+            .header
+            .as_ref()
+            .expect("log header must be read before parsing")
+            .salt;
+        let payload_ctx = EncryptedPayloadReadContext {
+            payload_size: plaintext_size,
+            op_count,
+            commit_ts,
+            salt,
+            nonce_size,
+            tag_size,
+        };
+        let chunk_count =
+            encrypted_payload_chunk_count(plaintext_size, self.encrypted_payload_chunk_size);
+        let mut running_crc = running_crc;
+        let mut plaintext = Vec::with_capacity(plaintext_size);
+        for chunk_index in 0..chunk_count {
+            running_crc = match return_if_io!(self.read_and_decrypt_encrypted_chunk(
+                &payload_ctx,
+                chunk_index,
+                running_crc,
+            )) {
+                EncryptedChunkReadResult::Ok { running_crc } => running_crc,
+                EncryptedChunkReadResult::Eof => return Ok(IOResult::Done(None)),
+            };
+            plaintext.extend_from_slice(&self.decrypt_scratch);
+        }
+        if plaintext.len() != plaintext_size {
+            return Err(LimboError::Corrupt(format!(
+                "encrypted plaintext size mismatch: expected {plaintext_size}, got {}",
+                plaintext.len()
+            )));
+        }
+        Ok(IOResult::Done(Some((plaintext, running_crc))))
     }
 
     /// Parse an unencrypted payload via field-by-field streaming IO reads.
-    fn parse_streaming_payload(
-        &mut self,
-        io: &Arc<dyn crate::IO>,
-        op_count: u32,
-        payload_size: usize,
-        commit_ts: u64,
-        mut running_crc: u32,
-    ) -> Result<PayloadParseResult> {
-        let mut parsed_ops = Vec::with_capacity((op_count as usize).min(1024));
-        let mut payload_bytes_read: u64 = 0;
+    ///
+    /// Resumable: progress lives in `self.frame_in_progress` (op index, parsed
+    /// ops, chained CRC, payload byte count). Each fully consumed op is committed
+    /// there and the consume cursor is checkpointed (`advance_checkpoint`), so a
+    /// mid-op IO yield re-parses only the in-flight op on re-entry and the buffer
+    /// compacts as ops are consumed. Corruption is reported as
+    /// `Err(LimboError::Corrupt(..))`; the caller maps it to an invalid frame.
+    fn parse_streaming_payload(&mut self) -> Result<IOResult<PayloadOutcome>> {
+        loop {
+            let (op_index, op_count, commit_ts) = {
+                let fip = self
+                    .frame_in_progress
+                    .as_ref()
+                    .expect("frame in progress while parsing streaming payload");
+                (fip.op_index, fip.op_count, fip.commit_ts)
+            };
 
-        for _ in 0..op_count {
+            if op_index >= op_count {
+                let (payload_size, payload_bytes_read) = {
+                    let fip = self
+                        .frame_in_progress
+                        .as_ref()
+                        .expect("frame in progress while parsing streaming payload");
+                    (fip.payload_size, fip.payload_bytes_read)
+                };
+                if payload_size as u64 != payload_bytes_read {
+                    return Err(LimboError::Corrupt(format!(
+                        "payload_size ({payload_size}) != payload_bytes_read ({payload_bytes_read})"
+                    )));
+                }
+                return Ok(IOResult::Done(PayloadOutcome::Ok));
+            }
+
+            // Seed this op's accumulators from the last committed op; they fold
+            // this op's bytes and are written back only once it is fully parsed.
+            let mut running_crc = self
+                .frame_in_progress
+                .as_ref()
+                .expect("frame in progress while parsing streaming payload")
+                .running_crc;
+            let mut payload_bytes_read = self
+                .frame_in_progress
+                .as_ref()
+                .expect("frame in progress while parsing streaming payload")
+                .payload_bytes_read;
+
             // Op header (6 bytes): tag(1) | flags(1) | table_id(4, little-endian i32)
-            let op_bytes = match self.try_consume_fixed::<6>(io)? {
+            let op_bytes = match return_if_io!(self.try_consume_fixed::<6>()) {
                 Some(bytes) => bytes,
-                None => return Ok(PayloadParseResult::Eof),
+                None => return Ok(IOResult::Done(PayloadOutcome::Eof)),
             };
             running_crc = crc32c::crc32c_append(running_crc, &op_bytes);
             let tag = op_bytes[0];
@@ -1725,7 +2579,7 @@ impl StreamingLogicalLogReader {
                 i32::from_le_bytes([op_bytes[2], op_bytes[3], op_bytes[4], op_bytes[5]]);
             let table_id = match tag {
                 OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX => {
-                    if flags & !OP_FLAG_BTREE_RESIDENT != 0 || table_id_i32 >= 0 {
+                    if flags & !OP_ALLOWED_FLAGS != 0 || table_id_i32 >= 0 {
                         return Err(LimboError::Corrupt(format!(
                             "invalid op flags={flags:#x} or table_id={table_id_i32} for tag={tag}"
                         )));
@@ -1745,25 +2599,48 @@ impl StreamingLogicalLogReader {
                 }
             };
             let btree_resident = (flags & OP_FLAG_BTREE_RESIDENT) != 0;
+            let has_portable_extension = (flags & OP_FLAG_PORTABLE_EXTENSION) != 0;
 
             let (payload_len, payload_len_bytes, payload_len_bytes_len) =
-                match self.consume_varint_bytes(io) {
-                    Ok(Some((value, bytes, len))) => (value, bytes, len),
-                    Ok(None) => return Ok(PayloadParseResult::Eof),
-                    Err(err) => return Err(err),
+                match return_if_io!(self.consume_varint_bytes()) {
+                    Some((value, bytes, len)) => (value, bytes, len),
+                    None => return Ok(IOResult::Done(PayloadOutcome::Eof)),
                 };
             running_crc =
                 crc32c::crc32c_append(running_crc, &payload_len_bytes[..payload_len_bytes_len]);
             let payload_len = usize::try_from(payload_len)
                 .map_err(|e| LimboError::Corrupt(format!("payload_len overflows usize: {e}")))?;
 
-            let payload = match self.try_consume_bytes(io, payload_len)? {
+            let payload = match return_if_io!(self.try_consume_bytes(payload_len)) {
                 Some(bytes) => bytes,
-                None => return Ok(PayloadParseResult::Eof),
+                None => return Ok(IOResult::Done(PayloadOutcome::Eof)),
             };
             running_crc = crc32c::crc32c_append(running_crc, &payload);
 
-            let op_total_bytes = 6 + payload_len_bytes_len + payload_len;
+            let (portable_extension, extension_total_bytes) = if has_portable_extension {
+                let (extension_len, extension_len_bytes, extension_len_bytes_len) =
+                    match return_if_io!(self.consume_varint_bytes()) {
+                        Some((value, bytes, len)) => (value, bytes, len),
+                        None => return Ok(IOResult::Done(PayloadOutcome::Eof)),
+                    };
+                running_crc = crc32c::crc32c_append(
+                    running_crc,
+                    &extension_len_bytes[..extension_len_bytes_len],
+                );
+                let extension_len = usize::try_from(extension_len).map_err(|e| {
+                    LimboError::Corrupt(format!("op extension length overflows usize: {e}"))
+                })?;
+                let extension = match return_if_io!(self.try_consume_bytes(extension_len)) {
+                    Some(bytes) => bytes,
+                    None => return Ok(IOResult::Done(PayloadOutcome::Eof)),
+                };
+                running_crc = crc32c::crc32c_append(running_crc, &extension);
+                (extension, extension_len_bytes_len + extension_len)
+            } else {
+                (Vec::new(), 0)
+            };
+
+            let op_total_bytes = 6 + payload_len_bytes_len + payload_len + extension_total_bytes;
             payload_bytes_read = u64::try_from(op_total_bytes)
                 .ok()
                 .and_then(|op_size| payload_bytes_read.checked_add(op_size))
@@ -1801,16 +2678,28 @@ impl StreamingLogicalLogReader {
                             "failed to read rowid varint in delete op: {e}"
                         ))
                     })?;
-                    if rowid_len != payload.len() {
+                    if rowid_len > payload.len() {
                         return Err(LimboError::Corrupt(format!(
-                            "delete op rowid varint len {rowid_len} != payload len {}",
+                            "delete op rowid varint len {rowid_len} > payload len {}",
                             payload.len()
                         )));
                     }
                     let rowid_i64 = rowid_u64 as i64;
+                    let mut payload = payload;
+                    let mut record_bytes = payload.split_off(rowid_len);
+                    let mut pk_record_bytes = Vec::new();
+                    if !portable_extension.is_empty() {
+                        let decoded = decode_delete_portable_extension(&portable_extension)?;
+                        if record_bytes.is_empty() {
+                            record_bytes = decoded.identity_record;
+                        }
+                        pk_record_bytes = decoded.pk_record;
+                    }
                     let rowid = RowID::new(table_id, RowKey::Int(rowid_i64));
                     ParsedOp::DeleteTable {
                         rowid,
+                        record_bytes,
+                        pk_record_bytes,
                         commit_ts,
                         btree_resident,
                     }
@@ -1858,39 +2747,209 @@ impl StreamingLogicalLogReader {
                 }
             };
 
-            parsed_ops.push(parsed_op);
+            // Op fully parsed and folded: commit it and checkpoint the cursor so
+            // re-entry resumes at the next op and the buffer can compact this one.
+            {
+                let fip = self
+                    .frame_in_progress
+                    .as_mut()
+                    .expect("frame in progress while parsing streaming payload");
+                fip.parsed_ops.push(parsed_op);
+                fip.running_crc = running_crc;
+                fip.payload_bytes_read = payload_bytes_read;
+                fip.op_index += 1;
+            }
+            self.advance_checkpoint();
         }
-
-        if payload_size as u64 != payload_bytes_read {
-            return Err(LimboError::Corrupt(format!(
-                "payload_size ({payload_size}) != payload_bytes_read ({payload_bytes_read})"
-            )));
-        }
-
-        Ok(PayloadParseResult::Ok(parsed_ops, running_crc))
     }
 
-    fn parse_next_transaction(&mut self, io: &Arc<dyn crate::IO>) -> Result<ParseResult> {
-        if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
-            return Ok(ParseResult::Eof);
-        }
-        let frame_start = self.offset.saturating_sub(self.bytes_can_read());
+    /// Parse the next transaction frame as a re-entrant phase machine.
+    ///
+    /// Progress is carried in `self.frame_in_progress` across IO yields. Each
+    /// phase (header, optional unencrypted extension block, payload, trailer) is
+    /// a re-entrant unit: once fully consumed and folded into the chained CRC it
+    /// checkpoints (`advance_checkpoint`), advancing `frame_anchor` to the
+    /// consume cursor so `read_more_data` can compact everything before it and a
+    /// later yield rewinds only to the latest checkpoint. Re-entry rewinds
+    /// `buffer_offset` to `frame_anchor` and re-runs just the in-flight unit from
+    /// local state. `frame_start` is captured once at frame open (never
+    /// recomputed) so an invalid frame reports the correct `last_valid_offset`.
+    fn parse_next_transaction(&mut self) -> Result<IOResult<ParseResult>> {
+        loop {
+            if self.frame_in_progress.is_none() {
+                // Start a fresh frame at the current consume cursor.
+                self.buffer_offset = self.frame_anchor;
+                if self.remaining_bytes() < self.tx_min_frame_size() {
+                    return Ok(IOResult::Done(ParseResult::Eof));
+                }
+                let frame_start = self.offset.saturating_sub(self.bytes_can_read());
+                self.frame_in_progress = Some(FrameInProgress::new(frame_start));
+            } else {
+                // Resume the in-flight frame: rewind the consume cursor to the
+                // latest checkpoint and re-run the current phase from there.
+                self.buffer_offset = self.frame_anchor;
+            }
 
-        let header_bytes = match self.try_consume_fixed::<TX_HEADER_SIZE>(io)? {
+            let phase = self
+                .frame_in_progress
+                .as_ref()
+                .expect("frame in progress")
+                .phase;
+            match phase {
+                FramePhase::Header => {
+                    let header = match return_if_io!(self.parse_frame_header()) {
+                        HeaderParseOutcome::Ok(header) => header,
+                        HeaderParseOutcome::Eof => return self.abort_frame_eof(),
+                        HeaderParseOutcome::Invalid => return self.invalidate_frame(),
+                    };
+                    // Unencrypted frames with an extension block consume it as a
+                    // separate phase; encrypted frames carry the extension inside
+                    // the encrypted plaintext (handled in the payload phase).
+                    let next_phase = if self.encryption_ctx.is_none() && header.extension_size > 0 {
+                        FramePhase::ExtensionBlock
+                    } else {
+                        FramePhase::Payload
+                    };
+                    {
+                        let fip = self.frame_in_progress.as_mut().expect("frame in progress");
+                        fip.payload_size = header.payload_size;
+                        fip.op_count = header.op_count;
+                        fip.commit_ts = header.commit_ts;
+                        fip.extension_size = header.extension_size;
+                        fip.extension_record_count = header.extension_record_count;
+                        fip.frame_flags = header.frame_flags;
+                        fip.running_crc = header.running_crc;
+                        fip.phase = next_phase;
+                    }
+                    self.advance_checkpoint();
+                }
+                FramePhase::ExtensionBlock => {
+                    let (extension_size, extension_record_count, running_crc) = {
+                        let fip = self.frame_in_progress.as_ref().expect("frame in progress");
+                        (
+                            fip.extension_size,
+                            fip.extension_record_count,
+                            fip.running_crc,
+                        )
+                    };
+                    let bytes = match return_if_io!(self.try_consume_bytes(extension_size)) {
+                        Some(bytes) => bytes,
+                        None => return self.abort_frame_eof(),
+                    };
+                    let running_crc = crc32c::crc32c_append(running_crc, &bytes);
+                    let portable_changes = match find_extension_payload(
+                        &bytes,
+                        extension_record_count,
+                        EXTENSION_TYPE_PORTABLE_CHANGES,
+                    ) {
+                        Ok(payload) => payload,
+                        Err(LimboError::Corrupt(msg)) => {
+                            tracing::warn!("corrupt extension block: {msg}");
+                            return self.invalidate_frame();
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    {
+                        let fip = self.frame_in_progress.as_mut().expect("frame in progress");
+                        fip.portable_changes = portable_changes;
+                        fip.running_crc = running_crc;
+                        fip.phase = FramePhase::Payload;
+                    }
+                    self.advance_checkpoint();
+                }
+                FramePhase::Payload => match self.parse_payload_phase() {
+                    Ok(IOResult::Done(PayloadOutcome::Ok)) => {
+                        self.frame_in_progress
+                            .as_mut()
+                            .expect("frame in progress")
+                            .phase = FramePhase::Trailer;
+                        self.advance_checkpoint();
+                    }
+                    Ok(IOResult::Done(PayloadOutcome::Eof)) => return self.abort_frame_eof(),
+                    Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                    Err(LimboError::Corrupt(msg)) => {
+                        tracing::warn!("corrupt payload: {msg}");
+                        return self.invalidate_frame();
+                    }
+                    Err(e) => return Err(e),
+                },
+                FramePhase::Trailer => {
+                    // TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
+                    let trailer_bytes =
+                        match return_if_io!(self.try_consume_fixed::<TX_TRAILER_SIZE>()) {
+                            Some(bytes) => bytes,
+                            None => return self.abort_frame_eof(),
+                        };
+                    let crc32c_expected = u32::from_le_bytes([
+                        trailer_bytes[0],
+                        trailer_bytes[1],
+                        trailer_bytes[2],
+                        trailer_bytes[3],
+                    ]);
+                    let end_magic = u32::from_le_bytes([
+                        trailer_bytes[4],
+                        trailer_bytes[5],
+                        trailer_bytes[6],
+                        trailer_bytes[7],
+                    ]);
+                    let running_crc = self
+                        .frame_in_progress
+                        .as_ref()
+                        .expect("frame in progress")
+                        .running_crc;
+                    if crc32c_expected != running_crc {
+                        return self.invalidate_frame();
+                    }
+                    if end_magic != END_MAGIC {
+                        return self.invalidate_frame();
+                    }
+                    return self.commit_frame();
+                }
+            }
+        }
+    }
+
+    /// Parse and validate the transaction header (a re-entrant atomic unit).
+    /// Reads from the current consume cursor and mutates only local state plus
+    /// the consume cursor, so it is safe to re-run from the frame anchor on
+    /// re-entry. The chained CRC is seeded from `self.running_crc` and folded
+    /// over the header bytes. Field/structural problems return `Invalid`; the
+    /// caller sets `last_valid_offset` from the captured `frame_start`.
+    fn parse_frame_header(&mut self) -> Result<IOResult<HeaderParseOutcome>> {
+        // TX HEADER v2 layout (24 bytes):
+        // FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
+        //
+        // TX HEADER v3 extension frames append:
+        // extension_size(8) | extension_record_count(4) | frame_flags(4)
+        let mut header_bytes = match return_if_io!(self.try_consume_bytes(TX_HEADER_SIZE)) {
             Some(bytes) => bytes,
-            None => return Ok(ParseResult::Eof),
+            None => return Ok(IOResult::Done(HeaderParseOutcome::Eof)),
         };
 
-        // TX HEADER layout (24 bytes): FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
         let frame_magic = u32::from_le_bytes([
             header_bytes[0],
             header_bytes[1],
             header_bytes[2],
             header_bytes[3],
         ]);
-        if frame_magic != FRAME_MAGIC {
-            self.last_valid_offset = frame_start;
-            return Ok(ParseResult::InvalidFrame);
+        let is_v2 = self
+            .header
+            .as_ref()
+            .is_some_and(|header| header.version == LOG_VERSION_V2);
+        let has_extension_header = !is_v2 && frame_magic == EXT_FRAME_MAGIC;
+        if frame_magic != FRAME_MAGIC && !has_extension_header {
+            return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
+        }
+        if is_v2 && frame_magic != FRAME_MAGIC {
+            return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
+        }
+        if has_extension_header {
+            let Some(extension_header) =
+                return_if_io!(self.try_consume_bytes(TX_EXT_HEADER_SIZE - TX_HEADER_SIZE))
+            else {
+                return Ok(IOResult::Done(HeaderParseOutcome::Eof));
+            };
+            header_bytes.extend_from_slice(&extension_header);
         }
         let payload_size_u64 = u64::from_le_bytes([
             header_bytes[4],
@@ -1918,43 +2977,461 @@ impl StreamingLogicalLogReader {
             header_bytes[22],
             header_bytes[23],
         ]);
+        let (extension_size, extension_record_count, frame_flags) = if has_extension_header {
+            let extension_size_u64 = u64::from_le_bytes([
+                header_bytes[24],
+                header_bytes[25],
+                header_bytes[26],
+                header_bytes[27],
+                header_bytes[28],
+                header_bytes[29],
+                header_bytes[30],
+                header_bytes[31],
+            ]);
+            let extension_size = match usize::try_from(extension_size_u64) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("extension_size overflows usize: {e}");
+                    return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
+                }
+            };
+            let extension_record_count = u32::from_le_bytes([
+                header_bytes[32],
+                header_bytes[33],
+                header_bytes[34],
+                header_bytes[35],
+            ]);
+            let frame_flags = u32::from_le_bytes([
+                header_bytes[36],
+                header_bytes[37],
+                header_bytes[38],
+                header_bytes[39],
+            ]);
+            if frame_flags & !TX_FRAME_FLAG_HAS_EXTENSION_BLOCK != 0 {
+                return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
+            }
+            if extension_size == 0 && extension_record_count != 0 {
+                return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
+            }
+            if extension_size > 0 && frame_flags & TX_FRAME_FLAG_HAS_EXTENSION_BLOCK == 0 {
+                return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
+            }
+            (extension_size, extension_record_count, frame_flags)
+        } else {
+            (0, 0, 0)
+        };
+
+        let payload_size = match usize::try_from(payload_size_u64) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("payload_size overflows usize: {e}");
+                return Ok(IOResult::Done(HeaderParseOutcome::Invalid));
+            }
+        };
+
+        // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC).
+        let running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
+
+        Ok(IOResult::Done(HeaderParseOutcome::Ok(FrameHeader {
+            payload_size,
+            op_count,
+            commit_ts,
+            extension_size,
+            extension_record_count,
+            frame_flags,
+            running_crc,
+        })))
+    }
+
+    /// Parse the payload phase, dispatching on encryption. The unencrypted path
+    /// is the resumable per-op machine (`parse_streaming_payload`) that
+    /// checkpoints into `frame_in_progress`; the encrypted paths are parsed
+    /// wholesale from the payload start (rewind-and-rebuild from `frame_anchor`)
+    /// and store their result into `frame_in_progress` once complete. Corruption
+    /// propagates as `Err(LimboError::Corrupt(..))` for the caller to map to an
+    /// invalid frame.
+    fn parse_payload_phase(&mut self) -> Result<IOResult<PayloadOutcome>> {
+        let (payload_size, op_count, commit_ts, extension_size, extension_record_count, header_crc) = {
+            let fip = self.frame_in_progress.as_ref().expect("frame in progress");
+            (
+                fip.payload_size,
+                fip.op_count,
+                fip.commit_ts,
+                fip.extension_size,
+                fip.extension_record_count,
+                fip.running_crc,
+            )
+        };
+        let encrypted_extension_size = if self.encryption_ctx.is_some() {
+            extension_size
+        } else {
+            0
+        };
+
+        if encrypted_extension_size > 0 {
+            let plaintext_size = payload_size
+                .checked_add(encrypted_extension_size)
+                .ok_or_else(|| {
+                    LimboError::Corrupt("encrypted plaintext size overflows usize".into())
+                })?;
+            let Some((plaintext, running_crc)) = return_if_io!(self.read_encrypted_plaintext(
+                plaintext_size,
+                op_count,
+                commit_ts,
+                header_crc,
+            )) else {
+                return Ok(IOResult::Done(PayloadOutcome::Eof));
+            };
+            let recovery_start = extension_size;
+            let recovery_end = recovery_start
+                .checked_add(payload_size)
+                .ok_or_else(|| LimboError::Corrupt("recovery payload offset overflow".into()))?;
+            let portable_changes = find_extension_payload(
+                &plaintext[..extension_size],
+                extension_record_count,
+                EXTENSION_TYPE_PORTABLE_CHANGES,
+            )?;
+            let parsed_ops = parse_ops_from_plaintext(
+                &plaintext[recovery_start..recovery_end],
+                payload_size,
+                op_count,
+                commit_ts,
+            )?;
+            let fip = self.frame_in_progress.as_mut().expect("frame in progress");
+            fip.parsed_ops = parsed_ops;
+            fip.portable_changes = portable_changes;
+            fip.running_crc = running_crc;
+            return Ok(IOResult::Done(PayloadOutcome::Ok));
+        }
+
+        if self.encryption_ctx.is_some() {
+            let (parsed_ops, running_crc) = match self.parse_encrypted_payload(
+                op_count,
+                payload_size,
+                commit_ts,
+                header_crc,
+            )? {
+                IOResult::Done(PayloadParseResult::Ok(ops, crc)) => (ops, crc),
+                IOResult::Done(PayloadParseResult::Eof) => {
+                    return Ok(IOResult::Done(PayloadOutcome::Eof))
+                }
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
+            let fip = self.frame_in_progress.as_mut().expect("frame in progress");
+            fip.parsed_ops = parsed_ops;
+            fip.running_crc = running_crc;
+            return Ok(IOResult::Done(PayloadOutcome::Ok));
+        }
+
+        // Unencrypted: resumable per-op machine that checkpoints into
+        // `frame_in_progress` (parsed ops + CRC + byte count) as it goes.
+        self.parse_streaming_payload()
+    }
+
+    /// Commit the consume cursor as the new rewind point. Called once a unit
+    /// (header / extension block / op / payload) is fully consumed and folded
+    /// into the in-progress chained CRC, so `read_more_data` may compact every
+    /// byte before it and re-entry resumes here rather than at the frame start.
+    fn advance_checkpoint(&mut self) {
+        self.frame_anchor = self.buffer_offset;
+    }
+
+    /// Torn tail: not enough bytes remain to finish the in-progress frame. Drop
+    /// it without advancing the chain — `last_valid_offset`/`running_crc` stay at
+    /// the last fully committed frame. EOF is terminal for a recovery pass
+    /// (`file_size` is fixed once recovery starts).
+    fn abort_frame_eof(&mut self) -> Result<IOResult<ParseResult>> {
+        self.frame_in_progress = None;
+        Ok(IOResult::Done(ParseResult::Eof))
+    }
+
+    /// The in-progress frame is structurally invalid (bad magic/flags/CRC/op).
+    /// Set `last_valid_offset` to the captured frame start so the writer
+    /// overwrites the torn frame on the next append, and drop the frame without
+    /// advancing the chain.
+    fn invalidate_frame(&mut self) -> Result<IOResult<ParseResult>> {
+        let frame_start = self
+            .frame_in_progress
+            .as_ref()
+            .expect("frame in progress")
+            .frame_start;
+        self.last_valid_offset = frame_start;
+        self.frame_in_progress = None;
+        Ok(IOResult::Done(ParseResult::InvalidFrame))
+    }
+
+    /// Commit a fully validated frame: advance `last_valid_offset` to the byte
+    /// past the trailer, carry this frame's CRC as the seed for the next frame,
+    /// and move the frame anchor past the trailer.
+    fn commit_frame(&mut self) -> Result<IOResult<ParseResult>> {
+        let fip = self.frame_in_progress.take().expect("frame in progress");
+        self.last_valid_offset = self.offset.saturating_sub(self.bytes_can_read());
+        self.running_crc = fip.running_crc;
+        self.frame_anchor = self.buffer_offset;
+        Ok(IOResult::Done(ParseResult::Frame(ParsedFrame {
+            ops: fip.parsed_ops,
+            portable_changes: fip.portable_changes,
+            extension_record_count: fip.extension_record_count,
+            frame_flags: fip.frame_flags,
+            commit_ts: fip.commit_ts,
+            end_offset: self.last_valid_offset,
+        })))
+    }
+
+    fn consume_and_crc_bytes(
+        &mut self,
+        mut amount: usize,
+        mut running_crc: u32,
+    ) -> Result<IOResult<Option<u32>>> {
+        const CHUNK_SIZE: usize = 64 * 1024;
+        while amount > 0 {
+            let chunk_len = amount.min(CHUNK_SIZE);
+            let Some(bytes) = return_if_io!(self.try_consume_bytes(chunk_len)) else {
+                return Ok(IOResult::Done(None));
+            };
+            running_crc = crc32c::crc32c_append(running_crc, &bytes);
+            amount -= chunk_len;
+        }
+        Ok(IOResult::Done(Some(running_crc)))
+    }
+
+    fn encrypted_payload_on_disk_size(&self, payload_size: usize) -> Result<usize> {
+        let Some(encryption_ctx) = self.encryption_ctx.as_ref() else {
+            return Ok(payload_size);
+        };
+        let mut on_disk_size = 0usize;
+        for chunk_index in
+            0..encrypted_payload_chunk_count(payload_size, self.encrypted_payload_chunk_size)
+        {
+            let plaintext_len = encrypted_chunk_plaintext_len(
+                payload_size,
+                chunk_index,
+                self.encrypted_payload_chunk_size,
+            )?;
+            on_disk_size = on_disk_size
+                .checked_add(encrypted_chunk_blob_size(
+                    plaintext_len,
+                    encryption_ctx.tag_size(),
+                    encryption_ctx.nonce_size(),
+                )?)
+                .ok_or_else(|| {
+                    LimboError::Corrupt("encrypted payload size overflows usize".to_string())
+                })?;
+        }
+        Ok(on_disk_size)
+    }
+
+    fn parse_next_portable_changes_frame(&mut self) -> Result<IOResult<ParseResult>> {
+        // See `parse_next_transaction`: rewind to the frame anchor so a mid-frame
+        // IO yield resumes correctly on re-entry.
+        self.buffer_offset = self.frame_anchor;
+        if self
+            .header
+            .as_ref()
+            .is_some_and(|h| h.version == LOG_VERSION_V2)
+        {
+            return Ok(IOResult::Done(ParseResult::Eof));
+        }
+        if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
+            return Ok(IOResult::Done(ParseResult::Eof));
+        }
+        let frame_start = self.offset.saturating_sub(self.bytes_can_read());
+
+        let mut header_bytes = match return_if_io!(self.try_consume_bytes(TX_HEADER_SIZE)) {
+            Some(bytes) => bytes,
+            None => return Ok(IOResult::Done(ParseResult::Eof)),
+        };
+
+        let frame_magic = u32::from_le_bytes([
+            header_bytes[0],
+            header_bytes[1],
+            header_bytes[2],
+            header_bytes[3],
+        ]);
+        let has_extension_header = frame_magic == EXT_FRAME_MAGIC;
+        if frame_magic != FRAME_MAGIC && !has_extension_header {
+            self.last_valid_offset = frame_start;
+            return Ok(IOResult::Done(ParseResult::InvalidFrame));
+        }
+        if has_extension_header {
+            let Some(extension_header) =
+                return_if_io!(self.try_consume_bytes(TX_EXT_HEADER_SIZE - TX_HEADER_SIZE))
+            else {
+                return Ok(IOResult::Done(ParseResult::Eof));
+            };
+            header_bytes.extend_from_slice(&extension_header);
+        }
+        let payload_size_u64 = u64::from_le_bytes([
+            header_bytes[4],
+            header_bytes[5],
+            header_bytes[6],
+            header_bytes[7],
+            header_bytes[8],
+            header_bytes[9],
+            header_bytes[10],
+            header_bytes[11],
+        ]);
+        let op_count = u32::from_le_bytes([
+            header_bytes[12],
+            header_bytes[13],
+            header_bytes[14],
+            header_bytes[15],
+        ]);
+        let commit_ts = u64::from_le_bytes([
+            header_bytes[16],
+            header_bytes[17],
+            header_bytes[18],
+            header_bytes[19],
+            header_bytes[20],
+            header_bytes[21],
+            header_bytes[22],
+            header_bytes[23],
+        ]);
+        let (extension_size_u64, extension_record_count, frame_flags) = if has_extension_header {
+            let extension_size_u64 = u64::from_le_bytes([
+                header_bytes[24],
+                header_bytes[25],
+                header_bytes[26],
+                header_bytes[27],
+                header_bytes[28],
+                header_bytes[29],
+                header_bytes[30],
+                header_bytes[31],
+            ]);
+            let extension_record_count = u32::from_le_bytes([
+                header_bytes[32],
+                header_bytes[33],
+                header_bytes[34],
+                header_bytes[35],
+            ]);
+            let frame_flags = u32::from_le_bytes([
+                header_bytes[36],
+                header_bytes[37],
+                header_bytes[38],
+                header_bytes[39],
+            ]);
+            if frame_flags & !TX_FRAME_FLAG_HAS_EXTENSION_BLOCK != 0 {
+                self.last_valid_offset = frame_start;
+                return Ok(IOResult::Done(ParseResult::InvalidFrame));
+            }
+            if extension_size_u64 == 0 && extension_record_count != 0 {
+                self.last_valid_offset = frame_start;
+                return Ok(IOResult::Done(ParseResult::InvalidFrame));
+            }
+            if extension_size_u64 > 0 && frame_flags & TX_FRAME_FLAG_HAS_EXTENSION_BLOCK == 0 {
+                self.last_valid_offset = frame_start;
+                return Ok(IOResult::Done(ParseResult::InvalidFrame));
+            }
+            (extension_size_u64, extension_record_count, frame_flags)
+        } else {
+            (0, 0, 0)
+        };
 
         let payload_size = match usize::try_from(payload_size_u64) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("payload_size overflows usize: {e}");
                 self.last_valid_offset = frame_start;
-                return Ok(ParseResult::InvalidFrame);
+                return Ok(IOResult::Done(ParseResult::InvalidFrame));
+            }
+        };
+        let extension_size = match usize::try_from(extension_size_u64) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("extension_size overflows usize: {e}");
+                self.last_valid_offset = frame_start;
+                return Ok(IOResult::Done(ParseResult::InvalidFrame));
             }
         };
 
-        // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
         let running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
-
-        // 2. Parse payload — branches for encrypted vs unencrypted.
-        //    Corrupt errors from payload parsing are treated as an invalid frame
-        //    (stop scanning, keep previously validated frames).
-        let (parsed_ops, running_crc) = match if self.encryption_ctx.is_some() {
-            self.parse_encrypted_payload(io, op_count, payload_size, commit_ts, running_crc)
+        let encrypted_extension_size = if self.encryption_ctx.is_some() {
+            extension_size
         } else {
-            self.parse_streaming_payload(io, op_count, payload_size, commit_ts, running_crc)
-        } {
-            Ok(PayloadParseResult::Ok(ops, crc)) => (ops, crc),
-            Ok(PayloadParseResult::Eof) => return Ok(ParseResult::Eof),
+            0
+        };
+        let payload_on_disk_size = match self.encrypted_payload_on_disk_size(
+            payload_size
+                .checked_add(encrypted_extension_size)
+                .ok_or_else(|| {
+                    LimboError::Corrupt(
+                        "payload plus encrypted extension size overflows usize".to_string(),
+                    )
+                })?,
+        ) {
+            Ok(size) => size,
             Err(LimboError::Corrupt(msg)) => {
-                tracing::warn!("corrupt payload: {msg}");
+                tracing::warn!("corrupt payload size: {msg}");
                 self.last_valid_offset = frame_start;
-                return Ok(ParseResult::InvalidFrame);
+                return Ok(IOResult::Done(ParseResult::InvalidFrame));
             }
             Err(e) => return Err(e),
         };
-
-        // 3. TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
-        let trailer_bytes = match self.try_consume_fixed::<TX_TRAILER_SIZE>(io)? {
-            Some(bytes) => bytes,
-            None => return Ok(ParseResult::Eof),
+        let (portable_changes, running_crc) = if encrypted_extension_size > 0 {
+            let plaintext_size = payload_size
+                .checked_add(encrypted_extension_size)
+                .ok_or_else(|| {
+                    LimboError::Corrupt("encrypted plaintext size overflows usize".into())
+                })?;
+            let Some((plaintext, running_crc)) = return_if_io!(self.read_encrypted_plaintext(
+                plaintext_size,
+                op_count,
+                commit_ts,
+                running_crc,
+            )) else {
+                return Ok(IOResult::Done(ParseResult::Eof));
+            };
+            let portable_changes = match find_extension_payload(
+                &plaintext[..extension_size],
+                extension_record_count,
+                EXTENSION_TYPE_PORTABLE_CHANGES,
+            ) {
+                Ok(payload) => payload,
+                Err(LimboError::Corrupt(msg)) => {
+                    tracing::warn!("corrupt extension block: {msg}");
+                    self.last_valid_offset = frame_start;
+                    return Ok(IOResult::Done(ParseResult::InvalidFrame));
+                }
+                Err(e) => return Err(e),
+            };
+            (portable_changes, running_crc)
+        } else {
+            let (portable_changes, running_crc) = if extension_size > 0 {
+                match return_if_io!(self.try_consume_bytes(extension_size)) {
+                    Some(bytes) => {
+                        let running_crc = crc32c::crc32c_append(running_crc, &bytes);
+                        let portable_changes = match find_extension_payload(
+                            &bytes,
+                            extension_record_count,
+                            EXTENSION_TYPE_PORTABLE_CHANGES,
+                        ) {
+                            Ok(payload) => payload,
+                            Err(LimboError::Corrupt(msg)) => {
+                                tracing::warn!("corrupt extension block: {msg}");
+                                self.last_valid_offset = frame_start;
+                                return Ok(IOResult::Done(ParseResult::InvalidFrame));
+                            }
+                            Err(e) => return Err(e),
+                        };
+                        (portable_changes, running_crc)
+                    }
+                    None => return Ok(IOResult::Done(ParseResult::Eof)),
+                }
+            } else {
+                (Vec::new(), running_crc)
+            };
+            let Some(running_crc) =
+                return_if_io!(self.consume_and_crc_bytes(payload_on_disk_size, running_crc))
+            else {
+                return Ok(IOResult::Done(ParseResult::Eof));
+            };
+            (portable_changes, running_crc)
         };
 
+        let trailer_bytes = match return_if_io!(self.try_consume_fixed::<TX_TRAILER_SIZE>()) {
+            Some(bytes) => bytes,
+            None => return Ok(IOResult::Done(ParseResult::Eof)),
+        };
         let crc32c_expected = u32::from_le_bytes([
             trailer_bytes[0],
             trailer_bytes[1],
@@ -1967,20 +3444,26 @@ impl StreamingLogicalLogReader {
             trailer_bytes[6],
             trailer_bytes[7],
         ]);
-
         if crc32c_expected != running_crc {
             self.last_valid_offset = frame_start;
-            return Ok(ParseResult::InvalidFrame);
+            return Ok(IOResult::Done(ParseResult::InvalidFrame));
         }
         if end_magic != END_MAGIC {
             self.last_valid_offset = frame_start;
-            return Ok(ParseResult::InvalidFrame);
+            return Ok(IOResult::Done(ParseResult::InvalidFrame));
         }
 
         self.last_valid_offset = self.offset.saturating_sub(self.bytes_can_read());
-        // Advance the chain: this frame's CRC becomes the seed for the next frame.
         self.running_crc = running_crc;
-        Ok(ParseResult::Ops(parsed_ops))
+        self.frame_anchor = self.buffer_offset;
+        Ok(IOResult::Done(ParseResult::Frame(ParsedFrame {
+            ops: Vec::new(),
+            portable_changes,
+            extension_record_count,
+            frame_flags,
+            commit_ts,
+            end_offset: self.last_valid_offset,
+        })))
     }
 
     pub(crate) fn parsed_op_to_streaming(
@@ -1998,12 +3481,16 @@ impl StreamingLogicalLogReader {
             } => {
                 // Compute column_count from the serialized record so recovered rows keep
                 // the same shape metadata as non-recovered rows.
+                // Decode shape metadata by reference; ownership is only needed for the row payload.
                 let column_count =
                     crate::types::ImmutableRecordRef::from_bin_record(&record_bytes).column_count();
-                let row = Row::new_table_row(
-                    RowID::new(table_id, rowid.row_id.clone()),
-                    record_bytes,
-                    column_count,
+                let row = crate::with_mv_store_allocation_site!(
+                    RowPayload,
+                    Row::new_table_row(
+                        RowID::new(table_id, rowid.row_id.clone()),
+                        &record_bytes,
+                        column_count,
+                    )?
                 );
                 Ok(StreamingResult::UpsertTableRow {
                     row,
@@ -2014,6 +3501,8 @@ impl StreamingLogicalLogReader {
             }
             ParsedOp::DeleteTable {
                 rowid,
+                record_bytes: _,
+                pk_record_bytes: _,
                 commit_ts,
                 btree_resident,
             } => Ok(StreamingResult::DeleteTableRow {
@@ -2030,7 +3519,7 @@ impl StreamingLogicalLogReader {
                 let key_record = crate::types::ImmutableRecord::from_bin_record(payload);
                 let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Upsert)?;
-                let key = SortableIndexKey::new_from_record(key_record, index_info);
+                let key = Arc::new(SortableIndexKey::new_from_record(key_record, index_info));
                 let rowid = RowID::new(table_id, RowKey::Record(key));
                 let row = Row::new_index_row(rowid.clone(), column_count);
                 Ok(StreamingResult::UpsertIndexRow {
@@ -2049,7 +3538,7 @@ impl StreamingLogicalLogReader {
                 let key_record = crate::types::ImmutableRecord::from_bin_record(payload);
                 let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Delete)?;
-                let key = SortableIndexKey::new_from_record(key_record, index_info);
+                let key = Arc::new(SortableIndexKey::new_from_record(key_record, index_info));
                 let rowid = RowID::new(table_id, RowKey::Record(key));
                 let row = Row::new_index_row(rowid.clone(), column_count);
                 Ok(StreamingResult::DeleteIndexRow {
@@ -2071,48 +3560,41 @@ impl StreamingLogicalLogReader {
         bytes_in_buffer + bytes_in_file
     }
 
-    fn try_consume_bytes(
-        &mut self,
-        io: &Arc<dyn crate::IO>,
-        amount: usize,
-    ) -> Result<Option<Vec<u8>>> {
+    fn try_consume_bytes(&mut self, amount: usize) -> Result<IOResult<Option<Vec<u8>>>> {
         if self.remaining_bytes() < amount {
-            return Ok(None);
+            return Ok(IOResult::Done(None));
         }
-        self.read_more_data(io, amount)?;
+        return_if_io!(self.read_more_data(amount));
         let buffer = self.buffer.read();
         let start = self.buffer_offset;
         let end = start + amount;
         let bytes = buffer[start..end].to_vec();
         self.buffer_offset = end;
-        Ok(Some(bytes))
+        Ok(IOResult::Done(Some(bytes)))
     }
 
-    fn try_consume_fixed<const N: usize>(
-        &mut self,
-        io: &Arc<dyn crate::IO>,
-    ) -> Result<Option<[u8; N]>> {
+    fn try_consume_fixed<const N: usize>(&mut self) -> Result<IOResult<Option<[u8; N]>>> {
         if self.remaining_bytes() < N {
-            return Ok(None);
+            return Ok(IOResult::Done(None));
         }
-        self.read_more_data(io, N)?;
+        return_if_io!(self.read_more_data(N));
         let buffer = self.buffer.read();
         let start = self.buffer_offset;
         let end = start + N;
         let mut out = [0u8; N];
         out.copy_from_slice(&buffer[start..end]);
         self.buffer_offset = end;
-        Ok(Some(out))
+        Ok(IOResult::Done(Some(out)))
     }
 
-    fn try_consume_u8(&mut self, io: &Arc<dyn crate::IO>) -> Result<Option<u8>> {
+    fn try_consume_u8(&mut self) -> Result<IOResult<Option<u8>>> {
         if self.remaining_bytes() == 0 {
-            return Ok(None);
+            return Ok(IOResult::Done(None));
         }
-        self.read_more_data(io, 1)?;
+        return_if_io!(self.read_more_data(1));
         let r = self.buffer.read()[self.buffer_offset];
         self.buffer_offset += 1;
-        Ok(Some(r))
+        Ok(IOResult::Done(Some(r)))
     }
 
     /// Reads a SQLite-format varint one byte at a time from the streaming reader.
@@ -2121,26 +3603,24 @@ impl StreamingLogicalLogReader {
     /// Unlike `read_varint` from sqlite3_ondisk (which requires a contiguous buffer),
     /// this reads byte-by-byte via `try_consume_u8` to handle streaming I/O where
     /// the varint may span a buffer boundary. Returns `None` on EOF (short read).
-    fn consume_varint_bytes(
-        &mut self,
-        io: &Arc<dyn crate::IO>,
-    ) -> Result<Option<(u64, [u8; 9], usize)>> {
+    #[allow(clippy::type_complexity)]
+    fn consume_varint_bytes(&mut self) -> Result<IOResult<Option<(u64, [u8; 9], usize)>>> {
         let mut v: u64 = 0;
         let mut bytes = [0u8; 9];
         let mut len = 0usize;
         for _ in 0..8 {
-            let Some(c) = self.try_consume_u8(io)? else {
-                return Ok(None);
+            let Some(c) = return_if_io!(self.try_consume_u8()) else {
+                return Ok(IOResult::Done(None));
             };
             bytes[len] = c;
             len += 1;
             v = (v << 7) + (c & 0x7f) as u64;
             if (c & 0x80) == 0 {
-                return Ok(Some((v, bytes, len)));
+                return Ok(IOResult::Done(Some((v, bytes, len))));
             }
         }
-        let Some(c) = self.try_consume_u8(io)? else {
-            return Ok(None);
+        let Some(c) = return_if_io!(self.try_consume_u8()) else {
+            return Ok(IOResult::Done(None));
         };
         bytes[len] = c;
         len += 1;
@@ -2148,53 +3628,100 @@ impl StreamingLogicalLogReader {
             return Err(LimboError::Corrupt("Invalid varint".to_string()));
         }
         v = (v << 8) + c as u64;
-        Ok(Some((v, bytes, len)))
+        Ok(IOResult::Done(Some((v, bytes, len))))
     }
 
-    fn read_exact_at(&self, io: &Arc<dyn crate::IO>, pos: u64, len: usize) -> Result<Vec<u8>> {
-        let header_buf = Arc::new(Buffer::new_temporary(len));
-        let out = Arc::new(RwLock::new(Vec::with_capacity(len)));
-        let out_clone = out.clone();
-        let completion: Box<ReadComplete> = Box::new(move |res| {
-            let out = out_clone.clone();
-            let mut out = out.write();
-            let Ok((buf, bytes_read)) = res else {
-                tracing::error!("couldn't read logical log header err={:?}", res);
-                return None;
-            };
-            if bytes_read > 0 {
-                out.extend_from_slice(&buf.as_slice()[..bytes_read as usize]);
+    /// Non-blocking read of exactly `len` bytes at file offset `pos`.
+    ///
+    /// On entry: if an in-flight `Exact` read is already pending, resume it
+    /// (yield until done, then return its accumulated buffer). Otherwise
+    /// issue a fresh pread, stash it in `self.in_flight_read`, and either
+    /// yield the completion (when not synchronously done) or loop to take
+    /// the resume branch.
+    fn read_exact_at(&mut self, pos: u64, len: usize) -> Result<IOResult<Vec<u8>>> {
+        loop {
+            if let Some(InFlightRead::Exact { completion, .. }) = &self.in_flight_read {
+                if !completion.succeeded() {
+                    let c = completion.clone();
+                    io_yield_one!(c);
+                }
+                let Some(InFlightRead::Exact {
+                    out, expected_len, ..
+                }) = self.in_flight_read.take()
+                else {
+                    unreachable!("in_flight_read variant just matched Exact");
+                };
+                let result = out.read().clone();
+                if result.len() != expected_len {
+                    return Err(LimboError::Corrupt(format!(
+                        "Logical log short read: expected {expected_len}, got {}",
+                        result.len()
+                    )));
+                }
+                return Ok(IOResult::Done(result));
             }
-            None
-        });
-        let c = Completion::new_read(header_buf, completion);
-        let c = self.file.pread(pos, c)?;
-        io.wait_for_completion(c)?;
-        let out = out.read().clone();
-        if out.len() != len {
-            return Err(LimboError::Corrupt(format!(
-                "Logical log short read: expected {len}, got {}",
-                out.len()
-            )));
+
+            let header_buf = Arc::new(Buffer::new_temporary(len));
+            let out = Arc::new(RwLock::new(Vec::with_capacity(len)));
+            let out_clone = out.clone();
+            let completion: Box<ReadComplete> = Box::new(move |res| {
+                let out = out_clone.clone();
+                let mut out = out.write();
+                let Ok((buf, bytes_read)) = res else {
+                    tracing::error!("couldn't read logical log header err={:?}", res);
+                    return None;
+                };
+                if bytes_read > 0 {
+                    out.extend_from_slice(&buf.as_slice()[..bytes_read as usize]);
+                }
+                None
+            });
+            let c = Completion::new_read(header_buf, completion);
+            let c = self.file.pread(pos, c)?;
+            self.in_flight_read = Some(InFlightRead::Exact {
+                completion: c,
+                out,
+                expected_len: len,
+            });
+            // Loop to take the resume branch — handles both the synchronous-
+            // completion and not-finished cases uniformly.
         }
-        Ok(out)
     }
 
     fn get_buffer(&self) -> crate::sync::RwLockReadGuard<'_, Vec<u8>> {
         self.buffer.read()
     }
 
-    /// Read at least `need` bytes from the logical log, issuing multiple reads if necessary.
-    /// If at any point 0 bytes are read, that indicates corruption.
-    pub fn read_more_data(&mut self, io: &Arc<dyn crate::IO>, need: usize) -> Result<()> {
-        let bytes_can_read = self.bytes_can_read();
-        if bytes_can_read >= need {
-            return Ok(());
-        }
-
-        let initial_buffer_offset = self.buffer_offset;
-
+    /// Read at least `need` bytes from the logical log, issuing multiple
+    /// reads if necessary. If at any point 0 bytes are read, that indicates
+    /// corruption.
+    ///
+    /// Non-blocking: a pread in flight is tracked in `self.in_flight_read`
+    /// and the method yields its completion until done. Re-entry picks up
+    /// where it left off without re-issuing the read.
+    pub fn read_more_data(&mut self, need: usize) -> Result<IOResult<()>> {
         loop {
+            // Resume hook: a pread that was issued by a previous call to
+            // this method completed; observe its result and advance.
+            if let Some(InFlightRead::Chunk { completion, .. }) = &self.in_flight_read {
+                if !completion.succeeded() {
+                    let c = completion.clone();
+                    io_yield_one!(c);
+                }
+                let Some(InFlightRead::Chunk { pre_size, .. }) = self.in_flight_read.take() else {
+                    unreachable!("in_flight_read variant just matched Chunk");
+                };
+                let buffer_size_after_read = self.buffer.read().len();
+                let bytes_read = buffer_size_after_read - pre_size;
+                if bytes_read == 0 {
+                    return Err(LimboError::Corrupt(format!(
+                        "Expected to read more bytes but read 0 bytes at offset {}",
+                        self.offset
+                    )));
+                }
+                self.offset += bytes_read;
+            }
+
             let buffer_size_before_read = self.buffer.read().len();
             turso_assert!(
                 buffer_size_before_read >= self.buffer_offset,
@@ -2205,7 +3732,31 @@ impl StreamingLogicalLogReader {
             let still_need = need.saturating_sub(bytes_available_in_buffer);
 
             if still_need == 0 {
-                break;
+                // Data is already buffered — return without touching the buffer.
+                // Compaction happens only on the disk-read path below: draining
+                // here would memmove the buffer tail on every consume (i.e. once
+                // per frame for tiny frames), which is a large recovery
+                // regression with no benefit, since the buffer only grows when we
+                // actually read from disk.
+                return Ok(IOResult::Done(()));
+            }
+
+            // We must read from disk. Compact the consumed bytes *before* the
+            // latest checkpoint (`frame_anchor`) first, so the buffer doesn't
+            // grow without bound. `frame_anchor` advances at every parse
+            // checkpoint (each header / extension block / op), so for the
+            // streaming path this drains fully-consumed ops and bounds the buffer
+            // to roughly the in-flight unit rather than the whole frame. Bytes at
+            // `frame_anchor..` must stay buffered so a mid-unit IO yield can be
+            // resumed by rewinding `buffer_offset` back to `frame_anchor` and
+            // re-parsing that unit. Draining up to `buffer_offset` (the consume
+            // cursor) instead would discard the in-flight unit's bytes and
+            // corrupt its re-parse.
+            let drain_to = self.frame_anchor.min(self.buffer.read().len());
+            if drain_to > 0 {
+                let _ = self.buffer.write().drain(0..drain_to);
+                self.buffer_offset -= drain_to;
+                self.frame_anchor -= drain_to;
             }
 
             turso_assert!(
@@ -2213,6 +3764,10 @@ impl StreamingLogicalLogReader {
                 "file_size < offset",
                 { "file_size": self.file_size, "offset": self.offset }
             );
+            // Recompute after draining: `buffer.len()` shrank, and `pre_size`
+            // (captured below) must reflect the post-drain length so the
+            // completion's `bytes_read = buffer.len() - pre_size` is correct.
+            let buffer_size_before_read = self.buffer.read().len();
             let to_read = 4096.max(still_need).min(self.file_size - self.offset);
 
             if to_read == 0 {
@@ -2238,30 +3793,13 @@ impl StreamingLogicalLogReader {
             });
             let c = Completion::new_read(header_buf, completion);
             let c = self.file.pread(self.offset as u64, c)?;
-            io.wait_for_completion(c)?;
-
-            let buffer_size_after_read = self.buffer.read().len();
-            let bytes_read = buffer_size_after_read - buffer_size_before_read;
-
-            if bytes_read == 0 {
-                return Err(LimboError::Corrupt(format!(
-                    "Expected to read {still_need} bytes more but read 0 bytes at offset {}",
-                    self.offset
-                )));
-            }
-
-            self.offset += bytes_read;
+            self.in_flight_read = Some(InFlightRead::Chunk {
+                completion: c,
+                pre_size: buffer_size_before_read,
+            });
+            // Loop to take the resume branch — covers both synchronous and
+            // asynchronous completion paths.
         }
-
-        // Cleanup consumed bytes. If everything was consumed, clear avoids memmove.
-        let mut buffer = self.buffer.write();
-        if initial_buffer_offset >= buffer.len() {
-            buffer.clear();
-        } else if initial_buffer_offset > 0 {
-            let _ = buffer.drain(0..initial_buffer_offset);
-        }
-        self.buffer_offset = 0;
-        Ok(())
     }
 
     fn bytes_can_read(&self) -> usize {
@@ -2304,7 +3842,7 @@ enum EncryptedChunkReadResult {
 #[cfg_attr(test, derive(Debug))]
 enum ParseResult {
     /// A fully validated transaction frame was parsed.
-    Ops(Vec<ParsedOp>),
+    Frame(ParsedFrame),
     /// True end-of-file: not enough bytes remain to form a complete frame.
     Eof,
     /// An invalid frame was encountered (bad magic, CRC mismatch, structural error).
@@ -2312,6 +3850,16 @@ enum ParseResult {
     /// but semantically distinct: the data exists but is not a valid frame.
     /// `last_valid_offset` is set to the start of the invalid frame before returning this.
     InvalidFrame,
+}
+
+#[cfg_attr(test, derive(Debug))]
+pub struct ParsedFrame {
+    ops: Vec<ParsedOp>,
+    pub portable_changes: Vec<u8>,
+    pub extension_record_count: u32,
+    pub frame_flags: u32,
+    pub commit_ts: u64,
+    pub end_offset: usize,
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
@@ -2325,6 +3873,8 @@ pub(crate) enum ParsedOp {
     },
     DeleteTable {
         rowid: RowID,
+        record_bytes: Vec<u8>,
+        pk_record_bytes: Vec<u8>,
         commit_ts: u64,
         btree_resident: bool,
     },
@@ -2354,6 +3904,9 @@ pub(crate) enum IndexOpKind {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::IOResult;
+    use crate::util::IOExt as _;
+    use std::cell::RefCell;
     use std::collections::BTreeSet;
     use std::sync::Once;
 
@@ -2376,17 +3929,20 @@ mod tests {
             read_varint, read_varint_partial, varint_len, write_varint, DatabaseHeader,
         },
         types::{ImmutableRecord, ImmutableRecordRef, IndexInfo, Text},
-        Buffer, Completion, LimboError, Value, ValueRef,
+        Buffer, Completion, SharedBufferData, Value, ValueRef,
     };
 
     use super::{
         build_encrypted_chunk_aad, encrypted_chunk_blob_size, encrypted_chunk_plaintext_len,
         encrypted_payload_blob_size, encrypted_payload_chunk_count, serialize_header_entry,
         serialize_op_entry, HeaderReadResult, LogHeader, LogicalLog, ParseResult, ParsedOp,
-        StreamingLogicalLogReader, StreamingResult, ENCRYPTED_CHUNK_AAD_SIZE,
-        ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, FRAME_MAGIC, LOG_HDR_CRC_START,
-        LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION, TX_HEADER_SIZE, TX_TRAILER_SIZE,
+        StreamingLogicalLogReader, ENCRYPTED_CHUNK_AAD_SIZE, ENCRYPTED_PAYLOAD_CHUNK_SIZE,
+        END_MAGIC, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_CRC_START, LOG_HDR_RESERVED_START,
+        LOG_HDR_SIZE, LOG_VERSION, LOG_VERSION_V2, TX_EXT_HEADER_SIZE, TX_HEADER_SIZE,
+        TX_HEADER_SIZE_V2, TX_TRAILER_SIZE,
     };
+    #[cfg(feature = "conn_raw_api")]
+    use super::{EXTENSION_RECORD_HEADER_SIZE, EXTENSION_TYPE_PORTABLE_CHANGES, OP_UPSERT_TABLE};
     use crate::OpenFlags;
     use crate::{turso_assert, turso_assert_less_than};
     use tracing_subscriber::EnvFilter;
@@ -2408,21 +3964,19 @@ mod tests {
         let file = io.open_file(file_name, OpenFlags::Create, false).unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
-        let mut tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: commit_ts,
-            row_versions: Vec::new(),
-            header: None,
-        };
+        let mut tx = crate::mvcc::database::LogRecord::new(commit_ts);
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row: row.clone(),
             btree_resident: false,
         };
-        tx.row_versions.push(version);
-        let c = log.log_tx(&tx).unwrap();
+        tx.push_row_version_for_test(&version);
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let rowid_len = varint_len(1);
@@ -2451,42 +4005,54 @@ mod tests {
         let mut reader = StreamingLogicalLogReader::new(file, None);
         reader.read_header(io).unwrap();
         let mut ops = Vec::new();
-        loop {
-            match reader
-                .next_record(io, |_id| {
-                    Err(LimboError::InternalError("no index".to_string()))
-                })
-                .unwrap()
-            {
-                StreamingResult::UpsertTableRow {
-                    row,
-                    rowid,
-                    commit_ts,
-                    btree_resident,
-                } => {
-                    ops.push(ExpectedTableOp::Upsert {
-                        rowid: rowid.row_id.to_int_or_panic(),
-                        payload: row.payload().to_vec(),
+        while let Some(frame) = reader.next_frame_blocking(io).unwrap() {
+            for op in frame {
+                match op {
+                    ParsedOp::UpsertTable {
+                        rowid,
+                        record_bytes,
                         commit_ts,
                         btree_resident,
-                    });
-                }
-                StreamingResult::DeleteTableRow {
-                    rowid,
-                    commit_ts,
-                    btree_resident,
-                } => {
-                    ops.push(ExpectedTableOp::Delete {
-                        rowid: rowid.row_id.to_int_or_panic(),
+                        ..
+                    } => {
+                        ops.push(ExpectedTableOp::Upsert {
+                            rowid: rowid.row_id.to_int_or_panic(),
+                            payload: record_bytes,
+                            commit_ts,
+                            btree_resident,
+                        });
+                    }
+                    ParsedOp::DeleteTable {
+                        rowid,
                         commit_ts,
                         btree_resident,
-                    });
+                        ..
+                    } => {
+                        ops.push(ExpectedTableOp::Delete {
+                            rowid: rowid.row_id.to_int_or_panic(),
+                            commit_ts,
+                            btree_resident,
+                        });
+                    }
+                    other => panic!("unexpected op: {other:?}"),
                 }
-                StreamingResult::Eof => break,
-                other => panic!("unexpected record: {other:?}"),
             }
         }
         ops
+    }
+
+    fn read_file_range_bytes(
+        file: &Arc<dyn crate::File>,
+        io: &Arc<dyn crate::IO>,
+        pos: u64,
+        len: usize,
+    ) -> Vec<u8> {
+        let buf = Arc::new(Buffer::new_temporary(len));
+        let c = file
+            .pread(pos, Completion::new_read(buf.clone(), |_| None))
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        buf.as_slice().to_vec()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2503,21 +4069,19 @@ mod tests {
         let row = generate_simple_string_row(table_id, rowid, payload_text);
         let row_version = crate::mvcc::database::RowVersion {
             id: commit_ts,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: if is_delete {
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(if is_delete {
                 Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
             } else {
                 None
-            },
+            }),
             row,
             btree_resident,
         };
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: commit_ts,
-            row_versions: vec![row_version],
-            header: None,
-        };
-        let c = log.log_tx(&tx).unwrap();
+        let tx = crate::mvcc::database::LogRecord::for_test(commit_ts, &[row_version], None);
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
     }
 
@@ -2528,7 +4092,300 @@ mod tests {
             .unwrap();
         let mut reader = StreamingLogicalLogReader::new(file, None);
         reader.buffer.write().extend_from_slice(bytes);
-        reader.consume_varint_bytes(&io)
+        io.block(|| reader.consume_varint_bytes())
+    }
+
+    /// A test `File` that DEFERS every pread and SHORT-READS at most `max_read`
+    /// bytes per call, so the streaming reader actually yields mid-frame (and is
+    /// re-entered) and a single op spans many reads. Owns the full log bytes;
+    /// reads complete only via an explicit `step()`, letting the test drive the
+    /// reader's state machine one IO at a time and observe peak buffer usage.
+    /// `MemoryIO` completes preads synchronously and fully, so it cannot exercise
+    /// the mid-frame yield/resume paths — this can.
+    struct SlowReadFile {
+        data: Vec<u8>,
+        max_read: usize,
+        pending: std::sync::Mutex<std::collections::VecDeque<(u64, Completion)>>,
+    }
+
+    impl SlowReadFile {
+        fn new(data: Vec<u8>, max_read: usize) -> Self {
+            Self {
+                data,
+                max_read,
+                pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            }
+        }
+
+        /// Complete the oldest pending pread with a short read. Returns false if
+        /// nothing is pending (a stall — the reader expected more IO).
+        fn step(&self) -> bool {
+            let Some((pos, c)) = self.pending.lock().unwrap().pop_front() else {
+                return false;
+            };
+            let pos = pos as usize;
+            let read = c.as_read();
+            let cap = read.buf().len();
+            let avail = self.data.len().saturating_sub(pos);
+            let n = cap.min(self.max_read).min(avail);
+            if n > 0 {
+                read.buf().as_mut_slice()[..n].copy_from_slice(&self.data[pos..pos + n]);
+            }
+            c.complete(n as i32);
+            true
+        }
+    }
+
+    impl crate::File for SlowReadFile {
+        fn lock_file(&self, _exclusive: bool) -> crate::Result<()> {
+            Ok(())
+        }
+        fn unlock_file(&self) -> crate::Result<()> {
+            Ok(())
+        }
+        fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+            self.pending.lock().unwrap().push_back((pos, c.clone()));
+            Ok(c)
+        }
+        fn pwrite(
+            &self,
+            _pos: u64,
+            _buffer: Arc<Buffer>,
+            _c: Completion,
+        ) -> crate::Result<Completion> {
+            unimplemented!("SlowReadFile is read-only")
+        }
+        fn sync(
+            &self,
+            _c: Completion,
+            _sync_type: crate::io::FileSyncType,
+        ) -> crate::Result<Completion> {
+            unimplemented!("SlowReadFile is read-only")
+        }
+        fn size(&self) -> crate::Result<u64> {
+            Ok(self.data.len() as u64)
+        }
+        fn truncate(&self, _len: u64, _c: Completion) -> crate::Result<Completion> {
+            unimplemented!("SlowReadFile is read-only")
+        }
+    }
+
+    /// Read an entire (synchronous) file into a `Vec`.
+    fn read_file_to_vec(file: &Arc<dyn crate::File>) -> Vec<u8> {
+        let size = file.size().unwrap() as usize;
+        let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = out.clone();
+        let buf = Arc::new(Buffer::new_temporary(size));
+        let c = Completion::new_read(buf, move |res| {
+            if let Ok((b, n)) = res {
+                sink.lock()
+                    .unwrap()
+                    .extend_from_slice(&b.as_slice()[..n as usize]);
+            }
+            None
+        });
+        let _completion = file.pread(0, c).unwrap();
+        let bytes = out.lock().unwrap().clone();
+        assert_eq!(bytes.len(), size, "expected a synchronous full read");
+        bytes
+    }
+
+    fn table_row_version(
+        table_id: MVTableId,
+        rowid: i64,
+        commit_ts: u64,
+        data: &str,
+    ) -> crate::mvcc::database::RowVersion {
+        crate::mvcc::database::RowVersion {
+            id: commit_ts,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
+            row: generate_simple_string_row(table_id, rowid, data),
+            btree_resident: false,
+        }
+    }
+
+    /// Recover all ops through `SlowReadFile`, driving the reader one deferred IO
+    /// at a time. Returns the recovered ops and the peak `buffer` length observed
+    /// across the whole recovery.
+    fn recover_with_forced_yields(data: Vec<u8>, max_read: usize) -> (Vec<ParsedOp>, usize) {
+        recover_with_forced_yields_inner(data, max_read, None)
+    }
+
+    fn recover_with_forced_yields_inner(
+        data: Vec<u8>,
+        max_read: usize,
+        encryption: Option<(crate::storage::encryption::EncryptionContext, usize)>,
+    ) -> (Vec<ParsedOp>, usize) {
+        let slow = Arc::new(SlowReadFile::new(data, max_read));
+        let file: Arc<dyn crate::File> = slow.clone();
+        let mut reader = match encryption {
+            Some((ctx, chunk_size)) => {
+                StreamingLogicalLogReader::new_with_payload_chunk_size(file, Some(ctx), chunk_size)
+            }
+            None => StreamingLogicalLogReader::new(file, None),
+        };
+        let mut peak = 0usize;
+
+        // Header (read in one shot; max_read must exceed LOG_HDR_SIZE).
+        loop {
+            match reader.try_read_header_nonblock().unwrap() {
+                IOResult::Done(HeaderReadResult::Valid(_)) => break,
+                IOResult::Done(other) => panic!("unexpected header result: {other:?}"),
+                IOResult::IO(_) => assert!(slow.step(), "stalled reading header"),
+            }
+            peak = peak.max(reader.buffer.read().len());
+        }
+
+        // Frames.
+        let mut ops = Vec::new();
+        loop {
+            let result = reader.next_frame().unwrap();
+            peak = peak.max(reader.buffer.read().len());
+            match result {
+                IOResult::Done(Some(frame_ops)) => ops.extend(frame_ops),
+                IOResult::Done(None) => break,
+                IOResult::IO(_) => {
+                    assert!(slow.step(), "stalled reading frame");
+                    peak = peak.max(reader.buffer.read().len());
+                }
+            }
+        }
+        (ops, peak)
+    }
+
+    /// What this test checks: streaming recovery is correctly re-entrant when IO
+    /// yields at every read boundary, and the read buffer compacts per-op so a
+    /// large multi-op frame is not forced wholesale into memory.
+    /// Why this matters: recovery runs on a cooperative event loop, so a frame
+    /// must resume identically across yields; and a huge transaction must not
+    /// blow up memory during replay (the buffer is bounded to ~one op, not the
+    /// whole frame).
+    #[test]
+    fn test_logical_log_streaming_recovery_forced_yields_bounded_memory() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("logical_log_forced_yields", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        let table_id: MVTableId = (-100).into();
+
+        // A small frame, then one large frame with many sizable ops, then a
+        // multi-op small frame. The large frame is what would dominate memory if
+        // the whole frame had to stay buffered for re-parse.
+        let big_payload = "x".repeat(3000);
+        let frames: Vec<Vec<crate::mvcc::database::RowVersion>> = vec![
+            vec![table_row_version(table_id, 1, 10, "first")],
+            (0..40)
+                .map(|i| table_row_version(table_id, 100 + i as i64, 20, &big_payload))
+                .collect(),
+            vec![
+                table_row_version(table_id, 2, 30, "a"),
+                table_row_version(table_id, 3, 30, "b"),
+            ],
+        ];
+        for (idx, rows) in frames.iter().enumerate() {
+            let commit_ts = (idx as u64 + 1) * 10;
+            let tx = crate::mvcc::database::LogRecord::for_test(commit_ts, rows, None);
+            let c = log.log_tx(tx).unwrap();
+            io.wait_for_completion(c).unwrap();
+        }
+
+        // Expected ops via the straightforward synchronous (full-read) path.
+        let mut expected_reader = StreamingLogicalLogReader::new(file.clone(), None);
+        expected_reader.read_header(&io).unwrap();
+        let mut expected = Vec::new();
+        while let Some(frame) = expected_reader.next_frame_blocking(&io).unwrap() {
+            expected.extend(frame);
+        }
+        assert_eq!(expected.len(), 1 + 40 + 2);
+
+        // Recover the same bytes with deferred, short (64-byte) reads so every
+        // `try_consume_*` yields and a single op spans dozens of reads.
+        let bytes = read_file_to_vec(&file);
+        let (recovered, peak) = recover_with_forced_yields(bytes, 64);
+
+        assert_eq!(
+            recovered, expected,
+            "forced-yield recovery must match the synchronous path exactly"
+        );
+
+        // The large frame is ~40 * ~3KB ≈ 120KB. With per-op checkpointing the
+        // buffer holds at most ~one op plus a read chunk; the whole-frame rewind
+        // model would keep the entire frame resident. Assert a bound far below
+        // the frame size.
+        assert!(
+            peak < 16 * 1024,
+            "peak buffer {peak} bytes should be bounded to ~one op, not the whole frame"
+        );
+    }
+
+    /// What this test checks: encrypted recovery is correctly re-entrant when IO
+    /// yields at every read boundary. The encrypted payload is parsed wholesale
+    /// (rewind-and-rebuild from the payload start), so this exercises that the
+    /// post-header checkpoint + payload-start resume decrypts identically across
+    /// yields. (Memory is intentionally not bounded for encrypted frames — the
+    /// plaintext is accumulated contiguously by design — so only correctness is
+    /// asserted here.)
+    /// Why this matters: the refactor changed the encrypted resume point from the
+    /// frame start to the payload start; this guards that change under yields,
+    /// which `MemoryIO`-based tests cannot reach.
+    #[test]
+    fn test_encrypted_log_recovery_forced_yields() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let enc_ctx = test_enc_ctx();
+        const TEST_CHUNK_SIZE: usize = 2 * 1024;
+
+        // Two transactions; the first has a multi-op payload large enough to span
+        // several encrypted chunks, the second is small.
+        let big = "z".repeat(2500);
+        let tx0 = crate::mvcc::database::LogRecord::for_test(
+            100,
+            &[
+                make_test_row_version((-2).into(), 1, &big, 100),
+                make_test_row_version((-2).into(), 2, &big, 100),
+                make_test_row_version((-2).into(), 3, "small", 100),
+            ],
+            None,
+        );
+        let tx1 = crate::mvcc::database::LogRecord::for_test(
+            200,
+            &[make_test_row_version((-2).into(), 4, "tail", 200)],
+            None,
+        );
+        let file = write_encrypted_txs_with_chunk_size_for_test(
+            &io,
+            "enc-forced-yields.db-log",
+            &enc_ctx,
+            TEST_CHUNK_SIZE,
+            vec![tx0, tx1],
+        );
+
+        let expected: Vec<ParsedOp> = parse_all_encrypted_tx_ops_with_chunk_size_for_test(
+            file.clone(),
+            &io,
+            &enc_ctx,
+            TEST_CHUNK_SIZE,
+        )
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect();
+        assert_eq!(expected.len(), 4);
+
+        let bytes = read_file_to_vec(&file);
+        let (recovered, _peak) =
+            recover_with_forced_yields_inner(bytes, 64, Some((enc_ctx.clone(), TEST_CHUNK_SIZE)));
+
+        assert_eq!(
+            recovered, expected,
+            "encrypted forced-yield recovery must match the synchronous path exactly"
+        );
     }
 
     /// What this test checks: A committed transaction written to the logical log is replayed correctly after restart.
@@ -2557,15 +4414,17 @@ mod tests {
                     )), // sql
                 ],
                 5,
-            );
+            )
+            .unwrap();
             mvcc_store
                 .insert(
                     tx_id,
                     Row::new_table_row(
                         RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob().to_vec(),
+                        data.as_blob(),
                         5,
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             // now insert a row into table -2
@@ -2628,15 +4487,17 @@ mod tests {
                     )), // sql
                 ],
                 5,
-            );
+            )
+            .unwrap();
             mvcc_store
                 .insert(
                     tx_id,
                     Row::new_table_row(
                         RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob().to_vec(),
+                        data.as_blob(),
                         5,
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -2741,15 +4602,17 @@ mod tests {
                     )), // sql
                 ],
                 5,
-            );
+            )
+            .unwrap();
             mvcc_store
                 .insert(
                     tx_id,
                     Row::new_table_row(
                         RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob().to_vec(),
+                        data.as_blob(),
                         5,
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -2854,7 +4717,7 @@ mod tests {
             .expect("Index should exist");
         // Use get_table_id_from_root_page to get the correct index_id (handles both checkpointed and non-checkpointed)
         let index_id = mvcc_store.get_table_id_from_root_page(index.root_page);
-        let index_info = Arc::new(IndexInfo::new_from_index(index));
+        let index_info = Arc::new(IndexInfo::new_from_index(index).unwrap());
 
         // Verify table rows can be read
         let tx = mvcc_store.begin_tx(pager).unwrap();
@@ -2884,9 +4747,10 @@ mod tests {
                     Value::from_i64(row_id),
                 ],
                 2,
-            );
+            )
+            .unwrap();
             let sortable_key = SortableIndexKey::new_from_record(key_record, index_info.clone());
-            let index_rowid = RowID::new(index_id, RowKey::Record(sortable_key));
+            let index_rowid = RowID::new(index_id, RowKey::Record(Arc::new(sortable_key)));
 
             // Use read_from_table_or_index to read the index row
             // This verifies that index rows were properly serialized and deserialized from the logical log
@@ -2898,7 +4762,9 @@ mod tests {
                 });
 
             let Some(index_row) = index_row_opt else {
-                panic!("Index row for ({data_value}, {row_id}) not found after recovery. Index rows should be in the logical log.");
+                panic!(
+                    "Index row for ({data_value}, {row_id}) not found after recovery. Index rows should be in the logical log."
+                );
             };
             // Verify the index row contains the correct data
             let RowKey::Record(sortable_key) = index_row.id.row_id else {
@@ -2941,34 +4807,30 @@ mod tests {
         let op_size = 6 + payload_len_len + payload_len;
         let frame_size = TX_HEADER_SIZE + op_size + TX_TRAILER_SIZE;
 
-        let mut tx1 = crate::mvcc::database::LogRecord {
-            tx_timestamp: 10,
-            row_versions: Vec::new(),
-            header: None,
-        };
-        tx1.row_versions.push(crate::mvcc::database::RowVersion {
+        let mut tx1 = crate::mvcc::database::LogRecord::new(10);
+        tx1.push_row_version_for_test(&crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(10)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(10),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row: row.clone(),
             btree_resident: false,
         });
-        let c = log.log_tx(&tx1).unwrap();
+        let c = log.log_tx(tx1).unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let mut tx2 = crate::mvcc::database::LogRecord {
-            tx_timestamp: 20,
-            row_versions: Vec::new(),
-            header: None,
-        };
-        tx2.row_versions.push(crate::mvcc::database::RowVersion {
+        let mut tx2 = crate::mvcc::database::LogRecord::new(20);
+        tx2.push_row_version_for_test(&crate::mvcc::database::RowVersion {
             id: 2,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(20)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(20),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
         });
-        let c = log.log_tx(&tx2).unwrap();
+        let c = log.log_tx(tx2).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let file_size = file.size().unwrap() as usize;
@@ -2985,12 +4847,16 @@ mod tests {
             reader.read_header(&io).unwrap();
             let mut seen = 0;
             loop {
-                match reader.next_record(&io, |_id| {
-                    Err(LimboError::InternalError("no index".to_string()))
-                }) {
-                    Ok(StreamingResult::UpsertTableRow { .. }) => seen += 1,
-                    Ok(StreamingResult::Eof) => break,
-                    Ok(other) => panic!("unexpected record: {other:?}"),
+                match reader.next_frame_blocking(&io) {
+                    Ok(Some(frame)) => {
+                        for op in frame {
+                            match op {
+                                ParsedOp::UpsertTable { .. } => seen += 1,
+                                other => panic!("unexpected op: {other:?}"),
+                            }
+                        }
+                    }
+                    Ok(None) => break,
                     Err(err) => panic!("unexpected error: {err:?}"),
                 }
             }
@@ -3068,17 +4934,17 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file, None);
         reader.read_header(&io).unwrap();
-        match reader
-            .next_record(&io, |_id| {
-                Err(LimboError::InternalError("no index".to_string()))
-            })
+        let frame = reader
+            .next_frame_blocking(&io)
             .unwrap()
-        {
-            StreamingResult::UpsertTableRow { rowid, .. } => {
+            .expect("expected one frame");
+        assert_eq!(frame.len(), 1);
+        match &frame[0] {
+            ParsedOp::UpsertTable { rowid, .. } => {
                 assert_eq!(rowid.table_id, table_id);
                 assert_eq!(rowid.row_id.to_int_or_panic(), 7);
             }
-            other => panic!("unexpected record: {other:?}"),
+            other => panic!("unexpected op: {other:?}"),
         }
     }
 
@@ -3108,18 +4974,20 @@ mod tests {
 
         // Frame 3: deferred path — offset must not advance until confirmed.
         let row3 = generate_simple_string_row((-2).into(), 3, "deferred");
-        let tx3 = crate::mvcc::database::LogRecord {
-            tx_timestamp: 3,
-            row_versions: vec![crate::mvcc::database::RowVersion {
+        let tx3 = crate::mvcc::database::LogRecord::for_test(
+            3,
+            &[crate::mvcc::database::RowVersion {
                 id: 3,
-                begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(3)),
-                end: None,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(3),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
                 row: row3,
                 btree_resident: false,
             }],
-            header: None,
-        };
-        let (c, bytes_written) = log.log_tx_deferred_offset(&tx3, None).unwrap();
+            None,
+        );
+        let (c, bytes_written) = log.log_tx_deferred_offset(tx3, None).unwrap();
         io.wait_for_completion(c).unwrap();
 
         assert_eq!(
@@ -3149,6 +5017,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_on_serialization_complete_gets_shared_write_bytes() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file(
+                "serialization-callback-shared.db-log",
+                OpenFlags::Create,
+                false,
+            )
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let captured = RefCell::new(Vec::<(SharedBufferData, u32)>::new());
+        let callback = |bytes: SharedBufferData, crc: u32| {
+            captured.borrow_mut().push((bytes, crc));
+            Ok(())
+        };
+
+        let tx1 = crate::mvcc::database::LogRecord::for_test(
+            1,
+            &[crate::mvcc::database::RowVersion {
+                id: 1,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(1),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
+                row: generate_simple_string_row((-2).into(), 1, "first"),
+                btree_resident: false,
+            }],
+            None,
+        );
+        let (c, first_len) = log.log_tx_deferred_offset(tx1, Some(&callback)).unwrap();
+        io.wait_for_completion(c).unwrap();
+        log.advance_offset_after_success(first_len);
+
+        let tx2 = crate::mvcc::database::LogRecord::for_test(
+            2,
+            &[crate::mvcc::database::RowVersion {
+                id: 2,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(2),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
+                row: generate_simple_string_row((-2).into(), 2, "second"),
+                btree_resident: false,
+            }],
+            None,
+        );
+        let (c, second_len) = log.log_tx_deferred_offset(tx2, Some(&callback)).unwrap();
+        io.wait_for_completion(c).unwrap();
+        log.advance_offset_after_success(second_len);
+
+        let captured = captured.borrow();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].0.len(), first_len as usize);
+        assert_eq!(captured[1].0.len(), second_len as usize);
+        assert!(matches!(&captured[0].0, SharedBufferData::Full(_)));
+        assert!(matches!(&captured[1].0, SharedBufferData::View(_)));
+
+        let first_on_disk = read_file_range_bytes(&file, &io, 0, first_len as usize);
+        let second_on_disk = read_file_range_bytes(&file, &io, first_len, second_len as usize);
+        assert_eq!(captured[0].0.as_slice(), first_on_disk.as_slice());
+        assert_eq!(captured[1].0.as_slice(), second_on_disk.as_slice());
+        assert_eq!(
+            captured[0].1,
+            u32::from_le_bytes(
+                captured[0].0.as_slice()[captured[0].0.len() - TX_TRAILER_SIZE
+                    ..captured[0].0.len() - TX_TRAILER_SIZE + 4]
+                    .try_into()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            captured[1].1,
+            u32::from_le_bytes(
+                captured[1].0.as_slice()[captured[1].0.len() - TX_TRAILER_SIZE
+                    ..captured[1].0.len() - TX_TRAILER_SIZE + 4]
+                    .try_into()
+                    .unwrap()
+            )
+        );
+    }
+
     /// What this test checks: A payload bit flip in a fully present tail frame is ignored as invalid tail.
     /// Why this matters: Availability-focused recovery keeps the valid prefix even when newest tail bytes are bad.
     #[test]
@@ -3160,21 +5111,19 @@ mod tests {
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
-        let mut tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 123,
-            row_versions: Vec::new(),
-            header: None,
-        };
+        let mut tx = crate::mvcc::database::LogRecord::new(123);
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(123)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(123),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
         };
-        tx.row_versions.push(version);
-        let c = log.log_tx(&tx).unwrap();
+        tx.push_row_version_for_test(&version);
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         // Flip one byte in the op data (varint payload_len).
@@ -3191,10 +5140,8 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let res = reader.next_record(&io, |_id| {
-            Err(LimboError::InternalError("no index".to_string()))
-        });
-        assert!(matches!(res.unwrap(), StreamingResult::Eof));
+        let res = reader.next_frame_blocking(&io);
+        assert!(res.unwrap().is_none());
     }
 
     /// What this test checks: Malformed payload-length varint in newest frame is treated as invalid tail.
@@ -3265,10 +5212,8 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let res = reader.next_record(&io, |_id| {
-            Err(LimboError::InternalError("no index".to_string()))
-        });
-        assert!(matches!(res.unwrap(), StreamingResult::Eof));
+        let res = reader.next_frame_blocking(&io);
+        assert!(res.unwrap().is_none());
     }
 
     /// What this test checks: Header payload-size mismatch in the newest frame is treated as invalid tail.
@@ -3293,10 +5238,8 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let res = reader.next_record(&io, |_id| {
-            Err(LimboError::InternalError("no index".to_string()))
-        });
-        assert!(matches!(res.unwrap(), StreamingResult::Eof));
+        let res = reader.next_frame_blocking(&io);
+        assert!(res.unwrap().is_none());
     }
 
     /// What this test checks: Invalid frame-magic at newest frame boundary is treated as invalid tail.
@@ -3317,10 +5260,8 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let res = reader.next_record(&io, |_id| {
-            Err(LimboError::InternalError("no index".to_string()))
-        });
-        assert!(matches!(res.unwrap(), StreamingResult::Eof));
+        let res = reader.next_frame_blocking(&io);
+        assert!(res.unwrap().is_none());
     }
 
     /// What this test checks: Corrupting only the stored CRC field turns newest frame into invalid tail.
@@ -3340,10 +5281,8 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let res = reader.next_record(&io, |_id| {
-            Err(LimboError::InternalError("no index".to_string()))
-        });
-        assert!(matches!(res.unwrap(), StreamingResult::Eof));
+        let res = reader.next_frame_blocking(&io);
+        assert!(res.unwrap().is_none());
     }
 
     /// What this test checks: A corrupted newest frame is dropped while older valid frames still replay.
@@ -3402,12 +5341,8 @@ mod tests {
             .open_file("header-corrupt.db-log", crate::OpenFlags::Create, false)
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 77,
-            row_versions: vec![],
-            header: None,
-        };
-        let c = log.log_tx(&tx).unwrap();
+        let tx = crate::mvcc::database::LogRecord::for_test(77, &[], None);
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         // Corrupt magic bytes in the file header.
@@ -3562,10 +5497,8 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let res = reader.next_record(&io, |_id| {
-            Err(LimboError::InternalError("no index".to_string()))
-        });
-        assert!(matches!(res.unwrap(), StreamingResult::Eof));
+        let res = reader.next_frame_blocking(&io);
+        assert!(res.unwrap().is_none());
     }
 
     /// What this test checks: Non-negative table_id in newest frame is treated as invalid tail.
@@ -3588,10 +5521,8 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let res = reader.next_record(&io, |_id| {
-            Err(LimboError::InternalError("no index".to_string()))
-        });
-        assert!(matches!(res.unwrap(), StreamingResult::Eof));
+        let res = reader.next_frame_blocking(&io);
+        assert!(res.unwrap().is_none());
     }
 
     /// What this test checks: Zero-operation frames are silently skipped by the reader, and a
@@ -3609,53 +5540,40 @@ mod tests {
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
         // Frame 1: empty tx (no ops). The reader must skip it silently (ops.is_empty() → continue).
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 200,
-            row_versions: vec![],
-            header: None,
-        };
-        let c = log.log_tx(&tx).unwrap();
+        let tx = crate::mvcc::database::LogRecord::for_test(200, &[], None);
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         // Frame 2: header-only tx. DatabaseHeader::default() has the SQLite magic that passes
         // the reader's magic validation check.
         let commit_ts = 201u64;
         let db_header = DatabaseHeader::default();
-        let header_tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: commit_ts,
-            row_versions: vec![],
-            header: Some(db_header),
-        };
-        let c = log.log_tx(&header_tx).unwrap();
+        let header_tx = crate::mvcc::database::LogRecord::for_test(commit_ts, &[], Some(db_header));
+        let c = log.log_tx(header_tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
 
         // The reader skips the empty frame and returns the UpdateHeader from frame 2.
-        let rec = reader
-            .next_record(&io, |_id| {
-                Err(LimboError::InternalError("no index".to_string()))
-            })
-            .unwrap();
-        match rec {
-            StreamingResult::UpdateHeader {
+        let frame = reader
+            .next_frame_blocking(&io)
+            .unwrap()
+            .expect("expected UpdateHeader frame after empty tx");
+        assert_eq!(frame.len(), 1);
+        match &frame[0] {
+            ParsedOp::UpdateHeader {
                 header: recovered,
                 commit_ts: recovered_ts,
             } => {
-                assert_eq!(recovered_ts, commit_ts);
+                assert_eq!(*recovered_ts, commit_ts);
                 assert_eq!(recovered.magic, db_header.magic);
             }
             other => panic!("expected UpdateHeader, got {other:?}"),
         }
 
         // Nothing left after frame 2.
-        let eof = reader
-            .next_record(&io, |_id| {
-                Err(LimboError::InternalError("no index".to_string()))
-            })
-            .unwrap();
-        assert!(matches!(eof, StreamingResult::Eof));
+        assert!(reader.next_frame_blocking(&io).unwrap().is_none());
     }
 
     /// What this test checks: Every single-bit flip in a full frame is either detected or safely rejected.
@@ -3668,19 +5586,17 @@ mod tests {
             .open_file("bitflip.db-log", crate::OpenFlags::Create, false)
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
-        let mut tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 300,
-            row_versions: Vec::new(),
-            header: None,
-        };
-        tx.row_versions.push(crate::mvcc::database::RowVersion {
+        let mut tx = crate::mvcc::database::LogRecord::new(300);
+        tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(300)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(300),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row: generate_simple_string_row((-2).into(), 42, "flip"),
             btree_resident: false,
         });
-        let c = log.log_tx(&tx).unwrap();
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let size = file.size().unwrap() as usize;
@@ -3706,13 +5622,11 @@ mod tests {
 
                 let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
                 reader.read_header(&io).unwrap();
-                let res = reader.next_record(&io, |_id| {
-                    Err(LimboError::InternalError("no index".to_string()))
-                });
+                let res = reader.next_frame_blocking(&io);
                 match res {
-                    Err(_) | Ok(StreamingResult::Eof) => {}
-                    Ok(other) => {
-                        panic!("bit flip at offset={i}, bit={bit} produced valid record: {other:?}")
+                    Err(_) | Ok(None) => {}
+                    Ok(Some(frame)) => {
+                        panic!("bit flip at offset={i}, bit={bit} produced valid frame: {frame:?}")
                     }
                 }
 
@@ -3743,28 +5657,25 @@ mod tests {
 
         let mut expected = Vec::new();
         for tx_i in 0..128u64 {
-            let mut tx = crate::mvcc::database::LogRecord {
-                tx_timestamp: 1_000 + tx_i,
-                row_versions: Vec::new(),
-                header: None,
-            };
+            let mut tx = crate::mvcc::database::LogRecord::new(1_000 + tx_i);
             let op_count = (rng.next_u64() % 4) as usize;
             for _ in 0..op_count {
                 let rowid = (rng.next_u64() % 64) as i64 + 1;
                 let btree_resident = (rng.next_u32() & 1) == 1;
                 let is_delete = (rng.next_u32() & 1) == 1;
                 if is_delete {
-                    tx.row_versions.push(crate::mvcc::database::RowVersion {
+                    tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
                         id: 0,
-                        begin: None,
-                        end: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(
-                            tx.tx_timestamp,
+                        begin: crate::mvcc::database::PackedTs::pack(None),
+                        end: crate::mvcc::database::PackedTs::pack(Some(
+                            crate::mvcc::database::TxTimestampOrID::Timestamp(tx.tx_timestamp),
                         )),
                         row: Row::new_table_row(
                             RowID::new((-2).into(), RowKey::Int(rowid)),
-                            Vec::new(),
+                            &[],
                             0,
-                        ),
+                        )
+                        .unwrap(),
                         btree_resident,
                     });
                     expected.push(ExpectedTableOp::Delete {
@@ -3775,12 +5686,12 @@ mod tests {
                 } else {
                     let payload = format!("r-{tx_i}-{rowid}");
                     let row = generate_simple_string_row((-2).into(), rowid, &payload);
-                    tx.row_versions.push(crate::mvcc::database::RowVersion {
+                    tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
                         id: 0,
-                        begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(
-                            tx.tx_timestamp,
+                        begin: crate::mvcc::database::PackedTs::pack(Some(
+                            crate::mvcc::database::TxTimestampOrID::Timestamp(tx.tx_timestamp),
                         )),
-                        end: None,
+                        end: crate::mvcc::database::PackedTs::pack(None),
                         row: row.clone(),
                         btree_resident,
                     });
@@ -3792,7 +5703,7 @@ mod tests {
                     });
                 }
             }
-            let c = log.log_tx(&tx).unwrap();
+            let c = log.log_tx(tx).unwrap();
             io.wait_for_completion(c).unwrap();
         }
 
@@ -3801,11 +5712,7 @@ mod tests {
         // correctly when a single frame spans chunk boundaries.
         let large_commit_ts = 1_000 + 128u64;
         let large_text: String = "x".repeat(200);
-        let mut large_tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: large_commit_ts,
-            row_versions: Vec::new(),
-            header: None,
-        };
+        let mut large_tx = crate::mvcc::database::LogRecord::new(large_commit_ts);
         for rowid in 1..=30i64 {
             let row = generate_simple_string_row((-3).into(), rowid, &large_text);
             expected.push(ExpectedTableOp::Upsert {
@@ -3814,19 +5721,17 @@ mod tests {
                 commit_ts: large_commit_ts,
                 btree_resident: false,
             });
-            large_tx
-                .row_versions
-                .push(crate::mvcc::database::RowVersion {
-                    id: rowid as u64,
-                    begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(
-                        large_commit_ts,
-                    )),
-                    end: None,
-                    row,
-                    btree_resident: false,
-                });
+            large_tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
+                id: rowid as u64,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(large_commit_ts),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
+                row,
+                btree_resident: false,
+            });
         }
-        let c = log.log_tx(&large_tx).unwrap();
+        let c = log.log_tx(large_tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let got = read_table_ops(file.clone(), &io);
@@ -3855,12 +5760,14 @@ mod tests {
             let row = generate_simple_string_row((-2).into(), rowid, &payload_text);
             let row_version = crate::mvcc::database::RowVersion {
                 id: commit_ts,
-                begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-                end: if is_delete {
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(if is_delete {
                     Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
                 } else {
                     None
-                },
+                }),
                 row: row.clone(),
                 btree_resident,
             };
@@ -3878,12 +5785,8 @@ mod tests {
                     btree_resident,
                 }
             });
-            let tx = crate::mvcc::database::LogRecord {
-                tx_timestamp: commit_ts,
-                row_versions: vec![row_version],
-                header: None,
-            };
-            let Ok(c) = log.log_tx(&tx) else {
+            let tx = crate::mvcc::database::LogRecord::for_test(commit_ts, &[row_version], None);
+            let Ok(c) = log.log_tx(tx) else {
                 return false;
             };
             if io.wait_for_completion(c).is_err() {
@@ -3961,22 +5864,20 @@ mod tests {
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
-        let mut tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 55,
-            row_versions: Vec::new(),
-            header: None,
-        };
+        let mut tx = crate::mvcc::database::LogRecord::new(55);
         let mut row = generate_simple_string_row((-2).into(), 1, "foo");
         row.id.table_id = (-2).into();
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(55)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(55),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: true,
         };
-        tx.row_versions.push(version);
-        let c = log.log_tx(&tx).unwrap();
+        tx.push_row_version_for_test(&version);
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         // Verify the on-disk frame header binary layout.
@@ -4001,16 +5902,16 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
-        let rec = reader
-            .next_record(&io, |_id| {
-                Err(LimboError::InternalError("no index".to_string()))
-            })
-            .unwrap();
-        match rec {
-            StreamingResult::UpsertTableRow { btree_resident, .. } => {
-                assert!(btree_resident);
+        let frame = reader
+            .next_frame_blocking(&io)
+            .unwrap()
+            .expect("expected one frame");
+        assert_eq!(frame.len(), 1);
+        match &frame[0] {
+            ParsedOp::UpsertTable { btree_resident, .. } => {
+                assert!(*btree_resident);
             }
-            _ => panic!("unexpected record"),
+            other => panic!("unexpected op: {other:?}"),
         }
     }
 
@@ -4025,21 +5926,19 @@ mod tests {
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
-        let mut tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 10,
-            row_versions: Vec::new(),
-            header: None,
-        };
+        let mut tx = crate::mvcc::database::LogRecord::new(10);
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(10)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(10),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
         };
-        tx.row_versions.push(version);
-        let c = log.log_tx(&tx).unwrap();
+        tx.push_row_version_for_test(&version);
+        let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let c = file
@@ -4050,6 +5949,7 @@ mod tests {
         let mut reader = StreamingLogicalLogReader::new(file.clone(), None);
         reader.read_header(&io).unwrap();
         let header = reader.header().unwrap();
+        assert_eq!(header.version, LOG_VERSION_V2);
         // Verify the on-disk CRC matches a fresh computation over the header bytes
         let encoded = header.encode();
         let mut check_buf = [0u8; LOG_HDR_SIZE];
@@ -4066,6 +5966,7 @@ mod tests {
         init_tracing();
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
         let header = LogHeader::new(&io);
+        assert_eq!(header.version, LOG_VERSION_V2);
         assert_ne!(header.salt, 0, "salt should be non-zero from IO RNG");
         let bytes = header.encode();
         // Verify CRC: zero out the CRC field and recompute
@@ -4145,8 +6046,9 @@ mod tests {
         let header = reader.header().unwrap();
         assert_eq!(header.salt, salt_after);
 
-        match reader.parse_next_transaction(&io) {
-            Ok(ParseResult::Ops(ops)) => {
+        match io.block(|| reader.parse_next_transaction()) {
+            Ok(ParseResult::Frame(frame)) => {
+                let ops = frame.ops;
                 assert!(!ops.is_empty(), "expected at least one op");
             }
             Ok(ParseResult::Eof) => panic!("expected ops, got EOF"),
@@ -4154,7 +6056,7 @@ mod tests {
             Err(e) => panic!("expected ops, got error: {e:?}"),
         }
         assert!(matches!(
-            reader.parse_next_transaction(&io),
+            io.block(|| reader.parse_next_transaction()),
             Ok(ParseResult::Eof)
         ));
     }
@@ -4185,7 +6087,7 @@ mod tests {
             HeaderReadResult::Valid(_)
         ));
         let mut count = 0;
-        while let Ok(ParseResult::Ops(_)) = reader.parse_next_transaction(&io) {
+        while let Ok(ParseResult::Frame(_)) = io.block(|| reader.parse_next_transaction()) {
             count += 1;
         }
         assert_eq!(count, 3);
@@ -4209,7 +6111,7 @@ mod tests {
             HeaderReadResult::Valid(_)
         ));
         // Frame 1 is corrupted — CRC mismatch on structurally complete frame
-        match reader.parse_next_transaction(&io) {
+        match io.block(|| reader.parse_next_transaction()) {
             Ok(ParseResult::InvalidFrame) => {}
             other => panic!("expected InvalidFrame after corrupted frame 1, got {other:?}"),
         }
@@ -4285,13 +6187,13 @@ mod tests {
         ));
 
         // Frame 1 from log A should validate fine
-        match reader.parse_next_transaction(&io) {
-            Ok(ParseResult::Ops(ops)) => assert!(!ops.is_empty()),
+        match io.block(|| reader.parse_next_transaction()) {
+            Ok(ParseResult::Frame(frame)) => assert!(!frame.ops.is_empty()),
             other => panic!("expected log A's frame to parse, got {other:?}"),
         }
 
         // The spliced frame from log B should fail CRC validation
-        match reader.parse_next_transaction(&io) {
+        match io.block(|| reader.parse_next_transaction()) {
             Ok(ParseResult::InvalidFrame) => {}
             other => {
                 panic!("spliced frame from a different log should NOT validate, got {other:?}")
@@ -4322,8 +6224,10 @@ mod tests {
         let row = generate_simple_string_row(table_id, rowid, value);
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
         }
@@ -4341,7 +6245,8 @@ mod tests {
                 Value::from_i64(rowid),
             ],
             2,
-        );
+        )
+        .unwrap();
         let sortable_key = SortableIndexKey::new_from_record(
             key_record,
             Arc::new(IndexInfo {
@@ -4351,12 +6256,14 @@ mod tests {
                 ..Default::default()
             }),
         );
-        let row_id = RowID::new(table_id, RowKey::Record(sortable_key));
+        let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
         let row = Row::new_index_row(row_id, 2);
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
         }
@@ -4378,19 +6285,20 @@ mod tests {
         commit_ts: u64,
         is_delete: bool,
     ) -> crate::mvcc::database::RowVersion {
-        let row = Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), record_bytes, 1);
+        let row =
+            Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), &record_bytes, 1).unwrap();
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
-            begin: if is_delete {
+            begin: crate::mvcc::database::PackedTs::pack(if is_delete {
                 None
             } else {
                 Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
-            },
-            end: if is_delete {
+            }),
+            end: crate::mvcc::database::PackedTs::pack(if is_delete {
                 Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
             } else {
                 None
-            },
+            }),
             row,
             btree_resident: false,
         }
@@ -4404,20 +6312,20 @@ mod tests {
         is_delete: bool,
     ) -> crate::mvcc::database::RowVersion {
         let sortable_key = SortableIndexKey::new_from_bytes(payload_bytes, test_index_info());
-        let row_id = RowID::new(table_id, RowKey::Record(sortable_key));
+        let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
         let row = Row::new_index_row(row_id, 2);
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
-            begin: if is_delete {
+            begin: crate::mvcc::database::PackedTs::pack(if is_delete {
                 None
             } else {
                 Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
-            },
-            end: if is_delete {
+            }),
+            end: crate::mvcc::database::PackedTs::pack(if is_delete {
                 Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
             } else {
                 None
-            },
+            }),
             row,
             btree_resident: false,
         }
@@ -4427,7 +6335,7 @@ mod tests {
         let mut encoded = Vec::new();
         let value = "x".repeat(text_len);
         let row_version = make_test_row_version((-2).into(), rowid, &value, 100);
-        serialize_op_entry(&mut encoded, &row_version).unwrap();
+        serialize_op_entry(&mut encoded, &row_version, None).unwrap();
         encoded.len()
     }
 
@@ -4468,8 +6376,8 @@ mod tests {
         if file_size == 0 {
             return Vec::new();
         }
-        let reader = StreamingLogicalLogReader::new(file, None);
-        reader.read_exact_at(io, 0, file_size).unwrap()
+        let mut reader = StreamingLogicalLogReader::new(file, None);
+        io.block(|| reader.read_exact_at(0, file_size)).unwrap()
     }
 
     fn overwrite_file_bytes(file: Arc<dyn crate::File>, io: &Arc<dyn crate::IO>, bytes: &[u8]) {
@@ -4495,7 +6403,7 @@ mod tests {
     fn append_encrypted_tx(
         log: &mut LogicalLog,
         io: &Arc<dyn crate::IO>,
-        tx: &crate::mvcc::database::LogRecord,
+        tx: crate::mvcc::database::LogRecord,
     ) {
         let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -4505,7 +6413,7 @@ mod tests {
         file: Arc<dyn crate::File>,
         io: &Arc<dyn crate::IO>,
         enc_ctx: &crate::storage::encryption::EncryptionContext,
-        tx: &crate::mvcc::database::LogRecord,
+        tx: crate::mvcc::database::LogRecord,
     ) {
         assert_eq!(
             file.size().unwrap(),
@@ -4521,7 +6429,7 @@ mod tests {
         io: &Arc<dyn crate::IO>,
         enc_ctx: &crate::storage::encryption::EncryptionContext,
         encrypted_payload_chunk_size: usize,
-        tx: &crate::mvcc::database::LogRecord,
+        tx: crate::mvcc::database::LogRecord,
     ) {
         assert_eq!(
             file.size().unwrap(),
@@ -4541,7 +6449,7 @@ mod tests {
         io: &Arc<dyn crate::IO>,
         file_name: &str,
         enc_ctx: &crate::storage::encryption::EncryptionContext,
-        tx: &crate::mvcc::database::LogRecord,
+        tx: crate::mvcc::database::LogRecord,
     ) -> Arc<dyn crate::File> {
         let file = open_test_file(io, file_name);
         write_first_encrypted_tx(file.clone(), io, enc_ctx, tx);
@@ -4553,7 +6461,7 @@ mod tests {
         file_name: &str,
         enc_ctx: &crate::storage::encryption::EncryptionContext,
         encrypted_payload_chunk_size: usize,
-        tx: &crate::mvcc::database::LogRecord,
+        tx: crate::mvcc::database::LogRecord,
     ) -> Arc<dyn crate::File> {
         let file = open_test_file(io, file_name);
         write_first_encrypted_tx_with_chunk_size_for_test(
@@ -4571,7 +6479,7 @@ mod tests {
         file_name: &str,
         enc_ctx: &crate::storage::encryption::EncryptionContext,
         encrypted_payload_chunk_size: usize,
-        txs: &[crate::mvcc::database::LogRecord],
+        txs: Vec<crate::mvcc::database::LogRecord>,
     ) -> Arc<dyn crate::File> {
         let file = open_test_file(io, file_name);
         let mut log = LogicalLog::new_with_payload_chunk_size(
@@ -4593,12 +6501,12 @@ mod tests {
     ) -> Vec<ParsedOp> {
         let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
         reader.read_header(io).unwrap();
-        let ops = match reader.parse_next_transaction(io).unwrap() {
-            ParseResult::Ops(ops) => ops,
+        let ops = match io.block(|| reader.parse_next_transaction()).unwrap() {
+            ParseResult::Frame(frame) => frame.ops,
             other => panic!("expected Ops, got {other:?}"),
         };
         assert!(matches!(
-            reader.parse_next_transaction(io).unwrap(),
+            io.block(|| reader.parse_next_transaction()).unwrap(),
             ParseResult::Eof
         ));
         ops
@@ -4616,12 +6524,12 @@ mod tests {
             encrypted_payload_chunk_size,
         );
         reader.read_header(io).unwrap();
-        let ops = match reader.parse_next_transaction(io).unwrap() {
-            ParseResult::Ops(ops) => ops,
+        let ops = match io.block(|| reader.parse_next_transaction()).unwrap() {
+            ParseResult::Frame(frame) => frame.ops,
             other => panic!("expected Ops, got {other:?}"),
         };
         assert!(matches!(
-            reader.parse_next_transaction(io).unwrap(),
+            io.block(|| reader.parse_next_transaction()).unwrap(),
             ParseResult::Eof
         ));
         ops
@@ -4644,11 +6552,11 @@ mod tests {
         let mut frames = Vec::new();
         let mut tx_index = 0usize;
         loop {
-            match reader
-                .parse_next_transaction(io)
+            match io
+                .block(|| reader.parse_next_transaction())
                 .map_err(|e| format!("failed to parse fuzz frame {tx_index}: {e}"))?
             {
-                ParseResult::Ops(ops) => frames.push(ops),
+                ParseResult::Frame(frame) => frames.push(frame.ops),
                 ParseResult::Eof => break,
                 ParseResult::InvalidFrame => {
                     return Err(format!("invalid fuzz frame at tx_index={tx_index}"));
@@ -4783,11 +6691,11 @@ mod tests {
         chunk_size: usize,
     ) {
         let mut filler_buf = Vec::new();
-        serialize_op_entry(&mut filler_buf, short_filler).unwrap();
+        serialize_op_entry(&mut filler_buf, short_filler, None).unwrap();
         let mut short_upsert_buf = Vec::new();
-        serialize_op_entry(&mut short_upsert_buf, short_upsert).unwrap();
+        serialize_op_entry(&mut short_upsert_buf, short_upsert, None).unwrap();
         let mut long_upsert_buf = Vec::new();
-        serialize_op_entry(&mut long_upsert_buf, long_upsert).unwrap();
+        serialize_op_entry(&mut long_upsert_buf, long_upsert, None).unwrap();
 
         turso_assert_less_than!(
             filler_buf.len(),
@@ -4837,7 +6745,7 @@ mod tests {
             false,
         );
         let mut short_upsert_buf = Vec::new();
-        serialize_op_entry(&mut short_upsert_buf, &short_upsert).unwrap();
+        serialize_op_entry(&mut short_upsert_buf, &short_upsert, None).unwrap();
         turso_assert_less_than!(
             short_upsert_buf.len(),
             StreamingLogicalLogReader::MAX_SERIALIZED_OP_PREFIX_LEN,
@@ -4942,11 +6850,11 @@ mod tests {
                 expected_ops.push(expected_op);
             }
 
-            txs.push(crate::mvcc::database::LogRecord {
-                tx_timestamp: commit_ts,
-                row_versions,
-                header: None,
-            });
+            txs.push(crate::mvcc::database::LogRecord::for_test(
+                commit_ts,
+                &row_versions,
+                None,
+            ));
             expected_frames.push(expected_ops);
         }
 
@@ -4985,7 +6893,7 @@ mod tests {
     ) {
         let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
         reader.read_header(io).unwrap();
-        match reader.parse_next_transaction(io).unwrap() {
+        match io.block(|| reader.parse_next_transaction()).unwrap() {
             ParseResult::InvalidFrame => {}
             other => panic!("expected InvalidFrame, got {other:?}"),
         }
@@ -5011,15 +6919,15 @@ mod tests {
             .to_vec();
 
         // Write one encrypted frame with 2 ops.
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 100,
-            row_versions: vec![
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            100,
+            &[
                 make_test_row_version(table_id, 1, "hello", 100),
                 make_test_row_version(table_id, 2, "world", 100),
             ],
-            header: None,
-        };
-        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, &tx);
+            None,
+        );
+        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, tx);
 
         // ── Layout invariant check ──
         // Read the raw TX header to extract payload_size.
@@ -5053,8 +6961,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            encrypted_blob_size,
-            expected_blob_size,
+            encrypted_blob_size, expected_blob_size,
             "on-disk blob size ({encrypted_blob_size}) != expected chunked encrypted size({expected_blob_size})"
         );
 
@@ -5062,8 +6969,8 @@ mod tests {
         let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
         reader.read_header(&io).unwrap();
 
-        let ops = match reader.parse_next_transaction(&io).unwrap() {
-            ParseResult::Ops(ops) => ops,
+        let ops = match io.block(|| reader.parse_next_transaction()).unwrap() {
+            ParseResult::Frame(frame) => frame.ops,
             other => panic!("expected Ops, got {other:?}"),
         };
         assert_eq!(ops.len(), 2);
@@ -5071,7 +6978,7 @@ mod tests {
         assert_upsert_table_op(&ops[1], table_id, 2, &expected_world_record_bytes, 100);
 
         assert!(matches!(
-            reader.parse_next_transaction(&io).unwrap(),
+            io.block(|| reader.parse_next_transaction()).unwrap(),
             ParseResult::Eof
         ));
     }
@@ -5091,18 +6998,14 @@ mod tests {
         let value = "t".repeat(text_len);
         let row_version = make_test_row_version((-2).into(), 1, &value, 100);
         let expected_record_bytes = row_version.row.payload().to_vec();
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 100,
-            row_versions: vec![row_version],
-            header: None,
-        };
+        let tx = crate::mvcc::database::LogRecord::for_test(100, &[row_version], None);
 
         let file = write_single_encrypted_tx_with_chunk_size_for_test(
             &io,
             "enc-roundtrip-test-chunk-size.db-log",
             &enc_ctx,
             TEST_CHUNK_SIZE,
-            &tx,
+            tx,
         );
 
         assert_eq!(
@@ -5166,7 +7069,7 @@ mod tests {
                 &format!("enc-carry-fuzz-{seed}-{case_index}.db-log"),
                 &enc_ctx,
                 TEST_CHUNK_SIZE,
-                &txs,
+                txs,
             );
             let actual_frames = parse_all_encrypted_tx_ops_with_chunk_size_for_test(
                 file,
@@ -5181,8 +7084,7 @@ mod tests {
             });
 
             assert_eq!(
-                actual_frames,
-                expected_frames,
+                actual_frames, expected_frames,
                 "encrypted carry fuzz failed: root_seed={seed} case_index={case_index} forced_case_index={forced_case_index} include_forced_prefix={include_forced_prefix} case_seed={case_seed}"
             );
         }
@@ -5190,14 +7092,298 @@ mod tests {
 
     #[test]
     fn test_encrypted_log_format_assumptions_are_pinned() {
-        assert_eq!(LOG_VERSION, 2);
+        assert_eq!(LOG_VERSION_V2, 2);
+        assert_eq!(LOG_VERSION, 3);
         assert_eq!(LOG_HDR_SIZE, 56);
         assert_eq!(ENCRYPTED_PAYLOAD_CHUNK_SIZE, 32 * 1024);
         assert_eq!(ENCRYPTED_CHUNK_AAD_SIZE, 32);
         assert_eq!(FRAME_MAGIC, 0x5854_564D);
+        assert_eq!(EXT_FRAME_MAGIC, 0x5845_564D);
         assert_eq!(END_MAGIC, 0x4554_564D);
+        assert_eq!(TX_HEADER_SIZE_V2, 24);
         assert_eq!(TX_HEADER_SIZE, 24);
+        assert_eq!(TX_EXT_HEADER_SIZE, 40);
         assert_eq!(TX_TRAILER_SIZE, 8);
+    }
+
+    #[test]
+    fn test_non_portable_first_write_uses_lml2_header_and_v2_frame() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file(
+                "non-portable-first-write-lml2.db-log",
+                OpenFlags::Create,
+                false,
+            )
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version((-2).into(), 1, "visible", 10)],
+            None,
+        );
+        let c = log.log_tx(tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let frame = read_file_bytes(file, &io);
+        let header = LogHeader::decode(&frame[..LOG_HDR_SIZE]).unwrap();
+        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(
+            u32::from_le_bytes(frame[LOG_HDR_SIZE..LOG_HDR_SIZE + 4].try_into().unwrap()),
+            FRAME_MAGIC
+        );
+    }
+
+    #[test]
+    fn test_non_portable_appends_keep_lml2_header_and_v2_frames() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("non-portable-appends-lml2.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        for (commit_ts, rowid) in [(10, 1), (20, 2)] {
+            let tx = crate::mvcc::database::LogRecord::for_test(
+                commit_ts,
+                &[make_test_row_version(
+                    (-2).into(),
+                    rowid,
+                    "visible",
+                    commit_ts,
+                )],
+                None,
+            );
+            let c = log.log_tx(tx).unwrap();
+            io.wait_for_completion(c).unwrap();
+        }
+
+        let frame = read_file_bytes(file, &io);
+        let header = LogHeader::decode(&frame[..LOG_HDR_SIZE]).unwrap();
+        assert_eq!(header.version, LOG_VERSION_V2);
+        assert_eq!(
+            u32::from_le_bytes(frame[LOG_HDR_SIZE..LOG_HDR_SIZE + 4].try_into().unwrap()),
+            FRAME_MAGIC
+        );
+
+        let first_payload_size = u64::from_le_bytes(
+            frame[LOG_HDR_SIZE + 4..LOG_HDR_SIZE + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let second_frame_start =
+            LOG_HDR_SIZE + TX_HEADER_SIZE + first_payload_size + TX_TRAILER_SIZE;
+        assert_eq!(
+            u32::from_le_bytes(
+                frame[second_frame_start..second_frame_start + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            FRAME_MAGIC
+        );
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn test_portable_changes_upgrade_non_empty_lml2_log_to_lml3() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file(
+                "portable-after-lml2-upgrade.db-log",
+                OpenFlags::Create,
+                false,
+            )
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version((-2).into(), 1, "visible", 10)],
+            None,
+        );
+        let c = log.log_tx(tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let mut portable_tx = crate::mvcc::database::LogRecord::for_test(
+            20,
+            &[make_test_row_version((-2).into(), 2, "visible", 20)],
+            None,
+        );
+        portable_tx.portable_changes_enabled = true;
+        portable_tx.portable_changes = vec![0x1a, 0x00];
+
+        let c = log
+            .upgrade_header_for_log_tx(&portable_tx)
+            .unwrap()
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        let c = log.log_tx(portable_tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let frame = read_file_bytes(file, &io);
+        let header = LogHeader::decode(&frame[..LOG_HDR_SIZE]).unwrap();
+        assert_eq!(header.version, LOG_VERSION);
+
+        let first_payload_size = u64::from_le_bytes(
+            frame[LOG_HDR_SIZE + 4..LOG_HDR_SIZE + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let second_frame_start =
+            LOG_HDR_SIZE + TX_HEADER_SIZE + first_payload_size + TX_TRAILER_SIZE;
+        assert_eq!(
+            u32::from_le_bytes(
+                frame[second_frame_start..second_frame_start + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            EXT_FRAME_MAGIC
+        );
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn test_next_portable_change_frame_returns_empty_and_nonempty_lml3_frames() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file(
+                "sync-frame-empty-and-nonempty.db-log",
+                OpenFlags::Create,
+                false,
+            )
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        let mut empty_sync_tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version((-2).into(), 1, "internal", 10)],
+            None,
+        );
+        empty_sync_tx.portable_changes_enabled = true;
+        let c = log.log_tx(empty_sync_tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let encoded_empty_logical_op = vec![0x1a, 0x00];
+        let mut sync_tx = crate::mvcc::database::LogRecord::for_test(
+            20,
+            &[make_test_row_version((-2).into(), 2, "visible", 20)],
+            None,
+        );
+        sync_tx.portable_changes = encoded_empty_logical_op;
+        let c = log.log_tx(sync_tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let mut reader = StreamingLogicalLogReader::new(file, None);
+        reader.read_header(&io).unwrap();
+        assert_eq!(reader.header().unwrap().version, LOG_VERSION);
+        let first = io
+            .block(|| reader.next_portable_change_frame())
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.commit_ts, 10);
+        assert_eq!(first.extension_record_count, 0);
+        assert!(first.payload.is_empty());
+
+        let second = io
+            .block(|| reader.next_portable_change_frame())
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.commit_ts, 20);
+        assert_eq!(second.extension_record_count, 1);
+        assert!(!second.payload.is_empty());
+        assert_eq!(second.end_offset, reader.last_valid_offset() as u64);
+
+        assert!(io
+            .block(|| reader.next_portable_change_frame())
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn test_portable_extension_block_precedes_recovery_payload() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file(
+                "portable-extension-before-payload.db-log",
+                OpenFlags::Create,
+                false,
+            )
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        let portable_metadata = vec![0x1a, 0x00];
+        let mut tx = crate::mvcc::database::LogRecord::for_test(
+            20,
+            &[make_test_row_version((-2).into(), 2, "visible", 20)],
+            None,
+        );
+        tx.portable_changes = portable_metadata.clone();
+        let c = log.log_tx(tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let frame = read_file_bytes(file, &io);
+        let tx_header_start = LOG_HDR_SIZE;
+        let body_start = LOG_HDR_SIZE + TX_EXT_HEADER_SIZE;
+        assert_eq!(
+            u32::from_le_bytes(
+                frame[tx_header_start..tx_header_start + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            EXT_FRAME_MAGIC
+        );
+        let extension_size = u64::from_le_bytes(
+            frame[tx_header_start + 24..tx_header_start + 32]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert!(extension_size >= EXTENSION_RECORD_HEADER_SIZE);
+
+        let extension_type =
+            u16::from_le_bytes(frame[body_start..body_start + 2].try_into().unwrap());
+        assert_eq!(extension_type, EXTENSION_TYPE_PORTABLE_CHANGES);
+        let extension_payload_len = u32::from_le_bytes(
+            frame[body_start + 4..body_start + EXTENSION_RECORD_HEADER_SIZE]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let extension_payload = &frame[body_start + EXTENSION_RECORD_HEADER_SIZE
+            ..body_start + EXTENSION_RECORD_HEADER_SIZE + extension_payload_len];
+        assert!(extension_payload.ends_with(&portable_metadata));
+
+        let recovery_start = body_start + extension_size;
+        assert_eq!(frame[recovery_start], OP_UPSERT_TABLE);
+    }
+
+    #[test]
+    fn test_next_portable_change_frame_does_not_advance_lml2_logs() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("sync-frame-lml2.db-log", OpenFlags::Create, false)
+            .unwrap();
+
+        let mut header = LogHeader::new(&io);
+        header.version = LOG_VERSION_V2;
+        let buffer = Arc::new(Buffer::new(header.encode().to_vec()));
+        let c = Completion::new_write(|_| {});
+        io.wait_for_completion(file.pwrite(0, buffer, c).unwrap())
+            .unwrap();
+
+        let mut reader = StreamingLogicalLogReader::new(file, None);
+        reader.read_header(&io).unwrap();
+        assert_eq!(reader.last_valid_offset(), LOG_HDR_SIZE);
+        assert!(io
+            .block(|| reader.next_portable_change_frame())
+            .unwrap()
+            .is_none());
+        assert_eq!(reader.last_valid_offset(), LOG_HDR_SIZE);
     }
 
     #[test]
@@ -5276,16 +7462,16 @@ mod tests {
         ] {
             let text_len = text_len_for_single_upsert_table_op_size(payload_size);
             let value = "p".repeat(text_len);
-            let tx = crate::mvcc::database::LogRecord {
-                tx_timestamp: 100,
-                row_versions: vec![make_test_row_version((-2).into(), 1, &value, 100)],
-                header: None,
-            };
+            let tx = crate::mvcc::database::LogRecord::for_test(
+                100,
+                &[make_test_row_version((-2).into(), 1, &value, 100)],
+                None,
+            );
             let file = write_single_encrypted_tx(
                 &io,
                 &format!("enc-layout-pinned-{payload_size}.db-log"),
                 &enc_ctx,
-                &tx,
+                tx,
             );
 
             let frame_bytes = read_file_bytes(file.clone(), &io);
@@ -5319,12 +7505,12 @@ mod tests {
         let value = "s".repeat(text_len);
 
         let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 444,
-            row_versions: vec![make_test_row_version(table_id, 1, &value, 444)],
-            header: None,
-        };
-        append_encrypted_tx(&mut log, &io, &tx);
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            444,
+            &[make_test_row_version(table_id, 1, &value, 444)],
+            None,
+        );
+        append_encrypted_tx(&mut log, &io, tx);
 
         let frame_bytes = read_file_bytes(file.clone(), &io);
         let payload_size = u64::from_le_bytes(
@@ -5342,7 +7528,7 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
         reader.read_header(&io).unwrap();
-        match reader.parse_next_transaction(&io).unwrap() {
+        match io.block(|| reader.parse_next_transaction()).unwrap() {
             ParseResult::InvalidFrame => {}
             other => panic!("expected InvalidFrame after payload_size tamper, got {other:?}"),
         }
@@ -5367,16 +7553,12 @@ mod tests {
             let value = "x".repeat(text_len);
             let row_version = make_test_row_version((-2).into(), 1, &value, 100);
             let expected_record_bytes = row_version.row.payload().to_vec();
-            let tx = crate::mvcc::database::LogRecord {
-                tx_timestamp: 100,
-                row_versions: vec![row_version],
-                header: None,
-            };
+            let tx = crate::mvcc::database::LogRecord::for_test(100, &[row_version], None);
             let file = write_single_encrypted_tx(
                 &io,
                 &format!("enc-layout-{target_op_size}.db-log"),
                 &enc_ctx,
-                &tx,
+                tx,
             );
 
             let frame_hdr = read_file_bytes(file.clone(), &io);
@@ -5415,12 +7597,8 @@ mod tests {
         let row_version = make_test_row_version((-2).into(), 1, &value, 100);
         let expected_record_bytes = row_version.row.payload().to_vec();
 
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 100,
-            row_versions: vec![row_version],
-            header: None,
-        };
-        let file = write_single_encrypted_tx(&io, "enc-cross-boundary.db-log", &enc_ctx, &tx);
+        let tx = crate::mvcc::database::LogRecord::for_test(100, &[row_version], None);
+        let file = write_single_encrypted_tx(&io, "enc-cross-boundary.db-log", &enc_ctx, tx);
         let ops = parse_only_encrypted_tx_ops(file, &io, &enc_ctx);
         assert_eq!(ops.len(), 1);
         assert_upsert_table_op(&ops[0], (-2).into(), 1, &expected_record_bytes, 100);
@@ -5448,11 +7626,11 @@ mod tests {
         let expected_second_record_bytes = second.row.payload().to_vec();
 
         let mut filler_buf = Vec::new();
-        serialize_op_entry(&mut filler_buf, &filler).unwrap();
+        serialize_op_entry(&mut filler_buf, &filler, None).unwrap();
         assert_eq!(filler_buf.len(), ENCRYPTED_PAYLOAD_CHUNK_SIZE - 7);
 
         let mut second_buf = Vec::new();
-        serialize_op_entry(&mut second_buf, &second).unwrap();
+        serialize_op_entry(&mut second_buf, &second, None).unwrap();
         // Table ops begin with a fixed 6-byte prelude:
         // 1 byte op tag + 1 byte flags + 4 bytes table_id.
         // The payload_len varint begins immediately after that prefix.
@@ -5470,12 +7648,8 @@ mod tests {
             "chunk boundary should fall after the first payload_len varint byte"
         );
 
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 100,
-            row_versions: vec![filler, second],
-            header: None,
-        };
-        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, &tx);
+        let tx = crate::mvcc::database::LogRecord::for_test(100, &[filler, second], None);
+        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, tx);
         let ops = parse_only_encrypted_tx_ops(file, &io, &enc_ctx);
         assert_eq!(ops.len(), 2);
         assert_upsert_table_op(&ops[0], (-2).into(), 1, &expected_filler_record_bytes, 100);
@@ -5505,7 +7679,7 @@ mod tests {
         let expected_filler_record_bytes = filler.row.payload().to_vec();
 
         let mut filler_buf = Vec::new();
-        serialize_op_entry(&mut filler_buf, &filler).unwrap();
+        serialize_op_entry(&mut filler_buf, &filler, None).unwrap();
         assert_eq!(filler_buf.len(), filler_payload_size);
         assert_eq!(
             filler_buf.len() + header_buf.len() - 1,
@@ -5513,12 +7687,8 @@ mod tests {
             "chunk boundary should split the header op after its first byte"
         );
 
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 100,
-            row_versions: vec![filler],
-            header: Some(header),
-        };
-        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, &tx);
+        let tx = crate::mvcc::database::LogRecord::for_test(100, &[filler], Some(header));
+        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, tx);
         let ops = parse_only_encrypted_tx_ops(file, &io, &enc_ctx);
         assert_eq!(ops.len(), 2);
         assert_upsert_table_op(&ops[0], (-2).into(), 1, &expected_filler_record_bytes, 100);
@@ -5547,12 +7717,8 @@ mod tests {
             .iter()
             .map(|row_version| row_version.row.payload().to_vec())
             .collect::<Vec<_>>();
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 200,
-            row_versions,
-            header: None,
-        };
-        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, &tx);
+        let tx = crate::mvcc::database::LogRecord::for_test(200, &row_versions, None);
+        write_first_encrypted_tx(file.clone(), &io, &enc_ctx, tx);
         let ops = parse_only_encrypted_tx_ops(file, &io, &enc_ctx);
         assert_eq!(ops.len(), 96);
         for (idx, op) in ops.iter().enumerate() {
@@ -5578,12 +7744,8 @@ mod tests {
         let row_version = make_test_index_row_version(index_id, 42, &value, 250);
         let expected_payload = row_version.row.payload().to_vec();
 
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 250,
-            row_versions: vec![row_version],
-            header: None,
-        };
-        let file = write_single_encrypted_tx(&io, "enc-index-boundary.db-log", &enc_ctx, &tx);
+        let tx = crate::mvcc::database::LogRecord::for_test(250, &[row_version], None);
+        let file = write_single_encrypted_tx(&io, "enc-index-boundary.db-log", &enc_ctx, tx);
 
         let frame_bytes = read_file_bytes(file.clone(), &io);
         let payload_size = u64::from_le_bytes(
@@ -5619,25 +7781,25 @@ mod tests {
 
         let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
         for i in 0..5u64 {
-            let tx = crate::mvcc::database::LogRecord {
-                tx_timestamp: 100 + i,
-                row_versions: vec![make_test_row_version(
+            let tx = crate::mvcc::database::LogRecord::for_test(
+                100 + i,
+                &[make_test_row_version(
                     table_id,
                     i as i64,
                     &format!("val_{i}"),
                     100 + i,
                 )],
-                header: None,
-            };
-            append_encrypted_tx(&mut log, &io, &tx);
+                None,
+            );
+            append_encrypted_tx(&mut log, &io, tx);
         }
 
         let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
         reader.read_header(&io).unwrap();
 
         for i in 0..5u64 {
-            let ops = match reader.parse_next_transaction(&io).unwrap() {
-                ParseResult::Ops(ops) => ops,
+            let ops = match io.block(|| reader.parse_next_transaction()).unwrap() {
+                ParseResult::Frame(frame) => frame.ops,
                 other => panic!("frame {i}: expected Ops, got {other:?}"),
             };
             assert_eq!(ops.len(), 1, "frame {i}");
@@ -5651,7 +7813,7 @@ mod tests {
         }
 
         assert!(matches!(
-            reader.parse_next_transaction(&io).unwrap(),
+            io.block(|| reader.parse_next_transaction()).unwrap(),
             ParseResult::Eof
         ));
     }
@@ -5671,17 +7833,17 @@ mod tests {
                 .unwrap();
 
             let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
-            let tx = crate::mvcc::database::LogRecord {
-                tx_timestamp: 100,
-                row_versions: vec![make_test_row_version(table_id, 1, "secret", 100)],
-                header: None,
-            };
-            append_encrypted_tx(&mut log, &io, &tx);
+            let tx = crate::mvcc::database::LogRecord::for_test(
+                100,
+                &[make_test_row_version(table_id, 1, "secret", 100)],
+                None,
+            );
+            append_encrypted_tx(&mut log, &io, tx);
 
             let mut reader = StreamingLogicalLogReader::new(file, Some(wrong_key_enc_ctx()));
             reader.read_header(&io).unwrap();
 
-            match reader.parse_next_transaction(&io).unwrap() {
+            match io.block(|| reader.parse_next_transaction()).unwrap() {
                 ParseResult::InvalidFrame => {}
                 other => panic!("expected InvalidFrame with wrong key, got {other:?}"),
             }
@@ -5697,12 +7859,12 @@ mod tests {
                 .unwrap();
 
             let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
-            let tx = crate::mvcc::database::LogRecord {
-                tx_timestamp: 100,
-                row_versions: vec![make_test_row_version(table_id, 1, "hdr_tamper", 100)],
-                header: None,
-            };
-            append_encrypted_tx(&mut log, &io, &tx);
+            let tx = crate::mvcc::database::LogRecord::for_test(
+                100,
+                &[make_test_row_version(table_id, 1, "hdr_tamper", 100)],
+                None,
+            );
+            append_encrypted_tx(&mut log, &io, tx);
 
             // Flip a byte in the commit_ts field (TX header offset 16..24, file offset = LOG_HDR + 16).
             let corrupt_offset = (LOG_HDR_SIZE + 16) as u64;
@@ -5714,7 +7876,7 @@ mod tests {
             let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
             reader.read_header(&io).unwrap();
 
-            match reader.parse_next_transaction(&io).unwrap() {
+            match io.block(|| reader.parse_next_transaction()).unwrap() {
                 ParseResult::InvalidFrame => {}
                 other => panic!("expected InvalidFrame after TX header tamper, got {other:?}"),
             }
@@ -5728,16 +7890,24 @@ mod tests {
                 .unwrap();
 
             let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
-            let tx = crate::mvcc::database::LogRecord {
-                tx_timestamp: 100,
-                row_versions: vec![make_test_row_version(table_id, 1, "tamper_me", 100)],
-                header: None,
-            };
-            append_encrypted_tx(&mut log, &io, &tx);
+            let tx = crate::mvcc::database::LogRecord::for_test(
+                100,
+                &[make_test_row_version(table_id, 1, "tamper_me", 100)],
+                None,
+            );
+            append_encrypted_tx(&mut log, &io, tx);
 
-            // Flip a byte in the ciphertext (after log header + TX header).
+            // Tamper a 16-byte window in the ciphertext (after log header
+            // + TX header). A single-byte overwrite with 0xFF can be a no-op
+            // when the cipher output at that offset already equals 0xFF
+            // (~1/256 per run); tampering a 16-byte run with a fixed
+            // alternating pattern makes the no-op probability 1/256^16,
+            // which is effectively never.
             let corrupt_offset = (LOG_HDR_SIZE + TX_HEADER_SIZE + 1) as u64;
-            let byte_buf = Arc::new(Buffer::new(vec![0xFF]));
+            let pattern: Vec<u8> = (0..16)
+                .map(|i| if i & 1 == 0 { 0x00 } else { 0xFF })
+                .collect();
+            let byte_buf = Arc::new(Buffer::new(pattern));
             let c = Completion::new_write(move |_| {});
             io.wait_for_completion(file.pwrite(corrupt_offset, byte_buf, c).unwrap())
                 .unwrap();
@@ -5745,7 +7915,7 @@ mod tests {
             let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
             reader.read_header(&io).unwrap();
 
-            match reader.parse_next_transaction(&io).unwrap() {
+            match io.block(|| reader.parse_next_transaction()).unwrap() {
                 ParseResult::InvalidFrame => {}
                 other => panic!("expected InvalidFrame after ciphertext tamper, got {other:?}"),
             }
@@ -5766,18 +7936,14 @@ mod tests {
 
         // Write 2 frames.
         let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
-        let first_tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 100,
-            row_versions: vec![first_row_version],
-            header: None,
-        };
-        append_encrypted_tx(&mut log, &io, &first_tx);
-        let second_tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 101,
-            row_versions: vec![make_test_row_version(table_id, 1, "data", 101)],
-            header: None,
-        };
-        append_encrypted_tx(&mut log, &io, &second_tx);
+        let first_tx = crate::mvcc::database::LogRecord::for_test(100, &[first_row_version], None);
+        append_encrypted_tx(&mut log, &io, first_tx);
+        let second_tx = crate::mvcc::database::LogRecord::for_test(
+            101,
+            &[make_test_row_version(table_id, 1, "data", 101)],
+            None,
+        );
+        append_encrypted_tx(&mut log, &io, second_tx);
 
         // Truncate mid-way through the second frame.
         let file_size = file.size().unwrap();
@@ -5790,8 +7956,9 @@ mod tests {
         reader.read_header(&io).unwrap();
 
         // First frame should parse fine.
-        match reader.parse_next_transaction(&io).unwrap() {
-            ParseResult::Ops(ops) => {
+        match io.block(|| reader.parse_next_transaction()).unwrap() {
+            ParseResult::Frame(frame) => {
+                let ops = frame.ops;
                 assert_eq!(ops.len(), 1);
                 assert_upsert_table_op(&ops[0], (-2).into(), 0, &expected_first_record_bytes, 100);
             }
@@ -5799,7 +7966,7 @@ mod tests {
         }
 
         // Second frame is torn — should be EOF.
-        match reader.parse_next_transaction(&io).unwrap() {
+        match io.block(|| reader.parse_next_transaction()).unwrap() {
             ParseResult::Eof => {}
             other => panic!("expected Eof for torn frame 2, got {other:?}"),
         }
@@ -5819,12 +7986,8 @@ mod tests {
         let base_file = open_test_file(&io, "enc-chunk-integrity-base.db-log");
         let row_version = make_test_row_version((-2).into(), 1, &value, 333);
         let expected_record_bytes = row_version.row.payload().to_vec();
-        let tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 333,
-            row_versions: vec![row_version],
-            header: None,
-        };
-        write_first_encrypted_tx(base_file.clone(), &io, &enc_ctx, &tx);
+        let tx = crate::mvcc::database::LogRecord::for_test(333, &[row_version], None);
+        write_first_encrypted_tx(base_file.clone(), &io, &enc_ctx, tx);
         let base_ops = parse_only_encrypted_tx_ops(base_file.clone(), &io, &enc_ctx);
         assert_eq!(base_ops.len(), 1);
         assert_upsert_table_op(&base_ops[0], (-2).into(), 1, &expected_record_bytes, 333);
@@ -5923,7 +8086,7 @@ mod tests {
             if allow_eof {
                 let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
                 reader.read_header(&io).unwrap();
-                match reader.parse_next_transaction(&io).unwrap() {
+                match io.block(|| reader.parse_next_transaction()).unwrap() {
                     ParseResult::InvalidFrame | ParseResult::Eof => {}
                     other => panic!("expected rejection for {label}, got {other:?}"),
                 }
@@ -5951,21 +8114,17 @@ mod tests {
         let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
         let first_row_version = make_test_row_version(table_id, 1, "prefix", 500);
         let expected_prefix_record_bytes = first_row_version.row.payload().to_vec();
-        let first_tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 500,
-            row_versions: vec![first_row_version],
-            header: None,
-        };
-        let c = log.log_tx(&first_tx).unwrap();
+        let first_tx = crate::mvcc::database::LogRecord::for_test(500, &[first_row_version], None);
+        let c = log.log_tx(first_tx).unwrap();
         io.wait_for_completion(c).unwrap();
         let second_frame_start = log.offset as usize;
 
-        let second_tx = crate::mvcc::database::LogRecord {
-            tx_timestamp: 600,
-            row_versions: vec![make_test_row_version(table_id, 2, &value, 600)],
-            header: None,
-        };
-        let c = log.log_tx(&second_tx).unwrap();
+        let second_tx = crate::mvcc::database::LogRecord::for_test(
+            600,
+            &[make_test_row_version(table_id, 2, &value, 600)],
+            None,
+        );
+        let c = log.log_tx(second_tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let base_bytes = read_file_bytes(file.clone(), &io);
@@ -6010,8 +8169,9 @@ mod tests {
 
             let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
             reader.read_header(&io).unwrap();
-            match reader.parse_next_transaction(&io).unwrap() {
-                ParseResult::Ops(ops) => {
+            match io.block(|| reader.parse_next_transaction()).unwrap() {
+                ParseResult::Frame(frame) => {
+                    let ops = frame.ops;
                     assert_eq!(ops.len(), 1);
                     assert_upsert_table_op(
                         &ops[0],
@@ -6023,7 +8183,7 @@ mod tests {
                 }
                 other => panic!("expected prefix frame to survive, got {other:?}"),
             }
-            match reader.parse_next_transaction(&io).unwrap() {
+            match io.block(|| reader.parse_next_transaction()).unwrap() {
                 ParseResult::Eof => {}
                 other => panic!("expected Eof for torn multi-chunk frame, got {other:?}"),
             }

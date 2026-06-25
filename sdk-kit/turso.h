@@ -46,6 +46,109 @@ typedef enum
     TURSO_TYPE_NULL = 5,
 } turso_type_t;
 
+
+typedef enum
+{
+    TURSO_EXTENSION_VALUE_NULL = 0,
+    TURSO_EXTENSION_VALUE_INTEGER = 1,
+    TURSO_EXTENSION_VALUE_FLOAT = 2,
+    TURSO_EXTENSION_VALUE_TEXT = 3,
+    TURSO_EXTENSION_VALUE_BLOB = 4,
+    TURSO_EXTENSION_VALUE_ERROR = 5,
+} turso_extension_value_type_t;
+
+typedef enum
+{
+    TURSO_EXTENSION_RESULT_OK = 0,
+    TURSO_EXTENSION_RESULT_ERROR = 1,
+    TURSO_EXTENSION_RESULT_INVALID_ARGS = 2,
+    TURSO_EXTENSION_RESULT_UNKNOWN = 3,
+    TURSO_EXTENSION_RESULT_OOM = 4,
+    TURSO_EXTENSION_RESULT_CORRUPT = 5,
+    TURSO_EXTENSION_RESULT_NOT_FOUND = 6,
+    TURSO_EXTENSION_RESULT_ALREADY_EXISTS = 7,
+    TURSO_EXTENSION_RESULT_PERMISSION_DENIED = 8,
+    TURSO_EXTENSION_RESULT_ABORTED = 9,
+    TURSO_EXTENSION_RESULT_OUT_OF_RANGE = 10,
+    TURSO_EXTENSION_RESULT_UNIMPLEMENTED = 11,
+    TURSO_EXTENSION_RESULT_INTERNAL = 12,
+    TURSO_EXTENSION_RESULT_UNAVAILABLE = 13,
+    TURSO_EXTENSION_RESULT_CUSTOM_ERROR = 14,
+    TURSO_EXTENSION_RESULT_EOF = 15,
+    TURSO_EXTENSION_RESULT_READ_ONLY = 16,
+    TURSO_EXTENSION_RESULT_ROWID = 17,
+    TURSO_EXTENSION_RESULT_ROW = 18,
+    TURSO_EXTENSION_RESULT_INTERRUPT = 19,
+    TURSO_EXTENSION_RESULT_BUSY = 20,
+    TURSO_EXTENSION_RESULT_CONSTRAINT_VIOLATION = 21,
+} turso_extension_result_code_t;
+
+typedef enum
+{
+    TURSO_EXTENSION_TEXT_TEXT = 0,
+    TURSO_EXTENSION_TEXT_JSON = 1,
+} turso_extension_text_subtype_t;
+
+typedef struct
+{
+    turso_extension_text_subtype_t subtype;
+    const uint8_t *text;
+    uint32_t len;
+} turso_extension_text_t;
+
+typedef struct
+{
+    const uint8_t *data;
+    uint64_t size;
+} turso_extension_blob_t;
+
+typedef struct
+{
+    turso_extension_result_code_t code;
+    turso_extension_text_t *message;
+} turso_extension_error_t;
+
+typedef union
+{
+    int64_t int_value;
+    double float_value;
+    const turso_extension_text_t *text;
+    const turso_extension_blob_t *blob;
+    const turso_extension_error_t *error;
+} turso_extension_value_data_t;
+
+typedef struct
+{
+    turso_extension_value_type_t value_type;
+    turso_extension_value_data_t value;
+} turso_value_t;
+
+typedef struct
+{
+    void *state;
+} turso_agg_ctx_t;
+
+/** Frees per-registration state supplied to scalar, aggregate, or collation callbacks. */
+typedef void (*turso_context_destructor_t)(uintptr_t context);
+
+/** Frees a value returned by a managed scalar or aggregate callback after Turso copies it. */
+typedef void (*turso_value_destructor_t)(turso_value_t *result);
+
+/** Scalar callback. argv points to argc immutable turso_value_t entries valid only for the call. */
+typedef turso_value_t (*turso_scalar_function_t)(uintptr_t context, int32_t argc, const turso_value_t *argv, turso_context_destructor_t context_destructor, turso_value_destructor_t value_destructor);
+
+/** Aggregate initializer. Return value is passed unchanged to step/final/destructor callbacks. */
+typedef turso_agg_ctx_t *(*turso_aggregate_init_function_t)(uintptr_t context);
+
+/** Aggregate step callback. argv points to argc immutable turso_value_t entries valid only for the call. */
+typedef turso_value_t (*turso_aggregate_step_function_t)(uintptr_t context, turso_agg_ctx_t *aggregate_context, int32_t argc, const turso_value_t *argv);
+
+/** Aggregate final callback. The aggregate_context is the value returned by the initializer. */
+typedef turso_value_t (*turso_aggregate_final_function_t)(uintptr_t context, turso_agg_ctx_t *aggregate_context);
+
+/** Collation callback. Byte ranges are UTF-8 text valid only for the call. Return follows strcmp ordering. */
+typedef int32_t (*turso_collation_function_t)(uintptr_t context, const uint8_t *left_ptr, size_t left_len, const uint8_t *right_ptr, size_t right_len);
+
 typedef enum
 {
     TURSO_TRACING_LEVEL_ERROR = 1,
@@ -165,6 +268,66 @@ bool turso_connection_get_autocommit(const turso_connection_t *self);
 /** Get last insert rowid for the connection or 0 if no inserts happened before */
 int64_t turso_connection_last_insert_rowid(const turso_connection_t *self);
 
+
+/** Register or replace a per-connection managed scalar function. */
+turso_status_code_t turso_connection_register_scalar_function(
+    const turso_connection_t *self,
+    const char *name,
+    int32_t argc,
+    bool deterministic,
+    uintptr_t context,
+    turso_scalar_function_t callback,
+    turso_context_destructor_t context_destructor,
+    turso_value_destructor_t value_destructor,
+    const char **error_opt_out);
+
+/** Register or replace a per-connection managed aggregate function. */
+turso_status_code_t turso_connection_register_aggregate_function(
+    const turso_connection_t *self,
+    const char *name,
+    int32_t argc,
+    uintptr_t context,
+    turso_aggregate_init_function_t init,
+    turso_aggregate_step_function_t step,
+    turso_aggregate_final_function_t finalize,
+    turso_context_destructor_t context_destructor,
+    turso_context_destructor_t aggregate_destructor,
+    turso_value_destructor_t value_destructor,
+    const char **error_opt_out);
+
+/** Unregister a per-connection managed scalar or aggregate function. */
+turso_status_code_t turso_connection_unregister_function(
+    const turso_connection_t *self,
+    const char *name,
+    const char **error_opt_out);
+
+/** Register or replace a per-connection managed collation. */
+turso_status_code_t turso_connection_register_collation(
+    const turso_connection_t *self,
+    const char *name,
+    uintptr_t context,
+    turso_collation_function_t callback,
+    turso_context_destructor_t context_destructor,
+    const char **error_opt_out);
+
+/** Unregister a per-connection managed collation. */
+turso_status_code_t turso_connection_unregister_collation(
+    const turso_connection_t *self,
+    const char *name,
+    const char **error_opt_out);
+
+/** Enable or disable SQL load_extension() for this connection. */
+turso_status_code_t turso_connection_enable_load_extension(
+    const turso_connection_t *self,
+    bool enabled,
+    const char **error_opt_out);
+
+/** Load an extension library on this connection using Turso's native extension loader. */
+turso_status_code_t turso_connection_load_extension(
+    const turso_connection_t *self,
+    const char *path,
+    const char **error_opt_out);
+
 /** Prepare single statement in a connection */
 turso_status_code_t
 turso_connection_prepare_single(
@@ -248,6 +411,62 @@ const char *turso_statement_column_name(const turso_statement_t *self, size_t in
  * C string allocated by Turso must be freed after the usage with corresponding turso_str_deinit(...) method
  */
 const char *turso_statement_column_decltype(const turso_statement_t *self, size_t index);
+
+/** Classification of a result column's declared type.
+ *
+ * Returned by turso_statement_column_kind. Values match the
+ * ColumnTypeKind variants in the Rust API and are kept stable: new kinds
+ * are appended.
+ */
+typedef enum
+{
+    TURSO_COLUMN_KIND_NONE = -1,
+    TURSO_COLUMN_KIND_BUILTIN = 0,
+    TURSO_COLUMN_KIND_CUSTOM = 1,
+    TURSO_COLUMN_KIND_DOMAIN = 2,
+    TURSO_COLUMN_KIND_STRUCT = 3,
+    TURSO_COLUMN_KIND_UNION = 4,
+} turso_column_kind_t;
+
+/** Get the declared type name of the column at `index`.
+ *
+ * Returns the same string as turso_statement_column_decltype, but resolved
+ * through the richer type-info path so the result is consistent with the
+ * other turso_statement_column_* getters declared below.
+ *
+ * Returns NULL when no type info is available (statement finalized, index
+ * out of bounds, or the result column is not a direct table-column ref).
+ * C string allocated by Turso must be freed with turso_str_deinit.
+ */
+const char *turso_statement_column_declared_name(const turso_statement_t *self, size_t index);
+
+/** Get the array depth of the column at `index`.
+ *
+ * Returns 0 for scalar table columns, n for n-dimensional array columns
+ * (e.g. INTEGER[][] -> 2), and 0 when no type info is available. To
+ * distinguish "scalar column" from "no info", check
+ * turso_statement_column_kind first: it returns TURSO_COLUMN_KIND_NONE in
+ * the latter case.
+ */
+uint32_t turso_statement_column_array_dimensions(const turso_statement_t *self, size_t index);
+
+/** Get the underlying primitive type name for columns whose declared type
+ * is a CREATE TYPE or CREATE DOMAIN.
+ *
+ * Returns one of "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC". Returns NULL
+ * when the declared type is a built-in primitive directly, when no type
+ * info is available, or when the column is not a direct table-column
+ * reference. C string allocated by Turso must be freed with
+ * turso_str_deinit.
+ */
+const char *turso_statement_column_base_type(const turso_statement_t *self, size_t index);
+
+/** Classify the column's declared type as builtin / custom / domain /
+ * struct / union (see turso_column_kind_t).
+ *
+ * Returns TURSO_COLUMN_KIND_NONE when no type information is available.
+ */
+turso_column_kind_t turso_statement_column_kind(const turso_statement_t *self, size_t index);
 
 /** Get the row value at the the index for a current statement state
  * SAFETY: returned pointers will be valid only until next invocation of statement operation (step, finalize, reset, etc)

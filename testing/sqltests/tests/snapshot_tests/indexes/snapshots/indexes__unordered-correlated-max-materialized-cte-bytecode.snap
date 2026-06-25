@@ -58,7 +58,7 @@ addr  opcode               p1  p2  p3  p4      p5  comment
   27      Next              2  23   0           0
   28      Copy              2  18   0           0  r[18]=r[2]
   29      IsNull           18  42   0           0  if (r[18]==NULL) goto 42
-  30      Affinity         18   1   0           0  r[18..19] = E
+  30      Affinity         18   1   0           0  r[18..19] = C
   31      SeekLT            3  42  18           0  key=[18..18]
   32        Null            0  18   0           0  r[18]=NULL
   33        IdxLE           3  42  18           0  key=[18..18]

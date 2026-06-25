@@ -486,7 +486,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             &self.configuration.table_name,
             &self.inverted_index_btree,
             // component, length, rowid
-            vec![key_info(), key_info(), key_info()],
+            crate::alloc::vec![key_info(), key_info(), key_info()],
         )?);
         self.stats_cursor = Some(open_index_cursor(
             connection,
@@ -494,7 +494,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             &self.configuration.table_name,
             &self.stats_btree,
             // component
-            vec![key_info()],
+            crate::alloc::vec![key_info()],
         )?);
         self.main_btree = Some(open_table_cursor(
             connection,
@@ -515,7 +515,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             &self.configuration.table_name,
             &self.inverted_index_btree,
             // component, length, rowid
-            vec![key_info(), key_info(), key_info()],
+            crate::alloc::vec![key_info(), key_info(), key_info()],
         )?);
         self.stats_cursor = Some(open_index_cursor(
             connection,
@@ -523,7 +523,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             &self.configuration.table_name,
             &self.stats_btree,
             // component
-            vec![key_info()],
+            crate::alloc::vec![key_info()],
         )?);
         Ok(IOResult::Done(()))
     }
@@ -590,7 +590,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             Value::from_i64(*rowid),
                         ],
                         3,
-                    );
+                    )?;
                     tracing::debug!(
                         "insert_state: seek: component={}, sum={}, rowid={}",
                         position,
@@ -649,7 +649,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         ));
                     };
                     let position = v.as_f32_sparse().idx[*idx];
-                    let key = ImmutableRecord::from_values(&[Value::from_i64(position as i64)], 1);
+                    let key = ImmutableRecord::from_values(&[Value::from_i64(position as i64)], 1)?;
                     self.insert_state = VectorSparseInvertedIndexInsertState::SeekStats {
                         vector: vector.take(),
                         sum: *sum,
@@ -705,7 +705,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                     Value::from_f64(value),
                                 ],
                                 4,
-                            );
+                            )?;
                             self.insert_state = VectorSparseInvertedIndexInsertState::UpdateStats {
                                 vector: vector.take(),
                                 sum: *sum,
@@ -746,7 +746,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             Value::from_f64(value.max(component.max)),
                         ],
                         4,
-                    );
+                    )?;
                     self.insert_state = VectorSparseInvertedIndexInsertState::UpdateStats {
                         vector: vector.take(),
                         sum: *sum,
@@ -842,7 +842,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             Value::from_i64(*rowid),
                         ],
                         3,
-                    );
+                    )?;
                     self.delete_state = VectorSparseInvertedIndexDeleteState::SeekInverted {
                         vector: vector.take(),
                         idx: *idx,
@@ -934,7 +934,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         ));
                     };
                     let position = v.as_f32_sparse().idx[*idx];
-                    let key = ImmutableRecord::from_values(&[Value::from_i64(position as i64)], 1);
+                    let key = ImmutableRecord::from_values(&[Value::from_i64(position as i64)], 1)?;
                     self.delete_state = VectorSparseInvertedIndexDeleteState::SeekStats {
                         vector: vector.take(),
                         sum: *sum,
@@ -1003,7 +1003,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             Value::from_f64(component.max),
                         ],
                         4,
-                    );
+                    )?;
                     self.delete_state = VectorSparseInvertedIndexDeleteState::UpdateStats {
                         vector: vector.take(),
                         sum: *sum,
@@ -1153,7 +1153,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         *key = Some(ImmutableRecord::from_values(
                             &[Value::from_i64(position as i64)],
                             1,
-                        ));
+                        )?);
                     }
                     let Some(k) = key.as_ref() else {
                         return Err(LimboError::InternalError(
@@ -1298,7 +1298,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         *key = Some(ImmutableRecord::from_values(
                             &[Value::from_i64(c.position as i64)],
                             1,
-                        ));
+                        )?);
                         *component = Some(c.position);
                     }
                     let Some(k) = key.as_ref() else {

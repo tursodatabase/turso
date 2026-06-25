@@ -74,15 +74,10 @@ impl Numeric {
                     | Some(StrToF64::FractionalPrefix(_))
                     | Some(StrToF64::DecimalPrefix(_)) => None,
                     Some(StrToF64::Fractional(value)) => Some(Self::Float(value)),
-                    Some(StrToF64::Decimal(real)) => {
-                        let integer = str_to_i64(s).unwrap_or(0);
-
-                        Some(if real == integer as f64 {
-                            Self::Integer(integer)
-                        } else {
-                            Self::Float(real)
-                        })
-                    }
+                    Some(StrToF64::Decimal(real)) => Some(match str_to_i64_checked(s) {
+                        Ok(integer) => Self::Integer(integer),
+                        Err(_) => Self::Float(real),
+                    }),
                 }
             }
         }
@@ -198,12 +193,9 @@ impl<T: AsRef<str>> From<T> for Numeric {
                 Self::Float(value)
             }
             Some(StrToF64::Decimal(real) | StrToF64::DecimalPrefix(real)) => {
-                let integer = str_to_i64(text).unwrap_or(0);
-
-                if real == integer as f64 {
-                    Self::Integer(integer)
-                } else {
-                    Self::Float(real)
+                match str_to_i64_checked(text) {
+                    Ok(integer) => Self::Integer(integer),
+                    Err(_) => Self::Float(real),
                 }
             }
         }
@@ -534,6 +526,22 @@ impl std::ops::MulAssign for DoubleDouble {
 }
 
 pub fn str_to_i64(input: impl AsRef<str>) -> Option<i64> {
+    Some(match str_to_i64_checked(input) {
+        Ok(v) => v,
+        Err(IntOverflow::Positive) => i64::MAX,
+        Err(IntOverflow::Negative) => i64::MIN,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum IntOverflow {
+    Positive,
+    Negative,
+}
+
+/// Like [`str_to_i64`] but distinguishes overflow from a successful parse.
+/// Returns `Err(_)` when the leading numeric prefix does not fit in i64.
+pub fn str_to_i64_checked(input: impl AsRef<str>) -> Result<i64, IntOverflow> {
     let input = input
         .as_ref()
         .trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == VERTICAL_TAB);
@@ -542,18 +550,21 @@ pub fn str_to_i64(input: impl AsRef<str>) -> Option<i64> {
 
     iter.next_if(|(_, ch)| matches!(ch, '+' | '-'));
     let Some((end, _)) = iter.take_while(|(_, ch)| ch.is_ascii_digit()).last() else {
-        return Some(0);
+        return Ok(0);
     };
 
-    input[0..=end].parse::<i64>().map_or_else(
-        |err| match err.kind() {
-            std::num::IntErrorKind::PosOverflow => Some(i64::MAX),
-            std::num::IntErrorKind::NegOverflow => Some(i64::MIN),
-            std::num::IntErrorKind::Empty => unreachable!(),
-            _ => Some(0),
-        },
-        Some,
-    )
+    input[0..=end]
+        .parse::<i64>()
+        .map_err(|err| match err.kind() {
+            std::num::IntErrorKind::PosOverflow => IntOverflow::Positive,
+            std::num::IntErrorKind::NegOverflow => IntOverflow::Negative,
+            // Empty/InvalidDigit are ruled out: the early `return Ok(0)` above
+            // fires when there are no digits, and the slice spans only an
+            // optional sign followed by ASCII digits. Zero is produced only by
+            // `NonZeroI*::from_str`, not by `i64::from_str`. `IntErrorKind` is
+            // `#[non_exhaustive]`, hence the catch-all.
+            _ => unreachable!("unexpected IntErrorKind from i64::from_str: {err:?}"),
+        })
 }
 
 #[derive(Debug, Clone, Copy)]

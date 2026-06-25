@@ -7,6 +7,7 @@
 //! tx slots).
 
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs::{File, create_dir_all};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -277,7 +278,7 @@ impl MultiprocessWhopper {
                 conn.execute("PRAGMA journal_mode = 'mvcc'")?;
             }
 
-            let schema = create_initial_schema(&mut rng);
+            let schema = create_initial_schema(&mut rng, &crate::SchemaBias::default());
             let tables = schema.iter().map(|t| t.table.clone()).collect::<Vec<_>>();
             for create_table in &schema {
                 conn.execute(create_table.to_string())?;
@@ -307,7 +308,7 @@ impl MultiprocessWhopper {
 
         // Build initial simulator state from the schema we just created
         let mut schema_rng = ChaCha8Rng::seed_from_u64(seed);
-        let schema = create_initial_schema(&mut schema_rng);
+        let schema = create_initial_schema(&mut schema_rng, &crate::SchemaBias::default());
         let tables = schema.iter().map(|t| t.table.clone()).collect::<Vec<_>>();
         let indexes = create_initial_indexes(&mut schema_rng, &tables);
         let indexes_vec: Vec<(String, String)> = indexes
@@ -604,7 +605,8 @@ impl MultiprocessWhopper {
                         | LimboError::SchemaConflict
                         | LimboError::Busy
                         | LimboError::BusySnapshot
-                        | LimboError::TableLocked,
+                        | LimboError::TableLocked
+                        | LimboError::OutOfMemory,
                     ) => continue,
                     _ => return Ok(op_result),
                 }
@@ -693,6 +695,32 @@ impl MultiprocessWhopper {
 
         self.processes = new_processes;
         self.worker_startup_telemetries = new_telemetries;
+
+        // Notify properties that the workers were restarted so they can
+        // drop in-memory state seeded from pre-restart emissions that
+        // never committed (e.g. nextval values in `all_values` whose
+        // transactions were rolled back when the worker died). Without
+        // this, a post-restart re-emission of the same integer trips
+        // the duplicate-value check even though only one durable
+        // emission ever existed.
+        //
+        // We pass an empty `persisted_sequences` map: the multiprocess
+        // simulator does not yet thread `query_persisted_sequence_states`
+        // (which the in-process driver provides) through the worker
+        // protocol. Properties that need real persisted state for their
+        // restart check (e.g. AutoincWatermarkMonotonicity reading
+        // `sqlite_sequence.seq`) treat an empty map as "no state to
+        // anchor against" and skip the check — the duplicate /
+        // monotonicity checks resume correctly once `all_values` is
+        // cleared. Wiring up the real query is tracked separately.
+        let empty_persisted: HashMap<String, crate::PersistedSequenceState> = HashMap::new();
+        for property in &self.properties {
+            property
+                .lock()
+                .unwrap()
+                .on_restart(&empty_persisted)
+                .map_err(|err| anyhow::anyhow!("property on_restart failed: {err}"))?;
+        }
         Ok(())
     }
 
@@ -939,34 +967,25 @@ impl MultiprocessWhopper {
             self.connection_states[connection_idx].txn_id = None;
         }
 
-        // Handle errors: initiate auto-rollback for retryable errors
+        // Handle errors via the shared classification helper so the in-
+        // process and multiprocess drivers can't drift when a new error
+        // class is added.
         if let Err(ref error) = op_result {
-            match error {
-                LimboError::SchemaUpdated
-                | LimboError::SchemaConflict
-                | LimboError::TableLocked
-                | LimboError::Busy
-                | LimboError::BusySnapshot
-                | LimboError::WriteWriteConflict
-                | LimboError::CommitDependencyAborted
-                | LimboError::InvalidArgument(..) => {
-                    if self.connection_states[connection_idx]
-                        .fiber_state
-                        .is_in_tx()
-                    {
-                        debug!(
-                            "connection {}: auto-rollback after {:?}",
-                            connection_idx, error
-                        );
-                        self.connection_states[connection_idx].current_op =
-                            Some(Operation::Rollback);
-                    } else {
-                        self.connection_states[connection_idx].txn_id = None;
-                    }
+            let in_tx = self.connection_states[connection_idx]
+                .fiber_state
+                .is_in_tx();
+            match crate::error_handling::classify_op_error(error, in_tx) {
+                crate::error_handling::ErrorAction::Rollback => {
+                    debug!(
+                        "connection {}: auto-rollback after {:?}",
+                        connection_idx, error
+                    );
+                    self.connection_states[connection_idx].current_op = Some(Operation::Rollback);
                 }
-                // Corruption and checkpoint errors: log and respawn the worker.
-                // These are real multiprocess bugs we want to surface but not crash on.
-                LimboError::Corrupt(_) | LimboError::CheckpointFailed(_) => {
+                crate::error_handling::ErrorAction::ClearTxn => {
+                    self.connection_states[connection_idx].txn_id = None;
+                }
+                crate::error_handling::ErrorAction::Respawn => {
                     error!(
                         "process {} hit corruption on step {} via connection {}: {} -- respawning",
                         location.process_idx, self.current_step, connection_idx, error
@@ -974,7 +993,7 @@ impl MultiprocessWhopper {
                     self.stats.corruption_events += 1;
                     self.kill_and_respawn_process(connection_idx, "corruption_recovery")?;
                 }
-                _ => {
+                crate::error_handling::ErrorAction::Fatal => {
                     return Err(anyhow::anyhow!(
                         "connection {} fatal error on step {}: {}",
                         connection_idx,

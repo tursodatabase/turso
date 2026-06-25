@@ -2,7 +2,7 @@
 # TPC-H benchmark script
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
-RELEASE_BUILD_DIR="$REPO_ROOT/target/release"
+RELEASE_BUILD_DIR="$("$REPO_ROOT/scripts/cargo-target-dir")/release"
 TPCH_DIR="$REPO_ROOT/perf/tpc-h"
 DB_FILE="$TPCH_DIR/TPC-H.db"
 

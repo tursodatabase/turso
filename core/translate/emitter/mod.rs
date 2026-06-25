@@ -1,7 +1,7 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 use super::{
-    collate::{get_expr_collation_ctx, CollationSeq},
+    collate::{get_expr_collation_ctx_with_symbols, CollationSeq},
     compound_select::emit_program_for_compound_select,
     emitter::{
         delete::emit_program_for_delete, select::emit_program_for_select,
@@ -28,6 +28,7 @@ use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
     EXPR_INDEX_SENTINEL,
 };
+use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::ColumnMask;
 use crate::vdbe::{
     affinity::Affinity,
@@ -180,6 +181,13 @@ pub struct Resolver<'a> {
     /// (e.g. via a nested sub-program), update this field on that
     /// path or switch to a live read.
     has_temp_schema: bool,
+    /// Foreign-key action programs currently being compiled by this resolver.
+    ///
+    /// This is shared with forked resolvers because `translate_inner` can fork
+    /// the resolver while compiling generated foreign-key action SQL. Without
+    /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
+    /// that its own action program is already being built.
+    pub(super) fk_action_compile_stack: FkActionCompileStack,
 }
 
 #[derive(Clone)]
@@ -286,6 +294,7 @@ impl<'a> Resolver<'a> {
             dqs_dml,
             trigger_context: None,
             has_temp_schema,
+            fk_action_compile_stack: FkActionCompileStack::default(),
         }
     }
 
@@ -314,6 +323,7 @@ impl<'a> Resolver<'a> {
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
+            fk_action_compile_stack: self.fk_action_compile_stack.clone(),
         }
     }
 
@@ -334,6 +344,7 @@ impl<'a> Resolver<'a> {
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
+            fk_action_compile_stack: self.fk_action_compile_stack.clone(),
         }
     }
 
@@ -491,9 +502,20 @@ impl<'a> Resolver<'a> {
         needs_decode: bool,
         referenced_tables: &TableReferences,
     ) -> Result<()> {
-        let collation = get_expr_collation_ctx(expr.as_ref(), referenced_tables)?;
+        let collation = get_expr_collation_ctx_with_symbols(
+            expr.as_ref(),
+            referenced_tables,
+            Some(self.symbol_table),
+        )?;
         self.cache_expr_reg(expr, reg, needs_decode, collation);
         Ok(())
+    }
+
+    pub fn resolve_collation(&self, name: &str) -> Result<CollationSeq> {
+        if let Some(collation) = self.symbol_table.resolve_collation(name) {
+            return Ok(collation);
+        }
+        CollationSeq::new(name)
     }
 
     /// Returns the register, decode flag, and collation metadata for a previously translated expression.
@@ -1323,7 +1345,9 @@ fn emit_cdc_insns_v1(
         cursor: cdc_cursor_id,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: InsertFlags::new()
+            .skip_last_rowid()
+            .skip_statement_change_count(),
         table_name: "".to_string(),
     });
     Ok(())
@@ -1462,7 +1486,9 @@ fn emit_cdc_insns_v2(
         cursor: cdc_cursor_id,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: InsertFlags::new()
+            .skip_last_rowid()
+            .skip_statement_change_count(),
         table_name: "".to_string(),
     });
     Ok(())
@@ -1548,7 +1574,9 @@ pub fn emit_cdc_commit_insns(
         cursor: cdc_cursor_id,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: InsertFlags::new()
+            .skip_last_rowid()
+            .skip_statement_change_count(),
         table_name: "".to_string(),
     });
     Ok(())
@@ -1629,6 +1657,7 @@ pub(crate) fn init_limit(
                         program.add_comment(program.offset(), "LIMIT counter");
                         program.emit_insn(Insn::MustBeInt {
                             reg: limit_ctx.reg_limit,
+                            target_pc: None,
                         });
                     }
                     _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
@@ -1637,7 +1666,10 @@ pub(crate) fn init_limit(
                     let r = limit_ctx.reg_limit;
 
                     _ = translate_expr(program, None, expr, r, &t_ctx.resolver)?;
-                    program.emit_insn(Insn::MustBeInt { reg: r });
+                    program.emit_insn(Insn::MustBeInt {
+                        reg: r,
+                        target_pc: None,
+                    });
                 }
             }
         }
@@ -1660,7 +1692,10 @@ pub(crate) fn init_limit(
                             value: value.into(),
                             dest: offset_reg,
                         });
-                        program.emit_insn(Insn::MustBeInt { reg: offset_reg });
+                        program.emit_insn(Insn::MustBeInt {
+                            reg: offset_reg,
+                            target_pc: None,
+                        });
                     }
                     _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
                 },
@@ -1669,7 +1704,10 @@ pub(crate) fn init_limit(
                 }
             }
             program.add_comment(program.offset(), "OFFSET counter");
-            program.emit_insn(Insn::MustBeInt { reg: offset_reg });
+            program.emit_insn(Insn::MustBeInt {
+                reg: offset_reg,
+                target_pc: None,
+            });
 
             let combined_reg = program.alloc_register();
             t_ctx.reg_limit_offset_sum = Some(combined_reg);
@@ -1695,18 +1733,13 @@ pub(crate) fn init_limit(
     Ok(())
 }
 
-/// Emits  `target_columns`, plus the stored columns needed by `target_columns`, into compact
-/// registers. This takes into account stored columns, and any stored columns required
-/// by virtual columns in `target_columns`.
+/// Emits `target_columns`, plus the stored columns needed by `target_columns`, into a
+/// DML row context. This takes into account stored columns, and any stored columns
+/// required by virtual columns in `target_columns`.
 ///
-/// Target columns are guaranteed to be in a contiguous block, in the given order, at the start of
-/// registers. The following postcondition holds:
-///
-/// ```text
-/// dml_ctx.to_column_reg(target_columns[i]) == dml_ctx.to_column_reg(target_columns[0]) + i
-/// ```
-///
-/// This way, target_columns[0] can be used as a base for opcodes that require unpacked records.
+/// Non-rowid target columns are allocated in target order. Rowid-alias columns resolve
+/// to `rowid_reg`, so callers that need an unpacked contiguous key or record must
+/// materialize one from `DmlColumnContext::to_column_reg`.
 pub(crate) fn emit_columns_and_dependencies(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
@@ -1716,15 +1749,33 @@ pub(crate) fn emit_columns_and_dependencies(
     resolver: &Resolver,
 ) -> Result<DmlColumnContext> {
     let targets: Vec<usize> = target_columns.into_iter().collect();
+    let target_mask: ColumnMask = targets.iter().copied().try_collect()?;
+    let non_rowid_targets: Vec<usize> = targets
+        .iter()
+        .copied()
+        .filter(|&idx| !table.columns()[idx].is_rowid_alias())
+        .collect();
+    let mut non_rowid_target_positions = vec![None; table.columns().len()];
+    for (pos, idx) in non_rowid_targets.iter().copied().enumerate() {
+        non_rowid_target_positions[idx] = Some(pos);
+    }
     let dependencies = table.dependencies_of_columns(targets.iter().copied())?;
 
-    let target_base = program.alloc_registers(targets.len());
+    let target_base = if non_rowid_targets.is_empty() {
+        0
+    } else {
+        program.alloc_registers(non_rowid_targets.len())
+    };
     let extra_base = {
         let mut dependencies_not_in_targets: ColumnMask = dependencies.clone();
-        let target_mask = targets.iter().copied().try_collect()?;
-        dependencies_not_in_targets.union_with(&target_mask)?;
+        dependencies_not_in_targets -= &target_mask;
 
-        let extra_count = dependencies_not_in_targets.count();
+        let extra_count = table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(idx, col)| dependencies_not_in_targets.get(*idx) && !col.is_rowid_alias())
+            .count();
 
         if extra_count > 0 {
             program.alloc_registers(extra_count)
@@ -1735,14 +1786,14 @@ pub(crate) fn emit_columns_and_dependencies(
 
     let mut extra_idx = 0;
     let pairs = table.columns().iter().enumerate().map(|(idx, col)| {
-        let reg = if col.is_rowid_alias() {
-            rowid_reg
-        } else if let Some(pos) = targets.iter().position(|&t| t == idx) {
+        let reg = if let Some(pos) = non_rowid_target_positions[idx] {
             let reg = target_base + pos;
             if !col.is_virtual_generated() {
                 program.emit_column_or_rowid(cursor_id, idx, reg);
             }
             reg
+        } else if col.is_rowid_alias() {
+            rowid_reg
         } else if dependencies.get(idx) {
             let reg = extra_base + extra_idx;
             program.emit_column_or_rowid(cursor_id, idx, reg);
@@ -1754,9 +1805,14 @@ pub(crate) fn emit_columns_and_dependencies(
         (col, reg)
     });
     let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
-    debug_assert!(targets
-        .windows(2)
-        .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
+    if targets
+        .iter()
+        .all(|&idx| !table.columns()[idx].is_rowid_alias())
+    {
+        debug_assert!(targets
+            .windows(2)
+            .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
+    }
 
     let table_arc = Arc::new(table.clone());
     gencol::compute_virtual_columns(

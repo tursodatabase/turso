@@ -1155,6 +1155,24 @@ test substr-large-float-clamp {
 expect {
 }
 
+test substr-extreme-negative-start-and-length {
+    SELECT length(substr('limbo', -7096519388852014892, -4829175794346763833)), substr('limbo', -7096519388852014892, -4829175794346763833) = '';
+}
+expect {
+    0|1
+}
+
+test datetime-numeric-string-whitespace {
+    SELECT unixepoch('5 '), unixepoch(' 5'), unixepoch(' 5 '), unixepoch(char(9) || '5' || char(10));
+    SELECT julianday('5 ') = 5.0, typeof(julianday('5 '));
+    SELECT unixepoch('5 trailing') IS NULL;
+}
+expect {
+    -210866328000|-210866328000|-210866328000|-210866328000
+    1|real
+    1
+}
+
 test cast-real-overflow-clamp {
     SELECT CAST(9223372036854775808 AS INTEGER);
 }

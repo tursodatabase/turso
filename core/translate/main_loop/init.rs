@@ -1,13 +1,22 @@
 use super::*;
 use crate::alloc::TursoIteratorExt;
+use crate::function::AggFunc;
 
-pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<DistinctCtx> {
+pub fn init_distinct(
+    program: &mut ProgramBuilder,
+    plan: &SelectPlan,
+    resolver: &Resolver,
+) -> Result<DistinctCtx> {
     let collations = plan
         .result_columns
         .iter()
         .map(|col| {
-            get_collseq_from_expr(&col.expr, &plan.table_references)
-                .map(|c| c.unwrap_or(CollationSeq::Binary))
+            get_collseq_from_expr_with_symbols(
+                &col.expr,
+                &plan.table_references,
+                Some(resolver.symbol_table),
+            )
+            .map(|c| c.unwrap_or(CollationSeq::Binary))
         })
         .collect::<Result<Vec<_>>>()?;
     let hash_table_id = program.alloc_hash_table_id();
@@ -59,6 +68,17 @@ impl InitLoop {
             }
         }
 
+        // Evaluate + range-check percentile direct arguments once, pre-loop.
+        // Doing this before the row loop opens means an out-of-range fraction
+        // halts the program regardless of how many rows reach the aggregate
+        // body (including empty / all-NULL / all-filtered input), matching PG.
+        for agg in aggregates
+            .iter_mut()
+            .filter(|a| matches!(a.func, AggFunc::PercentileCont | AggFunc::PercentileDisc))
+        {
+            emit_percentile_fraction_check(program, tables, &t_ctx.resolver, agg)?;
+        }
+
         // Initialize distinct aggregates using hash tables
         for agg in aggregates.iter_mut().filter(|agg| agg.is_distinct()) {
             turso_assert_eq!(
@@ -66,9 +86,12 @@ impl InitLoop {
                 1,
                 "DISTINCT aggregate functions must have exactly one argument"
             );
-            let collations =
-                vec![get_collseq_from_expr(&agg.original_expr, tables)?
-                    .unwrap_or(CollationSeq::Binary)];
+            let collations = vec![get_collseq_from_expr_with_symbols(
+                &agg.original_expr,
+                tables,
+                Some(t_ctx.resolver.symbol_table),
+            )?
+            .unwrap_or(CollationSeq::Binary)];
             let hash_table_id = program.alloc_hash_table_id();
             agg.distinctness = Distinctness::Distinct {
                 ctx: Some(DistinctCtx {
@@ -507,4 +530,86 @@ impl InitLoop {
 
         Ok(())
     }
+}
+
+/// Evaluates and range-checks a percentile aggregate's fraction direct
+/// argument. Stores the resulting register in `agg.fraction_reg`; bytecode
+/// halts on out-of-range. NULL fractions are allowed (propagated as a NULL
+/// result by finalize).
+fn emit_percentile_fraction_check(
+    program: &mut ProgramBuilder,
+    tables: &TableReferences,
+    resolver: &Resolver,
+    agg: &mut crate::translate::plan::Aggregate,
+) -> Result<()> {
+    use turso_parser::ast::Expr;
+    // The fraction must be constant w.r.t. the aggregated rows. Outer
+    // (correlated) columns are constant for the inner aggregate and allowed;
+    // a subquery may hide an input-column reference, so reject conservatively.
+    // This must run before we emit the expression — at this point the cursors
+    // for this query's tables aren't open yet, so a local Column read would
+    // panic in translate_expr.
+    walk_expr(&agg.args[1], &mut |e: &Expr| -> Result<WalkControl> {
+        let invalid = match e {
+            Expr::Column { table, .. } => {
+                matches!(tables.find_table_by_internal_id(*table), Some((false, _)))
+            }
+            Expr::Subquery(_) | Expr::Exists(_) | Expr::SubqueryResult { .. } => true,
+            _ => false,
+        };
+        if invalid {
+            crate::bail_parse_error!(
+                "the fraction argument of {}() must be a constant expression that does \
+                 not depend on the aggregated rows",
+                agg.func
+            );
+        }
+        Ok(WalkControl::Continue)
+    })?;
+
+    let fraction_reg = program.alloc_register();
+    translate_expr(program, Some(tables), &agg.args[1], fraction_reg, resolver)?;
+
+    // NULL skips the range check and propagates to a NULL result in finalize.
+    // Use one scratch register for both bounds: success falls through to `done`
+    // via `Le` on the upper bound; failure on either bound jumps to `bad: Halt`.
+    let done = program.allocate_label();
+    let bad = program.allocate_label();
+    let bound_reg = program.alloc_register();
+    program.emit_insn(Insn::IsNull {
+        reg: fraction_reg,
+        target_pc: done,
+    });
+    program.emit_insn(Insn::Real {
+        value: 0.0,
+        dest: bound_reg,
+    });
+    program.emit_insn(Insn::Lt {
+        lhs: fraction_reg,
+        rhs: bound_reg,
+        target_pc: bad,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::Real {
+        value: 1.0,
+        dest: bound_reg,
+    });
+    program.emit_insn(Insn::Le {
+        lhs: fraction_reg,
+        rhs: bound_reg,
+        target_pc: done,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.preassign_label_to_next_insn(bad);
+    program.emit_insn(Insn::Halt {
+        err_code: crate::error::SQLITE_ERROR,
+        description: "percentile value is not between 0 and 1".to_string(),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(done);
+    agg.fraction_reg = Some(fraction_reg);
+    Ok(())
 }

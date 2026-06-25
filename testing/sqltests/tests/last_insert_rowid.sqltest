@@ -54,3 +54,14 @@ expect {
     50|c
     50
 }
+
+@skip-if mvcc "CDC not supported in MVCC mode"
+test last-insert-rowid-unchanged-by-cdc-internal-inserts {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    PRAGMA capture_data_changes_conn = 'full';
+    INSERT INTO t1 VALUES (42, 'hello');
+    SELECT last_insert_rowid();
+}
+expect {
+    42
+}

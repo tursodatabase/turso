@@ -1,0 +1,27 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFrameworks>$(TursoTargetFrameworks)</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Turso</RootNamespace>
+    
+    <Title>Turso ADO.NET Provider</Title>
+    <Description>ADO.NET provider for Turso, exposing SQLite-compatible local database access through System.Data.Common.</Description>
+    <Authors>Turso authors</Authors>
+    <PackageTags>turso;sqlite;database;ado.net;system.data</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/tursodatabase/turso</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/tursodatabase/turso</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  
+  <ItemGroup>
+    <ProjectReference Include="..\Turso.Raw\Turso.Raw.csproj" />
+  </ItemGroup>
+
+</Project>

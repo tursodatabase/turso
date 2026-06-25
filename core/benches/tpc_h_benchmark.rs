@@ -31,6 +31,7 @@ fn rusqlite_open_tpc_h() -> rusqlite::Connection {
     sqlite_conn
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_tpc_h_queries(criterion: &mut Criterion) {
     // https://github.com/tursodatabase/turso/issues/174
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
@@ -104,7 +105,7 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
                             turso_core::StepResult::Row => {
                                 black_box(stmt.row());
                             }
-                            turso_core::StepResult::IO => {
+                            turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                                 db.io.step().unwrap();
                             }
                             turso_core::StepResult::Done => {

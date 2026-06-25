@@ -144,8 +144,10 @@ fn parse_pg_text_array(text: &str) -> Option<Vec<Value>> {
 }
 
 /// Pack values into a record-format array blob.
-pub(crate) fn values_to_record_blob(values: &[Value]) -> Value {
-    Value::Blob(ImmutableRecord::from_values(values, values.len()).into_payload())
+pub(crate) fn values_to_record_blob(values: &[Value]) -> Result<Value> {
+    Ok(Value::Blob(
+        ImmutableRecord::from_values(values, values.len())?.into_payload(),
+    ))
 }
 
 /// Serialize a record-format array blob to PostgreSQL text representation.
@@ -248,17 +250,42 @@ pub(crate) fn compute_array_length(val: &Value) -> Option<i64> {
     }
 }
 
-pub(crate) fn exec_array_append(arr: &Value, elem: &Value) -> Value {
+/// Compute the element count at array dimension `dim` (1-based). For `dim == 1`,
+/// returns the same value as [`compute_array_length`]. For `dim > 1`, the array
+/// is assumed to be uniform — each outer element is itself an array — and the
+/// walker recurses into element zero `dim - 1` times.
+///
+/// Returns `None` for NULL or non-array input, for `dim < 1`, for an empty
+/// array when `dim > 1` (no element zero to peek into), and for `dim` deeper
+/// than the array's actual nesting. Matches PostgreSQL's
+/// `array_length(arr, dim)` contract — except Turso doesn't track per-
+/// dimension lower bounds, so `array_upper(arr, dim)` equals this function
+/// for all valid `dim`.
+pub(crate) fn compute_array_length_at_dim(val: &Value, dim: i64) -> Option<i64> {
+    if dim < 1 {
+        return None;
+    }
+    if dim == 1 {
+        return compute_array_length(val);
+    }
+    // dim > 1: peek into element zero and recurse. Uniform-shape arrays let
+    // us answer "length at depth N" by looking at any element at depth 1;
+    // element zero is the cheapest to extract.
+    let first = array_values_from_any(val)?.into_iter().next()?;
+    compute_array_length_at_dim(&first, dim - 1)
+}
+
+pub(crate) fn exec_array_append(arr: &Value, elem: &Value) -> Result<Value> {
     let Some(mut elements) = array_values_from_any(arr) else {
-        return Value::Null;
+        return Ok(Value::Null);
     };
     elements.push(elem.clone());
     values_to_record_blob(&elements)
 }
 
-pub(crate) fn exec_array_prepend(arr: &Value, elem: &Value) -> Value {
+pub(crate) fn exec_array_prepend(arr: &Value, elem: &Value) -> Result<Value> {
     let Some(elements) = array_values_from_any(arr) else {
-        return Value::Null;
+        return Ok(Value::Null);
     };
     // Build new vec with elem first — avoids O(n) shift from Vec::insert(0, ...)
     let mut result = Vec::with_capacity(elements.len() + 1);
@@ -267,26 +294,26 @@ pub(crate) fn exec_array_prepend(arr: &Value, elem: &Value) -> Value {
     values_to_record_blob(&result)
 }
 
-pub(crate) fn exec_array_cat(a: &Value, b: &Value) -> Value {
+pub(crate) fn exec_array_cat(a: &Value, b: &Value) -> Result<Value> {
     if matches!(a, Value::Null) || matches!(b, Value::Null) {
-        return Value::Null;
+        return Ok(Value::Null);
     }
     let Some(mut elems_a) = array_values_from_any(a) else {
-        return Value::Null;
+        return Ok(Value::Null);
     };
     let Some(elems_b) = array_values_from_any(b) else {
-        return Value::Null;
+        return Ok(Value::Null);
     };
     elems_a.extend(elems_b);
     values_to_record_blob(&elems_a)
 }
 
-pub(crate) fn exec_array_remove(arr: &Value, target: &Value) -> Value {
+pub(crate) fn exec_array_remove(arr: &Value, target: &Value) -> Result<Value> {
     if matches!(arr, Value::Null) {
-        return Value::Null;
+        return Ok(Value::Null);
     }
     let Some(elements) = array_values_from_any(arr) else {
-        return Value::Null;
+        return Ok(Value::Null);
     };
     let result: Vec<Value> = elements.into_iter().filter(|e| e != target).collect();
     values_to_record_blob(&result)
@@ -345,12 +372,12 @@ fn array_find_streaming(
     None
 }
 
-pub(crate) fn exec_array_slice(arr: &Value, start: &Value, end: &Value) -> Value {
+pub(crate) fn exec_array_slice(arr: &Value, start: &Value, end: &Value) -> Result<Value> {
     if matches!(arr, Value::Null) {
-        return Value::Null;
+        return Ok(Value::Null);
     }
     let Some(elements) = array_values_from_any(arr) else {
-        return Value::Null;
+        return Ok(Value::Null);
     };
     // PG convention: 1-based inclusive bounds
     let start_idx = match start {
@@ -375,10 +402,10 @@ pub(crate) fn exec_string_to_array(
     text: &Value,
     delimiter: &Value,
     null_str: Option<&Value>,
-) -> Value {
+) -> Result<Value> {
     let text_str = match text {
         Value::Text(t) => t.as_str().to_string(),
-        Value::Null => return Value::Null,
+        Value::Null => return Ok(Value::Null),
         other => other.to_string(),
     };
 
@@ -557,9 +584,9 @@ pub(crate) fn make_array_from_registers(
     registers: &[super::Register],
     start_reg: usize,
     count: usize,
-) -> Value {
-    let record = ImmutableRecord::from_registers(&registers[start_reg..start_reg + count], count);
-    Value::Blob(record.into_payload())
+) -> Result<Value> {
+    let record = ImmutableRecord::from_registers(&registers[start_reg..start_reg + count], count)?;
+    Ok(Value::Blob(record.into_payload()))
 }
 
 /// Element-wise comparison of two record-format array blobs.
@@ -625,7 +652,7 @@ mod tests {
 
     #[test]
     fn test_compute_array_length_valid_array() {
-        let blob = values_to_record_blob(&[Value::from_i64(1), Value::from_i64(2)]);
+        let blob = values_to_record_blob(&[Value::from_i64(1), Value::from_i64(2)]).unwrap();
         assert_eq!(compute_array_length(&blob), Some(2));
     }
 
@@ -642,8 +669,9 @@ mod tests {
             Value::from_i64(3),
             Value::from_i64(2),
             Value::from_i64(1),
-        ]);
-        let result = exec_array_remove(&arr, &Value::from_i64(2));
+        ])
+        .unwrap();
+        let result = exec_array_remove(&arr, &Value::from_i64(2)).unwrap();
         let Value::Blob(blob) = &result else {
             panic!("Expected Blob");
         };
@@ -698,7 +726,7 @@ mod tests {
 
     #[test]
     fn test_string_to_array_null_delimiter_splits_chars() {
-        let result = exec_string_to_array(&Value::build_text("hello"), &Value::Null, None);
+        let result = exec_string_to_array(&Value::build_text("hello"), &Value::Null, None).unwrap();
         let Value::Blob(blob) = &result else {
             panic!("Expected Blob, got {result:?}");
         };
@@ -715,7 +743,8 @@ mod tests {
             Value::from_i64(10),
             Value::from_i64(20),
             Value::from_i64(30),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(
             exec_array_contains(&arr, &Value::from_i64(20)),
             Value::from_i64(1)
@@ -732,7 +761,8 @@ mod tests {
             Value::from_i64(10),
             Value::from_i64(20),
             Value::from_i64(30),
-        ]);
+        ])
+        .unwrap();
         // 1-based: element 20 is at position 2
         assert_eq!(
             exec_array_position(&arr, &Value::from_i64(20)),
@@ -747,7 +777,8 @@ mod tests {
             Value::from_i64(10),
             Value::from_i64(20),
             Value::from_i64(30),
-        ]);
+        ])
+        .unwrap();
         // array_find_streaming with impossible predicate should return None
         let Value::Blob(blob) = &arr else {
             panic!("Expected Blob");
@@ -758,7 +789,7 @@ mod tests {
     #[test]
     fn test_dc4_array_remove_null_returns_null() {
         assert_eq!(
-            exec_array_remove(&Value::Null, &Value::from_i64(1)),
+            exec_array_remove(&Value::Null, &Value::from_i64(1)).unwrap(),
             Value::Null
         );
     }
@@ -766,16 +797,19 @@ mod tests {
     #[test]
     fn test_dc4_array_slice_null_returns_null() {
         assert_eq!(
-            exec_array_slice(&Value::Null, &Value::from_i64(0), &Value::from_i64(2)),
+            exec_array_slice(&Value::Null, &Value::from_i64(0), &Value::from_i64(2)).unwrap(),
             Value::Null,
         );
     }
 
     #[test]
     fn test_dc4_array_cat_null_returns_null() {
-        assert_eq!(exec_array_cat(&Value::Null, &Value::Null), Value::Null);
         assert_eq!(
-            exec_array_cat(&Value::Null, &Value::from_i64(1)),
+            exec_array_cat(&Value::Null, &Value::Null).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            exec_array_cat(&Value::Null, &Value::from_i64(1)).unwrap(),
             Value::Null,
         );
     }
@@ -783,7 +817,8 @@ mod tests {
     #[test]
     fn test_serialize_array_from_blob() {
         let arr =
-            values_to_record_blob(&[Value::from_i64(1), Value::build_text("hello"), Value::Null]);
+            values_to_record_blob(&[Value::from_i64(1), Value::build_text("hello"), Value::Null])
+                .unwrap();
         let Value::Blob(blob) = &arr else {
             panic!("Expected Blob");
         };
@@ -799,7 +834,7 @@ mod tests {
             Register::Value(Value::build_text("two")),
             Register::Value(Value::from_i64(3)),
         ];
-        let result = make_array_from_registers(&registers, 0, 3);
+        let result = make_array_from_registers(&registers, 0, 3).unwrap();
         let Value::Blob(blob) = &result else {
             panic!("Expected Blob");
         };

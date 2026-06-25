@@ -687,7 +687,7 @@ fn test_vacuum_into_rejects_active_select_on_same_connection(
                 }
             }
             StepResult::Done => break,
-            StepResult::IO => select_stmt.get_pager().io.step()?,
+            StepResult::IO | StepResult::Yield => select_stmt.get_pager().io.step()?,
             StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
             StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
         }
@@ -747,7 +747,7 @@ fn test_vacuum_into_rejects_reprepared_active_select_on_same_connection(
                 }
             }
             StepResult::Done => break,
-            StepResult::IO => select_stmt.get_pager().io.step()?,
+            StepResult::IO | StepResult::Yield => select_stmt.get_pager().io.step()?,
             StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
             StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
         }
@@ -789,7 +789,7 @@ fn test_same_connection_select_then_write_then_continue_select(
                 }
             }
             StepResult::Done => break,
-            StepResult::IO => select_stmt.get_pager().io.step()?,
+            StepResult::IO | StepResult::Yield => select_stmt.get_pager().io.step()?,
             StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
             StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
         }
@@ -1242,69 +1242,6 @@ fn test_vacuum_into_empty_edge_cases(tmp_db: TempDatabase) -> anyhow::Result<()>
         let dup = dest_conn.execute("INSERT INTO t2 VALUES (1, 2.0)");
         assert!(dup.is_err(), "Unique index should prevent duplicate");
     }
-
-    Ok(())
-}
-
-/// Test VACUUM INTO preserves AUTOINCREMENT counters (sqlite_sequence)
-/// FIXME: enable for mvcc when autoincrement is fixed
-#[turso_macros::test]
-fn test_vacuum_into_preserves_autoincrement(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-
-    // create table with AUTOINCREMENT and insert some rows to advance the counter
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)")?;
-    conn.execute("INSERT INTO t (name) VALUES ('first')")?;
-    conn.execute("INSERT INTO t (name) VALUES ('second')")?;
-    conn.execute("INSERT INTO t (name) VALUES ('third')")?;
-
-    // delete rows to create a gap
-    conn.execute("DELETE FROM t WHERE id = 2")?;
-
-    // verify sqlite_sequence has the counter
-    let seq_before: Vec<(String, i64)> =
-        conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
-    assert_eq!(
-        seq_before,
-        vec![("t".to_string(), 3)],
-        "sqlite_sequence should have counter value 3"
-    );
-
-    let source_hash = compute_dbhash(&tmp_db);
-    let dest_dir = TempDir::new()?;
-    let dest_path = dest_dir.path().join("vacuumed.db");
-    let dest_path_str = dest_path.to_str().unwrap();
-    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
-
-    let dest_db = TempDatabase::new_with_existent(&dest_path);
-    let dest_conn = dest_db.connect_limbo();
-
-    // verify integrity and dbhash (before modifying destination)
-    assert_eq!(run_integrity_check(&dest_conn), "ok");
-    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
-
-    // verify sqlite_sequence was copied
-    let seq_after: Vec<(String, i64)> =
-        dest_conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
-    assert_eq!(
-        seq_after,
-        vec![("t".to_string(), 3)],
-        "sqlite_sequence should be preserved in destination"
-    );
-
-    // insert a new row and verify it gets id = 4 (not 1 or 3)
-    dest_conn.execute("INSERT INTO t (name) VALUES ('fourth')")?;
-    let new_row: Vec<(i64, String)> =
-        dest_conn.exec_rows("SELECT id, name FROM t WHERE name = 'fourth'");
-    assert_eq!(
-        new_row,
-        vec![(4, "fourth".to_string())],
-        "New row should get id = 4 (AUTOINCREMENT counter preserved)"
-    );
-
-    // verify integrity since we modified the db
-    let integrity_result = run_integrity_check(&dest_conn);
-    assert_eq!(integrity_result, "ok");
 
     Ok(())
 }
@@ -3786,9 +3723,10 @@ fn test_vacuum_into_preserves_custom_type_ordering_and_schema_reuse() -> anyhow:
     Ok(())
 }
 
-/// VACUUM INTO must preserve AUTOINCREMENT counters so that
-/// new inserts on both source and destination get the same next rowid.
-#[turso_macros::test]
+/// VACUUM INTO must preserve AUTOINCREMENT counters so that new inserts
+/// on both source and destination get the same next rowid, and the
+/// destination's `sqlite_sequence` row mirrors the source watermark.
+#[turso_macros::test(mvcc)]
 fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -3798,19 +3736,35 @@ fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> any
     conn.execute("INSERT INTO t (val) VALUES ('c')")?;
     // Delete some rows to create a gap - AUTOINCREMENT should never reuse rowids
     conn.execute("DELETE FROM t WHERE id = 2")?;
+    let source_seq: Vec<(String, i64)> =
+        conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
+    assert_eq!(source_seq, vec![("t".to_string(), 3)]);
     let source_hash = compute_dbhash(&tmp_db);
 
     let dest_dir = TempDir::new()?;
     let dest_path = dest_dir.path().join("autoincr.db");
-    let (dest_db, dest_conn) = run_vacuum_into_and_assert_round_trip(&tmp_db, &conn, &dest_path)?;
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, tmp_db.db_opts);
+    let dest_conn = dest_db.connect_limbo();
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    // Destination's sqlite_sequence carries the same watermark.
+    let dest_seq: Vec<(String, i64)> =
+        dest_conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
+    assert_eq!(dest_seq, source_seq);
 
     // Insert a new row on the source - should get id=4 (not 2, because AUTOINCREMENT)
     conn.execute("INSERT INTO t (val) VALUES ('d')")?;
     let source_new: Vec<(i64, String)> = conn.exec_rows("SELECT id, val FROM t WHERE val = 'd'");
     assert_eq!(source_new, vec![(4, "d".to_string())]);
 
-    // Insert a new row on the destination - should also get id=4
-    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    // dbhash equivalence holds for non-MVCC; MVCC's version pages make
+    // the file-level hash unstable but the logical contract above
+    // (sqlite_sequence + next-rowid assignment) is what matters.
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
     dest_conn.execute("INSERT INTO t (val) VALUES ('d')")?;
     let dest_new: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, val FROM t WHERE val = 'd'");
     assert_eq!(
@@ -4210,6 +4164,40 @@ fn test_plain_vacuum_preserves_autoincrement(tmp_db: TempDatabase) -> anyhow::Re
     assert_eq!(rows[0], (1, "one".into()));
     assert_eq!(rows[1], (3, "three".into()));
     assert_eq!(rows[2], (4, "four".into()));
+
+    Ok(())
+}
+
+/// Plain VACUUM must succeed against a database with user-created
+/// sequences and preserve their on-disk state. The post-VACUUM
+/// connection must still be able to nextval and observe the
+/// pre-VACUUM watermark.
+///
+/// Regression: classifying the `__turso_internal_seq_*` backing
+/// table as "skip-in-target-schema-replay" while leaving it in the
+/// copy phase produced `no such table: "__turso_internal_seq_s"` on
+/// any DB carrying a user-created sequence. Repro from the
+/// reviewer: `CREATE SEQUENCE s; SELECT nextval('s'); VACUUM;`.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test]
+fn test_plain_vacuum_preserves_user_sequence(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE SEQUENCE s START WITH 1 INCREMENT BY 1")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('s')");
+    assert_eq!(rows, vec![(1,)]);
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('s')");
+    assert_eq!(rows, vec![(2,)]);
+
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('s')");
+    assert_eq!(
+        rows,
+        vec![(3,)],
+        "post-VACUUM nextval must continue from the pre-VACUUM watermark"
+    );
 
     Ok(())
 }
@@ -6123,7 +6111,7 @@ fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_
             StepResult::Busy | StepResult::Interrupt => {
                 anyhow::bail!("unexpected non-IO result while staging checkpoint cleanup test")
             }
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 while let Some(event) = io.step_one()? {
                     if event.path == source_wal_path && event.kind == QueuedIoOpKind::Pwritev {
                         saw_source_wal_batch_write = true;

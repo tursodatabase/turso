@@ -275,7 +275,7 @@ fn do_fuzz(expr: Expr) -> Result<Corpus, Box<dyn Error>> {
         loop {
             use turso_core::StepResult;
             match stmt.step()? {
-                StepResult::IO => stmt.run_once()?,
+                StepResult::IO | StepResult::Yield => stmt.run_once()?,
                 StepResult::Row => {
                     let row = stmt.row().unwrap();
                     assert_eq!(row.len(), 1, "expr: {:?}", expr);

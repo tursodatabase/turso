@@ -801,6 +801,35 @@ expect {
     hundred
 }
 
+setup partial_index_indexed_by_between_schema {
+    CREATE TABLE t_between_forced(id INTEGER PRIMARY KEY, a INTEGER, c TEXT, e INTEGER);
+    CREATE INDEX idx_between_forced ON t_between_forced(a, c, id) WHERE e BETWEEN -10 AND 10;
+    INSERT INTO t_between_forced VALUES
+        (1, 1, 'in', 0),
+        (2, 2, 'out', 20),
+        (3, 3, 'also_in', -10);
+}
+
+@setup partial_index_indexed_by_between_schema
+test partial-index-indexed-by-between-predicate-can-prove-index {
+    SELECT id, a, c
+    FROM t_between_forced INDEXED BY idx_between_forced
+    WHERE e BETWEEN -10 AND 10
+    ORDER BY a, c, id;
+}
+expect {
+    1|1|in
+    3|3|also_in
+}
+
+@setup partial_index_indexed_by_between_schema
+snapshot-eqp partial-index-indexed-by-between-predicate-can-prove-index-eqp {
+    SELECT id, a, c
+    FROM t_between_forced INDEXED BY idx_between_forced
+    WHERE e BETWEEN -10 AND 10
+    ORDER BY a, c, id;
+}
+
 # Multiple partial indexes with BETWEEN on same table
 @cross-check-integrity
 test partial-index-between-multiple {
@@ -1228,27 +1257,212 @@ expect {
 
 # Functional correctness: results match what you'd expect when the partial
 # index is consulted for a seek.
-@cross-check-integrity
-test partial-index-seek-correctness {
+setup partial_index_seek_schema {
     CREATE TABLE samples (id INTEGER PRIMARY KEY, library_id INTEGER, attack_score INTEGER, name TEXT);
     CREATE INDEX samples_pidx ON samples(name) WHERE library_id IS NULL AND attack_score IS NOT NULL;
     INSERT INTO samples VALUES (1, NULL, 5, 'a'), (2, NULL, NULL, 'a'),
                                 (3, 1,    7, 'a'), (4, NULL, 9, 'b');
+}
+
+@setup partial_index_seek_schema
+@cross-check-integrity
+test partial-index-seek-correctness {
     SELECT id FROM samples WHERE library_id IS NULL AND attack_score IS NOT NULL AND name = 'a';
 }
 expect {
     1
 }
 
-@cross-check-integrity
-test partial-index-full-scan-correctness {
+@setup partial_index_seek_schema
+snapshot-eqp partial-index-seek-correctness-eqp {
+    SELECT id FROM samples WHERE library_id IS NULL AND attack_score IS NOT NULL AND name = 'a';
+}
+
+setup partial_index_full_scan_schema {
     CREATE TABLE samples (id INTEGER PRIMARY KEY, library_id INTEGER, attack_score INTEGER);
     CREATE INDEX samples_user_processed_idx ON samples (id)
         WHERE library_id IS NULL AND attack_score IS NOT NULL;
     INSERT INTO samples VALUES (1, NULL, 5), (2, NULL, NULL),
                                 (3, 1,    7), (4, NULL, 9);
+}
+
+@setup partial_index_full_scan_schema
+@cross-check-integrity
+test partial-index-full-scan-correctness {
     SELECT COUNT(*) FROM samples WHERE library_id IS NULL AND attack_score IS NOT NULL;
 }
 expect {
     2
+}
+
+@setup partial_index_full_scan_schema
+snapshot-eqp partial-index-full-scan-correctness-eqp {
+    SELECT COUNT(*) FROM samples WHERE library_id IS NULL AND attack_score IS NOT NULL;
+}
+
+# A RHS ON-clause predicate may prove a LEFT JOIN partial index: rows outside
+# the predicate cannot match the left row anyway.
+setup partial_index_left_join_on_schema {
+    CREATE TABLE left_items(id INTEGER);
+    CREATE TABLE right_items(id INTEGER, marker INTEGER);
+    CREATE INDEX right_marker_null_idx ON right_items(id) WHERE marker IS NULL;
+    INSERT INTO left_items VALUES(1), (2);
+    INSERT INTO right_items VALUES(10, NULL), (11, 5);
+}
+
+@setup partial_index_left_join_on_schema
+test partial-index-left-join-on-predicate-can-prove-index {
+    SELECT left_items.id, right_items.id, right_items.marker
+    FROM left_items
+    LEFT JOIN right_items ON right_items.marker IS NULL
+    ORDER BY left_items.id, right_items.id;
+}
+expect {
+    1|10|
+    2|10|
+}
+
+@setup partial_index_left_join_on_schema
+snapshot-eqp partial-index-left-join-on-predicate-can-prove-index-eqp {
+    SELECT left_items.id, right_items.id, right_items.marker
+    FROM left_items
+    LEFT JOIN right_items ON right_items.marker IS NULL
+    ORDER BY left_items.id, right_items.id;
+}
+
+# The same RHS predicate in WHERE is post-join. It cannot prove a partial index
+# for the right side of a LEFT JOIN because omitted non-matching RHS rows would
+# incorrectly create NULL-extended rows.
+setup partial_index_left_join_where_schema {
+    CREATE TABLE left_items(id INTEGER);
+    CREATE TABLE right_items(id INTEGER, marker INTEGER);
+    CREATE INDEX right_marker_null_idx ON right_items(id) WHERE marker IS NULL;
+    INSERT INTO left_items VALUES(1);
+    INSERT INTO right_items VALUES(10, 5);
+}
+
+@setup partial_index_left_join_where_schema
+test partial-index-left-join-where-predicate-cannot-prove-index {
+    SELECT COUNT(*)
+    FROM left_items
+    LEFT JOIN right_items ON 1
+    WHERE right_items.marker IS NULL;
+}
+expect {
+    0
+}
+
+@setup partial_index_left_join_where_schema
+snapshot-eqp partial-index-left-join-where-predicate-cannot-prove-index-eqp {
+    SELECT COUNT(*)
+    FROM left_items
+    LEFT JOIN right_items ON 1
+    WHERE right_items.marker IS NULL;
+}
+
+test partial-index-indexed-by-left-join-where-predicate-rejected {
+    CREATE TABLE left_items(id INTEGER);
+    CREATE TABLE right_items(id INTEGER, marker INTEGER);
+    CREATE INDEX right_marker_null_idx ON right_items(id) WHERE marker IS NULL;
+    INSERT INTO left_items VALUES(1);
+    INSERT INTO right_items VALUES(10, 5);
+    SELECT COUNT(*)
+    FROM left_items
+    LEFT JOIN right_items INDEXED BY right_marker_null_idx ON 1
+    WHERE right_items.marker IS NULL;
+}
+expect error {
+    no query solution
+}
+
+setup partial_index_indexed_by_null_rejecting_schema {
+    CREATE TABLE left_items(id INTEGER);
+    CREATE TABLE right_items(id INTEGER, marker INTEGER);
+    CREATE INDEX right_marker_five_idx ON right_items(id) WHERE marker = 5;
+    INSERT INTO left_items VALUES(1);
+    INSERT INTO right_items VALUES(1, 5), (1, 6);
+}
+
+@setup partial_index_indexed_by_null_rejecting_schema
+test partial-index-indexed-by-left-join-null-rejecting-where-can-prove-after-rewrite {
+    SELECT COUNT(*)
+    FROM left_items
+    LEFT JOIN right_items INDEXED BY right_marker_five_idx ON left_items.id = right_items.id
+    WHERE right_items.marker = 5;
+}
+expect {
+    1
+}
+
+@setup partial_index_indexed_by_null_rejecting_schema
+snapshot-eqp partial-index-indexed-by-left-join-null-rejecting-where-can-prove-after-rewrite-eqp {
+    SELECT COUNT(*)
+    FROM left_items
+    LEFT JOIN right_items INDEXED BY right_marker_five_idx ON left_items.id = right_items.id
+    WHERE right_items.marker = 5;
+}
+
+test partial-index-indexed-by-without-predicate-rejected {
+    CREATE TABLE indexed_items(id INTEGER, marker INTEGER);
+    CREATE INDEX indexed_items_marker_null_idx ON indexed_items(id) WHERE marker IS NULL;
+    INSERT INTO indexed_items VALUES(1, NULL), (2, 5);
+    SELECT id FROM indexed_items INDEXED BY indexed_items_marker_null_idx ORDER BY id;
+}
+expect error {
+    no query solution
+}
+
+setup partial_index_indexed_by_count_schema {
+    CREATE TABLE indexed_items(id INTEGER, marker INTEGER);
+    CREATE INDEX indexed_items_marker_null_idx ON indexed_items(id) WHERE marker IS NULL;
+    INSERT INTO indexed_items VALUES(1, NULL), (2, 5);
+}
+
+@setup partial_index_indexed_by_count_schema
+test partial-index-indexed-by-count-star-without-predicate-counts-table {
+    SELECT COUNT(*) FROM indexed_items INDEXED BY indexed_items_marker_null_idx;
+}
+expect {
+    2
+}
+
+@setup partial_index_indexed_by_count_schema
+snapshot-eqp partial-index-indexed-by-count-star-without-predicate-counts-table-eqp {
+    SELECT COUNT(*) FROM indexed_items INDEXED BY indexed_items_marker_null_idx;
+}
+
+setup partial_index_multi_index_or_schema {
+    CREATE TABLE indexed_items(a INT, b INT, c INT);
+    CREATE INDEX indexed_items_a_partial_idx ON indexed_items(a) WHERE b = 1;
+    CREATE INDEX indexed_items_c_idx ON indexed_items(c);
+    INSERT INTO indexed_items VALUES (2, 0, 9), (2, 1, 8), (5, 0, 3);
+}
+
+@setup partial_index_multi_index_or_schema
+test partial-index-multi-index-or-can-use-proven-partial-index {
+    SELECT a, b, c FROM indexed_items WHERE (a = 2 AND b = 1) OR c = 3 ORDER BY b, c;
+}
+expect {
+    5|0|3
+    2|1|8
+}
+
+@setup partial_index_multi_index_or_schema
+snapshot-eqp partial-index-multi-index-or-can-use-proven-partial-index-eqp {
+    SELECT a, b, c FROM indexed_items WHERE (a = 2 AND b = 1) OR c = 3 ORDER BY b, c;
+}
+
+@setup partial_index_multi_index_or_schema
+test partial-index-multi-index-or-rejects-unproven-partial-index {
+    SELECT a, b, c FROM indexed_items WHERE a = 2 OR c = 3 ORDER BY b, c;
+}
+expect {
+    5|0|3
+    2|0|9
+    2|1|8
+}
+
+@setup partial_index_multi_index_or_schema
+snapshot-eqp partial-index-multi-index-or-rejects-unproven-partial-index-eqp {
+    SELECT a, b, c FROM indexed_items WHERE a = 2 OR c = 3 ORDER BY b, c;
 }

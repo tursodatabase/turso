@@ -1,8 +1,12 @@
+use crate::alloc::{
+    ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt, TursoVecExt, Vec,
+    ALLOC_ERR_MSG,
+};
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, TxTimestampOrID,
-    WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
-    SQLITE_SCHEMA_MVCC_TABLE_ID,
+    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
+    TxTimestampOrID, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
+    MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -24,12 +28,26 @@ use crate::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
+use std::ops::Bound;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
+
+const COLLECT_PREEMPTION_THRESHOLD: usize = 1024;
+
+macro_rules! with_mvcc_checkpoint_allocation_site {
+    ($site:ident, $expr:expr) => {{
+        #[cfg(feature = "allocation_metric")]
+        let _turso_allocation_site_guard =
+            crate::alloc::enter_allocation_site(crate::alloc::MvccCheckpointAllocationSite::$site);
+        $expr
+    }};
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
     AcquireLock,
+    CollectTableRows,
+    CollectIndexRows,
     BeginPagerTxn,
     WriteRow {
         write_set_index: usize,
@@ -51,6 +69,16 @@ pub enum CheckpointState {
     DeleteIndexRowStateMachine {
         index_write_set_index: usize,
     },
+    /// Compact each non-CYCLE sequence backing table down to a single
+    /// watermark row. CYCLE seqs are skipped — they manage wrap
+    /// correctness via inline compaction in the nextval bytecode and
+    /// already stay at one row in steady state. Non-CYCLE seqs grow
+    /// monotonically (one row per nextval) since inline compaction
+    /// was removed from the hot path to eliminate shared-row WW
+    /// conflicts; checkpoint reclaims the historical rows here, via
+    /// `SeqCompactDriver` which drives `BTreeCursor` ops with normal
+    /// `IOResult` propagation (no `io.block` / `wait_for_completion`).
+    CompactSequences,
     CommitPagerTxn,
     CheckpointWal,
     /// Fsync the database file after checkpoint, before truncating WAL.
@@ -61,6 +89,14 @@ pub enum CheckpointState {
     FsyncLogicalLog,
     /// Truncate the WAL file after DB file and logical-log cleanup are safely durable.
     TruncateWal,
+    GcTableRows {
+        next_index: usize,
+        lwm: u64,
+    },
+    GcIndexRows {
+        next_index: usize,
+        lwm: u64,
+    },
     Finalize,
 }
 
@@ -107,7 +143,7 @@ pub struct LockStates {
 /// 7. Fsync the DB file
 /// 8. Truncate logical log to 0 (salt regenerated in memory), fsync, then truncate WAL
 /// 9. Releases the blocking_checkpoint_lock
-pub struct CheckpointStateMachine<Clock: LogicalClock> {
+pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
     /// The current state of the state machine
     state: CheckpointState,
     /// The states of the locks held by the state machine - these are tracked for error handling so that they are
@@ -120,7 +156,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// Pager used for writing to the B-tree
     pager: Arc<Pager>,
     /// MVCC store containing the row versions.
-    mvstore: Arc<MvStore<Clock>>,
+    mvstore: Arc<MvStore<Clock, A>>,
     /// Connection to the database
     connection: Arc<Connection>,
     #[cfg(any(test, injected_yields))]
@@ -164,10 +200,106 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     staged_checkpoint_header: Option<DatabaseHeader>,
     /// Guard to avoid restaging page 1 across CommitPagerTxn async retries.
     header_staged_for_commit: bool,
+    collect_table_cursor: Option<RowID>,
+    collect_index_tableid_cursor: Option<MVTableId>,
+    collect_index_key_cursor: Option<Arc<SortableIndexKey>>,
+    /// Async driver for `CheckpointState::CompactSequences`. Lazily set
+    /// on first entry to that state; cleared when the driver completes.
+    seq_compact: Option<SeqCompactDriver<Clock, A>>,
+}
+
+/// One pending compaction job in the per-checkpoint sequence sweep.
+#[derive(Debug, Clone, Copy)]
+struct SeqCompaction {
+    backing_root: i64,
+    backing_num_cols: usize,
+    /// MVCC table id derived from `backing_root` at sweep-plan time.
+    /// Cached here so the per-row purge in `ScanDelete` doesn't re-scan
+    /// `mvstore.table_id_to_rootpage` on every deletion. The driver uses
+    /// it together with the deleted row's `value` (= rowid alias) to
+    /// build the `RowID` it passes to
+    /// `MvStore::purge_row_versions_during_checkpoint`.
+    table_id: MVTableId,
+    /// `true` for ascending sequences (watermark = `Last`), `false` for
+    /// descending (watermark = `Rewind`). Direction-aware because the
+    /// "current value" of a sequence is the max for ascending and the
+    /// min for descending — keeping the wrong end as the watermark
+    /// after compaction would lose the last emitted value across
+    /// restart.
+    increment_positive: bool,
+}
+
+/// Per-row scan phase within `SeqCompactDriver`. Each backing table is
+/// walked end-to-end: a watermark seek (Last/Rewind) followed by a
+/// from-start scan that deletes every row whose key (= value = rowid,
+/// since `value` is `INTEGER PRIMARY KEY`) differs from the watermark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeqCompactPhase {
+    /// `cursor.last()` for ascending, `cursor.rewind()` for descending.
+    /// Yields IOResult::IO on page reads.
+    SeekWatermark,
+    /// `cursor.rowid()` to capture the watermark key. Yields IO on
+    /// further reads. If the cursor has no record (empty backing
+    /// table), advances to next sequence without scanning.
+    ReadWatermarkRowid,
+    /// `cursor.rewind()` to start the from-start scan. Yields IO.
+    ScanRewind,
+    /// `cursor.rowid()` on the current scan row. Yields IO.
+    ScanReadRowid,
+    /// `cursor.delete()` when the current row's key differs from the
+    /// watermark. Yields IO.
+    ScanDelete,
+    /// `cursor.next()` to advance the scan. Yields IO. Re-enters
+    /// `ScanReadRowid` when the cursor still has a record, otherwise
+    /// advances to the next sequence.
+    ScanNext,
+}
+
+/// Walks each pending sequence backing table and deletes every row
+/// that is not the current watermark. Pure `IOResult` plumbing — every
+/// cursor op yields up to the caller on page IO, so a `step()` call
+/// from inside the checkpoint state machine can propagate a yield
+/// upward without ever blocking the executor.
+///
+/// Generic over `Clock` so it can hold an `Arc<MvStore<Clock, A>>` — the
+/// driver paired-deletes from the B-tree (via the cursor) AND from the
+/// MVCC version chain (via `purge_row_versions_during_checkpoint`) so
+/// the two layers stay consistent. Skipping the version-chain purge
+/// would leave entries with `btree_resident: true` pointing at B-tree
+/// rows that no longer exist, surviving until `drop_unused_row_versions`
+/// Rule 3 catches up.
+struct SeqCompactDriver<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
+    /// Remaining backing tables to compact, in arbitrary order.
+    pending: Vec<SeqCompaction>,
+    /// Index of the in-flight compaction within `pending`.
+    current_idx: usize,
+    /// Cursor on the in-flight backing table. Constructed on entry to
+    /// `SeekWatermark`, dropped on transition to the next sequence.
+    cursor: Option<BTreeCursor>,
+    /// Current scan phase for the in-flight backing table.
+    phase: SeqCompactPhase,
+    /// The watermark key captured in `ReadWatermarkRowid`. The scan
+    /// keeps the row at this key and deletes all others.
+    watermark_key: Option<i64>,
+    /// Row key (= `value` column, since `value INTEGER PRIMARY KEY`)
+    /// captured in `ScanReadRowid` when we decide the current row must
+    /// go. Consumed by `ScanDelete` AFTER `cursor.delete()` returns
+    /// `Done` to build the matching `RowID` for the MVCC purge call.
+    /// Stored on the driver (not as a phase payload) so a yield mid-
+    /// `cursor.delete()` doesn't lose the rowid across re-entry.
+    pending_delete_rowid: Option<i64>,
+    /// Cached pager handle so cursor construction matches the original
+    /// `BTreeCursor::new_table` signature.
+    pager: Arc<Pager>,
+    /// MVCC store used to purge version-chain entries paired with each
+    /// B-tree delete. See the struct-level comment for the invariant.
+    mvstore: Arc<MvStore<Clock, A>>,
 }
 
 #[cfg(any(test, injected_yields))]
-impl<Clock: LogicalClock> ProvidesYieldContext for CheckpointStateMachine<Clock> {
+impl<Clock: LogicalClock, A: ConcurrentAllocator> ProvidesYieldContext
+    for CheckpointStateMachine<Clock, A>
+{
     fn yield_context(&self) -> YieldContext {
         YieldContext::new(
             self.connection.yield_injector(),
@@ -269,7 +401,7 @@ fn sqlite_schema_versions_refer_to_btree(lhs: &RowVersion, rhs: &RowVersion) -> 
 /// `ALTER TABLE ... RENAME COLUMN`, must collapse to the latest version; otherwise checkpoint
 /// treats one schema row chain as a DROP+CREATE pair and emits duplicate work for the same rowid.
 fn is_schema_metadata_only_rewrite(current: &RowVersion, next: Option<&RowVersion>) -> bool {
-    if current.end.is_none() {
+    if current.end().is_none() {
         return false;
     }
 
@@ -283,7 +415,205 @@ fn is_schema_metadata_only_rewrite(current: &RowVersion, next: Option<&RowVersio
     }
 }
 
-impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
+impl<Clock: LogicalClock, A: ConcurrentAllocator> SeqCompactDriver<Clock, A> {
+    /// Drive one step of the compaction sweep. Returns `IOResult::IO` on
+    /// any cursor page IO so the caller can yield up; returns
+    /// `IOResult::Done(())` when every pending backing table has been
+    /// compacted to its single watermark row.
+    fn step(&mut self) -> Result<IOResult<()>> {
+        loop {
+            let Some(seq) = self.pending.get(self.current_idx).copied() else {
+                return Ok(IOResult::Done(()));
+            };
+            if self.cursor.is_none() {
+                self.cursor = Some(BTreeCursor::new_table(
+                    self.pager.clone(),
+                    seq.backing_root,
+                    seq.backing_num_cols,
+                ));
+                self.phase = SeqCompactPhase::SeekWatermark;
+                self.watermark_key = None;
+                self.pending_delete_rowid = None;
+            }
+            let cursor = self
+                .cursor
+                .as_mut()
+                .expect("cursor must be set in active compaction");
+            match self.phase {
+                SeqCompactPhase::SeekWatermark => {
+                    let r = if seq.increment_positive {
+                        cursor.last()?
+                    } else {
+                        cursor.rewind()?
+                    };
+                    if let IOResult::IO(io) = r {
+                        return Ok(IOResult::IO(io));
+                    }
+                    self.phase = SeqCompactPhase::ReadWatermarkRowid;
+                }
+                SeqCompactPhase::ReadWatermarkRowid => {
+                    let r = cursor.rowid()?;
+                    let key = match r {
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                        IOResult::Done(opt) => opt,
+                    };
+                    match key {
+                        Some(k) => {
+                            self.watermark_key = Some(k);
+                            self.phase = SeqCompactPhase::ScanRewind;
+                        }
+                        None => {
+                            // Empty backing table — nothing to compact.
+                            self.advance_to_next_sequence();
+                        }
+                    }
+                }
+                SeqCompactPhase::ScanRewind => {
+                    let r = cursor.rewind()?;
+                    if let IOResult::IO(io) = r {
+                        return Ok(IOResult::IO(io));
+                    }
+                    self.phase = SeqCompactPhase::ScanReadRowid;
+                }
+                SeqCompactPhase::ScanReadRowid => {
+                    let r = cursor.rowid()?;
+                    let key = match r {
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                        IOResult::Done(opt) => opt,
+                    };
+                    match key {
+                        Some(k) if Some(k) == self.watermark_key => {
+                            self.phase = SeqCompactPhase::ScanNext;
+                        }
+                        Some(k) => {
+                            // Stash the key for the paired MVCC purge that
+                            // ScanDelete performs after `cursor.delete()`
+                            // returns Done. This branch and the transition
+                            // are synchronous (no yield between them), so
+                            // ScanDelete is guaranteed to observe
+                            // `pending_delete_rowid = Some(k)` on the
+                            // current iteration.
+                            self.pending_delete_rowid = Some(k);
+                            self.phase = SeqCompactPhase::ScanDelete;
+                        }
+                        None => {
+                            self.advance_to_next_sequence();
+                        }
+                    }
+                }
+                SeqCompactPhase::ScanDelete => {
+                    let r = cursor.delete()?;
+                    if let IOResult::IO(io) = r {
+                        return Ok(IOResult::IO(io));
+                    }
+                    // Pair the B-tree delete with the MVCC version-chain
+                    // purge so a snapshot reader can't observe the row
+                    // via `RowVersion.row` after the B-tree row is gone.
+                    // `pending_delete_rowid` was set in ScanReadRowid for
+                    // the row the cursor was on when we entered this
+                    // phase; consume it with `take()` so it doesn't leak
+                    // into the next scan iteration. See the
+                    // `purge_row_versions_during_checkpoint` doc comment
+                    // for the caller contract this depends on
+                    // (pager_commit_lock serializing nextval allocators).
+                    let rowid = self
+                        .pending_delete_rowid
+                        .take()
+                        .expect("pending_delete_rowid must be set when ScanDelete completes");
+                    self.mvstore.purge_row_versions_during_checkpoint(RowID {
+                        table_id: seq.table_id,
+                        row_id: RowKey::Int(rowid),
+                    });
+                    // After Delete the cursor is positioned at the slot
+                    // the deleted row used to occupy; the next Next
+                    // advances to the following row.
+                    self.phase = SeqCompactPhase::ScanNext;
+                }
+                SeqCompactPhase::ScanNext => {
+                    let r = cursor.next()?;
+                    if let IOResult::IO(io) = r {
+                        return Ok(IOResult::IO(io));
+                    }
+                    // `cursor.next()` leaves `has_record()` false at EOF
+                    // and the next `rowid()` returns Done(None); rely on
+                    // ScanReadRowid's None branch to advance.
+                    self.phase = SeqCompactPhase::ScanReadRowid;
+                }
+            }
+        }
+    }
+
+    fn advance_to_next_sequence(&mut self) {
+        self.cursor = None;
+        self.watermark_key = None;
+        self.pending_delete_rowid = None;
+        self.current_idx += 1;
+        self.phase = SeqCompactPhase::SeekWatermark;
+    }
+}
+
+impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, A> {
+    /// Build the per-checkpoint list of non-CYCLE sequence backing tables
+    /// to compact. CYCLE seqs are skipped — they keep themselves at one
+    /// row via inline compaction in the nextval bytecode and using
+    /// MAX/MIN-based compaction after a wrap would lose the post-wrap
+    /// "current" value. Reads the live root page from the MVCC store
+    /// when the schema still carries the uncheckpointed-negative
+    /// sentinel; tables that have no real root yet (created and
+    /// immediately dropped in this checkpoint) are filtered out.
+    fn pending_sequence_compactions(&self) -> Result<Vec<SeqCompaction>> {
+        let resolve_root = |schema_root: i64| -> Option<i64> {
+            if schema_root > 0 {
+                return Some(schema_root);
+            }
+            if schema_root == 0 {
+                return None;
+            }
+            let table_id = self.mvstore.get_table_id_from_root_page(schema_root);
+            self.mvstore
+                .table_id_to_rootpage
+                .get(&table_id)
+                .and_then(|entry| entry.value().map(|rp| rp as i64))
+        };
+        let db_id = crate::MAIN_DB_ID;
+        Ok(self
+            .connection
+            .with_schema(db_id, |schema| {
+                crate::without_allocation_faults!(
+                    // Checkpoint has already written table/index rows by the time sequence
+                    // compaction setup runs. An injected fault here can abort before the
+                    // checkpoint reaches its normal pager cleanup/retry path.
+                    // TODO: make sequence compaction setup resumable before re-enabling
+                    // fault injection for this collection.
+                    schema
+                        .sequences
+                        .values()
+                        .filter(|seq| !seq.cycle)
+                        .filter_map(|seq| {
+                            let backing_name =
+                                crate::translate::sequence::sequence_backing_table_name(&seq.name);
+                            let bt = schema.get_btree_table(&backing_name)?;
+                            let backing_root = resolve_root(bt.root_page)?;
+                            // Resolve the MVCC table_id once per sequence so the
+                            // per-row purge in `ScanDelete` doesn't re-scan
+                            // `table_id_to_rootpage` on every deletion. Uses the
+                            // schema-side root (pre-resolve) because
+                            // `get_table_id_from_root_page` already understands
+                            // the negative uncheckpointed-sentinel encoding.
+                            let table_id = self.mvstore.get_table_id_from_root_page(bt.root_page);
+                            Some(SeqCompaction {
+                                backing_root,
+                                backing_num_cols: bt.columns().len(),
+                                table_id,
+                                increment_positive: seq.increment_by >= 0,
+                            })
+                        })
+                        .try_collect()
+                )
+            })
+            .expect(ALLOC_ERR_MSG))
+    }
+
     fn refresh_checkpoint_bounds(&mut self) {
         let durable_tx_max = self.mvstore.durable_txid_max.load(Ordering::SeqCst);
         self.durable_txid_max_old = NonZeroU64::new(durable_tx_max);
@@ -292,16 +622,18 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
     pub fn new(
         pager: Arc<Pager>,
-        mvstore: Arc<MvStore<Clock>>,
+        mvstore: Arc<MvStore<Clock, A>>,
         connection: Arc<Connection>,
         update_transaction_state: bool,
         sync_mode: SyncMode,
+        database_id: usize,
     ) -> Self {
         let checkpoint_lock = mvstore.blocking_checkpoint_lock.clone();
-        // Prevent stale per-connection schema during checkpoint by using the shared DB schema.
-        // Unlike in WAL mode we actually write stuff from mv store to pager in checkpoint
-        // so this is important.
-        let schema = connection.db.clone_schema();
+        // Use the shared DB schema (not the per-connection cache, which may be
+        // stale) for the database whose pager we're checkpointing. Unlike WAL
+        // mode, MVCC checkpoint writes from the mv store back to the pager —
+        // so the schema must match the pager being checkpointed.
+        let schema = connection.clone_shared_schema(database_id);
         let index_id_to_index = schema
             .indexes
             .values()
@@ -344,14 +676,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             #[cfg(any(test, injected_yields))]
             yield_instance_id,
             checkpoint_lock,
-            write_set: Vec::new(),
+            write_set: crate::alloc::vec![],
             write_row_state_machine: None,
             delete_row_state_machine: None,
             cursors: HashMap::default(),
             created_btrees: HashMap::default(),
             destroyed_tables: HashSet::default(),
             destroyed_indexes: HashSet::default(),
-            index_write_set: Vec::new(),
+            index_write_set: crate::alloc::vec![],
             index_id_to_index,
             checkpoint_result: None,
             update_transaction_state,
@@ -360,6 +692,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             durable_mvcc_metadata,
             staged_checkpoint_header: None,
             header_staged_for_commit: false,
+            collect_table_cursor: None,
+            collect_index_tableid_cursor: None,
+            collect_index_key_cursor: None,
+            seq_compact: None,
         }
     }
 
@@ -379,7 +715,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     /// Cleanup path for I/O errors that happen while waiting on completions outside
     /// of `step()`. This mirrors `step()` error handling and also resets pager/WAL
     /// checkpoint bookkeeping.
-    pub fn cleanup_after_external_io_error(&mut self) {
+    pub fn cleanup_after_external_io_error(&mut self, err: LimboError) -> Result<()> {
+        // run storage cleanup within proper checkpoint context (e.g. pager has pending read/write txn)
+        let result = self.mvstore.storage.on_checkpoint_end(Err(err));
+
         if self.lock_states.pager_write_tx {
             self.pager.rollback_tx(self.connection.as_ref());
             if self.update_transaction_state {
@@ -407,6 +746,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             self.checkpoint_lock.unlock();
             self.lock_states.blocking_checkpoint_lock_held = false;
         }
+
+        result
     }
 
     /// Returns all checkpointable [RowVersion]s for that `table_id`
@@ -424,11 +765,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
             // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
             let mut begin_ts = None;
-            if let Some(TxTimestampOrID::Timestamp(b)) = version.begin {
+            if let Some(TxTimestampOrID::Timestamp(b)) = version.begin() {
                 begin_ts = Some(b);
             }
             let mut end_ts = None;
-            if let Some(TxTimestampOrID::Timestamp(e)) = version.end {
+            if let Some(TxTimestampOrID::Timestamp(e)) = version.end() {
                 end_ts = Some(e);
             }
             if begin_ts.is_none() && end_ts.is_none() {
@@ -493,7 +834,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
 
                 if let Some(previous_version) = versions_to_checkpoint.last() {
-                    let should_drop_previous = previous_version.end.is_some()
+                    let should_drop_previous = previous_version.end().is_some()
                         && !is_schema_metadata_only_rewrite(previous_version, Some(version));
                     if should_drop_previous {
                         versions_to_checkpoint.pop();
@@ -515,14 +856,20 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     ///    * The row is not a delete (we inserted or changed an existing row), OR
     ///    * The row is a delete AND it exists in the database file already.
     ///      If the row didn't exist in the database file and was deleted, we can simply not write it.
-    fn collect_committed_table_row_versions(&mut self) {
+    fn collect_table_rows(&mut self) -> Result<Option<IOCompletions>> {
         // Invariant: RowID ordering is (table_id, row_id) with table_id ascending.
         // Since MV table IDs are negative and sqlite_schema is table_id=-1, iterating
         // in reverse visits sqlite_schema first so CREATE/DROP metadata is applied
         // before user-table rows in this checkpoint pass.
-        for entry in self.mvstore.rows.iter().rev() {
+        let bounds: (Bound<RowID>, Bound<RowID>) = match self.collect_table_cursor.clone() {
+            None => (Bound::Unbounded, Bound::Unbounded),
+            Some(last) => (Bound::Unbounded, Bound::Excluded(last)),
+        };
+        let mut processed = 0;
+        for entry in self.mvstore.rows.range(bounds).rev() {
             let key = entry.key();
             tracing::trace!("collecting {key:?}");
+            self.collect_table_cursor = Some(key.clone());
             if self.destroyed_tables.contains(&key.table_id) {
                 // We won't checkpoint rows for tables that will be destroyed in this checkpoint.
                 // There's two forms of destroyed table:
@@ -535,7 +882,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             let row_versions = entry.value().read();
 
             for version in self.maybe_get_checkpointable_versions(&row_versions, key.table_id) {
-                let is_delete = version.end.is_some();
+                let is_delete = version.end().is_some();
 
                 let mut special_write = None;
                 // Set to true for schema deletes of never-checkpointed tables/indexes.
@@ -554,6 +901,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                     // No BTreeDestroyIndex needed since there's no physical B-tree.
                                     let index_id = MVTableId(root_page);
                                     self.destroyed_indexes.insert(index_id);
+                                    self.mvstore.remove_table_id_to_rootpage(&index_id);
                                     skip_write = true;
                                 } else {
                                     // DROP INDEX - index was checkpointed
@@ -603,13 +951,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         }
                         SqliteSchemaBtreeKind::Table => {
                             // This is a table schema change (existing logic)
-                            tracing::trace!("table schema change with root page {root_page}, is_delete={is_delete}");
+                            tracing::trace!(
+                                "table schema change with root page {root_page}, is_delete={is_delete}"
+                            );
                             if is_delete {
                                 if root_page < 0 {
                                     // Table was never checkpointed - derive table_id directly from root_page.
                                     // No BTreeDestroy needed since there's no physical B-tree.
                                     let table_id = MVTableId::from(root_page);
                                     self.destroyed_tables.insert(table_id);
+                                    self.mvstore.remove_table_id_to_rootpage(&table_id);
                                     skip_write = true;
                                 } else {
                                     // Table was checkpointed - look up by physical root page
@@ -644,11 +995,34 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             }
                         }
                     }
+                } else if is_delete
+                    && version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
+                    && !version.btree_resident
+                {
+                    // Schema row without a B-tree identity (e.g. sequence, trigger, view).
+                    // If it was never checkpointed to the B-tree, skip the delete — there
+                    // is nothing to remove from the pager.
+                    let begin_ts = match &version.begin() {
+                        Some(TxTimestampOrID::Timestamp(ts)) => Some(*ts),
+                        _ => None,
+                    };
+                    let was_checkpointed = self.durable_txid_max_old.is_some_and(|txid_max_old| {
+                        begin_ts.is_some_and(|b| b <= u64::from(txid_max_old))
+                    });
+                    if !was_checkpointed {
+                        skip_write = true;
+                    }
                 }
                 if !skip_write {
                     tracing::trace!("adding to write_set {:?}", (&version, &special_write));
-                    self.write_set.push((version, special_write));
+                    with_mvcc_checkpoint_allocation_site!(CheckpointWriteSet, {
+                        self.write_set.try_push((version, special_write))?;
+                    });
                 }
+            }
+            processed += 1;
+            if processed >= COLLECT_PREEMPTION_THRESHOLD {
+                return Ok(Some(IOCompletions::Single(Completion::new_yield())));
             }
         }
         // Writing in ascending order of rowid gives us a better chance of using balance-quick algorithm
@@ -661,6 +1035,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 version.0.row.id.row_id.clone(),
             )
         });
+        Ok(None)
     }
 
     /// Collect all committed index row versions that need to be written to the B-tree.
@@ -670,34 +1045,62 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     /// 2. Either:
     ///    * The row is not a delete (we inserted or changed an existing row), OR
     ///    * The row is a delete AND it exists in the database file already.
-    fn collect_committed_index_row_versions(&mut self) {
-        for entry in self.mvstore.index_rows.iter() {
+    fn collect_index_rows(&mut self) -> Result<Option<IOCompletions>> {
+        let outer_bounds: (Bound<MVTableId>, Bound<MVTableId>) =
+            match self.collect_index_tableid_cursor {
+                None => (Bound::Unbounded, Bound::Unbounded),
+                Some(last) if self.collect_index_key_cursor.is_none() => {
+                    (Bound::Excluded(last), Bound::Unbounded)
+                }
+                Some(last) => (Bound::Included(last), Bound::Unbounded),
+            };
+        let mut processed = 0;
+        for entry in self.mvstore.index_rows.range(outer_bounds) {
             let index_id = *entry.key();
 
             // Skip destroyed indexes - we won't checkpoint rows for indexes that will be destroyed
             if self.destroyed_indexes.contains(&index_id) {
+                self.collect_index_tableid_cursor = Some(index_id);
+                self.collect_index_key_cursor = None;
                 continue;
             }
 
             let index_rows_map = entry.value();
-            for entry in index_rows_map.iter() {
+            let inner_bounds: (Bound<Arc<SortableIndexKey>>, Bound<Arc<SortableIndexKey>>) =
+                match self.collect_index_key_cursor.clone() {
+                    None => (Bound::Unbounded, Bound::Unbounded),
+                    Some(last) => (Bound::Excluded(last), Bound::Unbounded),
+                };
+            for entry in index_rows_map.range(inner_bounds) {
                 let versions = entry.value().read();
+                self.collect_index_tableid_cursor = Some(index_id);
+                self.collect_index_key_cursor = Some(entry.key().clone());
 
                 for version in self.maybe_get_checkpointable_versions(&versions, index_id) {
-                    let is_delete = version.end.is_some();
+                    let is_delete = version.end().is_some();
 
                     // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
                     // the database file.
-                    self.index_write_set.push((index_id, version, is_delete));
+                    with_mvcc_checkpoint_allocation_site!(CheckpointIndexWriteSet, {
+                        self.index_write_set
+                            .try_push((index_id, version, is_delete))?;
+                    });
+                }
+                processed += 1;
+                if processed >= COLLECT_PREEMPTION_THRESHOLD {
+                    return Ok(Some(IOCompletions::Single(Completion::new_yield())));
                 }
             }
+            self.collect_index_tableid_cursor = Some(index_id);
+            self.collect_index_key_cursor = None;
         }
+        Ok(None)
     }
 
     #[cfg(any(test, debug_assertions))]
     fn max_collected_version_timestamp(&self) -> u64 {
         fn max_version_timestamp(version: &RowVersion) -> u64 {
-            [version.begin.as_ref(), version.end.as_ref()]
+            [version.begin().as_ref(), version.end().as_ref()]
                 .into_iter()
                 .filter_map(|ts| match ts {
                     Some(TxTimestampOrID::Timestamp(ts)) => Some(*ts),
@@ -741,6 +1144,33 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     /// Check if we have more rows to write
     fn has_more_rows(&self, write_set_index: usize) -> bool {
         write_set_index < self.write_set.len()
+    }
+
+    fn next_requires_seek_after_insert(&self, current_idx: usize) -> bool {
+        let Some(curr) = self.write_set.get(current_idx) else {
+            return true;
+        };
+        let Some(next) = self.write_set.get(current_idx + 1) else {
+            return true;
+        };
+        // Table not the same, then seek
+        if curr.0.row.id.table_id != next.0.row.id.table_id {
+            return true;
+        }
+        // If we have special write then seek
+        if curr.1.is_some() || next.1.is_some() {
+            return true;
+        }
+        let (RowKey::Int(prev_id), RowKey::Int(next_id)) =
+            (&curr.0.row.id.row_id, &next.0.row.id.row_id)
+        else {
+            return true;
+        };
+        // if next id is strictly prev_id + 1 then we don't need to seek
+        if next_id.checked_sub(*prev_id) != Some(1) {
+            return true;
+        }
+        false
     }
 
     /// Fsync the logical log file
@@ -787,9 +1217,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         !self.created_btrees.is_empty() || self.has_unpublished_schema_changes()
     }
 
-    fn publish_checkpointed_schema_roots(&mut self) {
+    fn publish_checkpointed_schema_roots(&mut self) -> Result<(), TryReserveError> {
         if !self.has_pending_root_publication() {
-            return;
+            return Ok(());
         }
 
         // Patch sqlite_schema in MV Store to contain positive rootpages instead of negative ones
@@ -818,12 +1248,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 *existing = row_version;
             } else {
                 self.mvstore
-                    .insert_version_raw(&mut row_versions, row_version);
+                    .insert_version_raw(&mut row_versions, row_version)?;
             }
         }
 
         if !self.has_unpublished_schema_changes() {
-            return;
+            return Ok(());
         }
 
         // Patch in-memory schema to do the same. This must happen as soon as the
@@ -874,12 +1304,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         drop(schema_ref);
         *self.connection.schema.write() = self.connection.db.clone_schema();
         self.connection.bump_prepare_context_generation();
+        Ok(())
     }
 
-    /// Garbage-collect row versions for rows that were just checkpointed.
-    /// Must be called AFTER durable_txid_max is updated and BEFORE the
-    /// checkpoint lock is released (no concurrent writers under blocking lock).
-    fn gc_checkpointed_versions(&self) {
+    fn gc_checkpointed_table_versions(&mut self) -> Option<IOCompletions> {
         // Safety: entry removal after dropping the version-chain write lock has a
         // TOCTOU gap — a concurrent writer could insert between the two. This is
         // only safe because the blocking checkpoint lock prevents concurrent writers.
@@ -889,21 +1317,31 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             self.lock_states.blocking_checkpoint_lock_held,
             "gc_checkpointed_versions requires the blocking checkpoint lock"
         );
-        let lwm = self.mvstore.compute_lwm();
         let ckpt_max = self.durable_txid_max_new;
-        let mut table_rows_to_gc = std::collections::BTreeSet::new();
-        let mut index_rows_to_gc = std::collections::BTreeSet::new();
-
-        for (row_version, _special_write) in &self.write_set {
-            table_rows_to_gc.insert((
-                row_version.row.id.table_id,
-                row_version.row.id.row_id.clone(),
-            ));
-        }
-
-        for (table_id, row_key) in table_rows_to_gc {
-            let row_id = RowID::new(table_id, row_key);
-            let Some(entry) = self.mvstore.rows.get(&row_id) else {
+        let CheckpointState::GcTableRows { next_index, lwm } = self.state else {
+            unreachable!("gc_checkpointed_table_versions runs only in GcTableRows");
+        };
+        let mut index = next_index;
+        let mut processed = 0;
+        while index < self.write_set.len() {
+            let current = index;
+            index += 1;
+            if current > 0
+                && self.write_set[current - 1].0.row.id == self.write_set[current].0.row.id
+            {
+                continue;
+            }
+            let row_id = &self.write_set[current].0.row.id;
+            if let Some(entry) = self.mvstore.rows.get(row_id) {
+                let is_now_empty = {
+                    let mut versions = entry.value().write();
+                    MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
+                    versions.is_empty()
+                };
+                if is_now_empty {
+                    self.mvstore.rows.remove(row_id);
+                }
+            } else {
                 // The MVCC metadata table row (persistent_tx_ts_max) is staged
                 // directly into the write set by maybe_stage_mvcc_metadata_write() and do not
                 // have a backing in-memory MVCC version chain. Skip GC for these.
@@ -912,46 +1350,75 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         .is_some_and(|(tid, _)| tid == row_id.table_id),
                     "row {row_id:?} missing from MVCC store but is not an MVCC metadata table row"
                 );
-                continue;
-            };
-            let is_now_empty = {
-                let mut versions = entry.value().write();
-                MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
-                versions.is_empty()
-            };
-            if is_now_empty {
-                self.mvstore.rows.remove(&row_id);
+            }
+            processed += 1;
+            if processed >= COLLECT_PREEMPTION_THRESHOLD {
+                break;
             }
         }
-
-        for (index_id, row_version, _is_delete) in &self.index_write_set {
-            let RowKey::Record(sortable_key) = &row_version.row.id.row_id else {
-                unreachable!("index row versions always have Record keys");
+        if index < self.write_set.len() {
+            let CheckpointState::GcTableRows { next_index, .. } = &mut self.state else {
+                unreachable!("gc_checkpointed_table_versions runs only in GcTableRows");
             };
-            index_rows_to_gc.insert((*index_id, RowKey::Record(sortable_key.clone())));
+            *next_index = index;
+
+            Some(IOCompletions::Single(Completion::new_yield()))
+        } else {
+            None
         }
+    }
 
-        for (index_id, row_key) in index_rows_to_gc {
-            let RowKey::Record(sortable_key) = row_key else {
-                unreachable!("index row versions always have Record keys");
-            };
-            let outer_entry = self
-                .mvstore
-                .index_rows
-                .get(&index_id)
-                .expect("index_id from write set must exist in index_rows");
-            let inner_map = outer_entry.value();
-            let is_now_empty = {
-                let inner_entry = inner_map
-                    .get(&sortable_key)
-                    .expect("index row from write set must exist in inner map");
-                let mut versions = inner_entry.value().write();
-                MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
-                versions.is_empty()
-            };
-            if is_now_empty {
-                inner_map.remove(&sortable_key);
+    fn gc_checkpointed_index_versions(&mut self) -> Option<IOCompletions> {
+        assert!(
+            self.lock_states.blocking_checkpoint_lock_held,
+            "gc_checkpointed_versions requires the blocking checkpoint lock"
+        );
+        let ckpt_max = self.durable_txid_max_new;
+        let CheckpointState::GcIndexRows { next_index, lwm } = self.state else {
+            unreachable!("gc_checkpointed_index_versions runs only in GcIndexRows");
+        };
+        let mut index = next_index;
+        let mut processed = 0;
+        while index < self.index_write_set.len() {
+            let current = index;
+            index += 1;
+            {
+                let (index_id, row_version, _is_delete) = &self.index_write_set[current];
+                let index_id = *index_id;
+                let RowKey::Record(sortable_key) = &row_version.row.id.row_id else {
+                    unreachable!("index row versions always have Record keys");
+                };
+                let outer_entry = self
+                    .mvstore
+                    .index_rows
+                    .get(&index_id)
+                    .expect("index_id from write set must exist in index_rows");
+                let inner_map = outer_entry.value();
+                let is_now_empty = {
+                    let inner_entry = inner_map
+                        .get(sortable_key)
+                        .expect("index row from write set must exist in inner map");
+                    let mut versions = inner_entry.value().write();
+                    MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
+                    versions.is_empty()
+                };
+                if is_now_empty {
+                    inner_map.remove(sortable_key);
+                }
             }
+            processed += 1;
+            if processed >= COLLECT_PREEMPTION_THRESHOLD {
+                break;
+            }
+        }
+        if index < self.index_write_set.len() {
+            let CheckpointState::GcIndexRows { next_index, .. } = &mut self.state else {
+                unreachable!("gc_checkpointed_index_versions runs only in GcIndexRows");
+            };
+            *next_index = index;
+            Some(IOCompletions::Single(Completion::new_yield()))
+        } else {
+            None
         }
     }
 
@@ -978,28 +1445,38 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let new_i64 = i64::try_from(new).map_err(|_| {
             LimboError::Corrupt(format!("MVCC checkpoint timestamp does not fit i64: {new}"))
         })?;
-        let record = ImmutableRecord::from_values(
-            &[
-                Value::build_text(MVCC_META_KEY_PERSISTENT_TX_TS_MAX),
-                Value::from_i64(new_i64),
-            ],
-            2,
+        let record = with_mvcc_checkpoint_allocation_site!(
+            CheckpointMetadataPayload,
+            ImmutableRecord::from_values(
+                &[
+                    Value::build_text(MVCC_META_KEY_PERSISTENT_TX_TS_MAX),
+                    Value::from_i64(new_i64),
+                ],
+                2,
+            )?
         );
-        let row = Row::new_table_row(
-            RowID::new(table_id, RowKey::Int(1)),
-            record.get_payload().to_vec(),
-            num_columns,
+        let row = with_mvcc_checkpoint_allocation_site!(
+            CheckpointMetadataPayload,
+            Row::new_table_row(
+                RowID::new(table_id, RowKey::Int(1)),
+                record.get_payload(),
+                num_columns,
+            )?
         );
-        self.write_set.push((
-            RowVersion {
-                id: 0,
-                begin: Some(TxTimestampOrID::Timestamp(new)),
-                end: None,
-                row,
-                btree_resident: true,
-            },
-            None,
-        ));
+        with_mvcc_checkpoint_allocation_site!(CheckpointWriteSet, {
+            self.write_set.try_push((
+                RowVersion {
+                    id: 0,
+                    begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(
+                        new,
+                    ))),
+                    end: crate::mvcc::database::PackedTs::pack(None),
+                    row,
+                    btree_resident: true,
+                },
+                None,
+            ))?;
+        });
         Ok(())
     }
 
@@ -1019,11 +1496,21 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // Resample after serializing with other checkpoints so already-durable
                 // index deletes are not replayed.
                 self.refresh_checkpoint_bounds();
-
-                self.collect_committed_table_row_versions();
+                self.state = CheckpointState::CollectTableRows;
+                Ok(TransitionResult::Continue)
+            }
+            CheckpointState::CollectTableRows => {
+                if let Some(io) = self.collect_table_rows()? {
+                    return Ok(TransitionResult::Io(io));
+                }
                 tracing::debug!("Collected {} committed versions", self.write_set.len());
-
-                self.collect_committed_index_row_versions();
+                self.state = CheckpointState::CollectIndexRows;
+                Ok(TransitionResult::Continue)
+            }
+            CheckpointState::CollectIndexRows => {
+                if let Some(io) = self.collect_index_rows()? {
+                    return Ok(TransitionResult::Io(io));
+                }
                 tracing::debug!("Collected {} index row changes", self.index_write_set.len());
                 // Checkpoint boundary is derived from a stable snapshot under the blocking lock:
                 // old durable boundary plus the latest committed tx watermark. This covers both
@@ -1042,9 +1529,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.durable_txid_max_new = durable_old.max(committed_max);
                 self.maybe_stage_mvcc_metadata_write()?;
 
-                self.mvstore
-                    .storage
-                    .on_checkpoint_start(self.durable_txid_max_new)?;
+                self.mvstore.storage.on_checkpoint_start()?;
 
                 if self.write_set.is_empty() && self.index_write_set.is_empty() {
                     // Nothing to checkpoint, skip pager txn and go straight to WAL checkpoint.
@@ -1093,8 +1578,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 if !self.has_more_rows(write_set_index) {
                     // Done writing all table rows, now process index rows
                     if self.index_write_set.is_empty() {
-                        // No index rows to write, skip to commit
-                        self.state = CheckpointState::CommitPagerTxn;
+                        // No index rows to write, compact sequence
+                        // backing tables, then commit.
+                        self.state = CheckpointState::CompactSequences;
                     } else {
                         // Start writing index rows
                         self.state = CheckpointState::WriteIndexRow {
@@ -1120,6 +1606,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         *special_write,
                     )
                 };
+                tracing::debug!(
+                    "WriteRow: num_columns={num_columns}, table_id={table_id:?}, special_write={special_write:?}"
+                );
 
                 // Handle CREATE TABLE / DROP TABLE / CREATE INDEX / DROP INDEX ops
                 if let Some(special_write) = special_write {
@@ -1128,10 +1617,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             let created_root_page: u32 = self.pager.io.block(|| {
                                 self.pager.btree_create(&CreateBTreeFlags::new_table())
                             })?;
-                            self.mvstore.insert_table_id_to_rootpage(
-                                table_id,
-                                Some(created_root_page as u64),
-                            );
+                            // TODO: If this allocation fails, we would have created a Btree here that is dangling, see later how we should handle this error
+                            crate::without_allocation_faults!(self
+                                .mvstore
+                                .insert_table_id_to_rootpage(
+                                    table_id,
+                                    Some(created_root_page as u64),
+                                )
+                                .expect(crate::alloc::ALLOC_ERR_MSG));
                         }
                         SpecialWrite::BTreeDestroy {
                             table_id,
@@ -1168,15 +1661,20 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_tables.insert(table_id);
+                            self.mvstore.remove_table_id_to_rootpage(&table_id);
                         }
                         SpecialWrite::BTreeCreateIndex { index_id, .. } => {
                             let created_root_page: u32 = self.pager.io.block(|| {
                                 self.pager.btree_create(&CreateBTreeFlags::new_index())
                             })?;
-                            self.mvstore.insert_table_id_to_rootpage(
-                                index_id,
-                                Some(created_root_page as u64),
-                            );
+                            // TODO: If this allocation fails, we would have created a Btree here that is dangling, see later how we should handle this error
+                            crate::without_allocation_faults!(self
+                                .mvstore
+                                .insert_table_id_to_rootpage(
+                                    index_id,
+                                    Some(created_root_page as u64),
+                                )
+                                .expect(crate::alloc::ALLOC_ERR_MSG));
                             // Index struct should already be stored in index_id_to_index from collect_committed_versions
                             turso_assert!(
                                 self.index_id_to_index.contains_key(&index_id),
@@ -1212,7 +1710,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                     known_root_page as i64,
                                     index.as_ref(),
                                     num_columns,
-                                );
+                                )?;
                                 let cursor = Arc::new(RwLock::new(cursor));
                                 self.cursors.insert(root_page, cursor.clone());
                                 cursor
@@ -1229,6 +1727,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_indexes.insert(index_id);
+                            self.mvstore.remove_table_id_to_rootpage(&index_id);
                         }
                     }
                 }
@@ -1263,6 +1762,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     })
                 };
 
+                tracing::debug!("WriteRow: resolved root page: root_page={root_page}");
+
                 // If a table was created, it now has a real root page allocated for it, but the 'root_page' field in the sqlite_schema record is still the table id.
                 // So we need to rewrite the row version to use the real root page.
                 if let Some(SpecialWrite::BTreeCreate {
@@ -1292,8 +1793,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
                         let mut values = record.get_values_owned()?;
                         values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len());
-                        row_version.row.data = Some(record.get_payload().to_owned());
+                        let record = ImmutableRecord::from_values(&values, values.len())?;
+                        // Btree creation has already happened by this point; an injected fault
+                        // while publishing the sqlite_schema root page can leave retry state with
+                        // a durable btree and a stale rootpage=0 schema row.
+                        // TODO: make this rewrite resumable before re-enabling fault injection.
+                        row_version.row.data = Some(crate::without_allocation_faults!(
+                            crate::alloc::try_arc_slice_from_slice(record.get_payload())?
+                        ));
                         row_version.clone()
                     };
                     self.created_btrees
@@ -1325,8 +1832,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         let record = ImmutableRecordRef::from_bin_record(row_version.row.payload());
                         let mut values = record.get_values_owned()?;
                         values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len());
-                        row_version.row.data = Some(record.get_payload().to_owned());
+                        let record = ImmutableRecord::from_values(&values, values.len())?;
+                        // Btree creation has already happened by this point; an injected fault
+                        // while publishing the sqlite_schema root page can leave retry state with
+                        // a durable btree and a stale rootpage=0 schema row.
+                        // TODO: make this rewrite resumable before re-enabling fault injection.
+                        row_version.row.data = Some(crate::without_allocation_faults!(
+                            crate::alloc::try_arc_slice_from_slice(record.get_payload())?
+                        ));
                         row_version.clone()
                     };
 
@@ -1354,7 +1867,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         })?;
 
                 // Check if this is an insert or delete
-                if row_version.end.is_some() {
+                if row_version.end().is_some() {
                     // This is a delete operation.
                     // Don't write the deletion record to the b-tree if the b-tree was just created; we can no-op in this case,
                     // since there is no existing row to delete.
@@ -1398,9 +1911,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 match write_row_state_machine.step(&())? {
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
                     IOResult::Done(_) => {
+                        let requires_seek = self.next_requires_seek_after_insert(write_set_index);
                         self.state = CheckpointState::WriteRow {
                             write_set_index: write_set_index + 1,
-                            requires_seek: true,
+                            requires_seek,
                         };
                         Ok(TransitionResult::Continue)
                     }
@@ -1436,8 +1950,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let requires_seek = *requires_seek;
 
                 if index_write_set_index >= self.index_write_set.len() {
-                    // Done writing all index rows
-                    self.state = CheckpointState::CommitPagerTxn;
+                    // Done writing all index rows, compact sequence
+                    // backing tables, then commit.
+                    self.state = CheckpointState::CompactSequences;
                     return Ok(TransitionResult::Continue);
                 }
 
@@ -1479,7 +1994,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         root_page as i64,
                         index.as_ref(),
                         index.columns.len(),
-                    );
+                    )?;
                     let cursor = Arc::new(RwLock::new(cursor));
                     self.cursors.insert(root_page, cursor.clone());
                     cursor
@@ -1567,6 +2082,34 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
             }
 
+            CheckpointState::CompactSequences => {
+                if self.seq_compact.is_none() {
+                    let pending = self.pending_sequence_compactions()?;
+                    if pending.is_empty() {
+                        self.state = CheckpointState::CommitPagerTxn;
+                        return Ok(TransitionResult::Continue);
+                    }
+                    self.seq_compact = Some(SeqCompactDriver {
+                        pending,
+                        current_idx: 0,
+                        cursor: None,
+                        phase: SeqCompactPhase::SeekWatermark,
+                        watermark_key: None,
+                        pending_delete_rowid: None,
+                        pager: self.pager.clone(),
+                        mvstore: self.mvstore.clone(),
+                    });
+                }
+                let driver = self.seq_compact.as_mut().expect("seq_compact set above");
+                match driver.step()? {
+                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                    IOResult::Done(()) => {
+                        self.seq_compact = None;
+                        self.state = CheckpointState::CommitPagerTxn;
+                        Ok(TransitionResult::Continue)
+                    }
+                }
+            }
             CheckpointState::CommitPagerTxn => {
                 if !self.header_staged_for_commit {
                     let mut checkpoint_header =
@@ -1622,7 +2165,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             )
                         })?;
                         self.mvstore.global_header.write().replace(header);
-                        self.publish_checkpointed_schema_roots();
+                        // TODO: not sure what is the error handling supposed to be here for alloc error
+                        crate::without_allocation_faults!(self
+                            .publish_checkpointed_schema_roots()
+                            .expect(crate::alloc::ALLOC_ERR_MSG));
                         inject_transition_failure!(
                             self,
                             CheckpointYieldPoint::AfterDurableBoundaryAdvanced
@@ -1728,25 +2274,52 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .expect("checkpoint_result should be set");
                 match wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())? {
                     IOResult::Done(()) => {
-                        self.state = CheckpointState::Finalize;
+                        turso_assert!(
+                            !self.has_pending_root_publication(),
+                            "checkpoint finalized after pager writes without publishing schema changes"
+                        );
+                        self.mvstore
+                            .durable_txid_max
+                            .store(self.durable_txid_max_new, Ordering::SeqCst);
+                        let lwm = self.mvstore.compute_lwm();
+                        self.state = CheckpointState::GcTableRows { next_index: 0, lwm };
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
                 }
             }
 
+            CheckpointState::GcTableRows { .. } => {
+                if let Some(io) = self.gc_checkpointed_table_versions() {
+                    return Ok(TransitionResult::Io(io));
+                }
+                let CheckpointState::GcTableRows { lwm, .. } = self.state else {
+                    unreachable!("state is GcTableRows here");
+                };
+                self.state = CheckpointState::GcIndexRows { next_index: 0, lwm };
+                Ok(TransitionResult::Continue)
+            }
+
+            CheckpointState::GcIndexRows { .. } => {
+                if let Some(io) = self.gc_checkpointed_index_versions() {
+                    return Ok(TransitionResult::Io(io));
+                }
+                self.state = CheckpointState::Finalize;
+                Ok(TransitionResult::Continue)
+            }
+
             CheckpointState::Finalize => {
                 tracing::debug!("Releasing blocking checkpoint lock");
-                turso_assert!(
-                    !self.has_pending_root_publication(),
-                    "checkpoint finalized after pager writes without publishing schema changes"
+                // The blocking checkpoint lock is still held here, so the
+                // slot-removing GC variant is safe: no concurrent writer can
+                // race the empty-slot removal. This bounds the skip-map entry
+                // counts — the lazy (non-removing) GC otherwise leaves empty
+                // chain slots behind forever for rows never written again.
+                assert!(
+                    self.lock_states.blocking_checkpoint_lock_held,
+                    "finalize GC requires the blocking checkpoint lock"
                 );
-
-                self.mvstore
-                    .durable_txid_max
-                    .store(self.durable_txid_max_new, Ordering::SeqCst);
-                self.gc_checkpointed_versions();
-                self.mvstore.drop_unused_row_versions();
+                self.mvstore.drop_unused_row_versions_and_slots();
                 self.checkpoint_lock.unlock();
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(
@@ -1759,7 +2332,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     }
 }
 
-impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
+impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
+    for CheckpointStateMachine<Clock, A>
+{
     type Context = ();
     type SMResult = CheckpointResult;
 
@@ -1767,17 +2342,15 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
         let res = self.step_inner(&());
         match res {
             Err(ref err) => {
-                self.mvstore
-                    .storage
-                    .on_checkpoint_end(self.durable_txid_max_new, Err(err.clone()))?;
                 tracing::debug!("Error in checkpoint state machine: {err}");
-                self.cleanup_after_external_io_error();
+                // `cleanup_after_external_io_error` already emits the paired
+                // `on_checkpoint_end(Err(..))`, so don't call it here too — doing both
+                // double-fires the hook for a single failure.
+                self.cleanup_after_external_io_error(err.clone())?;
                 res
             }
             Ok(TransitionResult::Done(ref result)) => {
-                self.mvstore
-                    .storage
-                    .on_checkpoint_end(self.durable_txid_max_new, Ok(result))?;
+                self.mvstore.storage.on_checkpoint_end(Ok(result))?;
                 res
             }
             Ok(result) => Ok(result),
@@ -1796,6 +2369,7 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
     use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::mvcc::database::SortableIndexKey;
     use crate::translate::collate::CollationSeq;
@@ -1820,16 +2394,18 @@ mod tests {
                 Value::build_text(format!("sql:{entry_type}:{name}:{root_page}")),
             ],
             5,
-        );
+        )
+        .unwrap();
         RowVersion {
             id: 1,
-            begin: begin.map(TxTimestampOrID::Timestamp),
-            end: end.map(TxTimestampOrID::Timestamp),
+            begin: crate::mvcc::database::PackedTs::pack(begin.map(TxTimestampOrID::Timestamp)),
+            end: crate::mvcc::database::PackedTs::pack(end.map(TxTimestampOrID::Timestamp)),
             row: Row::new_table_row(
                 RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(rowid)),
-                record.as_blob().to_vec(),
+                record.as_blob(),
                 5,
-            ),
+            )
+            .unwrap(),
             btree_resident: false,
         }
     }
@@ -1896,13 +2472,14 @@ mod tests {
     fn sqlite_schema_identity_ignores_payloadless_tombstones() {
         let tombstone = RowVersion {
             id: 1,
-            begin: None,
-            end: Some(TxTimestampOrID::Timestamp(2)),
+            begin: crate::mvcc::database::PackedTs::pack(None),
+            end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(2))),
             row: Row::new_table_row(
                 RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(9)),
-                Vec::new(),
+                &[],
                 0,
-            ),
+            )
+            .unwrap(),
             btree_resident: false,
         };
 
@@ -1942,14 +2519,18 @@ mod tests {
                 Value::from_i64(rowid),
             ],
             2,
-        );
+        )
+        .unwrap();
         let sortable_key = SortableIndexKey::new_from_record(key_record, index_info);
         let key_arc = Arc::new(sortable_key.clone());
-        let row = Row::new_index_row(RowID::new(index_id, RowKey::Record(sortable_key)), 2);
+        let row = Row::new_index_row(
+            RowID::new(index_id, RowKey::Record(Arc::new(sortable_key))),
+            2,
+        );
         let row_version = RowVersion {
             id: version_id,
-            begin: begin.map(TxTimestampOrID::Timestamp),
-            end: end.map(TxTimestampOrID::Timestamp),
+            begin: crate::mvcc::database::PackedTs::pack(begin.map(TxTimestampOrID::Timestamp)),
+            end: crate::mvcc::database::PackedTs::pack(end.map(TxTimestampOrID::Timestamp)),
             row,
             btree_resident,
         };
@@ -1968,6 +2549,7 @@ mod tests {
             conn.clone(),
             true,
             conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
         );
         checkpoint.durable_txid_max_old = std::num::NonZeroU64::new(10);
         checkpoint.durable_txid_max_new = 10;
@@ -1978,7 +2560,9 @@ mod tests {
         let (_, tombstone_version) =
             index_row_version(index_id, "blue_river_906", 75, 2, None, Some(10), true);
 
-        mvstore.insert_index_version(index_id, garbage_key, garbage_version);
+        mvstore
+            .insert_index_version(index_id, garbage_key, garbage_version)
+            .unwrap();
         let entry = mvstore
             .index_rows
             .get(&index_id)
@@ -1989,13 +2573,267 @@ mod tests {
             .expect("key bucket should exist after first insert")
             .key()
             .clone();
-        mvstore.insert_index_version(index_id, tombstone_key, tombstone_version);
+        mvstore
+            .insert_index_version(index_id, tombstone_key, tombstone_version)
+            .unwrap();
 
-        checkpoint.collect_committed_index_row_versions();
+        while checkpoint.collect_index_rows().unwrap().is_some() {}
 
         assert!(
             checkpoint.index_write_set.is_empty(),
             "a retry checkpoint must not replay a delete whose btree_resident tombstone was already made durable"
         );
+    }
+
+    fn committed_table_row_version(table_id: MVTableId, rowid: i64) -> RowVersion {
+        table_row_version(table_id, rowid, 1, Some(5), None, false)
+    }
+
+    fn table_row_version(
+        table_id: MVTableId,
+        rowid: i64,
+        version_id: u64,
+        begin: Option<u64>,
+        end: Option<u64>,
+        btree_resident: bool,
+    ) -> RowVersion {
+        let record = ImmutableRecord::from_values(&[Value::from_i64(rowid)], 1).unwrap();
+        RowVersion {
+            id: version_id,
+            begin: crate::mvcc::database::PackedTs::pack(begin.map(TxTimestampOrID::Timestamp)),
+            end: crate::mvcc::database::PackedTs::pack(end.map(TxTimestampOrID::Timestamp)),
+            row: Row::new_table_row(
+                RowID::new(table_id, RowKey::Int(rowid)),
+                record.as_blob(),
+                1,
+            )
+            .unwrap(),
+            btree_resident,
+        }
+    }
+
+    fn checkpoint_for_collect_tests() -> CheckpointStateMachine<crate::mvcc::clock::MvccClock> {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        let mvstore = db.get_mvcc_store();
+        let pager = conn.pager.load().clone();
+        let mut checkpoint = CheckpointStateMachine::new(
+            pager,
+            mvstore,
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
+        );
+        checkpoint.durable_txid_max_old = NonZeroU64::new(2);
+        checkpoint
+    }
+
+    #[test]
+    fn checkpoint_collection_uses_btree_marker_for_existence_but_writes_surviving_replacement() {
+        let checkpoint = checkpoint_for_collect_tests();
+        let table_id = MVTableId::from(-2);
+        let btree_tombstone = table_row_version(table_id, 1, 1, None, Some(5), true);
+        let replacement = table_row_version(table_id, 1, 2, Some(5), None, false);
+
+        let checkpointable =
+            checkpoint.maybe_get_checkpointable_versions(&[btree_tombstone, replacement], table_id);
+
+        assert_eq!(checkpointable.len(), 1);
+        assert_eq!(checkpointable[0].id, 2);
+        assert_eq!(checkpointable[0].end(), None);
+    }
+
+    #[test]
+    fn checkpoint_collection_uses_btree_marker_for_later_delete_of_replacement() {
+        let checkpoint = checkpoint_for_collect_tests();
+        let table_id = MVTableId::from(-2);
+        let btree_tombstone = table_row_version(table_id, 1, 1, None, Some(5), true);
+        let deleted_replacement = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
+
+        let checkpointable = checkpoint
+            .maybe_get_checkpointable_versions(&[btree_tombstone, deleted_replacement], table_id);
+
+        assert_eq!(checkpointable.len(), 1);
+        assert_eq!(checkpointable[0].id, 2);
+        assert_eq!(checkpointable[0].end(), Some(TxTimestampOrID::Timestamp(6)));
+    }
+
+    #[test]
+    fn checkpoint_collection_skips_delete_of_never_checkpointed_replacement_without_btree_marker() {
+        let checkpoint = checkpoint_for_collect_tests();
+        let table_id = MVTableId::from(-2);
+        let deleted_replacement = table_row_version(table_id, 1, 2, Some(5), Some(6), false);
+
+        let checkpointable =
+            checkpoint.maybe_get_checkpointable_versions(&[deleted_replacement], table_id);
+
+        assert!(checkpointable.is_empty());
+    }
+
+    #[test]
+    fn collect_table_rows_preempts_on_large_scan() {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        let mvstore = db.get_mvcc_store();
+        let pager = conn.pager.load().clone();
+        let mut checkpoint = CheckpointStateMachine::new(
+            pager,
+            mvstore.clone(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
+        );
+
+        // More than one chunk worth of committed rows so collection must preempt.
+        let table_id = MVTableId::from(-2);
+        let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
+        for i in 0..row_count as i64 {
+            let version = committed_table_row_version(table_id, i);
+            mvstore.rows.insert(
+                RowID::new(table_id, RowKey::Int(i)),
+                Arc::new(RwLock::new(crate::alloc::vec![version])),
+            );
+        }
+
+        // The first chunk fills up before the scan finishes, so it must yield.
+        let first = checkpoint.collect_table_rows().unwrap();
+        assert!(
+            first.is_some_and(|io| io.is_explicit_yield()),
+            "scanning more than COLLECT_PREEMPTION_THRESHOLD rows must preempt with an explicit yield"
+        );
+
+        // Resume from the cursor until the scan finishes; every row must still
+        // be collected exactly once across the chunks.
+        while checkpoint.collect_table_rows().unwrap().is_some() {}
+        assert_eq!(checkpoint.write_set.len(), row_count);
+    }
+
+    #[test]
+    fn collect_index_rows_preempts_on_large_scan() {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        let mvstore = db.get_mvcc_store();
+        let pager = conn.pager.load().clone();
+        let mut checkpoint = CheckpointStateMachine::new(
+            pager,
+            mvstore.clone(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
+        );
+
+        let index_id = MVTableId::from(-7);
+        let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
+        for i in 0..row_count as i64 {
+            let (key, version) = index_row_version(index_id, "k", i, 1, Some(5), None, false);
+            mvstore
+                .insert_index_version(index_id, key, version)
+                .unwrap();
+        }
+
+        let first = checkpoint.collect_index_rows().unwrap();
+        assert!(
+            first.is_some_and(|io| io.is_explicit_yield()),
+            "scanning more than COLLECT_PREEMPTION_THRESHOLD index rows must preempt with an explicit yield"
+        );
+
+        while checkpoint.collect_index_rows().unwrap().is_some() {}
+        assert_eq!(checkpoint.index_write_set.len(), row_count);
+    }
+
+    #[test]
+    fn gc_checkpointed_table_versions_preempts_on_large_scan() {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        let mvstore = db.get_mvcc_store();
+        let pager = conn.pager.load().clone();
+        let mut checkpoint = CheckpointStateMachine::new(
+            pager,
+            mvstore.clone(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
+        );
+        checkpoint.lock_states.blocking_checkpoint_lock_held = true;
+        checkpoint.durable_txid_max_new = 5;
+
+        let table_id = MVTableId::from(-2);
+        let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
+        for i in 0..row_count as i64 {
+            let version = committed_table_row_version(table_id, i);
+            let row_id = RowID::new(table_id, RowKey::Int(i));
+            mvstore.rows.insert(
+                row_id,
+                Arc::new(RwLock::new(crate::alloc::vec![version.clone()])),
+            );
+            checkpoint.write_set.push((version, None));
+        }
+        checkpoint.state = CheckpointState::GcTableRows {
+            next_index: 0,
+            lwm: u64::MAX,
+        };
+
+        let first = checkpoint.gc_checkpointed_table_versions();
+        assert!(
+            first.is_some_and(|io| io.is_explicit_yield()),
+            "GCing more than COLLECT_PREEMPTION_THRESHOLD rows must preempt with an explicit yield"
+        );
+
+        while checkpoint.gc_checkpointed_table_versions().is_some() {}
+        let remaining = mvstore
+            .rows
+            .iter()
+            .filter(|entry| entry.key().table_id == table_id)
+            .count();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn gc_checkpointed_index_versions_preempts_on_large_scan() {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        let mvstore = db.get_mvcc_store();
+        let pager = conn.pager.load().clone();
+        let mut checkpoint = CheckpointStateMachine::new(
+            pager,
+            mvstore.clone(),
+            conn.clone(),
+            true,
+            conn.get_sync_mode(),
+            crate::MAIN_DB_ID,
+        );
+        checkpoint.lock_states.blocking_checkpoint_lock_held = true;
+        checkpoint.durable_txid_max_new = 5;
+
+        let index_id = MVTableId::from(-7);
+        let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
+        for i in 0..row_count as i64 {
+            let (key, version) = index_row_version(index_id, "k", i, 1, Some(5), None, false);
+            mvstore
+                .insert_index_version(index_id, key, version.clone())
+                .unwrap();
+            checkpoint.index_write_set.push((index_id, version, false));
+        }
+        checkpoint.state = CheckpointState::GcIndexRows {
+            next_index: 0,
+            lwm: u64::MAX,
+        };
+
+        let first = checkpoint.gc_checkpointed_index_versions();
+        assert!(
+            first.is_some_and(|io| io.is_explicit_yield()),
+            "GCing more than COLLECT_PREEMPTION_THRESHOLD index rows must preempt with an explicit yield"
+        );
+
+        while checkpoint.gc_checkpointed_index_versions().is_some() {}
+        let remaining = mvstore
+            .index_rows
+            .get(&index_id)
+            .map_or(0, |entry| entry.value().len());
+        assert_eq!(remaining, 0);
     }
 }

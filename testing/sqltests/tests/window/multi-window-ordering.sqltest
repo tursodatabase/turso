@@ -1,0 +1,68 @@
+@database :memory:
+
+setup multi_window_base {
+    CREATE TABLE multi_window_items(g TEXT, v INTEGER);
+    INSERT INTO multi_window_items VALUES
+        ('a', 10),
+        ('a', 20),
+        ('b', 30),
+        ('b', 40),
+        ('c', 50);
+}
+
+# When multiple windows appear in one SELECT, each window function must see
+# rows in its own window's declared order, not in the order produced by an
+# adjacent window. The classic regression: an unordered `OVER ()` ending up
+# in the middle of the nesting picks up the enclosing layer's ordering.
+
+@setup multi_window_base
+test three-row-number-windows-distinct-defs {
+    SELECT g, v,
+           row_number() OVER (PARTITION BY g ORDER BY v),
+           row_number() OVER (ORDER BY v DESC),
+           row_number() OVER ()
+    FROM multi_window_items;
+}
+expect {
+    a|10|1|5|1
+    a|20|2|4|2
+    b|30|1|3|3
+    b|40|2|2|4
+    c|50|1|1|5
+}
+
+@setup multi_window_base
+test three-windows-aggregate-between {
+    SELECT g, v,
+           row_number() OVER (PARTITION BY g ORDER BY v),
+           sum(v) OVER (ORDER BY v DESC),
+           row_number() OVER ()
+    FROM multi_window_items;
+}
+expect {
+    a|10|1|150|1
+    a|20|2|140|2
+    b|30|1|120|3
+    b|40|2|90|4
+    c|50|1|50|5
+}
+
+# Reordering the window definitions in the SELECT list must change the
+# user-visible row order: the first-declared window's PARTITION/ORDER
+# defines the outermost layer, so its sort determines the output order.
+
+@setup multi_window_base
+test empty-over-first-then-ordered-then-partitioned {
+    SELECT g, v,
+           row_number() OVER (),
+           row_number() OVER (ORDER BY v DESC),
+           row_number() OVER (PARTITION BY g ORDER BY v)
+    FROM multi_window_items;
+}
+expect {
+    c|50|1|1|1
+    b|40|2|2|2
+    b|30|3|3|1
+    a|20|4|4|2
+    a|10|5|5|1
+}

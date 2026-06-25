@@ -14,7 +14,10 @@ use super::{
 use crate::translate::plan::BitSet;
 use crate::translate::{
     emitter::Resolver,
-    expr::{expr_vector_size, unwrap_parens, BindingBehavior, WalkControl},
+    expr::{
+        expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
+        BindingBehavior, WalkControl,
+    },
     plan::{NonFromClauseSubquery, SubqueryState},
 };
 use crate::{
@@ -25,11 +28,11 @@ use crate::{
     Result,
 };
 use crate::{
-    function::{AggFunc, ExtFunc},
+    function::{AccumulatorFunc, AggFunc, ExtFunc},
     translate::expr::bind_and_rewrite_expr,
 };
 use crate::{
-    translate::plan::{Window, WindowFunction, WindowFunctionKind},
+    translate::plan::{Window, WindowFunction},
     vdbe::builder::ProgramBuilder,
 };
 use smallvec::SmallVec;
@@ -212,7 +215,40 @@ pub fn resolve_window_and_aggregate_functions(
                 distinctness,
                 filter_over,
                 order_by,
+                within_group,
             } => {
+                let ordered_set_func = ordered_set_agg_func(&normalize_ident(name.as_str()));
+
+                if !within_group.is_empty() {
+                    let new_agg = build_ordered_set_aggregate(
+                        name,
+                        args,
+                        distinctness.as_ref(),
+                        order_by,
+                        within_group,
+                        filter_over,
+                        ordered_set_func,
+                    )?;
+                    add_aggregate_if_not_exists(
+                        aggs,
+                        expr,
+                        &new_agg.args,
+                        Distinctness::NonDistinct,
+                        new_agg.func,
+                        filter_over.filter_clause.as_deref().cloned(),
+                    )?;
+                    contains_aggregates = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+
+                // Ordered-set aggregates are only meaningful with WITHIN GROUP. mode() in
+                // particular has no plain-aggregate form, so reject it early with a clear error.
+                if matches!(ordered_set_func, Some(AggFunc::Mode)) {
+                    crate::bail_parse_error!(
+                        "mode() requires a WITHIN GROUP (ORDER BY ...) clause"
+                    );
+                }
+
                 if !order_by.is_empty() {
                     crate::bail_parse_error!(
                         "ORDER BY clause is not supported yet in aggregate functions"
@@ -226,9 +262,11 @@ pub fn resolve_window_and_aggregate_functions(
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
+                                resolver,
                                 expr,
-                                WindowFunctionKind::Agg(f),
+                                AccumulatorFunc::Agg(f),
                                 over_clause,
+                                filter_over.filter_clause.as_deref(),
                                 distinctness,
                             )?;
                         } else {
@@ -248,9 +286,11 @@ pub fn resolve_window_and_aggregate_functions(
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
+                                resolver,
                                 expr,
-                                WindowFunctionKind::Window(f),
+                                AccumulatorFunc::Window(f),
                                 over_clause,
+                                filter_over.filter_clause.as_deref(),
                                 distinctness,
                             )?;
                         } else {
@@ -268,9 +308,11 @@ pub fn resolve_window_and_aggregate_functions(
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
                                     link_with_window(
                                         windows.as_deref_mut(),
+                                        resolver,
                                         expr,
-                                        WindowFunctionKind::Agg(func),
+                                        AccumulatorFunc::Agg(func),
                                         over_clause,
+                                        filter_over.filter_clause.as_deref(),
                                         distinctness,
                                     )?;
                                 } else {
@@ -304,9 +346,11 @@ pub fn resolve_window_and_aggregate_functions(
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
+                                resolver,
                                 expr,
-                                WindowFunctionKind::Agg(f),
+                                AccumulatorFunc::Agg(f),
                                 over_clause,
+                                filter_over.filter_clause.as_deref(),
                                 Distinctness::NonDistinct,
                             )?;
                         } else {
@@ -326,9 +370,11 @@ pub fn resolve_window_and_aggregate_functions(
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
+                                resolver,
                                 expr,
-                                WindowFunctionKind::Window(f),
+                                AccumulatorFunc::Window(f),
                                 over_clause,
+                                filter_over.filter_clause.as_deref(),
                                 Distinctness::NonDistinct,
                             )?;
                         } else {
@@ -361,9 +407,11 @@ pub fn resolve_window_and_aggregate_functions(
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
                                     link_with_window(
                                         windows.as_deref_mut(),
+                                        resolver,
                                         expr,
-                                        WindowFunctionKind::Agg(func),
+                                        AccumulatorFunc::Agg(func),
                                         over_clause,
+                                        filter_over.filter_clause.as_deref(),
                                         Distinctness::NonDistinct,
                                     )?;
                                 } else {
@@ -396,37 +444,46 @@ pub fn resolve_window_and_aggregate_functions(
 
 fn link_with_window(
     windows: Option<&mut Vec<Window>>,
+    resolver: &Resolver,
     expr: &Expr,
-    func: WindowFunctionKind,
+    func: AccumulatorFunc,
     over_clause: &Over,
+    filter_clause: Option<&Expr>,
     distinctness: Distinctness,
 ) -> Result<()> {
     if distinctness.is_distinct() {
         crate::bail_parse_error!("DISTINCT is not supported for window functions");
     }
+    // FILTER decides which input rows contribute to a running aggregate, so
+    // it is only meaningful for aggregating window functions. Non-aggregate
+    // ones (`row_number`/`lag`/`lead`) have nothing to filter.
+    if matches!(func, AccumulatorFunc::Window(_)) && filter_clause.is_some() {
+        crate::bail_parse_error!("FILTER clause may only be used with aggregate window functions");
+    }
     expr_vector_size(expr)?;
     if let Some(windows) = windows {
         let window = resolve_window(windows, over_clause)?;
-        // Dedup: if an equivalent window function expression is already linked to
-        // this window, skip adding it again. Multiple occurrences of the same
-        // window function should share a single entry so the rewrite + emit code
-        // can rely on each entry being rewritten exactly once.
-        if window
-            .functions
-            .iter()
-            .any(|f| exprs_are_equivalent(&f.original_expr, expr))
+        // Two equivalent window expressions can share one `WindowFunction`
+        // entry unless they contain nondeterministic calls like `random()`,
+        // which SQLite evaluates separately at each SQL occurrence.
+        let deduplicate = !expr_contains_nondeterministic_scalar_function(expr, resolver)?;
+        if deduplicate
+            && window
+                .functions
+                .iter()
+                .any(|f| exprs_are_equivalent(&f.original_expr, expr))
         {
             return Ok(());
         }
         window.functions.push(WindowFunction {
             func,
             original_expr: expr.clone(),
-            rewritten_expr: None,
+            rewritten: None,
         });
     } else {
         let func_name = match &func {
-            WindowFunctionKind::Agg(f) => f.as_str().to_string(),
-            WindowFunctionKind::Window(f) => f.to_string(),
+            AccumulatorFunc::Agg(f) => f.as_str().to_string(),
+            AccumulatorFunc::Window(f) => f.to_string(),
         };
         crate::bail_parse_error!("misuse of window function: {}()", func_name);
     }
@@ -475,6 +532,89 @@ fn add_aggregate_if_not_exists(
         aggs.push(Aggregate::new(func, args, expr, distinctness, filter_expr));
     }
     Ok(())
+}
+
+/// Maps a normalized function name to the ordered-set [`AggFunc`] it implements, if any.
+/// Ordered-set aggregates are written `f(direct_args) WITHIN GROUP (ORDER BY x)`.
+fn ordered_set_agg_func(normalized_name: &str) -> Option<AggFunc> {
+    match normalized_name {
+        "mode" => Some(AggFunc::Mode),
+        "percentile_cont" => Some(AggFunc::PercentileCont),
+        "percentile_disc" => Some(AggFunc::PercentileDisc),
+        _ => None,
+    }
+}
+
+struct OrderedSetAggregate {
+    func: AggFunc,
+    // Matches `add_aggregate_if_not_exists`, which consumes `&[Box<Expr>]`.
+    #[allow(clippy::vec_box)]
+    args: Vec<Box<Expr>>,
+}
+
+/// Validates a `WITHIN GROUP (ORDER BY ...)` ordered-set aggregate and rewrites it into a
+/// uniform argument list for the rest of the pipeline: `[value]` for `mode`, or
+/// `[value, fraction]` for the percentile functions. `value` is the single ORDER BY
+/// expression; `fraction` is the direct argument.
+fn build_ordered_set_aggregate(
+    name: &ast::Name,
+    args: &[Box<Expr>],
+    distinctness: Option<&ast::Distinctness>,
+    order_by: &[ast::SortedColumn],
+    within_group: &[ast::SortedColumn],
+    filter_over: &ast::FunctionTail,
+    ordered_set_func: Option<AggFunc>,
+) -> Result<OrderedSetAggregate> {
+    let Some(func) = ordered_set_func else {
+        crate::bail_parse_error!(
+            "WITHIN GROUP is not supported for function {}()",
+            name.as_str()
+        );
+    };
+    if filter_over.over_clause.is_some() {
+        crate::bail_parse_error!(
+            "ordered-set aggregate {}() may not be used as a window function",
+            name.as_str()
+        );
+    }
+    if distinctness.is_some() {
+        crate::bail_parse_error!(
+            "DISTINCT is not supported for ordered-set aggregate {}()",
+            name.as_str()
+        );
+    }
+    if !order_by.is_empty() {
+        crate::bail_parse_error!(
+            "{}() does not accept an argument ORDER BY together with WITHIN GROUP",
+            name.as_str()
+        );
+    }
+    if within_group.len() != 1 {
+        crate::bail_parse_error!(
+            "WITHIN GROUP for {}() must specify exactly one ORDER BY expression",
+            name.as_str()
+        );
+    }
+    let sort_col = &within_group[0];
+    if matches!(sort_col.order, Some(ast::SortOrder::Desc)) || sort_col.nulls.is_some() {
+        crate::bail_parse_error!(
+            "DESC and NULLS ordering inside WITHIN GROUP are not supported yet"
+        );
+    }
+    let expected_direct_args = match func {
+        AggFunc::Mode => 0,
+        _ => 1, // percentile_cont / percentile_disc take the fraction
+    };
+    if args.len() != expected_direct_args {
+        crate::bail_parse_error!("wrong number of arguments to function {}()", name.as_str());
+    }
+    let mut new_args: Vec<Box<Expr>> = Vec::with_capacity(args.len() + 1);
+    new_args.push(sort_col.expr.clone());
+    new_args.extend(args.iter().cloned());
+    Ok(OrderedSetAggregate {
+        func,
+        args: new_args,
+    })
 }
 
 /// Plan a CTE when it's referenced in a query.
@@ -1062,12 +1202,12 @@ fn parse_table(
         let btree_table = Arc::new(crate::schema::BTreeTable::new(
             root_page,
             view_guard.name().to_string(),
-            Vec::new(),
+            crate::alloc::vec![],
             columns,
             crate::schema::BTreeCharacteristics::HAS_ROWID,
-            vec![],
-            vec![],
-            vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         ));
         drop(view_guard);
@@ -1134,6 +1274,19 @@ fn parse_table(
              Please DROP and recreate the view to use it.",
             normalized_qualified_name,
             DBSP_CIRCUIT_VERSION
+        );
+    }
+
+    // A view row whose stored SQL failed to parse at schema load
+    let is_broken_view = resolver.with_schema(database_id, |schema| {
+        schema.broken_views.contains(&normalized_qualified_name)
+    });
+
+    if is_broken_view {
+        crate::bail_parse_error!(
+            "view '{}' could not be loaded: its SQL in sqlite_schema does not parse. \n\
+             Use DROP VIEW to remove it, then recreate it.",
+            normalized_qualified_name
         );
     }
 
@@ -1411,51 +1564,7 @@ pub fn parse_where(
                 resolver,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
-            let _ = walk_expr_mut(&mut expr.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
-                if let Expr::Between {
-                    lhs,
-                    not,
-                    start,
-                    end,
-                } = e
-                {
-                    let lhs_expr = std::mem::take(lhs.as_mut());
-                    let start_expr = std::mem::take(start.as_mut());
-                    let end_expr = std::mem::take(end.as_mut());
-
-                    let (lower, upper, combine_op) = if *not {
-                        (
-                            Expr::Binary(
-                                Box::new(start_expr),
-                                ast::Operator::Greater,
-                                Box::new(lhs_expr.clone()),
-                            ),
-                            Expr::Binary(
-                                Box::new(lhs_expr),
-                                ast::Operator::Greater,
-                                Box::new(end_expr),
-                            ),
-                            ast::Operator::Or,
-                        )
-                    } else {
-                        (
-                            Expr::Binary(
-                                Box::new(start_expr),
-                                ast::Operator::LessEquals,
-                                Box::new(lhs_expr.clone()),
-                            ),
-                            Expr::Binary(
-                                Box::new(lhs_expr),
-                                ast::Operator::LessEquals,
-                                Box::new(end_expr),
-                            ),
-                            ast::Operator::And,
-                        )
-                    };
-                    *e = Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
-                }
-                Ok(WalkControl::Continue)
-            });
+            rewrite_between_exprs(&mut expr.expr)?;
         }
         // BETWEEN in WHERE is rewritten to binary terms here so each side can be
         // considered independently by constraint extraction and range planning.
@@ -1487,6 +1596,55 @@ pub fn parse_where(
     } else {
         Ok(())
     }
+}
+
+pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
+    walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
+        if let Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } = e
+        {
+            let lhs_expr = std::mem::take(lhs.as_mut());
+            let start_expr = std::mem::take(start.as_mut());
+            let end_expr = std::mem::take(end.as_mut());
+
+            let (lower, upper, combine_op) = if *not {
+                (
+                    Expr::Binary(
+                        Box::new(start_expr),
+                        ast::Operator::Greater,
+                        Box::new(lhs_expr.clone()),
+                    ),
+                    Expr::Binary(
+                        Box::new(lhs_expr),
+                        ast::Operator::Greater,
+                        Box::new(end_expr),
+                    ),
+                    ast::Operator::Or,
+                )
+            } else {
+                (
+                    Expr::Binary(
+                        Box::new(start_expr),
+                        ast::Operator::LessEquals,
+                        Box::new(lhs_expr.clone()),
+                    ),
+                    Expr::Binary(
+                        Box::new(lhs_expr),
+                        ast::Operator::LessEquals,
+                        Box::new(end_expr),
+                    ),
+                    ast::Operator::And,
+                )
+            };
+            *e = Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
 }
 
 /**
@@ -1787,7 +1945,12 @@ fn parse_join(
                 .take(table_references.joined_tables().len() - 1)
             {
                 for left_col in left_table.columns().iter().filter(|col| !col.hidden()) {
-                    if left_col.name == right_col.name {
+                    if left_col
+                        .name
+                        .as_deref()
+                        .zip(right_col.name.as_deref())
+                        .is_some_and(|(l, r)| l.eq_ignore_ascii_case(r))
+                    {
                         distinct_names.push(ast::Name::exact(
                             left_col.name.clone().expect("column name is None"),
                         ));
@@ -1848,8 +2011,8 @@ fn parse_join(
                             .filter(|(_, col)| !natural || !col.hidden())
                             .find(|(_, col)| {
                                 col.name
-                                    .as_ref()
-                                    .is_some_and(|name| *name == name_normalized)
+                                    .as_deref()
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(&name_normalized))
                             })
                             .map(|(idx, col)| {
                                 (left_table_offset, left_table.internal_id, idx, col)
@@ -1866,8 +2029,8 @@ fn parse_join(
                     }
                     let right_col = right_table.columns().iter().enumerate().find(|(_, col)| {
                         col.name
-                            .as_ref()
-                            .is_some_and(|name| *name == name_normalized)
+                            .as_deref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(&name_normalized))
                     });
                     if right_col.is_none() {
                         crate::bail_parse_error!(

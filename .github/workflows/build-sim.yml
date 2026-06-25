@@ -26,7 +26,7 @@ env:
 jobs:
   deploy:
     runs-on: blacksmith
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -41,6 +41,11 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push limbo-sim docker image
-        run: |
-          docker build -f testing/simulator/simulator-docker-runner/Dockerfile.simulator -t ${{ env.ECR_URL }}/${{ env.ECR_IMAGE_NAME }} --build-arg GIT_HASH=${{ env.GIT_HASH }} .
-          docker push ${{ env.ECR_URL }}/${{ env.ECR_IMAGE_NAME }}
+        uses: useblacksmith/build-push-action@v1
+        with:
+          context: .
+          file: testing/simulator/simulator-docker-runner/Dockerfile.simulator
+          push: true
+          tags: ${{ env.ECR_URL }}/${{ env.ECR_IMAGE_NAME }}
+          build-args: |
+            GIT_HASH=${{ env.GIT_HASH }}

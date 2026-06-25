@@ -180,3 +180,54 @@ fn test_alter_table_add_column_preserves_multiple_unique_constraints_reopen() {
         conn.close().unwrap();
     }
 }
+
+/// ALTER TABLE ADD COLUMN with a generated expression must be
+/// rejected when --experimental-generated-columns is disabled
+#[test]
+fn test_alter_add_generated_column_rejected_without_flag() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+
+    let err = conn
+        .execute("ALTER TABLE t ADD COLUMN b AS (a)")
+        .expect_err("generated column must be rejected without the flag");
+    assert!(
+        err.to_string().contains("Generated columns require"),
+        "unexpected error: {err}"
+    );
+
+    let cols: Vec<(String,)> = conn.exec_rows("SELECT name FROM pragma_table_info('t')");
+    assert_eq!(cols, vec![("a".to_string(),)]);
+}
+
+/// ALTER TABLE ADD COLUMN with a generated expression must be
+/// accepted when --experimental-generated-columns is enabled
+#[test]
+fn test_alter_add_generated_column_succeeds_with_flag() {
+    let path = TempDir::new()
+        .unwrap()
+        .keep()
+        .join("alter_add_generated_column.db");
+    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+
+    {
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(a)").unwrap();
+        conn.execute("INSERT INTO t VALUES (5)").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN b AS (a)").unwrap();
+
+        let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT a, b FROM t");
+        assert_eq!(rows, vec![(5, 5)]);
+        conn.close().unwrap();
+    }
+
+    {
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT a, b FROM t");
+        assert_eq!(rows, vec![(5, 5)]);
+        conn.close().unwrap();
+    }
+}

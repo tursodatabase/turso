@@ -127,7 +127,7 @@ impl WriteRowView {
 
                     // Create an ImmutableRecord from the values
                     let immutable_record =
-                        ImmutableRecord::from_values(&record_values, record_values.len());
+                        ImmutableRecord::from_values(&record_values, record_values.len())?;
                     let btree_key = BTreeKey::new_table_rowid(key_i64, Some(&immutable_record));
 
                     // Mark as Done before insert to avoid retry on I/O
@@ -504,7 +504,7 @@ impl DbspCircuit {
                 self.internal_state_index_root,
                 &index_def,
                 3,
-            );
+            )?;
             let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
             self.execute_node(root_id, pager, execute_state, false, &mut cursors)
         } else {
@@ -558,7 +558,7 @@ impl DbspCircuit {
                         self.internal_state_index_root,
                         &index_def,
                         3, // Index on first 3 columns
-                    );
+                    )?;
 
                     let state_cursors = Box::new(DbspStateCursors::new(
                         state_table_cursor,
@@ -745,7 +745,7 @@ impl DbspCircuit {
                             self.internal_state_index_root,
                             &index_def,
                             3,
-                        );
+                        )?;
                         let mut temp_cursors =
                             DbspStateCursors::new(temp_table_cursor, temp_index_cursor);
 
@@ -1717,6 +1717,7 @@ impl DbspCompiler {
                     distinctness: None,
                     args: ast_args,
                     order_by: Vec::new(),
+                    within_group: vec![],
                     filter_over: ast::FunctionTail {
                         filter_clause: None,
                         over_clause: None,
@@ -1762,6 +1763,7 @@ impl DbspCompiler {
                     },
                     args: ast_args,
                     order_by: Vec::new(),
+                    within_group: vec![],
                     filter_over: ast::FunctionTail {
                         filter_clause: None,
                         over_clause: None,
@@ -2283,7 +2285,7 @@ mod tests {
     macro_rules! test_schema {
         () => {{
             let mut schema = Schema::new();
-            let columns = vec![
+            let columns = crate::alloc::vec![
                 SchemaColumn::new(
                     Some("id".to_string()),
                     "INTEGER".to_string(),
@@ -2308,12 +2310,12 @@ mod tests {
             let users_table = BTreeTable::new(
                 2,
                 "users".to_string(),
-                vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                crate::alloc::vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
-                vec![],
-                vec![],
-                vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
                 None,
             );
             schema
@@ -2321,7 +2323,7 @@ mod tests {
                 .expect("Test setup: failed to add users table");
 
             // Add products table for join tests
-            let columns = vec![
+            let columns = crate::alloc::vec![
                 SchemaColumn::new(
                     Some("product_id".to_string()),
                     "INTEGER".to_string(),
@@ -2350,12 +2352,12 @@ mod tests {
             let products_table = BTreeTable::new(
                 3,
                 "products".to_string(),
-                vec![("product_id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                crate::alloc::vec![("product_id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
-                vec![],
-                vec![],
-                vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
                 None,
             );
             schema
@@ -2363,7 +2365,7 @@ mod tests {
                 .expect("Test setup: failed to add products table");
 
             // Add orders table for join tests
-            let columns = vec![
+            let columns = crate::alloc::vec![
                 SchemaColumn::new(
                     Some("order_id".to_string()),
                     "INTEGER".to_string(),
@@ -2397,12 +2399,12 @@ mod tests {
             let orders_table = BTreeTable::new(
                 4,
                 "orders".to_string(),
-                vec![("order_id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                crate::alloc::vec![("order_id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
-                vec![],
-                vec![],
-                vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
                 None,
             );
             schema
@@ -2410,7 +2412,7 @@ mod tests {
                 .expect("Test setup: failed to add orders table");
 
             // Add customers table with id and name for testing column ambiguity
-            let columns = vec![
+            let columns = crate::alloc::vec![
                 SchemaColumn::new(
                     Some("id".to_string()),
                     "INTEGER".to_string(),
@@ -2430,12 +2432,12 @@ mod tests {
             let customers_table = BTreeTable::new(
                 6,
                 "customers".to_string(),
-                vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                crate::alloc::vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
-                vec![],
-                vec![],
-                vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
                 None,
             );
             schema
@@ -2443,7 +2445,7 @@ mod tests {
                 .expect("Test setup: failed to add customers table");
 
             // Add purchases table (junction table for three-way join)
-            let columns = vec![
+            let columns = crate::alloc::vec![
                 SchemaColumn::new(
                     Some("id".to_string()),
                     "INTEGER".to_string(),
@@ -2477,12 +2479,12 @@ mod tests {
             let purchases_table = BTreeTable::new(
                 7,
                 "purchases".to_string(),
-                vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                crate::alloc::vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
-                vec![],
-                vec![],
-                vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
                 None,
             );
             schema
@@ -2490,7 +2492,7 @@ mod tests {
                 .expect("Test setup: failed to add purchases table");
 
             // Add vendors table with id, name, and price (ambiguous columns with customers)
-            let columns = vec![
+            let columns = crate::alloc::vec![
                 SchemaColumn::new(
                     Some("id".to_string()),
                     "INTEGER".to_string(),
@@ -2515,19 +2517,19 @@ mod tests {
             let vendors_table = BTreeTable::new(
                 8,
                 "vendors".to_string(),
-                vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+                crate::alloc::vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
-                vec![],
-                vec![],
-                vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
                 None,
             );
             schema
                 .add_btree_table(Arc::new(vendors_table))
                 .expect("Test setup: failed to add vendors table");
 
-            let columns = vec![
+            let columns = crate::alloc::vec![
                 SchemaColumn::new_default_integer(
                     Some("product_id".to_string()),
                     "INTEGER".to_string(),
@@ -2542,12 +2544,12 @@ mod tests {
             let sales_table = BTreeTable::new(
                 2,
                 "sales".to_string(),
-                vec![],
+                crate::alloc::vec![],
                 columns,
                 BTreeCharacteristics::HAS_ROWID,
-                vec![],
-                vec![],
-                vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
                 None,
             );
             schema

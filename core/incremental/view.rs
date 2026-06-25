@@ -1006,6 +1006,7 @@ impl IncrementalView {
                 distinctness,
                 filter_over,
                 order_by,
+                within_group,
             } => ast::Expr::FunctionCall {
                 name: name.clone(),
                 args: args
@@ -1015,6 +1016,7 @@ impl IncrementalView {
                 distinctness: *distinctness,
                 filter_over: filter_over.clone(),
                 order_by: order_by.clone(),
+                within_group: within_group.clone(),
             },
             ast::Expr::InList { lhs, not, rhs } => ast::Expr::InList {
                 lhs: Box::new(Self::unqualify_expression(lhs, table_name, aliases)),
@@ -1325,7 +1327,7 @@ impl IncrementalView {
                                 return Err(LimboError::Busy);
                             }
 
-                            crate::vdbe::StepResult::IO => {
+                            crate::vdbe::StepResult::IO | crate::vdbe::StepResult::Yield => {
                                 // Statement needs I/O - save state and return
                                 self.populate_state = PopulateState::ProcessingOneTable {
                                     queries,
@@ -1421,6 +1423,7 @@ impl IncrementalView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
     use crate::schema::{
         BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
     };
@@ -2555,7 +2558,7 @@ mod tests {
         // Get the orders table twice (simulating what would happen with CTEs)
         let orders_table = schema.get_btree_table("orders").unwrap();
 
-        let referenced_tables = vec![orders_table.clone(), orders_table];
+        let referenced_tables = std::vec![orders_table.clone(), orders_table];
 
         // Create a SELECT that would have conflicting WHERE conditions
         let select = parse_select(

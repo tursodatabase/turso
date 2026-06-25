@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::alloc::TursoSliceExt;
+
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType};
 
@@ -861,7 +863,7 @@ fn get_subquery_parser<'a>(
                     .enumerate()
                     .map(|(i, c)| {
                         let rhs_collation = get_collseq_from_expr(&c.expr, table_references)?;
-                        Ok(IndexColumn {
+                        Ok::<_, crate::LimboError>(IndexColumn {
                             name: c.name(table_references).unwrap_or("").to_string(),
                             order: SortOrder::Asc,
                             pos_in_table: i,
@@ -870,7 +872,8 @@ fn get_subquery_parser<'a>(
                             expr: None,
                         })
                     })
-                    .collect::<Result<Vec<_>>>()?;
+                    .try_collect::<Result<crate::alloc::Vec<_>>>()
+                    .expect("TODO: fallible allocations")?;
 
                 let ephemeral_index = Arc::new(Index {
                     columns,
@@ -1525,56 +1528,64 @@ pub fn emit_from_clause_subquery(
     });
     program.preassign_label_to_next_insn(coroutine_implementation_start_offset);
 
-    let result_column_start_reg = match plan {
-        Plan::Select(select_plan) => {
-            let mut metadata = Box::new(TranslateCtx {
-                labels_main_loop: (0..select_plan.joined_tables().len())
-                    .map(|_| LoopLabels::new(program))
-                    .collect(),
-                label_main_loop_end: None,
-                meta_group_by: None,
-                meta_left_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_semi_anti_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_sort: None,
-                reg_agg_start: None,
-                reg_nonagg_emit_once_flag: None,
-                reg_result_cols_start: None,
-                limit_ctx: None,
-                reg_offset: None,
-                reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
-                non_aggregate_expressions: Vec::new(),
-                agg_leaf_columns: Vec::new(),
-                cdc_cursor_id: None,
-                meta_window: None,
-                meta_in_seeks: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                materialized_build_inputs: HashMap::default(),
-                hash_table_contexts: HashMap::default(),
-                unsafe_testing: t_ctx.unsafe_testing,
-            });
-            metadata.materialized_build_inputs =
-                emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
-            emit_query(program, select_plan, &mut metadata)?
-        }
-        Plan::CompoundSelect { .. } => {
-            // Clone the plan to pass to emit_program_for_compound_select (it takes ownership)
-            let plan_clone = plan.clone();
-            let resolver = t_ctx.resolver.fork();
-            // emit_program_for_compound_select returns the result column start register
-            // for coroutine mode, which is needed by the outer query.
-            emit_program_for_compound_select(program, &resolver, plan_clone)?
-                .expect("compound CTE in coroutine mode must have result register")
-        }
-        Plan::Delete(_) | Plan::Update(_) => {
-            unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
-        }
-    };
+    // Coroutine bodies may be re-invoked from an outer loop (e.g. as the inner
+    // side of a LEFT JOIN). Emit under `nested()` so that HashClose for any
+    // hash join inside the body is deferred to statement teardown; otherwise
+    // the second invocation would find the hash table already removed and
+    // produce no matches. The hash build itself is guarded by Once and
+    // therefore correctly persists across re-invocations.
+    let result_column_start_reg = program.nested(|program| -> Result<usize> {
+        Ok(match plan {
+            Plan::Select(select_plan) => {
+                let mut metadata = Box::new(TranslateCtx {
+                    labels_main_loop: (0..select_plan.joined_tables().len())
+                        .map(|_| LoopLabels::new(program))
+                        .collect(),
+                    label_main_loop_end: None,
+                    meta_group_by: None,
+                    meta_left_joins: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    meta_semi_anti_joins: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    meta_sort: None,
+                    reg_agg_start: None,
+                    reg_nonagg_emit_once_flag: None,
+                    reg_result_cols_start: None,
+                    limit_ctx: None,
+                    reg_offset: None,
+                    reg_limit_offset_sum: None,
+                    resolver: t_ctx.resolver.fork(),
+                    non_aggregate_expressions: Vec::new(),
+                    agg_leaf_columns: Vec::new(),
+                    cdc_cursor_id: None,
+                    meta_window: None,
+                    meta_in_seeks: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    materialized_build_inputs: HashMap::default(),
+                    hash_table_contexts: HashMap::default(),
+                    unsafe_testing: t_ctx.unsafe_testing,
+                });
+                metadata.materialized_build_inputs =
+                    emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
+                emit_query(program, select_plan, &mut metadata)?
+            }
+            Plan::CompoundSelect { .. } => {
+                // Clone the plan to pass to emit_program_for_compound_select (it takes ownership)
+                let plan_clone = plan.clone();
+                let resolver = t_ctx.resolver.fork();
+                // emit_program_for_compound_select returns the result column start register
+                // for coroutine mode, which is needed by the outer query.
+                emit_program_for_compound_select(program, &resolver, plan_clone)?
+                    .expect("compound CTE in coroutine mode must have result register")
+            }
+            Plan::Delete(_) | Plan::Update(_) => {
+                unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
+            }
+        })
+    })?;
 
     program.emit_insn(Insn::EndCoroutine { yield_reg });
     program.preassign_label_to_next_insn(subquery_body_end_label);
@@ -1678,12 +1689,12 @@ fn emit_materialized_subquery_table(
     let ephemeral_table = Arc::new(BTreeTable::new(
         0,
         String::new(),
-        vec![],
-        columns.to_vec(),
+        crate::alloc::vec![],
+        columns.try_to_vec().expect("TODO: fallible allocations"),
         BTreeCharacteristics::HAS_ROWID,
-        vec![],
-        vec![],
-        vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     ));
 

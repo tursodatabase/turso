@@ -1732,7 +1732,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 if let Some(agg_fun) = Self::parse_aggregate_function(&func_name, 0) {
                     Ok(LogicalExpr::AggregateFunction {
                         fun: agg_fun,
-                        args: vec![],
+                        args: std::vec![],
                         distinct: false,
                     })
                 } else if let Ok(Some(func)) =
@@ -2397,6 +2397,10 @@ impl<'a> LogicalPlanBuilder<'a> {
                 AggFunc::Min | AggFunc::Max => Ok(Type::Text),
                 AggFunc::GroupConcat | AggFunc::StringAgg => Ok(Type::Text),
                 AggFunc::ArrayAgg => Ok(Type::Blob),
+                AggFunc::PercentileCont => Ok(Type::Real),
+                // mode/percentile_disc return an element of the ordered set, whose
+                // type is not known statically.
+                AggFunc::Mode | AggFunc::PercentileDisc => Ok(Type::Text),
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupArray
                 | AggFunc::JsonGroupArray
@@ -2456,6 +2460,7 @@ fn expand_sub_joins<'a>(joins: &[&'a ast::JoinedSelectTable], out: &mut Vec<Flat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
     use crate::schema::{
         BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
     };
@@ -4138,7 +4143,7 @@ mod tests {
     fn test_strip_alias_scalar_function() {
         let expr = LogicalExpr::ScalarFunction {
             fun: "substr".to_string(),
-            args: vec![
+            args: std::vec![
                 LogicalExpr::Column(Column::new("name")),
                 LogicalExpr::Literal(Value::from_i64(1)),
                 LogicalExpr::Literal(Value::from_i64(4)),
@@ -4174,7 +4179,7 @@ mod tests {
         // Test that two expressions match when one has an alias and one doesn't
         let base_expr = LogicalExpr::ScalarFunction {
             fun: "substr".to_string(),
-            args: vec![
+            args: std::vec![
                 LogicalExpr::Column(Column::new("orderdate")),
                 LogicalExpr::Literal(Value::from_i64(1)),
                 LogicalExpr::Literal(Value::from_i64(4)),
@@ -4209,7 +4214,7 @@ mod tests {
     fn test_strip_alias_aggregate_function() {
         let expr = LogicalExpr::AggregateFunction {
             fun: AggFunc::Sum,
-            args: vec![LogicalExpr::Column(Column::new("amount"))],
+            args: std::vec![LogicalExpr::Column(Column::new("amount"))],
             distinct: false,
         };
         let stripped = strip_alias(&expr);
@@ -4222,7 +4227,7 @@ mod tests {
         let expr1 = LogicalExpr::Column(Column::new("a"));
         let expr2 = LogicalExpr::ScalarFunction {
             fun: "substr".to_string(),
-            args: vec![
+            args: std::vec![
                 LogicalExpr::Column(Column::new("b")),
                 LogicalExpr::Literal(Value::from_i64(1)),
                 LogicalExpr::Literal(Value::from_i64(4)),

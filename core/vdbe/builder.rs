@@ -1406,6 +1406,12 @@ impl ProgramBuilder {
                 } => {
                     resolve(target_pc, "NotExists")?;
                 }
+                Insn::MustBeInt {
+                    target_pc: Some(target_pc),
+                    ..
+                } => {
+                    resolve(target_pc, "MustBeInt")?;
+                }
                 Insn::Yield {
                     yield_reg: _,
                     end_offset,

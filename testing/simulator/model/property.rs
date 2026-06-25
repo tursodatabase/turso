@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sql_generation::model::query::{Create, Insert, Select, predicate::Predicate, update::Update};
 
-use crate::model::{Query, QueryDiscriminants};
+use crate::model::{CreateSequence, DropSequence, Query, QueryDiscriminants};
 
 /// Properties are representations of executable specifications
 /// about the database behavior.
@@ -191,6 +191,20 @@ pub enum Property {
         tables: Vec<String>,
         write_kinds: Vec<QueryDiscriminants>,
     },
+    /// SequenceMonotonicity verifies that nextval() returns monotonically increasing
+    /// values matching the expected arithmetic sequence.
+    ///
+    /// Execution:
+    ///     CREATE SEQUENCE seq START WITH s INCREMENT BY i ...
+    ///     SELECT nextval('seq')  -- expect s
+    ///     SELECT nextval('seq')  -- expect s+i
+    ///     ...
+    ///     DROP SEQUENCE seq
+    SequenceMonotonicity {
+        create: CreateSequence,
+        num_calls: usize,
+        drop: DropSequence,
+    },
     /// Property used to subsititute a property with its queries only
     Queries {
         queries: Vec<Query>,
@@ -233,6 +247,7 @@ impl Property {
             | Property::SavepointRollback { queries, .. }
             | Property::Queries { queries } => Some(queries),
             Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => None,
+            Property::SequenceMonotonicity { .. } => None,
             Property::SelectLimit { .. }
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }

@@ -407,3 +407,217 @@ impl Workload for ElleRwReadWorkload {
         Some(Operation::ElleRwRead { table_name, key })
     }
 }
+
+// ============================================================================
+// Sequence Workloads
+// ============================================================================
+
+/// Create a new sequence with random parameters including min/max/cycle.
+pub struct CreateSequenceWorkload;
+
+impl Workload for CreateSequenceWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        // DDL only outside transactions
+        if *ctx.fiber_state != FiberState::Idle {
+            return None;
+        }
+        let seq_name = format!("seq_{}", rng.random_range(0..100000u32));
+        let increments: [i64; 6] = [1, 2, 3, 5, -1, -2];
+        let increment = increments[rng.random_range(0..increments.len())];
+
+        // Randomly choose between unbounded, bounded+cycle, and bounded+no-cycle
+        let arm = rng.random_range(0..4u32);
+        let (start, min_value, max_value, cycle) = if arm == 0 {
+            // Bounded sequence with cycle — small range to stress wrap-around
+            let range_size = rng.random_range(5..20i64);
+            if increment > 0 {
+                let min = 1;
+                let max = min + range_size * increment.abs();
+                (min, min, max, true)
+            } else {
+                let max = -1;
+                let min = max - range_size * increment.abs();
+                (max, min, max, true)
+            }
+        } else if arm == 1 {
+            // Bounded sequence without cycle — small range to stress overflow errors
+            let range_size = rng.random_range(5..15i64);
+            if increment > 0 {
+                let min = 1;
+                let max = min + range_size * increment.abs();
+                (min, min, max, false)
+            } else {
+                let max = -1;
+                let min = max - range_size * increment.abs();
+                (max, min, max, false)
+            }
+        } else {
+            // Unbounded (large range, no cycle)
+            if increment > 0 {
+                (increment, 1, i64::MAX, false)
+            } else {
+                (increment, i64::MIN + 1, -1, false)
+            }
+        };
+
+        Some(Operation::CreateSequence {
+            seq_name,
+            start,
+            increment,
+            min_value,
+            max_value,
+            cycle,
+        })
+    }
+}
+
+/// Call currval() on a random existing sequence.
+pub struct CurrValWorkload;
+
+impl Workload for CurrValWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if ctx.sim_state.sequences.is_empty() {
+            return None;
+        }
+        let seq_name = ctx.sim_state.sequences.pick(rng)?.0.clone();
+        Some(Operation::CurrVal { seq_name })
+    }
+}
+
+/// Call nextval() on a random existing sequence.
+pub struct NextValWorkload;
+
+impl Workload for NextValWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if ctx.sim_state.sequences.is_empty() {
+            return None;
+        }
+        let seq_name = ctx.sim_state.sequences.pick(rng)?.0.clone();
+        Some(Operation::NextVal { seq_name })
+    }
+}
+
+/// Call setval() on a random existing sequence with a random in-bounds value.
+pub struct SetValWorkload;
+
+impl Workload for SetValWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if ctx.sim_state.sequences.is_empty() {
+            return None;
+        }
+        let (seq_name, params) = ctx.sim_state.sequences.pick(rng)?;
+        let seq_name = seq_name.clone();
+        // Pick a value within the sequence's bounds
+        let value = rng.random_range(params.min_value..=params.max_value);
+        // Align to the increment grid
+        let aligned = params.start + ((value - params.start) / params.increment) * params.increment;
+        let aligned = aligned.clamp(params.min_value, params.max_value);
+        let is_called = rng.random_range(0..2u32) == 0;
+        Some(Operation::SetVal {
+            seq_name,
+            value: aligned,
+            is_called,
+        })
+    }
+}
+
+/// Drop a random existing sequence.
+pub struct DropSequenceWorkload;
+
+impl Workload for DropSequenceWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        // DDL only outside transactions
+        if *ctx.fiber_state != FiberState::Idle {
+            return None;
+        }
+        if ctx.sim_state.sequences.is_empty() {
+            return None;
+        }
+        let seq_name = ctx.sim_state.sequences.pick(rng)?.0.clone();
+        Some(Operation::DropSequence { seq_name })
+    }
+}
+
+/// Create a table with a column that defaults to nextval() of an existing sequence.
+pub struct CreateTableWithSeqDefaultWorkload;
+
+impl Workload for CreateTableWithSeqDefaultWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if *ctx.fiber_state != FiberState::Idle {
+            return None;
+        }
+        if ctx.sim_state.sequences.is_empty() {
+            return None;
+        }
+        let seq_name = ctx.sim_state.sequences.pick(rng)?.0.clone();
+        let table_name = format!("seq_tbl_{}", rng.random_range(0..100000u32));
+        Some(Operation::CreateTableWithSeqDefault {
+            table_name,
+            seq_name,
+        })
+    }
+}
+
+/// Insert a row into a table that has a sequence-backed DEFAULT column.
+pub struct InsertSeqDefaultWorkload;
+
+impl Workload for InsertSeqDefaultWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if ctx.sim_state.seq_default_tables.is_empty() {
+            return None;
+        }
+        let table_name = ctx.sim_state.seq_default_tables.pick(rng)?.0.clone();
+        Some(Operation::InsertSeqDefault { table_name })
+    }
+}
+
+/// Insert a row into the AUTOINCREMENT table with a NULL rowid and
+/// RETURNING id, so the `AutoincWatermarkMonotonicity` property can
+/// observe the engine-assigned rowid.
+pub struct AutoincInsertWorkload;
+
+impl Workload for AutoincInsertWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        let payload = format!("p{}", rng.random_range(0..1_000_000u32));
+        Some(Operation::AutoincInsert { payload })
+    }
+}
+
+/// Move an existing rowid in the AUTOINCREMENT table to a strictly
+/// higher value. This is the historical bug class — the engine must
+/// bump `sqlite_sequence.seq` so the next NULL-rowid insert in any
+/// fiber returns something above the relocated id.
+///
+/// The chosen `new_id` is drawn from a wide range so most attempts move
+/// the row past whatever the current watermark is; `old_id` is drawn
+/// from a small range so it has a reasonable chance of matching some
+/// recently-inserted row (early inserts use small ids). If the WHERE
+/// matches zero rows the engine treats the UPDATE as a no-op and the
+/// property check is satisfied trivially.
+pub struct AutoincUpdateRowidWorkload;
+
+impl Workload for AutoincUpdateRowidWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        // Only generate inside an explicit tx OR outside any tx: any
+        // active tx mode is fine for UPDATE, and the workload should not
+        // be skipped on either.
+        let _ = ctx;
+        let old_id = rng.random_range(1..1_000i64);
+        // Bias high so new_id is almost always above the current
+        // watermark (early-run watermark is small).
+        let new_id = rng.random_range(10_000..1_000_000_000i64);
+        Some(Operation::AutoincUpdateRowid { old_id, new_id })
+    }
+}
+
+/// Delete a row from the AUTOINCREMENT table by id. Mostly there to
+/// keep the table from being a strict-monotone-growth-only workload
+/// (delete-then-insert exercises the watermark-vs-btree-max interplay).
+pub struct AutoincDeleteWorkload;
+
+impl Workload for AutoincDeleteWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        let id = rng.random_range(1..10_000i64);
+        Some(Operation::AutoincDelete { id })
+    }
+}

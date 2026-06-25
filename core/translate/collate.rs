@@ -1,11 +1,17 @@
-use std::{cmp::Ordering, str::FromStr as _};
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    str::FromStr as _,
+};
 
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
 use turso_parser::ast::Expr;
 
 use crate::{
-    sync::{LazyLock, RwLock},
+    connection::SymbolTable,
+    sync::{LazyLock, Mutex, RwLock},
     translate::{
         expr::{walk_expr, WalkControl},
         plan::TableReferences,
@@ -13,49 +19,147 @@ use crate::{
     Result,
 };
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 /// **Pre defined collation sequences**\
 /// Collating functions only matter when comparing string values.
 /// Numeric values are always compared numerically, and BLOBs are always compared byte-by-byte using memcmp().
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub enum CollationSeq {
     Unset,
-    #[default]
     Binary,
     NoCase,
     Rtrim,
     Locale(LocaleCollationId),
+    /// Name/id token for a connection-owned callback. The comparison itself
+    /// must be resolved through `Connection` at runtime.
+    Custom(u32),
 }
+
+#[derive(Default)]
+struct CustomCollationNames {
+    // Custom collation callbacks are connection-local. This process-wide table
+    // only interns names so bytecode can carry compact `CollationSeq::Custom`
+    // tokens and resolve the callback through the active connection at runtime.
+    by_name: HashMap<String, u32>,
+    by_id: HashMap<u32, String>,
+}
+
+static CUSTOM_COLLATION_NAMES: LazyLock<Mutex<CustomCollationNames>> =
+    LazyLock::new(|| Mutex::new(CustomCollationNames::default()));
 
 impl CollationSeq {
     pub fn new(collation: &str) -> crate::Result<Self> {
-        match collation.to_ascii_lowercase().as_str() {
-            "binary" => return Ok(CollationSeq::Binary),
-            "nocase" => return Ok(CollationSeq::NoCase),
-            "rtrim" => return Ok(CollationSeq::Rtrim),
+        match crate::util::normalize_ident(collation).as_str() {
+            "binary" => return Ok(Self::Binary),
+            "nocase" => return Ok(Self::NoCase),
+            "rtrim" => return Ok(Self::Rtrim),
             _ => {}
         }
+
         LocaleCollationRegistry::global()
             .get_or_register(collation)
-            .map(CollationSeq::Locale)
+            .map(Self::Locale)
     }
 
     #[inline]
     /// Returns the collation, defaulting to BINARY if unset
     pub const fn from_bits(bits: u8) -> Self {
         match bits {
-            2 => CollationSeq::NoCase,
-            3 => CollationSeq::Rtrim,
-            _ => CollationSeq::Binary,
+            2 => Self::NoCase,
+            3 => Self::Rtrim,
+            _ => Self::Binary,
+        }
+    }
+
+    #[inline]
+    pub const fn to_bits(self) -> u16 {
+        match self {
+            Self::Unset => 0,
+            Self::Binary => 1,
+            Self::NoCase => 2,
+            Self::Rtrim => 3,
+            Self::Locale(id) => id.to_bits(),
+            Self::Custom(_) => 0,
+        }
+    }
+
+    #[inline]
+    pub const fn from_storage_bits(bits: u16) -> Self {
+        match bits {
+            0 => Self::Unset,
+            1 => Self::Binary,
+            2 => Self::NoCase,
+            3 => Self::Rtrim,
+            bits => Self::Locale(LocaleCollationId::from_bits(bits)),
+        }
+    }
+
+    #[inline]
+    pub const fn id(self) -> u32 {
+        match self {
+            Self::Custom(id) => id,
+            _ => self.to_bits() as u32,
+        }
+    }
+
+    #[inline]
+    pub const fn is_custom(self) -> bool {
+        matches!(self, Self::Custom(_))
+    }
+
+    pub fn custom(collation: &str) -> Self {
+        let normalized = crate::util::normalize_ident(collation);
+        let mut registry = CUSTOM_COLLATION_NAMES.lock();
+        if let Some(id) = registry.by_name.get(&normalized) {
+            return Self::Custom(*id);
+        }
+
+        let mut id = custom_collation_id(&normalized);
+        while id <= 3 || registry.by_id.contains_key(&id) {
+            id = id.wrapping_add(1).max(4);
+        }
+
+        registry.by_name.insert(normalized, id);
+        registry.by_id.insert(id, collation.to_string());
+        Self::Custom(id)
+    }
+
+    pub(crate) fn known_custom(collation: &str) -> Option<Self> {
+        let normalized = crate::util::normalize_ident(collation);
+        CUSTOM_COLLATION_NAMES
+            .lock()
+            .by_name
+            .get(&normalized)
+            .copied()
+            .map(Self::Custom)
+    }
+
+    pub fn name(self) -> String {
+        match self {
+            Self::Unset => "Unset".to_string(),
+            Self::Binary => "Binary".to_string(),
+            Self::NoCase => "NoCase".to_string(),
+            Self::Rtrim => "RTrim".to_string(),
+            Self::Locale(id) => LocaleCollationRegistry::global().name(id),
+            Self::Custom(id) => CUSTOM_COLLATION_NAMES
+                .lock()
+                .by_id
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("collation_{id}")),
         }
     }
 
     #[inline(always)]
     pub fn compare_strings(&self, lhs: &str, rhs: &str) -> Ordering {
-        match self {
-            CollationSeq::Unset | CollationSeq::Binary => Self::binary_cmp(lhs, rhs),
-            CollationSeq::NoCase => Self::nocase_cmp(lhs, rhs),
-            CollationSeq::Rtrim => Self::rtrim_cmp(lhs, rhs),
-            CollationSeq::Locale(id) => LocaleCollationRegistry::global().compare(*id, lhs, rhs),
+        match *self {
+            Self::Unset | Self::Binary => Self::binary_cmp(lhs, rhs),
+            Self::NoCase => Self::nocase_cmp(lhs, rhs),
+            Self::Rtrim => Self::rtrim_cmp(lhs, rhs),
+            Self::Locale(id) => LocaleCollationRegistry::global().compare(id, lhs, rhs),
+            // Immutable comparison paths have no connection to fetch the external
+            // callback from. Runtime VDBE paths dispatch custom collations via
+            // `Connection`; schema/index paths reject them before storage.
+            Self::Custom(_) => Self::binary_cmp(lhs, rhs),
         }
     }
 
@@ -66,9 +170,17 @@ impl CollationSeq {
 
     #[inline(always)]
     fn nocase_cmp(lhs: &str, rhs: &str) -> Ordering {
-        let nocase_lhs = uncased::UncasedStr::new(lhs);
-        let nocase_rhs = uncased::UncasedStr::new(rhs);
-        nocase_lhs.cmp(nocase_rhs)
+        for (left, right) in lhs.bytes().zip(rhs.bytes()) {
+            let left = left.to_ascii_lowercase();
+            let right = right.to_ascii_lowercase();
+            if left != right {
+                return left.cmp(&right);
+            }
+            if left == 0 {
+                return lhs.len().cmp(&rhs.len());
+            }
+        }
+        lhs.len().cmp(&rhs.len())
     }
 
     #[inline(always)]
@@ -76,53 +188,42 @@ impl CollationSeq {
         lhs.trim_end_matches(' ').cmp(rhs.trim_end_matches(' '))
     }
 
-    #[inline]
-    pub const fn to_bits(self) -> u16 {
-        match self {
-            CollationSeq::Unset => 0,
-            CollationSeq::Binary => 1,
-            CollationSeq::NoCase => 2,
-            CollationSeq::Rtrim => 3,
-            CollationSeq::Locale(id) => id.to_bits(),
-        }
-    }
-
-    #[inline]
-    pub const fn from_storage_bits(bits: u16) -> Self {
-        match bits {
-            0 => CollationSeq::Unset,
-            1 => CollationSeq::Binary,
-            2 => CollationSeq::NoCase,
-            3 => CollationSeq::Rtrim,
-            bits => CollationSeq::Locale(LocaleCollationId::from_bits(bits)),
-        }
-    }
-
     pub fn hash_key(&self, text: &str) -> Vec<u8> {
         match self {
-            CollationSeq::Unset | CollationSeq::Binary => text.as_bytes().to_vec(),
-            CollationSeq::NoCase => text.bytes().map(|b| b.to_ascii_lowercase()).collect(),
-            CollationSeq::Rtrim => text.trim_end_matches(' ').as_bytes().to_vec(),
-            CollationSeq::Locale(id) => LocaleCollationRegistry::global().sort_key(*id, text),
+            Self::Unset | Self::Binary => text.as_bytes().to_vec(),
+            Self::NoCase => text.bytes().map(|b| b.to_ascii_lowercase()).collect(),
+            Self::Rtrim => text.trim_end_matches(' ').as_bytes().to_vec(),
+            Self::Locale(id) => LocaleCollationRegistry::global().sort_key(*id, text),
+            // Hash joins using custom collations are disabled during planning
+            // because the callback is connection-owned and may define arbitrary equality.
+            Self::Custom(_) => text.as_bytes().to_vec(),
         }
+    }
+}
+
+fn resolve_collation_name(
+    collation: &str,
+    symbol_table: Option<&SymbolTable>,
+) -> Result<CollationSeq> {
+    if let Some(collation) = symbol_table.and_then(|syms| syms.resolve_collation(collation)) {
+        return Ok(collation);
+    }
+    CollationSeq::new(collation)
+}
+
+impl Default for CollationSeq {
+    fn default() -> Self {
+        Self::Binary
     }
 }
 
 impl std::fmt::Display for CollationSeq {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CollationSeq::Unset => write!(f, "Unset"),
-            CollationSeq::Binary => write!(f, "Binary"),
-            CollationSeq::NoCase => write!(f, "NoCase"),
-            CollationSeq::Rtrim => write!(f, "Rtrim"),
-            CollationSeq::Locale(id) => {
-                write!(f, "{}", LocaleCollationRegistry::global().name(*id))
-            }
-        }
+        f.write_str(&self.name())
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub struct LocaleCollationId(u16);
 
 impl LocaleCollationId {
@@ -230,6 +331,12 @@ impl LocaleCollationRegistry {
     }
 }
 
+fn custom_collation_id(name: &str) -> u32 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    ((hasher.finish() as u32) & 0x7fff_fffc).max(4)
+}
+
 /// Every column of every table has an associated collating function. If no collating function is explicitly defined,
 /// then the collating function defaults to BINARY.
 /// The COLLATE clause of the column definition is used to define alternative collating functions for a column.
@@ -257,7 +364,16 @@ pub fn get_collseq_from_expr(
     top_expr: &Expr,
     referenced_tables: &TableReferences,
 ) -> Result<Option<CollationSeq>> {
-    let (explicit, column) = get_collseq_parts_from_expr(top_expr, referenced_tables)?;
+    get_collseq_from_expr_with_symbols(top_expr, referenced_tables, None)
+}
+
+pub fn get_collseq_from_expr_with_symbols(
+    top_expr: &Expr,
+    referenced_tables: &TableReferences,
+    symbol_table: Option<&SymbolTable>,
+) -> Result<Option<CollationSeq>> {
+    let (explicit, column) =
+        get_collseq_parts_from_expr_with_symbols(top_expr, referenced_tables, symbol_table)?;
     Ok(explicit.or(column))
 }
 
@@ -269,9 +385,10 @@ pub fn get_collseq_from_expr(
 /// column translation records that fact in `ProgramBuilder::curr_collation_ctx()`.
 /// Synthetic expressions such as aggregates must opt out by storing `None` in
 /// the cache entry instead of calling this helper.
-pub fn get_expr_collation_ctx(
+pub fn get_expr_collation_ctx_with_symbols(
     top_expr: &Expr,
     referenced_tables: &TableReferences,
+    symbol_table: Option<&SymbolTable>,
 ) -> Result<Option<(CollationSeq, bool)>> {
     let mut maybe_column_collseq = None;
     let mut maybe_explicit_collseq = None;
@@ -280,8 +397,9 @@ pub fn get_expr_collation_ctx(
         match expr {
             Expr::Collate(_, seq) => {
                 if maybe_explicit_collseq.is_none() {
-                    maybe_explicit_collseq =
-                        Some(CollationSeq::new(seq.as_str()).unwrap_or_default());
+                    maybe_explicit_collseq = Some(
+                        resolve_collation_name(seq.as_str(), symbol_table).unwrap_or_default(),
+                    );
                 }
                 return Ok(WalkControl::SkipChildren);
             }
@@ -316,13 +434,25 @@ pub fn get_expr_collation_ctx(
 /// 1. Explicit COLLATE operator on either side wins (LHS takes precedence)
 /// 2. Column with defined collation on either side wins (LHS takes precedence)
 /// 3. Otherwise BINARY
+#[cfg(test)]
 pub fn resolve_comparison_collseq(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     referenced_tables: &TableReferences,
 ) -> Result<CollationSeq> {
-    let (lhs_explicit, lhs_column) = get_collseq_parts_from_expr(lhs_expr, referenced_tables)?;
-    let (rhs_explicit, rhs_column) = get_collseq_parts_from_expr(rhs_expr, referenced_tables)?;
+    resolve_comparison_collseq_with_symbols(lhs_expr, rhs_expr, referenced_tables, None)
+}
+
+pub fn resolve_comparison_collseq_with_symbols(
+    lhs_expr: &Expr,
+    rhs_expr: &Expr,
+    referenced_tables: &TableReferences,
+    symbol_table: Option<&SymbolTable>,
+) -> Result<CollationSeq> {
+    let (lhs_explicit, lhs_column) =
+        get_collseq_parts_from_expr_with_symbols(lhs_expr, referenced_tables, symbol_table)?;
+    let (rhs_explicit, rhs_column) =
+        get_collseq_parts_from_expr_with_symbols(rhs_expr, referenced_tables, symbol_table)?;
     Ok(lhs_explicit
         .or(rhs_explicit)
         .or(lhs_column)
@@ -334,9 +464,10 @@ pub fn resolve_comparison_collseq(
 /// Explicit collation comes from COLLATE operators; column collation comes from
 /// column definitions. These are kept separate to allow proper precedence resolution
 /// in binary comparisons.
-fn get_collseq_parts_from_expr(
+fn get_collseq_parts_from_expr_with_symbols(
     top_expr: &Expr,
     referenced_tables: &TableReferences,
+    symbol_table: Option<&SymbolTable>,
 ) -> Result<(Option<CollationSeq>, Option<CollationSeq>)> {
     let mut maybe_column_collseq = None;
     let mut maybe_explicit_collseq = None;
@@ -346,8 +477,9 @@ fn get_collseq_parts_from_expr(
             Expr::Collate(_, seq) => {
                 // Only store the first (leftmost) COLLATE operator we find
                 if maybe_explicit_collseq.is_none() {
-                    maybe_explicit_collseq =
-                        Some(CollationSeq::new(seq.as_str()).unwrap_or_default());
+                    maybe_explicit_collseq = Some(
+                        resolve_collation_name(seq.as_str(), symbol_table).unwrap_or_default(),
+                    );
                 }
                 // Skip children since we've found a COLLATE operator
                 return Ok(WalkControl::SkipChildren);
@@ -387,6 +519,7 @@ fn get_collseq_parts_from_expr(
 
 #[cfg(test)]
 mod tests {
+    use crate::alloc::vec;
     use crate::{sync::Arc, MAIN_DB_ID};
 
     use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
@@ -494,7 +627,7 @@ mod tests {
             Name::exact("NOCASE".to_string()),
         );
         let expr = Expr::Collate(
-            Box::new(Expr::Parenthesized(vec![Box::new(inner)])),
+            Box::new(Expr::Parenthesized(std::vec![Box::new(inner)])),
             Name::exact("RTRIM".to_string()),
         );
         let collseq = get_collseq_from_expr(&expr, &table_references).unwrap();
@@ -551,7 +684,7 @@ mod tests {
             column: 0,
             is_rowid_alias: false,
         };
-        let rhs = Expr::Parenthesized(vec![Box::new(Expr::Collate(
+        let rhs = Expr::Parenthesized(std::vec![Box::new(Expr::Collate(
             Box::new(Expr::Literal(Literal::String("x".to_string()))),
             Name::exact("RTRIM".to_string()),
         ))]);

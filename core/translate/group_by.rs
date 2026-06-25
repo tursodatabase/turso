@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use turso_parser::ast::{self, SortOrder};
 
 use super::{
@@ -6,6 +7,7 @@ use super::{
     plan::{Distinctness, GroupBy, SelectPlan, SubqueryEvalPhase, SubqueryOrigin},
     result_row::emit_select_result,
 };
+use crate::function::AccumulatorFunc;
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     order_by::{custom_type_comparator, EmitOrderBy},
@@ -20,7 +22,7 @@ use crate::translate::{
 use crate::{
     emit_explain,
     schema::PseudoCursorType,
-    translate::collate::{get_collseq_from_expr, CollationSeq},
+    translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq},
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -158,7 +160,7 @@ impl EmitGroupBy {
              * then the collating sequence of the column is used to determine sort order.
              * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
              */
-            let order_collations_nulls: Vec<(
+            let order_collations_nulls: crate::alloc::Vec<(
                 SortOrder,
                 Option<CollationSeq>,
                 Option<turso_parser::ast::NullsOrder>,
@@ -168,10 +170,15 @@ impl EmitGroupBy {
                 .zip(sort_order.iter())
                 .zip(group_by.nulls_order.iter())
                 .map(|((expr, ord), nulls)| {
-                    let collation = get_collseq_from_expr(expr, &plan.table_references)?;
-                    Ok((*ord, collation, *nulls))
+                    let collation = get_collseq_from_expr_with_symbols(
+                        expr,
+                        &plan.table_references,
+                        Some(t_ctx.resolver.symbol_table),
+                    )?;
+                    Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .try_collect::<Result<crate::alloc::Vec<_>>>()
+                .expect("TODO: fallible allocations")?;
 
             // Resolve custom type comparators for GROUP BY columns (e.g. array_lt).
             let comparators = group_by
@@ -180,7 +187,8 @@ impl EmitGroupBy {
                 .map(|expr| {
                     custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
                 })
-                .collect();
+                .try_collect()
+                .expect("TODO: fallible allocations");
 
             program.emit_insn(Insn::SorterOpen {
                 cursor_id: sort_cursor,
@@ -337,6 +345,12 @@ pub fn compute_group_by_sort_order(
 /// These are the base table columns that aggregate expressions depend on.
 /// By storing only these in the GROUP BY sorter (instead of pre-computed expression
 /// results), we reduce sorter record size and avoid redundant B-tree column reads.
+///
+/// Correlated subquery results (`SubqueryResult`) inside aggregate arguments are
+/// also collected as leaf expressions.  Their value is computed per-row during the
+/// scan loop, stored in the sorter, and read back during the sorter loop so that
+/// each sorted row sees the correct subquery result instead of a stale register
+/// value left over from the last scanned row.
 fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Result<Vec<ast::Expr>> {
     let mut leaf_columns: Vec<ast::Expr> = Vec::new();
     let mut collect = |expr: &ast::Expr| -> Result<WalkControl> {
@@ -348,6 +362,17 @@ fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Resu
                     .is_some()
                     && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr))
                 {
+                    leaf_columns.push(expr.clone());
+                }
+                Ok(WalkControl::SkipChildren)
+            }
+            ast::Expr::SubqueryResult { subquery_id, .. } => {
+                let is_correlated = plan
+                    .non_from_clause_subqueries
+                    .iter()
+                    .find(|s| s.internal_id == *subquery_id)
+                    .is_some_and(|s| s.correlated);
+                if is_correlated && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr)) {
                     leaf_columns.push(expr.clone());
                 }
                 Ok(WalkControl::SkipChildren)
@@ -641,7 +666,11 @@ pub fn group_by_process_single_group(
         .enumerate()
         .take(group_by.exprs.len())
     {
-        let maybe_collation = get_collseq_from_expr(&group_by.exprs[i], &plan.table_references)?;
+        let maybe_collation = get_collseq_from_expr_with_symbols(
+            &group_by.exprs[i],
+            &plan.table_references,
+            Some(t_ctx.resolver.symbol_table),
+        )?;
         c.collation = maybe_collation.unwrap_or_default();
     }
 
@@ -755,6 +784,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -809,6 +839,7 @@ pub fn group_by_process_single_group(
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -1004,7 +1035,7 @@ pub fn group_by_emit_row_phase<'a>(
         let agg_result_reg = agg_start_reg + i;
         program.emit_insn(Insn::AggFinal {
             register: agg_result_reg,
-            func: agg.func.clone(),
+            func: AccumulatorFunc::Agg(agg.func.clone()),
         });
         t_ctx.resolver.cache_expr_reg(
             std::borrow::Cow::Owned(agg.original_expr.clone()),

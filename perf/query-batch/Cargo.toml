@@ -1,0 +1,21 @@
+[package]
+name = "query-batch-benchmark"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)'] }
+
+[dependencies]
+turso = { workspace = true }
+rusqlite = { workspace = true }
+tokio = { workspace = true, default-features = true, features = ["full"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+turso_macros = { workspace = true }
+
+[[bench]]
+name = "query_batch"
+harness = false

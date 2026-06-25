@@ -5,7 +5,7 @@ pub trait TursoAllocExt {
 }
 
 pub trait TursoTryWithCapacityExt: Sized {
-    fn try_with_capacity(capacity: usize) -> Result<Self, TryReserveError>;
+    fn try_with_capacity_ext(capacity: usize) -> Result<Self, TryReserveError>;
 }
 
 pub trait TursoNewExt<T> {
@@ -42,6 +42,15 @@ pub trait TursoBinaryHeapExt<T>: Sized {
     fn try_push(&mut self, value: T) -> Result<(), TryReserveError>;
 }
 
+/// Conversion from a slice into an allocator-aware `Vec`.
+///
+/// Named `try_to_vec` because the inherent `[T]::to_vec` would always shadow
+/// a trait method called `to_vec`, leaving call sites on the global
+/// allocator.
+pub trait TursoSliceExt<T> {
+    fn try_to_vec(&self) -> Result<crate::alloc::Vec<T>, TryReserveError>;
+}
+
 pub trait TursoFromIterator<T>: Sized {
     fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
     where
@@ -52,8 +61,15 @@ pub trait TursoFromIterator<T>: Sized {
         I: IntoIterator<Item = T>;
 }
 
+#[cfg(nightly)]
+pub trait TursoFromIteratorIn<T, A>: Sized {
+    fn try_from_iter_in<I>(iter: I, alloc: A) -> Result<Self, TryReserveError>
+    where
+        I: IntoIterator<Item = T>;
+}
+
 pub trait TursoIteratorExt: Iterator + Sized {
-    #[inline]
+    #[inline(always)]
     fn try_collect<C>(self) -> Result<C, TryReserveError>
     where
         C: TursoFromIterator<Self::Item>,
@@ -68,6 +84,15 @@ pub trait TursoIteratorExt: Iterator + Sized {
         Self: Iterator<Item = (A, B)>,
     {
         <(FromA, FromB) as TursoFromIterator<(A, B)>>::try_from_iter(self)
+    }
+
+    #[cfg(nightly)]
+    #[inline(always)]
+    fn try_collect_in<C, A>(self, alloc: A) -> Result<C, TryReserveError>
+    where
+        C: TursoFromIteratorIn<Self::Item, A>,
+    {
+        C::try_from_iter_in(self, alloc)
     }
 }
 

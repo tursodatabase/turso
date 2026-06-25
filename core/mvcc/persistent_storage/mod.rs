@@ -1,32 +1,64 @@
 use crate::io::FileSyncType;
 use crate::storage::encryption::EncryptionContext;
+use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use crate::sync::Arc;
 use crate::sync::RwLock;
+use crate::turso_assert;
 use std::fmt::Debug;
 
 pub mod logical_log;
-use crate::mvcc::database::LogRecord;
+use crate::mvcc::database::{LogRecord, RowVersion};
 use crate::mvcc::persistent_storage::logical_log::{
-    LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
+    serialize_header_entry, serialize_op_entry, LogicalLog, OnSerializationComplete,
+    DEFAULT_LOG_CHECKPOINT_THRESHOLD,
 };
-use crate::{CheckpointResult, Completion, File, Result};
+use crate::{CheckpointResult, Completion, File, LimboError, Result};
 
 pub trait DurableStorage: Send + Sync + Debug {
+    /// Append one row-version op to `log_record`'s payload buffer, in the
+    /// on-disk wire format used by the logical log. Updates `op_count`.
+    fn serialize_row_version(
+        &self,
+        log_record: &mut LogRecord,
+        row_version: &RowVersion,
+        portable_extension: Option<&[u8]>,
+    ) -> Result<()>;
+
+    /// Append a `DatabaseHeader` op to `log_record`'s payload buffer.
+    fn serialize_database_header(
+        &self,
+        log_record: &mut LogRecord,
+        header: &DatabaseHeader,
+    ) -> Result<()>;
+
     /// Write a transaction to the logical log without advancing the writer offset.
     ///
-    /// If `on_serialization_complete` is provided, it is called with a zero-copy
-    /// reference to the serialized frame bytes and the running CRC after
-    /// serialization but before the disk write. The callback runs while the
-    /// internal write lock is held, so it should be fast (e.g. memcpy to a side
-    /// buffer).
+    /// If `on_serialization_complete` is provided, it is called with shared
+    /// ownership of the framed bytes and the running CRC after framing but
+    /// before the disk write. The callback runs while the internal write lock
+    /// is held, so it should be fast.
     fn log_tx(
         &self,
-        m: &LogRecord,
+        m: LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)>;
 
+    /// If `m` needs a logical-log header upgrade before it can be appended,
+    /// start that write and return its completion. Callers must wait for this
+    /// completion and then call `log_tx`.
+    fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>>;
+
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
+
+    /// Called after a logical-log write completed successfully, before the
+    /// transaction is made visible by advancing the logical-log offset.
+    ///
+    /// Implementations may return a completion for any additional durability
+    /// work that must finish before commit publication.
+    fn on_log_write_complete(&self) -> Result<Completion> {
+        Ok(Completion::new_yield())
+    }
 
     /// Persist the current logical-log header to durable storage.
     ///
@@ -35,13 +67,23 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn update_header(&self) -> Result<Completion>;
 
     fn truncate(&self) -> Result<Completion>;
+
+    /// Reset the logical log to a fresh header-only file.
+    ///
+    /// Used after an external database restore so future MVCC recovery starts
+    /// from the restored image instead of replaying stale local log frames.
+    fn reset_to_fresh_header(&self) -> Result<Completion>;
     fn get_logical_log_file(&self) -> Arc<dyn File>;
+    fn logical_log_offset(&self) -> u64;
     fn should_checkpoint(&self) -> bool;
     /// Set the checkpoint threshold in bytes of logical-log data written.
     /// A negative value disables automatic checkpointing.
     fn set_checkpoint_threshold(&self, threshold: i64);
     fn checkpoint_threshold(&self) -> i64;
-    fn advance_logical_log_offset_after_success(&self, bytes: u64);
+    fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()>;
+    fn discard_pending_log_write(&self) -> Result<()> {
+        Ok(())
+    }
     fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32);
 
     /// Set the in-memory log header from a previously-read on-disk header.
@@ -50,19 +92,13 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn set_header(&self, header: logical_log::LogHeader);
 
     /// Called when a checkpoint begins, before any rows are written to the B-tree.
-    /// `durable_txid_max` is the transaction watermark that will be durably persisted
-    /// once the checkpoint completes.
-    fn on_checkpoint_start(&self, _durable_txid_max: u64) -> Result<()> {
+    fn on_checkpoint_start(&self) -> Result<()> {
         Ok(())
     }
 
     /// Called after the checkpoint has fully completed: rows are flushed, WAL is
     /// truncated, and the logical log is reset.
-    fn on_checkpoint_end(
-        &self,
-        _durable_txid_max: u64,
-        _result: Result<&CheckpointResult>,
-    ) -> Result<()> {
+    fn on_checkpoint_end(&self, _result: Result<&CheckpointResult>) -> Result<()> {
         Ok(())
     }
 
@@ -105,14 +141,48 @@ impl Storage {
 }
 
 impl DurableStorage for Storage {
+    fn serialize_row_version(
+        &self,
+        log_record: &mut LogRecord,
+        row_version: &RowVersion,
+        portable_extension: Option<&[u8]>,
+    ) -> Result<()> {
+        serialize_op_entry(&mut log_record.buf, row_version, portable_extension)?;
+        log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
+            LimboError::InternalError("logical log op_count exceeds u32".to_string())
+        })?;
+        Ok(())
+    }
+
+    fn serialize_database_header(
+        &self,
+        log_record: &mut LogRecord,
+        header: &DatabaseHeader,
+    ) -> Result<()> {
+        turso_assert!(
+            !log_record.has_header,
+            "DatabaseHeader op appended more than once to a single LogRecord"
+        );
+        serialize_header_entry(&mut log_record.buf, header);
+        log_record.has_header = true;
+        log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
+            LimboError::InternalError("logical log op_count exceeds u32".to_string())
+        })?;
+        Ok(())
+    }
+
     fn log_tx(
         &self,
-        m: &LogRecord,
+        m: LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
         self.logical_log
             .write()
             .log_tx_deferred_offset(m, on_serialization_complete)
+    }
+
+    fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
+        self.logical_log.write().upgrade_header_for_log_tx(m)
     }
 
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
@@ -129,8 +199,18 @@ impl DurableStorage for Storage {
         Ok(c)
     }
 
+    fn reset_to_fresh_header(&self) -> Result<Completion> {
+        let c = self.logical_log.write().reset_to_fresh_header()?;
+        self.shadow_offset_store(0);
+        Ok(c)
+    }
+
     fn get_logical_log_file(&self) -> Arc<dyn File> {
         self.logical_log.read().file.clone()
+    }
+
+    fn logical_log_offset(&self) -> u64 {
+        self.log_offset.load(Ordering::Relaxed)
     }
 
     fn encryption_ctx(&self) -> Option<EncryptionContext> {
@@ -155,9 +235,10 @@ impl DurableStorage for Storage {
         self.checkpoint_threshold.load(Ordering::Relaxed)
     }
 
-    fn advance_logical_log_offset_after_success(&self, bytes: u64) {
+    fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()> {
         self.logical_log.write().advance_offset_after_success(bytes);
         self.shadow_offset_advance(bytes);
+        Ok(())
     }
 
     fn restore_logical_log_state_after_recovery(&self, offset: u64, running_crc: u32) {

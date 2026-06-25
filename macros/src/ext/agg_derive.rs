@@ -15,7 +15,7 @@ pub fn derive_agg_func(input: TokenStream) -> TokenStream {
     let expanded = quote! {
         impl #struct_name {
             #[no_mangle]
-            pub extern "C" fn #init_fn_name() -> *mut ::turso_ext::AggCtx {
+            pub extern "C" fn #init_fn_name(_context: usize) -> *mut ::turso_ext::AggCtx {
                 let state = ::std::boxed::Box::new(<#struct_name as ::turso_ext::AggFunc>::State::default());
                 let ctx = ::std::boxed::Box::new(::turso_ext::AggCtx {
                     state: ::std::boxed::Box::into_raw(state) as *mut ::std::os::raw::c_void,
@@ -25,24 +25,31 @@ pub fn derive_agg_func(input: TokenStream) -> TokenStream {
 
             #[no_mangle]
             pub extern "C" fn #step_fn_name(
+                _context: usize,
                 ctx: *mut ::turso_ext::AggCtx,
                 argc: i32,
                 argv: *const ::turso_ext::Value,
-            ) {
+            ) -> ::turso_ext::Value {
                 unsafe {
                     let ctx = &mut *ctx;
                     let state = &mut *(ctx.state as *mut <#struct_name as ::turso_ext::AggFunc>::State);
-                    let args = ::std::slice::from_raw_parts(argv, argc as usize);
+                    let args = if argc <= 0 || argv.is_null() {
+                        &[]
+                    } else {
+                        ::std::slice::from_raw_parts(argv, argc as usize)
+                    };
                     <#struct_name as ::turso_ext::AggFunc>::step(state, args);
                 }
+                ::turso_ext::Value::null()
             }
 
             #[no_mangle]
             pub extern "C" fn #finalize_fn_name(
+                _context: usize,
                 ctx: *mut ::turso_ext::AggCtx
             ) -> ::turso_ext::Value {
                 unsafe {
-                    let ctx = &mut *ctx;
+                    let ctx = ::std::boxed::Box::from_raw(ctx);
                     let state = ::std::boxed::Box::from_raw(ctx.state as *mut <#struct_name as ::turso_ext::AggFunc>::State);
                     match <#struct_name as ::turso_ext::AggFunc>::finalize(*state) {
                         Ok(val) => val,
@@ -72,12 +79,16 @@ pub fn derive_agg_func(input: TokenStream) -> TokenStream {
                     api.ctx,
                     c_name.as_ptr(),
                     #struct_name::ARGS,
+                    0,
                     #struct_name::#init_fn_name
                         as ::turso_ext::InitAggFunction,
                     #struct_name::#step_fn_name
                         as ::turso_ext::StepFunction,
                     #struct_name::#finalize_fn_name
                         as ::turso_ext::FinalizeFunction,
+                    None,
+                    None,
+                    None,
                 )
             }
         }

@@ -1,9 +1,25 @@
 #!/usr/bin/env python3
 import os
+import subprocess
+from pathlib import Path
 
 from cli_tests import console
 from cli_tests.test_turso_cli import TestTursoShell
 
+
+def _cargo_debug_dir() -> str:
+    """Return cargo's debug artefact directory (honours CARGO_TARGET_DIR)."""
+    root = Path(__file__).resolve().parents[2]
+    out = subprocess.run(
+        [str(root / "scripts" / "cargo-target-dir")],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return f"{out.stdout.strip()}/debug"
+
+
+DEBUG_DIR = _cargo_debug_dir()
 sqlite_exec = "./scripts/limbo-sqlite3"
 sqlite_flags = os.getenv("SQLITE_FLAGS", "-q").split(" ")
 
@@ -72,7 +88,7 @@ def null(res):
 
 def test_regexp():
     turso = TestTursoShell(test_data)
-    extension_path = "./target/debug/liblimbo_regexp"
+    extension_path = f"{DEBUG_DIR}/liblimbo_regexp"
     # regexp() is a built-in, verify it works before loading the extension
     turso.run_test_fn("SELECT regexp('a.c', 'abc');", true)
     turso.run_test_fn(f".load {extension_path}", null)
@@ -271,7 +287,7 @@ def validate_base64_decode(a):
 
 def test_crypto():
     turso = TestTursoShell()
-    extension_path = "./target/debug/liblimbo_crypto"
+    extension_path = f"{DEBUG_DIR}/liblimbo_crypto"
     # assert no function before extension loads
     turso.run_test_fn(
         "SELECT crypto_blake('a');",
@@ -409,8 +425,8 @@ def _test_series(limbo: TestTursoShell):
 
 
 def test_kv():
-    _test_kv(exec_name=None, ext_path="target/debug/libturso_ext_tests")
-    _test_kv(exec_name="sqlite3", ext_path="target/debug/liblimbo_sqlite_test_ext")
+    _test_kv(exec_name=None, ext_path=f"{DEBUG_DIR}/libturso_ext_tests")
+    _test_kv(exec_name="sqlite3", ext_path=f"{DEBUG_DIR}/liblimbo_sqlite_test_ext")
 
 
 def _test_kv(exec_name, ext_path):
@@ -427,6 +443,14 @@ def _test_kv(exec_name, ext_path):
         lambda res: "no such module: kv_store" in res,
     )
     turso.execute_dot(f".load {ext_path}")
+    # test_ctx_scalar is only registered by the turso test extension, not the
+    # sqlite3-compat one.
+    if exec_name is None:
+        turso.run_test_fn(
+            "SELECT test_ctx_scalar(40, 2);",
+            lambda res: "142" == res,
+            "can call ScalarDerive context-aware extension function",
+        )
     turso.execute_dot(
         "create virtual table t using kv_store;",
     )
@@ -518,7 +542,7 @@ def _test_kv(exec_name, ext_path):
 
 def test_ipaddr():
     turso = TestTursoShell()
-    ext_path = "./target/debug/liblimbo_ipaddr"
+    ext_path = f"{DEBUG_DIR}/liblimbo_ipaddr"
 
     turso.run_test_fn(
         "SELECT ipfamily('192.168.1.1');",
@@ -642,7 +666,7 @@ def validate_fuzzy_script(a):
 
 def test_fuzzy():
     turso = TestTursoShell()
-    ext_path = "./target/debug/liblimbo_fuzzy"
+    ext_path = f"{DEBUG_DIR}/liblimbo_fuzzy"
     turso.run_test_fn(
         "SELECT fuzzy_leven('awesome', 'aewsme');",
         lambda res: "error: no such function: " in res,
@@ -714,11 +738,72 @@ def test_fuzzy():
         validate_fuzzy_script,
         "fuzzy script function works",
     )
+    turso.run_test_fn(
+        "SELECT fuzzy_rsoundex();",
+        lambda res: "Invalid Argument" in res,
+        "fuzzy rsoundex function works",
+    )
+    turso.run_test_fn(
+        "SELECT fuzzy_leven('awesome');",
+        lambda res: "Invalid Argument" in res,
+        "fuzzy levenshtein function works",
+    )
+    turso.run_test_fn(
+        "SELECT fuzzy_damlev('awesome');",
+        lambda res: "Invalid Argument" in res,
+        "fuzzy damerau levenshtein1 function works",
+    )
+    turso.run_test_fn(
+        "SELECT fuzzy_editdist('abc');",
+        lambda res: "Invalid Argument" in res,
+        "fuzzy editdist1 function works",
+    )
+    turso.run_test_fn(
+        "SELECT fuzzy_jarowin('awesome');",
+        lambda res: "Invalid Argument" in res,
+        "fuzzy jarowin function works",
+    )
+    turso.run_test_fn(
+        "SELECT fuzzy_osadist('awesome');",
+        lambda res: "Invalid Argument" in res,
+        "fuzzy osadist function works",
+    )
+    turso.run_test_fn(
+        "SELECT fuzzy_phonetic();",
+        lambda res: "Invalid Argument" in res,
+        "fuzzy phonetic function works",
+    )
+    turso.run_test_fn(
+        "SELECT fuzzy_caver();",
+        lambda res: "Invalid Argument" in res,
+        "fuzzy caver function works",
+    )
+    turso.run_test_fn(
+        "SELECT fuzzy_soundex();",
+        lambda res: "Invalid Argument" in res,
+        "fuzzy soundex function works",
+    )
+    turso.run_test_fn(
+        "SELECT fuzzy_hamming('awesome');",
+        lambda res: "Invalid Argument" in res,
+        "fuzzy hamming function works",
+    )
+    turso.run_test_fn(
+        "SELECT fuzzy_translit();",
+        lambda res: "Invalid Argument" in res,
+        "fuzzy translit function works",
+    )
+    turso.run_test_fn(
+        "SELECT fuzzy_script();",
+        lambda res: "Invalid Argument" in res,
+        "fuzzy script function works",
+    )
+
 
 
 def test_vfs():
     turso = TestTursoShell()
-    ext_path = "target/debug/libturso_ext_tests"
+    ext_path = f"{DEBUG_DIR}/libturso_ext_tests"
     turso.run_test_fn(".vfslist", lambda x: "testvfs" not in x, "testvfs not loaded")
     turso.execute_dot(f".load {ext_path}")
     turso.run_test_fn(".vfslist", lambda res: "testvfs" in res, "testvfs extension loaded")
@@ -775,7 +860,7 @@ def test_csv():
     # open new empty connection explicitly to test whether we can load an extension
     # with brand new connection/uninitialized database.
     turso = TestTursoShell(init_commands="")
-    test_module_list(turso, "target/debug/liblimbo_csv", "csv")
+    test_module_list(turso, f"{DEBUG_DIR}/liblimbo_csv", "csv")
 
     turso.run_test_fn(
         "CREATE VIRTUAL TABLE csv USING csv(filename=./testing/cli_tests/test_files/test.csv);",
@@ -854,7 +939,7 @@ def cleanup():
 
 
 def test_tablestats():
-    ext_path = "target/debug/libturso_ext_tests"
+    ext_path = f"{DEBUG_DIR}/libturso_ext_tests"
     turso = TestTursoShell(use_testing_db=True)
     test_module_list(turso, ext_path=ext_path, module_name="tablestats")
     turso.execute_dot("CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT);")

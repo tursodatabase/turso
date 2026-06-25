@@ -20,9 +20,9 @@ use crate::{
         WAL_FRAME_SIZE,
     },
     database_tape::{
-        DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts, DatabaseReplaySession,
-        DatabaseReplaySessionOpts, DatabaseTape, DatabaseTapeOpts, DatabaseWalSession,
-        CDC_PRAGMA_NAME,
+        try_wal_watermark_read_page, DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts,
+        DatabaseReplaySession, DatabaseReplaySessionOpts, DatabaseTape, DatabaseTapeOpts,
+        DatabaseWalSession, CDC_PRAGMA_NAME,
     },
     errors::Error,
     io_operations::IoOperations,
@@ -47,6 +47,15 @@ pub struct DatabaseSyncEngineOpts {
     pub protocol_version_hint: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: usize,
+    /// Experimental [`turso_core::DatabaseOpts`] applied whenever the sync
+    /// engine opens the local database itself (the main connection in
+    /// [`DatabaseSyncEngine::create_db`] and the revert connection in
+    /// [`DatabaseSyncEngine::open_revert_db_conn`]). Bindings translate their
+    /// user-facing experimental feature list into these options. Note that
+    /// callers which open the main database on their own (e.g. the sdk-kit
+    /// path) must still apply the same options there — this field only governs
+    /// databases opened internally by the engine.
+    pub db_opts: turso_core::DatabaseOpts,
     pub partial_sync_opts: Option<PartialSyncOpts>,
     /// Base64-encoded encryption key for the Turso Cloud database
     pub remote_encryption_key: Option<String>,
@@ -526,7 +535,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 main_db_path,
                 main_db_storage.clone(),
                 OpenFlags::Create,
-                turso_core::DatabaseOpts::new(),
+                opts.db_opts,
                 None,
                 None,
             )? {
@@ -556,7 +565,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     Some(&self.revert_db_wal_path),
                     self.db_file.clone(),
                     OpenFlags::Create,
-                    turso_core::DatabaseOpts::new(),
+                    self.opts.db_opts,
                     None,
                     None,
                 )? {
@@ -675,7 +684,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let revert_conn = self.open_revert_db_conn(coro).await?;
 
         let mut page = [0u8; PAGE_SIZE];
-        let db_size = if revert_conn.try_wal_watermark_read_page(1, &mut page, None)? {
+        let db_size = if try_wal_watermark_read_page(coro, &revert_conn, 1, &mut page, None).await?
+        {
             db_size_from_page(&page)
         } else {
             0
@@ -732,17 +742,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     continue;
                 }
 
-                let begin_read_result =
-                    main_conn.try_wal_watermark_read_page_begin(page_no, Some(watermark))?;
-                let end_read_result = match begin_read_result {
-                    Some((page_ref, c)) => {
-                        while !c.succeeded() {
-                            let _ = coro.yield_(crate::types::SyncEngineIoResult::IO).await;
-                        }
-                        main_conn.try_wal_watermark_read_page_end(&mut page, page_ref)?
-                    }
-                    None => false,
-                };
+                let end_read_result = try_wal_watermark_read_page(
+                    coro,
+                    &main_conn,
+                    page_no,
+                    &mut page,
+                    Some(watermark),
+                )
+                .await?;
                 if !end_read_result {
                     tracing::debug!(
                         "checkpoint(path={:?}): skip page {} as it was allocated in the WAL portion for revert",

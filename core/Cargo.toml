@@ -28,7 +28,10 @@ experimental_win_iocp = []
 time = []
 fuzz = []
 omit_autovacuum = []
-simulator = ["fuzz", "serde"]
+simulator = ["fuzz", "serde", "io_memory_yield", "allocation_metric"]
+allocation_metric = []
+# Test only: exposed to testing/stress and the simulator, never to regular library users.
+io_memory_yield = []
 serde = ["dep:serde"]
 series = []
 encryption = []
@@ -88,7 +91,8 @@ turso_macros = { workspace = true }
 miette = { workspace = true }
 strum = { workspace = true }
 parking_lot = { workspace = true, features = ["arc_lock"] }
-crossbeam-skiplist = "0.1.3"
+crossbeam-epoch = "0.9.18"
+crossbeam-utils = "0.8.21"
 tracing = { workspace = true }
 ryu = "1.0.19"
 uncased = "0.9.10"
@@ -182,6 +186,10 @@ name = "mvcc_benchmark"
 harness = false
 
 [[bench]]
+name = "mvcc_recovery_benchmark"
+harness = false
+
+[[bench]]
 name = "json_benchmark"
 harness = false
 
@@ -230,4 +238,8 @@ harness = false
 
 [[bench]]
 name = "struct_union_profile"
+harness = false
+
+[[bench]]
+name = "prepare_params_benchmark"
 harness = false

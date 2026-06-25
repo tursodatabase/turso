@@ -1,0 +1,163 @@
+@database :memory:
+
+# Schema-qualified nextval resolves to the correct database
+test sequence-schema-qualified-nextval {
+    CREATE SEQUENCE my_seq;
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE aux.my_seq;
+    -- Unqualified resolves to main
+    SELECT nextval('my_seq');
+    -- Schema-qualified resolves to aux
+    SELECT nextval('aux.my_seq');
+    -- Main advances independently
+    SELECT nextval('my_seq');
+    -- Aux advances independently
+    SELECT nextval('aux.my_seq');
+}
+expect {
+    1
+    1
+    2
+    2
+}
+
+# Schema-qualified setval targets the correct database
+test sequence-schema-qualified-setval {
+    CREATE SEQUENCE s1;
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE aux.s1;
+    SELECT setval('s1', 100);
+    SELECT setval('aux.s1', 200);
+    SELECT nextval('s1');
+    SELECT nextval('aux.s1');
+}
+expect {
+    100
+    200
+    101
+    201
+}
+
+# currval returns per-session value scoped to the correct database
+test sequence-schema-qualified-currval {
+    CREATE SEQUENCE s1;
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE aux.s1;
+    SELECT nextval('s1');
+    SELECT nextval('aux.s1');
+    -- currval returns the value from the correct database
+    SELECT currval('s1');
+    SELECT currval('aux.s1');
+    -- advancing one doesn't affect the other's currval
+    SELECT nextval('s1');
+    SELECT currval('s1');
+    SELECT currval('aux.s1');
+}
+expect {
+    1
+    1
+    1
+    1
+    2
+    2
+    1
+}
+
+# setval on attached db doesn't affect main's currval
+test sequence-schema-qualified-setval-currval-isolation {
+    CREATE SEQUENCE s1;
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE aux.s1;
+    SELECT nextval('s1');
+    SELECT setval('aux.s1', 50);
+    -- main's currval unchanged
+    SELECT currval('s1');
+    -- aux's currval updated by setval
+    SELECT currval('aux.s1');
+    SELECT nextval('aux.s1');
+}
+expect {
+    1
+    50
+    1
+    50
+    51
+}
+
+# Error on nonexistent schema
+test sequence-nonexistent-schema-errors {
+    SELECT nextval('bogus.my_seq');
+}
+expect error {
+    no such database: bogus
+}
+
+# Error on nonexistent sequence in valid schema
+test sequence-nonexistent-in-valid-schema-errors {
+    ATTACH DATABASE ':memory:' AS aux;
+    SELECT nextval('aux.no_such_seq');
+}
+expect error {
+    sequence "aux.no_such_seq" does not exist
+}
+
+# --- Attached-db AUTOINCREMENT lifecycle ---
+
+# Pre-fix: `DROP TABLE aux.t` on an AUTOINCREMENT table left
+# `aux.sqlite_sequence` populated because `translate_drop_table` looked the
+# sqlite_sequence shape up via `resolver.schema()` (= MAIN). When main had
+# no `sqlite_sequence`, the cleanup was skipped entirely; when main DID
+# have one, the cursor would open against `aux` using main's root page
+# (silent cross-database corruption). Now the lookup goes through the
+# target database's schema, so the row keyed by the dropped table name is
+# correctly removed from `aux.sqlite_sequence`, and a re-CREATE of the
+# same name restarts the watermark at 1 instead of inheriting the prior
+# table's high-water mark.
+test drop-attached-autoincrement-clears-attached-sqlite-sequence {
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE TABLE aux.t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO aux.t(v) VALUES('a'),('b'),('c');
+    SELECT name, seq FROM aux.sqlite_sequence;
+    DROP TABLE aux.t;
+    SELECT count(*) FROM aux.sqlite_sequence;
+    CREATE TABLE aux.t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO aux.t(v) VALUES('x');
+    SELECT id, v FROM aux.t;
+    SELECT name, seq FROM aux.sqlite_sequence;
+    DETACH DATABASE aux;
+}
+expect {
+    t|3
+    0
+    1|x
+    t|1
+}
+
+# Same-named AUTOINCREMENT tables in main and aux maintain *independent*
+# watermarks; dropping one must not touch the other's sqlite_sequence row.
+# Regression guard for the database-scoping fix.
+test drop-attached-autoincrement-does-not-touch-main-sqlite-sequence {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES('m1'),('m2');
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE TABLE aux.t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO aux.t(v) VALUES('a1'),('a2'),('a3');
+    SELECT name, seq FROM main.sqlite_sequence;
+    SELECT name, seq FROM aux.sqlite_sequence;
+    DROP TABLE aux.t;
+    -- main untouched
+    SELECT name, seq FROM main.sqlite_sequence;
+    SELECT count(*) FROM aux.sqlite_sequence;
+    INSERT INTO t(v) VALUES('m3');
+    SELECT id, v FROM t ORDER BY id;
+    DETACH DATABASE aux;
+}
+expect {
+    t|2
+    t|3
+    t|2
+    0
+    1|m1
+    2|m2
+    3|m3
+}

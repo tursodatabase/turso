@@ -276,3 +276,10 @@ pub const SQLITE_CONSTRAINT_NOTNULL: usize = SQLITE_CONSTRAINT | (5 << 8);
 pub const SQLITE_CONSTRAINT_TRIGGER: usize = SQLITE_CONSTRAINT | (7 << 8);
 pub const SQLITE_FULL: usize = 13; // we want this in autoincrement - incase if user inserts max allowed int
 pub const SQLITE_CONSTRAINT_UNIQUE: usize = 2067;
+// Standard SQLite error code; kept for documentation and potential
+// reuse. The sequence inner-tx wrap used to emit Insn::Halt with this
+// code, but halt()'s constraint catch-all mis-wrapped it; Busy is now
+// returned directly via Err(LimboError::Busy) from
+// op_sequence_commit_inner_tx.
+#[allow(dead_code)]
+pub const SQLITE_BUSY: usize = 5;

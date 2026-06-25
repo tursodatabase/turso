@@ -20,11 +20,11 @@ members = [
     "extensions/fuzzy",
     "macros",
     "testing/simulator",
-    "sqlite3",
+    "bindings/c",
     "testing/stress",
     "testing/sqlite_test_ext",
     "tests",
-    "parser",
+    "sqlite/parser",
     "sync/engine",
     "sync/sdk-kit",
     "sql_generation",
@@ -33,6 +33,8 @@ members = [
     "perf/throughput/rusqlite",
     "perf/encryption",
     "perf/memory",
+    "perf/memory/codspeed",
+    "perf/query-batch",
     "tools/dbhash",
     "sdk-kit",
     "sdk-kit-macros",
@@ -61,11 +63,11 @@ default-members = [
     "extensions/fuzzy",
     "macros",
     "testing/simulator",
-    "sqlite3",
+    "bindings/c",
     "testing/stress",
     "testing/sqlite_test_ext",
     "tests",
-    "parser",
+    "sqlite/parser",
     "sync/engine",
     "sync/sdk-kit",
     "sql_generation",
@@ -83,24 +85,24 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.7.0-pre.3"
+version = "0.7.0-pre.11"
 authors = ["the Turso authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
-turso = { path = "bindings/rust", version = "0.7.0-pre.3" }
-turso_node = { path = "bindings/javascript", version = "0.7.0-pre.3" }
-turso_sdk_kit = { path = "sdk-kit", version = "0.7.0-pre.3" }
-turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.7.0-pre.3" }
-turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.7.0-pre.3" }
-limbo_completion = { path = "extensions/completion", version = "0.7.0-pre.3" }
-turso_core = { path = "core", version = "0.7.0-pre.3" }
-turso_sync_engine = { path = "sync/engine", version = "0.7.0-pre.3" }
-turso_ext = { path = "extensions/core", version = "0.7.0-pre.3" }
-turso_macros = { path = "macros", version = "0.7.0-pre.3" }
-turso_parser = { path = "parser", version = "0.7.0-pre.3" }
+turso = { path = "bindings/rust", version = "0.7.0-pre.11" }
+turso_node = { path = "bindings/javascript", version = "0.7.0-pre.11" }
+turso_sdk_kit = { path = "sdk-kit", version = "0.7.0-pre.11" }
+turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.7.0-pre.11" }
+turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.7.0-pre.11" }
+limbo_completion = { path = "extensions/completion", version = "0.7.0-pre.11" }
+turso_core = { path = "core", version = "0.7.0-pre.11" }
+turso_sync_engine = { path = "sync/engine", version = "0.7.0-pre.11" }
+turso_ext = { path = "extensions/core", version = "0.7.0-pre.11" }
+turso_macros = { path = "macros", version = "0.7.0-pre.11" }
+turso_parser = { path = "sqlite/parser", version = "0.7.0-pre.11" }
 sql_generation = { path = "sql_generation" }
 turso-dbhash = { path = "tools/dbhash" }
 strum = { version = "0.26", features = ["derive"] }
@@ -152,7 +154,6 @@ either = { version = "1.15" }
 loom = { version = "0.7" }
 shuttle = { version = "0.8.1" }
 
-
 [profile.dev.package.similar]
 opt-level = 3
 
@@ -201,6 +202,8 @@ inherits = "release-official"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(antithesis)', 'cfg(nightly)'] }
+# For now allow this for the allocator api migration
+unstable_name_collisions = "allow"
 
 [workspace.lints.clippy]
 or_fun_call = "deny"

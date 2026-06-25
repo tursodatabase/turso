@@ -422,16 +422,24 @@ pub(super) fn row_component_affinity_collation(
     let rhs_for_cmp = row_value_component_expr(rhs_expr, idx)?.unwrap_or(rhs_expr);
     Ok((
         comparison_affinity(lhs_for_cmp, rhs_for_cmp, referenced_tables, resolver),
-        comparison_collation(lhs_for_cmp, rhs_for_cmp, referenced_tables)?,
+        comparison_collation(lhs_for_cmp, rhs_for_cmp, referenced_tables, resolver)?,
     ))
 }
 
-pub(super) fn explicit_collation(expr: &Expr) -> Result<Option<CollationSeq>> {
+pub(super) fn explicit_collation(
+    expr: &Expr,
+    resolver: Option<&Resolver>,
+) -> Result<Option<CollationSeq>> {
     let mut found = None;
     walk_expr(expr, &mut |e| -> Result<WalkControl> {
         if let Expr::Collate(_, seq) = e {
             if found.is_none() {
-                found = Some(CollationSeq::new(seq.as_str()).unwrap_or_default());
+                let collation = match resolver {
+                    Some(resolver) => resolver.resolve_collation(seq.as_str()),
+                    None => CollationSeq::new(seq.as_str()),
+                }
+                .unwrap_or_default();
+                found = Some(collation);
             }
             return Ok(WalkControl::SkipChildren);
         }
@@ -444,20 +452,22 @@ pub(super) fn comparison_collation(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
+    resolver: Option<&Resolver>,
 ) -> Result<Option<CollationSeq>> {
     if let Some(tables) = referenced_tables {
-        let lhs_collation = get_collseq_from_expr(lhs_expr, tables)?;
+        let symbol_table = resolver.map(|resolver| resolver.symbol_table);
+        let lhs_collation = get_collseq_from_expr_with_symbols(lhs_expr, tables, symbol_table)?;
         if lhs_collation.is_some() {
             return Ok(lhs_collation);
         }
-        return get_collseq_from_expr(rhs_expr, tables);
+        return get_collseq_from_expr_with_symbols(rhs_expr, tables, symbol_table);
     }
 
-    let lhs_collation = explicit_collation(lhs_expr)?;
+    let lhs_collation = explicit_collation(lhs_expr, resolver)?;
     if lhs_collation.is_some() {
         return Ok(lhs_collation);
     }
-    explicit_collation(rhs_expr)
+    explicit_collation(rhs_expr, resolver)
 }
 
 #[allow(clippy::too_many_arguments)]

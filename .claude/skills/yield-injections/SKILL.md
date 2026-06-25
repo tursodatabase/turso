@@ -41,7 +41,7 @@ Each yield-capable live object has:
 
 There is no `inject_io_failure!` today; failure injection only works for `TransitionResult` state machines.
 
-Injected yields return `Completion::new_yield()`. It is already finished, but `is_explicit_yield()` is true, so VDBE must return `StepResult::IO` instead of continuing immediately.
+Injected yields return `Completion::new_yield()`. It is already finished, but `is_explicit_yield()` is true, so the VDBE surfaces it as `StepResult::Yield` instead of continuing immediately.
 
 ## New Yield-Capable Type
 
@@ -76,7 +76,7 @@ Add a family-specific `*_yield_key(...) -> u64` helper. Mix stable logical ident
 
 ## Adding A Point
 
-Before adding a hook, prove re-entry is safe. A synthetic yield returns `StepResult::IO`; the same statement/state machine may be stepped again immediately later. On re-entry, it must resume from an explicit state, not repeat non-idempotent work.
+Before adding a hook, prove re-entry is safe. A synthetic yield returns `StepResult::Yield`; the same statement/state machine may be stepped again immediately later. On re-entry, it must resume from an explicit state, not repeat non-idempotent work.
 
 Rules:
 

@@ -100,6 +100,31 @@ impl WorkerResponse {
     }
 }
 
+/// Extract the wire payload for a `LimboError`'s message field. For
+/// variants that carry an inner `String`, return that string directly
+/// (so it round-trips through `error_kind_to_limbo_error` unchanged).
+/// For unit variants, return the Display form. Using `Display` for
+/// inner-string variants would prepend the Display prefix
+/// (e.g. `"Database is full: {0}"`); the receiver would then
+/// reconstruct `LimboError::DatabaseFull("Database is full: ...")`,
+/// breaking any callsite that pattern-matches on the inner message
+/// (notably the multiprocess driver's `is_seq_exhaustion` check on
+/// `"nextval: reached "`).
+pub fn limbo_error_to_message(err: &LimboError) -> String {
+    match err {
+        LimboError::DatabaseFull(s)
+        | LimboError::Corrupt(s)
+        | LimboError::InternalError(s)
+        | LimboError::ParseError(s)
+        | LimboError::TxError(s)
+        | LimboError::InvalidArgument(s)
+        | LimboError::Constraint(s)
+        | LimboError::Conflict(s)
+        | LimboError::CheckpointFailed(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// Classify a `LimboError` into an error_kind string for the protocol.
 pub fn limbo_error_to_kind(err: &LimboError) -> &'static str {
     match err {
@@ -118,6 +143,10 @@ pub fn limbo_error_to_kind(err: &LimboError) -> &'static str {
         LimboError::InternalError(_) => "InternalError",
         LimboError::Conflict(_) => "Conflict",
         LimboError::CheckpointFailed(_) => "CheckpointFailed",
+        LimboError::ParseError(_) => "ParseError",
+        LimboError::TxError(_) => "TxError",
+        LimboError::DatabaseFull(_) => "DatabaseFull",
+        LimboError::OutOfMemory => "OutOfMemory",
         _ => "Other",
     }
 }
@@ -140,6 +169,69 @@ fn error_kind_to_limbo_error(kind: &str, message: &str) -> LimboError {
         "InternalError" => LimboError::InternalError(message.to_string()),
         "Conflict" => LimboError::Conflict(message.to_string()),
         "CheckpointFailed" => LimboError::CheckpointFailed(message.to_string()),
+        "ParseError" => LimboError::ParseError(message.to_string()),
+        "TxError" => LimboError::TxError(message.to_string()),
+        "DatabaseFull" => LimboError::DatabaseFull(message.to_string()),
+        "OutOfMemory" => LimboError::OutOfMemory,
         _ => LimboError::InternalError(format!("{kind}: {message}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `LimboError` variant the multiprocess handler relies on for
+    /// classification must round-trip through `limbo_error_to_kind` +
+    /// `error_kind_to_limbo_error` without collapsing into a different
+    /// variant. The historical failure mode: ParseError (and TxError, and
+    /// DatabaseFull) fell through to the `_ => "Other"` arm and the
+    /// receiving side reconstructed them as `InternalError`, masking the
+    /// classification from the multiprocess error handler — which then
+    /// fatal'd on any benign ParseError such as the workload-generated
+    /// `currval` on an undefined sequence.
+    #[test]
+    fn protocol_round_trips_classification_relevant_variants() {
+        type RoundTripCase = (LimboError, fn(&LimboError) -> bool);
+        let cases: &[RoundTripCase] = &[
+            (
+                LimboError::ParseError("x".into()),
+                |e| matches!(e, LimboError::ParseError(m) if m == "x"),
+            ),
+            (
+                LimboError::TxError("y".into()),
+                |e| matches!(e, LimboError::TxError(m) if m == "y"),
+            ),
+            (
+                LimboError::DatabaseFull("nextval: reached minimum value of sequence \"s\"".into()),
+                |e| matches!(e, LimboError::DatabaseFull(m) if m.starts_with("nextval: reached ")),
+            ),
+            (LimboError::Busy, |e| matches!(e, LimboError::Busy)),
+            (LimboError::OutOfMemory, |e| {
+                matches!(e, LimboError::OutOfMemory)
+            }),
+            (LimboError::WriteWriteConflict, |e| {
+                matches!(e, LimboError::WriteWriteConflict)
+            }),
+            (
+                LimboError::Corrupt("c".into()),
+                |e| matches!(e, LimboError::Corrupt(m) if m == "c"),
+            ),
+        ];
+        for (orig, predicate) in cases {
+            let kind = limbo_error_to_kind(orig);
+            let msg = match orig {
+                LimboError::ParseError(s)
+                | LimboError::TxError(s)
+                | LimboError::DatabaseFull(s)
+                | LimboError::Corrupt(s) => s.clone(),
+                _ => String::new(),
+            };
+            let reconstructed = error_kind_to_limbo_error(kind, &msg);
+            assert!(
+                predicate(&reconstructed),
+                "{orig:?} did not round-trip; got kind={kind:?}, reconstructed={reconstructed:?}",
+            );
+        }
     }
 }

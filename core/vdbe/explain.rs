@@ -956,19 +956,27 @@ pub fn insn_to_row(
             Insn::Program {
                 param_registers,
                 ignore_jump_target,
-                ..
-            } => (
-                "Program",
-                // P1: first parent register that contains a param
-                param_registers.first().copied().unwrap_or(0) as i64,
-                // P2: ignore jump target (for RAISE(IGNORE))
-                ignore_jump_target.as_debug_int() as i64,
-                // P3: number of registers that contain params
-                param_registers.len() as i64,
-                Value::build_text(program.sql.clone()),
-                0,
-                format!("subprogram={}", program.sql),
-            ),
+                program: subprogram,
+            } => {
+                let sql = subprogram
+                    .prepared_program()
+                    .expect("Program subprogram should be resolved before EXPLAIN")
+                    .sql
+                    .clone();
+                let comment = format!("subprogram={sql}");
+                (
+                    "Program",
+                    // P1: first parent register that contains a param
+                    param_registers.first().copied().unwrap_or(0) as i64,
+                    // P2: ignore jump target (for RAISE(IGNORE))
+                    ignore_jump_target.as_debug_int() as i64,
+                    // P3: number of registers that contain params
+                    param_registers.len() as i64,
+                    Value::build_text(sql),
+                    0,
+                    comment,
+                )
+            }
             Insn::ResetCount => (
                 "ResetCount",
                 0,
@@ -1492,10 +1500,13 @@ pub fn insn_to_row(
                 0,
                 format!("r[{rowid_reg}]=rowid"),
             ),
-            Insn::MustBeInt { reg } => (
+            Insn::MustBeInt { reg, target_pc } => (
                 "MustBeInt",
                 *reg as i64,
-                0,
+                target_pc
+                    .as_ref()
+                    .map(|target_pc| target_pc.as_offset_int())
+                    .unwrap_or_default() as i64,
                 0,
                 Value::build_text(""),
                 0,
@@ -1634,6 +1645,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string()
             ),
+            Insn::ClearBtree { db, root } => (
+                "ClearBtree",
+                *root,
+                *db as i64,
+                0,
+                Value::build_text(""),
+                0,
+                format!("root={root} iDb={db}"),
+            ),
             Insn::Destroy {
                 db,
                 root,
@@ -1690,6 +1710,115 @@ pub fn insn_to_row(
                 Value::build_text(type_name.clone()),
                 0,
                 format!("DROP TYPE {type_name}"),
+            ),
+            Insn::AddSequence { db, name, .. } => (
+                "AddSequence",
+                *db as i64,
+                0,
+                0,
+                Value::build_text(name.clone()),
+                0,
+                format!("ADD SEQUENCE {name}"),
+            ),
+            Insn::DropSequence { db, seq_name } => (
+                "DropSequence",
+                *db as i64,
+                0,
+                0,
+                Value::build_text(seq_name.clone()),
+                0,
+                format!("DROP SEQUENCE {seq_name}"),
+            ),
+            Insn::SequenceComputeNext {
+                db,
+                seq_name_reg,
+                in_value_reg,
+                in_is_called_reg,
+                was_empty_reg,
+                out_value_reg,
+            } => (
+                "SequenceComputeNext",
+                *db as i64,
+                *seq_name_reg as i64,
+                *out_value_reg as i64,
+                Value::Null,
+                0,
+                format!(
+                    "r[{out_value_reg}] = next(r[{in_value_reg}], is_called=r[{in_is_called_reg}], empty=r[{was_empty_reg}])"
+                ),
+            ),
+            Insn::SetSequenceCurrval {
+                seq_name_reg,
+                value_reg,
+            } => (
+                "SetSequenceCurrval",
+                0,
+                *seq_name_reg as i64,
+                *value_reg as i64,
+                Value::Null,
+                0,
+                format!("currval(r[{seq_name_reg}]) = r[{value_reg}]"),
+            ),
+            Insn::SequenceTrackAllocation {
+                db,
+                seq_name_reg,
+                value_reg,
+            } => (
+                "SequenceTrackAllocation",
+                *db as i64,
+                *seq_name_reg as i64,
+                *value_reg as i64,
+                Value::Null,
+                0,
+                format!("track sequence allocation r[{seq_name_reg}] = r[{value_reg}]"),
+            ),
+            Insn::SequenceRegisterAllocation {
+                db,
+                seq_name_reg,
+                value_reg,
+                saved_outer_reg,
+            } => (
+                "SequenceRegisterAllocation",
+                *db as i64,
+                *seq_name_reg as i64,
+                *value_reg as i64,
+                Value::Null,
+                0,
+                format!(
+                    "register allocation r[{seq_name_reg}] = r[{value_reg}] \
+                     against outer mv_tx r[{saved_outer_reg}]"
+                ),
+            ),
+            Insn::SequenceBeginInnerTx {
+                db,
+                path_kind_reg,
+                saved_outer_reg,
+            } => (
+                "SequenceBeginInnerTx",
+                *db as i64,
+                *path_kind_reg as i64,
+                *saved_outer_reg as i64,
+                Value::Null,
+                0,
+                format!(
+                    "r[{path_kind_reg}] = path; r[{saved_outer_reg}] = saved outer mv_tx"
+                ),
+            ),
+            Insn::SequenceCommitInnerTx {
+                db,
+                path_kind_reg,
+                saved_outer_reg,
+                status_reg,
+            } => (
+                "SequenceCommitInnerTx",
+                *db as i64,
+                *path_kind_reg as i64,
+                *saved_outer_reg as i64,
+                Value::from_i64(*status_reg as i64),
+                0,
+                format!(
+                    "commit inner tx; r[{status_reg}] = 0=Ok | 1=ConflictRetry"
+                ),
             ),
             Insn::AddType { db, sql } => (
                 "AddType",

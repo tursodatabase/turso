@@ -72,6 +72,10 @@ export interface DescribeRequest {
   sql: string;
 }
 
+export interface GetAutocommitRequest {
+  type: 'get_autocommit';
+}
+
 export interface DescribeResult {
   params: Array<{ name?: string }>;
   cols: Column[];
@@ -81,7 +85,7 @@ export interface DescribeResult {
 
 export interface PipelineRequest {
   baton: string | null;
-  requests: (ExecuteRequest | BatchRequest | SequenceRequest | CloseRequest | DescribeRequest)[];
+  requests: (ExecuteRequest | BatchRequest | SequenceRequest | CloseRequest | DescribeRequest | GetAutocommitRequest)[];
 }
 
 export interface PipelineResponse {
@@ -90,14 +94,19 @@ export interface PipelineResponse {
   results: Array<{
     type: 'ok' | 'error';
     response?: {
-      type: 'execute' | 'batch' | 'sequence' | 'close' | 'describe';
+      type: 'execute' | 'batch' | 'sequence' | 'close' | 'describe' | 'get_autocommit';
       result?: ExecuteResult | DescribeResult;
+      is_autocommit?: boolean;
     };
     error?: {
       message: string;
       code: string;
     };
   }>;
+}
+
+function toBase64(uint8: Uint8Array): string {
+  return Buffer.from(uint8.buffer, uint8.byteOffset, uint8.byteLength).toString('base64');
 }
 
 export function encodeValue(value: any): Value {
@@ -127,9 +136,12 @@ export function encodeValue(value: any): Value {
     return { type: 'text', value };
   }
   
-  if (value instanceof ArrayBuffer || value instanceof Uint8Array) {
-    const base64 = btoa(String.fromCharCode(...new Uint8Array(value)));
-    return { type: 'blob', base64 };
+  if (value instanceof ArrayBuffer) {
+    return { type: 'blob', base64: toBase64(new Uint8Array(value)) };
+  }
+
+  if (value instanceof Uint8Array) {
+    return { type: 'blob', base64: toBase64(value) };
   }
   
   return { type: 'text', value: String(value) };
@@ -195,6 +207,55 @@ export interface CursorEntry {
 /** HTTP header key for the encryption key */
 export const ENCRYPTION_KEY_HEADER = 'x-turso-encryption-key';
 
+/**
+ * Per-request HTTP context: where to send the request and which headers to
+ * attach. Built by the Session from its config and current base URL.
+ */
+export interface HttpContext {
+  /** Base URL requests are sent to. */
+  url: string;
+  /** Authentication token, sent as `Authorization: Bearer <token>`. */
+  authToken?: string;
+  /** Encryption key for the remote database, sent as `x-turso-encryption-key`. */
+  remoteEncryptionKey?: string;
+  /**
+   * Extra HTTP headers attached to the request. Applied after the standard
+   * headers, so they can override e.g. `Authorization`. Passing the `Host`
+   * key (case-insensitive) throws — fetch forbids setting it.
+   */
+  requestHeaders?: Record<string, string>;
+}
+
+function buildHeaders(ctx: HttpContext): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (ctx.authToken) {
+    headers['Authorization'] = `Bearer ${ctx.authToken}`;
+  }
+  if (ctx.remoteEncryptionKey) {
+    headers[ENCRYPTION_KEY_HEADER] = ctx.remoteEncryptionKey;
+  }
+  for (const [name, value] of Object.entries(ctx.requestHeaders ?? {})) {
+    // `Host` is a forbidden fetch header and would be silently dropped —
+    // throw instead so the caller learns the override never takes effect.
+    if (name.toLowerCase() === 'host') {
+      throw new DatabaseError("overwriting the 'Host' header is not supported");
+    }
+    headers[name] = value;
+  }
+  return headers;
+}
+
+function buildFetchOptions(ctx: HttpContext, body: string, signal?: AbortSignal): RequestInit {
+  return {
+    method: 'POST',
+    headers: buildHeaders(ctx),
+    body,
+    signal,
+  };
+}
+
 /** Per-query timeout options. Overrides defaultQueryTimeout for this call. */
 export interface QueryOptions {
   /** Per-query timeout in milliseconds. Overrides defaultQueryTimeout for this call. */
@@ -209,30 +270,13 @@ function wrapAbortError(error: unknown): never {
 }
 
 export async function executeCursor(
-  url: string,
-  authToken: string | undefined,
+  ctx: HttpContext,
   request: CursorRequest,
-  remoteEncryptionKey?: string,
   signal?: AbortSignal
 ): Promise<{ response: CursorResponse; entries: AsyncGenerator<CursorEntry> }> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
-  }
-  if (remoteEncryptionKey) {
-    headers[ENCRYPTION_KEY_HEADER] = remoteEncryptionKey;
-  }
-
   let response: Response;
   try {
-    response = await fetch(`${url}/v3/cursor`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(request),
-      signal,
-    });
+    response = await fetch(`${ctx.url}/v3/cursor`, buildFetchOptions(ctx, JSON.stringify(request), signal));
   } catch (error) {
     wrapAbortError(error);
   }
@@ -337,30 +381,13 @@ export async function executeCursor(
 }
 
 export async function executePipeline(
-  url: string,
-  authToken: string | undefined,
+  ctx: HttpContext,
   request: PipelineRequest,
-  remoteEncryptionKey?: string,
   signal?: AbortSignal
 ): Promise<PipelineResponse> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
-  }
-  if (remoteEncryptionKey) {
-    headers[ENCRYPTION_KEY_HEADER] = remoteEncryptionKey;
-  }
-
   let response: Response;
   try {
-    response = await fetch(`${url}/v3/pipeline`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(request),
-      signal,
-    });
+    response = await fetch(`${ctx.url}/v3/pipeline`, buildFetchOptions(ctx, JSON.stringify(request), signal));
   } catch (error) {
     wrapAbortError(error);
   }

@@ -179,8 +179,12 @@ bench-exclude-tpc-h:
 	fi
 .PHONY: bench-exclude-tpc-h
 
+codspeed-benchmarks-exclude-tpc-h:
+	@cargo bench --bench 2>&1 | awk '/^Available bench targets:/{list=1; next} list && NF {print $$1}' | grep -vx 'tpc_h_benchmark'
+.PHONY: codspeed-benchmarks-exclude-tpc-h
+
 codspeed-build-bench-exclude-tpc-h:
-	@benchmarks=$$(cargo bench --bench 2>&1 | grep -A 1000 '^Available bench targets:' | grep -v '^Available bench targets:' | grep -v '^ *$$' | grep -v 'tpc_h_benchmark' | xargs -I {} printf -- "--bench %s " {}); \
+	@benchmarks=$$($(MAKE) --no-print-directory codspeed-benchmarks-exclude-tpc-h | xargs -I {} printf -- "--bench %s " {}); \
 	if [ -z "$$benchmarks" ]; then \
 		echo "No benchmarks found (excluding tpc_h_benchmark)."; \
 		exit 1; \

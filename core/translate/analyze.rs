@@ -348,65 +348,14 @@ pub fn translate_analyze(
             root_page: target_table.root_page,
             db: database_id,
         });
-        let rowid_reg = program.alloc_register();
         let tablename_reg = program.alloc_register();
-        let indexname_reg = program.alloc_register();
-        let stat_text_reg = program.alloc_register();
-        let record_reg = program.alloc_register();
-        let count_reg = program.alloc_register();
         program.emit_insn(Insn::String8 {
             value: target_table.name.to_string(),
             dest: tablename_reg,
         });
         program.mark_last_insn_constant();
-        program.emit_insn(Insn::Count {
-            cursor_id: target_cursor,
-            target_reg: count_reg,
-            exact: true,
-        });
-        let after_insert = program.allocate_label();
-        program.emit_insn(Insn::IfNot {
-            reg: count_reg,
-            target_pc: after_insert,
-            jump_if_null: false,
-        });
-        program.emit_insn(Insn::Null {
-            dest: indexname_reg,
-            dest_end: None,
-        });
-        // stat = CAST(count AS TEXT)
-        program.emit_insn(Insn::Copy {
-            src_reg: count_reg,
-            dst_reg: stat_text_reg,
-            extra_amount: 0,
-        });
-        program.emit_insn(Insn::Cast {
-            reg: stat_text_reg,
-            affinity: Affinity::Text,
-        });
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(tablename_reg),
-            count: to_u16(3),
-            dest_reg: to_u16(record_reg),
-            index_name: None,
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::NewRowid {
-            cursor: stat_cursor,
-            rowid_reg,
-            prev_largest_reg: 0,
-        });
-        // FIXME: SQLite sets OPFLAG_APPEND on the insert, but that's not supported in turso right now.
-        // SQLite doesn't emit the table name, but like... why not?
-        program.emit_insn(Insn::Insert {
-            cursor: stat_cursor,
-            key_reg: rowid_reg,
-            record_reg,
-            flag: Default::default(),
-            table_name: "sqlite_stat1".to_string(),
-        });
-        program.preassign_label_to_next_insn(after_insert);
         // Emit index stats for this table (or for a single index target).
+        let is_specific_index_target = target_index.is_some();
         let indexes: Vec<Arc<Index>> = match target_index {
             Some(idx) => vec![idx],
             None => resolver.with_schema(database_id, |s| {
@@ -416,6 +365,64 @@ pub fn translate_analyze(
                     .collect()
             }),
         };
+        // Match SQLite: emit the table-level sqlite_stat1 row only when ANALYZE
+        // targets a table and there are no non-partial indexes contributing stats.
+        let emit_table_stat =
+            !is_specific_index_target && !indexes.iter().any(|index| index.where_clause.is_none());
+        if emit_table_stat {
+            let indexname_reg = program.alloc_register();
+            let stat_text_reg = program.alloc_register();
+            let record_reg = program.alloc_register();
+            let count_reg = program.alloc_register();
+            program.emit_insn(Insn::Count {
+                cursor_id: target_cursor,
+                target_reg: count_reg,
+                exact: true,
+            });
+            let after_insert = program.allocate_label();
+            program.emit_insn(Insn::IfNot {
+                reg: count_reg,
+                target_pc: after_insert,
+                jump_if_null: false,
+            });
+            program.emit_insn(Insn::Null {
+                dest: indexname_reg,
+                dest_end: None,
+            });
+            // stat = CAST(count AS TEXT)
+            program.emit_insn(Insn::Copy {
+                src_reg: count_reg,
+                dst_reg: stat_text_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::Cast {
+                reg: stat_text_reg,
+                affinity: Affinity::Text,
+            });
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u16(tablename_reg),
+                count: to_u16(3),
+                dest_reg: to_u16(record_reg),
+                index_name: None,
+                affinity_str: None,
+            });
+            let rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::NewRowid {
+                cursor: stat_cursor,
+                rowid_reg,
+                prev_largest_reg: 0,
+            });
+            // FIXME: SQLite sets OPFLAG_APPEND on the insert, but that's not supported in turso right now.
+            // SQLite doesn't emit the table name, but like... why not?
+            program.emit_insn(Insn::Insert {
+                cursor: stat_cursor,
+                key_reg: rowid_reg,
+                record_reg,
+                flag: Default::default(),
+                table_name: "sqlite_stat1".to_string(),
+            });
+            program.preassign_label_to_next_insn(after_insert);
+        }
         for index in indexes {
             emit_index_stats(program, stat_cursor, &target_table, &index, database_id);
         }

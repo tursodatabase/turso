@@ -1,7 +1,4 @@
-use std::{
-    num::{NonZero, NonZeroUsize},
-    sync::Arc,
-};
+use std::num::{NonZero, NonZeroUsize};
 
 /// Convert a usize to u16 for instruction fields (registers, counts).
 /// Panics if the value exceeds u16::MAX.
@@ -10,10 +7,12 @@ pub fn to_u16(v: usize) -> u16 {
     v.try_into().expect("value exceeds u16::MAX")
 }
 
-use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
+use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
+use crate::function::AccumulatorFunc;
 use crate::{
     schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
+    sync::{Arc, OnceLock, Weak},
     translate::{collate::CollationSeq, emitter::TransactionMode},
     types::KeyInfo,
     vdbe::affinity::Affinity,
@@ -23,6 +22,45 @@ use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::{ResolveType, SortOrder};
+
+/// The program run by an `Insn::Program` instruction.
+///
+/// Most callers already have a finished trigger or foreign-key action program.
+/// Recursive foreign-key actions are different: while compiling one action
+/// program, the generated SQL can need to emit a call back to that same action
+/// program before it has finished compiling.
+#[derive(Debug, Clone)]
+pub enum Subprogram {
+    /// A finished trigger or foreign-key action program.
+    PreparedProgram(Arc<PreparedProgram>),
+    /// A recursive foreign-key action program that is still being compiled.
+    ///
+    /// Example: `t(id PRIMARY KEY, parent REFERENCES t(id) ON DELETE CASCADE)`.
+    /// The action that deletes child rows from `t` can itself delete more rows
+    /// from `t`, so it must call the same action program that is being built.
+    /// The slot is filled after compilation finishes. The stored reference is
+    /// weak so the finished program does not own itself.
+    Pending(Arc<OnceLock<Weak<PreparedProgram>>>),
+}
+
+impl Subprogram {
+    /// Return the finished program that `Insn::Program` should run.
+    ///
+    /// `Pending` must have been filled during compilation before execution
+    /// reaches the instruction. If it has not been filled, compilation emitted
+    /// a recursive foreign-key action call without connecting it to the
+    /// finished action program.
+    pub(super) fn prepared_program(&self) -> crate::Result<Arc<PreparedProgram>> {
+        match self {
+            Self::PreparedProgram(program) => Ok(program.clone()),
+            Self::Pending(program) => program.get().and_then(Weak::upgrade).ok_or_else(|| {
+                crate::LimboError::InternalError(
+                    "recursive foreign-key action subprogram was not resolved".into(),
+                )
+            }),
+        }
+    }
+}
 
 /// Known custom type comparator functions for sorting and MIN/MAX aggregates.
 /// These replace heap-allocated String names with a compact enum.
@@ -142,6 +180,7 @@ impl InsertFlags {
     pub const REQUIRE_SEEK: u8 = 0x02; // Flag indicating that a seek is required to insert the row
     pub const EPHEMERAL_TABLE_INSERT: u8 = 0x04; // Flag indicating that this is an insert into an ephemeral table
     pub const SKIP_LAST_ROWID: u8 = 0x08; // Flag indicating that last_insert_rowid() must not be updated
+    pub const SKIP_STATEMENT_CHANGE_COUNT: u8 = 0x10; // Flag indicating that changes() must not count this insert
 
     pub fn new() -> Self {
         InsertFlags(0)
@@ -168,6 +207,11 @@ impl InsertFlags {
 
     pub fn skip_last_rowid(mut self) -> Self {
         self.0 |= InsertFlags::SKIP_LAST_ROWID;
+        self
+    }
+
+    pub fn skip_statement_change_count(mut self) -> Self {
+        self.0 |= InsertFlags::SKIP_STATEMENT_CHANGE_COUNT;
         self
     }
 }
@@ -798,7 +842,7 @@ pub enum Insn {
         can_fallthrough: bool,
     },
 
-    /// Invoke a trigger subprogram.
+    /// Invoke a trigger or foreign-key action subprogram.
     ///
     /// According to SQLite documentation (https://sqlite.org/opcode.html):
     /// "The Program opcode invokes the trigger subprogram. The Program instruction
@@ -810,7 +854,7 @@ pub enum Insn {
         /// At runtime, values are copied from these parent registers into
         /// the child statement's parameters via bind_at.
         param_registers: Vec<usize>,
-        program: Arc<PreparedProgram>,
+        program: Subprogram,
         /// Jump target when RAISE(IGNORE) fires in the subprogram.
         /// Points to the "skip this row" address in the parent program.
         ignore_jump_target: BranchOffset,
@@ -990,14 +1034,14 @@ pub enum Insn {
         acc_reg: usize,
         col: usize,
         delimiter: usize,
-        func: AggFunc,
+        func: AccumulatorFunc,
         /// Optional custom type comparator for MIN/MAX aggregates.
         comparator: Option<SortComparatorType>,
     },
 
     AggFinal {
         register: usize,
-        func: AggFunc,
+        func: AccumulatorFunc,
     },
 
     /// Similar to AggFinal, but instead of writing the result back into the
@@ -1006,7 +1050,7 @@ pub enum Insn {
     AggValue {
         acc_reg: usize,
         dest_reg: usize,
-        func: AggFunc,
+        func: AccumulatorFunc,
     },
 
     /// Open a sorter.
@@ -1014,14 +1058,14 @@ pub enum Insn {
         cursor_id: CursorID, // P1
         columns: usize,      // P2
         /// Combined order, collation, and nulls ordering per column.
-        order_collations_nulls: Vec<(
+        order_collations_nulls: crate::alloc::Vec<(
             SortOrder,
             Option<CollationSeq>,
             Option<turso_parser::ast::NullsOrder>,
         )>,
         /// Per-column custom type comparators for ORDER BY sorting.
         /// When present, the comparator is used instead of standard value comparison.
-        comparators: Vec<Option<SortComparatorType>>,
+        comparators: crate::alloc::Vec<Option<SortComparatorType>>,
     },
 
     /// Insert a row into the sorter.
@@ -1164,6 +1208,7 @@ pub enum Insn {
 
     MustBeInt {
         reg: usize,
+        target_pc: Option<BranchOffset>,
     },
 
     SoftNull {
@@ -1247,6 +1292,12 @@ pub enum Insn {
         pc_if_empty: BranchOffset,
     },
 
+    /// Delete all contents from a persistent table or index b-tree while keeping its root page.
+    ClearBtree {
+        db: usize,
+        root: i64,
+    },
+
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
     Destroy {
         /// The database index (0 = main, 1 = temp, 2+ = attached)
@@ -1307,6 +1358,124 @@ pub enum Insn {
         db: usize,
         /// The name of the type being dropped
         type_name: String,
+    },
+    /// Add a fully-configured sequence to the in-memory schema.
+    /// Emitted by CREATE SEQUENCE after ParseSchema has added the backing table.
+    AddSequence {
+        db: usize,
+        name: String,
+        start: i64,
+        increment: i64,
+        min_value: i64,
+        max_value: i64,
+        cycle: bool,
+    },
+    /// Drop a sequence from the in-memory schema
+    DropSequence {
+        /// The database within which this sequence needs to be dropped
+        db: usize,
+        /// The name of the sequence being dropped
+        seq_name: String,
+    },
+    /// Begin the autonomous inner transaction that wraps a sequence
+    /// read-modify-write. The translator emits this immediately before
+    /// the cursor-based RMW bytecode and pairs it with a matching
+    /// `SequenceCommitInnerTx`.
+    ///
+    /// Path selection happens here at runtime:
+    ///
+    /// * Skipped — when MVCC is not in use for `db`, OR the connection's
+    ///   current outer tx is exclusive (autocommit Write, BEGIN, BEGIN
+    ///   IMMEDIATE, BEGIN DEFERRED). The cursor RMW that follows runs
+    ///   inline in the outer tx. The matching `SequenceCommitInnerTx`
+    ///   is a no-op. Under exclusive no other writer can race, so
+    ///   in-tx rollback unburning the value is acceptable per Turso's
+    ///   relaxed-burnt-value contract.
+    /// * Wrapped — outer is Concurrent or autocommit Read or none.
+    ///   Begins a fresh Concurrent inner tx via `mv_store.begin_tx`,
+    ///   saves the outer's `(tx_id, mode)`, and swaps the connection's
+    ///   mv_tx for `db` to the inner. The cursor RMW runs against the
+    ///   inner. `SequenceCommitInnerTx` then commits the inner
+    ///   independently of the outer's eventual fate.
+    ///
+    /// Outputs:
+    /// * `path_kind_reg` — Integer(0)=Skipped, Integer(1)=Wrapped.
+    /// * `saved_outer_reg` — opaque snapshot of the prior mv_tx for
+    ///   `db`. Format is private to the begin/commit pair; consumers
+    ///   must not interpret it. `Null` when Skipped.
+    SequenceBeginInnerTx {
+        db: usize,
+        path_kind_reg: usize,
+        saved_outer_reg: usize,
+    },
+    /// Commit the autonomous inner transaction started by a matching
+    /// `SequenceBeginInnerTx`. Multi-step: drives the inner's
+    /// `CommitStateMachine` one step per opcode call, yielding
+    /// `InsnFunctionStepResult::IO` to the VDBE driver when the
+    /// state machine needs IO (mirrors `op_auto_commit`'s drive of
+    /// the outer commit).
+    ///
+    /// On terminal outcomes the opcode advances the pc by 1 and writes
+    /// `status_reg`:
+    /// * `0 (Ok)` — commit completed (or path was Skipped).
+    /// * `1 (ConflictRetry)` — commit hit
+    ///   `WriteWriteConflict`/`BusySnapshot`/`Conflict`. Inner tx
+    ///   rolled back. The translator emits a conditional jump back to
+    ///   the retry-top label after this opcode so the RMW restarts
+    ///   under a fresh inner tx.
+    ///
+    /// Other errors propagate up unchanged.
+    SequenceCommitInnerTx {
+        db: usize,
+        path_kind_reg: usize,
+        saved_outer_reg: usize,
+        status_reg: usize,
+    },
+    /// Compute the next value of a sequence from the just-read watermark row.
+    /// Pure synchronous arithmetic — no I/O. The caller (translator) emits
+    /// cursor seek + Column reads to load the watermark into `in_value_reg`
+    /// and `in_is_called_reg`; this opcode applies the start/inc/min/max/cycle
+    /// logic to produce the next value into `out_value_reg`. If
+    /// `was_empty_reg` (set by caller via IsNull-style branching) indicates
+    /// the backing table is empty, the next value is `start_value`. Returns
+    /// `LimboError::DatabaseFull` on overflow when `cycle` is false.
+    SequenceComputeNext {
+        db: usize,
+        seq_name_reg: usize,
+        in_value_reg: usize,
+        in_is_called_reg: usize,
+        was_empty_reg: usize,
+        out_value_reg: usize,
+    },
+    /// Record this connection's currval for a sequence after a successful
+    /// nextval/setval. Pure synchronous register operation. currval is
+    /// per-connection global (not schema-qualified), so no database id
+    /// is carried — schema-qualified currvals would be a separate feature.
+    SetSequenceCurrval {
+        seq_name_reg: usize,
+        value_reg: usize,
+    },
+    /// Publish sequence allocation metadata for sync watermarks after a
+    /// successful sequence RMW commit.
+    SequenceTrackAllocation {
+        db: usize,
+        seq_name_reg: usize,
+        value_reg: usize,
+    },
+    /// Register an in-flight sequence allocation against the *outer*
+    /// transaction *before* the inner-tx RMW commit publishes the new
+    /// boundary. Emitted ahead of `SequenceCommitInnerTx` so the active
+    /// allocation is visible to `sequence_watermark_experimental()` the
+    /// instant another connection can observe (and advance past) this
+    /// value. See `op_sequence_register_allocation` for the race this
+    /// closes.
+    SequenceRegisterAllocation {
+        db: usize,
+        seq_name_reg: usize,
+        value_reg: usize,
+        /// Register holding the encoded saved outer mv_tx (the blob written
+        /// by `SequenceBeginInnerTx`). Empty blob means "no outer tx".
+        saved_outer_reg: usize,
     },
     /// Add a custom type to the in-memory schema by parsing its CREATE TYPE SQL
     AddType {
@@ -1932,11 +2101,20 @@ impl InsnVariants {
             InsnVariants::IndexMethodDestroy => execute::op_index_method_destroy,
             InsnVariants::IndexMethodOptimize => execute::op_index_method_optimize,
             InsnVariants::IndexMethodQuery => execute::op_index_method_query,
+            InsnVariants::ClearBtree => execute::op_clear_btree,
             InsnVariants::Destroy => execute::op_destroy,
             InsnVariants::ResetSorter => execute::op_reset_sorter,
             InsnVariants::DropTable => execute::op_drop_table,
             InsnVariants::DropTrigger => execute::op_drop_trigger,
             InsnVariants::DropType => execute::op_drop_type,
+            InsnVariants::AddSequence => execute::op_add_sequence,
+            InsnVariants::DropSequence => execute::op_drop_sequence,
+            InsnVariants::SequenceComputeNext => execute::op_sequence_compute_next,
+            InsnVariants::SetSequenceCurrval => execute::op_set_sequence_currval,
+            InsnVariants::SequenceTrackAllocation => execute::op_sequence_track_allocation,
+            InsnVariants::SequenceRegisterAllocation => execute::op_sequence_register_allocation,
+            InsnVariants::SequenceBeginInnerTx => execute::op_sequence_begin_inner_tx,
+            InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
@@ -2043,12 +2221,21 @@ impl Insn {
             | Self::IndexMethodCreate { .. }
             | Self::IndexMethodDestroy { .. }
             | Self::IndexMethodOptimize { .. }
+            | Self::ClearBtree { .. }
             | Self::Destroy { .. }
             | Self::DropTable { .. }
             | Self::DropView { .. }
             | Self::DropIndex { .. }
             | Self::DropTrigger { .. }
             | Self::DropType { .. }
+            | Self::AddSequence { .. }
+            | Self::DropSequence { .. }
+            | Self::SequenceComputeNext { .. }
+            | Self::SetSequenceCurrval { .. }
+            | Self::SequenceTrackAllocation { .. }
+            | Self::SequenceRegisterAllocation { .. }
+            | Self::SequenceBeginInnerTx { .. }
+            | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
@@ -2060,7 +2247,12 @@ impl Insn {
             | Self::JournalMode { .. }
             | Self::Vacuum { .. } => false,
             Self::MaxPgcnt { new_max, .. } => *new_max == 0,
-            Self::Program { program, .. } => program.is_readonly(),
+            // A recursive foreign-key action is treated as writable while it's still being
+            // compiled; only fully-prepared subprograms can declare themselves read-only.
+            Self::Program { program, .. } => match program {
+                Subprogram::PreparedProgram(p) => p.is_readonly(),
+                Subprogram::Pending(_) => false,
+            },
             _ => true,
         }
     }

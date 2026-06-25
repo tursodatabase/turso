@@ -644,7 +644,7 @@ pub fn translate_expr(
             // First translate inner expr, then set the curr collation. If we set curr collation before,
             // it may be overwritten later by inner translate.
             translate_expr(program, referenced_tables, expr, target_register, resolver)?;
-            let collation = CollationSeq::new(collation.as_str())?;
+            let collation = resolver.resolve_collation(collation.as_str())?;
             program.set_collation(Some((collation, true)));
             Ok(target_register)
         }
@@ -660,6 +660,7 @@ pub fn translate_expr(
             args,
             filter_over,
             order_by: _,
+            within_group: _,
         } => {
             let args_count = args.len();
             let func_type = resolver.resolve_function(name.as_str(), args_count)?;
@@ -1234,7 +1235,8 @@ pub fn translate_expr(
                         | ScalarFunc::RandomBlob
                         | ScalarFunc::Sign
                         | ScalarFunc::Soundex
-                        | ScalarFunc::ZeroBlob => {
+                        | ScalarFunc::ZeroBlob
+                        | ScalarFunc::SequenceWatermark => {
                             let args = expect_arguments_exact!(args, 1, srf);
                             let start_reg = program.alloc_register();
                             translate_expr(
@@ -1273,6 +1275,23 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::Random => {
+                            if !args.is_empty() {
+                                crate::bail_parse_error!(
+                                    "{} function with arguments",
+                                    srf.to_string()
+                                );
+                            }
+                            let regs = program.alloc_register();
+                            program.emit_insn(Insn::Function {
+                                constant_mask: 0,
+                                start_reg: regs,
+                                dest: target_register,
+                                func: func_ctx,
+                            });
+                            Ok(target_register)
+                        }
+                        #[cfg(feature = "test_helper")]
+                        ScalarFunc::TestNondetCounter => {
                             if !args.is_empty() {
                                 crate::bail_parse_error!(
                                     "{} function with arguments",
@@ -1803,6 +1822,11 @@ pub fn translate_expr(
                         | ScalarFunc::TestUintLt
                         | ScalarFunc::TestUintEq
                         | ScalarFunc::StringReverse
+                        | ScalarFunc::Gcd
+                        | ScalarFunc::Lcm
+                        | ScalarFunc::Repeat
+                        | ScalarFunc::Lpad
+                        | ScalarFunc::Rpad
                         | ScalarFunc::BooleanToInt
                         | ScalarFunc::IntToBoolean
                         | ScalarFunc::ValidateIpAddr
@@ -1944,6 +1968,22 @@ pub fn translate_expr(
                                 [src_reg <- 0],
                                 Insn::StructField { src_reg, field_index, dest: target_register })
                         }
+                        ScalarFunc::NextVal | ScalarFunc::SetVal => translate_sequence_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        ),
+                        ScalarFunc::CurrVal => translate_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        ),
                     }
                 }
                 Func::Math(math_func) => match math_func.arity() {
@@ -2118,6 +2158,7 @@ pub fn translate_expr(
                         args,
                         filter_over: filter_over.clone(),
                         order_by: vec![],
+                        within_group: vec![],
                     };
 
                     // Recursively call translate_expr with the synthetic function call
@@ -2138,6 +2179,7 @@ pub fn translate_expr(
                         args: vec![], // Empty args for func(*)
                         filter_over: filter_over.clone(),
                         order_by: vec![], // Empty order_by for func(*)
+                        within_group: vec![],
                     };
 
                     // Recursively call translate_expr with the synthetic function call
@@ -2333,53 +2375,26 @@ pub fn translate_expr(
                         let is_btree_index = index_cursor_id.is_some_and(|cid| {
                             program.get_cursor_type(cid).is_some_and(|ct| ct.is_index())
                         });
-                        // FIXME(https://github.com/tursodatabase/turso/issues/4801):
-                        // This is a defensive workaround for cursor desynchronization.
-                        //
-                        // When `use_covering_index` is false, both table AND index cursors
-                        // are open and positioned at the same row. If we read some columns
-                        // from the index cursor and others from the table cursor, we rely
-                        // on both cursors staying synchronized.
-                        //
-                        // The problem: AFTER triggers can INSERT into the same table,
-                        // which modifies the index btree. This repositions or invalidates
-                        // the parent program's index cursor, while the table cursor remains
-                        // at the correct position. Result: we read a mix of data from
-                        // different rows - corruption.
-                        //
-                        // Why does the table cursor not have this problem? Because it's
-                        // explicitly re-sought by rowid (via NotExists instruction) before
-                        // each use. The rowid is stored in a register and used as a stable
-                        // key. The index cursor, by contrast, just trusts its internal
-                        // position (page + cell index) without re-seeking.
-                        //
-                        // Why not check if the table has triggers and allow the optimization
-                        // when there are none? Several reasons:
-                        // 1. ProgramBuilder.trigger indicates if THIS program is a trigger
-                        //    subprogram, not whether the table has triggers.
-                        // 2. In translate_expr(), we lack context about which table is being
-                        //    modified or whether we're even in an UPDATE/INSERT/DELETE.
-                        // 3. Triggers can be recursive (trigger on T inserts into U, whose
-                        //    trigger inserts back into T).
-                        //
-                        // The proper fix is to implement SQLite's `saveAllCursors()` approach:
-                        // before ANY btree write, find all cursors pointing to that btree
-                        // (by root_page) and save their positions. When those cursors are
-                        // next accessed, they re-seek to their saved position. This could
-                        // be done lazily with a generation number per btree - cursors check
-                        // if the generation changed and re-seek if needed. This would
-                        // require a global cursor registry and significant refactoring.
-                        //
-                        // For now, we only read from the index cursor when `use_covering_index`
-                        // is true, meaning only the index cursor exists (no table cursor to
-                        // get out of sync with). This foregoes the optimization of reading
-                        // individual columns from a non-covering index.
+                        // For non-outer-scope reads: an index can supply a
+                        // column's value only when the index actually
+                        // stores it. Presence in the index's column list
+                        // (`column_table_pos_to_index_pos`) is necessary
+                        // but not sufficient for VIRTUAL generated
+                        // columns — the index has a slot but the value
+                        // is only materialized when the index is
+                        // covering. For stored columns the slot implies
+                        // the value, so any in-index hit is fine.
                         let read_from_index = if is_from_outer_query_scope {
                             is_btree_index
-                        } else if is_btree_index && use_covering_index {
-                            index.as_ref().is_some_and(|idx| {
+                        } else if is_btree_index {
+                            let column_is_in_index = index.as_ref().is_some_and(|idx| {
                                 idx.column_table_pos_to_index_pos(*column).is_some()
-                            })
+                            });
+                            let column_is_virtual = matches!(
+                                table.get_column_at(*column).map(|c| c.generated_type()),
+                                Some(GeneratedType::Virtual { .. })
+                            );
+                            column_is_in_index && (!column_is_virtual || use_covering_index)
                         } else {
                             false
                         };

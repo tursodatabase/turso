@@ -251,7 +251,12 @@ fn emit_loop_source<'a>(
                     None
                 };
 
-                emit_collseq_if_needed(program, &plan.table_references, &min_max.argument);
+                emit_collseq_if_needed(
+                    program,
+                    &plan.table_references,
+                    &min_max.argument,
+                    &t_ctx.resolver,
+                );
                 let comparator = custom_type_comparator(
                     &min_max.argument,
                     &plan.table_references,
@@ -261,7 +266,7 @@ fn emit_loop_source<'a>(
                     acc_reg: start_reg,
                     col: expr_reg,
                     delimiter: 0,
-                    func: min_max.func.clone(),
+                    func: crate::function::AccumulatorFunc::Agg(min_max.func.clone()),
                     comparator,
                 });
                 program.emit_insn(Insn::Goto {
@@ -308,6 +313,7 @@ fn emit_loop_source<'a>(
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
                     reg,
                     &t_ctx.resolver,
+                    agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx

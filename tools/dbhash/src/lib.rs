@@ -115,7 +115,7 @@ fn get_table_names(
     stmt.bind_at(
         NonZero::new(1).unwrap(),
         Value::from_text(like_pattern.to_string()),
-    );
+    )?;
     let mut names = Vec::new();
 
     loop {
@@ -126,6 +126,7 @@ fn get_table_names(
                 names.push(name.to_string());
             }
             StepResult::IO => io.step()?,
+            StepResult::Yield => continue,
             StepResult::Done => break,
             StepResult::Busy | StepResult::Interrupt => {
                 return Err(LimboError::Busy);
@@ -161,6 +162,7 @@ fn hash_rows(
                 }
             }
             StepResult::IO => io.step()?,
+            StepResult::Yield => continue,
             StepResult::Done => break,
             StepResult::Busy | StepResult::Interrupt => {
                 return Err(LimboError::Busy);
@@ -201,7 +203,7 @@ fn hash_schema(
     stmt.bind_at(
         NonZero::new(1).unwrap(),
         Value::from_text(like_pattern.to_string()),
-    );
+    )?;
     hash_rows(&mut stmt, io, hasher, debug)?;
     Ok(())
 }

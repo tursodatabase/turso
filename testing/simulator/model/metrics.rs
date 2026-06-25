@@ -22,6 +22,11 @@ pub struct Remaining {
     pub alter_table: u32,
     pub drop_index: u32,
     pub pragma_count: u32,
+    pub create_sequence: u32,
+    pub drop_sequence: u32,
+    pub nextval: u32,
+    pub setval: u32,
+    pub sequence_info: Vec<(String, i64, i64)>,
 }
 
 impl Remaining {
@@ -31,6 +36,7 @@ impl Remaining {
         stats: &InteractionStats,
         mvcc: bool,
         context: &impl GenerationContext,
+        sequence_info: Vec<(String, i64, i64)>,
     ) -> Remaining {
         let total_weight = opts.total_weight();
 
@@ -44,6 +50,10 @@ impl Remaining {
         let total_alter_table = (max_interactions * opts.alter_table_weight) / total_weight;
         let total_drop_index = (max_interactions * opts.drop_index) / total_weight;
         let total_pragma = (max_interactions * opts.pragma_weight) / total_weight;
+        let total_create_sequence = (max_interactions * opts.create_sequence_weight) / total_weight;
+        let total_nextval = (max_interactions * opts.nextval_weight) / total_weight;
+        let total_setval = (max_interactions * opts.setval_weight) / total_weight;
+        let total_drop_sequence = (max_interactions * opts.drop_sequence_weight) / total_weight;
 
         let remaining_select = total_select
             .checked_sub(stats.select_count)
@@ -76,6 +86,19 @@ impl Remaining {
             .checked_sub(stats.drop_index_count)
             .unwrap_or_default();
 
+        let remaining_create_sequence = total_create_sequence
+            .checked_sub(stats.create_sequence_count)
+            .unwrap_or_default();
+        let mut remaining_nextval = total_nextval
+            .checked_sub(stats.nextval_count)
+            .unwrap_or_default();
+        let mut remaining_setval = total_setval
+            .checked_sub(stats.setval_count)
+            .unwrap_or_default();
+        let mut remaining_drop_sequence = total_drop_sequence
+            .checked_sub(stats.drop_sequence_count)
+            .unwrap_or_default();
+
         if mvcc {
             // TODO: index not supported yet for mvcc
             remaining_create_index = 0;
@@ -91,6 +114,13 @@ impl Remaining {
             remaining_drop_index = 0;
         }
 
+        // Sequence operations that require existing sequences get weight 0 when none exist
+        if sequence_info.is_empty() {
+            remaining_nextval = 0;
+            remaining_setval = 0;
+            remaining_drop_sequence = 0;
+        }
+
         Remaining {
             select: remaining_select,
             insert: remaining_insert,
@@ -102,6 +132,11 @@ impl Remaining {
             alter_table: remaining_alter_table,
             drop_index: remaining_drop_index,
             pragma_count: remaining_pragma,
+            create_sequence: remaining_create_sequence,
+            drop_sequence: remaining_drop_sequence,
+            nextval: remaining_nextval,
+            setval: remaining_setval,
+            sequence_info,
         }
     }
 }
@@ -121,6 +156,10 @@ pub(crate) struct InteractionStats {
     pub alter_table_count: u32,
     pub drop_index_count: u32,
     pub pragma_count: u32,
+    pub create_sequence_count: u32,
+    pub drop_sequence_count: u32,
+    pub nextval_count: u32,
+    pub setval_count: u32,
 }
 
 impl InteractionStats {
@@ -150,6 +189,10 @@ impl InteractionStats {
             Query::ReleaseSavepoint(_) => self.commit_count += 1,
             Query::AlterTable(_) => self.alter_table_count += 1,
             Query::DropIndex(_) => self.drop_index_count += 1,
+            Query::CreateSequence(_) => self.create_sequence_count += 1,
+            Query::DropSequence(_) => self.drop_sequence_count += 1,
+            Query::Nextval(_) => self.nextval_count += 1,
+            Query::Setval(_) => self.setval_count += 1,
             Query::Placeholder => {}
             Query::Pragma(_) => self.pragma_count += 1,
         }
@@ -160,7 +203,7 @@ impl Display for InteractionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}",
+            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}, CreateSeq: {}, DropSeq: {}, Nextval: {}, Setval: {}",
             self.select_count,
             self.insert_count,
             self.delete_count,
@@ -173,6 +216,10 @@ impl Display for InteractionStats {
             self.rollback_count,
             self.alter_table_count,
             self.drop_index_count,
+            self.create_sequence_count,
+            self.drop_sequence_count,
+            self.nextval_count,
+            self.setval_count,
         )
     }
 }

@@ -19,10 +19,15 @@ public partial class SqliteConnection
         if (function is null)
         {
             _scalarFunctions.Remove(name);
+            if (_database is not null)
+                TursoBindings.UnregisterFunction(DatabaseHandle, name);
             return;
         }
 
-        throw new NotSupportedException(AdvancedExtensionApisNotSupportedMessage);
+        var registration = new ScalarFunctionRegistration(name, argc, isDeterministic, function);
+        _scalarFunctions[name] = registration;
+        if (_database is not null)
+            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
     }
 
     private void RegisterScalarFunctions()
@@ -82,22 +87,22 @@ public partial class SqliteConnection
         return (T)Convert.ChangeType(value, targetType, CultureInfo.InvariantCulture);
     }
 
-    private static void InvokeScalarFunction(IntPtr context, int argc, IntPtr argv, IntPtr result)
+    private static TursoExtensionValue InvokeScalarFunction(IntPtr context, int argc, IntPtr argv, IntPtr contextDestructor, IntPtr valueDestructor)
     {
         try
         {
             var registration = (ScalarFunctionRegistration?)GCHandle.FromIntPtr(context).Target
                 ?? throw new ObjectDisposedException(nameof(ScalarFunctionRegistration));
             var args = ReadArguments(argc, argv);
-            WriteResult(result, registration.Invoke(args));
+            return CreateResult(registration.Invoke(args));
         }
         catch (SqliteException ex)
         {
-            WriteError(result, "__turso_sqlite_error__:" + ex.SqliteErrorCode.ToString(CultureInfo.InvariantCulture) + ":" + ex.Message);
+            return CreateError("__turso_sqlite_error__:" + ex.SqliteErrorCode.ToString(CultureInfo.InvariantCulture) + ":" + ex.Message);
         }
         catch (Exception ex)
         {
-            WriteError(result, ex.Message);
+            return CreateError(ex.Message);
         }
     }
 
@@ -110,13 +115,8 @@ public partial class SqliteConnection
         if (result == IntPtr.Zero)
             return;
 
-        var value = Marshal.PtrToStructure<ExtensionResultValue>(result);
-        if (value.ValueType is ExtensionValueType.Text or ExtensionValueType.Blob or ExtensionValueType.Error)
-        {
-            var data = value.Value.Bytes.Data;
-            if (data != IntPtr.Zero)
-                Marshal.FreeHGlobal(data);
-        }
+        var value = Marshal.PtrToStructure<TursoExtensionValue>(result);
+        FreeExtensionValue(value);
     }
 
     private static object?[] ReadArguments(int argc, IntPtr argv)
@@ -125,17 +125,17 @@ public partial class SqliteConnection
             return [];
 
         var args = new object?[argc];
-        var size = Marshal.SizeOf<ExtensionInputValue>();
+        var size = Marshal.SizeOf<TursoExtensionValue>();
         for (var i = 0; i < argc; i++)
         {
-            var value = Marshal.PtrToStructure<ExtensionInputValue>(IntPtr.Add(argv, i * size));
+            var value = Marshal.PtrToStructure<TursoExtensionValue>(IntPtr.Add(argv, i * size));
             args[i] = value.ValueType switch
             {
-                ExtensionValueType.Null => null,
-                ExtensionValueType.Integer => value.Value.IntValue,
-                ExtensionValueType.Real => value.Value.RealValue,
-                ExtensionValueType.Text => ReadText(value.Value.TextValue),
-                ExtensionValueType.Blob => ReadBlob(value.Value.BlobValue),
+                TursoExtensionValueType.Null => null,
+                TursoExtensionValueType.Integer => value.Value.IntValue,
+                TursoExtensionValueType.Float => value.Value.RealValue,
+                TursoExtensionValueType.Text => ReadText(value.Value.TextValue),
+                TursoExtensionValueType.Blob => ReadBlob(value.Value.BlobValue),
                 _ => null
             };
         }
@@ -171,60 +171,118 @@ public partial class SqliteConnection
         return bytes;
     }
 
-    private static void WriteResult(IntPtr result, object? value)
+    private static TursoExtensionValue CreateResult(object? value)
     {
         if (value is null or DBNull)
-        {
-            Marshal.StructureToPtr(ExtensionResultValue.Null(), result, false);
-            return;
-        }
+            return new TursoExtensionValue { ValueType = TursoExtensionValueType.Null };
 
-        switch (value)
+        return value switch
         {
-            case bool boolValue:
-                Marshal.StructureToPtr(ExtensionResultValue.Integer(boolValue ? 1 : 0), result, false);
+            bool boolValue => CreateInteger(boolValue ? 1 : 0),
+            byte byteValue => CreateInteger(byteValue),
+            sbyte sbyteValue => CreateInteger(sbyteValue),
+            short shortValue => CreateInteger(shortValue),
+            ushort ushortValue => CreateInteger(ushortValue),
+            int intValue => CreateInteger(intValue),
+            uint uintValue => CreateInteger(uintValue),
+            long longValue => CreateInteger(longValue),
+            float floatValue => CreateReal(floatValue),
+            double doubleValue => CreateReal(doubleValue),
+            decimal decimalValue => CreateText(decimalValue.ToString(CultureInfo.InvariantCulture)),
+            byte[] bytes => CreateBlob(bytes),
+            _ => CreateText(Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty),
+        };
+    }
+
+    private static TursoExtensionValue CreateInteger(long value)
+        => new() { ValueType = TursoExtensionValueType.Integer, Value = new TursoExtensionValueUnion { IntValue = value } };
+
+    private static TursoExtensionValue CreateReal(double value)
+        => new() { ValueType = TursoExtensionValueType.Float, Value = new TursoExtensionValueUnion { RealValue = value } };
+
+    private static TursoExtensionValue CreateText(string value)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value);
+        var text = new ExtensionTextValue { Subtype = 0, Text = AllocBytes(bytes), Length = checked((uint)bytes.Length) };
+        var ptr = Marshal.AllocHGlobal(Marshal.SizeOf<ExtensionTextValue>());
+        Marshal.StructureToPtr(text, ptr, false);
+        return new TursoExtensionValue { ValueType = TursoExtensionValueType.Text, Value = new TursoExtensionValueUnion { TextValue = ptr } };
+    }
+
+    private static TursoExtensionValue CreateBlob(byte[] bytes)
+    {
+        var blob = new ExtensionBlobValue { Data = AllocBytes(bytes), Length = (ulong)bytes.Length };
+        var ptr = Marshal.AllocHGlobal(Marshal.SizeOf<ExtensionBlobValue>());
+        Marshal.StructureToPtr(blob, ptr, false);
+        return new TursoExtensionValue { ValueType = TursoExtensionValueType.Blob, Value = new TursoExtensionValueUnion { BlobValue = ptr } };
+    }
+
+    private static TursoExtensionValue CreateError(string message)
+    {
+        var text = CreateText(message);
+        var error = new ExtensionErrorValue { Code = 14, Message = text.Value.TextValue };
+        var ptr = Marshal.AllocHGlobal(Marshal.SizeOf<ExtensionErrorValue>());
+        Marshal.StructureToPtr(error, ptr, false);
+        return new TursoExtensionValue { ValueType = TursoExtensionValueType.Error, Value = new TursoExtensionValueUnion { ErrorValue = ptr } };
+    }
+
+    private static IntPtr AllocBytes(byte[] bytes)
+    {
+        if (bytes.Length == 0)
+            return IntPtr.Zero;
+
+        var data = Marshal.AllocHGlobal(bytes.Length);
+        Marshal.Copy(bytes, 0, data, bytes.Length);
+        return data;
+    }
+
+    private static void FreeExtensionValue(TursoExtensionValue value)
+    {
+        switch (value.ValueType)
+        {
+            case TursoExtensionValueType.Text:
+                FreeText(value.Value.TextValue);
                 break;
-            case byte byteValue:
-                Marshal.StructureToPtr(ExtensionResultValue.Integer(byteValue), result, false);
+            case TursoExtensionValueType.Blob:
+                FreeBlob(value.Value.BlobValue);
                 break;
-            case sbyte sbyteValue:
-                Marshal.StructureToPtr(ExtensionResultValue.Integer(sbyteValue), result, false);
-                break;
-            case short shortValue:
-                Marshal.StructureToPtr(ExtensionResultValue.Integer(shortValue), result, false);
-                break;
-            case ushort ushortValue:
-                Marshal.StructureToPtr(ExtensionResultValue.Integer(ushortValue), result, false);
-                break;
-            case int intValue:
-                Marshal.StructureToPtr(ExtensionResultValue.Integer(intValue), result, false);
-                break;
-            case uint uintValue:
-                Marshal.StructureToPtr(ExtensionResultValue.Integer(uintValue), result, false);
-                break;
-            case long longValue:
-                Marshal.StructureToPtr(ExtensionResultValue.Integer(longValue), result, false);
-                break;
-            case float floatValue:
-                Marshal.StructureToPtr(ExtensionResultValue.Real(floatValue), result, false);
-                break;
-            case double doubleValue:
-                Marshal.StructureToPtr(ExtensionResultValue.Real(doubleValue), result, false);
-                break;
-            case decimal decimalValue:
-                Marshal.StructureToPtr(ExtensionResultValue.Real((double)decimalValue), result, false);
-                break;
-            case byte[] bytes:
-                Marshal.StructureToPtr(ExtensionResultValue.Bytes(ExtensionValueType.Blob, bytes), result, false);
-                break;
-            default:
-                Marshal.StructureToPtr(ExtensionResultValue.Bytes(ExtensionValueType.Text, Encoding.UTF8.GetBytes(Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty)), result, false);
+            case TursoExtensionValueType.Error:
+                FreeError(value.Value.ErrorValue);
                 break;
         }
     }
 
-    private static void WriteError(IntPtr result, string message)
-        => Marshal.StructureToPtr(ExtensionResultValue.Bytes(ExtensionValueType.Error, Encoding.UTF8.GetBytes(message)), result, false);
+    private static void FreeText(IntPtr ptr)
+    {
+        if (ptr == IntPtr.Zero)
+            return;
+
+        var text = Marshal.PtrToStructure<ExtensionTextValue>(ptr);
+        if (text.Text != IntPtr.Zero)
+            Marshal.FreeHGlobal(text.Text);
+        Marshal.FreeHGlobal(ptr);
+    }
+
+    private static void FreeBlob(IntPtr ptr)
+    {
+        if (ptr == IntPtr.Zero)
+            return;
+
+        var blob = Marshal.PtrToStructure<ExtensionBlobValue>(ptr);
+        if (blob.Data != IntPtr.Zero)
+            Marshal.FreeHGlobal(blob.Data);
+        Marshal.FreeHGlobal(ptr);
+    }
+
+    private static void FreeError(IntPtr ptr)
+    {
+        if (ptr == IntPtr.Zero)
+            return;
+
+        var error = Marshal.PtrToStructure<ExtensionErrorValue>(ptr);
+        FreeText(error.Message);
+        Marshal.FreeHGlobal(ptr);
+    }
 
     private sealed class ScalarFunctionRegistration(string name, int argc, bool isDeterministic, Func<object?[], object?> invoke)
     {
@@ -254,42 +312,6 @@ public partial class SqliteConnection
         }
     }
 
-    private enum ExtensionValueType
-    {
-        Null = 0,
-        Integer = 1,
-        Real = 2,
-        Text = 3,
-        Blob = 4,
-        Error = 5,
-    }
-
-    [StructLayout(LayoutKind.Explicit)]
-    private struct ExtensionInputValue
-    {
-        [FieldOffset(0)]
-        public ExtensionValueType ValueType;
-
-        [FieldOffset(8)]
-        public ExtensionInputValueUnion Value;
-    }
-
-    [StructLayout(LayoutKind.Explicit)]
-    private struct ExtensionInputValueUnion
-    {
-        [FieldOffset(0)]
-        public long IntValue;
-
-        [FieldOffset(0)]
-        public double RealValue;
-
-        [FieldOffset(0)]
-        public IntPtr TextValue;
-
-        [FieldOffset(0)]
-        public IntPtr BlobValue;
-    }
-
     [StructLayout(LayoutKind.Sequential)]
     private struct ExtensionTextValue
     {
@@ -306,57 +328,9 @@ public partial class SqliteConnection
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct ExtensionBytes
+    private struct ExtensionErrorValue
     {
-        public IntPtr Data;
-        public nuint Length;
-    }
-
-    [StructLayout(LayoutKind.Explicit)]
-    private struct ExtensionResultValue
-    {
-        [FieldOffset(0)]
-        public ExtensionValueType ValueType;
-
-        [FieldOffset(8)]
-        public ExtensionResultValueUnion Value;
-
-        public static ExtensionResultValue Null()
-            => new() { ValueType = ExtensionValueType.Null };
-
-        public static ExtensionResultValue Integer(long value)
-            => new() { ValueType = ExtensionValueType.Integer, Value = new ExtensionResultValueUnion { IntValue = value } };
-
-        public static ExtensionResultValue Real(double value)
-            => new() { ValueType = ExtensionValueType.Real, Value = new ExtensionResultValueUnion { RealValue = value } };
-
-        public static ExtensionResultValue Bytes(ExtensionValueType valueType, byte[] bytes)
-        {
-            var data = Marshal.AllocHGlobal(bytes.Length);
-            if (bytes.Length != 0)
-                Marshal.Copy(bytes, 0, data, bytes.Length);
-
-            return new ExtensionResultValue
-            {
-                ValueType = valueType,
-                Value = new ExtensionResultValueUnion
-                {
-                    Bytes = new ExtensionBytes { Data = data, Length = (nuint)bytes.Length }
-                }
-            };
-        }
-    }
-
-    [StructLayout(LayoutKind.Explicit)]
-    private struct ExtensionResultValueUnion
-    {
-        [FieldOffset(0)]
-        public long IntValue;
-
-        [FieldOffset(0)]
-        public double RealValue;
-
-        [FieldOffset(0)]
-        public ExtensionBytes Bytes;
+        public int Code;
+        public IntPtr Message;
     }
 }

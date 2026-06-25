@@ -21,6 +21,7 @@ fn rusqlite_open() -> rusqlite::Connection {
     sqlite_conn
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench(criterion: &mut Criterion) {
     // Flag to disable rusqlite benchmarks if needed
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
@@ -456,7 +457,7 @@ fn bench(criterion: &mut Criterion) {
                 loop {
                     match stmt.step().unwrap() {
                         turso_core::StepResult::Row => {}
-                        turso_core::StepResult::IO => {
+                        turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                             db.io.step().unwrap();
                         }
                         turso_core::StepResult::Done => {
@@ -489,6 +490,7 @@ fn bench(criterion: &mut Criterion) {
     }
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_sequential_jsonb(criterion: &mut Criterion) {
     // Flag to disable rusqlite benchmarks if needed
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
@@ -614,7 +616,7 @@ fn bench_sequential_jsonb(criterion: &mut Criterion) {
             loop {
                 match stmt.step().unwrap() {
                     turso_core::StepResult::Row => {}
-                    turso_core::StepResult::IO => {
+                    turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                         db.io.step().unwrap();
                     }
                     turso_core::StepResult::Done => {
@@ -646,6 +648,7 @@ fn bench_sequential_jsonb(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_json_patch(criterion: &mut Criterion) {
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
@@ -906,7 +909,7 @@ fn bench_json_patch(criterion: &mut Criterion) {
                 loop {
                     match stmt.step().unwrap() {
                         turso_core::StepResult::Row => {}
-                        turso_core::StepResult::IO => {
+                        turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                             db.io.step().unwrap();
                         }
                         turso_core::StepResult::Done => {

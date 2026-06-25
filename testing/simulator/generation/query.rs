@@ -1,6 +1,9 @@
 use crate::{
     generation::WeightedDistribution,
-    model::{Query, QueryDiscriminants, metrics::Remaining},
+    model::{
+        CreateSequence, DropSequence, Nextval, Query, QueryDiscriminants, Setval,
+        metrics::Remaining,
+    },
 };
 use rand::{
     Rng,
@@ -121,12 +124,62 @@ fn random_drop_index<R: rand::Rng + ?Sized>(
     Query::DropIndex(DropIndex::arbitrary(rng, conn_ctx))
 }
 
+fn random_create_sequence<R: rand::Rng + ?Sized>(rng: &mut R) -> Query {
+    let name = format!("seq_{}", rng.random_range(0..10000u32));
+    let increment = *[1i64, 2, 5, 10, -1, -2, -5].choose(rng).unwrap();
+    let cycle = rng.random_bool(0.1);
+    let (start, min_value, max_value) = if increment > 0 {
+        (rng.random_range(1..100i64), 1, i64::MAX)
+    } else {
+        (rng.random_range(-100..-1i64), i64::MIN + 1, -1)
+    };
+    Query::CreateSequence(CreateSequence {
+        name,
+        start,
+        increment,
+        min_value,
+        max_value,
+        cycle,
+    })
+}
+
+fn random_nextval<R: rand::Rng + ?Sized>(rng: &mut R, sequence_names: &[String]) -> Query {
+    assert!(!sequence_names.is_empty());
+    let name = sequence_names.choose(rng).unwrap().clone();
+    Query::Nextval(Nextval { name })
+}
+
+fn random_drop_sequence<R: rand::Rng + ?Sized>(rng: &mut R, sequence_names: &[String]) -> Query {
+    assert!(!sequence_names.is_empty());
+    let name = sequence_names.choose(rng).unwrap().clone();
+    Query::DropSequence(DropSequence { name })
+}
+
+fn random_setval<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    sequence_info: &[(String, i64, i64)],
+) -> Query {
+    assert!(!sequence_info.is_empty());
+    let (name, min_value, max_value) = sequence_info.choose(rng).unwrap();
+    let value = rng.random_range(*min_value..=*max_value);
+    let is_called = rng.random_bool(0.8);
+    Query::Setval(Setval {
+        name: name.clone(),
+        value,
+        is_called,
+    })
+}
+
 /// Possible queries that can be generated given the table state
 ///
 /// Does not take into account transactional statements
 pub const fn possible_queries(tables: &[Table]) -> &'static [QueryDiscriminants] {
     if tables.is_empty() {
-        &[QueryDiscriminants::Select, QueryDiscriminants::Create]
+        &[
+            QueryDiscriminants::Select,
+            QueryDiscriminants::Create,
+            QueryDiscriminants::CreateSequence,
+        ]
     } else {
         QueryDiscriminants::ALL_NO_TRANSACTION
     }
@@ -135,21 +188,27 @@ pub const fn possible_queries(tables: &[Table]) -> &'static [QueryDiscriminants]
 type QueryGenFunc<R, G> = fn(&mut R, &G) -> Query;
 
 impl QueryDiscriminants {
-    fn gen_function<R, G>(&self) -> QueryGenFunc<R, G>
+    fn gen_function<R, G>(&self) -> Option<QueryGenFunc<R, G>>
     where
         R: rand::Rng + ?Sized,
         G: GenerationContext,
     {
         match self {
-            QueryDiscriminants::Create => random_create,
-            QueryDiscriminants::Select => random_select,
-            QueryDiscriminants::Insert => random_insert,
-            QueryDiscriminants::Delete => random_delete,
-            QueryDiscriminants::Update => random_update,
-            QueryDiscriminants::Drop => random_drop,
-            QueryDiscriminants::CreateIndex => random_create_index,
-            QueryDiscriminants::AlterTable => random_alter_table,
-            QueryDiscriminants::DropIndex => random_drop_index,
+            QueryDiscriminants::Create => Some(random_create),
+            QueryDiscriminants::Select => Some(random_select),
+            QueryDiscriminants::Insert => Some(random_insert),
+            QueryDiscriminants::Delete => Some(random_delete),
+            QueryDiscriminants::Update => Some(random_update),
+            QueryDiscriminants::Drop => Some(random_drop),
+            QueryDiscriminants::CreateIndex => Some(random_create_index),
+            QueryDiscriminants::AlterTable => Some(random_alter_table),
+            QueryDiscriminants::DropIndex => Some(random_drop_index),
+            QueryDiscriminants::Pragma => Some(random_pragma),
+            // Sequence queries are handled specially in sample() since they need sequence_names
+            QueryDiscriminants::CreateSequence
+            | QueryDiscriminants::DropSequence
+            | QueryDiscriminants::Nextval
+            | QueryDiscriminants::Setval => None,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback
@@ -161,7 +220,6 @@ impl QueryDiscriminants {
             QueryDiscriminants::Placeholder => {
                 unreachable!("Query Placeholders should not be generated")
             }
-            QueryDiscriminants::Pragma => random_pragma,
         }
     }
 
@@ -178,6 +236,11 @@ impl QueryDiscriminants {
             QueryDiscriminants::CreateIndex => remaining.create_index,
             QueryDiscriminants::AlterTable => remaining.alter_table,
             QueryDiscriminants::DropIndex => remaining.drop_index,
+            QueryDiscriminants::Pragma => remaining.pragma_count,
+            QueryDiscriminants::CreateSequence => remaining.create_sequence,
+            QueryDiscriminants::DropSequence => remaining.drop_sequence,
+            QueryDiscriminants::Nextval => remaining.nextval,
+            QueryDiscriminants::Setval => remaining.setval,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback
@@ -189,7 +252,6 @@ impl QueryDiscriminants {
             QueryDiscriminants::Placeholder => {
                 unreachable!("Query Placeholders should not be generated")
             }
-            QueryDiscriminants::Pragma => remaining.pragma_count,
         }
     }
 }
@@ -199,6 +261,7 @@ pub(super) struct QueryDistribution {
     queries: &'static [QueryDiscriminants],
     query_weights: Vec<u32>,
     weights: WeightedIndex<u32>,
+    sequence_info: Vec<(String, i64, i64)>,
 }
 
 impl QueryDistribution {
@@ -212,6 +275,7 @@ impl QueryDistribution {
             queries,
             query_weights,
             weights,
+            sequence_info: remaining.sequence_info.clone(),
         }
     }
 
@@ -241,11 +305,36 @@ impl WeightedDistribution for QueryDistribution {
         rng: &mut R,
         ctx: &C,
     ) -> Self::GenItem {
-        let weights = &self.weights;
+        let idx = self.weights.sample(rng);
+        let discriminant = self.queries[idx];
 
-        let idx = weights.sample(rng);
-        let query_fn = self.queries[idx].gen_function();
-        (query_fn)(rng, ctx)
+        // Sequence queries are handled specially since they need sequence info
+        match discriminant {
+            QueryDiscriminants::CreateSequence => random_create_sequence(rng),
+            QueryDiscriminants::Nextval => {
+                let names: Vec<String> = self
+                    .sequence_info
+                    .iter()
+                    .map(|(n, _, _)| n.clone())
+                    .collect();
+                random_nextval(rng, &names)
+            }
+            QueryDiscriminants::DropSequence => {
+                let names: Vec<String> = self
+                    .sequence_info
+                    .iter()
+                    .map(|(n, _, _)| n.clone())
+                    .collect();
+                random_drop_sequence(rng, &names)
+            }
+            QueryDiscriminants::Setval => random_setval(rng, &self.sequence_info),
+            _ => {
+                let query_fn = discriminant
+                    .gen_function()
+                    .expect("non-sequence discriminant should have a gen_function");
+                (query_fn)(rng, ctx)
+            }
+        }
     }
 }
 

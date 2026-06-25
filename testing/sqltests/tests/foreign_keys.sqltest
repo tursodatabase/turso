@@ -351,6 +351,52 @@ test fk-self-ipk-single-mismatch {
 expect error {
 }
 
+@cross-check-integrity
+test fk-self-ipk-text-child-coerces-rowid-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        rid TEXT REFERENCES t(id)
+    );
+    INSERT INTO t(id, rid) VALUES(1, '1');
+    SELECT typeof(id), typeof(rid), id, rid FROM t;
+}
+expect {
+    integer|text|1|1
+}
+
+@cross-check-integrity
+test fk-deferred-self-ipk-invalid-text-child-is-deferred {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        rid TEXT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    BEGIN;
+    INSERT INTO t(id, rid) VALUES(1, 'abc');
+    SELECT count(*) FROM t;
+    ROLLBACK;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test fk-deferred-self-ipk-invalid-blob-child-is-deferred {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        rid BLOB REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    BEGIN;
+    INSERT INTO t(id, rid) VALUES(1, x'31');
+    SELECT count(*) FROM t;
+    ROLLBACK;
+}
+expect {
+    1
+}
+
 # Self-reference on composite PRIMARY KEY: single-row insert should pass
 @cross-check-integrity
 test fk-self-composite-single-ok {
@@ -454,6 +500,101 @@ test fk-self-unique-ok {
 }
 expect {
     A|B|A|B
+}
+
+@cross-check-integrity
+test fk-self-unique-parent-affinity-does-not-coerce-same-row-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k INTEGER UNIQUE,
+        pk TEXT REFERENCES t(k)
+    );
+    INSERT INTO t(id, k, pk) VALUES (1, 1, '1');
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-self-unique-parent-text-does-not-coerce-same-row-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k TEXT UNIQUE,
+        pk INTEGER REFERENCES t(k)
+    );
+    INSERT INTO t(id, k, pk) VALUES (1, '1', 1);
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-self-unique-parent-affinity-does-not-coerce-same-row-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k INTEGER UNIQUE,
+        pk TEXT REFERENCES t(k) DEFERRABLE INITIALLY DEFERRED
+    );
+    BEGIN;
+    INSERT INTO t(id, k, pk) VALUES (1, 1, '1');
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-self-unique-same-row-stored-values-match {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k INTEGER UNIQUE,
+        pk NUMERIC REFERENCES t(k)
+    );
+    INSERT INTO t(id, k, pk) VALUES (1, 1, '1');
+    SELECT typeof(k), typeof(pk), k, pk FROM t;
+}
+expect {
+    integer|integer|1|1
+}
+
+@cross-check-integrity
+test fk-cross-table-parent-affinity-still-coerces-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k INTEGER UNIQUE);
+    CREATE TABLE c(pk TEXT REFERENCES p(k));
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES ('1');
+    SELECT typeof(pk), pk FROM c;
+}
+expect {
+    text|1
+}
+
+@cross-check-integrity
+test fk-self-unique-parent-collation-does-not-satisfy-same-row-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k TEXT COLLATE NOCASE UNIQUE,
+        pk TEXT REFERENCES t(k)
+    );
+    INSERT INTO t(id, k, pk) VALUES (1, 'A', 'a');
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-cross-table-parent-collation-still-matches-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE UNIQUE);
+    CREATE TABLE c(pk TEXT REFERENCES p(k));
+    INSERT INTO p VALUES ('A');
+    INSERT INTO c VALUES ('a');
+    SELECT pk FROM c;
+}
+expect {
+    a
 }
 
 @cross-check-integrity
@@ -767,6 +908,192 @@ expect {
 }
 
 @cross-check-integrity
+test fk-deferred-parent-update-ignore-noop-keeps-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE ON CONFLICT IGNORE);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid,
+        FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (20);
+    INSERT INTO parent VALUES (24);
+    INSERT INTO child VALUES (1, 20);
+    BEGIN;
+    INSERT INTO child VALUES (2, 276);
+    UPDATE parent SET id=20 WHERE id=24;
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-parent-update-or-ignore-noop-keeps-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid,
+        FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (20);
+    INSERT INTO parent VALUES (24);
+    INSERT INTO child VALUES (1, 20);
+    BEGIN;
+    INSERT INTO child VALUES (2, 276);
+    UPDATE OR IGNORE parent SET id=20 WHERE id=24;
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-parent-update-ignore-noop-keeps-old-key-valid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE ON CONFLICT IGNORE);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid,
+        FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (20);
+    INSERT INTO parent VALUES (24);
+    INSERT INTO child VALUES (1, 24);
+    BEGIN;
+    UPDATE parent SET id=20 WHERE id=24;
+    COMMIT;
+    SELECT id, pid FROM child;
+}
+expect {
+    1|24
+}
+
+@cross-check-integrity
+test fk-deferred-parent-ipk-update-ignore-noop-keeps-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY ON CONFLICT IGNORE);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (20);
+    INSERT INTO parent VALUES (24);
+    INSERT INTO child VALUES (1, 20);
+    BEGIN;
+    INSERT INTO child VALUES (2, 276);
+    UPDATE parent SET id=20 WHERE id=24;
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-parent-update-ignore-notnull-noop-keeps-old-key-valid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE, nn NOT NULL);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (24, 'ok');
+    INSERT INTO child VALUES (1, 24);
+    BEGIN;
+    UPDATE OR IGNORE parent SET id=99, nn=NULL WHERE id=24;
+    COMMIT;
+    SELECT id, nn FROM parent;
+}
+expect {
+    24|ok
+}
+
+@cross-check-integrity
+test fk-deferred-child-update-ignore-noop-keeps-old-key-valid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid,
+        u UNIQUE ON CONFLICT IGNORE,
+        FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1, 10);
+    INSERT INTO child VALUES (2, 1, 20);
+    BEGIN;
+    UPDATE child SET pid=999, u=10 WHERE id=2;
+    COMMIT;
+    SELECT id, pid, u FROM child ORDER BY id;
+}
+expect {
+    1|1|10
+    2|1|20
+}
+
+@cross-check-integrity
+test fk-deferred-child-update-ignore-noop-keeps-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid,
+        u UNIQUE ON CONFLICT IGNORE,
+        FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1, 10);
+    BEGIN;
+    INSERT INTO child VALUES (2, 999, 20);
+    UPDATE child SET pid=1, u=10 WHERE id=2;
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-child-update-or-ignore-noop-keeps-old-key-valid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE);
+    CREATE TABLE child(
+        id PRIMARY KEY,
+        pid,
+        u UNIQUE,
+        FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1, 10);
+    INSERT INTO child VALUES (2, 1, 20);
+    BEGIN;
+    UPDATE OR IGNORE child SET pid=999, u=10 WHERE id=2;
+    COMMIT;
+    SELECT id, pid, u FROM child ORDER BY id;
+}
+expect {
+    1|1|10
+    2|1|20
+}
+
+@cross-check-integrity
+test fk-deferred-child-ipk-update-ignore-noop-keeps-old-key-valid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id UNIQUE);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY ON CONFLICT IGNORE,
+        pid REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+    INSERT INTO child VALUES (2, 1);
+    BEGIN;
+    UPDATE child SET id=1, pid=999 WHERE id=2;
+    COMMIT;
+    SELECT id, pid FROM child ORDER BY id;
+}
+expect {
+    1|1
+    2|1
+}
+
+@cross-check-integrity
 test fk-deferred-insert-commit-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -962,6 +1289,111 @@ expect {
 }
 
 @cross-check-integrity
+test fk-deferred-update-self-ref-id-and-pid-one-stmt {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id  INTEGER PRIMARY KEY,
+        pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO t VALUES(1, 1);
+    BEGIN;
+    UPDATE t SET id=2, pid=2 WHERE id=1;
+    COMMIT;
+    SELECT id, pid FROM t;
+}
+expect {
+    2|2
+}
+
+@cross-check-integrity
+test fk-deferred-update-self-ref-rowid-affinity-one-stmt {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id  INTEGER PRIMARY KEY,
+        pid TEXT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO t VALUES(1, 1);
+    BEGIN;
+    UPDATE t SET id=2, pid='2' WHERE id=1;
+    COMMIT;
+    SELECT id, typeof(pid), pid FROM t;
+}
+expect {
+    2|text|2
+}
+
+@cross-check-integrity
+test fk-deferred-update-self-ref-indexed-child-key-one-stmt {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id  INTEGER PRIMARY KEY,
+        pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    CREATE INDEX t_pid ON t(pid);
+    INSERT INTO t VALUES(1, 1);
+    BEGIN;
+    UPDATE t SET id=2, pid=2 WHERE id=1;
+    COMMIT;
+    SELECT id, pid FROM t;
+}
+expect {
+    2|2
+}
+
+@cross-check-integrity
+test fk-deferred-update-self-ref-unique-key-one-stmt {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        u  TEXT UNIQUE,
+        pu TEXT REFERENCES t(u) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO t VALUES(1, 'a', 'a');
+    BEGIN;
+    UPDATE t SET u='b', pu='b' WHERE id=1;
+    COMMIT;
+    SELECT u, pu FROM t;
+}
+expect {
+    b|b
+}
+
+@cross-check-integrity
+test fk-deferred-update-self-ref-composite-key-one-stmt {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        a, b,
+        x, y,
+        UNIQUE(a, b),
+        FOREIGN KEY(x, y) REFERENCES t(a, b) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO t VALUES(1, 1, 2, 1, 2);
+    BEGIN;
+    UPDATE t SET a=3, b=4, x=3, y=4 WHERE id=1;
+    COMMIT;
+    SELECT a, b, x, y FROM t;
+}
+expect {
+    3|4|3|4
+}
+
+@cross-check-integrity
+test fk-deferred-update-self-ref-one-stmt-still-fails-if-missing {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id  INTEGER PRIMARY KEY,
+        pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO t VALUES(1, 1);
+    BEGIN;
+    UPDATE t SET id=2, pid=3 WHERE id=1;
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
 test fk-deferred-delete-parent-commit-fails {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -1150,6 +1582,48 @@ test fk-deferred-composite-parent-update-fix {
 }
 expect {
     10|7|7
+}
+
+# Composite child FK whose first component is an INTEGER PRIMARY KEY rowid alias.
+# The OLD child key probe must materialize each component, not assume adjacent registers.
+@cross-check-integrity
+test fk-deferred-child-update-rowid-alias-composite-old-probe {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INT, b INT, UNIQUE(a,b));
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        x INT,
+        FOREIGN KEY(id,x) REFERENCES parent(a,b) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES(1,2),(1,3);
+    INSERT INTO child VALUES(1,2);
+    BEGIN;
+    INSERT INTO child VALUES(9,9);
+    UPDATE child SET x=3 WHERE id=1;
+    COMMIT;
+}
+expect error {
+}
+
+# Composite child FK whose second component is an INTEGER PRIMARY KEY rowid alias.
+# This covers the non-leading alias case for OLD child key materialization.
+@cross-check-integrity
+test fk-deferred-child-update-rowid-alias-composite-old-probe-second-component {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INT, b INT, UNIQUE(a,b));
+    CREATE TABLE child(
+        x INT,
+        id INTEGER PRIMARY KEY,
+        FOREIGN KEY(x,id) REFERENCES parent(a,b) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES(2,1),(3,1);
+    INSERT INTO child(x,id) VALUES(2,1);
+    BEGIN;
+    INSERT INTO child(x,id) VALUES(9,9);
+    UPDATE child SET x=3 WHERE id=1;
+    COMMIT;
+}
+expect error {
 }
 
 # TX: NULL in child FK -> never a violation
@@ -1795,6 +2269,228 @@ expect {
     0
 }
 
+# ON DELETE CASCADE - self-referential chain
+@cross-check-integrity
+test fk-cascade-delete-self-referential-chain {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    INSERT INTO t VALUES(1,NULL),(2,1),(3,2);
+    DELETE FROM t WHERE id=1;
+    SELECT id, pid FROM t ORDER BY id;
+}
+expect {
+}
+
+# ON DELETE CASCADE - longer self-referential chain
+@cross-check-integrity
+test fk-cascade-delete-self-referential-long-chain {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    INSERT INTO t VALUES
+        (1,NULL),(2,1),(3,2),(4,3),(5,4),(6,5),
+        (7,6),(8,7),(9,8),(10,9),(11,10),(12,11);
+    DELETE FROM t WHERE id=1;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# ON DELETE CASCADE - composite self-referential chain
+@cross-check-integrity
+test fk-cascade-delete-self-referential-composite-chain {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        a INTEGER,
+        b INTEGER,
+        pa INTEGER,
+        pb INTEGER,
+        PRIMARY KEY(a,b),
+        FOREIGN KEY(pa,pb) REFERENCES t(a,b) ON DELETE CASCADE
+    );
+    INSERT INTO t VALUES(1,1,NULL,NULL),(2,2,1,1),(3,3,2,2);
+    DELETE FROM t WHERE a=1 AND b=1;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# ON DELETE CASCADE - two self references to the same table
+@cross-check-integrity
+test fk-cascade-delete-self-referential-two-fks {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        p1 INTEGER REFERENCES t(id) ON DELETE CASCADE,
+        p2 INTEGER REFERENCES t(id) ON DELETE CASCADE
+    );
+    INSERT INTO t VALUES(1,NULL,NULL),(2,1,NULL),(3,NULL,1),(4,2,3);
+    DELETE FROM t WHERE id=1;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# ON DELETE CASCADE - deferred self-referential chain
+@cross-check-integrity
+test fk-cascade-delete-self-referential-deferred {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        pid INTEGER REFERENCES t(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO t VALUES(1,NULL),(2,1),(3,2);
+    BEGIN;
+    DELETE FROM t WHERE id=1;
+    SELECT count(*) FROM t;
+    COMMIT;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+    0
+}
+
+# ON DELETE CASCADE - more than one root row starts a self-referential cascade
+@cross-check-integrity
+test fk-cascade-delete-self-referential-multi-root {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    INSERT INTO t VALUES(1,NULL),(2,1),(3,2),(10,NULL),(11,10);
+    DELETE FROM t WHERE id IN (1,10);
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# ON DELETE CASCADE - multi-row parent delete on adjacent rows of a self-ref chain.
+# Each deleted root row references the next, so the parent scan and the cascade
+# target overlapping rows.
+@cross-check-integrity
+test fk-cascade-delete-self-referential-adjacent-rows {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    INSERT INTO t VALUES(1,NULL),(2,1),(3,2),(4,3),(5,4),(6,5),(7,6),(8,7);
+    DELETE FROM t WHERE id BETWEEN 1 AND 4;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# EXPLAIN should print the recursive FK action once and then stop.
+test fk-cascade-delete-self-referential-explain-terminates {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    EXPLAIN DELETE FROM t WHERE id=1;
+}
+expect pattern {
+    Program
+}
+
+# ON DELETE CASCADE - two tables cascade into each other
+@cross-check-integrity
+test fk-cascade-delete-two-table-cycle {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER REFERENCES b(id) ON DELETE CASCADE);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON DELETE CASCADE);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    DELETE FROM a WHERE id=1;
+    SELECT count(*) FROM a;
+    SELECT count(*) FROM b;
+}
+expect {
+    0
+    0
+}
+
+# ON DELETE CASCADE - three tables cascade into a cycle
+@cross-check-integrity
+test fk-cascade-delete-three-table-cycle {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, cid INTEGER REFERENCES c(id) ON DELETE CASCADE);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON DELETE CASCADE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, bid INTEGER REFERENCES b(id) ON DELETE CASCADE);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    INSERT INTO c VALUES(3,2);
+    UPDATE a SET cid=3 WHERE id=1;
+    DELETE FROM a WHERE id=1;
+    SELECT (SELECT count(*) FROM a),(SELECT count(*) FROM b),(SELECT count(*) FROM c);
+}
+expect {
+    0|0|0
+}
+
+# Two-table cycle with mixed cascade actions: a->b ON DELETE CASCADE,
+# b->a ON UPDATE CASCADE. Verifies the (fk, parent_change) compile-stack
+# key distinguishes ON DELETE from ON UPDATE for the same FK pair.
+@cross-check-integrity
+test fk-cascade-mixed-actions-two-table-cycle {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER REFERENCES b(id) ON DELETE CASCADE);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON UPDATE CASCADE);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    UPDATE a SET id=10 WHERE id=1;
+    SELECT 'after-update', a.id, a.bid, b.id, b.aid FROM a, b;
+    DELETE FROM b WHERE id=2;
+    SELECT 'after-delete-a', count(*) FROM a;
+    SELECT 'after-delete-b', count(*) FROM b;
+}
+expect {
+    after-update|10|2|2|10
+    after-delete-a|0
+    after-delete-b|0
+}
+
+# RESTRICT in a two-table cycle: must report a constraint violation rather
+# than recurse. The RESTRICT action does not emit a cascade
+# subprogram, but the cycle topology should not confuse the planner.
+@cross-check-integrity
+test fk-restrict-two-table-cycle {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER REFERENCES b(id) ON DELETE RESTRICT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON DELETE RESTRICT);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    DELETE FROM a WHERE id=1;
+}
+expect error {
+}
+
+# Cascade fires a trigger that issues an UPDATE that fires another cascade.
+# Exercises the interaction between fkeys.rs (cascade emission) and trigger_exec.rs.
+@cross-check-integrity
+test fk-cascade-trigger-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON UPDATE CASCADE);
+    CREATE TABLE gc(id INTEGER PRIMARY KEY, cid INTEGER REFERENCES c(id) ON UPDATE CASCADE);
+    CREATE TRIGGER tr AFTER UPDATE OF pid ON c BEGIN
+      UPDATE c SET id = id + 100 WHERE id = NEW.id;
+    END;
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(10, 1);
+    INSERT INTO gc VALUES(20, 10);
+    UPDATE p SET id=99 WHERE id=1;
+    SELECT 'p', id FROM p;
+    SELECT 'c', id, pid FROM c;
+    SELECT 'gc', id, cid FROM gc;
+}
+expect {
+    p|99
+    c|110|99
+    gc|20|110
+}
+
 # Basic ON UPDATE CASCADE - single child row
 @cross-check-integrity
 test fk-cascade-update-basic {
@@ -1825,6 +2521,37 @@ expect {
     10|99
     11|99
     12|99
+}
+
+# ON UPDATE CASCADE - self-referential hierarchy
+@cross-check-integrity
+test fk-cascade-update-self-referential-chain {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) ON UPDATE CASCADE);
+    INSERT INTO t VALUES(1,NULL),(2,1),(3,2);
+    UPDATE t SET id=id+10 WHERE id=1;
+    SELECT id, pid FROM t ORDER BY id;
+}
+expect {
+    2|11
+    3|2
+    11|
+}
+
+# ON UPDATE CASCADE - two tables update each other
+@cross-check-integrity
+test fk-cascade-update-two-table-cycle {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER REFERENCES b(id) ON UPDATE CASCADE);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON UPDATE CASCADE);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    UPDATE a SET id=10 WHERE id=1;
+    SELECT a.id,a.bid,b.id,b.aid FROM a,b;
+}
+expect {
+    10|2|2|10
 }
 
 # ON UPDATE CASCADE - composite key
@@ -1891,6 +2618,22 @@ expect {
     1||
 }
 
+# ON DELETE SET NULL - two tables clear each other's references
+@cross-check-integrity
+test fk-setnull-delete-two-table-cycle {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER REFERENCES b(id) ON DELETE SET NULL);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON DELETE SET NULL);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    DELETE FROM a WHERE id=1;
+    SELECT id, aid FROM b ORDER BY id;
+}
+expect {
+    2|
+}
+
 # Basic ON UPDATE SET NULL
 @cross-check-integrity
 test fk-setnull-update-basic {
@@ -1904,6 +2647,82 @@ test fk-setnull-update-basic {
 }
 expect {
     10|
+}
+
+# ON UPDATE SET NULL - two tables clear each other's references
+@cross-check-integrity
+test fk-setnull-update-two-table-cycle {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER REFERENCES b(id) ON UPDATE SET NULL);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON UPDATE SET NULL);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    UPDATE a SET id=10 WHERE id=1;
+    SELECT a.id,a.bid,b.id,b.aid FROM a,b;
+}
+expect {
+    10|2|2|
+}
+
+# ON DELETE SET DEFAULT - two tables reset each other's references to NULL
+@cross-check-integrity
+test fk-setdefault-delete-two-table-cycle-null-default {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER DEFAULT NULL REFERENCES b(id) ON DELETE SET DEFAULT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER DEFAULT NULL REFERENCES a(id) ON DELETE SET DEFAULT);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    DELETE FROM a WHERE id=1;
+    SELECT id, aid FROM b ORDER BY id;
+}
+expect {
+    2|
+}
+
+# ON UPDATE SET DEFAULT - two tables reset each other's references to NULL
+@cross-check-integrity
+test fk-setdefault-update-two-table-cycle-null-default {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER DEFAULT NULL REFERENCES b(id) ON UPDATE SET DEFAULT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER DEFAULT NULL REFERENCES a(id) ON UPDATE SET DEFAULT);
+    INSERT INTO a VALUES(1,NULL);
+    INSERT INTO b VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    UPDATE a SET id=10 WHERE id=1;
+    SELECT a.id,a.bid,b.id,b.aid FROM a,b;
+}
+expect {
+    10|2|2|
+}
+
+# ON DELETE SET DEFAULT - two-table cycle fails when the default has no parent row
+@cross-check-integrity
+test fk-setdefault-delete-two-table-cycle-missing-default-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER DEFAULT 999 REFERENCES b(id) ON DELETE SET DEFAULT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER DEFAULT 999 REFERENCES a(id) ON DELETE SET DEFAULT);
+    INSERT INTO a(id,bid) VALUES(1,NULL);
+    INSERT INTO b(id,aid) VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    DELETE FROM a WHERE id=1;
+}
+expect error {
+}
+
+# ON UPDATE SET DEFAULT - two-table cycle fails when the default has no parent row
+@cross-check-integrity
+test fk-setdefault-update-two-table-cycle-missing-default-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, bid INTEGER DEFAULT 999 REFERENCES b(id) ON UPDATE SET DEFAULT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid INTEGER DEFAULT 999 REFERENCES a(id) ON UPDATE SET DEFAULT);
+    INSERT INTO a(id,bid) VALUES(1,NULL);
+    INSERT INTO b(id,aid) VALUES(2,1);
+    UPDATE a SET bid=2 WHERE id=1;
+    UPDATE a SET id=10 WHERE id=1;
+}
+expect error {
 }
 
 # ON DELETE CASCADE with ON UPDATE NO ACTION
@@ -2268,6 +3087,157 @@ test fk-restrict-null-child-ok {
 }
 expect {
     0
+}
+
+# ON UPDATE RESTRICT should ignore parent keys containing NULL (SQLite `=` semantics).
+@cross-check-integrity
+test fk-update-restrict-null-parent-key-noop {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(k INT UNIQUE);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        pkey INT REFERENCES parent(k) ON UPDATE RESTRICT
+    );
+    CREATE INDEX child_pkey_idx ON child(pkey);
+    INSERT INTO parent VALUES(NULL), (1);
+    INSERT INTO child VALUES(10, NULL), (20, 1);
+    UPDATE parent SET k = k WHERE k IS NULL;
+    SELECT ifnull(pkey, 'NULL') FROM child ORDER BY id;
+}
+expect {
+    NULL
+    1
+}
+
+# ON UPDATE RESTRICT should also ignore NULL parent keys without a child index.
+@cross-check-integrity
+test fk-update-restrict-null-parent-key-noop-scan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(k INT UNIQUE);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        pkey INT REFERENCES parent(k) ON UPDATE RESTRICT
+    );
+    INSERT INTO parent VALUES(NULL), (1);
+    INSERT INTO child VALUES(10, NULL), (20, 1);
+    UPDATE parent SET k = k WHERE k IS NULL;
+    SELECT ifnull(pkey, 'NULL') FROM child ORDER BY id;
+}
+expect {
+    NULL
+    1
+}
+
+# ON UPDATE NO ACTION should also ignore parent keys containing NULL.
+@cross-check-integrity
+test fk-update-noaction-null-parent-key-noop {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(k INT UNIQUE);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        pkey INT REFERENCES parent(k) ON UPDATE NO ACTION
+    );
+    CREATE INDEX child_pkey_idx ON child(pkey);
+    INSERT INTO parent VALUES(NULL), (1);
+    INSERT INTO child VALUES(10, NULL), (20, 1);
+    UPDATE parent SET k = 2 WHERE k IS NULL;
+    SELECT ifnull(pkey, 'NULL') FROM child ORDER BY id;
+}
+expect {
+    NULL
+    1
+}
+
+# ON DELETE RESTRICT should ignore NULL parent keys without a child index.
+@cross-check-integrity
+test fk-delete-restrict-null-parent-key-noop-scan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(k INT UNIQUE);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        pkey INT REFERENCES parent(k) ON DELETE RESTRICT
+    );
+    INSERT INTO parent VALUES(NULL), (1);
+    INSERT INTO child VALUES(10, NULL), (20, 1);
+    DELETE FROM parent WHERE k IS NULL;
+    SELECT count(*) FROM parent WHERE k IS NULL;
+    SELECT k FROM parent;
+    SELECT ifnull(pkey, 'NULL') FROM child ORDER BY id;
+}
+expect {
+    0
+    1
+    NULL
+    1
+}
+
+# ON DELETE RESTRICT should ignore NULL parent keys when the child lookup uses an index.
+@cross-check-integrity
+test fk-delete-restrict-null-parent-key-noop-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(k INT UNIQUE);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        pkey INT REFERENCES parent(k) ON DELETE RESTRICT
+    );
+    CREATE INDEX child_pkey_idx ON child(pkey);
+    INSERT INTO parent VALUES(NULL), (1);
+    INSERT INTO child VALUES(10, NULL), (20, 1);
+    DELETE FROM parent WHERE k IS NULL;
+    SELECT count(*) FROM parent WHERE k IS NULL;
+    SELECT k FROM parent;
+    SELECT ifnull(pkey, 'NULL') FROM child ORDER BY id;
+}
+expect {
+    0
+    1
+    NULL
+    1
+}
+
+# Composite parent key: a partial-NULL key cannot be referenced, so ON UPDATE
+# RESTRICT must ignore it even when other components match a child row.
+@cross-check-integrity
+test fk-update-restrict-partial-null-composite-parent-key-noop {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INT, b INT, UNIQUE(a, b));
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        x INT,
+        y INT,
+        FOREIGN KEY(x, y) REFERENCES parent(a, b) ON UPDATE RESTRICT
+    );
+    INSERT INTO parent VALUES(1, NULL), (1, 2);
+    INSERT INTO child VALUES(10, 1, 2);
+    UPDATE parent SET b = b WHERE b IS NULL;
+    SELECT a, ifnull(b, 'NULL') FROM parent ORDER BY a, b;
+}
+expect {
+    1|NULL
+    1|2
+}
+
+# Composite parent key: deleting a partial-NULL parent row must not trip
+# ON DELETE RESTRICT for children matching the non-NULL components.
+@cross-check-integrity
+test fk-delete-restrict-partial-null-composite-parent-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INT, b INT, UNIQUE(a, b));
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        x INT,
+        y INT,
+        FOREIGN KEY(x, y) REFERENCES parent(a, b) ON DELETE RESTRICT
+    );
+    INSERT INTO parent VALUES(1, NULL), (1, 2);
+    INSERT INTO child VALUES(10, 1, 2);
+    DELETE FROM parent WHERE b IS NULL;
+    SELECT count(*) FROM parent;
+    SELECT a, b FROM parent;
+}
+expect {
+    1
+    1|2
 }
 
 # DROP parent table should fail when child rows reference it

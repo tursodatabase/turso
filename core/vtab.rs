@@ -21,9 +21,9 @@ pub struct VirtualTable {
     pub(crate) name: String,
     pub(crate) columns: Vec<Column>,
     pub(crate) kind: VTabKind,
-    vtab_type: VirtualTableType,
+    pub(crate) vtab_type: VirtualTableType,
     // identifier to tie a cursor to a specific instantiated virtual table instance
-    vtab_id: u64,
+    pub(crate) vtab_id: u64,
     // Whether this virtual table is safe to use from within triggers and views.
     // Corresponds to SQLite's SQLITE_VTAB_INNOCUOUS flag.
     pub(crate) innocuous: bool,
@@ -41,115 +41,25 @@ impl VirtualTable {
         }
     }
 
-    #[cfg(feature = "cli_only")]
-    fn dbpage_virtual_table() -> Arc<VirtualTable> {
-        let dbpage_table = crate::dbpage::DbPageTable::new();
-        let dbpage_vtab = VirtualTable {
-            name: dbpage_table.name(),
-            columns: Self::resolve_columns(dbpage_table.sql())
-                .expect("sqlite_dbpage schema resolution should not fail"),
-            kind: VTabKind::TableValuedFunction,
-            vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(dbpage_table))),
-            vtab_id: 0,
-            innocuous: true,
-        };
-        Arc::new(dbpage_vtab)
-    }
-
-    #[cfg(feature = "cli_only")]
-    fn btree_dump_virtual_table() -> Arc<VirtualTable> {
-        let btree_dump_table = crate::btree_dump::BtreeDumpTable::new();
-        let vtab = VirtualTable {
-            name: btree_dump_table.name(),
-            columns: Self::resolve_columns(btree_dump_table.sql())
-                .expect("btree_dump schema resolution should not fail"),
-            kind: VTabKind::TableValuedFunction,
-            vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(btree_dump_table))),
-            vtab_id: 0,
-            innocuous: true,
-        };
-        Arc::new(vtab)
-    }
-
-    fn turso_types_virtual_table() -> Arc<VirtualTable> {
-        let table = crate::turso_types_vtab::TursoTypesTable::new();
-        let vtab = VirtualTable {
-            name: table.name(),
-            columns: Self::resolve_columns(table.sql())
-                .expect("sqlite_turso_types schema resolution should not fail"),
+    /// Wrap an `InternalVirtualTable` implementation so it can appear in a
+    /// `Schema`'s catalog. The table's `name()` becomes the catalog name and
+    /// its `sql()` is parsed to derive the column metadata. Returns an error
+    /// if the SQL string is not a valid `CREATE TABLE` statement.
+    pub(crate) fn wrap_internal_table<T>(table: T) -> crate::Result<Arc<VirtualTable>>
+    where
+        T: InternalVirtualTable + 'static,
+    {
+        let name = table.name();
+        let sql = table.sql();
+        let columns = Self::resolve_columns(sql)?;
+        Ok(Arc::new(VirtualTable {
+            name,
+            columns,
             kind: VTabKind::TableValuedFunction,
             vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(table))),
             vtab_id: 0,
             innocuous: true,
-        };
-        Arc::new(vtab)
-    }
-
-    pub(crate) fn builtin_functions(enable_custom_types: bool) -> Vec<Arc<VirtualTable>> {
-        let mut vtables: Vec<Arc<VirtualTable>> = PragmaVirtualTable::functions()
-            .into_iter()
-            .map(|(tab, schema)| {
-                let vtab = VirtualTable {
-                    name: format!("pragma_{}", tab.pragma_name),
-                    columns: Self::resolve_columns(schema)
-                        .expect("pragma table-valued function schema resolution should not fail"),
-                    kind: VTabKind::TableValuedFunction,
-                    vtab_type: VirtualTableType::Pragma(tab),
-                    vtab_id: 0,
-                    innocuous: true,
-                };
-                Arc::new(vtab)
-            })
-            .collect();
-
-        #[cfg(feature = "json")]
-        vtables.extend(Self::json_virtual_tables());
-
-        #[cfg(feature = "cli_only")]
-        vtables.push(Self::dbpage_virtual_table());
-
-        #[cfg(feature = "cli_only")]
-        vtables.push(Self::btree_dump_virtual_table());
-
-        if enable_custom_types {
-            vtables.push(Self::turso_types_virtual_table());
-        }
-
-        vtables
-    }
-
-    #[cfg(feature = "json")]
-    fn json_virtual_tables() -> Vec<Arc<VirtualTable>> {
-        use crate::json::vtab::JsonVirtualTable;
-
-        let json_each = JsonVirtualTable::json_each();
-
-        let json_each_virtual_table = VirtualTable {
-            name: json_each.name(),
-            columns: Self::resolve_columns(json_each.sql())
-                .expect("internal table-valued function schema resolution should not fail"),
-            kind: VTabKind::TableValuedFunction,
-            vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(json_each))),
-            vtab_id: 0,
-            innocuous: true,
-        };
-
-        let json_tree = JsonVirtualTable::json_tree();
-
-        let json_tree_virtual_table = VirtualTable {
-            name: json_tree.name(),
-            columns: Self::resolve_columns(json_tree.sql())
-                .expect("internal table-valued function schema resolution should not fail"),
-            kind: VTabKind::TableValuedFunction,
-            vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(json_tree))),
-            vtab_id: 0,
-            innocuous: true,
-        };
-
-        vec![
-            Arc::new(json_each_virtual_table),
-            Arc::new(json_tree_virtual_table),
-        ]
+        }))
     }
 
     pub(crate) fn function(name: &str, syms: &SymbolTable) -> crate::Result<Arc<VirtualTable>> {
@@ -194,7 +104,7 @@ impl VirtualTable {
         Ok(Arc::new(vtab))
     }
 
-    fn resolve_columns(schema: String) -> crate::Result<Vec<Column>> {
+    pub(crate) fn resolve_columns(schema: String) -> crate::Result<Vec<Column>> {
         let mut parser = Parser::new(schema.as_bytes());
         if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) =
             parser.next_cmd()?.ok_or_else(|| {
@@ -686,4 +596,159 @@ pub trait InternalVirtualTableCursor: Send + Sync {
         idx_str: Option<String>,
         idx_num: i32,
     ) -> Result<bool, LimboError>;
+}
+
+#[cfg(all(test, feature = "fs"))]
+mod tests {
+    use super::*;
+    use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags};
+
+    /// Minimal `InternalVirtualTable` that exposes a fixed two-row table. Used
+    /// to verify that callers can register an arbitrary catalog table at
+    /// database open time and query it like any other table.
+    #[derive(Debug)]
+    struct StaticTable {
+        name: &'static str,
+    }
+
+    impl InternalVirtualTable for StaticTable {
+        fn name(&self) -> String {
+            self.name.to_string()
+        }
+        fn sql(&self) -> String {
+            format!("CREATE TABLE {}(key TEXT, value INTEGER)", self.name)
+        }
+        fn open(
+            &self,
+            _conn: Arc<Connection>,
+        ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+            Ok(Arc::new(RwLock::new(StaticCursor {
+                rows: vec![("alpha".to_string(), 1), ("beta".to_string(), 2)],
+                position: -1,
+            })))
+        }
+        fn best_index(
+            &self,
+            constraints: &[turso_ext::ConstraintInfo],
+            _order_by: &[turso_ext::OrderByInfo],
+        ) -> std::result::Result<turso_ext::IndexInfo, ResultCode> {
+            Ok(turso_ext::IndexInfo {
+                idx_num: 0,
+                idx_str: None,
+                order_by_consumed: false,
+                estimated_cost: 1.0,
+                estimated_rows: 2,
+                constraint_usages: constraints
+                    .iter()
+                    .map(|_| turso_ext::ConstraintUsage {
+                        argv_index: None,
+                        omit: false,
+                    })
+                    .collect(),
+            })
+        }
+    }
+
+    struct StaticCursor {
+        rows: Vec<(String, i64)>,
+        position: i64,
+    }
+
+    impl InternalVirtualTableCursor for StaticCursor {
+        fn next(&mut self) -> Result<bool, LimboError> {
+            self.position += 1;
+            Ok((self.position as usize) < self.rows.len())
+        }
+        fn rowid(&self) -> i64 {
+            self.position
+        }
+        fn column(&self, column: usize) -> Result<Value, LimboError> {
+            let (key, value) = &self.rows[self.position as usize];
+            match column {
+                0 => Ok(Value::build_text(key.clone())),
+                1 => Ok(Value::from_i64(*value)),
+                _ => Err(LimboError::InternalError(format!(
+                    "column index {column} out of range"
+                ))),
+            }
+        }
+        fn filter(
+            &mut self,
+            _args: &[Value],
+            _idx_str: Option<String>,
+            _idx_num: i32,
+        ) -> Result<bool, LimboError> {
+            self.position = -1;
+            self.next()
+        }
+    }
+
+    #[test]
+    fn registered_internal_vtab_is_visible_to_connections() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            crate::util::MEMORY_PATH,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let name = db
+            .register_internal_vtab(StaticTable {
+                name: "external_metadata",
+            })
+            .unwrap();
+        assert_eq!(name, "external_metadata");
+
+        let conn = db.connect().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM external_metadata")
+            .unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        let mapped: Vec<(String, i64)> = rows
+            .into_iter()
+            .map(|cols| {
+                let key = match &cols[0] {
+                    Value::Text(t) => t.as_str().to_string(),
+                    other => panic!("unexpected key type {other:?}"),
+                };
+                let value = match &cols[1] {
+                    Value::Numeric(crate::Numeric::Integer(i)) => *i,
+                    other => panic!("unexpected value type {other:?}"),
+                };
+                (key, value)
+            })
+            .collect();
+        assert_eq!(
+            mapped,
+            vec![("alpha".to_string(), 1), ("beta".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn registered_internal_vtab_lookup_folds_ascii_only() {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            crate::util::MEMORY_PATH,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let name = db
+            .register_internal_vtab(StaticTable {
+                name: "External_ΔΥΣ",
+            })
+            .unwrap();
+        assert_eq!(name, "External_ΔΥΣ");
+
+        let conn = db.connect().unwrap();
+        let mut stmt = conn.prepare("SELECT key, value FROM external_ΔΥΣ").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(rows.len(), 2);
+
+        assert!(conn.prepare("SELECT key, value FROM external_δυσ").is_err());
+    }
 }

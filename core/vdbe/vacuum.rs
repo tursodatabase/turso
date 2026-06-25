@@ -1,3 +1,4 @@
+use rustc_hash::FxHashMap;
 use std::sync::{atomic::Ordering, Arc};
 
 use crate::error::LimboError;
@@ -77,6 +78,30 @@ impl SchemaEntry {
     pub fn is_sqlite_sequence(&self) -> bool {
         self.name == "sqlite_sequence"
     }
+
+    /// True for backing tables of the implicit sequences created by
+    /// `CREATE TABLE ... AUTOINCREMENT` — i.e. the table is named
+    /// `__turso_internal_seq___turso_internal_autoincrement_<table>`.
+    /// User-created sequences (`CREATE SEQUENCE foo` →
+    /// `__turso_internal_seq_foo`) do NOT match.
+    ///
+    /// VACUUM uses this to skip the standalone `CREATE TABLE` replay
+    /// for autoincrement backing tables only: the user's
+    /// `CREATE TABLE ... AUTOINCREMENT` is replayed separately and
+    /// auto-recreates the backing table from `CREATE TABLE` bytecode,
+    /// so replaying the standalone entry too would trip
+    /// "table already exists". User-sequence backing tables, on the
+    /// other hand, are the ONLY persistent representation of
+    /// `CREATE SEQUENCE` — they must be replayed.
+    pub fn is_autoinc_sequence_backing_table(&self) -> bool {
+        let Some(seq_name) = self
+            .name
+            .strip_prefix(crate::schema::SEQ_BACKING_TABLE_PREFIX)
+        else {
+            return false;
+        };
+        seq_name.starts_with(crate::schema::AUTOINCREMENT_SEQ_PREFIX)
+    }
 }
 
 /// Split rowid-ordered schema entries into the replay phases used by VACUUM.
@@ -93,15 +118,20 @@ pub(crate) fn classify_schema_entries(
     for (idx, entry) in entries.iter().enumerate() {
         match entry.entry_type {
             SchemaEntryType::Table if entry.is_storage_backed() => {
-                // Skip sqlite_sequence in the schema creation phase. When we
-                // create an AUTOINCREMENT table, Turso automatically creates
-                // sqlite_sequence if it doesn't exist (see translate/schema.rs).
-                // Since entries are ordered by rowid, an AUTOINCREMENT table may
-                // appear before sqlite_sequence. If we create that table first
-                // (which auto-creates sqlite_sequence), then later try to run
-                // "CREATE TABLE sqlite_sequence(name,seq)", it fails with
-                // "table already exists".
-                if !entry.is_sqlite_sequence() {
+                // Skip sqlite_sequence and AUTOINCREMENT implicit sequence
+                // backing tables in the schema creation phase: both are
+                // auto-created as a side effect of replaying the user's
+                // CREATE TABLE ... AUTOINCREMENT, so a standalone CREATE
+                // TABLE replay would trip "table already exists".
+                //
+                // User-created sequence backing tables (`CREATE SEQUENCE
+                // foo` → `__turso_internal_seq_foo`) DO need creation
+                // replay — that backing table IS the persistent
+                // representation of the sequence, and nothing else
+                // creates it in the target. Excluding them used to abort
+                // VACUUM with `no such table: "__turso_internal_seq_foo"`
+                // during the copy phase.
+                if !entry.is_sqlite_sequence() && !entry.is_autoinc_sequence_backing_table() {
                     tables_to_create.push(idx);
                 }
                 // All storage-backed tables get their data copied, including
@@ -614,10 +644,10 @@ pub(crate) fn vacuum_target_build_step(
                         state.phase = VacuumTargetBuildPhase::PrepareCreateTable { idx: 0 };
                         continue;
                     }
-                    crate::StepResult::IO => {
+                    crate::StepResult::IO | crate::StepResult::Yield => {
                         let io = schema_stmt
                             .take_io_completions()
-                            .expect("StepResult::IO returned but no completions available");
+                            .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                         state.phase = VacuumTargetBuildPhase::CollectSchemaRows { schema_stmt };
                         return Ok(crate::IOResult::IO(io));
                     }
@@ -675,10 +705,10 @@ pub(crate) fn vacuum_target_build_step(
                     state.phase = VacuumTargetBuildPhase::PrepareCreateTable { idx: idx + 1 };
                     continue;
                 }
-                crate::StepResult::IO => {
+                crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_schema_stmt
                         .take_io_completions()
-                        .expect("StepResult::IO returned but no completions available");
+                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepCreateTable {
                         target_schema_stmt,
                         idx,
@@ -737,16 +767,19 @@ pub(crate) fn vacuum_target_build_step(
                         schema.get_btree_table(table_name)
                     });
 
-                // sqlite_sequence may already have rows from the AUTOINCREMENT
-                // tracking that ran during the table data copy. Use INSERT OR
-                // REPLACE so the source counter values overwrite any stale
-                // auto-generated ones (matches SQLite vacuum.c behavior).
+                // sqlite_sequence and AUTOINCREMENT implicit backing tables
+                // may already have rows from the AUTOINCREMENT tracking that
+                // ran during the table data copy. Use INSERT OR REPLACE so
+                // the source counter values overwrite any stale auto-
+                // generated ones (matches SQLite vacuum.c behavior). User-
+                // created sequence backing tables get a fresh CREATE TABLE
+                // replay (no auto-populated rows), so plain INSERT is fine.
                 // todo: sqlite disables AUTOINCREMENT during vacuum, but we don't have such a way yet
                 let (select_sql, insert_sql) = build_copy_sql(
                     &config.escaped_schema_name,
                     &escaped_table_name,
                     source_btree_table.as_deref(),
-                    entry.is_sqlite_sequence(),
+                    entry.is_sqlite_sequence() || entry.is_autoinc_sequence_backing_table(),
                 )?;
 
                 // SELECT from source, INSERT into the target.
@@ -789,7 +822,7 @@ pub(crate) fn vacuum_target_build_step(
                     for (i, value) in row.get_values().cloned().enumerate() {
                         let index =
                             std::num::NonZero::new(i + 1).expect("i + 1 is always non-zero");
-                        target_insert_stmt.bind_at(index, value);
+                        target_insert_stmt.bind_at(index, value)?;
                     }
 
                     state.phase = VacuumTargetBuildPhase::StepTargetInsert {
@@ -806,10 +839,10 @@ pub(crate) fn vacuum_target_build_step(
                     };
                     continue;
                 }
-                crate::StepResult::IO => {
+                crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = select_stmt
                         .take_io_completions()
-                        .expect("StepResult::IO returned but no completions available");
+                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::CopyRows {
                         select_stmt,
                         target_insert_stmt,
@@ -839,10 +872,10 @@ pub(crate) fn vacuum_target_build_step(
                     };
                     continue;
                 }
-                crate::StepResult::IO => {
+                crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_insert_stmt
                         .take_io_completions()
-                        .expect("StepResult::IO returned but no completions available");
+                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepTargetInsert {
                         select_stmt,
                         target_insert_stmt,
@@ -888,10 +921,10 @@ pub(crate) fn vacuum_target_build_step(
                     state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: idx + 1 };
                     continue;
                 }
-                crate::StepResult::IO => {
+                crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_schema_stmt
                         .take_io_completions()
-                        .expect("StepResult::IO returned but no completions available");
+                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                         target_schema_stmt,
                         idx,
@@ -932,10 +965,10 @@ pub(crate) fn vacuum_target_build_step(
                     state.phase = VacuumTargetBuildPhase::PreparePostData { idx: idx + 1 };
                     continue;
                 }
-                crate::StepResult::IO => {
+                crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_schema_stmt
                         .take_io_completions()
-                        .expect("StepResult::IO returned but no completions available");
+                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepPostData {
                         target_schema_stmt,
                         idx,
@@ -1541,7 +1574,18 @@ fn install_mvcc_state_after_vacuum_commit(
 
 /// Capture the finalized replacement metadata from the temp target before the
 /// source WAL publish. Then once temp back pages are committed, we can just install this.
-fn capture_target_metadata(temp_db: &VacuumTempDb) -> Result<VacuumCommittedImageMeta> {
+///
+/// `source_sequences` is the source connection's sequence-descriptor map
+/// at the moment VACUUM started. VACUUM rewrites every page but preserves
+/// every sequence's definition (start/inc/min/max/cycle), so the map is
+/// still valid for the post-VACUUM image — and grafting it onto the
+/// reparsed schema avoids the blocking sequence-descriptor reload path,
+/// which would violate the vdbe async contract from inside VACUUM's
+/// state machine.
+fn capture_target_metadata(
+    temp_db: &VacuumTempDb,
+    source_sequences: FxHashMap<String, Arc<crate::schema::Sequence>>,
+) -> Result<VacuumCommittedImageMeta> {
     let temp_conn = &temp_db.conn;
     let temp_pager = temp_conn.get_pager();
     temp_pager.begin_read_tx()?;
@@ -1551,7 +1595,10 @@ fn capture_target_metadata(temp_db: &VacuumTempDb) -> Result<VacuumCommittedImag
         let header = temp_pager
             .io
             .block(|| temp_pager.with_header(|header| *header))?;
-        temp_conn.reparse_schema_with_cookie(header.schema_cookie.get())?;
+        temp_conn.reparse_schema_with_cookie_keeping_sequences(
+            header.schema_cookie.get(),
+            source_sequences,
+        )?;
         Ok(VacuumCommittedImageMeta {
             header,
             schema: temp_conn.schema.read().clone(),
@@ -1599,7 +1646,17 @@ fn reload_physical_schema_for_mvcc_vacuum(
     source_pager.begin_read_tx()?;
     connection.set_tx_state(crate::connection::TransactionState::Read);
 
-    let reparse_result = connection.reparse_schema();
+    // Preserve the current sequences map and graft it onto the reparsed
+    // schema. The MVCC VACUUM rebuilds physical page locations but does
+    // not touch sequence definitions, so the in-memory descriptors stay
+    // valid. The standard `reparse_schema` would otherwise call the
+    // blocking `Schema::populate_sequences` and `populate_sequences_via_sql`
+    // helpers, which violate the vdbe async contract from inside the
+    // VACUUM state machine.
+    let preserved_sequences = connection.schema.read().sequences.clone();
+    let reparse_result = connection.read_current_schema_cookie().and_then(|cookie| {
+        connection.reparse_schema_with_cookie_keeping_sequences(cookie, preserved_sequences)
+    });
 
     source_pager.end_read_tx();
     connection.set_tx_state(crate::connection::TransactionState::None);
@@ -1805,7 +1862,8 @@ fn vacuum_in_place_step(
                 let temp_db_ref = temp_db
                     .as_ref()
                     .expect("VACUUM CaptureTargetMetadata phase requires temp db");
-                *committed_image = Some(capture_target_metadata(temp_db_ref)?);
+                let source_sequences = connection.schema.read().sequences.clone();
+                *committed_image = Some(capture_target_metadata(temp_db_ref, source_sequences)?);
                 *phase = VacuumInPlacePhase::BeginTempReadTx;
                 continue;
             }
@@ -2321,10 +2379,13 @@ fn vacuum_in_place_cleanup(
 mod tests {
     use super::*;
     use crate::io::{FileId, FileSyncType};
+    use crate::mvcc::yield_hooks::YieldPointMarker;
+    use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
     use crate::schema::Schema;
     use crate::storage::encryption::{CipherMode, EncryptionKey};
     use crate::storage::pager::Page;
     use crate::util::IOExt;
+    use crate::vdbe::execute::TransactionYieldPoint;
     use crate::{
         Buffer, Clock, Completion, DatabaseOpts, File, MemoryIO, MonotonicInstant, OpenFlags,
         WallClockInstant, IO,
@@ -2417,6 +2478,33 @@ mod tests {
         count_as_wal_sync: bool,
         db_syncs: Arc<AtomicUsize>,
         wal_syncs: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct OneShotTransactionYieldInjector {
+        yielded: AtomicUsize,
+    }
+
+    impl OneShotTransactionYieldInjector {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                yielded: AtomicUsize::new(0),
+            })
+        }
+
+        fn yielded(&self) -> bool {
+            self.yielded.load(StdOrdering::SeqCst) != 0
+        }
+    }
+
+    impl YieldInjector for OneShotTransactionYieldInjector {
+        fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+            point == TransactionYieldPoint::BeforeStart.point()
+                && self
+                    .yielded
+                    .compare_exchange(0, 1, StdOrdering::SeqCst, StdOrdering::SeqCst)
+                    .is_ok()
+        }
     }
 
     impl File for SyncCountingFile {
@@ -2760,7 +2848,7 @@ mod tests {
         }
         temp.conn.execute("COMMIT")?;
 
-        let committed = capture_target_metadata(&temp)?;
+        let committed = capture_target_metadata(&temp, FxHashMap::default())?;
 
         assert_eq!(committed.header.schema_cookie.get(), 42);
         assert_eq!(committed.header.read_version, mvcc_version);
@@ -2809,8 +2897,7 @@ mod tests {
 
         let before = io.counts();
         assert_eq!(
-            before.db,
-            0,
+            before.db, 0,
             "target build with synchronous=OFF must not sync the destination db file before finalization"
         );
 
@@ -2827,6 +2914,89 @@ mod tests {
             1,
             "VACUUM INTO finalization must do exactly one WAL fsync after truncation"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn vacuum_target_build_preserves_nested_statement_explicit_yield() -> Result<()> {
+        let io = Arc::new(MemoryIO::new());
+        let source_io: Arc<dyn IO> = io.clone();
+        let source_db = Database::open_file_with_flags(
+            source_io,
+            "vacuum-yield-source.db",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_vacuum(true),
+            None,
+        )?;
+        let source_conn = source_db.connect()?;
+        source_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+        source_conn.execute("CREATE INDEX idx_t_payload ON t(payload)")?;
+        for id in 1..=8 {
+            source_conn.execute(format!("INSERT INTO t VALUES({id}, 'payload-{id}')"))?;
+        }
+        source_conn.execute("BEGIN")?;
+
+        let source_pager = source_conn.get_pager();
+        let header_meta = source_pager
+            .io
+            .block(|| source_pager.with_header(VacuumDbHeaderMeta::from_source_header))?;
+
+        let target_io: Arc<dyn IO> = io.clone();
+        let target_db = Database::open_file_with_flags(
+            target_io,
+            "vacuum-yield-target.db",
+            OpenFlags::Create,
+            vacuum_target_opts_from_source(&source_db),
+            None,
+        )?;
+        let target_conn = target_db.connect()?;
+        mirror_symbols(&source_conn, &target_conn);
+
+        let config = VacuumTargetBuildConfig {
+            source_conn: source_conn.clone(),
+            escaped_schema_name: "main".to_string(),
+            source_db_id: crate::MAIN_DB_ID,
+            header_meta,
+            source_custom_types: capture_custom_types(&source_conn, crate::MAIN_DB_ID),
+            target_mvcc_enabled: source_db.mvcc_enabled(),
+            target_auto_vacuum_mode: source_pager.get_auto_vacuum_mode(),
+            copy_mvcc_metadata_table: false,
+        };
+
+        let injector = OneShotTransactionYieldInjector::new();
+        source_conn.set_yield_injector(Some(injector.clone()));
+
+        let mut context = VacuumTargetBuildContext::new(target_conn.clone());
+        let mut saw_explicit_yield = false;
+        loop {
+            match vacuum_target_build_step(&config, &mut context)? {
+                crate::IOResult::Done(()) => break,
+                crate::IOResult::IO(completions) => {
+                    saw_explicit_yield |= completions.is_explicit_yield();
+                    if !completions.is_explicit_yield() {
+                        completions.wait(io.as_ref())?;
+                    }
+                }
+            }
+        }
+
+        source_conn.set_yield_injector(None);
+        source_conn.execute("COMMIT")?;
+
+        assert!(injector.yielded(), "test must trigger the injected yield");
+        assert!(
+            saw_explicit_yield,
+            "vacuum target build must return the nested explicit yield instead of panicking"
+        );
+
+        let mut copied_rows = None;
+        let mut stmt = target_conn.prepare("SELECT COUNT(*) FROM t")?;
+        stmt.run_with_row_callback(|row| {
+            copied_rows = Some(row.get::<i64>(0)?);
+            Ok(())
+        })?;
+        assert_eq!(copied_rows, Some(8));
 
         Ok(())
     }

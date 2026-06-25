@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
 use crate::translate::emitter::TransactionMode;
@@ -120,8 +121,8 @@ const QUOTE_PAIRS: &[(char, char)] = &[
 
 pub fn normalize_ident(identifier: &str) -> String {
     // quotes normalization already happened in the parser layer (see Name ast node implementation)
-    // so, we only need to convert identifier string to lowercase
-    identifier.to_lowercase()
+    // so, we only need to apply SQLite's ASCII-only identifier case folding.
+    identifier.to_ascii_lowercase()
 }
 
 /// Escape a SQL string literal payload for safe interpolation inside single quotes.
@@ -155,65 +156,111 @@ pub struct UnparsedFromSqlIndex {
     pub sql: String,
 }
 
-#[instrument(skip_all, level = Level::INFO)]
+/// Carries the in-progress state of [`parse_schema_rows`] across IO yields:
+/// the schema-scan statement plus the accumulators that `handle_schema_row`
+/// fills row-by-row. Without this, a yield mid-scan would lose the partially
+/// accumulated indexes/materialized-view info and re-run the statement from
+/// scratch.
+#[derive(Default)]
+pub struct ParseSchemaRowsState {
+    inner: Option<ParseSchemaRowsInner>,
+}
+
+struct ParseSchemaRowsInner {
+    rows: Statement,
+    from_sql_indexes: crate::alloc::Vec<UnparsedFromSqlIndex>,
+    automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>>,
+    dbsp_state_roots: HashMap<String, i64>,
+    dbsp_state_index_roots: HashMap<String, i64>,
+    materialized_view_info: HashMap<String, (String, i64)>,
+}
+
+impl ParseSchemaRowsState {
+    /// Initialize the scan state from a prepared `SELECT * FROM sqlite_schema`
+    /// statement (or equivalent) and the MVCC transaction it should read under.
+    pub fn new(mut rows: Statement, mv_tx: Option<(u64, TransactionMode)>) -> Self {
+        rows.set_mv_tx(mv_tx);
+        Self {
+            inner: Some(ParseSchemaRowsInner {
+                rows,
+                from_sql_indexes: <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(10).expect("TODO: fallible allocations"),
+                automatic_indices: HashMap::with_capacity_and_hasher(10, Default::default()),
+                dbsp_state_roots: HashMap::default(),
+                dbsp_state_index_roots: HashMap::default(),
+                materialized_view_info: HashMap::default(),
+            }),
+        }
+    }
+}
+
+/// Non-blocking schema-row parser: steps the schema-scan statement held in
+/// `state`, feeding each row to `handle_schema_row`, and yields IO instead of
+/// pumping it. Re-invoke after each yielded completion; accumulators persist in
+/// `state`. On completion, populates indices and materialized views.
+#[instrument(skip_all, level = Level::DEBUG)]
 pub fn parse_schema_rows(
-    mut rows: Statement,
+    state: &mut ParseSchemaRowsState,
     schema: &mut Schema,
     syms: &SymbolTable,
-    mv_tx: Option<(u64, TransactionMode)>,
     resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
-) -> Result<()> {
-    rows.set_mv_tx(mv_tx);
-    let mv_store = rows.mv_store().clone();
-    // TODO: if we IO, this unparsed indexes is lost. Will probably need some state between
-    // IO runs
-    let mut from_sql_indexes = Vec::with_capacity(10);
-    let mut automatic_indices = HashMap::with_capacity_and_hasher(10, Default::default());
+) -> Result<IOResult<()>> {
+    {
+        let inner = state
+            .inner
+            .as_mut()
+            .expect("ParseSchemaRowsState not initialized");
+        // Destructure so the statement (receiver) and the accumulators (captured
+        // by the closure) are borrowed as disjoint fields.
+        let ParseSchemaRowsInner {
+            rows,
+            from_sql_indexes,
+            automatic_indices,
+            dbsp_state_roots,
+            dbsp_state_index_roots,
+            materialized_view_info,
+        } = inner;
+        crate::return_if_io!(rows.run_with_row_callback_nonblock(|row| {
+            let ty = row.get::<&str>(0)?;
+            let name = row.get::<&str>(1)?;
+            let table_name = row.get::<&str>(2)?;
+            let root_page = row.get::<i64>(3)?;
+            let sql = row.get::<&str>(4).ok();
+            schema.handle_schema_row(
+                ty,
+                name,
+                table_name,
+                root_page,
+                sql,
+                syms,
+                from_sql_indexes,
+                automatic_indices,
+                dbsp_state_roots,
+                dbsp_state_index_roots,
+                materialized_view_info,
+                resolve_attached_db,
+            )
+        }));
+    }
 
-    // Store DBSP state table root pages: view_name -> dbsp_state_root_page
-    let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
-    // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
-    let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-    // Store materialized view info (SQL and root page) for later creation
-    let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
-
-    // TODO: How do we ensure that the I/O we submitted to
-    // read the schema is actually complete?
-    rows.run_with_row_callback(|row| {
-        let ty = row.get::<&str>(0)?;
-        let name = row.get::<&str>(1)?;
-        let table_name = row.get::<&str>(2)?;
-        let root_page = row.get::<i64>(3)?;
-        let sql = row.get::<&str>(4).ok();
-        schema.handle_schema_row(
-            ty,
-            name,
-            table_name,
-            root_page,
-            sql,
-            syms,
-            &mut from_sql_indexes,
-            &mut automatic_indices,
-            &mut dbsp_state_roots,
-            &mut dbsp_state_index_roots,
-            &mut materialized_view_info,
-            resolve_attached_db,
-        )
-    })?;
-
+    // Scan complete: finalize. Take ownership of the accumulators.
+    let inner = state
+        .inner
+        .take()
+        .expect("ParseSchemaRowsState not initialized");
+    let has_mv_store = inner.rows.mv_store().is_some();
     schema.populate_indices(
         syms,
-        from_sql_indexes,
-        automatic_indices,
-        mv_store.is_some(),
+        inner.from_sql_indexes,
+        inner.automatic_indices,
+        has_mv_store,
     )?;
     schema.populate_materialized_views(
-        materialized_view_info,
-        dbsp_state_roots,
-        dbsp_state_index_roots,
+        inner.materialized_view_info,
+        inner.dbsp_state_roots,
+        inner.dbsp_state_index_roots,
     )?;
 
-    Ok(())
+    Ok(IOResult::Done(()))
 }
 
 fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
@@ -350,6 +397,8 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
         (Literal::Blob(b1), Literal::Blob(b2)) => b1 == b2,
         (Literal::Keyword(k1), Literal::Keyword(k2)) => check_ident_equivalency(k1, k2),
         (Literal::Null, Literal::Null) => true,
+        (Literal::True, Literal::True) => true,
+        (Literal::False, Literal::False) => true,
         (Literal::CurrentDate, Literal::CurrentDate) => true,
         (Literal::CurrentTime, Literal::CurrentTime) => true,
         (Literal::CurrentTimestamp, Literal::CurrentTimestamp) => true,
@@ -449,6 +498,7 @@ pub fn try_substitute_parameters(
             distinctness,
             args,
             order_by,
+            within_group,
             filter_over,
         } => {
             let mut substituted = Vec::new();
@@ -460,6 +510,7 @@ pub fn try_substitute_parameters(
                 distinctness: *distinctness,
                 name: name.clone(),
                 order_by: order_by.clone(),
+                within_group: within_group.clone(),
                 filter_over: filter_over.clone(),
             }))
         }
@@ -485,6 +536,7 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
                 distinctness: distinct1,
                 args: args1,
                 order_by: order1,
+                within_group: within1,
                 filter_over: filter1,
             },
             Expr::FunctionCall {
@@ -492,6 +544,7 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
                 distinctness: distinct2,
                 args: args2,
                 order_by: order2,
+                within_group: within2,
                 filter_over: filter2,
             },
         ) => {
@@ -502,6 +555,9 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
                 return None;
             }
             if !order1.is_empty() || !order2.is_empty() {
+                return None;
+            }
+            if !within1.is_empty() || !within2.is_empty() {
                 return None;
             }
             if filter1.filter_clause.is_some() || filter1.over_clause.is_some() {
@@ -586,6 +642,7 @@ pub fn try_capture_parameters_column_agnostic(
             distinctness: pattern_distinct,
             args: pattern_args,
             order_by: pattern_order,
+            within_group: pattern_within,
             filter_over: pattern_filter,
         },
         Expr::FunctionCall {
@@ -593,6 +650,7 @@ pub fn try_capture_parameters_column_agnostic(
             distinctness: query_distinct,
             args: query_args,
             order_by: query_order,
+            within_group: query_within,
             filter_over: query_filter,
         },
     ) = (pattern, query)
@@ -617,6 +675,10 @@ pub fn try_capture_parameters_column_agnostic(
     }
     // ORDER BY within function not supported
     if !pattern_order.is_empty() || !query_order.is_empty() {
+        return None;
+    }
+    // WITHIN GROUP not supported
+    if !pattern_within.is_empty() || !query_within.is_empty() {
         return None;
     }
 
@@ -748,6 +810,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 distinctness: distinct1,
                 args: args1,
                 order_by: order1,
+                within_group: within1,
                 filter_over: filter1,
             },
             Expr::FunctionCall {
@@ -755,6 +818,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 distinctness: distinct2,
                 args: args2,
                 order_by: order2,
+                within_group: within2,
                 filter_over: filter2,
             },
         ) => {
@@ -762,6 +826,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 && distinct1 == distinct2
                 && args1 == args2
                 && order1 == order2
+                && within1 == within2
                 && filter1 == filter2
         }
         (
@@ -1451,8 +1516,12 @@ pub struct ViewColumnSchema {
 
 impl ViewColumnSchema {
     /// Get all columns as a flat vector (without table association info)
-    pub fn flat_columns(&self) -> Vec<Column> {
-        self.columns.iter().map(|vc| vc.column.clone()).collect()
+    pub fn flat_columns(&self) -> crate::alloc::Vec<Column> {
+        self.columns
+            .iter()
+            .map(|vc| vc.column.clone())
+            .try_collect()
+            .expect("TODO: fallible allocations")
     }
 
     /// Get columns that belong to a specific table
@@ -2147,7 +2216,7 @@ mod rename_column_view {
     pub struct RewrittenView {
         pub sql: String,
         pub select_stmt: ast::Select,
-        pub columns: Vec<Column>,
+        pub columns: crate::alloc::Vec<Column>,
     }
 
     pub fn rewrite_view_sql_for_column_rename(
@@ -2216,7 +2285,7 @@ mod rename_column_view {
 
             for (i, indexed_col) in view_columns.iter().enumerate() {
                 if let Some(col) = final_columns.get_mut(i) {
-                    col.name = Some(indexed_col.col_name.to_string());
+                    col.name = Some(indexed_col.col_name.as_str().to_string());
                 }
             }
 
@@ -2252,7 +2321,7 @@ mod rename_column_view {
     fn apply_view_column_rename(
         view_columns: ViewColumnSchema,
         ctx: &ViewRewriteCtx,
-    ) -> Vec<Column> {
+    ) -> crate::alloc::Vec<Column> {
         let target_norm = ctx.target_table_norm.as_str();
         let mut columns = view_columns.columns;
 
@@ -2275,19 +2344,23 @@ mod rename_column_view {
             }
         }
 
-        columns.into_iter().map(|vc| vc.column).collect()
+        columns
+            .into_iter()
+            .map(|vc| vc.column)
+            .try_collect()
+            .expect("TODO: fallible allocations")
     }
 
     fn view_columns_from_select(
         select: &ast::Select,
         schema: &Schema,
         explicit: &[ast::IndexedColumn],
-    ) -> Result<Vec<Column>> {
+    ) -> Result<crate::alloc::Vec<Column>> {
         let view_column_schema = extract_view_columns(select, schema)?;
         let mut columns = view_column_schema.flat_columns();
         for (i, indexed_col) in explicit.iter().enumerate() {
             if let Some(col) = columns.get_mut(i) {
-                col.name = Some(indexed_col.col_name.to_string());
+                col.name = Some(indexed_col.col_name.as_str().to_string());
             }
         }
         Ok(columns)
@@ -3072,7 +3145,7 @@ mod rename_column_view {
     fn apply_explicit_column_names(columns: &mut [String], explicit: &[ast::IndexedColumn]) {
         for (i, indexed_col) in explicit.iter().enumerate() {
             if let Some(col) = columns.get_mut(i) {
-                *col = indexed_col.col_name.to_string();
+                *col = indexed_col.col_name.as_str().to_string();
             }
         }
     }
@@ -4763,7 +4836,9 @@ pub mod tests {
     fn test_normalize_ident() {
         assert_eq!(normalize_ident("foo"), "foo");
         assert_eq!(normalize_ident("FOO"), "foo");
-        assert_eq!(normalize_ident("ὈΔΥΣΣΕΎΣ"), "ὀδυσσεύς");
+        // SQLite folds only ASCII; non-ASCII bytes pass through untouched.
+        assert_eq!(normalize_ident("ὈΔΥΣΣΕΎΣ"), "ὈΔΥΣΣΕΎΣ");
+        assert_eq!(normalize_ident("Foo_ΔΥΣ"), "foo_ΔΥΣ");
     }
 
     fn schema_with_tables(create_table_sqls: &[&str]) -> Schema {
@@ -5245,6 +5320,7 @@ pub mod tests {
             distinctness: None,
             args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
+            within_group: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
                 over_clause: None,
@@ -5255,6 +5331,7 @@ pub mod tests {
             distinctness: None,
             args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
+            within_group: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
                 over_clause: None,
@@ -5267,6 +5344,7 @@ pub mod tests {
             distinctness: Some(ast::Distinctness::Distinct),
             args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
+            within_group: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
                 over_clause: None,
@@ -5282,6 +5360,7 @@ pub mod tests {
             distinctness: None,
             args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
+            within_group: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
                 over_clause: None,
@@ -5292,6 +5371,7 @@ pub mod tests {
             distinctness: Some(ast::Distinctness::Distinct),
             args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
+            within_group: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
                 over_clause: None,

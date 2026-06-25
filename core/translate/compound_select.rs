@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
 use crate::translate::collate::get_collseq_from_expr;
@@ -77,13 +78,19 @@ pub fn emit_program_for_compound_select(
                                 .map_err(|_| LimboError::ParseError("invalid limit".to_string()))?;
                             program.emit_insn(Insn::Real { value, dest: reg });
                             program.add_comment(program.offset(), "LIMIT counter");
-                            program.emit_insn(Insn::MustBeInt { reg });
+                            program.emit_insn(Insn::MustBeInt {
+                                reg,
+                                target_pc: None,
+                            });
                         }
                     }
                     _ => {
                         _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
                         program.add_comment(program.offset(), "LIMIT counter");
-                        program.emit_insn(Insn::MustBeInt { reg });
+                        program.emit_insn(Insn::MustBeInt {
+                            reg,
+                            target_pc: None,
+                        });
                     }
                 }
                 Ok::<_, LimboError>(LimitCtx::new_shared(reg))
@@ -120,7 +127,10 @@ pub fn emit_program_for_compound_select(
                     }
                 }
                 program.add_comment(program.offset(), "OFFSET counter");
-                program.emit_insn(Insn::MustBeInt { reg });
+                program.emit_insn(Insn::MustBeInt {
+                    reg,
+                    target_pc: None,
+                });
                 let combined_reg = program.alloc_register();
                 program.add_comment(program.offset(), "OFFSET + LIMIT");
                 program.emit_insn(Insn::OffsetLimit {
@@ -553,7 +563,8 @@ fn create_dedupe_index(
             collation: None,
             expr: None,
         })
-        .collect::<Vec<_>>();
+        .try_collect::<crate::alloc::Vec<_>>()
+        .expect("TODO: fallible allocations");
     for (i, column) in dedupe_columns.iter_mut().enumerate() {
         let left_collation = get_collseq_from_expr(
             &left_select.result_columns[i].expr,
@@ -774,7 +785,8 @@ fn create_collection_index(
             collation: None,
             expr: None,
         })
-        .collect::<Vec<_>>();
+        .try_collect::<crate::alloc::Vec<_>>()
+        .expect("TODO: fallible allocations");
     for (i, column) in columns.iter_mut().enumerate() {
         let left_collation = get_collseq_from_expr(
             &left_select.result_columns[i].expr,
@@ -835,7 +847,7 @@ fn emit_compound_order_by(
     // We append a sequence number as an extra sort key after the ORDER BY columns
     // to break ties by insertion order, matching SQLite's merge-based compound SELECT
     // which naturally outputs left-arm rows before right-arm rows for equal keys.
-    let mut order_collations_nulls: Vec<(
+    let mut order_collations_nulls: crate::alloc::Vec<(
         SortOrder,
         Option<crate::translate::collate::CollationSeq>,
         Option<turso_parser::ast::NullsOrder>,
@@ -848,7 +860,8 @@ fn emit_compound_order_by(
                 .and_then(|c| c.collation);
             (*order, collation, *nulls)
         })
-        .collect();
+        .try_collect()
+        .expect("TODO: fallible allocations");
     // Sequence tie-breaker: preserves insertion order for rows with equal ORDER BY keys
     order_collations_nulls.push((SortOrder::Asc, None, None));
 
@@ -876,18 +889,20 @@ fn emit_compound_order_by(
     let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
     // Resolve custom type comparators for ORDER BY columns (e.g. numeric(10,2) needs
     // NumericLt to sort correctly instead of default blob/text comparison).
-    let mut comparators: Vec<Option<crate::vdbe::insn::SortComparatorType>> = order_by
-        .iter()
-        .map(|(col_idx, _, _)| {
-            program.result_columns.get(*col_idx).and_then(|rc| {
-                custom_type_comparator(
-                    &rc.expr,
-                    &program.table_references,
-                    right_most_ctx.resolver.schema(),
-                )
+    let mut comparators: crate::alloc::Vec<Option<crate::vdbe::insn::SortComparatorType>> =
+        order_by
+            .iter()
+            .map(|(col_idx, _, _)| {
+                program.result_columns.get(*col_idx).and_then(|rc| {
+                    custom_type_comparator(
+                        &rc.expr,
+                        &program.table_references,
+                        right_most_ctx.resolver.schema(),
+                    )
+                })
             })
-        })
-        .collect();
+            .try_collect()
+            .expect("TODO: fallible allocations");
     // No comparator needed for the sequence tie-breaker column
     comparators.push(None);
     program.emit_insn(Insn::SorterOpen {
@@ -991,13 +1006,19 @@ fn emit_compound_order_by(
                             .map_err(|_| LimboError::ParseError("invalid limit".to_string()))?;
                         program.emit_insn(Insn::Real { value, dest: reg });
                         program.add_comment(program.offset(), "LIMIT counter");
-                        program.emit_insn(Insn::MustBeInt { reg });
+                        program.emit_insn(Insn::MustBeInt {
+                            reg,
+                            target_pc: None,
+                        });
                     }
                 }
                 _ => {
                     _ = translate_expr(program, None, limit_expr, reg, &right_most_ctx.resolver);
                     program.add_comment(program.offset(), "LIMIT counter");
-                    program.emit_insn(Insn::MustBeInt { reg });
+                    program.emit_insn(Insn::MustBeInt {
+                        reg,
+                        target_pc: None,
+                    });
                 }
             }
             Ok::<_, LimboError>(reg)
@@ -1023,7 +1044,10 @@ fn emit_compound_order_by(
                 }
             }
             program.add_comment(program.offset(), "OFFSET counter");
-            program.emit_insn(Insn::MustBeInt { reg });
+            program.emit_insn(Insn::MustBeInt {
+                reg,
+                target_pc: None,
+            });
             if let Some(limit_reg) = limit_ctx {
                 let combined_reg = program.alloc_register();
                 program.add_comment(program.offset(), "OFFSET + LIMIT");

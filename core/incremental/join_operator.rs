@@ -47,7 +47,7 @@ fn read_next_join_row(
         ],
     };
 
-    let index_record = ImmutableRecord::from_values(&index_key_values, index_key_values.len());
+    let index_record = ImmutableRecord::from_values(&index_key_values, index_key_values.len())?;
 
     // Use GE (>=) for initial seek with NULL, GT (>) for continuation
     let seek_op = if last_element_hash.is_none() {
@@ -546,7 +546,7 @@ impl JoinOperator {
 
 fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
     let record = ImmutableRecordRef::from_bin_record(blob);
-    let all_values: Vec<Value> = record.get_values_owned()?;
+    let all_values = record.get_values_owned()?;
 
     if all_values.is_empty() {
         return Err(crate::LimboError::InternalError(
@@ -565,20 +565,22 @@ fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
     };
 
     // Rest are the row values
+    // TODO: std boundary conversion; adjust once incremental uses the
+    // allocator with fallible allocations everywhere.
     let values = all_values[1..].to_vec();
 
     Ok(HashableRow::new(rowid, values))
 }
 
-fn serialize_hashable_row(row: &HashableRow) -> Vec<u8> {
+fn serialize_hashable_row(row: &HashableRow) -> Result<Vec<u8>> {
     use crate::types::ImmutableRecord;
 
     let mut all_values = Vec::with_capacity(row.values.len() + 1);
     all_values.push(Value::from_i64(row.rowid));
     all_values.extend_from_slice(&row.values);
 
-    let record = ImmutableRecord::from_values(&all_values, all_values.len());
-    record.as_blob().clone()
+    let record = ImmutableRecord::from_values(&all_values, all_values.len())?;
+    Ok(record.as_blob().clone())
 }
 
 impl IncrementalOperator for JoinOperator {
@@ -649,7 +651,7 @@ impl IncrementalOperator for JoinOperator {
                     ];
 
                     // The record values: we'll store the serialized row as a blob
-                    let row_blob = serialize_hashable_row(row);
+                    let row_blob = serialize_hashable_row(row)?;
                     let record_values = vec![
                         Value::from_i64(self.left_storage_id()),
                         zset_hash.to_value(),
@@ -697,7 +699,7 @@ impl IncrementalOperator for JoinOperator {
                     ];
 
                     // The record values: we'll store the serialized row as a blob
-                    let row_blob = serialize_hashable_row(row);
+                    let row_blob = serialize_hashable_row(row)?;
                     let record_values = vec![
                         Value::from_i64(self.right_storage_id()),
                         zset_hash.to_value(),

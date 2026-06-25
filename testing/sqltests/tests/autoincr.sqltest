@@ -2,12 +2,21 @@
 @skip-file-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 
 # Test: Create an AUTOINCREMENT table and verify sqlite_sequence is also created.
+#
+# Turso-only: SQLite does not maintain the internal
+# `__turso_internal_seq___turso_internal_autoincrement_*` backing table
+# (Turso's disk-only sequence allocator) so the schema listing differs.
+# The `sqlite_sequence` row creation is exercised by every other
+# AUTOINCREMENT test in this file, so the SQLite cross-check coverage
+# is preserved.
+@skip-if sqlite "Turso-specific internal backing table not present in SQLite"
 @cross-check-integrity
 test autoinc-create-sequence-table {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;
 }
 expect {
+    __turso_internal_seq___turso_internal_autoincrement_t1
     sqlite_sequence
     t1
 }

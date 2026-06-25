@@ -667,7 +667,10 @@ pub fn emit_upsert(
                 dst_reg: r,
                 extra_amount: 0,
             });
-            program.emit_insn(Insn::MustBeInt { reg: r });
+            program.emit_insn(Insn::MustBeInt {
+                reg: r,
+                target_pc: None,
+            });
             new_rowid_reg = Some(r);
         }
     }
@@ -1197,6 +1200,37 @@ pub fn emit_upsert(
                 .skip_last_rowid(),
             table_name: table.get_name().to_string(),
         });
+
+        // MVCC AUTOINCREMENT: an ON CONFLICT DO UPDATE that moves the rowid
+        // forward must advance the implicit sequence past the new rowid, just
+        // like an explicit-rowid INSERT or a plain UPDATE does. The MVCC
+        // allocator trusts the backing-table watermark ONLY (it never consults
+        // MAX(rowid)), so without this a later AUTOINCREMENT INSERT would emit
+        // a value at or below the manually-set rowid and eventually collide.
+        // WAL mode is unaffected: its NewRowid path already takes the max of
+        // sqlite_sequence.seq and MAX(rowid), so it skips past the new rowid
+        // automatically. Mirrors the UPDATE path in emitter/update.rs.
+        if table.btree().is_some_and(|bt| bt.has_autoincrement)
+            && connection.mv_store_for_db(upsert_database_id).is_some()
+        {
+            let seq_name = crate::schema::autoincrement_sequence_name(table.get_name());
+            let seq = resolver
+                .with_schema(upsert_database_id, |s| s.get_sequence(&seq_name).cloned())
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError(format!(
+                        "missing implicit sequence for AUTOINCREMENT table \"{}\"",
+                        table.get_name()
+                    ))
+                })?;
+            crate::translate::sequence::emit_disk_advance_past(
+                program,
+                resolver,
+                upsert_database_id,
+                &seq_name,
+                &seq,
+                rnew,
+            )?;
+        }
     } else {
         program.emit_insn(Insn::Insert {
             cursor: ctx.cursor_id,

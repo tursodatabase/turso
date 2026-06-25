@@ -52,7 +52,8 @@ use crate::{
 };
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
-    constraints_from_where_clause, usable_constraints_for_join_order, Constraint,
+    can_use_partial_index, constraints_from_where_clause, partial_index,
+    partial_index_predicate_terms, usable_constraints_for_join_order, Constraint,
     ConstraintOperator, ConstraintRef,
 };
 use cost::Cost;
@@ -627,6 +628,7 @@ fn transform_match_to_fts_match(
                         distinctness: None,
                         args,
                         order_by: vec![],
+                        within_group: vec![],
                         filter_over: FunctionTail {
                             filter_clause: None,
                             over_clause: None,
@@ -1121,7 +1123,7 @@ fn update_from_scratch_col_name(idx: usize) -> String {
     format!("__update_from_{idx}")
 }
 
-fn update_from_scratch_columns(set_clause_count: usize) -> Vec<Column> {
+fn update_from_scratch_columns(set_clause_count: usize) -> crate::alloc::Vec<Column> {
     (0..set_clause_count)
         .map(|idx| {
             // Keep scratch-table columns at BLOB affinity so materializing SET payloads
@@ -1136,7 +1138,8 @@ fn update_from_scratch_columns(set_clause_count: usize) -> Vec<Column> {
                 ColDef::default(),
             )
         })
-        .collect()
+        .try_collect()
+        .expect("TODO: fallible allocations")
 }
 
 /// Build the SELECT that gathers the stable write set for an UPDATE before the
@@ -1155,17 +1158,17 @@ fn build_update_write_set_plan(
     let columns = if is_update_from {
         update_from_scratch_columns(plan.set_clauses.len())
     } else {
-        vec![(*ROWID_COLUMN).clone()]
+        crate::alloc::vec![(*ROWID_COLUMN).clone()]
     };
     let ephemeral_table = Arc::new(BTreeTable::new(
         0, // root_page, not relevant for ephemeral table definition
         "ephemeral_scratch".to_string(),
-        vec![],
+        crate::alloc::vec![],
         columns,
         BTreeCharacteristics::HAS_ROWID,
-        vec![],
-        vec![],
-        vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     ));
 
@@ -1754,6 +1757,8 @@ fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInterna
 fn enforce_indexed_by_hints(
     table_references: &TableReferences,
     available_indexes: &AvailableIndexes,
+    where_clause: &[WhereTerm],
+    simple_aggregate: Option<&SimpleAggregate>,
     constraints_per_table: &mut [TableConstraints],
 ) -> Result<()> {
     for (i, table_ref) in table_references.joined_tables().iter().enumerate() {
@@ -1775,6 +1780,21 @@ fn enforce_indexed_by_hints(
                 let Some(forced_index) = forced_index else {
                     crate::bail_parse_error!("no such index: {}", idx_name);
                 };
+                let forced_partial_index_unusable = forced_index.where_clause.is_some()
+                    && !can_use_partial_index(forced_index.as_ref(), table_ref, where_clause);
+                if forced_partial_index_unusable
+                    && matches!(simple_aggregate, Some(SimpleAggregate::Count))
+                {
+                    // SQLite's isSimpleCount() path emits OP_Count without
+                    // invoking sqlite3WhereBegin(), so a forced unusable
+                    // partial index is ignored here instead of causing
+                    // "no query solution".
+                    cs.candidates.retain(|c| c.index.is_none());
+                    continue;
+                }
+                if forced_partial_index_unusable {
+                    crate::bail_parse_error!("no query solution");
+                }
                 // Keep only the candidate for the forced index.
                 let forced_index = forced_index.clone();
                 cs.candidates.retain(|c| {
@@ -1923,13 +1943,6 @@ fn optimize_table_access(
         params,
     )?;
 
-    // Enforce INDEXED BY / NOT INDEXED hints on constraint candidates.
-    enforce_indexed_by_hints(
-        table_references,
-        available_indexes,
-        &mut constraints_per_table,
-    )?;
-
     let base_table_rows = table_references
         .joined_tables()
         .iter()
@@ -2001,12 +2014,18 @@ fn optimize_table_access(
             schema,
             params,
         )?;
-        enforce_indexed_by_hints(
-            table_references,
-            available_indexes,
-            &mut constraints_per_table,
-        )?;
     }
+
+    // Enforce INDEXED BY / NOT INDEXED after outer-join rewrites settle, because
+    // a null-rejecting WHERE term can turn a LEFT JOIN into an INNER JOIN and
+    // then safely prove a forced partial index.
+    enforce_indexed_by_hints(
+        table_references,
+        available_indexes,
+        where_clause,
+        simple_aggregate,
+        &mut constraints_per_table,
+    )?;
 
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
@@ -2213,6 +2232,18 @@ fn optimize_table_access(
                     let try_to_build_ephemeral_index = !is_leftmost_table && !uses_index;
 
                     if !try_to_build_ephemeral_index {
+                        if let Some(index) = partial_index(index.as_ref()) {
+                            let is_outer_join = table_references.joined_tables()[table_idx]
+                                .join_info
+                                .as_ref()
+                                .is_some_and(|join_info| join_info.is_outer());
+                            mark_partial_index_predicate_terms_consumed(
+                                index,
+                                &table_references.joined_tables()[table_idx],
+                                where_clause,
+                                is_outer_join,
+                            );
+                        }
                         table_references.joined_tables_mut()[table_idx].op =
                             Operation::Scan(Scan::BTreeTable {
                                 iter_dir: *iter_dir,
@@ -2234,14 +2265,17 @@ fn optimize_table_access(
                             });
                         continue;
                     };
-                    // Ephemeral indexes mirror rowid/column lookups. If the constraint targets an
-                    // expression (table_col_pos == None) we cannot derive a seek key that matches
-                    // the row layout, so fall back to a scan in that situation.
+                    // Ephemeral indexes mirror rowid/column lookups; expression-index
+                    // constraints (table_col_pos == None) fall back to a scan.
+                    let table_columns = table_references.joined_tables()[table_idx].table.columns();
+                    let is_strict = table_references.joined_tables()[table_idx]
+                        .table
+                        .is_strict();
                     let usable: Vec<(usize, &Constraint)> = table_constraints
                         .constraints
                         .iter()
                         .enumerate()
-                        .filter(|(_, c)| c.usable && c.table_col_pos.is_some())
+                        .filter(|(_, c)| c.can_drive_index_seek(table_columns, is_strict))
                         .collect();
                     // Find this table's position in best_join_order (which excludes build tables)
                     let join_order_pos = best_join_order
@@ -2329,11 +2363,19 @@ fn optimize_table_access(
                             )?,
                         });
                 } else {
-                    let is_outer_join = table_references.joined_tables_mut()[table_idx]
+                    let is_outer_join = table_references.joined_tables()[table_idx]
                         .join_info
                         .as_ref()
                         .is_some_and(|join_info| join_info.is_outer());
                     let defer_cross_table_constraints = hash_join_build_only_tables.get(table_idx);
+                    if let Some(index) = partial_index(index.as_ref()) {
+                        mark_partial_index_predicate_terms_consumed(
+                            index,
+                            &table_references.joined_tables()[table_idx],
+                            where_clause,
+                            is_outer_join,
+                        );
+                    }
                     mark_seek_constraints_consumed(
                         &constraints_per_table[table_idx].constraints,
                         constraint_refs,
@@ -2555,6 +2597,18 @@ fn optimize_table_access(
                         ));
                     }
                 };
+                let is_outer_join = table_references.joined_tables()[table_idx]
+                    .join_info
+                    .as_ref()
+                    .is_some_and(|join_info| join_info.is_outer());
+                if let Some(index) = partial_index(index.as_ref()) {
+                    mark_partial_index_predicate_terms_consumed(
+                        index,
+                        &table_references.joined_tables()[table_idx],
+                        where_clause,
+                        is_outer_join,
+                    );
+                }
                 where_clause[*where_term_idx].consumed = true;
                 table_references.joined_tables_mut()[table_idx].op =
                     Operation::Search(Search::InSeek {
@@ -2739,6 +2793,26 @@ fn mark_seek_constraints_consumed(
             }
             where_term.consumed = true;
         }
+    }
+}
+
+fn mark_partial_index_predicate_terms_consumed(
+    index: &Index,
+    table_reference: &JoinedTable,
+    where_clause: &mut [WhereTerm],
+    is_outer_join: bool,
+) {
+    let predicate_terms = partial_index_predicate_terms(index, table_reference, where_clause)
+        .expect("selected partial index predicate must be implied by query");
+    for term_idx in predicate_terms {
+        let where_term = &mut where_clause[term_idx];
+        if where_term.consumed {
+            continue;
+        }
+        if is_outer_join && where_term.from_outer_join != Some(table_reference.internal_id) {
+            continue;
+        }
+        where_term.consumed = true;
     }
 }
 
@@ -3141,7 +3215,7 @@ fn ephemeral_index_build(
     table_reference: &JoinedTable,
     constraint_refs: &[RangeConstraintRef],
 ) -> Index {
-    let mut ephemeral_columns: Vec<IndexColumn> = table_reference
+    let mut ephemeral_columns: crate::alloc::Vec<IndexColumn> = table_reference
         .columns()
         .iter()
         .enumerate()
@@ -3161,7 +3235,8 @@ fn ephemeral_index_build(
         })
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))
-        .collect();
+        .try_collect()
+        .expect("TODO: fallible allocations");
     // sort so that constraints first, then rest in whatever order they were in in the table
     ephemeral_columns.sort_by(|a, b| {
         let a_constraint = constraint_refs
@@ -3682,6 +3757,7 @@ mod tests {
             distinctness: None,
             args: args.into_iter().map(Box::new).collect(),
             order_by: vec![],
+            within_group: vec![],
             filter_over: no_tail(),
         }
     }
