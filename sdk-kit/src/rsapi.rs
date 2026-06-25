@@ -27,7 +27,7 @@ use turso_core::{
 use crate::{
     assert_send, assert_sync,
     capi::{self, c},
-    ConcurrentGuard,
+    ConcurrentGuard, IoBackend,
 };
 
 assert_send!(TursoDatabase, TursoConnection, TursoStatement);
@@ -55,7 +55,7 @@ pub struct TursoLog<'a> {
     pub level: &'a str,
 }
 
-type Logger = dyn Fn(TursoLog) + Send + Sync + 'static;
+type Logger = dyn Fn(TursoLog<'_>) + Send + Sync + 'static;
 pub struct TursoSetupConfig {
     pub logger: Option<Box<Logger>>,
     pub log_level: Option<String>,
@@ -139,7 +139,7 @@ pub struct TursoDatabaseConfig {
     /// - "memory": in-memory backend
     /// - "syscall": generic syscall backend
     /// - "io_uring": IO uring (supported only on Linux)
-    pub vfs: Option<String>,
+    pub vfs: IoBackend,
 
     /// optional custom IO provided by the caller
     pub io: Option<Arc<dyn IO>>,
@@ -314,9 +314,9 @@ impl TursoDatabaseConfig {
                 hexkey: encryption_hexkey.unwrap(),
             }),
             vfs: if !config.vfs.is_null() {
-                Some(str_from_c_str(config.vfs)?.to_string())
+                str_from_c_str(config.vfs)?.into()
             } else {
-                None
+                IoBackend::Default
             },
             io: None,
             db_file: None,
@@ -494,7 +494,7 @@ static SETUP: Once = Once::new();
 
 struct CallbackLayer<F>
 where
-    F: Fn(TursoLog) + Send + Sync + 'static,
+    F: Fn(TursoLog<'_>) + Send + Sync + 'static,
 {
     callback: F,
 }
@@ -502,7 +502,7 @@ where
 impl<S, F> tracing_subscriber::Layer<S> for CallbackLayer<F>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    F: Fn(TursoLog) + Send + Sync + 'static,
+    F: Fn(TursoLog<'_>) + Send + Sync + 'static,
 {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let mut buffer = String::new();
@@ -609,9 +609,9 @@ impl TursoDatabase {
         let io: Arc<dyn turso_core::IO + 'static> = if let Some(io) = &self.config.io {
             io.clone()
         } else {
-            match self.config.vfs.as_deref() {
-                Some("memory") => Arc::new(turso_core::MemoryIO::new()),
-                Some("syscall") => {
+            match self.config.vfs {
+                IoBackend::Memory => Arc::new(turso_core::MemoryIO::new()),
+                IoBackend::Syscall => {
                     #[cfg(all(target_family = "unix", not(miri)))]
                     {
                         Arc::new(turso_core::UnixIO::new().map_err(|e| {
@@ -630,31 +630,29 @@ impl TursoDatabase {
                     }
                 }
                 #[cfg(all(target_os = "linux", not(miri)))]
-                Some("io_uring") => Arc::new(turso_core::UringIO::new().map_err(|e| {
+                IoBackend::IoUring => Arc::new(turso_core::UringIO::new().map_err(|e| {
                     TursoError::Error(format!("unable to create io_uring backend: {e}"))
                 })?),
                 #[cfg(all(target_os = "windows", not(miri)))]
-                Some("experimental_win_iocp") => {
-                    Arc::new(turso_core::WindowsIOCP::new().map_err(|e| {
-                        TursoError::Error(format!("unable to create win_iocp backend: {e}"))
-                    })?)
-                }
+                IoBackend::IOCP => Arc::new(turso_core::WindowsIOCP::new().map_err(|e| {
+                    TursoError::Error(format!("unable to create win_iocp backend: {e}"))
+                })?),
                 #[cfg(any(not(target_os = "linux"), miri))]
-                Some("io_uring") => {
+                IoBackend::IoUring => {
                     return Err(TursoError::Error(
                         "io_uring is only available on Linux targets".to_string(),
                     ));
                 }
                 #[cfg(any(not(target_os = "windows"), miri))]
-                Some("experimental_win_iocp") => {
+                IoBackend::IOCP => {
                     return Err(TursoError::Error(
                         "win_iocp is only available on Windows targets".to_string(),
                     ));
                 }
-                Some(vfs) => {
+                IoBackend::Other(ref vfs) => {
                     Database::io_for_vfs(vfs).map_err(|e| TursoError::Error(format!("{e}")))?
                 }
-                None => match self.config.path.as_str() {
+                IoBackend::Default => match self.config.path.as_str() {
                     ":memory:" => Arc::new(turso_core::MemoryIO::new()),
                     _ => Arc::new(turso_core::PlatformIO::new()?),
                 },
@@ -1439,8 +1437,9 @@ impl TursoStatement {
 
 #[cfg(test)]
 mod tests {
-    use crate::rsapi::{
-        TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR,
+    use crate::{
+        rsapi::{TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR},
+        IoBackend,
     };
     use turso_core::Value;
 
@@ -1450,7 +1449,7 @@ mod tests {
             experimental_features: features.map(str::to_string),
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         }
@@ -1500,7 +1499,7 @@ mod tests {
                 experimental_features: None,
                 async_io: false,
                 encryption: None,
-                vfs: None,
+                vfs: IoBackend::Default,
                 io: None,
                 db_file: None,
             });
@@ -1561,7 +1560,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1581,7 +1580,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1611,7 +1610,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1634,7 +1633,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1684,7 +1683,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1743,7 +1742,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1775,7 +1774,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1804,7 +1803,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1829,7 +1828,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1855,7 +1854,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1905,7 +1904,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1993,7 +1992,7 @@ mod tests {
                     experimental_features: Some("encryption".to_string()),
                     async_io: false,
                     encryption: Some(create_encryption_opts()),
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
                 });
@@ -2033,7 +2032,7 @@ mod tests {
                     experimental_features: Some("encryption".to_string()),
                     async_io: false,
                     encryption: Some(create_encryption_opts()),
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
                 });
@@ -2059,7 +2058,7 @@ mod tests {
                         cipher: TEST_CIPHER.to_string(),
                         hexkey: WRONG_HEXKEY.to_string(),
                     }),
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
                 });
@@ -2073,7 +2072,7 @@ mod tests {
                     experimental_features: Some("encryption".to_string()),
                     async_io: false,
                     encryption: None,
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
                 });
@@ -2108,7 +2107,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -2145,7 +2144,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -2179,7 +2178,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -2213,7 +2212,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });

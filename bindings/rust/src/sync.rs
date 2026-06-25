@@ -16,6 +16,7 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use tokio::sync::mpsc;
+use turso_sdk_kit::IoBackend;
 
 use crate::{connection::Connection, Error, Result};
 
@@ -337,7 +338,7 @@ impl Builder {
             // IMPORTANT: async IO must be turned on to delegate IO to this layer.
             async_io: true,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         };

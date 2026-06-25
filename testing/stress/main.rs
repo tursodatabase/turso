@@ -689,11 +689,9 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     spawn_log_level_watcher(reload_handle);
     println!("tracing_log={tracing_log_path}");
 
-    let vfs_option = opts.vfs.clone();
-
     let mut builder = Builder::new_local(&db_file);
-    if let Some(ref vfs) = vfs_option {
-        builder = builder.with_io(vfs.clone());
+    if let Some(vfs) = &opts.vfs {
+        builder = builder.with_io(vfs);
     }
     let db = Arc::new(Mutex::new(builder.build().await?));
 
@@ -785,7 +783,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
         let nr_iterations = opts.nr_iterations;
         let db = db.clone();
-        let vfs_for_task = vfs_option.clone();
+        let vfs_for_task = opts.vfs.clone();
         let schema_for_task = schema.clone();
         let busy_timeout = opts.busy_timeout;
         let tx_mode = opts.tx_mode;
@@ -811,8 +809,8 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     // Reopen the database
                     let mut db_guard = db.lock().await;
                     let mut builder = Builder::new_local(&db_file);
-                    if let Some(ref vfs) = vfs_for_task {
-                        builder = builder.with_io(vfs.clone());
+                    if let Some(vfs) = &vfs_for_task {
+                        builder = builder.with_io(vfs);
                     }
                     *db_guard = builder.build().await?;
                     conn = db_guard.connect()?;
@@ -1013,8 +1011,8 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     // SQLite/rusqlite doesn't understand MVCC journal mode.
     if opts.tx_mode == TxMode::Concurrent {
         let mut builder = Builder::new_local(&db_file);
-        if let Some(ref vfs) = vfs_option {
-            builder = builder.with_io(vfs.clone());
+        if let Some(vfs) = &opts.vfs {
+            builder = builder.with_io(vfs);
         }
         let db = builder.build().await?;
         let conn = db.connect()?;
