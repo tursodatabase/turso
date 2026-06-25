@@ -121,6 +121,37 @@ jobs:
           path: coverage/
           retention-days: 14
 
+  build-windows-arm64-cli:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-windows-arm64-cli"
+          cache-on-failure: true
+      - uses: "./.github/shared/setup-sccache"
+      - name: Build Windows ARM64 CLI
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (!(Test-Path $vswhere)) {
+            throw "vswhere.exe not found"
+          }
+
+          $vcvars = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -find "VC\Auxiliary\Build\vcvarsall.bat" | Select-Object -First 1
+          if (!$vcvars) {
+            throw "Visual Studio ARM64 build tools not found"
+          }
+
+          & $env:ComSpec /c "call `"$vcvars`" x64_arm64 >nul && set CC_aarch64_pc_windows_msvc=cl.exe && cargo build -p turso_cli --bin tursodb --locked --target aarch64-pc-windows-msvc"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
   shuttle-tests:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
