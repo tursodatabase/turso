@@ -1,4 +1,5 @@
 using System.Collections;
+using System.ComponentModel;
 using System.Data;
 using System.Data.Common;
 using System.Globalization;
@@ -8,25 +9,27 @@ namespace Turso;
 internal sealed class TursoRemoteDataReader : DbDataReader
 {
     private readonly TursoConnection? _connection;
-    private readonly RemoteStatementResult _result;
+    private readonly IReadOnlyList<RemoteStatementResult> _results;
     private readonly CommandBehavior _behavior;
     private readonly int _recordsAffected;
+    private int _resultIndex;
     private int _rowIndex = -1;
     private bool _isClosed;
 
     public TursoRemoteDataReader(TursoCommand command, RemoteStatementResult result, CommandBehavior behavior)
-        : this(command.Connection as TursoConnection, result, behavior)
+        : this(command.Connection as TursoConnection, [result], behavior)
     {
     }
 
-    private TursoRemoteDataReader(TursoConnection? connection, RemoteStatementResult result, CommandBehavior behavior)
+    public TursoRemoteDataReader(TursoConnection? connection, IReadOnlyList<RemoteStatementResult> results, CommandBehavior behavior)
     {
-        ArgumentNullException.ThrowIfNull(result);
+        ArgumentNullException.ThrowIfNull(results);
 
         _connection = connection;
-        _result = result;
+        _results = results;
         _behavior = behavior;
-        _recordsAffected = checked((int)result.AffectedRowCount);
+        foreach (var result in results)
+            _recordsAffected = checked(_recordsAffected + (int)result.AffectedRowCount);
     }
 
     public override bool GetBoolean(int ordinal)
@@ -206,8 +209,15 @@ internal sealed class TursoRemoteDataReader : DbDataReader
     public override bool NextResult()
     {
         EnsureOpen();
-        _rowIndex = CurrentResult.Rows.Count;
-        return false;
+        if (_resultIndex + 1 >= _results.Count)
+        {
+            _rowIndex = CurrentResult.Rows.Count;
+            return false;
+        }
+
+        _resultIndex++;
+        _rowIndex = -1;
+        return true;
     }
 
     public override Task<bool> NextResultAsync(CancellationToken cancellationToken)
@@ -253,7 +263,16 @@ internal sealed class TursoRemoteDataReader : DbDataReader
         return new DbEnumerator(this, closeReader: false);
     }
 
-    private RemoteStatementResult CurrentResult => _result;
+    private RemoteStatementResult CurrentResult
+    {
+        get
+        {
+            if (_results.Count == 0)
+                throw new InvalidOperationException("The data reader has no result sets.");
+
+            return _results[_resultIndex];
+        }
+    }
 
     private bool HasCurrentRow => _rowIndex >= 0 && _rowIndex < CurrentResult.Rows.Count;
 
