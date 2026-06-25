@@ -16,6 +16,7 @@
     <PackageProjectUrl>https://github.com/tursodatabase/turso</PackageProjectUrl>
     <RepositoryUrl>https://github.com/tursodatabase/turso</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);1591;EF1001</NoWarn>
   </PropertyGroup>
@@ -26,5 +27,9 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Turso.Data.Sqlite\Turso.Data.Sqlite.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\Readme.md" Pack="true" PackagePath="README.md" />
   </ItemGroup>
 </Project>
