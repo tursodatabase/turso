@@ -6752,7 +6752,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Rule 1: Aborted garbage (begin=None, end=None) — always remove.
     /// Rule 2: Superseded (end=Timestamp(e), e <= lwm) — remove unless it's a
     ///         tombstone (no committed current version) whose deletion hasn't
-    ///         been checkpointed (e > ckpt_max).
+    ///         been checkpointed (e > ckpt_max), or a B-tree-resident version
+    ///         whose physical delete/overwrite hasn't been checkpointed.
     /// Rule 3: Current checkpointed sole-survivor (end=None, b <= ckpt_max,
     ///         b < lwm, no other versions remain) — remove.
     ///
@@ -6767,7 +6768,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // removable — UNLESS it's a tombstone (sole version, no committed
         // current version) whose deletion hasn't been checkpointed to B-tree
         // yet. In that case removing it would let the dual cursor fall through
-        // to a stale B-tree row.
+        // to a stale B-tree row. A B-tree-resident version needs the same guard
+        // even with a committed current replacement: that replacement can be
+        // deleted before checkpoint, leaving this as the only evidence that
+        // checkpoint must remove or overwrite the physical row.
         //
         // has_current only counts committed current versions (begin=Timestamp).
         // Pending inserts (begin=TxID) don't count — they might roll back,
@@ -6777,8 +6781,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         });
         versions.retain(|rv| match &rv.end() {
             Some(TxTimestampOrID::Timestamp(e)) if *e <= lwm => {
-                // Retain only if this is a tombstone AND not yet checkpointed.
-                !has_current && *e > ckpt_max
+                // Also retain B-tree-resident versions until checkpoint makes the physical change durable.
+                *e > ckpt_max && (rv.btree_resident || !has_current)
             }
             _ => true,
         });
