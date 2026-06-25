@@ -108,6 +108,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      id-token: write  # required for Azure OIDC login (code signing on Windows)
     defaults:
       run:
         working-directory: ${{ env.working-directory }}
@@ -188,7 +189,33 @@ jobs:
       - name: Build rust native library
         if: ${{ !contains(matrix.target, 'unknown-linux-gnu') && !contains(matrix.target, 'apple-darwin') && !contains(matrix.target, 'apple-ios') }}
         run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official'
-      
+
+      # Code-sign the Windows native DLL with Azure Artifact Signing (formerly
+      # Trusted Signing). Runs only for the windows-msvc targets and only when
+      # the AZURE_SIGNING_ENABLED repo variable is set to "true" (so forks and
+      # PRs without access to the signing secrets are skipped). The action only
+      # works on Windows runners, which is why signing happens here in the
+      # native build job rather than in the Linux pack/publish job.
+      - name: Azure login (OIDC) for code signing
+        if: ${{ contains(matrix.target, 'pc-windows-msvc') && vars.AZURE_SIGNING_ENABLED == 'true' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Code sign Windows native library
+        if: ${{ contains(matrix.target, 'pc-windows-msvc') && vars.AZURE_SIGNING_ENABLED == 'true' }}
+        uses: azure/trusted-signing-action@v0
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_CERT_PROFILE }}
+          files: ${{ github.workspace }}/bindings/dotnet/rs_compiled/${{ matrix.target }}/release-official/turso_sdk_kit.dll
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
       - name: Upload rust native library
         uses: actions/upload-artifact@v6
         with:
