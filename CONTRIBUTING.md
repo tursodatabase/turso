@@ -64,7 +64,7 @@ cargo test
 
 ### Configuring `mold` Linker
 
-The `mold` linker can reduce your build time from a minute to just few seconds.
+The `mold` linker (Linux only) can reduce your build time from a minute to just few seconds.
 
 First, install `mold`:
 
