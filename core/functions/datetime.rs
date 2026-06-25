@@ -1673,7 +1673,6 @@ mod tests {
             Value::build_text("2024.07.21"),
             Value::build_text("07/21/2024"),
             Value::build_text("21/07/2024"),
-
         ];
 
         for case in invalid_cases {
@@ -1702,15 +1701,12 @@ mod tests {
             "1e309 minutes",
             "1e309 seconds",
             "1e309 months",
-            "1e309 years"
+            "1e309 years",
         ];
 
         for modifier in modifiers {
             assert_eq!(
-                exec_datetime_full(&[
-                    Value::build_text("now"),
-                    Value::build_text(modifier),
-                ]),
+                exec_datetime_full(&[Value::build_text("now"), Value::build_text(modifier),]),
                 Value::Null,
                 "modifier: {modifier}"
             );
@@ -1867,28 +1863,18 @@ mod tests {
         let valid = ["+24:59", "-24:59"];
 
         for modifier in valid {
-            assert_ne!(exec_datetime_full(&[
-                    Value::build_text("now"),
-                    Value::build_text(modifier),
-                ]),
+            assert_ne!(
+                exec_datetime_full(&[Value::build_text("now"), Value::build_text(modifier),]),
                 Value::Null,
                 "modifier: {modifier}"
             );
         }
 
-        let invalid = [
-            "+25:00",
-            "+25:01",
-            "-25:00",
-            "-25:01",
-        ];
+        let invalid = ["+25:00", "+25:01", "-25:00", "-25:01"];
 
         for modifier in invalid {
             assert_eq!(
-                exec_datetime_full(&[
-                    Value::build_text("now"),
-                    Value::build_text(modifier),
-                ]),
+                exec_datetime_full(&[Value::build_text("now"), Value::build_text(modifier),]),
                 Value::Null,
                 "modifier: {modifier}"
             );
@@ -1927,16 +1913,10 @@ mod tests {
         ];
 
         for modifier in modifiers {
-            let result = exec_datetime_full(&[
-                Value::build_text("2023-06-15"),
-                Value::build_text(modifier),
-            ]);
+            let result =
+                exec_datetime_full(&[Value::build_text("2023-06-15"), Value::build_text(modifier)]);
 
-            assert_eq!(
-                result,
-                Value::Null,
-                "modifier: {modifier}"
-            );
+            assert_eq!(result, Value::Null, "modifier: {modifier}");
         }
     }
 
@@ -2104,8 +2084,6 @@ mod tests {
             Value::build_text("-0001-12-31 23:59:59")
         );
 
-        
-
         assert_eq!(
             exec_datetime_full(&[
                 Value::build_text("0000-01-01 00:00:00"),
@@ -2121,7 +2099,7 @@ mod tests {
             ]),
             Value::build_text("-0001-12-01 00:00:00")
         );
-        
+
         assert_eq!(
             exec_datetime_full(&[
                 Value::build_text("0000-01-01 00:00:00"),
