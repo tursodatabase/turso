@@ -242,7 +242,6 @@
 #![warn(missing_docs, unsafe_op_in_unsafe_fn)]
 
 pub mod base;
-pub mod collector;
 
 #[doc(inline)]
 pub use base::{SkipList, SkiplistAllocator};

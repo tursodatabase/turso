@@ -6,7 +6,6 @@ use std::{
 };
 
 use crate::skiplist::SkipMap;
-use crossbeam_epoch as epoch;
 use crossbeam_utils::thread;
 
 #[test]
@@ -15,35 +14,6 @@ fn smoke() {
     m.insert(1, 10);
     m.insert(5, 50);
     m.insert(7, 70);
-}
-
-#[test]
-fn custom_collector() {
-    let collector = epoch::Collector::new();
-    let m = SkipMap::with_collector(collector);
-
-    let first = m.insert(1, 10);
-    assert_eq!(*first.value(), 10);
-    drop(first);
-
-    m.insert(2, 20);
-    assert_eq!(*m.get(&1).unwrap().value(), 10);
-
-    let mut entry = m.front().unwrap();
-    assert!(entry.move_next());
-    assert_eq!(*entry.key(), 2);
-
-    let mut iter = m.iter();
-    assert_eq!(*iter.next().unwrap().key(), 1);
-    drop(iter);
-
-    let mut range = m.range(1..=2);
-    assert_eq!(*range.next_back().unwrap().key(), 2);
-    drop(range);
-
-    assert_eq!(*m.remove(&1).unwrap().value(), 10);
-    m.clear();
-    assert!(m.is_empty());
 }
 
 #[test]

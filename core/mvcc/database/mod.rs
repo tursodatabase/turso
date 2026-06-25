@@ -48,7 +48,6 @@ use crate::{
     turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable, Numeric,
 };
 use crate::{Connection, Pager, SyncMode};
-use crossbeam_epoch as epoch;
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
 use std::collections::{BTreeSet, HashMap as StdHashMap};
@@ -3741,10 +3740,6 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// Allocator backing every skiplist in this store, including lazily
     /// created per-index maps in `index_rows`.
     alloc: A,
-    /// Collector backing every skiplist in this store. Embedders that need
-    /// store-scoped deferred destruction can inject a dedicated collector with
-    /// `new_in_with_collector`.
-    skiplist_collector: epoch::Collector,
     tx_ids: AtomicU64,
     version_id_counter: AtomicU64,
     next_rowid: AtomicU64,
@@ -3862,17 +3857,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         clock: Clock,
         storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
     ) -> Result<Self> {
-        Self::new_with_collector(clock, storage, epoch::default_collector().clone())
-    }
-
-    /// Creates a new database backed by the default [`TursoAllocator`] whose
-    /// skiplists use `collector`.
-    pub fn new_with_collector(
-        clock: Clock,
-        storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
-        collector: epoch::Collector,
-    ) -> Result<Self> {
-        Self::new_in_with_collector(clock, storage, TursoAllocator, collector)
+        Self::new_in(clock, storage, TursoAllocator)
     }
 }
 
@@ -3929,28 +3914,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
         alloc: A,
     ) -> Result<Self> {
-        Self::new_in_with_collector(clock, storage, alloc, epoch::default_collector().clone())
-    }
-
-    /// Creates a new database whose skiplists allocate through `alloc` and use
-    /// `collector` for epoch reclamation.
-    pub fn new_in_with_collector(
-        clock: Clock,
-        storage: Arc<dyn crate::mvcc::persistent_storage::DurableStorage>,
-        alloc: A,
-        collector: epoch::Collector,
-    ) -> Result<Self> {
-        let table_id_to_rootpage = SkipMap::with_collector_in(collector.clone(), alloc.clone());
+        let table_id_to_rootpage = SkipMap::new_in(alloc.clone());
         // table id 1 / root page 1 is always sqlite_schema.
         Self::insert_initial_rootpage_mapping(&table_id_to_rootpage)?;
         Ok(Self {
-            rows: SkipMap::with_collector_in(collector.clone(), alloc.clone()),
+            rows: SkipMap::new_in(alloc.clone()),
             table_id_to_rootpage,
-            index_rows: SkipMap::with_collector_in(collector.clone(), alloc.clone()),
-            txs: SkipMap::with_collector_in(collector.clone(), alloc.clone()),
-            finalized_tx_states: SkipMap::with_collector_in(collector.clone(), alloc.clone()),
+            index_rows: SkipMap::new_in(alloc.clone()),
+            txs: SkipMap::new_in(alloc.clone()),
+            finalized_tx_states: SkipMap::new_in(alloc.clone()),
             alloc,
-            skiplist_collector: collector,
             tx_ids: AtomicU64::new(1), // let's reserve transaction 0 for special purposes
             version_id_counter: AtomicU64::new(1), // Reserve 0 for special purposes
             next_rowid: AtomicU64::new(0), // TODO: determine this from B-Tree
@@ -6931,10 +6904,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         index_id: MVTableId,
     ) -> Result<IndexRowsEntry<'_, A>, TryReserveError> {
         let alloc = self.alloc.clone();
-        let collector = self.skiplist_collector.clone();
-        let index = self.index_rows.try_get_or_insert_with(index_id, move || {
-            SkipMap::with_collector_in(collector, alloc)
-        })?;
+        let index = self
+            .index_rows
+            .try_get_or_insert_with(index_id, move || SkipMap::new_in(alloc))?;
         Ok(index)
     }
 
