@@ -1,7 +1,11 @@
+mod conn;
+mod counter;
+mod logging;
 mod opts;
+mod progress;
+mod sql_logging;
 
 use clap::Parser;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use opts::{Opts, TxMode};
 #[cfg(not(antithesis))]
 use rand::rngs::StdRng;
@@ -10,28 +14,20 @@ use rand::{Rng, SeedableRng};
 #[cfg(shuttle)]
 use shuttle::scheduler::Scheduler;
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use turso_stress::sync::atomic::{AtomicBool, Ordering};
+use turso_stress::sync::Arc;
+use turso_stress::sync::AsyncBarrier as Barrier;
+use turso_stress::sync::AsyncMutex as Mutex;
 
-type SqlLog = Arc<std::sync::Mutex<BufWriter<File>>>;
-
-fn log_sql(log: &SqlLog, thread: usize, sql: &str, result: &str) {
-    let sql = sql.trim().trim_end_matches(';');
-    let mut w = log.lock().unwrap();
-    writeln!(w, "{sql}; -- [thread:{thread}] {result}").unwrap();
-    if result.starts_with("ERROR") {
-        w.flush().unwrap();
-    }
-}
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::reload;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
+use crate::conn::StressDb;
+use crate::counter::StressCounter;
+use crate::logging::Tracer;
+use crate::progress::ProgressBars;
+use crate::sql_logging::SqlLogger;
+use turso::core::clear_database_registry;
 use turso::Builder;
+use turso_stress::ThreadId;
 
 /// Represents a column in a SQLite table
 #[derive(Debug, Clone)]
@@ -497,72 +493,6 @@ pub fn load_schema(
     Ok(ArbitrarySchema { tables })
 }
 
-pub type LogLevelReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
-
-pub fn init_tracing(log_path: &str) -> Result<(WorkerGuard, LogLevelReloadHandle), std::io::Error> {
-    let log_file = std::fs::File::create(log_path)?;
-    let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let (filter_layer, reload_handle) = reload::Layer::new(filter);
-
-    if let Err(e) = tracing_subscriber::registry()
-        .with(filter_layer)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(non_blocking)
-                .with_ansi(false)
-                .with_line_number(true)
-                .with_thread_ids(true)
-                .json(),
-        )
-        .try_init()
-    {
-        println!("Unable to setup tracing appender: {e:?}");
-    }
-    Ok((guard, reload_handle))
-}
-
-const LOG_LEVEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-
-const LOG_LEVEL_FILE: &str = "RUST_LOG";
-
-/// Spawns a background thread that watches for a RUST_LOG file and dynamically
-/// updates the log level when the file contents change.
-pub fn spawn_log_level_watcher(reload_handle: LogLevelReloadHandle) {
-    std::thread::spawn(move || {
-        let mut last_content: Option<String> = None;
-
-        loop {
-            std::thread::sleep(LOG_LEVEL_POLL_INTERVAL);
-
-            let content = match std::fs::read_to_string(LOG_LEVEL_FILE) {
-                Ok(content) => content.trim().to_string(),
-                Err(_) => {
-                    continue;
-                }
-            };
-
-            if last_content.as_ref() == Some(&content) {
-                continue;
-            }
-
-            match content.parse::<EnvFilter>() {
-                Ok(new_filter) => {
-                    if let Err(e) = reload_handle.reload(new_filter) {
-                        eprintln!("Failed to reload log filter: {e}");
-                    } else {
-                        last_content = Some(content);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Invalid log filter in {LOG_LEVEL_FILE}: {e}");
-                    last_content = Some(content);
-                }
-            }
-        }
-    });
-}
-
 fn sqlite_integrity_check(
     db_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -654,16 +584,9 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     let ddl_statements = schema.to_sql();
     let schema = Arc::new(schema);
 
-    let mut handles = Vec::with_capacity(opts.nr_threads);
     let mut stop = false;
 
-    let multi_progress = MultiProgress::new();
-    let progress_style = ProgressStyle::default_bar()
-        .template(
-            "[{elapsed_precise}] {prefix} {bar:40.cyan/blue} {pos:>7}/{len:7} ({percent}%) {msg}",
-        )
-        .unwrap()
-        .progress_chars("##-");
+    let progress_bars = ProgressBars::new(opts.nr_iterations);
 
     let tempfile = tempfile::NamedTempFile::new()?;
     let (_, path) = tempfile.keep().unwrap();
@@ -679,334 +602,243 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     println!("db_file={db_file}");
 
     let sql_log_path = format!("{db_file}.sql");
-    let sql_log_file = File::create(&sql_log_path)?;
-    let sql_log: SqlLog = Arc::new(std::sync::Mutex::new(BufWriter::new(sql_log_file)));
     println!("sql_log={sql_log_path}");
+    let sql_logger = Arc::new(SqlLogger::new(&sql_log_path)?);
 
     let tracing_log_path = format!("{db_file}.jsonl");
-    // This may cause torn writes if payloads are > 4KB, but for now let's ignore the issue.
-    let (_guard, reload_handle) = init_tracing(&tracing_log_path)?;
-    spawn_log_level_watcher(reload_handle);
     println!("tracing_log={tracing_log_path}");
+    let _tracer = Tracer::new(&tracing_log_path)?;
 
     let vfs_option = opts.vfs.clone();
 
-    let mut builder = Builder::new_local(&db_file);
-    if let Some(ref vfs) = vfs_option {
-        builder = builder.with_io(vfs.clone());
-    }
-    let db = Arc::new(Mutex::new(builder.build().await?));
+    let db = Arc::new(Mutex::new(StressDb::new(
+        db_file.clone(),
+        sql_logger.clone(),
+        vfs_option.clone(),
+    )));
 
-    for thread in 0..opts.nr_threads {
-        if stop {
-            break;
-        }
-        let db_file = db_file.clone();
-        let conn = db.lock().await.connect()?;
+    let mut stress_counter = StressCounter::new(opts.nr_threads, opts.nr_iterations);
 
-        match opts.tx_mode {
-            TxMode::SQLite => {
-                conn.pragma_update("journal_mode", "WAL").await?;
-                conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
-            }
-            TxMode::Concurrent => {
-                conn.pragma_update("journal_mode", "mvcc").await?;
-            }
-        };
+    let threads: Vec<_> = (0..opts.nr_threads)
+        .map(ThreadId::new)
+        .enumerate()
+        .collect();
 
-        conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
+    let progress_bars: Vec<_> = threads
+        .iter()
+        .map(|(_, thread)| progress_bars.add(thread.to_string()))
+        .collect();
 
-        for stmt in &ddl_statements {
-            let mut retry_counter = 0;
-            while retry_counter < 10 {
-                match conn.execute(stmt, ()).await {
-                    Ok(_) => {
-                        log_sql(&sql_log, thread, stmt, "OK");
-                        break;
-                    }
-                    Err(turso::Error::Busy(e)) => {
-                        log_sql(&sql_log, thread, stmt, &format!("ERROR(busy): {e}"));
-                        println!("Error (busy) creating table: {e}");
-                        retry_counter += 1;
-                    }
-                    Err(turso::Error::DatabaseFull(e)) => {
-                        log_sql(
-                            &sql_log,
-                            thread,
-                            stmt,
-                            &format!("ERROR(database_full): {e}"),
-                        );
-                        eprintln!("Database full, stopping: {e}");
-                        stop = true;
-                        break;
-                    }
-                    Err(turso::Error::IoError(std::io::ErrorKind::StorageFull, _)) => {
-                        log_sql(&sql_log, thread, stmt, "ERROR(io): StorageFull");
-                        eprintln!("No storage space, stopping");
-                        stop = true;
-                        break;
-                    }
-                    Err(turso::Error::BusySnapshot(e)) => {
-                        log_sql(
-                            &sql_log,
-                            thread,
-                            stmt,
-                            &format!("ERROR(busy_snapshot): {e}"),
-                        );
-                        println!("Error (busy snapshot): {e}");
-                        retry_counter += 1;
-                    }
-                    Err(turso::Error::IoError(kind, op)) => {
-                        log_sql(
-                            &sql_log,
-                            thread,
-                            stmt,
-                            &format!("ERROR(io): {op}: {kind:?}"),
-                        );
-                        eprintln!("I/O error ({op}: {kind:?}), stopping");
-                        stop = true;
-                        break;
-                    }
-                    Err(e) => {
-                        log_sql(&sql_log, thread, stmt, &format!("ERROR(fatal): {e}"));
-                        turso_macros::turso_assert_unreachable!("fatal error creating table", { "thread": thread, "stmt": stmt, "error": e });
-                    }
+    let conn = StressDb::connect(&db, ThreadId::new(usize::MAX), opts.busy_timeout).await?;
+    'stmts: for stmt in &ddl_statements {
+        let mut retry_counter = 0;
+        while retry_counter < 10 {
+            match conn.execute(stmt, ()).await {
+                Ok(_) => {
+                    break;
+                }
+                Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {
+                    retry_counter += 1;
+                }
+                Err(
+                    turso::Error::DatabaseFull(_)
+                    | turso::Error::IoError(std::io::ErrorKind::StorageFull, _)
+                    | turso::Error::IoError(_, _),
+                ) => {
+                    stop = true;
+                    break 'stmts;
+                }
+                Err(e) => {
+                    turso_macros::turso_assert_unreachable!("fatal error creating table", { "stmt": stmt, "error": e });
                 }
             }
-            if stop {
+        }
+        if retry_counter == 10 {
+            eprintln!(
+                "WARNING: Could not execute statement [{stmt}] after {retry_counter} attempts."
+            );
+        }
+    }
+
+    match opts.tx_mode {
+        TxMode::SQLite => {
+            conn.pragma_update("journal_mode", "WAL").await?;
+            conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
+        }
+        TxMode::Concurrent => {
+            conn.pragma_update("journal_mode", "mvcc").await?;
+        }
+    };
+
+    while !stop && !stress_counter.all_done() {
+        let mut handles = Vec::with_capacity(opts.nr_threads);
+        let reopen_requested = Arc::new(AtomicBool::new(false));
+        let all_threads_ready = Arc::new(Barrier::new(stress_counter.incomplete_threads()));
+
+        for (iteration_idx, ((thread_idx, thread), mut progress_bar)) in threads
+            .iter()
+            .cloned()
+            .zip(progress_bars.iter().cloned())
+            .enumerate()
+        {
+            if stress_counter.done(thread_idx) {
+                continue;
+            } else if stop {
                 break;
             }
-            if retry_counter == 10 {
-                eprintln!(
-                    "WARNING: Could not execute statement [{stmt}] after {retry_counter} attempts."
+
+            let reopen_requested = reopen_requested.clone();
+            let db = db.clone();
+            let schema_for_task = schema.clone();
+            let sql_logger = sql_logger.clone();
+            let all_threads_ready = all_threads_ready.clone();
+            let stress_counter = stress_counter.clone();
+
+            let handle = turso_stress::future::spawn(async move {
+                let mut conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
+                let mut rng = ThreadRng::new(
+                    global_seed
+                        .wrapping_add(thread_idx as u64)
+                        .wrapping_add(iteration_idx as u64 * 1000),
                 );
-            }
-        }
+                let mut iteration_count_this_batch = 0;
 
-        let nr_iterations = opts.nr_iterations;
-        let db = db.clone();
-        let vfs_for_task = vfs_option.clone();
-        let schema_for_task = schema.clone();
-        let busy_timeout = opts.busy_timeout;
-        let tx_mode = opts.tx_mode;
-        let sql_log = sql_log.clone();
-
-        let progress_bar = multi_progress.add(ProgressBar::new(nr_iterations as u64));
-        progress_bar.set_style(progress_style.clone());
-        progress_bar.set_prefix(format!("Thread {thread}"));
-
-        let handle = turso_stress::future::spawn(async move {
-            let mut conn = db.lock().await.connect()?;
-
-            conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
-
-            conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
-
-            progress_bar.set_message("executing queries...");
-
-            let mut rng = ThreadRng::new(global_seed.wrapping_add(thread as u64));
-
-            for i in 0..nr_iterations {
-                if gen_bool(&mut rng, 0.01) {
-                    // Reopen the database
-                    let mut db_guard = db.lock().await;
-                    let mut builder = Builder::new_local(&db_file);
-                    if let Some(ref vfs) = vfs_for_task {
-                        builder = builder.with_io(vfs.clone());
-                    }
-                    *db_guard = builder.build().await?;
-                    conn = db_guard.connect()?;
-                    conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
-                } else if gen_bool(&mut rng, 0.02) {
-                    // Reconnect to the database
-                    let db_guard = db.lock().await;
-                    conn = db_guard.connect()?;
-                    conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
-                }
-
-                let tx = if rng.get_random() % 2 == 0 {
-                    match tx_mode {
-                        TxMode::SQLite => Some("BEGIN;"),
-                        TxMode::Concurrent => Some("BEGIN CONCURRENT;"),
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(tx_stmt) = tx {
-                    match conn.execute(tx_stmt, ()).await {
-                        Ok(_) => log_sql(&sql_log, thread, tx_stmt, "OK"),
-                        Err(e) => log_sql(&sql_log, thread, tx_stmt, &format!("ERROR: {e}")),
-                    }
-                }
-
-                let sql = generate_random_statement(&mut rng, &schema_for_task);
-
-                progress_bar.set_position(i as u64);
-                match conn.execute(&sql, ()).await {
-                    Ok(_) => {
-                        log_sql(&sql_log, thread, &sql, "OK");
-                    }
-                    Err(e) => match e {
-                        turso::Error::Corrupt(e) => {
-                            log_sql(&sql_log, thread, &sql, &format!("ERROR(corrupt): {e}"));
-                            turso_macros::turso_assert_unreachable!("corrupt error executing query", { "thread": thread, "error": e, "sql": sql });
-                        }
-                        turso::Error::Constraint(e) => {
-                            log_sql(&sql_log, thread, &sql, &format!("ERROR(constraint): {e}"));
-                        }
-                        turso::Error::Busy(e) => {
-                            log_sql(&sql_log, thread, &sql, &format!("ERROR(busy): {e}"));
-                            println!("thread#{thread} Error[WARNING] executing query: {e}");
-                        }
-                        turso::Error::BusySnapshot(e) => {
-                            log_sql(
-                                &sql_log,
-                                thread,
-                                &sql,
-                                &format!("ERROR(busy_snapshot): {e}"),
-                            );
-                            println!("thread#{thread} Error[WARNING] busy snapshot: {e}");
-                        }
-                        turso::Error::Error(e) => {
-                            log_sql(&sql_log, thread, &sql, &format!("ERROR: {e}"));
-                        }
-                        turso::Error::DatabaseFull(e) => {
-                            log_sql(
-                                &sql_log,
-                                thread,
-                                &sql,
-                                &format!("ERROR(database_full): {e}"),
-                            );
-                            eprintln!("thread#{thread} Database full: {e}");
-                        }
-                        turso::Error::IoError(kind, op) => {
-                            log_sql(
-                                &sql_log,
-                                thread,
-                                &sql,
-                                &format!("ERROR(io): {op}: {kind:?}"),
-                            );
-                            eprintln!("thread#{thread} I/O error ({op}: {kind:?}), continuing...");
-                        }
-                        _ => {
-                            log_sql(&sql_log, thread, &sql, &format!("ERROR(fatal): {e}"));
-                            turso_macros::turso_assert_unreachable!("fatal error executing query", { "thread": thread, "error": e, "sql": sql });
-                        }
-                    },
-                }
-
-                // When inside a transaction, 30% chance to exercise savepoints.
-                // This generates the pattern that exposed the pager rollback bug
-                // in tursodatabase/turso#6176: SAVEPOINT → DML (possibly with
-                // large blobs that allocate new pages) → ROLLBACK TO / RELEASE.
-                if tx.is_some() && rng.get_random() % 100 < 30 {
-                    let sp_name = format!("sp_{}", rng.get_random() % 100);
-                    let savepoint_sql = format!("SAVEPOINT {sp_name};");
-                    match conn.execute(&savepoint_sql, ()).await {
-                        Ok(_) => log_sql(&sql_log, thread, &savepoint_sql, "OK"),
-                        Err(e) => log_sql(&sql_log, thread, &savepoint_sql, &format!("ERROR: {e}")),
+                all_threads_ready.wait().await;
+                for interaction_idx in stress_counter.iteration_idx(thread_idx)..opts.nr_iterations
+                {
+                    if gen_bool(&mut rng, 0.02) {
+                        // Reconnect to the database
+                        conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
                     }
 
-                    // Execute 1-3 DML statements inside the savepoint.
-                    let sp_stmts = 1 + (rng.get_random() % 3) as usize;
-                    for _ in 0..sp_stmts {
-                        let sp_sql = generate_random_statement(&mut rng, &schema_for_task);
-                        match conn.execute(&sp_sql, ()).await {
-                            Ok(_) => log_sql(&sql_log, thread, &sp_sql, "OK"),
-                            Err(turso::Error::Corrupt(e)) => {
-                                log_sql(&sql_log, thread, &sp_sql, &format!("ERROR(corrupt): {e}"));
+                    let tx = match opts.tx_mode {
+                        TxMode::SQLite => gen_bool(&mut rng, 0.5).then_some("BEGIN;"),
+                        TxMode::Concurrent => {
+                            gen_bool(&mut rng, 0.9).then_some("BEGIN CONCURRENT;")
+                        }
+                    };
+
+                    if let Some(tx_stmt) = tx {
+                        let _ = conn.execute(tx_stmt, ()).await;
+                    }
+
+                    let sql = generate_random_statement(&mut rng, &schema_for_task);
+
+                    if let Err(turso::Error::Corrupt(e)) = conn.execute(&sql, ()).await {
+                        turso_macros::turso_assert_unreachable!("corrupt error executing query", { "thread": thread, "error": e, "sql": sql });
+                    }
+
+                    // When inside a transaction, 30% chance to exercise savepoints.
+                    // This generates the pattern that exposed the pager rollback bug
+                    // in tursodatabase/turso#6176: SAVEPOINT → DML (possibly with
+                    // large blobs that allocate new pages) → ROLLBACK TO / RELEASE.
+                    if tx.is_some() && rng.get_random() % 100 < 30 {
+                        let sp_name = format!("sp_{}", rng.get_random() % 100);
+                        let savepoint_sql = format!("SAVEPOINT {sp_name};");
+                        let _ = conn.execute(&savepoint_sql, ()).await;
+
+                        // Execute 1-3 DML statements inside the savepoint.
+                        let sp_stmts = 1 + (rng.get_random() % 3) as usize;
+                        for _ in 0..sp_stmts {
+                            let sp_sql = generate_random_statement(&mut rng, &schema_for_task);
+                            if let Err(turso::Error::Corrupt(e)) = conn.execute(&sp_sql, ()).await {
                                 turso_macros::turso_assert_unreachable!("corrupt error in savepoint", { "thread": thread, "error": e, "sql": sp_sql });
                             }
-                            Err(e) => log_sql(&sql_log, thread, &sp_sql, &format!("ERROR: {e}")),
                         }
+
+                        // 50% ROLLBACK TO (partial undo), 50% RELEASE (keep changes).
+                        if rng.get_random() % 2 == 0 {
+                            let rollback_sql = format!("ROLLBACK TO {sp_name};");
+                            let _ = conn.execute(&rollback_sql, ()).await;
+                        }
+                        let release_sql = format!("RELEASE {sp_name};");
+                        let _ = conn.execute(&release_sql, ()).await;
                     }
 
-                    // 50% ROLLBACK TO (partial undo), 50% RELEASE (keep changes).
-                    if rng.get_random() % 2 == 0 {
-                        let rollback_sql = format!("ROLLBACK TO {sp_name};");
-                        match conn.execute(&rollback_sql, ()).await {
-                            Ok(_) => log_sql(&sql_log, thread, &rollback_sql, "OK"),
+                    if tx.is_some() {
+                        let end_tx = if rng.get_random() % 2 == 0 {
+                            "COMMIT;"
+                        } else {
+                            "ROLLBACK;"
+                        };
+                        let _ = conn.execute(end_tx, ()).await;
+                    }
+
+                    const INTEGRITY_CHECK_INTERVAL: usize = 100;
+                    if interaction_idx % INTEGRITY_CHECK_INTERVAL == 0 {
+                        let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
+                        match res.next().await {
+                            Ok(Some(row)) => {
+                                let value = row.get_value(0).unwrap();
+                                if value != "ok".into() {
+                                    sql_logger.log(
+                                        &thread,
+                                        "PRAGMA integrity_check",
+                                        &format!("ERROR: {value:?}"),
+                                    );
+                                    turso_macros::turso_assert_unreachable!("integrity check failed", { "thread": thread, "value": value });
+                                }
+                                sql_logger.log(&thread, "PRAGMA integrity_check", "OK");
+                            }
+                            Ok(None) => {
+                                sql_logger.log(&thread, "PRAGMA integrity_check", "ERROR: no rows");
+                                turso_macros::turso_assert_unreachable!("integrity check returned no rows", { "thread": thread });
+                            }
                             Err(e) => {
-                                log_sql(&sql_log, thread, &rollback_sql, &format!("ERROR: {e}"))
-                            }
-                        }
-                    }
-                    let release_sql = format!("RELEASE {sp_name};");
-                    match conn.execute(&release_sql, ()).await {
-                        Ok(_) => log_sql(&sql_log, thread, &release_sql, "OK"),
-                        Err(e) => log_sql(&sql_log, thread, &release_sql, &format!("ERROR: {e}")),
-                    }
-                }
-
-                if tx.is_some() {
-                    let end_tx = if rng.get_random() % 2 == 0 {
-                        "COMMIT;"
-                    } else {
-                        "ROLLBACK;"
-                    };
-                    match conn.execute(end_tx, ()).await {
-                        Ok(_) => log_sql(&sql_log, thread, end_tx, "OK"),
-                        Err(e) => log_sql(&sql_log, thread, end_tx, &format!("ERROR: {e}")),
-                    }
-                }
-
-                const INTEGRITY_CHECK_INTERVAL: usize = 100;
-                if i % INTEGRITY_CHECK_INTERVAL == 0 {
-                    let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
-                    match res.next().await {
-                        Ok(Some(row)) => {
-                            let value = row.get_value(0).unwrap();
-                            if value != "ok".into() {
-                                log_sql(
-                                    &sql_log,
-                                    thread,
+                                sql_logger.log(
+                                    &thread,
                                     "PRAGMA integrity_check",
-                                    &format!("ERROR: {value:?}"),
+                                    &format!("ERROR: {e}"),
                                 );
-                                turso_macros::turso_assert_unreachable!("integrity check failed", { "thread": thread, "value": value });
+                                println!("thread#{thread} Error performing integrity check: {e}");
                             }
-                            log_sql(&sql_log, thread, "PRAGMA integrity_check", "OK");
                         }
-                        Ok(None) => {
-                            log_sql(&sql_log, thread, "PRAGMA integrity_check", "ERROR: no rows");
-                            turso_macros::turso_assert_unreachable!("integrity check returned no rows", { "thread": thread });
-                        }
-                        Err(e) => {
-                            log_sql(
-                                &sql_log,
-                                thread,
-                                "PRAGMA integrity_check",
-                                &format!("ERROR: {e}"),
-                            );
-                            println!("thread#{thread} Error performing integrity check: {e}");
+                        match res.next().await {
+                            Ok(Some(_)) => {
+                                turso_macros::turso_assert_unreachable!("integrity check returned more than 1 row", { "thread": thread });
+                            }
+                            Err(e) => {
+                                println!("thread#{thread} Error performing integrity check: {e}")
+                            }
+                            _ => {}
                         }
                     }
-                    match res.next().await {
-                        Ok(Some(_)) => {
-                            turso_macros::turso_assert_unreachable!("integrity check returned more than 1 row", { "thread": thread });
-                        }
-                        Err(e) => println!("thread#{thread} Error performing integrity check: {e}"),
-                        _ => {}
+
+                    if gen_bool(&mut rng, 0.01 / stress_counter.incomplete_threads() as f64) {
+                        reopen_requested.store(true, Ordering::Release);
                     }
+                    if reopen_requested.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    progress_bar.tick();
+                    iteration_count_this_batch += 1;
                 }
-            }
-            // In case this thread is running an exclusive transaction, commit it so that it doesn't block other threads.
-            match conn.execute("COMMIT", ()).await {
-                Ok(_) => log_sql(&sql_log, thread, "COMMIT", "OK"),
-                Err(e) => log_sql(&sql_log, thread, "COMMIT", &format!("ERROR: {e}")),
-            }
-            progress_bar.finish_with_message("done");
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-        });
-        handles.push(handle);
+
+                // In case this thread is running an exclusive transaction, commit it so that it doesn't block other threads.
+                let _ = conn.execute("COMMIT", ()).await;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                    thread_idx,
+                    iteration_count_this_batch,
+                ))
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let (thread_idx, completed_iteration_count) = handle.await??;
+            stress_counter.register_iterations(thread_idx, completed_iteration_count);
+        }
+
+        // This is what triggers MVCC recovery
+        db.lock().await.reset();
+        clear_database_registry();
     }
 
-    for handle in handles {
-        handle.await??;
-    }
-    // Flush SQL log before exit
-    sql_log.lock().unwrap().flush().unwrap();
+    progress_bars
+        .into_iter()
+        .for_each(|mut progress_bar| progress_bar.finish());
+
     println!("Database file: {db_file}");
 
     // Switch back to WAL mode before SQLite integrity check if we were in MVCC mode.

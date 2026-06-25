@@ -1201,22 +1201,19 @@ pub fn turso_assert_all(input: TokenStream) -> TokenStream {
     emit_boolean_guidance(&file_path, input, BooleanCombinator::All).into()
 }
 
-/// Asserts that a code path is reached **at least once** during Antithesis testing.
-///
-/// # Behavior
-///
-/// **Currently a no-op in all builds.** This macro is disabled pending better SQL
-/// generation in `turso-stress`. When enabled, it will tell Antithesis that this code
-/// path should be exercised at least once across the entire test campaign.
+/// Asserts that a code path is reached **at least once** during Antithesis testing. No-op in
+/// non-antithesis builds.
 ///
 /// # Parameters
 ///
-/// - `"message"` — human-readable description of the code path.
+/// - `"message"` — human-readable description of the code path (required).
+/// - `{ "key": value, ... }` *(optional)* — structured details for Antithesis.
 ///
 /// # Usage
 ///
 /// ```ignore
 /// turso_assert_reachable!("opcode: Init");
+/// turso_assert_reachable!("checkpoint", { "frames": frame_count });
 /// ```
 ///
 /// # Examples
@@ -1229,11 +1226,26 @@ pub fn turso_assert_all(input: TokenStream) -> TokenStream {
 /// # When to use
 ///
 /// Place at code paths that should be exercised by the fuzzer.
-//TODO enable this when turso-stress has better SQL generation
 #[proc_macro]
-pub fn turso_assert_reachable(_input: TokenStream) -> TokenStream {
+pub fn turso_assert_reachable(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as MessageAssertInput);
+    let prefixed = prefix_message(&file_path, &input.message);
+    let details = details_json(&input.details);
+    let debug_check = details_debug_check(&input.details);
+
+    let env_check = antithesis_env_check();
     quote! {
         {
+            #[cfg(antithesis)]
+            {
+                #env_check
+                antithesis_sdk::assert_reachable!(#prefixed, #details);
+            }
+            #[cfg(not(antithesis))]
+            {
+                #debug_check
+            }
         }
     }
     .into()

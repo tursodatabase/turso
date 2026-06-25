@@ -7566,6 +7566,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     };
                 }
                 RecoverLogicalLogState::Replay { ctx } => {
+                    turso_assert_reachable!("MVCC recovery (replaying a frame)");
                     loop {
                         let Some(frame) = return_if_io!(ctx.reader.next_frame()) else {
                             let recovered_offset = ctx.reader.last_valid_offset() as u64;
