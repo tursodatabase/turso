@@ -113,6 +113,11 @@ struct YieldContext;
 pub struct MVTableId(i64);
 
 /// The versions of a single row.
+///
+/// This associated type keeps `RowVersionChain<A>` allocator-shaped in MVCC
+/// code without scattering `cfg(nightly)` branches. Stable Rust cannot define
+/// a `Vec<T, A>` type alias that ignores `A`, so the stable implementation
+/// maps every allocator to the allocator-free `Vec<RowVersion>`.
 pub trait RowVersionAllocator: ConcurrentAllocator {
     type RowVersionChain: std::fmt::Debug;
 }
