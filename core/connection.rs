@@ -4300,6 +4300,10 @@ impl Connection {
         matches!(self.get_tx_state(), TransactionState::Write { .. })
     }
 
+    pub fn has_open_mvcc_tx(&self) -> bool {
+        self.get_mv_tx_id().is_some() || self.next_attached_mv_tx().is_some()
+    }
+
     pub(crate) fn get_mv_tx_id(&self) -> Option<u64> {
         self.mv_tx.read().map(|(tx_id, _)| tx_id)
     }
@@ -4513,6 +4517,14 @@ impl Connection {
         }
         self.rollback_attached_wal_txns();
         self.set_tx_state(TransactionState::None);
+    }
+
+    pub fn rollback_implicit_mvcc_tx(&self) {
+        if !self.get_auto_commit() || !self.has_open_mvcc_tx() {
+            return;
+        }
+        let pager = self.pager.load().clone();
+        self.rollback_current_txn_state(&pager, true);
     }
 
     /// Roll back transaction state for helpers that start a manual `BEGIN`
