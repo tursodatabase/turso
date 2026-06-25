@@ -589,11 +589,6 @@ impl<K, V, C, A: SkiplistAllocator> SkipList<K, V, C, A> {
             assert!(c == &self.collector);
         }
     }
-
-    /// Pins the current thread in this skip list's collector.
-    pub(crate) fn pin(&self) -> Guard {
-        crate::skiplist::collector::pin(&self.collector)
-    }
 }
 
 impl<K, V, C, A: SkiplistAllocator> SkipList<K, V, C, A>
@@ -2058,13 +2053,6 @@ where
     }
 }
 
-impl<'a, K: 'a, V: 'a, C, A: SkiplistAllocator> RefIter<'a, K, V, C, A> {
-    /// Returns the parent skip list.
-    pub(crate) fn skiplist(&self) -> &'a SkipList<K, V, C, A> {
-        self.parent
-    }
-}
-
 impl<'a, K: 'a, V: 'a, C, A: SkiplistAllocator> RefIter<'a, K, V, C, A>
 where
     C: Comparator<K>,
@@ -2303,18 +2291,6 @@ where
             .field("head", &self.head)
             .field("tail", &self.tail)
             .finish()
-    }
-}
-
-impl<'a, Q, R, K: 'a, V: 'a, C, A: SkiplistAllocator> RefRange<'a, Q, R, K, V, C, A>
-where
-    C: Comparator<K> + Comparator<K, Q>,
-    R: RangeBounds<Q>,
-    Q: ?Sized,
-{
-    /// Returns the parent skip list.
-    pub(crate) fn skiplist(&self) -> &'a SkipList<K, V, C, A> {
-        self.parent
     }
 }
 

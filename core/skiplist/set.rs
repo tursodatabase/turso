@@ -5,8 +5,6 @@ use core::{
     ops::{Bound, Deref, RangeBounds},
 };
 
-use crossbeam_epoch as epoch;
-
 use super::{
     base::SkiplistAllocator,
     comparator::{BasicComparator, Comparator},
@@ -44,13 +42,6 @@ impl<T> SkipSet<T> {
             inner: map::SkipMap::new(),
         }
     }
-
-    /// Returns a new, empty set with the default comparator and `collector`.
-    pub fn with_collector(collector: epoch::Collector) -> Self {
-        Self {
-            inner: map::SkipMap::with_collector(collector),
-        }
-    }
 }
 
 impl<T, A: SkiplistAllocator> SkipSet<T, BasicComparator, A> {
@@ -70,14 +61,6 @@ impl<T, A: SkiplistAllocator> SkipSet<T, BasicComparator, A> {
             inner: map::SkipMap::new_in(alloc),
         }
     }
-
-    /// Returns a new, empty set with the default comparator and `collector`
-    /// that allocates its nodes in `alloc`.
-    pub fn with_collector_in(collector: epoch::Collector, alloc: A) -> Self {
-        Self {
-            inner: map::SkipMap::with_collector_in(collector, alloc),
-        }
-    }
 }
 
 impl<T, C> SkipSet<T, C> {
@@ -93,13 +76,6 @@ impl<T, C> SkipSet<T, C> {
     pub fn with_comparator(comparator: C) -> Self {
         Self {
             inner: map::SkipMap::with_comparator(comparator),
-        }
-    }
-
-    /// Returns a new, empty set with `collector` and the given comparator.
-    pub fn with_collector_and_comparator(collector: epoch::Collector, comparator: C) -> Self {
-        Self {
-            inner: map::SkipMap::with_collector_and_comparator(collector, comparator),
         }
     }
 }
@@ -120,18 +96,6 @@ impl<T, C, A: SkiplistAllocator> SkipSet<T, C, A> {
     pub fn with_comparator_in(comparator: C, alloc: A) -> Self {
         Self {
             inner: map::SkipMap::with_comparator_in(comparator, alloc),
-        }
-    }
-
-    /// Returns a new, empty set with `collector` and the given comparator that
-    /// allocates its nodes in `alloc`.
-    pub fn with_collector_comparator_in(
-        collector: epoch::Collector,
-        comparator: C,
-        alloc: A,
-    ) -> Self {
-        Self {
-            inner: map::SkipMap::with_collector_comparator_in(collector, comparator, alloc),
         }
     }
 
