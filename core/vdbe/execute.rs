@@ -3048,6 +3048,12 @@ pub fn halt(
         return Ok(InsnFunctionStepResult::Done);
     }
 
+    // The integrity_check bytecode is finished once it reaches Halt. Release
+    // its schema guard before autocommit closes the MVCC read transaction:
+    // that close can wait on a schema-changing commit dependency, and the
+    // schema-changing commit may be waiting for this guard.
+    state.release_mvcc_integrity_check_guard();
+
     if auto_commit {
         // In autocommit mode, a statement that leaves deferred violations must fail here,
         // and it also ends the transaction.
@@ -13777,6 +13783,9 @@ pub fn op_integrity_check(
     };
     match state.active_op_state.integrity_check() {
         OpIntegrityCheckState::Start => {
+            if let Some(mv_store) = mv_store.as_ref() {
+                state.begin_mvcc_integrity_check_guard(mv_store)?;
+            }
             let (freelist_trunk_page, db_size) = return_if_io!(with_header(
                 &target_pager,
                 mv_store.as_ref(),

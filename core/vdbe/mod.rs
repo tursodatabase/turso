@@ -39,7 +39,10 @@ pub use crate::translate::collate::CollationSeq;
 use crate::{
     error::LimboError,
     function::FuncCtx,
-    mvcc::{database::CommitStateMachine, MvccClock},
+    mvcc::{
+        database::{CommitStateMachine, MvccIntegrityCheckGuard},
+        MvccClock,
+    },
     numeric::Numeric,
     return_if_io,
     schema::Trigger,
@@ -763,6 +766,8 @@ pub struct ProgramState {
     /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
+    /// Held by MVCC `PRAGMA integrity_check`.
+    mvcc_integrity_check_guard: Option<MvccIntegrityCheckGuard>,
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
@@ -823,6 +828,7 @@ impl ProgramState {
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
+            mvcc_integrity_check_guard: None,
             rowsets: HashMap::default(),
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
@@ -953,6 +959,7 @@ impl ProgramState {
             .store(0, Ordering::SeqCst);
         self.fk_deferred_violations_when_stmt_started
             .store(0, Ordering::SeqCst);
+        self.release_mvcc_integrity_check_guard();
         self.rowsets.clear();
         self.bloom_filters.clear();
         self.hash_tables.clear();
@@ -977,6 +984,17 @@ impl ProgramState {
 
     pub(crate) fn record_total_change(&self) {
         self.n_total_change.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn begin_mvcc_integrity_check_guard(&mut self, mv_store: &MvStore) -> Result<()> {
+        if self.mvcc_integrity_check_guard.is_none() {
+            self.mvcc_integrity_check_guard = Some(mv_store.begin_integrity_check_guard()?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_mvcc_integrity_check_guard(&mut self) {
+        self.mvcc_integrity_check_guard = None;
     }
 
     /// Whether this statement owns the implicit autocommit transaction it is
@@ -1497,12 +1515,15 @@ impl Program {
         match &result {
             Ok(StepResult::Done) => {
                 state.execution_state = ProgramExecutionState::Done;
+                state.release_mvcc_integrity_check_guard();
             }
             Ok(StepResult::Interrupt) => {
                 state.execution_state = ProgramExecutionState::Interrupted;
+                state.release_mvcc_integrity_check_guard();
             }
             Err(_) => {
                 state.execution_state = ProgramExecutionState::Failed;
+                state.release_mvcc_integrity_check_guard();
             }
             _ => {}
         }
