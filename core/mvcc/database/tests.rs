@@ -1,7 +1,7 @@
 use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
-use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt};
+use crate::alloc::{TursoAllocator, TursoIteratorExt, TursoTryWithCapacityExt};
 use crate::io::{PlatformIO, IO};
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
@@ -246,7 +246,7 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
     .unwrap();
 
     let tx_id = 7;
-    let tx = new_tx(tx_id, 1, TransactionState::Active);
+    let tx = new_tx_in::<FailOnDemandAlloc>(tx_id, 1, TransactionState::Active);
     tx.begin_savepoint();
     store.txs.try_insert(tx_id, tx).unwrap();
 
@@ -4833,6 +4833,14 @@ or not found |                    | the timestamp.
 */
 
 fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
+    new_tx_in(tx_id, begin_ts, state)
+}
+
+fn new_tx_in<A: super::RowVersionAllocator>(
+    tx_id: TxID,
+    begin_ts: u64,
+    state: TransactionState,
+) -> Transaction<A> {
     let state = state.into();
     Transaction {
         state,
@@ -5226,11 +5234,12 @@ fn test_index_finger_no_spurious_dep_on_stepped_over_key() {
     let writer_id: TxID = 9_000_050;
     store.txs.insert(
         writer_id,
-        new_tx(writer_id, 1, TransactionState::Preparing(40)),
+        new_tx_in::<crate::alloc::DynAllocator>(writer_id, 1, TransactionState::Preparing(40)),
     );
-    store
-        .txs
-        .insert(reader_id, new_tx(reader_id, 100, TransactionState::Active));
+    store.txs.insert(
+        reader_id,
+        new_tx_in::<crate::alloc::DynAllocator>(reader_id, 100, TransactionState::Active),
+    );
 
     // MVCC-only tombstone at key 20: committed insert (begin Timestamp) deleted
     // by the Preparing writer (end TxID). Not present in the B-tree.
@@ -5243,11 +5252,17 @@ fn test_index_finger_no_spurious_dep_on_stepped_over_key() {
         row: Row::new_index_row(row_id, 1),
         btree_resident: false,
     };
+    let mut tombstone_versions =
+        <RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
+            RowVersion,
+            crate::alloc::DynAllocator,
+        >>::new_in(crate::alloc::DynAllocator::default());
+    tombstone_versions.push(tombstone);
     store
         .get_or_create_index_rows(table_id)
         .unwrap()
         .value()
-        .insert(key20, Arc::new(RwLock::new(crate::alloc::vec![tombstone])));
+        .insert(key20, Arc::new(RwLock::new(tombstone_versions)));
 
     let mut finger = IndexShadowFinger::default();
     // B-tree key 10: finger seeds at the first index key >= 10 (key 20), which is
@@ -6497,7 +6512,7 @@ fn transaction_display() {
 
     let empty_versions = || Arc::new(RwLock::new(crate::alloc::vec![]));
     let write_set = Mutex::new({
-        let mut write_set = WriteSet::new();
+        let mut write_set: WriteSet = WriteSet::new();
         write_set.insert(RowID::new((-2).into(), RowKey::Int(11)), empty_versions());
         write_set.insert(RowID::new((-2).into(), RowKey::Int(13)), empty_versions());
         write_set
@@ -8094,7 +8109,7 @@ fn test_gc_rule3_not_firing_with_unremovable_superseded() {
 #[test]
 /// GC on an empty version chain is a no-op. Verifies no panics or off-by-one errors.
 fn test_gc_noop_on_empty() {
-    let mut versions: RowVersionChain = crate::alloc::vec![];
+    let mut versions: RowVersionChain<TursoAllocator> = crate::alloc::vec![];
     let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 5);
     assert_eq!(dropped, 0);
 }
@@ -8213,7 +8228,7 @@ fn test_gc_shrinks_version_chain_capacity() {
 
     // One committed current version that survives GC (b=1 > ckpt_max=0, so
     // rule 3 doesn't fire), plus a burst of aborted garbage (always removed).
-    let mut versions: RowVersionChain =
+    let mut versions: RowVersionChain<TursoAllocator> =
         std::iter::once(make_version(Some(TxTimestampOrID::Timestamp(1)), None))
             .chain((0..1023).map(|_| make_version(None, None)))
             .try_collect()
@@ -8231,7 +8246,7 @@ fn test_gc_shrinks_version_chain_capacity() {
     );
 
     // A chain emptied entirely also releases its allocation.
-    let mut versions: RowVersionChain = (0..1024)
+    let mut versions: RowVersionChain<TursoAllocator> = (0..1024)
         .map(|_| make_version(None, None))
         .try_collect()
         .unwrap();
@@ -8247,7 +8262,9 @@ fn test_gc_shrinks_version_chain_capacity() {
 
     // Small chains are not worth a realloc: capacity at or below the minimum
     // threshold is left untouched even when fully emptied.
-    let mut small: RowVersionChain = RowVersionChain::try_with_capacity_ext(16).unwrap();
+    let mut small: RowVersionChain<TursoAllocator> =
+        <RowVersionChain<TursoAllocator> as TursoTryWithCapacityExt>::try_with_capacity_ext(16)
+            .unwrap();
     small.push(make_version(None, None));
     let capacity_before = small.capacity();
     MvStore::<MvccClock>::gc_version_chain(&mut small, 0, 0);
@@ -8979,7 +8996,7 @@ fn test_gc_e2e_index_rows_collected_after_checkpoint() {
 /// Represents a version chain entry for quickcheck.
 #[derive(Debug, Clone)]
 struct ArbitraryVersionChain {
-    versions: RowVersionChain,
+    versions: RowVersionChain<TursoAllocator>,
     lwm: u64,
     ckpt_max: u64,
 }
@@ -9046,7 +9063,7 @@ impl Arbitrary for ArbitraryVersionChain {
     fn arbitrary(g: &mut Gen) -> Self {
         // 1..8 versions (no empty chains — they trivially pass all properties)
         let len = usize::arbitrary(g) % 8 + 1;
-        let versions: RowVersionChain = (0..len)
+        let versions: RowVersionChain<TursoAllocator> = (0..len)
             .map(|_| arbitrary_row_version(g))
             .try_collect()
             .unwrap();

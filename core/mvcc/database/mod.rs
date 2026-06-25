@@ -1,5 +1,6 @@
 use crate::alloc::{
-    ConcurrentAllocator, TryReserveError, TursoAllocator, TursoTryWithCapacityExt, ALLOC_ERR_MSG,
+    ConcurrentAllocator, TryReserveError, TursoAllocator, TursoTryWithCapacityExt, TursoVecInExt,
+    ALLOC_ERR_MSG,
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
@@ -112,11 +113,25 @@ struct YieldContext;
 pub struct MVTableId(i64);
 
 /// The versions of a single row.
-pub type RowVersionChain = crate::alloc::Vec<RowVersion>;
-pub type RowVersions = Arc<RwLock<RowVersionChain>>;
-type TableRowEntry<'a, A = TursoAllocator> = Entry<'a, RowID, RowVersions, BasicComparator, A>;
+pub trait RowVersionAllocator: ConcurrentAllocator {
+    type RowVersionChain: std::fmt::Debug;
+}
+
+#[cfg(not(nightly))]
+impl<A: ConcurrentAllocator> RowVersionAllocator for A {
+    type RowVersionChain = crate::alloc::Vec<RowVersion>;
+}
+
+#[cfg(nightly)]
+impl<A: ConcurrentAllocator> RowVersionAllocator for A {
+    type RowVersionChain = crate::alloc::Vec<RowVersion, A>;
+}
+
+pub type RowVersionChain<A = TursoAllocator> = <A as RowVersionAllocator>::RowVersionChain;
+pub type RowVersions<A = TursoAllocator> = Arc<RwLock<RowVersionChain<A>>>;
+type TableRowEntry<'a, A = TursoAllocator> = Entry<'a, RowID, RowVersions<A>, BasicComparator, A>;
 type IndexRowEntry<'a, A = TursoAllocator> =
-    Entry<'a, Arc<SortableIndexKey>, RowVersions, BasicComparator, A>;
+    Entry<'a, Arc<SortableIndexKey>, RowVersions<A>, BasicComparator, A>;
 type IndexRowsEntry<'a, A = TursoAllocator> =
     Entry<'a, MVTableId, IndexRowsMap<A>, BasicComparator, A>;
 type TableRowIterator<'a, A = TursoAllocator> =
@@ -127,7 +142,7 @@ type IndexRowIterator<'a, A = TursoAllocator> =
 /// Per-index map of sortable keys to their version chains, stored as the
 /// values of [`MvStore::index_rows`].
 pub type IndexRowsMap<A = TursoAllocator> =
-    SkipMap<Arc<SortableIndexKey>, RowVersions, BasicComparator, A>;
+    SkipMap<Arc<SortableIndexKey>, RowVersions<A>, BasicComparator, A>;
 
 impl MVTableId {
     pub fn new(value: i64) -> Self {
@@ -707,8 +722,8 @@ enum SavepointKind {
 }
 
 /// Tracks row/index version deltas created inside a single savepoint scope.
-#[derive(Debug, Default)]
-pub struct Savepoint {
+#[derive(Debug)]
+pub struct Savepoint<A: RowVersionAllocator = TursoAllocator> {
     kind: SavepointKind,
     deferred_fk_violations: isize,
     header: DatabaseHeader,
@@ -723,10 +738,26 @@ pub struct Savepoint {
     deleted_index_versions: Vec<((MVTableId, Arc<SortableIndexKey>), u64)>,
     /// RowIDs that were NEWLY added to write_set by this savepoint.
     /// On rollback: only these should be removed from write_set.
-    newly_added_to_write_set: Vec<(RowID, RowVersions)>,
+    newly_added_to_write_set: Vec<(RowID, RowVersions<A>)>,
 }
 
-impl Savepoint {
+impl<A: RowVersionAllocator> Default for Savepoint<A> {
+    fn default() -> Self {
+        Self {
+            kind: SavepointKind::default(),
+            deferred_fk_violations: 0,
+            header: DatabaseHeader::default(),
+            header_dirty: false,
+            created_table_versions: Vec::new(),
+            created_index_versions: Vec::new(),
+            deleted_table_versions: Vec::new(),
+            deleted_index_versions: Vec::new(),
+            newly_added_to_write_set: Vec::new(),
+        }
+    }
+}
+
+impl<A: RowVersionAllocator> Savepoint<A> {
     /// Creates an internal statement savepoint used for per-statement rollback.
     fn statement(header: DatabaseHeader, header_dirty: bool) -> Self {
         Self {
@@ -759,7 +790,7 @@ impl Savepoint {
     /// Merges child savepoint deltas into this savepoint.
     ///
     /// Called when releasing nested savepoints so outer rollback still has a full undo set.
-    fn merge_from(&mut self, mut other: Savepoint) {
+    fn merge_from(&mut self, mut other: Savepoint<A>) {
         self.created_table_versions
             .append(&mut other.created_table_versions);
         self.created_index_versions
@@ -773,16 +804,16 @@ impl Savepoint {
     }
 }
 
-struct SavepointRollbackResult {
+struct SavepointRollbackResult<A: RowVersionAllocator = TursoAllocator> {
     /// Savepoints that were rolled back, in the order they were created (oldest to newest).
-    rolledback_savepoints: Vec<Savepoint>,
+    rolledback_savepoints: Vec<Savepoint<A>>,
     /// Deferred FK counter snapshot captured at the target named savepoint.
     deferred_fk_violations: isize,
 }
 
-#[derive(Debug, Default)]
-struct WriteSet {
-    entries: Vec<(RowID, RowVersions)>,
+#[derive(Debug)]
+struct WriteSet<A: RowVersionAllocator = TursoAllocator> {
+    entries: Vec<(RowID, RowVersions<A>)>,
     /// A set of the pointer addresses of the `RowVersions`. Used to deduplicate entries.
     ///
     /// This is correct because instances of [RowVersions] are created once per [RowID] and then
@@ -791,13 +822,22 @@ struct WriteSet {
     seen: HashSet<usize>,
 }
 
-impl WriteSet {
+impl<A: RowVersionAllocator> Default for WriteSet<A> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            seen: HashSet::default(),
+        }
+    }
+}
+
+impl<A: RowVersionAllocator> WriteSet<A> {
     fn new() -> Self {
         Self::default()
     }
 
     /// Returns `true` if this `RowVersions` was not already contained in the write set.
-    fn insert(&mut self, id: RowID, row_versions: RowVersions) -> bool {
+    fn insert(&mut self, id: RowID, row_versions: RowVersions<A>) -> bool {
         let ptr = Arc::as_ptr(&row_versions) as usize;
         if self.seen.insert(ptr) {
             self.entries.push((id, row_versions));
@@ -811,12 +851,12 @@ impl WriteSet {
         self.entries.is_empty()
     }
 
-    fn iter(&self) -> std::slice::Iter<'_, (RowID, RowVersions)> {
+    fn iter(&self) -> std::slice::Iter<'_, (RowID, RowVersions<A>)> {
         self.entries.iter()
     }
 
     /// Retain entries where `keep(rowid, row_versions)` returns true.
-    fn retain<F: FnMut(&RowID, &RowVersions) -> bool>(&mut self, mut keep: F) {
+    fn retain<F: FnMut(&RowID, &RowVersions<A>) -> bool>(&mut self, mut keep: F) {
         let seen = &mut self.seen;
         self.entries.retain(|(rowid, rv)| {
             if keep(rowid, rv) {
@@ -829,14 +869,14 @@ impl WriteSet {
     }
 
     /// Clones the write set into a [Vec].
-    fn to_vec(&self) -> Vec<(RowID, RowVersions)> {
+    fn to_vec(&self) -> Vec<(RowID, RowVersions<A>)> {
         self.entries.clone()
     }
 }
 
 /// Transaction
 #[derive(Debug)]
-pub struct Transaction {
+pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// The state of the transaction.
     state: AtomicTransactionState,
     /// The transaction ID.
@@ -844,14 +884,14 @@ pub struct Transaction {
     /// The transaction begin timestamp.
     begin_ts: u64,
     /// The transaction write set. Only writer is the [Transaction]'s own connection.
-    write_set: Mutex<WriteSet>,
+    write_set: Mutex<WriteSet<A>>,
     /// The transaction header.
     header: RwLock<DatabaseHeader>,
     /// True when the transaction mutated its local database header snapshot.
     header_dirty: AtomicBool,
     /// Stack of savepoints for statement-level rollback.
     /// Each savepoint tracks versions created/deleted during that statement.
-    savepoint_stack: RwLock<Vec<Savepoint>>,
+    savepoint_stack: RwLock<Vec<Savepoint<A>>>,
     /// True when this transaction currently holds the serialized logical-log commit lock.
     pager_commit_lock_held: AtomicBool,
     /// Number of unresolved commit dependencies (must reach 0 before commit).
@@ -868,8 +908,8 @@ pub struct Transaction {
     commit_dep_set: Mutex<HashSet<TxID>>,
 }
 
-impl Transaction {
-    fn new(tx_id: u64, begin_ts: u64, header: DatabaseHeader) -> Transaction {
+impl<A: RowVersionAllocator> Transaction<A> {
+    fn new(tx_id: u64, begin_ts: u64, header: DatabaseHeader) -> Transaction<A> {
         Transaction {
             state: TransactionState::Active.into(),
             tx_id,
@@ -885,7 +925,7 @@ impl Transaction {
         }
     }
 
-    fn insert_to_write_set(&self, id: RowID, row_versions: RowVersions) {
+    fn insert_to_write_set(&self, id: RowID, row_versions: RowVersions<A>) {
         // Always record in the current savepoint's `newly_added_to_write_set`.
         // Duplicates here are harmless: `rollback_savepoint_changes` collects
         // touched rowids into a BTreeSet (dedup), and the actual write_set
@@ -955,7 +995,7 @@ impl Transaction {
         }
     }
 
-    fn pop_statement_savepoint(&self) -> Option<Savepoint> {
+    fn pop_statement_savepoint(&self) -> Option<Savepoint<A>> {
         let mut savepoints = self.savepoint_stack.write();
         if !matches!(
             savepoints.last().map(|savepoint| &savepoint.kind),
@@ -1000,7 +1040,7 @@ impl Transaction {
             return commits_transaction;
         }
 
-        let drained: Vec<Savepoint> = savepoints.drain(target_idx..).collect();
+        let drained: Vec<Savepoint<A>> = savepoints.drain(target_idx..).collect();
         if let Some(parent) = savepoints.last_mut() {
             for savepoint in drained {
                 parent.merge_from(savepoint);
@@ -1012,7 +1052,7 @@ impl Transaction {
     /// Find the named savepoint to rollback to and pop all savepoints above it. Returns the rolled
     /// back savepoints and net change in deferred FK violations for undoing changes to transaction
     /// state.
-    fn rollback_to_named_savepoint(&self, name: &str) -> Option<SavepointRollbackResult> {
+    fn rollback_to_named_savepoint(&self, name: &str) -> Option<SavepointRollbackResult<A>> {
         let mut savepoints = self.savepoint_stack.write();
         let target_idx = savepoints.iter().rposition(|savepoint| {
             matches!(
@@ -1039,7 +1079,7 @@ impl Transaction {
         let header = savepoints[target_idx].header;
         let header_dirty = savepoints[target_idx].header_dirty;
 
-        let drained: Vec<Savepoint> = savepoints.drain(target_idx..).collect();
+        let drained: Vec<Savepoint<A>> = savepoints.drain(target_idx..).collect();
         savepoints.push(Savepoint::named(
             target_name,
             starts_transaction,
@@ -1116,7 +1156,7 @@ impl Transaction {
     }
 }
 
-impl std::fmt::Display for Transaction {
+impl<A: RowVersionAllocator> std::fmt::Display for Transaction<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         write!(
             f,
@@ -1606,7 +1646,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         &self,
         rowid: &RowID,
         end_ts: u64,
-        tx: &Transaction,
+        tx: &Transaction<A>,
         mvcc_store: &Arc<MvStore<Clock, A>>,
     ) -> Result<()> {
         let row_versions = mvcc_store.rows.get(rowid);
@@ -1630,7 +1670,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         &self,
         rowid: &RowID,
         end_ts: u64,
-        tx: &Transaction,
+        tx: &Transaction<A>,
         mvcc_store: &Arc<MvStore<Clock, A>>,
     ) -> Result<()> {
         let RowKey::Record(record) = &rowid.row_id else {
@@ -1691,7 +1731,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
     fn check_version_conflicts(
         &self,
         end_ts: u64,
-        tx: &Transaction,
+        tx: &Transaction<A>,
         mvcc_store: &Arc<MvStore<Clock, A>>,
         row_versions: &[RowVersion],
     ) -> Result<()> {
@@ -1996,7 +2036,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             }
         };
 
-        let collect_versions = |row_versions: &RowVersions,
+        let collect_versions = |row_versions: &RowVersions<A>,
                                 log_record: &mut LogRecord|
          -> Result<()> {
             // `log_record.row_versions` is the logical transaction log. Recovery
@@ -2272,7 +2312,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         {
             let _ = mvcc_store;
             let _ = log_record;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(feature = "conn_raw_api")]
@@ -3716,7 +3756,7 @@ pub struct RecoverCtx {
 /// A multi-version concurrency control database.
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
-    pub rows: SkipMap<RowID, RowVersions, BasicComparator, A>,
+    pub rows: SkipMap<RowID, RowVersions<A>, BasicComparator, A>,
     /// Table ID is an opaque identifier that is only meaningful to the MV store.
     /// Each checkpointed MVCC table corresponds to a single B-tree on the pager,
     /// which naturally has a root page.
@@ -3733,7 +3773,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// because operations like last() on an index are much easier when we don't have to take the
     /// table identifier into account.
     pub index_rows: SkipMap<MVTableId, IndexRowsMap<A>, BasicComparator, A>,
-    txs: SkipMap<TxID, Transaction, BasicComparator, A>,
+    txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
     finalized_tx_states: SkipMap<TxID, TransactionState, BasicComparator, A>,
@@ -4949,7 +4989,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub(crate) fn read_visible_from_versions(
         &self,
         tx_id: TxID,
-        versions: &RowVersions,
+        versions: &RowVersions<A>,
     ) -> Result<Option<Row>> {
         let tx = self
             .txs
@@ -4976,7 +5016,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub(crate) fn read_visible_into_record(
         &self,
         tx_id: TxID,
-        versions: &RowVersions,
+        versions: &RowVersions<A>,
         record: &mut ImmutableRecord,
     ) -> Result<bool> {
         let tx = self
@@ -5040,7 +5080,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         table_id: MVTableId,
         mv_store_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
         tx_id: TxID,
-    ) -> Option<(RowID, RowVersions)> {
+    ) -> Option<(RowID, RowVersions<A>)> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
             "mv_store_iterator must be initialized when calling get_row_id_for_table_in_direction",
         );
@@ -5100,7 +5140,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// (O(log N)) per scanned row with an amortized-O(1) merge step.
     pub(crate) fn index_chain_invalidates_btree(
         &self,
-        versions: &RwLock<RowVersionChain>,
+        versions: &RwLock<RowVersionChain<A>>,
         tx_id: TxID,
     ) -> bool {
         let tx = self
@@ -5173,9 +5213,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     fn find_last_visible_version(
         &self,
-        tx: &Transaction,
+        tx: &Transaction<A>,
         row: &TableRowEntry<'_, A>,
-    ) -> Option<(RowID, RowVersions)> {
+    ) -> Option<(RowID, RowVersions<A>)> {
         row.value()
             .read()
             .iter()
@@ -5186,7 +5226,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     fn find_last_visible_index_version(
         &self,
-        tx: &Transaction,
+        tx: &Transaction<A>,
         row: IndexRowEntry<'_, A>,
     ) -> Option<RowID> {
         row.value()
@@ -5197,7 +5237,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .map(|version| version.row.id.clone())
     }
 
-    fn find_next_visible_index_row<'a, I>(&self, tx: &Transaction, mut rows: I) -> Option<RowID>
+    fn find_next_visible_index_row<'a, I>(&self, tx: &Transaction<A>, mut rows: I) -> Option<RowID>
     where
         I: Iterator<Item = IndexRowEntry<'a, A>>,
     {
@@ -5211,10 +5251,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     fn find_next_visible_table_row<'a, I>(
         &self,
-        tx: &Transaction,
+        tx: &Transaction<A>,
         mut rows: I,
         table_id: MVTableId,
-    ) -> Option<(RowID, RowVersions)>
+    ) -> Option<(RowID, RowVersions<A>)>
     where
         I: Iterator<Item = TableRowEntry<'a, A>>,
     {
@@ -5556,7 +5596,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TxInsert)]
-    fn insert_tx_entry(&self, tx_id: TxID, tx: Transaction) -> Result<(), TryReserveError> {
+    fn insert_tx_entry(&self, tx_id: TxID, tx: Transaction<A>) -> Result<(), TryReserveError> {
         self.txs.try_insert(tx_id, tx)?;
         Ok(())
     }
@@ -5901,7 +5941,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         // Snapshot under the lock so we can drop it before recursing into
         // `rollback_rowid` (which may take other locks).
-        let write_set_snapshot: Vec<(RowID, RowVersions)> = tx.write_set.lock().to_vec();
+        let write_set_snapshot: Vec<(RowID, RowVersions<A>)> = tx.write_set.lock().to_vec();
         for (_rowid, row_versions) in &write_set_snapshot {
             for rv in row_versions.write().iter_mut() {
                 rollback_row_version(tx_id, rv);
@@ -5956,7 +5996,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    fn unlock_commit_lock_if_held(&self, tx: &Transaction) {
+    fn unlock_commit_lock_if_held(&self, tx: &Transaction<A>) {
         if tx.pager_commit_lock_held.swap(false, Ordering::AcqRel) {
             self.commit_coordinator.pager_commit_lock.unlock();
         }
@@ -6057,7 +6097,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(Some(deferred_fk_violations))
     }
 
-    fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint) {
+    fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint<A>) {
         let Savepoint {
             header,
             header_dirty,
@@ -6757,7 +6797,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Rule 3: Current checkpointed sole-survivor (end=None, b <= ckpt_max,
     ///         b < lwm, no other versions remain) — remove.
     ///
-    fn gc_version_chain(versions: &mut RowVersionChain, lwm: u64, ckpt_max: u64) -> usize {
+    fn gc_version_chain(versions: &mut RowVersionChain<A>, lwm: u64, ckpt_max: u64) -> usize {
         let before = versions.len();
 
         // Rule 1: aborted garbage
@@ -6816,7 +6856,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// peak allocation forever. Capacity drops to a quarter of its current
     /// value — deliberately not to fit — when the survivors occupy less than
     /// a quarter of it, so steady-state chains keep slack for new versions.
-    fn shrink_version_chain_allocation(versions: &mut RowVersionChain) {
+    fn shrink_version_chain_allocation(versions: &mut RowVersionChain<A>) {
         let capacity = versions.capacity();
         if capacity > Self::CHAIN_SHRINK_MIN_CAPACITY && versions.len() < capacity / 4 {
             versions.shrink_to(capacity / 4);
@@ -6854,17 +6894,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         id: RowID,
         row_version: RowVersion,
-    ) -> Result<RowVersions, TryReserveError> {
+    ) -> Result<RowVersions<A>, TryReserveError> {
         let row_versions = self.get_or_create_table_row_versions(id)?;
         self.insert_version_raw(&mut row_versions.write(), row_version)?;
         Ok(row_versions)
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TableRowsEntry)]
-    fn get_or_create_table_row_versions(&self, id: RowID) -> Result<RowVersions, TryReserveError> {
-        let versions = self
-            .rows
-            .try_get_or_insert_with(id, || Arc::new(RwLock::new(crate::alloc::vec![])))?;
+    fn get_or_create_table_row_versions(
+        &self,
+        id: RowID,
+    ) -> Result<RowVersions<A>, TryReserveError> {
+        let alloc = self.alloc.clone();
+        let versions = self.rows.try_get_or_insert_with(id, move || {
+            Arc::new(RwLock::new(<RowVersionChain<A> as TursoVecInExt<
+                RowVersion,
+                A,
+            >>::new_in(alloc)))
+        })?;
         Ok(versions.value().clone())
     }
 
@@ -6888,7 +6935,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         index_id: MVTableId,
         key: Arc<SortableIndexKey>,
         mut row_version: RowVersion,
-    ) -> Result<(Arc<SortableIndexKey>, RowVersions)> {
+    ) -> Result<(Arc<SortableIndexKey>, RowVersions<A>)> {
         let index = self.get_or_create_index_rows(index_id)?;
         let index = index.value();
         let entry = self.get_or_create_index_key_entry(index, key)?;
@@ -6920,8 +6967,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         index: &'a IndexRowsMap<A>,
         key: Arc<SortableIndexKey>,
     ) -> Result<IndexRowEntry<'a, A>, TryReserveError> {
-        let entry =
-            index.try_get_or_insert_with(key, || Arc::new(RwLock::new(crate::alloc::vec![])))?;
+        let alloc = self.alloc.clone();
+        let entry = index.try_get_or_insert_with(key, move || {
+            Arc::new(RwLock::new(<RowVersionChain<A> as TursoVecInExt<
+                RowVersion,
+                A,
+            >>::new_in(alloc)))
+        })?;
         Ok(entry)
     }
 
@@ -6930,7 +6982,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::RowVersionReserve)]
     pub fn insert_version_raw(
         &self,
-        versions: &mut RowVersionChain,
+        versions: &mut RowVersionChain<A>,
         row_version: RowVersion,
     ) -> Result<(), TryReserveError> {
         // NOTICE: this is an insert a'la insertion sort, with pessimistic linear complexity.
@@ -8443,9 +8495,9 @@ pub fn create_seek_range<K: Ord>(
 /// Ref: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf , page 301,
 /// 2.6. Updating a Version.
 fn is_write_write_conflict<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction, BasicComparator, A>,
+    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
-    tx: &Transaction,
+    tx: &Transaction<A>,
     rv: &RowVersion,
 ) -> bool {
     match rv.end() {
@@ -8522,8 +8574,8 @@ impl RowVersion {
     /// * End timestamp is not applicable yet, meaning deletion of row is not visible to this transaction
     fn is_visible_to<A: ConcurrentAllocator>(
         &self,
-        tx: &Transaction,
-        txs: &SkipMap<TxID, Transaction, BasicComparator, A>,
+        tx: &Transaction<A>,
+        txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
         finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     ) -> bool {
         is_begin_visible(txs, finalized_tx_states, tx, self)
@@ -8540,8 +8592,8 @@ impl RowVersion {
     /// This is used by dual-cursor to determine if a B-tree row should be shown or hidden.
     fn is_btree_invalidating_version<A: ConcurrentAllocator>(
         &self,
-        tx: &Transaction,
-        txs: &SkipMap<TxID, Transaction, BasicComparator, A>,
+        tx: &Transaction<A>,
+        txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
         finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     ) -> bool {
         // If the version is fully visible, it invalidates the B-tree
@@ -8603,8 +8655,8 @@ impl RowVersion {
 /// The lock on `commit_dep_set` serializes with the drain in commit/abort
 /// resolution, preventing the race where we push an entry after the drain.
 fn register_commit_dependency<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction, BasicComparator, A>,
-    dependent_tx: &Transaction,
+    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    dependent_tx: &Transaction<A>,
     depended_on_tx_id: TxID,
 ) {
     turso_assert!(
@@ -8661,7 +8713,7 @@ fn register_commit_dependency<A: ConcurrentAllocator>(
 }
 
 fn lookup_tx_state<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction, BasicComparator, A>,
+    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx_id: TxID,
 ) -> Option<TransactionState> {
@@ -8688,9 +8740,9 @@ fn lookup_finalized_tx_state<A: ConcurrentAllocator>(
 }
 
 fn is_begin_visible<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction, BasicComparator, A>,
+    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
-    tx: &Transaction,
+    tx: &Transaction<A>,
     rv: &RowVersion,
 ) -> bool {
     match rv.begin() {
@@ -8779,9 +8831,9 @@ fn is_begin_visible<A: ConcurrentAllocator>(
 }
 
 fn is_end_visible<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction, BasicComparator, A>,
+    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
-    current_tx: &Transaction,
+    current_tx: &Transaction<A>,
     row_version: &RowVersion,
 ) -> bool {
     match row_version.end() {

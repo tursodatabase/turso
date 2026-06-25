@@ -27,7 +27,7 @@ pub use collections::TursoFromIteratorIn;
 pub use collections::{
     TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt, TursoFromIterator, TursoHashMapExt,
     TursoHashSetExt, TursoIteratorExt, TursoNewExt, TursoSliceExt, TursoTryNewExt,
-    TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt,
+    TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt, TursoVecInExt,
 };
 
 pub const ALLOC_ERR_MSG: &str = "TODO: fallible allocations";

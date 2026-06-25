@@ -25,6 +25,12 @@ pub trait TursoVecExt<T>: Sized {
     fn try_push(&mut self, value: T) -> Result<(), TryReserveError>;
 }
 
+pub trait TursoVecInExt<T, A>: Sized {
+    fn new_in(alloc: A) -> Self;
+    fn with_capacity_in(capacity: usize, alloc: A) -> Self;
+    fn try_with_capacity_in(capacity: usize, alloc: A) -> Result<Self, TryReserveError>;
+}
+
 pub trait TursoHashMapExt<K, V>: Sized {
     fn try_insert(&mut self, key: K, value: V) -> Result<Option<V>, TryReserveError>;
 }

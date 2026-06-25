@@ -25,8 +25,8 @@ use std::ops::Bound;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
 
-#[derive(Debug, Clone)]
-enum CursorPosition {
+#[derive(Clone)]
+enum CursorPosition<A: ConcurrentAllocator = TursoAllocator> {
     /// We haven't loaded any row yet.
     BeforeFirst,
     /// We have loaded a row. This position points to a rowid in either MVCC index or in BTree.
@@ -38,10 +38,26 @@ enum CursorPosition {
         /// iterator so `read_mvcc_current_row` can skip a second `self.rows.get`.
         /// `Some` only for MVCC table rows reached via the scan path; `None`
         /// (btree rows, index rows, seek/insert positions) falls back to a lookup.
-        versions: Option<RowVersions>,
+        versions: Option<RowVersions<A>>,
     },
     /// We have reached the end of the table.
     End,
+}
+
+impl<A: ConcurrentAllocator> Debug for CursorPosition<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeFirst => f.write_str("BeforeFirst"),
+            Self::Loaded {
+                row_id, in_btree, ..
+            } => f
+                .debug_struct("Loaded")
+                .field("row_id", row_id)
+                .field("in_btree", in_btree)
+                .finish_non_exhaustive(),
+            Self::End => f.write_str("End"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -188,18 +204,27 @@ fn cursor_yield_key(tx_id: u64, table_id: MVTableId) -> u64 {
 /// With DualCursorPeek we track the "peeked" next value for each cursor in the dual-cursor iteration,
 /// so that we always return the correct 'next' value (e.g. if mvcc has 1 and 3 and btree has 2 and 4,
 /// we should return 1, 2, 3, 4 in order).
-#[derive(Debug, Clone, Default)]
-struct DualCursorPeek {
+#[derive(Debug, Clone)]
+struct DualCursorPeek<A: ConcurrentAllocator = TursoAllocator> {
     /// Next row available from MVCC
-    mvcc_peek: CursorPeek,
+    mvcc_peek: CursorPeek<A>,
     /// Next row available from btree
-    btree_peek: CursorPeek,
+    btree_peek: CursorPeek<A>,
 }
 
-impl DualCursorPeek {
+impl<A: ConcurrentAllocator> Default for DualCursorPeek<A> {
+    fn default() -> Self {
+        Self {
+            mvcc_peek: CursorPeek::default(),
+            btree_peek: CursorPeek::default(),
+        }
+    }
+}
+
+impl<A: ConcurrentAllocator> DualCursorPeek<A> {
     /// Returns the next row key, whether the row is from the BTree, and (for
     /// MVCC winners) the resolved version chain captured during iteration.
-    fn get_next(&self, dir: IterationDirection) -> Option<(RowKey, bool, Option<RowVersions>)> {
+    fn get_next(&self, dir: IterationDirection) -> Option<(RowKey, bool, Option<RowVersions<A>>)> {
         tracing::trace!(
             "get_next: mvcc_key: {:?}, btree_key: {:?}",
             self.mvcc_peek.get_row_key(),
@@ -234,7 +259,7 @@ impl DualCursorPeek {
         &self,
         table_id: MVTableId,
         dir: IterationDirection,
-    ) -> CursorPosition {
+    ) -> CursorPosition<A> {
         match self.get_next(dir) {
             Some((row_key, in_btree, versions)) => CursorPosition::Loaded {
                 row_id: RowID {
@@ -268,20 +293,25 @@ impl DualCursorPeek {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-enum CursorPeek {
-    #[default]
+#[derive(Debug, Clone)]
+enum CursorPeek<A: ConcurrentAllocator = TursoAllocator> {
     Uninitialized,
     Row {
         key: RowKey,
         /// Resolved MVCC version chain, set when this peek came from the MVCC
         /// table iterator. `None` for btree peeks and index peeks.
-        versions: Option<RowVersions>,
+        versions: Option<RowVersions<A>>,
     },
     Exhausted,
 }
 
-impl CursorPeek {
+impl<A: ConcurrentAllocator> Default for CursorPeek<A> {
+    fn default() -> Self {
+        Self::Uninitialized
+    }
+}
+
+impl<A: ConcurrentAllocator> CursorPeek<A> {
     pub fn get_row_key(&self) -> Option<&RowKey> {
         match self {
             CursorPeek::Row { key, .. } => Some(key),
@@ -289,7 +319,7 @@ impl CursorPeek {
         }
     }
 
-    pub fn get_versions(&self) -> Option<RowVersions> {
+    pub fn get_versions(&self) -> Option<RowVersions<A>> {
         match self {
             CursorPeek::Row { versions, .. } => versions.clone(),
             _ => None,
@@ -304,7 +334,7 @@ pub enum MvccCursorType {
 }
 
 pub(crate) type MvccEntry<'l, T, A = TursoAllocator> =
-    Entry<'l, T, RowVersions, BasicComparator, A>;
+    Entry<'l, T, RowVersions<A>, BasicComparator, A>;
 
 pub(crate) type MvccIterator<'l, T, A = TursoAllocator> =
     Box<dyn Iterator<Item = MvccEntry<'l, T, A>> + Send + Sync>;
@@ -369,7 +399,7 @@ pub(crate) enum IndexShadowFinger<A: ConcurrentAllocator = TursoAllocator> {
     Peeked {
         iter: MvccIterator<'static, Arc<SortableIndexKey>, A>,
         key: Arc<SortableIndexKey>,
-        versions: RowVersions,
+        versions: RowVersions<A>,
     },
     /// Ran past the last version; every remaining B-tree row is visible.
     Exhausted,
@@ -466,7 +496,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     connection: Arc<Connection>,
     #[cfg(any(test, injected_yields))]
     yield_instance_id: u64,
-    current_pos: CursorPosition,
+    current_pos: CursorPosition<A>,
     /// Stateful MVCC table iterator if this is a table cursor.
     table_iterator: Option<MvccIterator<'static, RowID, A>>,
     /// Stateful MVCC index iterator if this is an index cursor.
@@ -484,7 +514,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     count_state: Option<CountState>,
     btree_advance_state: Option<AdvanceBtreeState>,
     /// Dual-cursor peek state for proper iteration
-    dual_peek: DualCursorPeek,
+    dual_peek: DualCursorPeek<A>,
     /// Forward-scan finger over `index_rows`; see [`IndexShadowFinger`].
     index_finger: IndexShadowFinger<A>,
 }
@@ -723,7 +753,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         Ok(self.reusable_immutable_record.as_mut().unwrap())
     }
 
-    fn get_current_pos(&self) -> CursorPosition {
+    fn get_current_pos(&self) -> CursorPosition<A> {
         self.current_pos.clone()
     }
 

@@ -1344,7 +1344,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             if let Some(entry) = self.mvstore.rows.get(row_id) {
                 let is_now_empty = {
                     let mut versions = entry.value().write();
-                    MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
+                    MvStore::<Clock, A>::gc_version_chain(&mut versions, lwm, ckpt_max);
                     versions.is_empty()
                 };
                 if is_now_empty {
@@ -1408,7 +1408,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .get(sortable_key)
                         .expect("index row from write set must exist in inner map");
                     let mut versions = inner_entry.value().write();
-                    MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
+                    MvStore::<Clock, A>::gc_version_chain(&mut versions, lwm, ckpt_max);
                     versions.is_empty()
                 };
                 if is_now_empty {
@@ -2703,9 +2703,15 @@ mod tests {
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
         for i in 0..row_count as i64 {
             let version = committed_table_row_version(table_id, i);
+            let mut versions =
+                <crate::mvcc::database::RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
+                    RowVersion,
+                    crate::alloc::DynAllocator,
+                >>::new_in(crate::alloc::DynAllocator::default());
+            versions.push(version);
             mvstore.rows.insert(
                 RowID::new(table_id, RowKey::Int(i)),
-                Arc::new(RwLock::new(crate::alloc::vec![version])),
+                Arc::new(RwLock::new(versions)),
             );
         }
 
@@ -2778,10 +2784,13 @@ mod tests {
         for i in 0..row_count as i64 {
             let version = committed_table_row_version(table_id, i);
             let row_id = RowID::new(table_id, RowKey::Int(i));
-            mvstore.rows.insert(
-                row_id,
-                Arc::new(RwLock::new(crate::alloc::vec![version.clone()])),
-            );
+            let mut versions =
+                <crate::mvcc::database::RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
+                    RowVersion,
+                    crate::alloc::DynAllocator,
+                >>::new_in(crate::alloc::DynAllocator::default());
+            versions.push(version.clone());
+            mvstore.rows.insert(row_id, Arc::new(RwLock::new(versions)));
             checkpoint.write_set.push((version, None));
         }
         checkpoint.state = CheckpointState::GcTableRows {
