@@ -191,8 +191,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Replace the exe entry in the archive (-j stores it as bare tursodb.exe).
-          zip -j "$WINDOWS_ZIP" sign-tmp/tursodb.exe
+          # Windows runners' Git Bash ships `unzip` but not `zip`, so use 7-Zip
+          # (preinstalled, on PATH) to replace the exe entry. Running from inside
+          # sign-tmp stores it as bare tursodb.exe at the archive root.
+          abs_zip="$(pwd)/$WINDOWS_ZIP"
+          ( cd sign-tmp && 7z a -tzip "$abs_zip" tursodb.exe )
           # Regenerate the sidecar to match cargo-dist's "<hash> *<name>" format.
           hash=$(sha256sum "$WINDOWS_ZIP" | cut -d' ' -f1)
           printf '%s *%s\n' "$hash" "$(basename "$WINDOWS_ZIP")" > "${WINDOWS_ZIP}.sha256"
