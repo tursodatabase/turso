@@ -13678,6 +13678,89 @@ fn test_mvcc_portable_changes_use_checkpointed_schema_after_restart() {
 
 #[cfg(feature = "conn_raw_api")]
 #[test]
+fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoint() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:").unwrap();
+    let creator = db.connect().unwrap();
+    creator.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    creator.set_portable_logical_changes_enabled(true);
+    creator
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+
+    let checkpoint = db.connect().unwrap();
+    checkpoint
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let rows = get_rows(
+        &checkpoint,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 'items'",
+    );
+    let rootpage = rows[0][0].as_int().unwrap();
+    assert!(rootpage > 0);
+
+    let writer = db.connect().unwrap();
+    writer.set_portable_logical_changes_enabled(true);
+    writer
+        .execute("INSERT INTO items(id, payload) VALUES (1, 'after-checkpoint')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&writer);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(
+        objects.iter().any(|object| object.name == "items"),
+        "DML-only portable frame should resolve user table after cross-connection checkpoint"
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_resolve_table_after_alter_backfill() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute(
+            "CREATE TABLE items(
+                id INTEGER PRIMARY KEY,
+                owner TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                rev INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .unwrap();
+    db.conn
+        .execute("CREATE INDEX items_owner_rev_idx ON items(owner, rev)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items (id, owner, payload, rev) VALUES (1, 'seed-a', 'alpha', 1)")
+        .unwrap();
+
+    db.conn
+        .execute("ALTER TABLE items ADD COLUMN note TEXT")
+        .unwrap();
+    db.conn
+        .execute("UPDATE items SET note = 'schema-note'")
+        .unwrap();
+
+    db.conn
+        .execute(
+            "INSERT INTO items (id, owner, payload, rev, note)
+             VALUES (1000000, 'remote-owner', 'remote-bootstrap-5', 1, 'remote-owner-note-1000000')",
+        )
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    assert!(
+        txns.len() >= 6,
+        "expected every portable-enabled commit to be encoded, got {} txns",
+        txns.len()
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
 fn test_mvcc_portable_changes_emit_ddl_and_backfill_rows_in_same_transaction() {
     let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn

@@ -73,8 +73,8 @@ use super::persistent_storage::logical_log::{
 };
 #[cfg(feature = "conn_raw_api")]
 use super::portable_logical::{
-    is_portable_logical_name, is_portable_table_schema_row, portable_schema_row_from_record,
-    PortableLogicalBuilder, PortableObjectMapEntry,
+    is_portable_logical_name, is_portable_schema_row, is_portable_table_schema_row,
+    portable_schema_row_from_record, PortableLogicalBuilder, PortableObjectMapEntry,
 };
 
 #[cfg(test)]
@@ -505,6 +505,10 @@ pub struct LogRecord {
     /// frames, even if this transaction has no client-visible metadata.
     #[cfg(feature = "conn_raw_api")]
     pub portable_changes_enabled: bool,
+    /// True when a frame must carry a portable transaction wrapper even if
+    /// the wrapper metadata itself is empty.
+    #[cfg(feature = "conn_raw_api")]
+    pub portable_changes_required: bool,
 }
 
 impl LogRecord {
@@ -524,6 +528,8 @@ impl LogRecord {
             portable_changes: Vec::new(),
             #[cfg(feature = "conn_raw_api")]
             portable_changes_enabled: false,
+            #[cfg(feature = "conn_raw_api")]
+            portable_changes_required: false,
         }
     }
 
@@ -610,16 +616,10 @@ fn rootpage_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocator>(
 }
 
 #[cfg(feature = "conn_raw_api")]
-fn portable_table_name_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocator>(
-    connection: &Connection,
-    mvcc_store: &MvStore<Clock, A>,
-    table_id: MVTableId,
-) -> Option<String> {
-    let rootpage = rootpage_for_mv_table_id(mvcc_store, table_id);
+fn table_name_for_rootpage_in_schema(schema: &Schema, rootpage: i64) -> Option<String> {
     if rootpage == 0 {
         return None;
     }
-    let schema = connection.schema.read();
     if let Some(name) = schema.table_name_for_root_page(rootpage) {
         return Some(name.to_string());
     }
@@ -630,6 +630,59 @@ fn portable_table_name_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocat
     schema
         .table_name_for_root_page(alternate_rootpage)
         .map(ToString::to_string)
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn table_name_for_rootpage(connection: &Connection, rootpage: i64) -> Option<String> {
+    {
+        let schema = connection.schema.read();
+        if let Some(name) = table_name_for_rootpage_in_schema(&schema, rootpage) {
+            return Some(name);
+        }
+    }
+
+    let schema = connection.db.schema.lock();
+    table_name_for_rootpage_in_schema(&schema, rootpage)
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn table_name_for_rootpage_in_mvcc_schema<Clock: LogicalClock, A: ConcurrentAllocator>(
+    mvcc_store: &MvStore<Clock, A>,
+    rootpage: i64,
+) -> Option<String> {
+    if rootpage == 0 {
+        return None;
+    }
+    let alternate_rootpage = -rootpage;
+    for entry in mvcc_store.rows.iter() {
+        if entry.key().table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+            continue;
+        }
+        let row_versions = entry.value().read();
+        for row_version in row_versions.iter().rev() {
+            if row_version.end().is_some() {
+                continue;
+            }
+            let Ok(row) = portable_schema_row_from_record(row_version.row.payload()) else {
+                continue;
+            };
+            if row.rootpage == rootpage || row.rootpage == alternate_rootpage {
+                return Some(row.name);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(feature = "conn_raw_api")]
+fn portable_table_name_for_mv_table_id<Clock: LogicalClock, A: ConcurrentAllocator>(
+    connection: &Connection,
+    mvcc_store: &MvStore<Clock, A>,
+    table_id: MVTableId,
+) -> Option<String> {
+    let rootpage = rootpage_for_mv_table_id(mvcc_store, table_id);
+    table_name_for_rootpage(connection, rootpage)
+        .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, rootpage))
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -2366,6 +2419,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             let mut schema_deletes = HashMap::default();
             let mut schema_rowids = Vec::new();
             let mut data_table_ids = HashSet::default();
+            let mut has_portable_schema_changes = false;
             for op in &parsed_ops {
                 match op {
                     ParsedOp::UpsertTable {
@@ -2376,6 +2430,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     } if *table_id == SQLITE_SCHEMA_MVCC_TABLE_ID => {
                         let rowid = rowid.row_id.to_int_or_panic();
                         let row = portable_schema_row_from_record(record_bytes)?;
+                        has_portable_schema_changes |= is_portable_schema_row(&row);
                         schema_rowids.push(rowid);
                         schema_upserts.insert(rowid, row);
                     }
@@ -2391,6 +2446,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                         }
                         let schema_rowid = rowid.row_id.to_int_or_panic();
                         let row = portable_schema_row_from_record(record_bytes)?;
+                        has_portable_schema_changes |= is_portable_schema_row(&row);
                         schema_rowids.push(schema_rowid);
                         schema_deletes.insert(schema_rowid, row);
                     }
@@ -2485,44 +2541,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             }
 
             if !needed_rootpages.is_empty() {
-                let schema = self.connection.schema.read();
                 for rootpage in needed_rootpages {
-                    let (resolved_table_id, table_ref) = if let Some(name) =
-                        schema.table_name_for_root_page(rootpage)
-                    {
-                        (
-                            portable_table_id_from_rootpage(rootpage),
-                            PortableTableRef {
-                                name: name.to_string(),
-                            },
-                        )
-                    } else if rootpage < 0 {
-                        let checkpointed_rootpage = -rootpage;
-                        let Some(name) = schema.table_name_for_root_page(checkpointed_rootpage)
-                        else {
-                            continue;
-                        };
-                        (
-                            portable_table_id_from_rootpage(checkpointed_rootpage),
-                            PortableTableRef {
-                                name: name.to_string(),
-                            },
-                        )
-                    } else if rootpage > 0 {
-                        let uncheckpointed_rootpage = -rootpage;
-                        let Some(name) = schema.table_name_for_root_page(uncheckpointed_rootpage)
-                        else {
-                            continue;
-                        };
-                        (
-                            portable_table_id_from_rootpage(rootpage),
-                            PortableTableRef {
-                                name: name.to_string(),
-                            },
-                        )
-                    } else {
+                    let Some(name) = table_name_for_rootpage(&self.connection, rootpage)
+                        .or_else(|| table_name_for_rootpage_in_mvcc_schema(mvcc_store, rootpage))
+                    else {
                         continue;
                     };
+                    let resolved_rootpage = if rootpage < 0 { -rootpage } else { rootpage };
+                    let resolved_table_id = portable_table_id_from_rootpage(resolved_rootpage);
+                    let table_ref = PortableTableRef { name };
                     table_refs_by_id.insert(resolved_table_id, table_ref);
                 }
 
@@ -2549,8 +2576,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
 
             for table_id in data_table_ids {
                 let Some(table_ref) = table_refs_by_id.get(&table_id) else {
-                    return Err(LimboError::InternalError(format!(
-                        "unable to resolve MVCC table id for portable changes: table_id={table_id}"
+                    return Err(LimboError::Corrupt(format!(
+                        "portable changes cannot resolve user data table id {table_id}"
                     )));
                 };
                 if !is_portable_logical_name(&table_ref.name) {
@@ -2559,6 +2586,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             }
 
             log_record.portable_changes = builder.finish();
+            log_record.portable_changes_required = has_portable_schema_changes;
             Ok(())
         }
     }
