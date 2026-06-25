@@ -4024,6 +4024,7 @@ fn is_unsafe_datetime_modifier(expr: &Expr) -> bool {
 fn string_literal_eq(value: &str, expected: &str) -> bool {
     value.trim_matches('\'').eq_ignore_ascii_case(expected)
 }
+
 pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
     use ast::Expr;
     match expr {
