@@ -14,6 +14,11 @@ on:
         required: false
         default: 240
         type: number
+      diff_base:
+        description: "Branch or SHA to diff against for targeted testing (leave blank for no targeted testing)"
+        required: false
+        default: ""
+        type: string
   workflow_call:
     inputs:
       test_name:
@@ -22,6 +27,10 @@ on:
       duration:
         required: true
         type: number
+      diff_base:
+        required: false
+        default: ""
+        type: string
 
 env:
   ANTITHESIS_DOCKER_HOST: us-central1-docker.pkg.dev
@@ -39,6 +48,21 @@ jobs:
     - name: Publish workload
       run: bash ./scripts/antithesis/publish-workload.sh
 
+    - name: Generate diff for targeted testing
+      if: ${{ inputs.diff_base != '' }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        DIFF_BASE: ${{ inputs.diff_base }}
+        HEAD_SHA: ${{ github.sha }}
+      run: |
+        curl --fail --silent --show-error --location \
+          -H "Accept: application/vnd.github.diff" \
+          -H "Authorization: Bearer $GH_TOKEN" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          "https://api.github.com/repos/$REPO/compare/$DIFF_BASE...$HEAD_SHA" \
+          -o testing/stress/git.diff
+
     - name: Publish config
       run: bash ./scripts/antithesis/publish-config.sh
 
@@ -55,7 +79,7 @@ jobs:
         description: >-
           Turso - ${{ github.event_name }}
           on ${{ github.ref_name }} (${{ github.sha }})
-          by ${{ github.actor }}${{ inputs.test_name && format(' ({0})', inputs.test_name) || '' }}
+          by ${{ github.actor }}${{ inputs.test_name && format(' ({0})', inputs.test_name) || '' }}${{ inputs.diff_base && format(' diff vs {0}', inputs.diff_base) || '' }}
         email_recipients: ${{ secrets.ANTITHESIS_EMAIL }}
         test_name: ${{ inputs.test_name }}
         additional_parameters: |-
