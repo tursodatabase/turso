@@ -1,6 +1,6 @@
 # Turso .NET
 
-ADO.NET bindings for Turso local databases.
+ADO.NET bindings for Turso local and remote databases.
 
 The `Turso.Data.Sqlite` package includes both a SQLite-compatible `Turso.Data.Sqlite` facade and Turso-specific `System.Data.Common` types such as `TursoConnection`, `TursoCommand`, `TursoDataReader`, `TursoParameter`, `TursoTransaction`, and `TursoFactory`.
 
@@ -58,6 +58,24 @@ command.Parameters.Add(parameter);
 var value = command.ExecuteScalar();
 ```
 
+Remote Turso/libSQL databases can use the same `TursoConnection` surface with a remote URL and auth token:
+
+```C#
+await using var connection = new TursoConnection(
+    "Data Source=libsql://example-org.turso.io;Auth Token=eyJ...");
+await connection.OpenAsync();
+
+await using var command = connection.CreateCommand();
+command.CommandText = "SELECT name FROM customers WHERE id = $id";
+command.Parameters.Add(new TursoParameter("$id", 42));
+
+var name = await command.ExecuteScalarAsync();
+```
+
+Remote mode uses the Hrana HTTP `/v2/pipeline` protocol. `libsql://` URLs default to HTTPS; `Tls=False` maps them to HTTP for local development. `ws://` and `wss://` URLs are accepted and mapped to the equivalent HTTP pipeline endpoint. `Auth Token` requires HTTPS unless the host is `localhost` or loopback.
+
+Remote mode currently supports direct single-statement command execution. Remote transactions, ADO.NET batches, and embedded replicas are not enabled yet in the .NET provider. `Replica Path` and `Sync Interval` are parsed so applications fail early with clear errors.
+
 Provider factories are available through `TursoFactory.Instance`:
 
 ```C#
@@ -93,6 +111,11 @@ Supported common connection string keywords include:
 | `Vfs` | Parsed and preserved for compatibility. |
 | `Encryption Cipher` | Turso local encryption cipher. |
 | `Encryption Key` | Hex-encoded encryption key used with `Encryption Cipher`. |
+| `Auth Token` | Bearer token for remote Turso/libSQL URLs. Aliases include `AuthToken` and `Authentication Token`. |
+| `Replica Path` | Reserved for embedded replicas. The .NET provider currently fails early with a clear unsupported error. |
+| `Read Your Writes` | Keeps the remote Hrana session baton across commands. Defaults to `True`. Set `False` for stateless one-shot remote requests. |
+| `Sync Interval` | Reserved for embedded replicas. Automatic sync is not enabled yet. |
+| `Tls` | Optional override for `libsql://` development URLs. Conflicting values with explicit `http://` or `https://` schemes fail early. |
 
 ## SQLite-compatible facade coverage
 
@@ -137,4 +160,4 @@ var options = new DbContextOptionsBuilder<AppDbContext>()
 
 The local provider supports the normal EF Core SQLite query pipeline, including composed `IQueryable<T>` filters, navigation-property joins, ordering, paging, grouping, aggregates, async materialization, and `SaveChangesAsync`. Schema creation can use the standard EF Core SQLite mechanisms such as `EnsureCreated`, `EnsureCreatedAsync`, and migrations against local database files.
 
-Remote `libsql://`/auth-token EF Core support is not part of the local provider. Use the local/embedded provider for EF Core today; remote/serverless EF support needs a separate connection, batching, retry, and transaction design.
+Remote `libsql://`/auth-token EF Core support is not part of the local provider. Use the local/embedded provider for EF Core today; remote/serverless EF support needs a separate connection, retry, and transaction design.

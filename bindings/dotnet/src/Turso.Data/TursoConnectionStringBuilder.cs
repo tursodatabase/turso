@@ -30,6 +30,18 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         ["EncryptionCipher"] = "Encryption Cipher",
         ["Encryption Key"] = "Encryption Key",
         ["EncryptionKey"] = "Encryption Key",
+        ["Auth Token"] = "Auth Token",
+        ["AuthToken"] = "Auth Token",
+        ["Authentication Token"] = "Auth Token",
+        ["AuthenticationToken"] = "Auth Token",
+        ["Replica Path"] = "Replica Path",
+        ["ReplicaPath"] = "Replica Path",
+        ["Read Your Writes"] = "Read Your Writes",
+        ["ReadYourWrites"] = "Read Your Writes",
+        ["Sync Interval"] = "Sync Interval",
+        ["SyncInterval"] = "Sync Interval",
+        ["Tls"] = "Tls",
+        ["TLS"] = "Tls",
     };
 
     public TursoConnectionStringBuilder()
@@ -111,6 +123,40 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         set => SetString("Encryption Key", value);
     }
 
+    public string AuthToken
+    {
+        get => GetString("Auth Token");
+        set => SetString("Auth Token", value);
+    }
+
+    public string ReplicaPath
+    {
+        get => GetString("Replica Path");
+        set => SetString("Replica Path", value);
+    }
+
+    public bool ReadYourWrites
+    {
+        get => GetBool("Read Your Writes", defaultValue: true);
+        set => this["Read Your Writes"] = value;
+    }
+
+    public int SyncInterval
+    {
+        get => GetInt("Sync Interval", 0);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Sync Interval"] = value;
+        }
+    }
+
+    public bool? Tls
+    {
+        get => GetNullableBool("Tls");
+        set => SetNullable("Tls", value);
+    }
+
     [AllowNull]
     public override object this[string keyword]
     {
@@ -185,9 +231,11 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         this[keyword] = value;
     }
 
-    private bool GetBool(string keyword)
+    private bool GetBool(string keyword, bool defaultValue = false)
     {
-        return TryGetValue(keyword, out var value) && Convert.ToBoolean(value, CultureInfo.InvariantCulture);
+        return TryGetValue(keyword, out var value)
+            ? Convert.ToBoolean(value, CultureInfo.InvariantCulture)
+            : defaultValue;
     }
 
     private bool? GetNullableBool(string keyword)
