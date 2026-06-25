@@ -197,7 +197,7 @@ cargo run -Zbuild-std --target x86_64-unknown-linux-gnu -p turso_stress -- --vfs
 
 ## Finding things to work on
 
-The issue tracker has issues tagged with [good first issue](https://github.com/tursodatabase/limbo/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22),
+The issue tracker has issues tagged with [good first issue](https://github.com/tursodatabase/turso/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22),
 which are considered to be things to work on to get going. If you're interested in working on one of them, comment on the issue tracker, and we're happy to help you get going.
 
 You don't need to ask "can I work on this?" The answer is always yes. Pick something, work on it, and open a pull request. A few things to keep in mind:
