@@ -964,6 +964,26 @@ fn closure_scalar_supports_multiple_arities(tmp_db: TempDatabase) -> anyhow::Res
     Ok(())
 }
 
+#[turso_macros::test]
+fn closure_scalar_shadows_builtin_functions(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let builtin: Vec<(i64,)> = conn.exec_rows("SELECT abs(-5)");
+    assert_eq!(builtin, vec![(5,)]);
+
+    conn.register_scalar_function("abs", 1, true, |_args| Ok(Value::from_i64(42)))?;
+    let shadowed: Vec<(i64,)> = conn.exec_rows("SELECT abs(-5)");
+    assert_eq!(shadowed, vec![(42,)]);
+
+    let other = tmp_db.connect_limbo();
+    let other_builtin: Vec<(i64,)> = other.exec_rows("SELECT abs(-5)");
+    assert_eq!(other_builtin, vec![(5,)]);
+
+    conn.unregister_scalar_function("abs")?;
+    let restored: Vec<(i64,)> = conn.exec_rows("SELECT abs(-5)");
+    assert_eq!(restored, vec![(5,)]);
+    Ok(())
+}
+
 unsafe extern "C" fn dotnet_nocase_collation(
     _context: usize,
     left_ptr: *const u8,
