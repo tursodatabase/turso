@@ -1052,6 +1052,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             .or_else(|| self.mvstore.current_root_page(&table_id))
     }
 
+    fn table_exists_for_snapshot(&self, table_id: MVTableId) -> bool {
+        if self.pending_alloc_roots.contains_key(&table_id) {
+            return true;
+        }
+        self.mvstore
+            .table_id_to_rootpage
+            .get(&table_id)
+            .is_some_and(|entry| {
+                let e = entry.value();
+                e.root_page.is_some() && e.covers(self.snapshot_ts)
+            })
+    }
+
     /// Stage a newly-created root for deferred publication. The write phase resolves it via
     /// [`Self::resolve_checkpoint_root`]; it is inserted into the shared map only at commit.
     fn ckpt_rootmap_alloc(&mut self, table_id: MVTableId, root_page: u64) {
@@ -1236,6 +1249,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     if !was_checkpointed {
                         skip_write = true;
                     }
+                } else if key.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID
+                    && is_delete
+                    && !self.table_exists_for_snapshot(key.table_id)
+                {
+                    // B-tree was destroyed in a prior checkpoint; late tombstones are logical-only.
+                    skip_write = true;
                 }
                 if !skip_write {
                     tracing::trace!("adding to write_set {:?}", (&version, &special_write));
@@ -1302,6 +1321,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
                 for version in self.maybe_get_checkpointable_versions(&versions, index_id) {
                     let is_delete = version.end().is_some();
+                    if is_delete && !self.table_exists_for_snapshot(index_id) {
+                        continue;
+                    }
 
                     // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
                     // the database file.
@@ -2215,6 +2237,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     return Ok(TransitionResult::Continue);
                 }
 
+                let is_delete = self
+                    .get_current_row_version(write_set_index)
+                    .is_some_and(|(v, _)| v.end().is_some());
+                if is_delete && !self.table_exists_for_snapshot(table_id) {
+                    self.state = CheckpointState::WriteRow {
+                        write_set_index: write_set_index + 1,
+                        requires_seek: true,
+                    };
+                    return Ok(TransitionResult::Continue);
+                }
+
                 let root_page = self.resolve_checkpoint_root(table_id).unwrap_or_else(|| {
                     panic!(
                         "Table ID does not have a root page: {table_id}, row_version: {:?}",
@@ -2431,6 +2464,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     };
                     return Ok(TransitionResult::Continue);
                 };
+
+                if *is_delete && !self.table_exists_for_snapshot(*index_id) {
+                    self.state = CheckpointState::WriteIndexRow {
+                        index_write_set_index: index_write_set_index + 1,
+                        requires_seek: true,
+                    };
+                    return Ok(TransitionResult::Continue);
+                }
 
                 // Get root page for this index
                 let root_page = self
