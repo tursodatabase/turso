@@ -178,8 +178,6 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     mvstore: Arc<MvStore<Clock, A>>,
     /// Connection to the database
     connection: Arc<Connection>,
-    /// Database whose pager and schema this checkpoint is writing.
-    database_id: usize,
     #[cfg(any(test, injected_yields))]
     yield_instance_id: u64,
     /// Lock used to block other transactions from running during the checkpoint
@@ -777,7 +775,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             durable_txid_max_new: durable_tx_max,
             mvstore,
             connection,
-            database_id,
             #[cfg(any(test, injected_yields))]
             yield_instance_id,
             checkpoint_lock,
