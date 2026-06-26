@@ -302,6 +302,9 @@ pub struct WhopperOpts {
     pub reopen_probability: f64,
     /// Probability of failing a scoped Turso allocation while stepping a statement.
     pub allocation_fault_probability: f64,
+    /// Skip inline `PRAGMA integrity_check` workloads during the run and validate once
+    /// after all workers finish. Useful for hunting false-positive integrity failures.
+    pub integrity_check_final_only: bool,
 }
 
 /// Schema-generation bias
@@ -350,6 +353,7 @@ impl Default for WhopperOpts {
             close_connections_gracefully: true,
             reopen_probability: 0.0,
             allocation_fault_probability: 0.0,
+            integrity_check_final_only: false,
         }
     }
 }
@@ -495,6 +499,11 @@ impl WhopperOpts {
 
     pub fn with_allocation_fault_probability(mut self, probability: f64) -> Self {
         self.allocation_fault_probability = probability;
+        self
+    }
+
+    pub fn with_integrity_check_final_only(mut self, enable: bool) -> Self {
+        self.integrity_check_final_only = enable;
         self
     }
 }
@@ -653,6 +662,7 @@ pub struct Whopper {
     /// If false, drop fiber connections without first closing them.
     close_connections_gracefully: bool,
     allocation_fault_injector: Option<&'static SimulatorAllocationFaultInjector>,
+    integrity_check_final_only: bool,
 }
 
 impl Whopper {
@@ -810,6 +820,7 @@ impl Whopper {
             experimental_mvcc_passive_checkpoint: opts.experimental_mvcc_passive_checkpoint,
             close_connections_gracefully: opts.close_connections_gracefully,
             allocation_fault_injector,
+            integrity_check_final_only: opts.integrity_check_final_only,
         };
 
         whopper.open_connections()?;
@@ -1185,8 +1196,74 @@ impl Whopper {
         Ok(())
     }
 
+    /// Run `PRAGMA integrity_check` once after the simulation completes.
+    pub fn run_final_integrity_check(&mut self) -> anyhow::Result<()> {
+        use crate::properties::validate_integrity_check_result;
+
+        self.drain_active_statements("final integrity_check")?;
+
+        let fiber_idx = self
+            .context
+            .fibers
+            .iter()
+            .position(|fiber| fiber.statement.borrow().is_none())
+            .unwrap_or(0);
+
+        println!("running final integrity_check after simulation");
+        let connection = self.context.fibers[fiber_idx].connection.clone();
+        let yield_injector = Arc::new(SimulatorYieldInjector::new(fiber_yield_seed(
+            self.seed, fiber_idx,
+        )));
+        let mut stmt = connection.prepare("PRAGMA integrity_check")?;
+        let mut rows = Vec::new();
+        let mut drain_iterations = 0usize;
+        loop {
+            let step_result = step_stmt_with_injections(
+                &connection,
+                yield_injector.clone(),
+                self.allocation_fault_injector,
+                AllocationFaultContext {
+                    step: self.current_step as u64,
+                    fiber_idx: fiber_idx as u64,
+                    execution_id: 0,
+                },
+                &mut stmt,
+            )?;
+            match step_result {
+                turso_core::StepResult::Row => {
+                    if let Some(row) = stmt.row() {
+                        rows.push(row.get_values().cloned().collect());
+                    }
+                }
+                turso_core::StepResult::Done => break,
+                turso_core::StepResult::Busy => {
+                    return validate_integrity_check_result(
+                        self.current_step,
+                        fiber_idx,
+                        &Err(turso_core::LimboError::Busy),
+                    );
+                }
+                _ => {}
+            }
+            self.io.step()?;
+            drain_iterations += 1;
+            if drain_iterations >= self.max_drain_steps {
+                anyhow::bail!(
+                    "final integrity_check exceeded max_drain_steps ({})",
+                    self.max_drain_steps
+                );
+            }
+        }
+        validate_integrity_check_result(self.current_step, fiber_idx, &Ok(rows))?;
+        self.stats.integrity_checks += 1;
+        Ok(())
+    }
+
     /// Finalize all properties (e.g., export Elle history).
-    pub fn finalize_properties(&self) -> anyhow::Result<()> {
+    pub fn finalize_properties(&mut self) -> anyhow::Result<()> {
+        if self.integrity_check_final_only {
+            self.run_final_integrity_check()?;
+        }
         for property in &self.properties {
             let mut property = property.lock().unwrap();
             property.finalize()?;
@@ -1307,24 +1384,9 @@ impl Whopper {
         }
     }
 
-    /// Reopen the database by closing all connections and recreating them.
-    /// This simulates a database restart/reopen scenario.
-    /// Active statements are run to completion before closing.
-    pub fn reopen(&mut self) -> anyhow::Result<()> {
-        debug!(
-            "Restarting database, completing active statements for {} fibers",
-            self.context.fibers.len()
-        );
-
-        // Drain active statements with a per-reopen budget independent of
-        // `max_steps`. The main loop's step budget governs how long the
-        // simulator runs overall; drain is a finalization phase that runs
-        // until either every fiber's in-flight statement has terminated
-        // (Done/Busy/Err) or `max_drain_steps` iterations elapse. The latter
-        // catches genuine engine-side infinite loops (leaked lock,
-        // unresolvable IO yield). Legitimate IO-heavy operations like
-        // `PRAGMA integrity_check` can run for thousands of yields per page,
-        // so the cap needs to comfortably exceed that.
+    /// Drain in-flight statements on all fibers. Used before reopen and before
+    /// the post-run integrity check.
+    fn drain_active_statements(&mut self, reason: &str) -> anyhow::Result<()> {
         let mut drain_iterations = 0usize;
         while self
             .context
@@ -1341,7 +1403,7 @@ impl Whopper {
                     .filter_map(|(i, f)| f.statement.borrow().is_some().then_some(i))
                     .collect();
                 anyhow::bail!(
-                    "reopen drain exceeded max_drain_steps ({}) with statements still live on \
+                    "{reason} drain exceeded max_drain_steps ({}) with statements still live on \
                      fibers {:?}; likely a leaked lock or other infinite loop in the engine",
                     self.max_drain_steps,
                     stuck,
@@ -1354,24 +1416,24 @@ impl Whopper {
                 let Some(op_result) = self.step_drained_statement(fiber_idx) else {
                     continue;
                 };
-                // Statement finished during drain. Notify properties
-                // so committed_watermark and friends stay in sync
-                // with what the engine actually committed to disk —
-                // a drained autocommit that reached StepResult::Done
-                // ran its inline backing-table writes + commit_txn
-                // before returning, so its sequence writes are durable
-                // on disk even though the user-level statement never
-                // returned to the original generate→init→complete
-                // pipeline. Without this notification, the post-
-                // restart disk can be more (or less) advanced than
-                // the checker's committed_watermark and the restart
-                // assertion misfires.
                 self.finalize_drained_statement(fiber_idx, op_result);
             }
-            self.io.step().unwrap();
+            self.io.step()?;
             drain_iterations += 1;
         }
+        Ok(())
+    }
 
+    /// Reopen the database by closing all connections and recreating them.
+    /// This simulates a database restart/reopen scenario.
+    /// Active statements are run to completion before closing.
+    pub fn reopen(&mut self) -> anyhow::Result<()> {
+        debug!(
+            "Restarting database, completing active statements for {} fibers",
+            self.context.fibers.len()
+        );
+
+        self.drain_active_statements("reopen")?;
         // Close and drop all fiber connections to release database Arc references
         {
             let fibers = self.context.fibers.drain(..).collect::<Vec<_>>();

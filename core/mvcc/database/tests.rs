@@ -473,25 +473,6 @@ fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
     );
 }
 
-/// The btree-read DUAL GATE, anchored to the WAL read mark. A PASSIVE checkpoint materializes an
-/// object's btree off-lock at WAL position `materialized_at`; a transaction may read it only when
-/// BOTH (a) the binding logically covers its snapshot (`begin <= begin_ts < end`) AND (b) its
-/// frozen read mark physically reaches the pages (`materialized_at <= read_mark`). The physical
-/// gate protects a tx with `begin_ts > c_ts` that opened before the materialization: its read mark
-/// predates the frames, so it stays version-store-only instead of reading a page it can't reach.
-/// Reproducer attempt for the passive off-lock free-and-reuse corruption: a checkpointed index's
-/// root page is freed on DROP and a later object reuses it via the freelist; integrity_check found
-/// the page referenced twice / a btree page left on the freelist (whopper seed 37925386091653428).
-/// Per-row materialization-frame GC retention (whopper seed 25980596428923395, which surfaced as
-/// integrity_check "wrong # of entries in index" / "MVCC delete: rowid not found").
-///
-/// Under PASSIVE off-lock checkpointing the version-store GC must not reclaim a version until its
-/// current state is actually in the B-tree AND every reader's read mark has reached that frame.
-/// The old GC keyed on `ckpt_max` (a logical timestamp), which a deferred/coalesced B-tree
-/// materialization could run ahead of — so a delete record was dropped before the B-tree reflected
-/// the delete, and a reader pinned at an older WAL frame read the stale B-tree. The fix stamps each
-/// version with `materialized_at` (the WAL frame its state reached the B-tree) and gates Rules 2/3
-/// on `materialized_at != ORIGIN && min_reader_mark >= materialized_at`. This pins that gate.
 #[test]
 fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     use crate::mvcc::database::WalPos;
@@ -504,13 +485,13 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     let stamped_insert = || {
         let mut rv = make_rv(ts(5), None);
         rv.set_materialized_at(frame(100));
-        vec![rv]
+        crate::alloc::vec![rv]
     };
     // Superseded delete (begin=Ts(3), end=Ts(5)<=lwm), materialized at frame 100.
     let stamped_delete = || {
         let mut rv = make_rv(ts(3), ts(5));
         rv.set_materialized_at(frame(100));
-        vec![rv]
+        crate::alloc::vec![rv]
     };
 
     // Reader pinned below the materialization frame: its (stale) B-tree view can't reach frame 100,
@@ -537,7 +518,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     // An unmaterialized version (materialized_at == ORIGIN) is never reclaimed by passive Rule 2/3,
     // even with a maximal reader mark and ckpt_max/lwm that would otherwise allow it — the B-tree
     // does not yet reflect its state.
-    let mut v = vec![make_rv(ts(5), None)];
+    let mut v = crate::alloc::vec![make_rv(ts(5), None)];
     let dropped = MvStore::<MvccClock>::gc_version_chain(&mut v, 10, 10, true, WalPos::STAGED);
     assert_eq!(
         dropped, 0,
@@ -698,9 +679,6 @@ fn mvcc_passive_drop_index_then_reuse_page_integrity() {
     conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
     assert_ok(conn, "after initial build");
 
-    // Serial drop/free + create/reuse churn is integrity-clean. The whopper failure
-    // (seed 37925386091653428) needs concurrent commit history during the off-lock checkpoint,
-    // so this stands as a sanity test that serial free+reuse is correct.
     for round in 0..6 {
         for i in 0..6 {
             conn.execute(format!("DROP INDEX idx{i}_a")).unwrap();
@@ -4468,23 +4446,6 @@ fn test_conflict_abort_of_indexed_update_keeps_btree_resident_index_entry() {
     assert_eq!(&integ[0][0].to_string(), "ok", "integrity: {integ:?}");
 }
 
-/// Deterministic regression for the non-blocking checkpoint vs. concurrent-CREATE bug
-/// (reproduces whopper chaos+mvcc seeds 28 / 60, which panic at the
-/// `has_pending_root_publication()` assert in `TruncateWal`).
-///
-/// Mechanism: a Passive auto-checkpoint captures `snapshot_ts` in `PrepareCheckpoint`,
-/// then runs its collection off-lock. While it is parked there (before acquiring the
-/// blocking lock), another connection COMMITs a `CREATE TABLE` — its commit timestamp is
-/// ABOVE `snapshot_ts`, so this checkpoint does NOT materialize it, yet it now sits in the
-/// shared schema with a negative (uncheckpointed) root page. The single-orchestrator
-/// `checkpoint_in_progress` gate (held while parked) prevents the CREATE's own commit from
-/// checkpointing it. When the parked checkpoint resumes and reaches `TruncateWal`, the
-/// over-strict invariant — which flags ANY negative-root object in the LIVE schema, not just
-/// the ones this pass owns — panics.
-///
-/// Fixed by making `has_unpublished_schema_changes` deferral-aware (only flag negative root
-/// pages this checkpoint actually materialized, via `table_id_to_rootpage`) while keeping
-/// `publish_checkpointed_schema_roots` writing the live schema.
 #[test]
 fn test_passive_checkpoint_tolerates_concurrent_create_after_snapshot() {
     let db = MvccTestDbNoConn::new_with_random_db_passive();
@@ -9850,12 +9811,24 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
     let current = make_rv(ts(5), None);
     let mut versions = crate::alloc::vec![tombstone, current.clone()];
 
-    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 2, false, crate::mvcc::database::WalPos::STAGED);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(
+        &mut versions,
+        10,
+        2,
+        false,
+        crate::mvcc::database::WalPos::STAGED,
+    );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
     assert!(versions[0].btree_resident);
 
-    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 5, false, crate::mvcc::database::WalPos::STAGED);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(
+        &mut versions,
+        10,
+        5,
+        false,
+        crate::mvcc::database::WalPos::STAGED,
+    );
     assert_eq!(dropped, 2);
     assert!(versions.is_empty());
 
@@ -9863,12 +9836,24 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
     rewritten_btree_row.btree_resident = true;
     let mut versions = crate::alloc::vec![rewritten_btree_row, current];
 
-    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 2, false, crate::mvcc::database::WalPos::STAGED);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(
+        &mut versions,
+        10,
+        2,
+        false,
+        crate::mvcc::database::WalPos::STAGED,
+    );
     assert_eq!(dropped, 0);
     assert_eq!(versions.len(), 2);
     assert!(versions[0].btree_resident);
 
-    let dropped = MvStore::<MvccClock>::gc_version_chain(&mut versions, 10, 5, false, crate::mvcc::database::WalPos::STAGED);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(
+        &mut versions,
+        10,
+        5,
+        false,
+        crate::mvcc::database::WalPos::STAGED,
+    );
     assert_eq!(dropped, 2);
     assert!(versions.is_empty());
 }
