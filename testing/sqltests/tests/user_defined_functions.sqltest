@@ -1,0 +1,100 @@
+@database :memory:
+
+@backend rust
+test test-udf-echo-integer {
+    SELECT test_udf('echo', 7);
+}
+expect {
+    7
+}
+
+@backend rust
+test test-udf-echo-text {
+    SELECT test_udf('echo', 'hello');
+}
+expect {
+    hello
+}
+
+@backend rust
+test test-udf-const {
+    SELECT test_udf('const');
+}
+expect {
+    42
+}
+
+@backend rust
+test test-udf-null-is-null {
+    SELECT test_udf('null') IS NULL;
+}
+expect {
+    1
+}
+
+@backend rust
+test test-udf-argc {
+    SELECT test_udf('argc', 10, 20, 30);
+}
+expect {
+    3
+}
+
+@backend rust
+test test-udf-add {
+    SELECT test_udf('add', 2, 3, 4);
+}
+expect {
+    9
+}
+
+@backend rust
+test test-udf-concat {
+    SELECT test_udf('concat', 'a', 'b', 'c');
+}
+expect {
+    abc
+}
+
+@backend rust
+test test-udf-upper {
+    SELECT test_udf('upper', 'hello');
+}
+expect {
+    HELLO
+}
+
+@backend rust
+test test-udf-len {
+    SELECT test_udf('len', 'hello');
+}
+expect {
+    5
+}
+
+@backend rust
+test test-udf-in-where-clause {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT x FROM t WHERE test_udf('add', x, x) >= 6 ORDER BY x;
+}
+expect {
+    3
+    4
+}
+
+@backend rust
+test test-udf-unknown-behavior-errors {
+    SELECT test_udf('does-not-exist');
+}
+expect error {
+    unknown behavior 'does-not-exist'
+}
+
+@backend rust
+test test-udf-explicit-error {
+    SELECT test_udf('boom');
+}
+expect error {
+    test_udf: boom
+}
