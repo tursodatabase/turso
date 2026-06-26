@@ -10,6 +10,7 @@ use turso_core::{Connection, LimboError, Result, Value};
 ///
 /// - WriteWriteConflict: MVCC conflict, the DB rolled back the transaction
 /// - TxError: Transaction state error (e.g., BEGIN twice, COMMIT with no transaction)
+/// - SchemaUpdated: a concurrent connection altered the schema
 /// - Busy / BusySnapshot: another connection holds the write lock or
 ///   read snapshot. The simulator drives multiple connections against
 ///   the same database; under contention the engine surfaces these the
@@ -29,6 +30,7 @@ fn is_recoverable_tx_error(err: &LimboError) -> bool {
         err,
         LimboError::WriteWriteConflict
             | LimboError::TxError(_)
+            | LimboError::SchemaUpdated
             | LimboError::Busy
             | LimboError::BusySnapshot
     ) || matches!(

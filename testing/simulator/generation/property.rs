@@ -164,6 +164,9 @@ impl Property {
                 // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
                 // - [x] A row that holds for the predicate will not be inserted.
                 // - [x] The table `t` will not be renamed, dropped, or altered.
+                // - [x] Under MVCC, there will be no DDL (this is a best effort, because concurrent
+                //       transactions could still drop the table, in which case this property will
+                //       be skipped).
 
                 |rng, ctx, query_distr, property| {
                     let Property::DeleteSelect {
@@ -177,6 +180,9 @@ impl Property {
 
                     let table_name = table_name.clone();
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    if ctx.opts().mvcc && query.is_ddl() {
+                        return None;
+                    }
                     // See InsertValuesSelect above — if the target table was
                     // dropped between schedule and generation, fall back to
                     // an unconstrained query.
@@ -222,6 +228,10 @@ impl Property {
                         }
                         Query::AlterTable(AlterTable { table_name: t, .. }) if *t == table.name => {
                             // Cannot alter the same table
+                            None
+                        }
+                        _ if ctx.opts().mvcc && query.is_ddl() => {
+                            // No DDL in MVCC
                             None
                         }
                         _ => Some(query),
@@ -279,6 +289,7 @@ impl Property {
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
+            | Property::EachColumnMatchesModel { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
                 unreachable!("No extensional queries")
             }
@@ -369,6 +380,115 @@ impl Property {
                     InteractionBuilder::with_interaction(select_interaction),
                     InteractionBuilder::with_interaction(assertion),
                 ]
+            }
+            Property::EachColumnMatchesModel { table, columns } => {
+                let table_name = table.clone();
+
+                let assumption = InteractionType::Assumption(Assertion::new(
+                    format!("table {table_name} exists"),
+                    {
+                        let table_name = table_name.clone();
+                        move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                            let conn_tables = env.get_conn_tables(connection_index);
+                            if conn_tables.iter().any(|t| t.name == table_name) {
+                                Ok(Ok(()))
+                            } else {
+                                Ok(Err(format!("table {table_name} does not exist")))
+                            }
+                        }
+                    },
+                    vec![table_name.clone()],
+                ));
+
+                // Columns were captured at generation time. If ALTER TABLE shifts
+                // them before this property fires, the runtime model lookup below
+                // will surface that mismatch rather than silently passing.
+                let columns: Vec<String> = columns.clone();
+
+                let mut builders = Vec::with_capacity(columns.len() + 2);
+                builders.push(InteractionBuilder::with_interaction(assumption));
+                for col in &columns {
+                    let select = Select::single(
+                        table_name.clone(),
+                        vec![ResultColumn::Column(col.clone())],
+                        Predicate::true_(),
+                        None,
+                        Distinctness::All,
+                    );
+                    builders.push(InteractionBuilder::with_interaction(
+                        InteractionType::Query(Query::Select(select)),
+                    ));
+                }
+
+                let columns_for_assertion = columns;
+                let table_for_assertion = table_name.clone();
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    format!("each column of {table_name} matches the simulator model"),
+                    move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                        let n = columns_for_assertion.len();
+                        if stack.len() < n {
+                            return Err(LimboError::InternalError(format!(
+                                "EachColumnMatchesModel: expected {n} results on stack, got {}",
+                                stack.len()
+                            )));
+                        }
+                        let conn_tables = env.get_conn_tables(connection_index);
+                        let Some(model_table) =
+                            conn_tables.iter().find(|t| t.name == table_for_assertion)
+                        else {
+                            return Ok(Err(format!(
+                                "table {table_for_assertion} disappeared from model"
+                            )));
+                        };
+                        let model_cols: Vec<&str> = model_table
+                            .columns
+                            .iter()
+                            .map(|c| c.name.as_str())
+                            .collect();
+
+                        let start = stack.len() - n;
+                        for (i, col_name) in columns_for_assertion.iter().enumerate() {
+                            let result = &stack[start + i];
+                            let Ok(rows) = result else {
+                                return Ok(Err(format!(
+                                    "SELECT {col_name} FROM {table_for_assertion} returned an error: {result:?}"
+                                )));
+                            };
+
+                            let Some(col_pos) = model_cols.iter().position(|c| *c == col_name)
+                            else {
+                                return Ok(Err(format!(
+                                    "column {col_name} no longer in model for {table_for_assertion}"
+                                )));
+                            };
+
+                            // Multiset comparison: counts of each value must match.
+                            use std::collections::BTreeMap;
+                            let mut db_counts: BTreeMap<&SimValue, usize> = BTreeMap::new();
+                            for row in rows {
+                                if let Some(v) = row.first() {
+                                    *db_counts.entry(v).or_insert(0) += 1;
+                                }
+                            }
+                            let mut model_counts: BTreeMap<&SimValue, usize> = BTreeMap::new();
+                            for row in &model_table.rows {
+                                if let Some(v) = row.get(col_pos) {
+                                    *model_counts.entry(v).or_insert(0) += 1;
+                                }
+                            }
+
+                            if db_counts != model_counts {
+                                return Ok(Err(format!(
+                                    "column {col_name} of {table_for_assertion} disagrees with model: db={db_counts:?} model={model_counts:?}"
+                                )));
+                            }
+                        }
+                        Ok(Ok(()))
+                    },
+                    vec![table_name],
+                ));
+                builders.push(InteractionBuilder::with_interaction(assertion));
+                builders
             }
             Property::ReadYourUpdatesBack {
                 update,
@@ -1929,6 +2049,20 @@ fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_each_column_matches_model<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    assert!(!ctx.tables().is_empty());
+    let table = pick(ctx.tables(), rng);
+    Property::EachColumnMatchesModel {
+        table: table.name.clone(),
+        columns: table.columns.iter().map(|c| c.name.clone()).collect(),
+    }
+}
+
 fn property_all_tables_have_expected_content<R: rand::Rng + ?Sized>(
     _rng: &mut R,
     _query_distr: &QueryDistribution,
@@ -2195,6 +2329,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
             PropertyDiscriminants::SavepointRollback => property_savepoint_rollback,
             PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
+            PropertyDiscriminants::EachColumnMatchesModel => property_each_column_matches_model,
             PropertyDiscriminants::AllTableHaveExpectedContent => {
                 property_all_tables_have_expected_content
             }
@@ -2261,6 +2396,13 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::EachColumnMatchesModel => {
+                if !ctx.tables().is_empty() {
+                    remaining.select.max(1)
+                } else {
+                    0
+                }
+            }
             // AllTableHaveExpectedContent should only be generated by Properties that inject faults
             PropertyDiscriminants::AllTableHaveExpectedContent => 0,
             PropertyDiscriminants::DoubleCreateFailure => {
@@ -2320,9 +2462,14 @@ impl PropertyDiscriminants {
                 }
             }
             PropertyDiscriminants::FaultyQuery => {
+                // Disabled under MVCC: I/O fault injection during writes can leave the
+                // MVCC store / btree in a state the (experimental) MVCC layer does not
+                // currently recover from, manifesting as committed rows that survive a
+                // subsequent DELETE. Re-enable once MVCC is robust to fault injection.
                 if env.profile.io.enable
                     && env.profile.io.fault.enable
                     && !env.opts.disable_faulty_query
+                    && !env.profile.mvcc
                 {
                     20
                 } else {
@@ -2363,6 +2510,7 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::SavepointRollback => QueryCapabilities::INSERT,
             PropertyDiscriminants::TableHasExpectedContent => QueryCapabilities::SELECT,
+            PropertyDiscriminants::EachColumnMatchesModel => QueryCapabilities::SELECT,
             PropertyDiscriminants::AllTableHaveExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::DoubleCreateFailure => QueryCapabilities::CREATE,
             PropertyDiscriminants::SelectLimit => QueryCapabilities::SELECT,

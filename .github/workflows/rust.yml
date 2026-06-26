@@ -251,6 +251,9 @@ jobs:
           - name: Differential
             iterations: 10
             args: "--maximum-tests 1000 --differential --io-backend=memory"
+          - name: SimpleMVCC
+            iterations: 10
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile simple_mvcc --io-backend=memory"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
