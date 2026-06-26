@@ -35,7 +35,6 @@ members = [
     "perf/memory",
     "perf/memory/codspeed",
     "perf/query-batch",
-    "perf/checkpoint-bench",
     "tools/dbhash",
     "sdk-kit",
     "sdk-kit-macros",
