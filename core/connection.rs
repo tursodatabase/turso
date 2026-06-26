@@ -3114,6 +3114,7 @@ impl Connection {
                             init.db.open_flags,
                             init.db.durable_storage.clone(),
                             enc_ctx,
+                            init.db.mv_store_allocator.clone(),
                         )?;
                         init.db.mv_store.store(Some(mv_store));
                         *state = AttachDatabaseState::Bootstrap(Box::new(

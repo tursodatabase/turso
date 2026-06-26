@@ -188,13 +188,17 @@ pub(crate) fn open_table_cursor(
 }
 
 /// helper method to open index BTree cursor in the index method implementation
-pub(crate) fn open_index_cursor(
+pub(crate) fn open_index_cursor<I, E>(
     connection: &Connection,
     database_id: usize,
     table: &str,
     index: &str,
-    keys: crate::alloc::Vec<KeyInfo>,
-) -> Result<BTreeCursor> {
+    keys: I,
+) -> Result<BTreeCursor>
+where
+    I: IntoIterator<Item = KeyInfo, IntoIter = E>,
+    E: ExactSizeIterator<Item = KeyInfo>,
+{
     let pager = connection.get_pager_from_database_index(&database_id)?;
     let Some(scratch) = connection.with_schema(database_id, |schema| {
         schema.get_index(table, index).cloned()
@@ -203,13 +207,15 @@ pub(crate) fn open_index_cursor(
             "index {index} for table {table} not found",
         )));
     };
-    let mut cursor = BTreeCursor::new(pager, scratch.root_page, keys.len());
-    cursor.index_info = Some(Arc::new(IndexInfo {
-        has_rowid: false,
-        num_cols: keys.len(),
-        key_info: keys,
-        is_unique: scratch.unique,
-    }));
+    let keys = keys.into_iter();
+    let num_cols = keys.len();
+    let mut cursor = BTreeCursor::new(pager, scratch.root_page, num_cols);
+    cursor.index_info = Some(Arc::new(IndexInfo::new(
+        keys,
+        false,
+        num_cols,
+        scratch.unique,
+    )?));
     Ok(cursor)
 }
 

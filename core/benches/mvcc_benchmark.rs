@@ -14,6 +14,7 @@ use codspeed_criterion_compat::{
     async_executor::FuturesExecutor, criterion_group, criterion_main, Criterion, Throughput,
 };
 
+use turso_core::alloc::DynAllocator;
 use turso_core::mvcc::clock::MvccClock;
 use turso_core::mvcc::database::{MvStore, Row, RowID, RowKey};
 use turso_core::types::{IOResult, ImmutableRecord, Text};
@@ -22,7 +23,7 @@ use turso_core::{Connection, Database, MemoryIO, Statement, StepResult, Value};
 struct BenchDb {
     _db: Arc<Database>,
     conn: Arc<Connection>,
-    mvcc_store: Arc<MvStore<MvccClock>>,
+    mvcc_store: Arc<MvStore<MvccClock, DynAllocator>>,
 }
 
 fn bench_db() -> BenchDb {

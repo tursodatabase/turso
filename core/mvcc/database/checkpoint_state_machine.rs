@@ -1344,7 +1344,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             if let Some(entry) = self.mvstore.rows.get(row_id) {
                 let is_now_empty = {
                     let mut versions = entry.value().write();
-                    MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
+                    MvStore::<Clock, A>::gc_version_chain(&mut versions, lwm, ckpt_max);
                     versions.is_empty()
                 };
                 if is_now_empty {
@@ -1408,7 +1408,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .get(sortable_key)
                         .expect("index row from write set must exist in inner map");
                     let mut versions = inner_entry.value().write();
-                    MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
+                    MvStore::<Clock, A>::gc_version_chain(&mut versions, lwm, ckpt_max);
                     versions.is_empty()
                 };
                 if is_now_empty {
@@ -1466,10 +1466,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         );
         let row = with_mvcc_checkpoint_allocation_site!(
             CheckpointMetadataPayload,
-            Row::new_table_row(
+            Row::new_table_row_in(
                 RowID::new(table_id, RowKey::Int(1)),
                 record.get_payload(),
                 num_columns,
+                self.mvstore.allocator(),
             )?
         );
         with_mvcc_checkpoint_allocation_site!(CheckpointWriteSet, {
@@ -1793,6 +1794,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             .expect("Table ID does not have a root page")
                     };
                     let row_version = {
+                        let alloc = self.mvstore.allocator();
                         let (row_version, _) = self
                             .get_current_row_version_mut(write_set_index)
                             .ok_or_else(|| {
@@ -1810,7 +1812,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         // a durable btree and a stale rootpage=0 schema row.
                         // TODO: make this rewrite resumable before re-enabling fault injection.
                         row_version.row.data = Some(crate::without_allocation_faults!(
-                            crate::alloc::try_arc_slice_from_slice(record.get_payload())?
+                            crate::alloc::try_arc_slice_from_slice_in(record.get_payload(), alloc)?
                         ));
                         row_version.clone()
                     };
@@ -1833,6 +1835,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             .expect("Index ID does not have a root page")
                     };
                     let row_version = {
+                        let alloc = self.mvstore.allocator();
                         let (row_version, _) = self
                             .get_current_row_version_mut(write_set_index)
                             .ok_or_else(|| {
@@ -1849,7 +1852,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         // a durable btree and a stale rootpage=0 schema row.
                         // TODO: make this rewrite resumable before re-enabling fault injection.
                         row_version.row.data = Some(crate::without_allocation_faults!(
-                            crate::alloc::try_arc_slice_from_slice(record.get_payload())?
+                            crate::alloc::try_arc_slice_from_slice_in(record.get_payload(), alloc)?
                         ));
                         row_version.clone()
                     };
@@ -2507,23 +2510,26 @@ mod tests {
         end: Option<u64>,
         btree_resident: bool,
     ) -> (Arc<SortableIndexKey>, RowVersion) {
-        let index_info = Arc::new(IndexInfo {
-            key_info: vec![
-                KeyInfo {
-                    sort_order: SortOrder::Asc,
-                    collation: CollationSeq::Binary,
-                    nulls_order: None,
-                },
-                KeyInfo {
-                    sort_order: SortOrder::Asc,
-                    collation: CollationSeq::Binary,
-                    nulls_order: None,
-                },
-            ],
-            has_rowid: true,
-            num_cols: 2,
-            is_unique: true,
-        });
+        let index_info = Arc::new(
+            IndexInfo::new(
+                vec![
+                    KeyInfo {
+                        sort_order: SortOrder::Asc,
+                        collation: CollationSeq::Binary,
+                        nulls_order: None,
+                    },
+                    KeyInfo {
+                        sort_order: SortOrder::Asc,
+                        collation: CollationSeq::Binary,
+                        nulls_order: None,
+                    },
+                ],
+                true,
+                2,
+                true,
+            )
+            .unwrap(),
+        );
         let key_record = ImmutableRecord::from_values(
             &[
                 Value::Text(crate::types::Text::new(key_text.to_string())),
@@ -2623,7 +2629,8 @@ mod tests {
         }
     }
 
-    fn checkpoint_for_collect_tests() -> CheckpointStateMachine<crate::mvcc::clock::MvccClock> {
+    fn checkpoint_for_collect_tests(
+    ) -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
         let db = MvccTestDbNoConn::new();
         let conn = db.connect();
         let mvstore = db.get_mvcc_store();
@@ -2702,9 +2709,15 @@ mod tests {
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
         for i in 0..row_count as i64 {
             let version = committed_table_row_version(table_id, i);
+            let mut versions =
+                <crate::mvcc::database::RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
+                    RowVersion,
+                    crate::alloc::DynAllocator,
+                >>::new_in(crate::alloc::DynAllocator::default());
+            versions.push(version);
             mvstore.rows.insert(
                 RowID::new(table_id, RowKey::Int(i)),
-                Arc::new(RwLock::new(crate::alloc::vec![version])),
+                Arc::new(RwLock::new(versions)),
             );
         }
 
@@ -2777,10 +2790,13 @@ mod tests {
         for i in 0..row_count as i64 {
             let version = committed_table_row_version(table_id, i);
             let row_id = RowID::new(table_id, RowKey::Int(i));
-            mvstore.rows.insert(
-                row_id,
-                Arc::new(RwLock::new(crate::alloc::vec![version.clone()])),
-            );
+            let mut versions =
+                <crate::mvcc::database::RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
+                    RowVersion,
+                    crate::alloc::DynAllocator,
+                >>::new_in(crate::alloc::DynAllocator::default());
+            versions.push(version.clone());
+            mvstore.rows.insert(row_id, Arc::new(RwLock::new(versions)));
             checkpoint.write_set.push((version, None));
         }
         checkpoint.state = CheckpointState::GcTableRows {
