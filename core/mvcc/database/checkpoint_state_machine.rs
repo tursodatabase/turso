@@ -3354,6 +3354,9 @@ mod tests {
             true,
             conn.get_sync_mode(),
             crate::MAIN_DB_ID,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
         );
         checkpoint.durable_txid_max_old = NonZeroU64::new(2);
         checkpoint

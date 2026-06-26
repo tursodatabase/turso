@@ -7739,7 +7739,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Row lives only in the B-tree: record a B-tree-resident tombstone so the collection
         // (btree_resident => exists_in_db_file) materializes the physical delete.
         let version_id = self.get_version_id();
-        let row = Row::new_table_row(rowid, Vec::new(), num_cols);
+        let row = Row::new_table_row(rowid, &[], num_cols).expect("empty tombstone row");
         let _ = self.insert_version_raw(
             &mut versions,
             RowVersion {
