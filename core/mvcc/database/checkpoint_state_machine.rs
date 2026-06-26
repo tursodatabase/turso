@@ -1,12 +1,12 @@
 use crate::alloc::{
-    ALLOC_ERR_MSG, ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt,
-    TursoVecExt, Vec,
+    ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt, TursoVecExt, Vec,
+    ALLOC_ERR_MSG,
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME, MVTableId,
-    MvStore, Row, RowID, RowKey, RowVersion, SQLITE_SCHEMA_MVCC_TABLE_ID, SortableIndexKey,
-    TxTimestampOrID, WalPos, WriteRowStateMachine,
+    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
+    TxTimestampOrID, WalPos, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
+    MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -17,15 +17,15 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, TursoRwLock, WalAutoActions};
+use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
-use crate::sync::atomic::Ordering;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef};
+use crate::{turso_assert, turso_assert_eq};
 use crate::{
     CheckpointResult, Completion, Connection, IOExt, LimboError, Numeric, Pager, Result, SyncMode,
     TransactionState, Value, ValueRef,
 };
-use crate::{turso_assert, turso_assert_eq};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
 use std::ops::Bound;
@@ -1643,10 +1643,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             )
         })?;
         self.mvstore.global_header.write().replace(header);
-        crate::without_allocation_faults!(
-            self.publish_checkpointed_schema_roots()
-                .expect(crate::alloc::ALLOC_ERR_MSG)
-        );
+        crate::without_allocation_faults!(self
+            .publish_checkpointed_schema_roots()
+            .expect(crate::alloc::ALLOC_ERR_MSG));
         Ok(())
     }
 
@@ -3141,8 +3140,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
 mod tests {
     use super::*;
     use crate::alloc::vec;
-    use crate::mvcc::database::SortableIndexKey;
     use crate::mvcc::database::tests::MvccTestDbNoConn;
+    use crate::mvcc::database::SortableIndexKey;
     use crate::translate::collate::CollationSeq;
     use crate::types::{IndexInfo, KeyInfo};
     use turso_parser::ast::SortOrder;
