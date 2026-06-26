@@ -18205,6 +18205,45 @@ fn test_checkpoint_after_create_and_drop_sequence() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+/// A passive checkpoint must not panic when collecting or writing a user-data tombstone
+/// for a table whose B-tree was destroyed in a prior checkpoint (e.g. DROP SEQUENCE after
+/// the backing table was materialized).
+#[test]
+fn test_passive_checkpoint_skips_late_tombstone_after_prior_destroy() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mv_store = db.get_db().get_mv_store().clone().unwrap();
+    let rootpage = get_rows(
+        &conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = mv_store.get_table_id_from_root_page(rootpage);
+
+    conn.execute("DROP TABLE t").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let tx = conn.get_mv_tx_id().unwrap();
+    mv_store
+        .delete(tx, RowID::new(table_id, RowKey::Int(1)))
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
 /// Descending sequence compaction must keep the most-advanced (lowest) value.
 ///
 /// A descending sequence (INCREMENT BY -1, START WITH 100) produces values 100, 99, 98...
@@ -19084,4 +19123,118 @@ fn mvcc_bug_repro_dropped_committed_delete_rewrites_all_tombstone_txids() {
     result
         .unwrap()
         .expect("later public writer must not conflict on a stale removed tombstone TxID");
+}
+
+/// Reproducer for passive-checkpoint review finding #2: the `TruncateWal` assert
+/// (`!has_pending_root_publication()`) is a FALSE POSITIVE when a second connection
+/// commits `DROP TABLE` of an already-checkpointed table while a passive checkpoint is
+/// parked past its publish window.
+///
+/// `has_unpublished_schema_changes` reads the LIVE shared `db.schema.dropped_root_pages`
+/// (`checkpoint_state_machine.rs:1381`), which belongs to whoever last mutated the schema —
+/// not to "this checkpoint's pending publications". The parked checkpoint already cleared
+/// its own pending pages and released the checkpoint lock back in `CommitPagerTxn`. A
+/// concurrent committed `DROP` of a checkpointed (positive-root) table then repopulates that
+/// shared set off-lock, so when the checkpoint resumes into `TruncateWal` the assert fires
+/// → process panic.
+///
+/// Interleaving (single-threaded, driven via yield injection — the REPL can't express this
+/// because `run_collect_rows` drives the embedded checkpoint to completion atomically):
+///   1. `conn_c` commits a write that triggers a passive checkpoint; we park it at
+///      `AfterDurableBoundaryAdvanced`, the yield right after the publish window unlocks.
+///   2. `conn_d` commits `DROP TABLE keep` off-lock → `db.schema.dropped_root_pages = {root}`.
+///   3. `conn_c` resumes → `TruncateWal` → assert panics.
+#[test]
+#[should_panic(
+    expected = "checkpoint finalized after pager writes without publishing schema changes"
+)]
+fn test_passive_checkpoint_truncate_wal_assert_fires_on_concurrent_drop_of_checkpointed_table() {
+    use crate::StepResult;
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    // `keep` must be CHECKPOINTED (positive root) before the DROP: DROP only records
+    // positive root pages in `dropped_root_pages` (execute.rs:11507).
+    let conn_keep = db.connect();
+    conn_keep
+        .execute("CREATE TABLE keep(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn_keep.execute("INSERT INTO keep VALUES (1)").unwrap();
+    conn_keep
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let keep_root = get_rows(
+        &conn_keep,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'keep'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    assert!(
+        keep_root > 0,
+        "keep must be checkpointed (positive root) for the DROP to record it, got {keep_root}"
+    );
+    // `conn_c` drives the parked checkpoint. A separate `other` table gives the checkpoint a
+    // write set without touching `keep`. threshold=0 forces a checkpoint on the next commit.
+    let conn_c = db.connect();
+    conn_c
+        .execute("CREATE TABLE other(y INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn_c
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let injector =
+        FixedYieldInjector::new([CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point()]);
+    conn_c.set_yield_injector(Some(injector.clone()));
+    // This commit's post-commit auto-checkpoint is the one we park.
+    let mut checkpoint = conn_c.prepare("INSERT INTO other VALUES (1)").unwrap();
+    let pager_io = conn_c.pager.load().io.clone();
+    let step_to_next_yield = |checkpoint: &mut crate::Statement, expect_remaining: usize| {
+        for _ in 0..200_000 {
+            match checkpoint.step().unwrap() {
+                StepResult::IO | StepResult::Yield => {
+                    if injector.remaining_len() == expect_remaining {
+                        return true;
+                    }
+                    pager_io.step().unwrap();
+                }
+                StepResult::Done => return false,
+                other => panic!("unexpected checkpoint step: {other:?}"),
+            }
+        }
+        false
+    };
+    assert!(
+        step_to_next_yield(&mut checkpoint, 0),
+        "passive checkpoint must yield at AfterDurableBoundaryAdvanced (publish window done)"
+    );
+    // At the park point the checkpoint has published all of ITS work and released the lock,
+    // so the live shared set is clean — proving the panic below is a FALSE positive, not the
+    // checkpoint's own residue.
+    assert!(
+        conn_c.db.schema.lock().dropped_root_pages.is_empty(),
+        "parked checkpoint should have published its own pages; live set must be clean"
+    );
+    // Concurrent committed DROP of the checkpointed table repopulates the live shared
+    // `dropped_root_pages` off-lock. (threshold=0 makes this commit attempt its own
+    // checkpoint, but the gate is held by the parked one, so it no-ops without clearing.)
+    let conn_d = db.connect();
+    conn_d.execute("DROP TABLE keep").unwrap();
+    assert!(
+        conn_c
+            .db
+            .schema
+            .lock()
+            .dropped_root_pages
+            .contains(&keep_root),
+        "concurrent DROP must record keep's root in the live shared dropped_root_pages"
+    );
+    // Resume the parked checkpoint → CheckpointWal → SyncDbFile → TruncateLogicalLog →
+    // TruncateWal, where `!has_pending_root_publication()` now reads the DROP's pages and
+    // panics. The #[should_panic] above is the failure signal.
+    for _ in 0..200_000 {
+        match checkpoint.step().unwrap() {
+            StepResult::Done => break,
+            StepResult::IO | StepResult::Yield => pager_io.step().unwrap(),
+            other => panic!("unexpected checkpoint step after resume: {other:?}"),
+        }
+    }
 }
