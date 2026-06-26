@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>Encrypted Guestbook</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      max-width: 600px;
+      margin: 2rem auto;
+    }
+
+    #status {
+      padding: 8px 12px;
+      border-radius: 6px;
+      background: #eef7ee;
+      color: #1b5e20;
+      margin-bottom: 1rem;
+    }
+
+    #comments {
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 0;
+      list-style: none;
+    }
+
+    #comments li {
+      padding: 8px;
+      border-top: 1px solid #eee;
+    }
+
+    #comments li:first-child {
+      border-top: none;
+    }
+
+    .time {
+      font-size: 0.8em;
+      color: gray;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Encrypted Guestbook</h1>
+  <p id="status">Opening encrypted database…</p>
+  <form id="form">
+    <input id="comment" placeholder="Write a comment..." style="width:70%; padding:6px;" />
+    <button type="submit">Add</button>
+  </form>
+  <ul id="comments"></ul>
+
+  <script type="module">
+    import { connect } from "@tursodatabase/database-wasm/vite";
+
+    const ENCRYPTION_KEY =
+      "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+
+    const status = document.getElementById("status");
+
+    let db = await connect("encrypted-guestbook.db", {
+      timeout: 1000,
+      encryption: {
+        cipher: "aegis256",
+        hexkey: ENCRYPTION_KEY,
+      },
+    });
+
+    status.textContent =
+      "Database opened with aegis256 encryption. Data is stored encrypted in OPFS.";
+
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS guestbook ( comment TEXT, created_at DEFAULT (unixepoch()) );
+      CREATE INDEX IF NOT EXISTS guestbook_idx ON guestbook (created_at);
+    `);
+    await refresh();
+
+    async function addComment() {
+      const insert = db.prepare(`INSERT INTO guestbook(comment) VALUES (?)`);
+
+      const input = document.getElementById("comment");
+      const text = input.value.trim();
+      input.value = "";
+
+      await insert.run([text]);
+      await refresh();
+    }
+    document.getElementById("form").addEventListener("submit", (e) => {
+      e.preventDefault();
+      addComment();
+    });
+
+    async function refresh() {
+      const select = db.prepare(`SELECT comment, created_at FROM guestbook ORDER BY created_at DESC LIMIT ?`);
+      const rows = await select.all([5]);
+
+      const ul = document.getElementById("comments");
+      ul.innerHTML = "";
+      rows.forEach((row) => {
+        const li = document.createElement("li");
+        li.innerHTML = `
+              <div>${row.comment}</div>
+              <div class="time">${new Date(row.created_at * 1000).toLocaleString()}</div>
+            `;
+        ul.appendChild(li);
+      });
+    }
+  </script>
+</body>
+
+</html>
