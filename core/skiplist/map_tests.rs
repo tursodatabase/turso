@@ -54,6 +54,42 @@ fn insert() {
 }
 
 #[test]
+fn reserved_insert_uses_preallocated_node() {
+    let alloc = FailOnDemandAlloc::default();
+    let map: SkipMap<i32, String, _, _> = SkipMap::new_in(alloc.clone());
+
+    let reservation = map.try_reserve_insert().unwrap();
+    alloc.fail_allocations(true);
+
+    map.insert_reserved(reservation, 1, "one".to_string());
+
+    assert_eq!(map.len(), 1);
+    assert_eq!(map.get(&1).unwrap().value(), "one");
+}
+
+#[test]
+fn dropped_insert_reservation_leaves_map_unchanged() {
+    let map: SkipMap<i32, String> = SkipMap::new();
+
+    let reservation = map.try_reserve_insert().unwrap();
+    drop(reservation);
+
+    assert!(map.is_empty());
+}
+
+#[test]
+fn reserved_insert_replaces_existing_key() {
+    let map = SkipMap::new();
+    map.insert(1, "one");
+
+    let reservation = map.try_reserve_insert().unwrap();
+    map.insert_reserved(reservation, 1, "uno");
+
+    assert_eq!(map.len(), 1);
+    assert_eq!(map.get(&1).unwrap().value(), &"uno");
+}
+
+#[test]
 fn compare_and_insert() {
     let insert = [0, 4, 2, 12, 8, 7, 11, 5];
     let not_present = [1, 3, 6, 9, 10];
