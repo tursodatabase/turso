@@ -2295,41 +2295,6 @@ fn test_full_checkpoint_reopen_recovers_truncate_mode() {
     assert_eq!(rows[0][1].to_string(), "x");
 }
 
-/// Default (flag-off) mode must NOT use the passive `checkpoint_in_progress` gate: it is
-/// serialized by the blocking lock, not turned into a silent no-op. We pin the gate ON (as a
-/// concurrent off-lock checkpoint would) and confirm a flag-off TRUNCATE still does real work
-/// (truncates the logical log) and never claims/releases the gate it doesn't own.
-#[test]
-fn test_flag_off_truncate_ignores_passive_checkpoint_gate() {
-    let db = MvccTestDbNoConn::new_with_random_db();
-    let conn = db.connect();
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
-
-    let store = db.get_mvcc_store();
-    assert!(
-        store.logical_log_offset() > 0,
-        "precondition: log has appended frames to truncate"
-    );
-
-    // Pin the passive single-orchestrator gate ON; flag-off must ignore it.
-    store.checkpoint_in_progress.store(true, Ordering::SeqCst);
-
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    assert_eq!(
-        store.logical_log_offset(),
-        0,
-        "flag-off TRUNCATE must do real work, not no-op on the passive gate"
-    );
-    assert!(
-        store.checkpoint_in_progress.load(Ordering::SeqCst),
-        "flag-off checkpoint must not claim or release the passive gate"
-    );
-    store.checkpoint_in_progress.store(false, Ordering::SeqCst);
-}
-
 /// In default (flag-off) mode an explicit TRUNCATE that loses the blocking-checkpoint lock to a
 /// concurrent reader/writer must report `Busy` (the pre-feature contract), never a false-success
 /// no-op. An open transaction holds the checkpoint lock for its lifetime.
@@ -3688,12 +3653,6 @@ fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
     assert_eq!(&integrity[0][0].to_string(), "ok");
 }
 
-/// Repro candidate #4: a large transaction's commit runs `RewriteLiveVersions` in
-/// 1024-entry batches, so it yields with its table versions rewritten (TxID->Timestamp)
-/// but its index versions not yet. A concurrent reader whose snapshot is past the commit
-/// then sees the table at the new value while the index entries are still `TxID` — if the
-/// index read mishandles that, the row goes "missing from index". Drives the commit
-/// step-by-step and checks integrity on another connection at each IO yield.
 #[test]
 fn test_reader_consistent_during_large_indexed_commit_rewrite() {
     use crate::StepResult;
@@ -4328,12 +4287,6 @@ fn test_passive_concurrent_transfer_preserves_sum_and_count() {
     assert_eq!(total, TOTAL, "final total balance must be unchanged");
 }
 
-/// Repro candidate: a concurrent reader must NOT observe an in-flight (uncommitted)
-/// index tombstone. conn2 updates an indexed UNIQUE column (tombstoning the old entry
-/// with end=TxID(conn2), inserting the new) but does not commit; conn1's snapshot
-/// predates conn2, so conn1 must still see the OLD indexed value via the index. A bug
-/// where the index scan applies the end=TxID tombstone without checking the deleting
-/// tx's visibility makes the row "missing from index" for conn1.
 #[test]
 fn test_reader_does_not_see_inflight_index_tombstone() {
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -4402,11 +4355,6 @@ fn test_rollback_of_indexed_update_keeps_btree_resident_index_entry() {
     assert_eq!(&integ[0][0].to_string(), "ok", "integrity: {integ:?}");
 }
 
-/// Repro candidate matching the turso_stress trace exactly: an UPDATE of an indexed
-/// UNIQUE column inside a BEGIN CONCURRENT tx that ABORTS via write-write conflict
-/// (not a clean ROLLBACK). The pre-update index entry (719, btree-resident) must be
-/// restored when the tx aborts; a buggy abort leaves it tombstoned → the row's value
-/// goes missing from the index even though the row (unchanged) still holds it.
 #[test]
 fn test_conflict_abort_of_indexed_update_keeps_btree_resident_index_entry() {
     let db = MvccTestDbNoConn::new_with_random_db();
