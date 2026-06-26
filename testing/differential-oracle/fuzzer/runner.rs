@@ -28,6 +28,88 @@ use crate::schema::SchemaIntrospector;
 pub use sql_gen::TreeMode;
 use sql_gen_prop::SqlValue;
 
+fn register_oracle_udfs(
+    turso: &turso_core::Connection,
+    sqlite: &rusqlite::Connection,
+) -> Result<()> {
+    turso
+        .register_scalar_function("sim_double", 1, true, |args| {
+            Ok(oracle_sim_double(
+                args.first().unwrap_or(&turso_core::Value::Null),
+            ))
+        })
+        .context("register sim_double on Turso")?;
+    turso
+        .register_scalar_function("sim_is_even", 1, true, |args| {
+            Ok(oracle_sim_is_even(
+                args.first().unwrap_or(&turso_core::Value::Null),
+            ))
+        })
+        .context("register sim_is_even on Turso")?;
+
+    use rusqlite::functions::FunctionFlags;
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    sqlite
+        .create_scalar_function("sim_double", 1, flags, |ctx| {
+            Ok(core_value_to_sqlite(oracle_sim_double(
+                &sqlite_value_to_core(ctx.get_raw(0)),
+            )))
+        })
+        .context("register sim_double on SQLite")?;
+    sqlite
+        .create_scalar_function("sim_is_even", 1, flags, |ctx| {
+            Ok(core_value_to_sqlite(oracle_sim_is_even(
+                &sqlite_value_to_core(ctx.get_raw(0)),
+            )))
+        })
+        .context("register sim_is_even on SQLite")?;
+    Ok(())
+}
+
+fn oracle_sim_double(value: &turso_core::Value) -> turso_core::Value {
+    match value {
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(n)) => {
+            turso_core::Value::from_i64(n.wrapping_mul(2))
+        }
+        _ => turso_core::Value::Null,
+    }
+}
+
+fn oracle_sim_is_even(value: &turso_core::Value) -> turso_core::Value {
+    match value {
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(n)) => {
+            turso_core::Value::from_i64((n % 2 == 0) as i64)
+        }
+        _ => turso_core::Value::Null,
+    }
+}
+
+fn sqlite_value_to_core(value: rusqlite::types::ValueRef<'_>) -> turso_core::Value {
+    match value {
+        rusqlite::types::ValueRef::Null => turso_core::Value::Null,
+        rusqlite::types::ValueRef::Integer(n) => turso_core::Value::from_i64(n),
+        rusqlite::types::ValueRef::Real(f) => turso_core::Value::from_f64(f),
+        rusqlite::types::ValueRef::Text(bytes) => {
+            turso_core::Value::build_text(String::from_utf8_lossy(bytes).into_owned())
+        }
+        rusqlite::types::ValueRef::Blob(bytes) => turso_core::Value::Blob(bytes.to_vec()),
+    }
+}
+
+fn core_value_to_sqlite(value: turso_core::Value) -> rusqlite::types::Value {
+    match value {
+        turso_core::Value::Null => rusqlite::types::Value::Null,
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(n)) => {
+            rusqlite::types::Value::Integer(n)
+        }
+        turso_core::Value::Numeric(turso_core::Numeric::Float(f)) => {
+            rusqlite::types::Value::Real(f64::from(f))
+        }
+        turso_core::Value::Text(text) => rusqlite::types::Value::Text(text.as_str().to_string()),
+        turso_core::Value::Blob(blob) => rusqlite::types::Value::Blob(blob),
+    }
+}
+
 /// Configuration for the simulator.
 #[derive(Debug, Clone)]
 pub struct SimConfig {
@@ -227,6 +309,8 @@ impl Fuzzer {
             .execute("ATTACH ':memory:' AS aux", [])
             .context("Failed to ATTACH on SQLite")?;
         tracing::info!("Attached ':memory:' AS aux on both connections");
+
+        register_oracle_udfs(&turso_conn, &sqlite_conn)?;
 
         // Enable MVCC after ATTACH (ATTACH is not supported in MVCC mode)
         if config.mvcc {

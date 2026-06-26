@@ -25,7 +25,7 @@ path = "lib.rs"
 turso_core = { workspace = true, features = ["simulator"] }
 sql_gen_prop = { path = "../sql_gen_prop" }
 sql_gen = { path = "../sql_gen", features = ["serde"] }
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["functions"] }
 rand.workspace = true
 rand_chacha.workspace = true
 anyhow.workspace = true
