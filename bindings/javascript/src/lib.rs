@@ -24,6 +24,9 @@ use std::{
 };
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
+use turso_ext::{
+    ContextDestructor, ResultCode, Value as ExtValue, ValueDestructor, ValueType as ExtValueType,
+};
 
 /// Shared ownership of a `turso_core::Statement` that can be explicitly finalized.
 ///
@@ -594,6 +597,63 @@ impl Database {
         Ok(())
     }
 
+    #[napi(js_name = "registerScalarFunction")]
+    pub fn register_scalar_function(
+        &self,
+        env: Env,
+        name: String,
+        arity: i32,
+        deterministic: bool,
+        safe_integers: bool,
+        callback: Unknown,
+    ) -> napi::Result<()> {
+        let conn = self.conn()?;
+        let name_c = std::ffi::CString::new(name.clone())
+            .map_err(|_| create_generic_error("function name must not contain a NUL byte"))?;
+        let mut func_ref = std::ptr::null_mut();
+        check_status!(
+            unsafe {
+                napi::sys::napi_create_reference(env.raw(), callback.raw(), 1, &mut func_ref)
+            },
+            "failed to reference the user-defined function"
+        )?;
+        let context = Box::into_raw(Box::new(JsScalarFunction {
+            func_ref,
+            env: env.raw(),
+            safe_integers,
+        })) as usize;
+        let api = unsafe { conn._build_turso_ext() };
+        let result = unsafe {
+            (api.register_scalar_function)(
+                api.ctx,
+                name_c.as_ptr(),
+                arity,
+                deterministic,
+                context,
+                js_scalar_trampoline,
+                Some(drop_js_scalar_function),
+                None,
+            )
+        };
+        unsafe { conn._free_extension_ctx(api) };
+        if result == ResultCode::OK {
+            Ok(())
+        } else {
+            unsafe { drop_js_scalar_function(context) };
+            Err(create_generic_error(&format!(
+                "failed to register function '{name}'"
+            )))
+        }
+    }
+
+    #[napi(js_name = "unregisterScalarFunction")]
+    pub fn unregister_scalar_function(&self, name: String) -> napi::Result<()> {
+        self.conn()?
+            .unregister_scalar_function(&name)
+            .map_err(|e| to_generic_error("failed to unregister function", e))?;
+        Ok(())
+    }
+
     /// Runs the I/O loop synchronously.
     #[napi]
     pub fn io_loop_sync(&self) -> napi::Result<()> {
@@ -1021,6 +1081,206 @@ fn to_js_value<'a>(
             }
         }
     }
+}
+
+const UNSUPPORTED_RETURN: &str =
+    "user-defined function returned a value that is not a number, bigint, string, Buffer, or null";
+
+struct JsScalarFunction {
+    func_ref: napi::sys::napi_ref,
+    env: napi::sys::napi_env,
+    safe_integers: bool,
+}
+
+fn ext_value_to_core(value: &ExtValue) -> turso_core::Value {
+    match value.value_type() {
+        ExtValueType::Null | ExtValueType::Error => turso_core::Value::Null,
+        ExtValueType::Integer => value
+            .to_integer()
+            .map(turso_core::Value::from_i64)
+            .unwrap_or(turso_core::Value::Null),
+        ExtValueType::Float => value
+            .to_float()
+            .map(turso_core::Value::from_f64)
+            .unwrap_or(turso_core::Value::Null),
+        ExtValueType::Text => value
+            .to_text()
+            .map(|text| turso_core::Value::build_text(text.to_string()))
+            .unwrap_or(turso_core::Value::Null),
+        ExtValueType::Blob => value
+            .to_blob()
+            .map(turso_core::Value::Blob)
+            .unwrap_or(turso_core::Value::Null),
+    }
+}
+
+fn js_value_to_ext(value: Unknown) -> std::result::Result<ExtValue, String> {
+    let value_type = value.get_type().map_err(|err| err.to_string())?;
+    match value_type {
+        ValueType::Undefined | ValueType::Null => Ok(ExtValue::null()),
+        ValueType::Number => {
+            let number: f64 = unsafe { value.cast() }.map_err(|err| err.to_string())?;
+            if number.is_nan() {
+                Ok(ExtValue::null())
+            } else if number.fract() == 0.0
+                && number >= i64::MIN as f64
+                && number <= i64::MAX as f64
+            {
+                Ok(ExtValue::from_integer(number as i64))
+            } else {
+                Ok(ExtValue::from_float(number))
+            }
+        }
+        ValueType::BigInt => {
+            let bigint: BigInt = unsafe { value.cast() }.map_err(|err| err.to_string())?;
+            let (signed, lossless) = bigint.get_i64();
+            if lossless {
+                Ok(ExtValue::from_integer(signed))
+            } else {
+                Err("user-defined function returned a BigInt outside the range of a 64-bit signed integer".to_string())
+            }
+        }
+        ValueType::String => {
+            let text = value
+                .coerce_to_string()
+                .and_then(|text| text.into_utf8())
+                .map_err(|err| err.to_string())?;
+            let text = text.as_str().map_err(|err| err.to_string())?.to_string();
+            Ok(ExtValue::from_text(text))
+        }
+        ValueType::Object => {
+            let object = value.coerce_to_object().map_err(|err| err.to_string())?;
+            if object.is_buffer().unwrap_or(false) || object.is_typedarray().unwrap_or(false) {
+                let length = object
+                    .get_named_property::<u32>("length")
+                    .map_err(|err| err.to_string())?;
+                let mut bytes = Vec::with_capacity(length as usize);
+                for index in 0..length {
+                    let byte = object
+                        .get_element::<u32>(index)
+                        .map_err(|err| err.to_string())?;
+                    bytes.push(byte as u8);
+                }
+                Ok(ExtValue::from_blob(bytes))
+            } else {
+                Err(UNSUPPORTED_RETURN.to_string())
+            }
+        }
+        _ => Err(UNSUPPORTED_RETURN.to_string()),
+    }
+}
+
+fn exception_message(env_raw: napi::sys::napi_env, exception: napi::sys::napi_value) -> String {
+    if let Ok(unknown) = unsafe { Unknown::from_napi_value(env_raw, exception) } {
+        if let Ok(object) = unknown.coerce_to_object() {
+            if let Ok(message) = object.get_named_property::<String>("message") {
+                if !message.is_empty() {
+                    return message;
+                }
+            }
+        }
+    }
+    if let Ok(unknown) = unsafe { Unknown::from_napi_value(env_raw, exception) } {
+        if let Ok(text) = unknown.coerce_to_string().and_then(|text| text.into_utf8()) {
+            if let Ok(text) = text.as_str() {
+                return text.to_string();
+            }
+        }
+    }
+    "user-defined function threw an exception".to_string()
+}
+
+unsafe fn invoke_js_scalar(
+    function: &JsScalarFunction,
+    argc: i32,
+    argv: *const ExtValue,
+) -> ExtValue {
+    let env = napi::Env::from_raw(function.env);
+    let arg_count = argc.max(0) as usize;
+    let mut array = match env.create_array(arg_count as u32) {
+        Ok(array) => array,
+        Err(err) => return ExtValue::error_with_message(err.to_string()),
+    };
+    for index in 0..arg_count {
+        let value = ext_value_to_core(unsafe { &*argv.add(index) });
+        match to_js_value(&env, &value, function.safe_integers) {
+            Ok(js_value) => {
+                if let Err(err) = array.set(index as u32, js_value) {
+                    return ExtValue::error_with_message(err.to_string());
+                }
+            }
+            Err(err) => return ExtValue::error_with_message(err.to_string()),
+        }
+    }
+    let arguments = match array.coerce_to_object() {
+        Ok(object) => object.to_unknown().raw(),
+        Err(err) => return ExtValue::error_with_message(err.to_string()),
+    };
+
+    let mut callback = std::ptr::null_mut();
+    if unsafe {
+        napi::sys::napi_get_reference_value(function.env, function.func_ref, &mut callback)
+    } != napi::sys::Status::napi_ok
+    {
+        return ExtValue::error_with_message("failed to resolve user-defined function".to_string());
+    }
+    let mut this = std::ptr::null_mut();
+    unsafe { napi::sys::napi_get_undefined(function.env, &mut this) };
+    let arguments = [arguments];
+    let mut raw_result = std::ptr::null_mut();
+    let status = unsafe {
+        napi::sys::napi_call_function(
+            function.env,
+            this,
+            callback,
+            arguments.len(),
+            arguments.as_ptr(),
+            &mut raw_result,
+        )
+    };
+
+    let mut pending = false;
+    unsafe { napi::sys::napi_is_exception_pending(function.env, &mut pending) };
+    if pending {
+        let mut exception = std::ptr::null_mut();
+        unsafe { napi::sys::napi_get_and_clear_last_exception(function.env, &mut exception) };
+        return ExtValue::error_with_message(exception_message(function.env, exception));
+    }
+    if status != napi::sys::Status::napi_ok {
+        return ExtValue::error_with_message("failed to call user-defined function".to_string());
+    }
+
+    match unsafe { Unknown::from_napi_value(function.env, raw_result) } {
+        Ok(result) => match js_value_to_ext(result) {
+            Ok(value) => value,
+            Err(message) => ExtValue::error_with_message(message),
+        },
+        Err(err) => ExtValue::error_with_message(err.to_string()),
+    }
+}
+
+unsafe extern "C" fn js_scalar_trampoline(
+    context: usize,
+    argc: i32,
+    argv: *const ExtValue,
+    _context_destructor: Option<ContextDestructor>,
+    _value_destructor: Option<ValueDestructor>,
+) -> ExtValue {
+    let function = unsafe { &*(context as *const JsScalarFunction) };
+    let mut scope = std::ptr::null_mut();
+    if unsafe { napi::sys::napi_open_handle_scope(function.env, &mut scope) }
+        != napi::sys::Status::napi_ok
+    {
+        return ExtValue::error_with_message("failed to open a napi handle scope".to_string());
+    }
+    let result = unsafe { invoke_js_scalar(function, argc, argv) };
+    unsafe { napi::sys::napi_close_handle_scope(function.env, scope) };
+    result
+}
+
+unsafe extern "C" fn drop_js_scalar_function(context: usize) {
+    let function = unsafe { Box::from_raw(context as *mut JsScalarFunction) };
+    unsafe { napi::sys::napi_delete_reference(function.env, function.func_ref) };
 }
 
 #[cfg(test)]

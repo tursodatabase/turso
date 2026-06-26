@@ -1,4 +1,5 @@
 import { bindParams } from "./bind.js";
+import { registerScalarFunction } from "./function.js";
 import { SqliteError } from "./sqlite-error.js";
 import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE } from "./types.js";
 
@@ -235,7 +236,8 @@ class Database {
   }
 
   function(name, options, fn) {
-    throw new Error("not implemented");
+    registerScalarFunction(this.db, name, options, fn);
+    return this;
   }
 
   aggregate(name, options) {

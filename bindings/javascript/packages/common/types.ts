@@ -45,6 +45,8 @@ export interface NativeDatabase {
     executor(sql: string, queryOptions?: QueryOptions): NativeExecutor;
 
     defaultSafeIntegers(toggle: boolean);
+    registerScalarFunction(name: string, arity: number, deterministic: boolean, safeIntegers: boolean, callback: (args: any[]) => any): void;
+    unregisterScalarFunction(name: string): void;
     inTransaction(): boolean;
     totalChanges(): number;
     changes(): number;

@@ -85,6 +85,8 @@ export declare class Database {
    * * `toggle` - Whether to use safe integers by default.
    */
   defaultSafeIntegers(toggle?: boolean | undefined | null): void
+  registerScalarFunction(name: string, arity: number, deterministic: boolean, safeIntegers: boolean, callback: unknown): void
+  unregisterScalarFunction(name: string): void
   /** Runs the I/O loop synchronously. */
   ioLoopSync(): void
   /** Runs the I/O loop asynchronously, returning a Promise. */
