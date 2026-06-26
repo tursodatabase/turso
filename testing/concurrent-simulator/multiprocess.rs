@@ -49,7 +49,6 @@ pub struct MultiprocessOpts {
     pub restart_probability: f64,
     pub history_output: Option<PathBuf>,
     pub keep_files: bool,
-    pub integrity_check_final_only: bool,
 }
 
 struct OperationHistoryWriter {
@@ -224,7 +223,6 @@ pub struct MultiprocessWhopper {
     kill_probability: f64,
     restart_probability: f64,
     keep_files: bool,
-    integrity_check_final_only: bool,
 }
 
 impl MultiprocessWhopper {
@@ -389,7 +387,6 @@ impl MultiprocessWhopper {
             kill_probability: opts.kill_probability,
             restart_probability: opts.restart_probability,
             keep_files: opts.keep_files,
-            integrity_check_final_only: opts.integrity_check_final_only,
         })
     }
 
@@ -1169,13 +1166,6 @@ impl MultiprocessWhopper {
 
     /// Finalize: check properties, shut down workers, clean up.
     pub fn finalize(&mut self) -> anyhow::Result<()> {
-        if self.integrity_check_final_only {
-            println!("running final integrity_check after simulation");
-            let result = self.execute_sql_direct(0, "PRAGMA integrity_check")?;
-            crate::properties::validate_integrity_check_result(self.current_step, 0, &result)?;
-            self.stats.integrity_checks += 1;
-        }
-
         // Finalize properties
         for property in &self.properties {
             let mut property = property.lock().unwrap();
