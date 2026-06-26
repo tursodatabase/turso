@@ -154,20 +154,20 @@ pub(crate) unsafe extern "C" fn register_scalar_function_with_options(
         Ok(s) => crate::util::normalize_ident(s),
         Err(_) => return ResultCode::InvalidArgs,
     };
+    let func = Arc::new(ExternalFunc::new_scalar(
+        name_str.clone(),
+        argc,
+        deterministic,
+        context,
+        callback,
+        context_destructor,
+        value_destructor,
+    ));
     let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
     unsafe {
-        (*ext_ctx.syms).functions.insert(
-            name_str.clone(),
-            Arc::new(ExternalFunc::new_scalar(
-                name_str,
-                argc,
-                deterministic,
-                context,
-                callback,
-                context_destructor,
-                value_destructor,
-            )),
-        );
+        let overloads = (*ext_ctx.syms).functions.entry(name_str).or_default();
+        overloads.retain(|existing| existing.func.argc() != argc);
+        overloads.push(func);
         if !ext_ctx.prepare_context_generation.is_null() {
             (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
         }
@@ -219,20 +219,20 @@ pub(crate) unsafe extern "C" fn register_aggregate_function(
         Ok(s) => crate::util::normalize_ident(s),
         Err(_) => return ResultCode::InvalidArgs,
     };
+    let func = Arc::new(ExternalFunc::new_aggregate(
+        name_str.clone(),
+        args,
+        context,
+        (init_func, step_func, finalize_func),
+        context_destructor,
+        aggregate_destructor,
+        value_destructor,
+    ));
     let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
     unsafe {
-        (*ext_ctx.syms).functions.insert(
-            name_str.clone(),
-            Arc::new(ExternalFunc::new_aggregate(
-                name_str,
-                args,
-                context,
-                (init_func, step_func, finalize_func),
-                context_destructor,
-                aggregate_destructor,
-                value_destructor,
-            )),
-        );
+        let overloads = (*ext_ctx.syms).functions.entry(name_str).or_default();
+        overloads.retain(|existing| existing.func.argc() != args);
+        overloads.push(func);
         if !ext_ctx.prepare_context_generation.is_null() {
             (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
         }

@@ -940,6 +940,30 @@ fn closure_scalar_reregistration_replaces_and_unregister_removes(
     Ok(())
 }
 
+#[turso_macros::test]
+fn closure_scalar_supports_multiple_arities(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_scalar_function("udf_n", 1, true, |_args| Ok(Value::from_i64(1)))?;
+    conn.register_scalar_function("udf_n", 2, true, |_args| Ok(Value::from_i64(2)))?;
+    conn.register_scalar_function("udf_n", -1, true, |args| {
+        Ok(Value::from_i64(100 + args.len() as i64))
+    })?;
+
+    let one: Vec<(i64,)> = conn.exec_rows("SELECT udf_n(10)");
+    assert_eq!(one, vec![(1,)]);
+    let two: Vec<(i64,)> = conn.exec_rows("SELECT udf_n(10, 20)");
+    assert_eq!(two, vec![(2,)]);
+    let variadic: Vec<(i64,)> = conn.exec_rows("SELECT udf_n(10, 20, 30)");
+    assert_eq!(variadic, vec![(103,)]);
+
+    conn.register_scalar_function("udf_n", 1, true, |_args| Ok(Value::from_i64(11)))?;
+    let replaced: Vec<(i64,)> = conn.exec_rows("SELECT udf_n(10)");
+    assert_eq!(replaced, vec![(11,)]);
+    let unchanged: Vec<(i64,)> = conn.exec_rows("SELECT udf_n(10, 20)");
+    assert_eq!(unchanged, vec![(2,)]);
+    Ok(())
+}
+
 unsafe extern "C" fn dotnet_nocase_collation(
     _context: usize,
     left_ptr: *const u8,
