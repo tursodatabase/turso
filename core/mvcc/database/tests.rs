@@ -5228,16 +5228,19 @@ fn test_index_finger_no_spurious_dep_on_stepped_over_key() {
     let table_id = MVTableId::from(-999_i64);
 
     // Single-column ascending integer index key.
-    let info = std::sync::Arc::new(crate::types::IndexInfo {
-        key_info: crate::alloc::vec![crate::types::KeyInfo {
-            sort_order: turso_parser::ast::SortOrder::Asc,
-            collation: crate::translate::collate::CollationSeq::Binary,
-            nulls_order: None,
-        }],
-        has_rowid: false,
-        num_cols: 1,
-        is_unique: false,
-    });
+    let info = std::sync::Arc::new(
+        crate::types::IndexInfo::new(
+            crate::alloc::vec![crate::types::KeyInfo {
+                sort_order: turso_parser::ast::SortOrder::Asc,
+                collation: crate::translate::collate::CollationSeq::Binary,
+                nulls_order: None,
+            }],
+            false,
+            1,
+            false,
+        )
+        .unwrap(),
+    );
     let idx_key = |v: i64| {
         let rec = crate::types::ImmutableRecord::from_values(&[Value::from_i64(v)], 1).unwrap();
         std::sync::Arc::new(SortableIndexKey::new_from_record(rec, info.clone()))

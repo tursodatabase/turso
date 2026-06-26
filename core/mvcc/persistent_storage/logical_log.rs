@@ -6258,15 +6258,7 @@ mod tests {
             2,
         )
         .unwrap();
-        let sortable_key = SortableIndexKey::new_from_record(
-            key_record,
-            Arc::new(IndexInfo {
-                has_rowid: true,
-                num_cols: 2,
-                is_unique: false,
-                ..Default::default()
-            }),
-        );
+        let sortable_key = SortableIndexKey::new_from_record(key_record, test_index_info());
         let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
         let row = Row::new_index_row(row_id, 2);
         crate::mvcc::database::RowVersion {
@@ -6281,12 +6273,26 @@ mod tests {
     }
 
     fn test_index_info() -> Arc<IndexInfo> {
-        Arc::new(IndexInfo {
-            has_rowid: true,
-            num_cols: 2,
-            is_unique: false,
-            ..Default::default()
-        })
+        Arc::new(
+            IndexInfo::new(
+                [
+                    crate::types::KeyInfo {
+                        sort_order: turso_parser::ast::SortOrder::Asc,
+                        collation: crate::translate::collate::CollationSeq::Binary,
+                        nulls_order: None,
+                    },
+                    crate::types::KeyInfo {
+                        sort_order: turso_parser::ast::SortOrder::Asc,
+                        collation: crate::translate::collate::CollationSeq::Binary,
+                        nulls_order: None,
+                    },
+                ],
+                true,
+                2,
+                false,
+            )
+            .unwrap(),
+        )
     }
 
     fn make_test_raw_table_row_version(

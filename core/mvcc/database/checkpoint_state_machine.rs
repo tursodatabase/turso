@@ -2510,23 +2510,26 @@ mod tests {
         end: Option<u64>,
         btree_resident: bool,
     ) -> (Arc<SortableIndexKey>, RowVersion) {
-        let index_info = Arc::new(IndexInfo {
-            key_info: vec![
-                KeyInfo {
-                    sort_order: SortOrder::Asc,
-                    collation: CollationSeq::Binary,
-                    nulls_order: None,
-                },
-                KeyInfo {
-                    sort_order: SortOrder::Asc,
-                    collation: CollationSeq::Binary,
-                    nulls_order: None,
-                },
-            ],
-            has_rowid: true,
-            num_cols: 2,
-            is_unique: true,
-        });
+        let index_info = Arc::new(
+            IndexInfo::new(
+                vec![
+                    KeyInfo {
+                        sort_order: SortOrder::Asc,
+                        collation: CollationSeq::Binary,
+                        nulls_order: None,
+                    },
+                    KeyInfo {
+                        sort_order: SortOrder::Asc,
+                        collation: CollationSeq::Binary,
+                        nulls_order: None,
+                    },
+                ],
+                true,
+                2,
+                true,
+            )
+            .unwrap(),
+        );
         let key_record = ImmutableRecord::from_values(
             &[
                 Value::Text(crate::types::Text::new(key_text.to_string())),

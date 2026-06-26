@@ -1550,12 +1550,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
                                     panic!("SeekKey::IndexKey requires Index cursor type");
                                 };
-                                Arc::new(IndexInfo {
-                                    key_info: index_info.key_info.clone(),
-                                    has_rowid: index_info.has_rowid,
-                                    num_cols: index_key.column_count(),
-                                    is_unique: index_info.is_unique,
-                                })
+                                Arc::new(IndexInfo::new_in(
+                                    index_info.key_info.iter().cloned(),
+                                    index_info.has_rowid,
+                                    index_key.column_count(),
+                                    index_info.is_unique,
+                                    self.db.allocator(),
+                                )?)
                             };
                             let sortable_key =
                                 SortableIndexKey::new_from_record((*index_key).clone(), index_info);

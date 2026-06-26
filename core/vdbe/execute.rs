@@ -1267,7 +1267,11 @@ pub fn op_open_read(
                 index.as_ref(),
                 num_columns,
             )?);
-            let index_info = Arc::new(IndexInfo::new_from_index(index)?);
+            let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
+                IndexInfo::new_from_index_in(index, mv_store.allocator())?
+            } else {
+                IndexInfo::new_from_index(index)?
+            });
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
@@ -11079,7 +11083,11 @@ pub fn op_open_write(
                 index.as_ref(),
                 num_columns,
             )?);
-            let index_info = Arc::new(IndexInfo::new_from_index(index)?);
+            let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
+                IndexInfo::new_from_index_in(index, mv_store.allocator())?
+            } else {
+                IndexInfo::new_from_index(index)?
+            });
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
