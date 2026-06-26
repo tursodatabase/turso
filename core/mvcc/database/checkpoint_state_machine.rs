@@ -799,13 +799,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             staged_checkpoint_header: None,
             header_staged_for_commit: false,
             pager_commit_done: false,
-            pending_rootmap_ops: Vec::new(),
+            pending_rootmap_ops: crate::alloc::vec![],
             pending_alloc_roots: std::collections::HashMap::new(),
             collect_table_cursor: None,
             collect_index_tableid_cursor: None,
             collect_index_key_cursor: None,
             seq_compact: None,
-            pending_seq_deletes: Vec::new(),
+            pending_seq_deletes: crate::alloc::vec![],
             // Set in PrepareCheckpoint once the off-lock snapshot is taken; until
             // then `u64::MAX` disables the upper-bound filter (collect everything).
             snapshot_ts: u64::MAX,
@@ -813,7 +813,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             build_local_schema_began_read_tx: false,
             local_schema: None,
             owns_checkpoint_in_progress: false,
-            staged_roots: Vec::new(),
+            staged_roots: crate::alloc::vec![],
         }
     }
 
@@ -1577,11 +1577,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // row live and conflict, never re-synthesize a tombstone) and > durable_txid_max_new (the
         // boundary stored below), so the next checkpoint still materializes the physical delete.
         if let Some(ts) = seq_delete_ts {
-            for (rowid, num_cols) in std::mem::take(&mut self.pending_seq_deletes) {
+            for (rowid, num_cols) in
+                std::mem::replace(&mut self.pending_seq_deletes, crate::alloc::vec![])
+            {
                 self.mvstore.seqcompact_commit_delete(rowid, num_cols, ts);
             }
         }
-        let ops = std::mem::take(&mut self.pending_rootmap_ops);
+        let ops = std::mem::replace(&mut self.pending_rootmap_ops, crate::alloc::vec![]);
         for op in &ops {
             match op {
                 RootMapOp::Retire { id, end_ts } => self.mvstore.retire_rootpage(*id, *end_ts),
@@ -1596,7 +1598,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
         }
         self.pending_alloc_roots.clear();
-        for table_id in std::mem::take(&mut self.staged_roots) {
+        for table_id in std::mem::replace(&mut self.staged_roots, crate::alloc::vec![]) {
             self.mvstore
                 .publish_rootpage_visible(table_id, materialized_at);
         }
@@ -2592,7 +2594,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         pager: self.pager.clone(),
                         mvstore: self.mvstore.clone(),
                         passive: matches!(self.mode, CheckpointMode::Passive { .. }),
-                        compacted: Vec::new(),
+                        compacted: crate::alloc::vec![],
                     });
                 }
                 let driver = self.seq_compact.as_mut().expect("seq_compact set above");

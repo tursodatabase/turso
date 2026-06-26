@@ -13,6 +13,10 @@ enum TransactionMode {
     Mvcc,
     Concurrent,
     LogicalLog,
+    /// MVCC with `BEGIN CONCURRENT`; auto-checkpoint uses blocking TRUNCATE (flag off).
+    MvccTruncate,
+    /// MVCC with `BEGIN CONCURRENT`; auto-checkpoint uses experimental passive/off-lock path.
+    MvccPassive,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -77,15 +81,23 @@ fn main() -> Result<()> {
     rt.block_on(async_main(args))
 }
 
+fn remove_db_tree(db_path: &str) {
+    if let Ok(entries) = std::fs::read_dir(".") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name == db_path || name.starts_with(&format!("{db_path}-")) {
+                let _ = std::fs::remove_file(name);
+            }
+        }
+    }
+}
+
 async fn async_main(args: Args) -> Result<()> {
     let db_path = "write_throughput_test.db";
-    if std::path::Path::new(db_path).exists() {
-        std::fs::remove_file(db_path).expect("Failed to remove existing database");
-    }
-    let wal_path = "write_throughput_test.db-wal";
-    if std::path::Path::new(wal_path).exists() {
-        std::fs::remove_file(wal_path).expect("Failed to remove existing database");
-    }
+    remove_db_tree(db_path);
 
     let db = setup_database(db_path, args.mode, args.io).await?;
 
@@ -132,8 +144,16 @@ async fn async_main(args: Args) -> Result<()> {
     let overall_elapsed = overall_start.elapsed();
     let overall_throughput = (total_inserts as f64) / overall_elapsed.as_secs_f64();
 
+    let mode_label = match args.mode {
+        TransactionMode::Legacy => "legacy",
+        TransactionMode::Mvcc => "mvcc",
+        TransactionMode::Concurrent => "concurrent",
+        TransactionMode::LogicalLog => "logical-log",
+        TransactionMode::MvccTruncate => "mvcc-truncate",
+        TransactionMode::MvccPassive => "mvcc-passive",
+    };
     println!(
-        "Turso,{},{},{},{:.2}",
+        "Turso,{mode_label},{},{},{},{:.2}",
         args.threads, args.batch_size, args.compute, overall_throughput
     );
 
@@ -154,15 +174,24 @@ async fn setup_database(
     } else {
         builder
     };
+    let builder = match mode {
+        TransactionMode::MvccPassive => builder.experimental_mvcc_passive_checkpoint(true),
+        TransactionMode::MvccTruncate => builder.experimental_mvcc_passive_checkpoint(false),
+        _ => builder,
+    };
     let db = builder.build().await?;
     let conn = db.connect()?;
 
     // Enable MVCC for modes that require it
     if matches!(
         mode,
-        TransactionMode::Mvcc | TransactionMode::Concurrent | TransactionMode::LogicalLog
+        TransactionMode::Mvcc
+            | TransactionMode::Concurrent
+            | TransactionMode::LogicalLog
+            | TransactionMode::MvccTruncate
+            | TransactionMode::MvccPassive
     ) {
-        conn.pragma_update("journal_mode", "'mvcc'").await?;
+        conn.pragma_update("journal_mode", "mvcc").await?;
     }
 
     conn.execute(
@@ -205,7 +234,10 @@ async fn worker_thread(
 
             let begin_stmt = match mode {
                 TransactionMode::Legacy | TransactionMode::Mvcc => "BEGIN",
-                TransactionMode::Concurrent | TransactionMode::LogicalLog => "BEGIN CONCURRENT",
+                TransactionMode::Concurrent
+                | TransactionMode::LogicalLog
+                | TransactionMode::MvccTruncate
+                | TransactionMode::MvccPassive => "BEGIN CONCURRENT",
             };
 
             // Retry loop for BusySnapshot errors (stale snapshot requires full tx restart)
@@ -245,7 +277,9 @@ async fn worker_thread(
             Ok::<_, turso::Error>(())
         };
         match mode {
-            TransactionMode::Concurrent => tx_futs.push(tx_fut),
+            TransactionMode::Concurrent
+            | TransactionMode::MvccTruncate
+            | TransactionMode::MvccPassive => tx_futs.push(tx_fut),
             _ => tx_fut.await?,
         };
     }

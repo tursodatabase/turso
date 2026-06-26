@@ -90,6 +90,10 @@ struct Args {
     /// Stream multiprocess operation/lifecycle history as JSONL for deterministic debugging
     #[arg(long)]
     history_output: Option<PathBuf>,
+    /// Skip inline `PRAGMA integrity_check` during the run; validate once after all
+    /// workers finish. Useful for hunting false-positive integrity failures.
+    #[arg(long)]
+    integrity_check_final_only: bool,
 }
 
 #[derive(Subcommand)]
@@ -194,6 +198,7 @@ fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         restart_probability: args.restart_probability,
         history_output: args.history_output.clone(),
         keep_files: args.keep,
+        integrity_check_final_only: args.integrity_check_final_only,
     };
 
     println!(
@@ -273,6 +278,9 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
             "allocation fault probability = {}",
             opts.allocation_fault_probability
         );
+    }
+    if opts.integrity_check_final_only {
+        println!("integrity_check = final-only (no inline checks during run)");
     }
 
     let reopen_probability = args.reopen_probability.unwrap_or(opts.reopen_probability);
@@ -398,8 +406,7 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
     } else {
         let allow_passive_checkpoint =
             !args.enable_mvcc || args.enable_experimental_mvcc_passive_checkpoint;
-        let w: Vec<(u32, Box<dyn Workload>)> = vec![
-            (10, Box::new(IntegrityCheckWorkload)),
+        let mut w: Vec<(u32, Box<dyn Workload>)> = vec![
             (
                 5,
                 Box::new(WalCheckpointWorkload {
@@ -427,13 +434,18 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             (10, Box::new(CommitWorkload)),
             (10, Box::new(RollbackWorkload)),
         ];
+        if !args.integrity_check_final_only {
+            w.insert(0, (10, Box::new(IntegrityCheckWorkload)));
+        }
 
-        let p: Vec<Box<dyn Property>> = vec![
-            Box::new(IntegrityCheckProperty),
+        let mut p: Vec<Box<dyn Property>> = vec![
             Box::new(SimpleKeysDoNotDisappear::new()),
             Box::new(SequenceCorrectnessProperty::new()),
             Box::new(AutoincWatermarkMonotonicity::new()),
         ];
+        if !args.integrity_check_final_only {
+            p.insert(0, Box::new(IntegrityCheckProperty));
+        }
 
         (w, p, vec![], vec![])
     }
@@ -475,7 +487,8 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_workloads(workloads)
         .with_properties(properties)
         .with_chaotic_profiles(chaotic_profiles)
-        .with_allocation_fault_probability(args.allocation_fault_probability);
+        .with_allocation_fault_probability(args.allocation_fault_probability)
+        .with_integrity_check_final_only(args.integrity_check_final_only);
 
     Ok(opts)
 }
