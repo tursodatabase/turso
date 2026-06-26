@@ -7403,7 +7403,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     // Keep until this delete is in the B-tree and reachable by every reader.
                     !materialized_for_readers(rv)
                 } else {
-                    !has_current && *e > ckpt_max
+                    // Retain superseded versions until checkpoint makes the physical change
+                    // durable. btree_resident markers and tombstones without a committed
+                    // current successor must survive even when a newer current exists.
+                    *e > ckpt_max && (rv.btree_resident || !has_current)
                 }
             }
             _ => true,

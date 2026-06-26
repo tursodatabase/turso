@@ -2,13 +2,13 @@ use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
 use crate::alloc::{TursoAllocator, TursoIteratorExt, TursoTryWithCapacityExt};
-use crate::io::{PlatformIO, IO};
+use crate::io::{IO, PlatformIO};
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
 use crate::mvcc::database::{CommitYieldPoint, ExclusiveTxYieldPoint};
 use crate::mvcc::persistent_storage::logical_log::{
-    LogicalLog, ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE,
+    ENCRYPTED_PAYLOAD_CHUNK_SIZE, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_SIZE, LogicalLog,
 };
 #[cfg(feature = "conn_raw_api")]
 use crate::mvcc::persistent_storage::logical_log::{ParsedOp, StreamingLogicalLogReader};
@@ -18,12 +18,12 @@ use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
 use crate::state_machine::{StateTransition, TransitionResult};
 use crate::storage::sqlite3_ondisk::{
-    checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,
-    WAL_HEADER_SIZE,
+    DatabaseHeader, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalHeader, checksum_wal, read_varint,
+    write_varint,
 };
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
+use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::types::ImmutableRecordRef;
 use crate::vdbe::execute::TransactionYieldPoint;
 use crate::{
@@ -1174,11 +1174,7 @@ fn read_db_page_size(path: &str) -> usize {
     file.seek(SeekFrom::Start(0)).unwrap();
     file.read_exact(&mut header).unwrap();
     let raw = u16::from_be_bytes([header[16], header[17]]);
-    if raw == 1 {
-        65536
-    } else {
-        raw as usize
-    }
+    if raw == 1 { 65536 } else { raw as usize }
 }
 
 fn page_file_offset(page_no: u32, page_size: usize) -> u64 {
@@ -1186,11 +1182,7 @@ fn page_file_offset(page_no: u32, page_size: usize) -> u64 {
 }
 
 fn page_header_offset(page_no: u32) -> usize {
-    if page_no == 1 {
-        100
-    } else {
-        0
-    }
+    if page_no == 1 { 100 } else { 0 }
 }
 
 fn read_db_page(path: &str, page_no: u32, page_size: usize) -> Vec<u8> {
@@ -4899,16 +4891,17 @@ fn test_delete_nonexistent() {
         .mvcc_store
         .begin_tx(db.conn.pager.load().clone())
         .unwrap();
-    assert!(!db
-        .mvcc_store
-        .delete(
-            tx,
-            RowID {
-                table_id: (-2).into(),
-                row_id: RowKey::Int(1)
-            },
-        )
-        .unwrap());
+    assert!(
+        !db.mvcc_store
+            .delete(
+                tx,
+                RowID {
+                    table_id: (-2).into(),
+                    row_id: RowKey::Int(1)
+                },
+            )
+            .unwrap()
+    );
 }
 
 /// What this test checks: Core MVCC read/write semantics hold for this operation sequence.
@@ -5124,16 +5117,17 @@ fn test_dirty_read_deleted() {
     // T2 deletes row with ID 1, but does not commit.
     let conn2 = db.db.connect().unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
-    assert!(db
-        .mvcc_store
-        .delete(
-            tx2,
-            RowID {
-                table_id: (-2).into(),
-                row_id: RowKey::Int(1)
-            },
-        )
-        .unwrap());
+    assert!(
+        db.mvcc_store
+            .delete(
+                tx2,
+                RowID {
+                    table_id: (-2).into(),
+                    row_id: RowKey::Int(1)
+                },
+            )
+            .unwrap()
+    );
 
     // T3 reads row with ID 1, but doesn't see the delete because T2 hasn't committed.
     let conn3 = db.db.connect().unwrap();
@@ -5383,14 +5377,14 @@ fn test_future_row() {
     assert_eq!(row, None);
 }
 
+use crate::Value;
 use crate::mvcc::cursor::MvccLazyCursor;
 use crate::mvcc::database::CommitYieldPoint::LogRecordPrepared;
 use crate::mvcc::database::{MvStore, Row, RowID};
 use crate::types::Text;
-use crate::Value;
+use crate::{DATABASE_MANAGER, ValueRef};
 use crate::{Database, StepResult};
 use crate::{MemoryIO, Statement};
-use crate::{ValueRef, DATABASE_MANAGER};
 // Simple atomic clock implementation for testing
 
 fn setup_test_db() -> (MvccTestDb, u64, MVTableId, i64) {
@@ -9166,9 +9160,11 @@ fn test_gc_rule1_aborted_among_live_versions() {
     // Only aborted removed; superseded has e=5 > lwm=2 so retained
     assert_eq!(dropped, 1);
     assert_eq!(versions.len(), 2);
-    assert!(versions
-        .iter()
-        .all(|rv| rv.begin().is_some() || rv.end().is_some()));
+    assert!(
+        versions
+            .iter()
+            .all(|rv| rv.begin().is_some() || rv.end().is_some())
+    );
 }
 
 /// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
@@ -13171,8 +13167,8 @@ fn test_close_persists_drop_index() {
 
 #[test]
 fn test_partial_commit_visibility_bug() {
-    use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use crate::sync::Arc;
+    use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::collections::HashMap;
     use std::thread;
     use std::time::Duration;
@@ -14116,10 +14112,11 @@ fn test_committed_delete_tombstone_conflict() {
     // Td: delete row 1 and commit.
     let conn_d = db.db.connect().unwrap();
     let tx_d = db.mvcc_store.begin_tx(conn_d.pager.load().clone()).unwrap();
-    assert!(db
-        .mvcc_store
-        .delete(tx_d, RowID::new(table_id, RowKey::Int(1)))
-        .unwrap());
+    assert!(
+        db.mvcc_store
+            .delete(tx_d, RowID::new(table_id, RowKey::Int(1)))
+            .unwrap()
+    );
     commit_tx(db.mvcc_store.clone(), &conn_d, tx_d).unwrap();
 
     // T2: insert_btree_resident for the same row.
@@ -14785,9 +14782,11 @@ fn test_mvcc_portable_changes_contains_user_schema_and_rows() {
     let txns = decode_portable_change_txns(&portable_changes);
     let objects = decoded_object_maps(&txns);
 
-    assert!(objects
-        .iter()
-        .any(|object| object.name == "items" && object.mv_table_id < 0));
+    assert!(
+        objects
+            .iter()
+            .any(|object| object.name == "items" && object.mv_table_id < 0)
+    );
 }
 
 #[cfg(feature = "conn_raw_api")]
@@ -15778,17 +15777,17 @@ fn test_checkpoint_recovers_after_crash_restart_drop_recreate_index() {
 /// path:
 /// 1. An INSERT commits with `mvcc_checkpoint_threshold = 0` and yields at the
 ///    checkpoint's `BeforeAcquireLock` point, after the checkpoint has captured
-///    the schema but before it has collected rows.
+///    its snapshot but before it acquires the blocking lock and collects rows.
 /// 2. A second connection creates a new index while auto-checkpointing remains
 ///    enabled, making the index schema row durable after the delayed checkpoint's
 ///    schema snapshot.
 /// 3. A later INSERT writes a fresh index row version for that now-durable index.
 /// 4. The background connection observes the new schema through normal SQL, so
 ///    the resumed checkpoint no longer fails early as a stale-schema write.
-/// 5. Resuming the delayed checkpoint refreshes its durable watermark, skips the
-///    durable CREATE INDEX schema row, but still collects the fresh index row.
-///    The checkpoint-local `index_id_to_index` map must have been refreshed
-///    alongside the durable watermark so `WriteIndexRow` can open the index.
+/// 5. Resuming the delayed checkpoint acquires the lock, refreshes its durable
+///    watermark and index map, then collects under the lock. The durable CREATE
+///    INDEX schema row is skipped, but the fresh index row is collected and
+///    `WriteIndexRow` can open the index via the refreshed `index_id_to_index`.
 #[test]
 fn test_auto_checkpoint_refreshes_index_metadata_after_schema_change() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -17259,11 +17258,11 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
     use crate::io::FileSyncType;
     use crate::mvcc;
     use crate::mvcc::database::{LogRecord, RowVersion};
-    use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
     use crate::mvcc::persistent_storage::DurableStorage;
+    use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
     use crate::storage::encryption::EncryptionContext;
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
-    use crate::{CheckpointResult, File, Result, IO};
+    use crate::{CheckpointResult, File, IO, Result};
     use std::time::Duration;
 
     /// BusyOnLogTxStorage is a test double that can be stubbed to return [LimboError::Busy] from log_tx.
@@ -18546,30 +18545,12 @@ fn test_checkpoint_seek_skip_divider_reinsert_loses_row() {
     }
 }
 
-/// Reproducer for passive-checkpoint review finding #2: the `TruncateWal` assert
-/// (`!has_pending_root_publication()`) is a FALSE POSITIVE when a second connection
-/// commits `DROP TABLE` of an already-checkpointed table while a passive checkpoint is
-/// parked past its publish window.
-///
-/// `has_unpublished_schema_changes` reads the LIVE shared `db.schema.dropped_root_pages`
-/// (`checkpoint_state_machine.rs:1381`), which belongs to whoever last mutated the schema —
-/// not to "this checkpoint's pending publications". The parked checkpoint already cleared
-/// its own pending pages and released the checkpoint lock back in `CommitPagerTxn`. A
-/// concurrent committed `DROP` of a checkpointed (positive-root) table then repopulates that
-/// shared set off-lock, so when the checkpoint resumes into `TruncateWal` the assert fires
-/// → process panic.
-///
-/// Interleaving (single-threaded, driven via yield injection — the REPL can't express this
-/// because `run_collect_rows` drives the embedded checkpoint to completion atomically):
-///   1. `conn_c` commits a write that triggers a passive checkpoint; we park it at
-///      `AfterDurableBoundaryAdvanced`, the yield right after the publish window unlocks.
-///   2. `conn_d` commits `DROP TABLE keep` off-lock → `db.schema.dropped_root_pages = {root}`.
-///   3. `conn_c` resumes → `TruncateWal` → assert panics.
+/// Reproducer for passive-checkpoint review finding #2 (fixed): concurrent `DROP TABLE` of an
+/// already-checkpointed table during a parked passive checkpoint must not trip
+/// `has_pending_root_publication` — that set tracks this checkpoint's own staged work, not
+/// unrelated live schema mutations.
 #[test]
-#[should_panic(
-    expected = "checkpoint finalized after pager writes without publishing schema changes"
-)]
-fn test_passive_checkpoint_truncate_wal_assert_fires_on_concurrent_drop_of_checkpointed_table() {
+fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointed_table() {
     use crate::StepResult;
     let _ = tracing_subscriber::fmt::try_init();
     let db = MvccTestDbNoConn::new_with_random_db_passive();
@@ -18648,9 +18629,8 @@ fn test_passive_checkpoint_truncate_wal_assert_fires_on_concurrent_drop_of_check
             .contains(&keep_root),
         "concurrent DROP must record keep's root in the live shared dropped_root_pages"
     );
-    // Resume the parked checkpoint → CheckpointWal → SyncDbFile → TruncateLogicalLog →
-    // TruncateWal, where `!has_pending_root_publication()` now reads the DROP's pages and
-    // panics. The #[should_panic] above is the failure signal.
+    // Resume the parked checkpoint — must complete without tripping a false-positive
+    // publication assert on the concurrent DROP's dropped_root_pages entry.
     for _ in 0..200_000 {
         match checkpoint.step().unwrap() {
             StepResult::Done => break,
@@ -18658,4 +18638,5 @@ fn test_passive_checkpoint_truncate_wal_assert_fires_on_concurrent_drop_of_check
             other => panic!("unexpected checkpoint step after resume: {other:?}"),
         }
     }
+    assert_integrity_ok(&conn_c);
 }

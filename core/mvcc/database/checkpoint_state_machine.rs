@@ -1,12 +1,12 @@
 use crate::alloc::{
-    ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt, TursoVecExt, Vec,
-    ALLOC_ERR_MSG,
+    ALLOC_ERR_MSG, ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt,
+    TursoVecExt, Vec,
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
-    TxTimestampOrID, WalPos, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
-    MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
+    DeleteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME, MVTableId,
+    MvStore, Row, RowID, RowKey, RowVersion, SQLITE_SCHEMA_MVCC_TABLE_ID, SortableIndexKey,
+    TxTimestampOrID, WalPos, WriteRowStateMachine,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -17,15 +17,15 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, TursoRwLock, WalAutoActions};
-use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
+use crate::sync::atomic::Ordering;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef};
-use crate::{turso_assert, turso_assert_eq};
 use crate::{
     CheckpointResult, Completion, Connection, IOExt, LimboError, Numeric, Pager, Result, SyncMode,
     TransactionState, Value, ValueRef,
 };
+use crate::{turso_assert, turso_assert_eq};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
 use std::ops::Bound;
@@ -52,6 +52,7 @@ const SQLITE_SCHEMA_COLUMN_COUNT: usize = 5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
     PrepareCheckpoint,
+    AcquireLock,
     BuildLocalSchemaView,
     CollectTableRows,
     CollectIndexRows,
@@ -178,6 +179,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     mvstore: Arc<MvStore<Clock, A>>,
     /// Connection to the database
     connection: Arc<Connection>,
+    /// Database whose pager and schema this checkpoint is writing.
+    database_id: usize,
     #[cfg(any(test, injected_yields))]
     yield_instance_id: u64,
     /// Lock used to block other transactions from running during the checkpoint
@@ -702,6 +705,34 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         self.durable_txid_max_new = durable_tx_max;
     }
 
+    fn refresh_schema_metadata(&mut self) {
+        let schema = self.connection.clone_shared_schema(self.database_id);
+        self.index_id_to_index = schema
+            .indexes
+            .values()
+            .flatten()
+            .map(|index| {
+                turso_assert!(index.root_page != 0, "index root_page must be non-zero");
+                (
+                    self.mvstore.get_table_id_from_root_page(index.root_page),
+                    index.clone(),
+                )
+            })
+            .collect();
+        self.mvcc_meta_table = schema.get_btree_table(MVCC_META_TABLE_NAME).map(|table| {
+            turso_assert!(
+                table.root_page != 0,
+                "mvcc meta table root_page must be non-zero"
+            );
+            (
+                self.mvstore.get_table_id_from_root_page(table.root_page),
+                table.columns().len(),
+            )
+        });
+        self.durable_mvcc_metadata =
+            !self.connection.db.is_in_memory_db() && self.mvcc_meta_table.is_some();
+    }
+
     pub fn new(
         pager: Arc<Pager>,
         mvstore: Arc<MvStore<Clock, A>>,
@@ -775,6 +806,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             durable_txid_max_new: durable_tx_max,
             mvstore,
             connection,
+            database_id,
             #[cfg(any(test, injected_yields))]
             yield_instance_id,
             checkpoint_lock,
@@ -1611,9 +1643,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             )
         })?;
         self.mvstore.global_header.write().replace(header);
-        crate::without_allocation_faults!(self
-            .publish_checkpointed_schema_roots()
-            .expect(crate::alloc::ALLOC_ERR_MSG));
+        crate::without_allocation_faults!(
+            self.publish_checkpointed_schema_roots()
+                .expect(crate::alloc::ALLOC_ERR_MSG)
+        );
         Ok(())
     }
 
@@ -1891,11 +1924,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         return Ok(TransitionResult::Done(CheckpointResult::default()));
                     }
                     self.owns_checkpoint_in_progress = true;
-                } else if !self.lock_states.blocking_checkpoint_lock_held {
-                    if !self.checkpoint_lock.write() {
-                        return Err(crate::LimboError::Busy);
-                    }
-                    self.lock_states.blocking_checkpoint_lock_held = true;
                 }
 
                 // Clamp below any in-flight (Preparing) commit so the published durable
@@ -1903,14 +1931,35 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 // not yet durable in the logical log (it would be lost on reopen).
                 self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
 
-                // Checkpoint state machines can be created before they are run.
-                // Resample after serializing so already-durable index deletes are not replayed.
-                self.refresh_checkpoint_bounds();
-                self.state = if passive {
-                    CheckpointState::BuildLocalSchemaView
+                if passive {
+                    // Checkpoint state machines can be created before they are run.
+                    // Resample after serializing so already-durable index deletes are not replayed.
+                    self.refresh_checkpoint_bounds();
+                    self.state = CheckpointState::BuildLocalSchemaView;
                 } else {
-                    CheckpointState::CollectTableRows
-                };
+                    self.state = CheckpointState::AcquireLock;
+                }
+                Ok(TransitionResult::Continue)
+            }
+            CheckpointState::AcquireLock => {
+                inject_transition_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
+
+                tracing::debug!("Acquiring blocking checkpoint lock");
+                if !self.lock_states.blocking_checkpoint_lock_held {
+                    let locked = self.checkpoint_lock.write();
+                    if !locked {
+                        return Err(crate::LimboError::Busy);
+                    }
+                    self.lock_states.blocking_checkpoint_lock_held = true;
+                }
+
+                // Checkpoint state machines can be created before they are run.
+                // Resample after serializing with other checkpoints so already-durable
+                // index deletes are not replayed, and keep schema-derived index metadata
+                // aligned with the refreshed durable boundary.
+                self.refresh_checkpoint_bounds();
+                self.refresh_schema_metadata();
+                self.state = CheckpointState::CollectTableRows;
                 Ok(TransitionResult::Continue)
             }
             CheckpointState::BuildLocalSchemaView => {
@@ -1995,11 +2044,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
                 tracing::debug!("Collected {} index row changes", self.index_write_set.len());
 
-                inject_transition_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
-                // Passive (off-lock) path: collection AND the btree write phase run without the
-                // blocking lock. The only serialized point is the brief publish window in
-                // CommitPagerTxn. Blocking (flag-off) already holds the lock from
-                // PrepareCheckpoint.
+                let passive = self
+                    .connection
+                    .experimental_mvcc_passive_checkpoint_enabled();
+                if passive {
+                    inject_transition_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
+                    // Passive (off-lock) path: collection AND the btree write phase run without the
+                    // blocking lock. The only serialized point is the brief publish window in
+                    // CommitPagerTxn.
+                }
 
                 let durable_old = self.durable_txid_max_old.map(u64::from).unwrap_or_default();
                 #[cfg(any(test, debug_assertions))]
@@ -3088,8 +3141,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
 mod tests {
     use super::*;
     use crate::alloc::vec;
-    use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::mvcc::database::SortableIndexKey;
+    use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::translate::collate::CollationSeq;
     use crate::types::{IndexInfo, KeyInfo};
     use turso_parser::ast::SortOrder;
