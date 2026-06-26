@@ -95,6 +95,39 @@ pub struct VTabImpl {
     pub implementation: Arc<VTabModuleImpl>,
 }
 
+type BoxedScalarFn = Box<dyn Fn(&[crate::Value]) -> crate::Result<crate::Value> + Send + Sync>;
+
+struct UserScalarFunction {
+    call: BoxedScalarFn,
+}
+
+unsafe extern "C" fn dispatch_user_scalar(
+    context: usize,
+    argc: i32,
+    argv: *const ExtValue,
+    _context_destructor: Option<ContextDestructor>,
+    _value_destructor: Option<ValueDestructor>,
+) -> ExtValue {
+    let function = unsafe { &*(context as *const UserScalarFunction) };
+    let mut args = Vec::with_capacity(argc.max(0) as usize);
+    if argc > 0 && !argv.is_null() {
+        for raw in unsafe { std::slice::from_raw_parts(argv, argc as usize) } {
+            match crate::Value::from_ffi_ref(raw) {
+                Ok(value) => args.push(value),
+                Err(err) => return ExtValue::error_with_message(err.to_string()),
+            }
+        }
+    }
+    match (function.call)(&args) {
+        Ok(value) => value.to_ffi(),
+        Err(err) => ExtValue::error_with_message(err.to_string()),
+    }
+}
+
+unsafe extern "C" fn drop_user_scalar(context: usize) {
+    drop(unsafe { Box::from_raw(context as *mut UserScalarFunction) });
+}
+
 pub(crate) unsafe fn register_scalar_function(
     ctx: *mut c_void,
     name: *const c_char,
@@ -350,5 +383,67 @@ impl Connection {
             return;
         }
         let _ = unsafe { Box::from_raw(api.ctx as *mut ExtensionCtx) };
+    }
+
+    pub fn register_scalar_function<F>(
+        &self,
+        name: &str,
+        arity: i32,
+        deterministic: bool,
+        function: F,
+    ) -> crate::Result<()>
+    where
+        F: Fn(&[crate::Value]) -> crate::Result<crate::Value> + Send + Sync + 'static,
+    {
+        let name_c = CString::new(name).map_err(|_| {
+            crate::LimboError::InvalidArgument(format!(
+                "scalar function name must not contain a NUL byte: {name:?}"
+            ))
+        })?;
+        let context = Box::into_raw(Box::new(UserScalarFunction {
+            call: Box::new(function),
+        })) as usize;
+        let api = unsafe { self._build_turso_ext() };
+        let result = unsafe {
+            (api.register_scalar_function)(
+                api.ctx,
+                name_c.as_ptr(),
+                arity,
+                deterministic,
+                context,
+                dispatch_user_scalar,
+                Some(drop_user_scalar),
+                None,
+            )
+        };
+        unsafe { self._free_extension_ctx(api) };
+        if result == ResultCode::OK {
+            Ok(())
+        } else {
+            unsafe { drop_user_scalar(context) };
+            Err(crate::LimboError::InvalidArgument(format!(
+                "failed to register scalar function {name:?}: {result}"
+            )))
+        }
+    }
+
+    pub fn unregister_scalar_function(&self, name: &str) -> crate::Result<()> {
+        let name_c = CString::new(name).map_err(|_| {
+            crate::LimboError::InvalidArgument(format!(
+                "scalar function name must not contain a NUL byte: {name:?}"
+            ))
+        })?;
+        let api = unsafe { self._build_turso_ext() };
+        let result = unsafe { (api.unregister_function)(api.ctx, name_c.as_ptr()) };
+        unsafe { self._free_extension_ctx(api) };
+        match result {
+            ResultCode::OK => Ok(()),
+            ResultCode::NotFound => Err(crate::LimboError::InvalidArgument(format!(
+                "no such function: {name}"
+            ))),
+            other => Err(crate::LimboError::InvalidArgument(format!(
+                "failed to unregister function {name:?}: {other}"
+            ))),
+        }
     }
 }
