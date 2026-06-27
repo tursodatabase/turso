@@ -6602,7 +6602,6 @@ dependencies = [
  "clap",
  "clap_complete",
  "comfy-table",
- "csv",
  "ctrlc",
  "dirs 5.0.1",
  "env_logger",

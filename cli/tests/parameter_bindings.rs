@@ -6,7 +6,7 @@ fn run_cli(input: &[u8]) -> Output {
         .arg(":memory:")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("failed to run tursodb");
 
@@ -20,6 +20,10 @@ fn run_cli(input: &[u8]) -> Output {
 fn stdout_lines(output: &Output) -> Vec<&str> {
     let s = std::str::from_utf8(&output.stdout).expect("non-utf8 stdout");
     s.lines().collect()
+}
+
+fn stderr_text(output: &Output) -> &str {
+    std::str::from_utf8(&output.stderr).expect("non-utf8 stderr")
 }
 
 #[test]
@@ -50,13 +54,11 @@ fn parameter_clear_removes_binding() {
 fn parameter_set_rejects_bare_name() {
     let output = run_cli(b".mode list\n.parameter set x 41\nselect :x;\n");
 
-    assert_eq!(output.status.code(), Some(0));
-    let lines = stdout_lines(&output);
+    assert_eq!(output.status.code(), Some(1));
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("Error: parameter name must start with one of")),
-        "expected bare-name validation error, got: {lines:?}"
+        stderr_text(&output).contains("Error: parameter name must start with one of"),
+        "expected bare-name validation error, got: {:?}",
+        stderr_text(&output)
     );
 }
 
@@ -66,6 +68,44 @@ fn parameter_set_supports_quoted_multi_word_text() {
 
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(stdout_lines(&output), vec!["hello world"]);
+}
+
+#[test]
+fn parameter_set_preserves_escaped_newline_text() {
+    let output = run_cli(b".mode list\n.parameter set @x \"\\xA\"\nselect hex(@x), length(@x);\n");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout_lines(&output), vec!["0A|1"]);
+}
+
+#[test]
+fn parameter_set_preserves_fallback_text_spaces() {
+    let output =
+        run_cli(b".mode list\n.parameter set @x \"  a  \"\nselect quote(@x), length(@x);\n");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout_lines(&output), vec!["'  a  '|5"]);
+}
+
+#[test]
+fn parameter_set_truncates_nul_escape_like_sqlite_shell() {
+    let output = run_cli(b".mode list\n.parameter set @x \"\\xZZ\"\nselect hex(@x), quote(@x);\n");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout_lines(&output), vec!["|''"]);
+}
+
+#[test]
+fn parameter_set_rejects_invalid_utf8_escape_current_turso_policy() {
+    let output = run_cli(b".mode list\n.parameter set @x \"\\xFF\"\nselect hex(@x);\n");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout_lines(&output), vec![""]);
+    assert!(
+        stderr_text(&output).contains("dot-command escape produced invalid UTF-8"),
+        "expected invalid UTF-8 escape error, got: {:?}",
+        stderr_text(&output)
+    );
 }
 
 #[test]
@@ -82,13 +122,11 @@ fn parameter_clear_only_removes_requested_name() {
 fn parameter_set_rejects_zero_positional_index() {
     let output = run_cli(b".mode list\n.parameter set ?0 41\n");
 
-    assert_eq!(output.status.code(), Some(0));
-    let lines = stdout_lines(&output);
+    assert_eq!(output.status.code(), Some(1));
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("?N' must use an index >= 1")),
-        "expected positional index bounds validation error, got: {lines:?}"
+        stderr_text(&output).contains("?N' must use an index >= 1"),
+        "expected positional index bounds validation error, got: {:?}",
+        stderr_text(&output)
     );
 }
 
