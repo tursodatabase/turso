@@ -1,3 +1,5 @@
+use crate::alloc::vec;
+use crate::alloc::*;
 use crate::json::error::{Error as PError, Result as PResult};
 use crate::json::Conv;
 use crate::{bail_parse_error, LimboError, Result};
@@ -458,7 +460,7 @@ impl PathOperation for DeleteOperation {
             let nul = JsonbHeader::make_null().into_bytes();
             let nul_bytes = nul.as_bytes();
             json.data.clear();
-            json.data.extend_from_slice(nul_bytes);
+            json.append_from_data_unsafe(nul_bytes)?;
         }
 
         Ok(())
@@ -633,11 +635,11 @@ pub struct SearchOperation {
 }
 
 impl SearchOperation {
-    pub fn new(capacity: usize) -> Self {
-        Self {
+    pub fn new(capacity: usize) -> Result<Self> {
+        Ok(Self {
             mode: PathOperationMode::ReplaceExisting,
-            value: Jsonb::new(capacity, None),
-        }
+            value: Jsonb::new(capacity, None)?,
+        })
     }
 
     pub fn result(self) -> Jsonb {
@@ -661,8 +663,7 @@ impl PathOperation for SearchOperation {
         };
         let (JsonbHeader(_, size), header_size) = json.read_header(idx)?;
         self.value
-            .data
-            .extend_from_slice(&json.data[idx..idx + header_size + size]);
+            .append_from_data_unsafe(&json.data[idx..idx + header_size + size])?;
 
         Ok(())
     }
@@ -904,43 +905,50 @@ pub struct ObjectIteratorState {
 }
 
 impl Jsonb {
-    pub fn new(capacity: usize, data: Option<&[u8]>) -> Self {
+    pub fn empty() -> Self {
+        Self { data: Vec::new() }
+    }
+
+    pub fn new(capacity: usize, data: Option<&[u8]>) -> Result<Self> {
         if let Some(data) = data {
-            return Self {
-                data: data.to_vec(),
-            };
+            return Ok(Self {
+                data: data.to_vec(), // TODO: later have to_vec fallible
+            });
         }
-        Self {
-            data: Vec::with_capacity(capacity),
-        }
+        Ok(Self {
+            data: Vec::try_with_capacity_ext(capacity)?,
+        })
     }
 
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
-    pub fn make_empty_array(size: usize) -> Self {
+    pub fn make_empty_array(size: usize) -> Result<Self> {
         let mut jsonb = Self {
-            data: Vec::with_capacity(size),
+            data: Vec::try_with_capacity_ext(size)?,
         };
         jsonb
             .write_element_header(0, ElementType::ARRAY, 0, false)
             .expect("writing header to new vector should not fail");
-        jsonb
+        Ok(jsonb)
     }
 
-    pub fn make_empty_obj(size: usize) -> Self {
+    pub fn make_empty_obj(size: usize) -> Result<Self> {
         let mut jsonb = Self {
-            data: Vec::with_capacity(size),
+            data: Vec::try_with_capacity_ext(size)?,
         };
         jsonb
             .write_element_header(0, ElementType::OBJECT, 0, false)
             .expect("writing header to new vector should not fail");
-        jsonb
+        Ok(jsonb)
     }
 
-    pub fn append_to_array_unsafe(&mut self, data: &[u8]) {
-        self.data.extend_from_slice(data);
+    pub fn append_from_data_unsafe(
+        &mut self,
+        data: &[u8],
+    ) -> std::result::Result<(), crate::alloc::TryReserveError> {
+        self.data.try_extend(data.iter().copied())
     }
 
     pub fn append_jsonb_to_end(&mut self, mut data: Vec<u8>) {
@@ -1788,7 +1796,7 @@ impl Jsonb {
                         // Write header and content
                         if len <= 11 {
                             self.data
-                                .push((ElementType::TEXT as u8) | ((len as u8) << 4));
+                                .try_push((ElementType::TEXT as u8) | ((len as u8) << 4))?;
                         } else {
                             self.write_element_header(header_pos, ElementType::TEXT, len, false)
                                 .map_err(|_| PError::Message {
@@ -1797,7 +1805,7 @@ impl Jsonb {
                                 })?;
                         }
 
-                        self.data.extend_from_slice(&input[pos..end_pos]);
+                        self.append_from_data_unsafe(&input[pos..end_pos])?;
                         return Ok(end_pos + 1); // Skip past closing quote
                     }
                     break;
@@ -1827,7 +1835,7 @@ impl Jsonb {
 
         // Special case for unquoted JSON5 keys (identifiers)
         if !quoted {
-            self.data.push(quote);
+            self.data.try_push(quote)?;
             len += 1;
 
             if pos < input.len() && input[pos] == b':' {
@@ -1867,33 +1875,33 @@ impl Jsonb {
 
                 match esc {
                     b'b' => {
-                        self.data.extend_from_slice(b"\\b");
+                        self.append_from_data_unsafe(b"\\b")?;
                         len += 2;
                         element_type = ElementType::TEXTJ;
                     }
                     b'f' => {
-                        self.data.extend_from_slice(b"\\f");
+                        self.append_from_data_unsafe(b"\\f")?;
                         len += 2;
                         element_type = ElementType::TEXTJ;
                     }
                     b'n' => {
-                        self.data.extend_from_slice(b"\\n");
+                        self.append_from_data_unsafe(b"\\n")?;
                         len += 2;
                         element_type = ElementType::TEXTJ;
                     }
                     b'r' => {
-                        self.data.extend_from_slice(b"\\r");
+                        self.append_from_data_unsafe(b"\\r")?;
                         len += 2;
                         element_type = ElementType::TEXTJ;
                     }
                     b't' => {
-                        self.data.extend_from_slice(b"\\t");
+                        self.append_from_data_unsafe(b"\\t")?;
                         len += 2;
                         element_type = ElementType::TEXTJ;
                     }
                     b'\\' | b'"' | b'/' => {
-                        self.data.push(b'\\');
-                        self.data.push(esc);
+                        self.data.try_push(b'\\')?;
+                        self.data.try_push(esc)?;
                         len += 2;
                         element_type = ElementType::TEXTJ;
                     }
@@ -1920,29 +1928,29 @@ impl Jsonb {
                             escape_buffer[2 + i] = h;
                         }
 
-                        self.data.extend_from_slice(&escape_buffer[0..6]);
+                        self.append_from_data_unsafe(&escape_buffer[0..6])?;
                         len += 6;
                         pos += 4;
                         element_type = ElementType::TEXTJ;
                     }
                     // JSON5 extensions
                     b'\n' => {
-                        self.data.extend_from_slice(b"\\\n");
+                        self.append_from_data_unsafe(b"\\\n")?;
                         len += 2;
                         element_type = ElementType::TEXT5;
                     }
                     b'\'' => {
-                        self.data.extend_from_slice(b"\\\'");
+                        self.append_from_data_unsafe(b"\\\'")?;
                         len += 2;
                         element_type = ElementType::TEXT5;
                     }
                     b'0' => {
-                        self.data.extend_from_slice(b"\\0");
+                        self.append_from_data_unsafe(b"\\0")?;
                         len += 2;
                         element_type = ElementType::TEXT5;
                     }
                     b'v' => {
-                        self.data.extend_from_slice(b"\\v");
+                        self.append_from_data_unsafe(b"\\v")?;
                         len += 2;
                         element_type = ElementType::TEXT5;
                     }
@@ -1969,7 +1977,7 @@ impl Jsonb {
                             escape_buffer[2 + i] = h;
                         }
 
-                        self.data.extend_from_slice(&escape_buffer[0..4]);
+                        self.append_from_data_unsafe(&escape_buffer[0..4])?;
                         len += 4;
                         pos += 2;
                         element_type = ElementType::TEXT5;
@@ -1989,11 +1997,11 @@ impl Jsonb {
             } else if c <= 0x1F {
                 // Control character
                 element_type = ElementType::TEXT5;
-                self.data.push(c);
+                self.data.try_push(c)?;
                 len += 1;
             } else {
                 // Normal character
-                self.data.push(c);
+                self.data.try_push(c)?;
                 len += 1;
             }
         }
@@ -2028,7 +2036,7 @@ impl Jsonb {
                 is_json5 = true;
                 pos += 1;
             } else {
-                self.data.push(input[pos]);
+                self.data.try_push(input[pos])?;
                 pos += 1;
                 len += 1;
             }
@@ -2042,20 +2050,20 @@ impl Jsonb {
 
         // Check for hex (JSON5)
         if pos < input.len() && input[pos] == b'0' && pos + 1 < input.len() {
-            self.data.push(input[pos]);
+            self.data.try_push(input[pos])?;
             pos += 1;
             len += 1;
             has_digit = true;
 
             if pos < input.len() && (input[pos] == b'x' || input[pos] == b'X') {
                 // Hexadecimal number
-                self.data.push(input[pos]);
+                self.data.try_push(input[pos])?;
                 pos += 1;
                 len += 1;
 
                 let mut has_digit = false;
                 while pos < input.len() && is_hex_digit(input[pos]) {
-                    self.data.push(input[pos]);
+                    self.data.try_push(input[pos])?;
                     pos += 1;
                     len += 1;
                     has_digit = true;
@@ -2109,7 +2117,7 @@ impl Jsonb {
             pos += infinity.len();
 
             // Write Infinity as 9.0e+999
-            self.data.extend_from_slice(b"9.0e+999");
+            self.append_from_data_unsafe(b"9.0e+999")?;
             self.write_element_header(
                 num_start,
                 ElementType::FLOAT5,
@@ -2128,14 +2136,14 @@ impl Jsonb {
         while pos < input.len() {
             match input[pos] {
                 b'0'..=b'9' => {
-                    self.data.push(input[pos]);
+                    self.data.try_push(input[pos])?;
                     pos += 1;
                     len += 1;
                     has_digit = true;
                 }
                 b'.' => {
                     is_float = true;
-                    self.data.push(input[pos]);
+                    self.data.try_push(input[pos])?;
                     pos += 1;
                     len += 1;
 
@@ -2146,13 +2154,13 @@ impl Jsonb {
                 }
                 b'e' | b'E' => {
                     is_float = true;
-                    self.data.push(input[pos]);
+                    self.data.try_push(input[pos])?;
                     pos += 1;
                     len += 1;
 
                     // Optional sign after exponent
                     if pos < input.len() && (input[pos] == b'+' || input[pos] == b'-') {
-                        self.data.push(input[pos]);
+                        self.data.try_push(input[pos])?;
                         pos += 1;
                         len += 1;
                     }
@@ -2211,7 +2219,7 @@ impl Jsonb {
         }
 
         pos += true_lit.len();
-        self.data.push(ElementType::TRUE as u8);
+        self.data.try_push(ElementType::TRUE as u8)?;
 
         Ok(pos)
     }
@@ -2228,7 +2236,7 @@ impl Jsonb {
         }
 
         pos += false_lit.len();
-        self.data.push(ElementType::FALSE as u8);
+        self.data.try_push(ElementType::FALSE as u8)?;
 
         Ok(pos)
     }
@@ -2250,7 +2258,7 @@ impl Jsonb {
             && input[pos + 3] == b'l'
         {
             pos += 4;
-            self.data.push(ElementType::NULL as u8);
+            self.data.try_push(ElementType::NULL as u8)?;
             return Ok(pos);
         }
 
@@ -2261,7 +2269,7 @@ impl Jsonb {
             && (input[pos + 2] == b'n' || input[pos + 2] == b'N')
         {
             pos += 3;
-            self.data.push(ElementType::NULL as u8);
+            self.data.try_push(ElementType::NULL as u8)?;
             return Ok(pos);
         }
 
@@ -2281,7 +2289,7 @@ impl Jsonb {
         if payload_size <= 11 && !size_might_change {
             let header_byte = (element_type as u8) | ((payload_size as u8) << 4);
             if cursor == self.len() {
-                self.data.push(header_byte);
+                self.data.try_push(header_byte)?;
             } else {
                 self.data[cursor] = header_byte;
             }
@@ -2293,7 +2301,7 @@ impl Jsonb {
         let header_len = header_bytes.len();
 
         if cursor == self.len() {
-            self.data.extend_from_slice(header_bytes);
+            self.append_from_data_unsafe(header_bytes)?;
             return Ok(header_len);
         }
 
@@ -2326,8 +2334,10 @@ impl Jsonb {
         Ok(new_len)
     }
 
-    fn from_str(input: &str) -> PResult<Self> {
-        let mut result = Self::new(input.len(), None);
+    pub fn from_str(input: &str) -> PResult<Self> {
+        let mut result = Self {
+            data: Vec::try_with_capacity_ext(input.len())?,
+        };
         let input = input.as_bytes();
 
         if input.is_empty() {
@@ -2368,7 +2378,7 @@ impl Jsonb {
         }
     }
 
-    pub fn from_raw_data(data: &[u8]) -> Self {
+    pub fn from_raw_data(data: &[u8]) -> Result<Self> {
         Self::new(data.len(), Some(data))
     }
 
@@ -2407,7 +2417,7 @@ impl Jsonb {
     ) -> Result<Vec<JsonTraversalResult>> {
         let mut path_iter = path.elements.iter().peekable();
         let mut pos = 0;
-        let mut stack: Vec<JsonTraversalResult> = Vec::with_capacity(path.elements.len());
+        let mut stack: Vec<JsonTraversalResult> = Vec::try_with_capacity_ext(path.elements.len())?;
 
         while let Some(current) = path_iter.next() {
             let next_is_array = matches!(path_iter.peek(), Some(PathElement::ArrayLocator(_)))
@@ -2448,7 +2458,7 @@ impl Jsonb {
                 None => result.field_value_index,
             };
 
-            stack.push(result);
+            stack.try_push(result)?;
         }
 
         Ok(stack)
@@ -3026,7 +3036,7 @@ impl Jsonb {
 
         if patch_header.0 != ElementType::OBJECT {
             self.data.clear();
-            self.data.extend_from_slice(&patch.data);
+            self.append_from_data_unsafe(&patch.data)?;
             return Ok(());
         }
 
@@ -3075,13 +3085,13 @@ impl Jsonb {
                     Cow::Borrowed(key_text)
                 };
 
-                key_values.push((
+                key_values.try_push((
                     key_text,
                     value_header.0,
                     value_cursor,
                     value_header_size,
                     value_header.1,
-                ));
+                ))?;
 
                 patch_key_cursor = value_cursor + value_header_size + value_header.1;
             }
@@ -3090,7 +3100,9 @@ impl Jsonb {
                 // Create a path to this key
                 let mut key_path = path.clone();
 
-                key_path.elements.push(PathElement::Key(key_text, false));
+                key_path
+                    .elements
+                    .try_push(PathElement::Key(key_text, false))?;
 
                 match value_type {
                     ElementType::NULL => {
@@ -3119,7 +3131,7 @@ impl Jsonb {
                             if target_header.0 == ElementType::OBJECT {
                                 work_stack.push_back((key_path, value_cursor));
                             } else {
-                                let patch_obj = Jsonb::new(value_data.len(), Some(value_data));
+                                let patch_obj = Jsonb::new(value_data.len(), Some(value_data))?;
                                 let mut op = ReplaceOperation::new(patch_obj);
                                 result.operate_on_path(&key_path, &mut op)?;
                                 let _ = result.operate_on_path(&key_path, &mut op);
@@ -3130,7 +3142,7 @@ impl Jsonb {
                             let empty_obj = Jsonb::new(
                                 1,
                                 Some(JsonbHeader::make_obj().into_bytes().as_bytes()),
-                            );
+                            )?;
                             let mut op = SetOperation::new(empty_obj);
                             let _ = result.operate_on_path(&key_path, &mut op);
 
@@ -3140,7 +3152,7 @@ impl Jsonb {
                     _ => {
                         let value_data = &patch.data
                             [value_cursor..value_cursor + value_header_size + value_size];
-                        let patch_value = Jsonb::new(value_data.len(), Some(value_data));
+                        let patch_value = Jsonb::new(value_data.len(), Some(value_data))?;
 
                         let mut op = SetOperation::new(patch_value);
 
@@ -3168,27 +3180,31 @@ impl Jsonb {
     pub fn array_iterator_next(
         &self,
         st: &ArrayIteratorState,
-    ) -> Option<((usize, Jsonb), ArrayIteratorState)> {
+    ) -> Result<Option<((usize, Jsonb), ArrayIteratorState)>> {
         if st.cursor >= st.end {
-            return None;
+            return Ok(None);
         }
 
-        let (JsonbHeader(_, payload_len), header_len) = self.read_header(st.cursor).ok()?;
+        let Ok((JsonbHeader(_, payload_len), header_len)) = self.read_header(st.cursor) else {
+            return Ok(None);
+        };
         let start = st.cursor;
-        let stop = start.checked_add(header_len + payload_len)?;
+        let Some(stop) = start.checked_add(header_len + payload_len) else {
+            return Ok(None);
+        };
 
         if stop > st.end || stop > self.data.len() {
-            return None;
+            return Ok(None);
         }
 
-        let elem = Jsonb::new(stop - start, Some(&self.data[start..stop]));
+        let elem = Jsonb::new(stop - start, Some(&self.data[start..stop]))?;
         let next = ArrayIteratorState {
             cursor: stop,
             end: st.end,
             index: st.index + 1,
         };
 
-        Some(((st.index, elem), next))
+        Ok(Some(((st.index, elem), next)))
     }
 
     pub fn object_iterator(&self) -> Result<ObjectIteratorState> {
@@ -3203,42 +3219,51 @@ impl Jsonb {
         }
     }
 
+    #[expect(clippy::type_complexity)]
     pub fn object_iterator_next(
         &self,
         st: &ObjectIteratorState,
-    ) -> Option<((usize, Jsonb, Jsonb), ObjectIteratorState)> {
+    ) -> Result<Option<((usize, Jsonb, Jsonb), ObjectIteratorState)>> {
         if st.cursor >= st.end {
-            return None;
+            return Ok(None);
         }
 
         // key
-        let (JsonbHeader(key_ty, key_len), key_hdr_len) = self.read_header(st.cursor).ok()?;
+        let Ok((JsonbHeader(key_ty, key_len), key_hdr_len)) = self.read_header(st.cursor) else {
+            return Ok(None);
+        };
         if !key_ty.is_valid_key() {
-            return None;
+            return Ok(None);
         }
         let key_start = st.cursor;
-        let key_stop = key_start.checked_add(key_hdr_len + key_len)?;
+        let Some(key_stop) = key_start.checked_add(key_hdr_len + key_len) else {
+            return Ok(None);
+        };
         if key_stop > st.end || key_stop > self.data.len() {
-            return None;
+            return Ok(None);
         }
 
         // value
-        let (JsonbHeader(_, val_len), val_hdr_len) = self.read_header(key_stop).ok()?;
+        let Ok((JsonbHeader(_, val_len), val_hdr_len)) = self.read_header(key_stop) else {
+            return Ok(None);
+        };
         let val_start = key_stop;
-        let val_stop = val_start.checked_add(val_hdr_len + val_len)?;
+        let Some(val_stop) = val_start.checked_add(val_hdr_len + val_len) else {
+            return Ok(None);
+        };
         if val_stop > st.end || val_stop > self.data.len() {
-            return None;
+            return Ok(None);
         }
 
-        let key = Jsonb::new(key_stop - key_start, Some(&self.data[key_start..key_stop]));
-        let value = Jsonb::new(val_stop - val_start, Some(&self.data[val_start..val_stop]));
+        let key = Jsonb::new(key_stop - key_start, Some(&self.data[key_start..key_stop]))?;
+        let value = Jsonb::new(val_stop - val_start, Some(&self.data[val_start..val_stop]))?;
         let next = ObjectIteratorState {
             cursor: val_stop,
             end: st.end,
             index: st.index + 1,
         };
 
-        Some(((st.index, key, value), next))
+        Ok(Some(((st.index, key, value), next)))
     }
 
     /// If the iterator points at a container value, return an iterator for that container.
@@ -3525,11 +3550,12 @@ fn is_json_ok(ch: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
 
     #[test]
     fn test_null_serialization() {
         // Create JSONB with null value
-        let mut jsonb = Jsonb::new(10, None);
+        let mut jsonb = Jsonb::new(10, None).unwrap();
         jsonb.data.push(ElementType::NULL as u8);
 
         // Test serialization
@@ -3544,12 +3570,12 @@ mod tests {
     #[test]
     fn test_boolean_serialization() {
         // True
-        let mut jsonb_true = Jsonb::new(10, None);
+        let mut jsonb_true = Jsonb::new(10, None).unwrap();
         jsonb_true.data.push(ElementType::TRUE as u8);
         assert_eq!(jsonb_true.to_string().unwrap(), "true");
 
         // False
-        let mut jsonb_false = Jsonb::new(10, None);
+        let mut jsonb_false = Jsonb::new(10, None).unwrap();
         jsonb_false.data.push(ElementType::FALSE as u8);
         assert_eq!(jsonb_false.to_string().unwrap(), "false");
 
@@ -3616,7 +3642,7 @@ mod tests {
             93,  // ']'
         ];
 
-        let jsonb = Jsonb::from_raw_data(&data);
+        let jsonb = Jsonb::from_raw_data(&data).unwrap();
         // This should not panic - the fix uses byte-level checks that handle
         // non-ASCII safely. The malformed data is rejected as invalid INT5,
         // matching SQLite's "malformed JSON" behavior.
@@ -3631,7 +3657,7 @@ mod tests {
         assert!(valid.to_string().is_ok());
 
         // Malformed JSONB with invalid element type should error
-        let malformed = Jsonb::from_raw_data(&[0xFF]);
+        let malformed = Jsonb::from_raw_data(&[0xFF]).unwrap();
         let err = malformed.to_string().unwrap_err();
         assert!(err.to_string().contains("Invalid element type"));
 
@@ -3639,14 +3665,16 @@ mod tests {
         let bad_int5 = Jsonb::from_raw_data(&[
             0x34, // INT5 header, 3 bytes payload
             b'a', b'b', b'c', // not a valid number
-        ]);
+        ])
+        .unwrap();
         let err = bad_int5.to_string().unwrap_err();
         assert!(err.to_string().contains("malformed JSON"));
 
         // Empty INT5 payload should error
         let empty_int5 = Jsonb::from_raw_data(&[
             0x04, // INT5 header, 0 bytes payload
-        ]);
+        ])
+        .unwrap();
         let err = empty_int5.to_string().unwrap_err();
         assert!(err.to_string().contains("malformed JSON"));
 
@@ -3654,14 +3682,16 @@ mod tests {
         let sign_only_int5 = Jsonb::from_raw_data(&[
             0x14, // INT5 header, 1 byte payload
             b'+',
-        ]);
+        ])
+        .unwrap();
         let err = sign_only_int5.to_string().unwrap_err();
         assert!(err.to_string().contains("malformed JSON"));
 
         let minus_only_int5 = Jsonb::from_raw_data(&[
             0x14, // INT5 header, 1 byte payload
             b'-',
-        ]);
+        ])
+        .unwrap();
         let err = minus_only_int5.to_string().unwrap_err();
         assert!(err.to_string().contains("malformed JSON"));
     }
@@ -4068,7 +4098,7 @@ world""#,
         let binary_data = parsed.data;
 
         // Create a new Jsonb from the binary data
-        let from_binary = Jsonb::new(0, Some(&binary_data));
+        let from_binary = Jsonb::new(0, Some(&binary_data)).unwrap();
         assert_eq!(from_binary.to_string().unwrap(), original);
     }
 
@@ -4099,7 +4129,7 @@ world""#,
         let mut invalid = jsonb.data;
         if !invalid.is_empty() {
             invalid[0] = 0xFF; // Invalid element type
-            let jsonb = Jsonb::new(0, Some(&invalid));
+            let jsonb = Jsonb::new(0, Some(&invalid)).unwrap();
             assert!(jsonb.element_type().is_err());
         }
     }
@@ -4142,7 +4172,7 @@ world""#,
             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // u64::MAX as payload size
             b'a', b'b', b'c', // some actual data (doesn't matter, cursor+len will overflow)
         ];
-        let jsonb = Jsonb::new(0, Some(&malformed_text));
+        let jsonb = Jsonb::new(0, Some(&malformed_text)).unwrap();
         let result = jsonb.to_string();
         assert!(result.is_err());
         assert!(
@@ -4157,7 +4187,7 @@ world""#,
             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // u64::MAX as payload size
             0x01, // NULL element inside (doesn't matter, cursor+len will overflow)
         ];
-        let jsonb = Jsonb::new(0, Some(&malformed_array));
+        let jsonb = Jsonb::new(0, Some(&malformed_array)).unwrap();
         let result = jsonb.to_string();
         assert!(result.is_err());
         assert!(
@@ -4172,7 +4202,7 @@ world""#,
             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // u64::MAX as payload size
             0x17, b'k', // TEXT key "k" (doesn't matter, cursor+len will overflow)
         ];
-        let jsonb = Jsonb::new(0, Some(&malformed_object));
+        let jsonb = Jsonb::new(0, Some(&malformed_object)).unwrap();
         let result = jsonb.to_string();
         assert!(result.is_err());
         assert!(
@@ -4185,6 +4215,7 @@ world""#,
 #[cfg(test)]
 mod path_operations_tests {
     use super::*;
+    use crate::alloc::vec;
     use crate::json::path::{JsonPath, PathElement};
     use std::borrow::Cow;
 
@@ -4422,7 +4453,7 @@ mod path_operations_tests {
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
 
         // Create a search operation
-        let mut operation = SearchOperation::new(100);
+        let mut operation = SearchOperation::new(100).unwrap();
 
         // Create a path to the "person" property
         let path = create_path(vec![

@@ -15,6 +15,13 @@ pub enum Error {
         /// The location of the error, if applicable.
         location: Option<usize>,
     },
+    Alloc,
+}
+
+impl From<crate::alloc::TryReserveError> for Error {
+    fn from(_: crate::alloc::TryReserveError) -> Self {
+        Self::Alloc
+    }
 }
 
 impl From<std::io::Error> for Error {
@@ -39,6 +46,7 @@ impl Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Message { ref msg, .. } => write!(formatter, "{msg}"),
+            Self::Alloc => write!(formatter, "out of memory"),
         }
     }
 }
@@ -49,6 +57,7 @@ impl From<Error> for crate::LimboError {
     fn from(err: Error) -> Self {
         match err {
             Error::Message { msg, .. } => crate::LimboError::ParseError(msg),
+            Error::Alloc => crate::LimboError::OutOfMemory,
         }
     }
 }
