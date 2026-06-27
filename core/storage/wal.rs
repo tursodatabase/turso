@@ -4301,6 +4301,7 @@ impl Wal for WalFile {
         for (page, fid, csum) in &page_frame_and_checksum {
             self.complete_append_frame(page.get().id as u64, *fid, *csum);
         }
+        self.has_unpublished_frames.store(true, Ordering::Release);
 
         Ok(c)
     }
@@ -5972,6 +5973,70 @@ pub mod test {
             assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
             assert_eq!(page.wal_tag_pair(), ((idx + 1) as u64, 0));
             assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
+        }
+    }
+
+    #[test]
+    fn commit_after_cacheflush_spill_continues_frame_numbering() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+
+        let spilled = vec![
+            page_with_pattern(2, 0x10, &buffer_pool),
+            page_with_pattern(3, 0x20, &buffer_pool),
+        ];
+        let spilled_expected = spilled
+            .iter()
+            .map(|page| page.get_contents().as_ptr().to_vec())
+            .collect::<Vec<_>>();
+        let c = wal
+            .append_frames_vectored(spilled, PageSize::new(page_size).unwrap())
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        assert_eq!(wal.get_max_frame(), 2);
+
+        let committed = vec![page_with_pattern(4, 0x30, &buffer_pool)];
+        let prepared = wal
+            .prepare_frames(
+                &committed,
+                PageSize::new(page_size).unwrap(),
+                Some(99),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            prepared.metadata[0].1, 3,
+            "commit frame must continue after spilled frames, not reuse frame numbers"
+        );
+        assert_eq!(prepared.final_max_frame, 3);
+
+        let file = wal.wal_file().unwrap();
+        let c = file
+            .pwritev(
+                prepared.offset,
+                prepared.bufs.clone(),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        wal.commit_prepared_frames(&[prepared]);
+        wal.finish_append_frames_commit().unwrap();
+
+        assert_eq!(wal.find_frame(2, None).unwrap(), Some(1));
+        assert_eq!(wal.find_frame(3, None).unwrap(), Some(2));
+        assert_eq!(wal.find_frame(4, None).unwrap(), Some(3));
+
+        let readback = vec![Arc::new(crate::Page::new(2)), Arc::new(crate::Page::new(3))];
+        let c = wal
+            .read_frames_batch(1, &readback, buffer_pool, None)
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        for (idx, page) in readback.iter().enumerate() {
+            assert_eq!(page.get().id, idx + 2);
+            assert_eq!(
+                page.get_contents().as_ptr(),
+                spilled_expected[idx].as_slice()
+            );
         }
     }
 
