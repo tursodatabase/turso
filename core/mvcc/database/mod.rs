@@ -1616,6 +1616,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     self.tx_id,
                     self.connection.as_ref(),
                     self.db_id,
+                    self.did_commit_schema_change,
                 );
             }
             self.end_read_tx_for_db();
@@ -5991,15 +5992,45 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         crate::without_allocation_faults!(self.remove_tx(tx_id).expect(ALLOC_ERR_MSG));
     }
 
-    fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
+    fn cleanup_dropped_commit(
+        &self,
+        tx_id: TxID,
+        connection: &Connection,
+        db_id: usize,
+        did_commit_schema_change: bool,
+    ) {
         let tx_state = self.txs.get(&tx_id).map(|tx| tx.value().state.load());
         match tx_state {
             Some(TransactionState::Active | TransactionState::Preparing(_)) => {
                 self.rollback_tx_inner(tx_id, Some(connection), db_id);
             }
-            Some(TransactionState::Committed(_)) => {
-                if let Some(tx) = self.txs.get(&tx_id) {
-                    self.unlock_commit_lock_if_held(tx.value());
+            Some(TransactionState::Committed(commit_ts)) => {
+                if let Some(tx_entry) = self.txs.get(&tx_id) {
+                    let tx = tx_entry.value();
+                    self.rewrite_committed_tx_references(tx_id, commit_ts, tx);
+
+                    let dependents = std::mem::take(&mut *tx.commit_dep_set.lock());
+                    for dep_tx_id in dependents {
+                        if let Some(dep_tx_entry) = self.txs.get(&dep_tx_id) {
+                            dep_tx_entry
+                                .value()
+                                .commit_dep_counter
+                                .fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
+
+                    self.unlock_commit_lock_if_held(tx);
+                    let tx_header = *tx.header.read();
+                    let last_committed_ts = self
+                        .last_committed_tx_ts
+                        .fetch_max(commit_ts, Ordering::AcqRel);
+                    if last_committed_ts <= commit_ts {
+                        self.global_header.write().replace(tx_header);
+                    }
+                    if did_commit_schema_change {
+                        self.last_committed_schema_change_ts
+                            .fetch_max(commit_ts, Ordering::AcqRel);
+                    }
                 }
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
@@ -6014,6 +6045,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
+                }
+            }
+        }
+    }
+
+    fn rewrite_committed_tx_references(&self, tx_id: TxID, commit_ts: u64, tx: &Transaction<A>) {
+        let write_set_snapshot: Vec<(RowID, RowVersions<A>)> = tx.write_set.lock().to_vec();
+        for (_rowid, row_versions) in &write_set_snapshot {
+            for row_version in row_versions.write().iter_mut() {
+                if row_version.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
+                    row_version.set_begin(Some(TxTimestampOrID::Timestamp(commit_ts)));
+                }
+                if row_version.end() == Some(TxTimestampOrID::TxID(tx_id)) {
+                    row_version.set_end(Some(TxTimestampOrID::Timestamp(commit_ts)));
                 }
             }
         }
