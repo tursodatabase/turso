@@ -2107,9 +2107,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             // - look only at this one write-set entry (`row_versions`);
             // - copy the versions written or ended by the committing transaction;
             // - if this same entry appears twice with the same
-            //   `begin=Timestamp(...)`, keep the later one, because recovery should
-            //   not replay an intermediate value for the same table row,
-            //   sqlite_schema row, or index entry;
+            //   `begin=Timestamp(...)`, keep the later one, except when the earlier
+            //   one is a B-tree-resident delete marker that checkpoint still needs;
             // - append those versions to `log_record.row_versions` without sorting
             //   them against versions from other write-set entries.
 
@@ -6860,8 +6859,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Rule 1: Aborted garbage (begin=None, end=None) — always remove.
     /// Rule 2: Superseded (end=Timestamp(e), e <= lwm) — remove unless it's a
     ///         tombstone (no committed current version) whose deletion hasn't
-    ///         been checkpointed (e > ckpt_max), or a B-tree-resident version
-    ///         whose physical delete/overwrite hasn't been checkpointed.
+    ///         been checkpointed (e > ckpt_max), or a version with a physical
+    ///         B-tree image whose delete/overwrite hasn't been checkpointed.
     /// Rule 3: Current checkpointed sole-survivor (end=None, b <= ckpt_max,
     ///         b < lwm, no other versions remain) — remove.
     ///
@@ -6876,10 +6875,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // removable — UNLESS it's a tombstone (sole version, no committed
         // current version) whose deletion hasn't been checkpointed to B-tree
         // yet. In that case removing it would let the dual cursor fall through
-        // to a stale B-tree row. A B-tree-resident version needs the same guard
-        // even with a committed current replacement: that replacement can be
-        // deleted before checkpoint, leaving this as the only evidence that
-        // checkpoint must remove or overwrite the physical row.
+        // to a stale B-tree row. A version with a physical B-tree image needs
+        // the same guard even with a committed current replacement: that
+        // replacement can be deleted before checkpoint, leaving this as the
+        // only evidence that checkpoint must remove or overwrite the physical
+        // row.
         //
         // has_current only counts committed current versions (begin=Timestamp).
         // Pending inserts (begin=TxID) don't count — they might roll back,
@@ -6889,8 +6889,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         });
         versions.retain(|rv| match &rv.end() {
             Some(TxTimestampOrID::Timestamp(e)) if *e <= lwm => {
-                // Also retain B-tree-resident versions until checkpoint makes the physical change durable.
-                *e > ckpt_max && (rv.btree_resident || !has_current)
+                let has_physical_btree_image = rv.btree_resident
+                    || matches!(
+                        rv.begin(),
+                        Some(TxTimestampOrID::Timestamp(b)) if b <= ckpt_max
+                    );
+                *e > ckpt_max && (has_physical_btree_image || !has_current)
             }
             _ => true,
         });
