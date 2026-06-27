@@ -3,6 +3,7 @@ use std::sync::{atomic::Ordering, Arc};
 
 use crate::error::LimboError;
 use crate::io::{Buffer, Completion, CompletionGroup, WriteBatch as IOWriteBatch};
+use crate::return_if_io;
 use crate::schema::{BTreeTable, Schema, TypeDef};
 use crate::storage::pager::{AutoVacuumMode, Page, PageRef, Pager};
 use crate::storage::sqlite3_ondisk::{
@@ -1585,10 +1586,10 @@ fn install_mvcc_state_after_vacuum_commit(
 fn capture_target_metadata(
     temp_db: &VacuumTempDb,
     source_sequences: FxHashMap<String, Arc<crate::schema::Sequence>>,
-) -> Result<VacuumCommittedImageMeta> {
+) -> Result<IOResult<VacuumCommittedImageMeta>> {
     let temp_conn = &temp_db.conn;
     let temp_pager = temp_conn.get_pager();
-    temp_pager.begin_read_tx()?;
+    return_if_io!(temp_pager.begin_read_tx());
     temp_conn.set_tx_state(crate::connection::TransactionState::Read);
 
     let capture_result = (|| {
@@ -1607,7 +1608,7 @@ fn capture_target_metadata(
 
     temp_pager.end_read_tx();
     temp_conn.set_tx_state(crate::connection::TransactionState::None);
-    capture_result
+    capture_result.map(IOResult::Done)
 }
 
 /// Install the already-captured replacement schema/header after the source WAL
@@ -1642,8 +1643,8 @@ fn install_committed_vacuum_image(
 fn reload_physical_schema_for_mvcc_vacuum(
     connection: &Arc<Connection>,
     source_pager: &Pager,
-) -> Result<()> {
-    source_pager.begin_read_tx()?;
+) -> Result<IOResult<()>> {
+    return_if_io!(source_pager.begin_read_tx());
     connection.set_tx_state(crate::connection::TransactionState::Read);
 
     // Preserve the current sequences map and graft it onto the reparsed
@@ -1661,7 +1662,7 @@ fn reload_physical_schema_for_mvcc_vacuum(
     source_pager.end_read_tx();
     connection.set_tx_state(crate::connection::TransactionState::None);
 
-    reparse_result
+    reparse_result.map(IOResult::Done)
 }
 
 /// Step the in-place VACUUM state machine once. Returns `IO` to yield or
@@ -1743,7 +1744,12 @@ fn vacuum_in_place_step(
                     // After demotion this connection stops reading schema-cookie state from the
                     // MV store and starts reading directly from the pager-backed DB image.
                     // Let's be conservative, and reparse schema
-                    reload_physical_schema_for_mvcc_vacuum(connection, &source_pager)?;
+                    // Yielding here drops `guard`, whose Drop fully undoes the
+                    // demotion and releases the gate; re-entry re-acquires.
+                    return_if_io!(reload_physical_schema_for_mvcc_vacuum(
+                        connection,
+                        &source_pager
+                    ));
                     Some(guard)
                 } else {
                     None
@@ -1863,7 +1869,10 @@ fn vacuum_in_place_step(
                     .as_ref()
                     .expect("VACUUM CaptureTargetMetadata phase requires temp db");
                 let source_sequences = connection.schema.read().sequences.clone();
-                *committed_image = Some(capture_target_metadata(temp_db_ref, source_sequences)?);
+                *committed_image = Some(return_if_io!(capture_target_metadata(
+                    temp_db_ref,
+                    source_sequences
+                )));
                 *phase = VacuumInPlacePhase::BeginTempReadTx;
                 continue;
             }
@@ -1880,7 +1889,7 @@ fn vacuum_in_place_step(
                     !temp_pager.holds_read_lock(),
                     "VACUUM temp COMMIT should release the temp WAL read lock"
                 );
-                temp_pager.begin_read_tx()?;
+                return_if_io!(temp_pager.begin_read_tx());
 
                 // one invariant is that temp db should have disabled checkpoints and all raeds
                 // must happen over WAL only. In that case, the db file should be same as the page
@@ -2848,7 +2857,10 @@ mod tests {
         }
         temp.conn.execute("COMMIT")?;
 
-        let committed = capture_target_metadata(&temp, FxHashMap::default())?;
+        let committed = match capture_target_metadata(&temp, FxHashMap::default())? {
+            crate::IOResult::Done(committed) => committed,
+            crate::IOResult::IO(_) => panic!("temp capture should not need async I/O"),
+        };
 
         assert_eq!(committed.header.schema_cookie.get(), 42);
         assert_eq!(committed.header.read_version, mvcc_version);

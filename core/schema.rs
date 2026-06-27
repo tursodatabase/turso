@@ -1553,8 +1553,8 @@ impl Schema {
                         ));
                     }
 
+                    return_if_io!(pager.begin_read_tx());
                     state.cursor = Some(BTreeCursor::new_table(Arc::clone(pager), 1, 10));
-                    pager.begin_read_tx()?;
                     state.read_tx_active = true;
 
                     state.accumulators = Some(MakeFromBtreeAccumulators {
