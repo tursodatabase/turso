@@ -7625,6 +7625,268 @@ fn test_mvcc_checkpoint_abandoned_large_commit_churn_preserves_index_integrity()
     }
 }
 
+fn assert_checkpointed_churn_model(
+    conn: &Arc<Connection>,
+    expected: &std::collections::BTreeMap<i64, (i64, i64)>,
+    seed: u64,
+    step: usize,
+) {
+    assert_integrity_ok(conn);
+
+    let rows = get_rows(conn, "SELECT id,a,b FROM t ORDER BY id");
+    assert_eq!(
+        rows.len(),
+        expected.len(),
+        "seed {seed} step {step}: unexpected row count"
+    );
+    for (row, (&id, &(a, b))) in rows.iter().zip(expected.iter()) {
+        assert_eq!(
+            row,
+            &vec![Value::from_i64(id), Value::from_i64(a), Value::from_i64(b)],
+            "seed {seed} step {step}: table row mismatch for id {id}"
+        );
+
+        let rows = get_rows(conn, format!("SELECT id,b FROM t WHERE a = {a}").as_str());
+        assert_eq!(
+            rows,
+            vec![vec![Value::from_i64(id), Value::from_i64(b)]],
+            "seed {seed} step {step}: t_a lookup mismatch for id {id}"
+        );
+
+        let rows = get_rows(conn, format!("SELECT id,a FROM t WHERE b = {b}").as_str());
+        assert_eq!(
+            rows,
+            vec![vec![Value::from_i64(id), Value::from_i64(a)]],
+            "seed {seed} step {step}: t_b lookup mismatch for id {id}"
+        );
+    }
+}
+
+fn rewrite_checkpointed_churn_row(conn: &Arc<Connection>, mode: usize, id: i64, a: i64, b: i64) {
+    match mode {
+        0 => conn
+            .execute(format!(
+                "INSERT OR REPLACE INTO t(id,a,b) VALUES({id},{a},{b})"
+            ))
+            .unwrap(),
+        1 => conn
+            .execute(format!("UPDATE OR REPLACE t SET a={a},b={b} WHERE id={id}"))
+            .unwrap(),
+        2 => conn
+            .execute(format!(
+                "INSERT INTO t(id,a,b) VALUES({id},{a},{b}) \
+                 ON CONFLICT(id) DO UPDATE SET a=excluded.a,b=excluded.b"
+            ))
+            .unwrap(),
+        _ => unreachable!(),
+    }
+}
+
+fn sql_rows_as_strings(rows: Vec<Vec<Value>>) -> Vec<Vec<String>> {
+    rows.into_iter()
+        .map(|row| row.into_iter().map(|value| value.to_string()).collect())
+        .collect()
+}
+
+fn assert_text_pk_churn_model(
+    conn: &Arc<Connection>,
+    expected: &std::collections::BTreeMap<String, String>,
+    seed: u64,
+    step: usize,
+) {
+    let integrity_rows = get_rows(conn, "PRAGMA integrity_check");
+    assert_eq!(
+        integrity_rows.len(),
+        1,
+        "seed {seed} step {step}: integrity_check rows: {integrity_rows:?}"
+    );
+    assert_eq!(
+        integrity_rows[0][0].to_string(),
+        "ok",
+        "seed {seed} step {step}: integrity_check rows: {integrity_rows:?}"
+    );
+
+    let expected_rows: Vec<Vec<String>> = expected
+        .iter()
+        .map(|(k, v)| vec![format!("'{k}'"), format!("'{v}'")])
+        .collect();
+
+    let indexed_rows = sql_rows_as_strings(get_rows(
+        conn,
+        "SELECT quote(k), quote(v) FROM t ORDER BY k",
+    ));
+    assert_eq!(
+        indexed_rows, expected_rows,
+        "seed {seed} step {step}: indexed table scan mismatch"
+    );
+
+    let forced_rows = sql_rows_as_strings(get_rows(
+        conn,
+        "SELECT quote(k), quote(v) FROM t NOT INDEXED ORDER BY k",
+    ));
+    assert_eq!(
+        forced_rows, expected_rows,
+        "seed {seed} step {step}: forced table scan mismatch"
+    );
+
+    for (k, v) in expected {
+        let lookup_rows = sql_rows_as_strings(get_rows(
+            conn,
+            format!("SELECT quote(v) FROM t WHERE k = '{k}'").as_str(),
+        ));
+        assert_eq!(
+            lookup_rows,
+            vec![vec![format!("'{v}'")]],
+            "seed {seed} step {step}: primary-key lookup mismatch for {k}"
+        );
+
+        let forced_lookup_rows = sql_rows_as_strings(get_rows(
+            conn,
+            format!("SELECT quote(v) FROM t NOT INDEXED WHERE k = '{k}'").as_str(),
+        ));
+        assert_eq!(
+            forced_lookup_rows,
+            vec![vec![format!("'{v}'")]],
+            "seed {seed} step {step}: forced primary-key lookup mismatch for {k}"
+        );
+    }
+}
+
+#[test]
+fn test_mvcc_checkpoint_replace_delete_churn_preserves_index_integrity() {
+    const ROWS: i64 = 6;
+    const STEPS: usize = 24;
+
+    for seed in 0..8_u64 {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_gc_threshold = 1").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a, b)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_a ON t(a)").unwrap();
+        conn.execute("CREATE INDEX t_b ON t(b)").unwrap();
+
+        let mut expected = std::collections::BTreeMap::new();
+        for id in 1..=ROWS {
+            let a = id * 10;
+            let b = id * 100;
+            conn.execute(format!("INSERT INTO t(id,a,b) VALUES({id},{a},{b})"))
+                .unwrap();
+            expected.insert(id, (a, b));
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert_checkpointed_churn_model(&conn, &expected, seed, 0);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(0x4d564343_43484b50_u64 ^ seed);
+        for step in 1..=STEPS {
+            let id = rng.random_range(1..=ROWS);
+            if let std::collections::btree_map::Entry::Vacant(entry) = expected.entry(id) {
+                let a = 30_000 + (seed as i64 * 1_000) + (step as i64 * 10) + id;
+                let b = 40_000 + (seed as i64 * 1_000) + (step as i64 * 10) + id;
+                conn.execute(format!("INSERT INTO t(id,a,b) VALUES({id},{a},{b})"))
+                    .unwrap();
+                entry.insert((a, b));
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                assert_checkpointed_churn_model(&conn, &expected, seed, step);
+            }
+
+            let (old_a, old_b) = expected[&id];
+            let new_a = 10_000 + (seed as i64 * 1_000) + (step as i64 * 10) + id;
+            let new_b = 20_000 + (seed as i64 * 1_000) + (step as i64 * 10) + id;
+            let (a, b) = match rng.random_range(0..3) {
+                0 => (new_a, old_b),
+                1 => (old_a, new_b),
+                2 => (new_a, new_b),
+                _ => unreachable!(),
+            };
+
+            rewrite_checkpointed_churn_row(&conn, rng.random_range(0..3), id, a, b);
+            expected.insert(id, (a, b));
+
+            if step % 4 != 0 || rng.random_bool(0.5) {
+                conn.execute(format!("DELETE FROM t WHERE id={id}"))
+                    .unwrap();
+                expected.remove(&id);
+                if rng.random_bool(0.25) {
+                    conn.execute(format!("DELETE FROM t WHERE id={id}"))
+                        .unwrap();
+                }
+            }
+
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            assert_checkpointed_churn_model(&conn, &expected, seed, step);
+        }
+    }
+}
+
+#[test]
+fn test_mvcc_checkpoint_reopen_text_pk_upsert_delete_churn_preserves_autoindex_integrity() {
+    const KEYS: &[&str] = &["k1", "k2", "k3", "k4"];
+    const STEPS: usize = 20;
+
+    for seed in 0..8_u64 {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        let mut conn = db.connect();
+        conn.execute("CREATE TABLE t(k TEXT PRIMARY KEY, v TEXT)")
+            .unwrap();
+
+        let mut expected = std::collections::BTreeMap::new();
+        for key in KEYS {
+            let value = format!("orig_{key}");
+            conn.execute(format!("INSERT INTO t VALUES('{key}','{value}')"))
+                .unwrap();
+            expected.insert((*key).to_string(), value);
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert_text_pk_churn_model(&conn, &expected, seed, 0);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(0x54585450_4b524550_u64 ^ seed);
+        for step in 1..=STEPS {
+            let key = KEYS[rng.random_range(0..KEYS.len())];
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                expected.entry(key.to_string())
+            {
+                let value = format!("reinsert_{seed}_{step}_{key}");
+                conn.execute(format!("INSERT INTO t VALUES('{key}','{value}')"))
+                    .unwrap();
+                entry.insert(value);
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                assert_text_pk_churn_model(&conn, &expected, seed, step);
+            }
+
+            conn.execute("BEGIN").unwrap();
+            let upserts = 2 + rng.random_range(0..2);
+            let mut final_value = String::new();
+            for round in 0..upserts {
+                final_value = format!("u_{seed}_{step}_{round}_{key}");
+                conn.execute(format!(
+                    "INSERT INTO t VALUES('{key}','{final_value}') \
+                     ON CONFLICT(k) DO UPDATE SET v=excluded.v"
+                ))
+                .unwrap();
+            }
+            conn.execute("COMMIT").unwrap();
+            expected.insert(key.to_string(), final_value);
+
+            conn.close().unwrap();
+            drop(conn);
+            db.restart();
+            conn = db.connect();
+            conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+            assert_text_pk_churn_model(&conn, &expected, seed, step);
+
+            if step % 4 != 0 || rng.random_bool(0.5) {
+                conn.execute(format!("DELETE FROM t WHERE k='{key}'"))
+                    .unwrap();
+                expected.remove(key);
+            }
+
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            assert_text_pk_churn_model(&conn, &expected, seed, step);
+        }
+    }
+}
+
 #[test]
 fn test_mvcc_checkpoint_integrity_after_upsert_with_secondary_indexes() {
     let db = MvccTestDbNoConn::new_with_random_db();
