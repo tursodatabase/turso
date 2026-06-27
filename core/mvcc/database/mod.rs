@@ -2198,8 +2198,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     continue;
                 };
                 canonicalize_table_id(&mut committed_version);
+                let is_btree_resident_delete_marker =
+                    |version: &RowVersion| version.btree_resident && version.end().is_some();
                 let replaces_last = entry_versions.last().is_some_and(|last| {
                     last.row.id == committed_version.row.id
+                        && !is_btree_resident_delete_marker(last)
                         && matches!(
                             (&last.begin(), &committed_version.begin()),
                             (
@@ -2218,6 +2221,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 {
                     let same_row_and_begin = |existing: &RowVersion| {
                         existing.row.id == committed_version.row.id
+                            && !is_btree_resident_delete_marker(existing)
+                            && !is_btree_resident_delete_marker(&committed_version)
                             && matches!(
                                 (&existing.begin(), &committed_version.begin()),
                                 (
