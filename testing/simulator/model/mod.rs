@@ -558,6 +558,9 @@ impl Shadow for Query {
     fn shadow(&self, env: &mut ShadowTablesMut) -> Self::Result {
         // First check if we are not in a deferred transaction, if we are create a snapshot
         env.upgrade_transaction(self);
+        // Lazily pin the read snapshot of any attached database this query
+        // touches, matching turso's per-attached-database snapshot acquisition.
+        env.ensure_dbs_pinned(self);
 
         match self {
             Query::Create(create) => create.shadow(env),
