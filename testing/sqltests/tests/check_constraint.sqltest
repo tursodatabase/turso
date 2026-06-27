@@ -1908,3 +1908,37 @@ test check_constraint_integer_affinity_coercion_violation {
 expect error {
     CHECK constraint failed: val > 5
 }
+
+# Bug fix (#7646): DROP COLUMN rejected when a column-level CHECK on a surviving column references the dropped column
+@cross-check-integrity
+test check_constraint_drop_column_referenced_by_column_level_check {
+    CREATE TABLE t(a, b CHECK(b > a));
+    ALTER TABLE t DROP COLUMN a;
+}
+expect error {
+}
+
+# Dropping a column whose own column-level CHECK only references itself is allowed
+@cross-check-integrity
+test check_constraint_drop_column_with_own_column_level_check {
+    CREATE TABLE t(a INTEGER CHECK(a > 0), b);
+    INSERT INTO t VALUES(5, 1);
+    ALTER TABLE t DROP COLUMN a;
+    INSERT INTO t(b) VALUES(2);
+    SELECT b FROM t ORDER BY b;
+}
+expect {
+    1
+    2
+}
+
+# Dropping an unrelated column keeps and still enforces a CHECK on another column
+@cross-check-integrity
+test check_constraint_drop_unrelated_column_keeps_column_level_check {
+    CREATE TABLE t(a, b CHECK(b > 0));
+    INSERT INTO t VALUES(1, 5);
+    ALTER TABLE t DROP COLUMN a;
+    INSERT INTO t(b) VALUES(-1);
+}
+expect error {
+}

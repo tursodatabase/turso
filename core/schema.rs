@@ -2969,6 +2969,13 @@ impl CheckConstraint {
     pub fn sql(&self) -> String {
         format!("CHECK({})", self.expr)
     }
+
+    /// True if this is a column-level CHECK defined on `normalized_col`.
+    pub fn is_on_column(&self, normalized_col: &str) -> bool {
+        self.column
+            .as_ref()
+            .is_some_and(|col| normalize_ident(col) == normalized_col)
+    }
 }
 
 /// RAII wrapper that resets its inner value when cloned.

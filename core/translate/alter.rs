@@ -1022,27 +1022,21 @@ pub fn translate_alter_table(
                 }
             }
 
-            // Handle CHECK constraints:
-            // - Column-level CHECK constraints for the dropped column are silently removed
-            // - Table-level CHECK constraints referencing the dropped column cause an error
+            // Reject the drop if a CHECK that outlives it still references the
+            // dropped column (matches SQLite); the column's own CHECK is dropped with it.
             for check in &btree.check_constraints {
-                if check.column.is_some() {
-                    // Column-level constraint: will be removed below
+                if check.is_on_column(&col_normalized) {
                     continue;
                 }
-                // Table-level constraint: check if it references the dropped column
                 if check_expr_references_column(&check.expr, &col_normalized) {
                     return Err(LimboError::ParseError(format!(
                         "error in table {table_name} after drop column: no such column: {column_name}"
                     )));
                 }
             }
-            // Remove column-level CHECK constraints for the dropped column
-            btree.check_constraints.retain(|c| {
-                c.column
-                    .as_ref()
-                    .is_none_or(|col| normalize_ident(col) != normalize_ident(column_name))
-            });
+            btree
+                .check_constraints
+                .retain(|c| !c.is_on_column(&col_normalized));
 
             // Check if column is used in a foreign key constraint (child side)
             // SQLite does not allow dropping a column that is part of a FK constraint
