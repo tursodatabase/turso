@@ -7458,6 +7458,28 @@ fn abandon_statement_after_explicit_yields(
     }
 }
 
+fn abandon_statement_after_pauses(conn: &Arc<Connection>, sql: &str, target_pauses: usize) {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let mut pauses = 0;
+    while pauses < target_pauses {
+        match stmt.step().unwrap() {
+            crate::StepResult::IO => {
+                pauses += 1;
+                stmt._io().step().unwrap();
+                if pauses == target_pauses {
+                    break;
+                }
+            }
+            crate::StepResult::Yield => pauses += 1,
+            crate::StepResult::Row => {}
+            crate::StepResult::Done => {
+                panic!("{sql} finished before target pause {target_pauses}")
+            }
+            other => panic!("unexpected step result while abandoning {sql}: {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn test_mvcc_checkpoint_abandoned_delete_churn_preserves_index_integrity_after_reopen() {
     const CASES: &[(i64, usize)] = &[(600, 1), (600, 3), (768, 2)];
@@ -7507,6 +7529,97 @@ fn test_mvcc_checkpoint_abandoned_delete_churn_preserves_index_integrity_after_r
             scalar_count(&conn, "SELECT count(*) FROM t"),
             expected_count,
             "case {seed}: reopen changed abandoned-delete row count"
+        );
+        assert_integrity_ok(&conn);
+    }
+}
+
+#[test]
+fn test_mvcc_checkpoint_abandoned_large_commit_churn_preserves_index_integrity() {
+    const CASES: &[(i64, i64, usize)] = &[(1_500, 1_500, 9), (1_537, 769, 9)];
+
+    for (seed, &(row_count, target_id, target_pauses)) in CASES.iter().enumerate() {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        let mut conn = db.connect();
+
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("PRAGMA mvcc_gc_threshold = 1").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        for id in 1..=row_count {
+            conn.execute(format!("INSERT INTO t VALUES({id}, 'old{id}')"))
+                .unwrap();
+        }
+
+        abandon_statement_after_pauses(&conn, "COMMIT", target_pauses);
+        assert_eq!(
+            scalar_count(&conn, "SELECT count(*) FROM t"),
+            row_count,
+            "case {seed}: abandoned COMMIT did not reach post-durable state"
+        );
+
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute(format!("UPDATE t SET v = 'mid' WHERE id = {target_id}"))
+            .unwrap();
+        conn.execute(format!("DELETE FROM t WHERE id = {target_id}"))
+            .unwrap();
+        assert!(
+            get_rows(
+                &conn,
+                &format!("SELECT id, v FROM t WHERE id = {target_id}")
+            )
+            .is_empty(),
+            "case {seed}: target row remained visible before checkpoint"
+        );
+
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert!(
+            get_rows(
+                &conn,
+                &format!("SELECT id, v FROM t WHERE id = {target_id}")
+            )
+            .is_empty(),
+            "case {seed}: checkpoint resurrected target row by table lookup"
+        );
+        assert!(
+            get_rows(
+                &conn,
+                &format!("SELECT id, v FROM t INDEXED BY t_v WHERE v = 'old{target_id}'"),
+            )
+            .is_empty(),
+            "case {seed}: checkpoint resurrected target row by old index lookup"
+        );
+        assert_integrity_ok(&conn);
+
+        conn.close().unwrap();
+        drop(conn);
+        db.restart();
+        conn = db.connect();
+        conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+
+        assert!(
+            get_rows(
+                &conn,
+                &format!("SELECT id, v FROM t WHERE id = {target_id}")
+            )
+            .is_empty(),
+            "case {seed}: reopen resurrected target row by table lookup"
+        );
+        assert!(
+            get_rows(
+                &conn,
+                &format!("SELECT id, v FROM t INDEXED BY t_v WHERE v = 'old{target_id}'"),
+            )
+            .is_empty(),
+            "case {seed}: reopen resurrected target row by old index lookup"
         );
         assert_integrity_ok(&conn);
     }
