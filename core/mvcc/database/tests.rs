@@ -7433,6 +7433,85 @@ fn test_mvcc_checkpoint_reopen_text_pk_upsert_delete_removes_autoindex_entry() {
     assert_integrity_ok(&conn);
 }
 
+fn scalar_count(conn: &Arc<Connection>, sql: &str) -> i64 {
+    let rows = get_rows(conn, sql);
+    assert_eq!(rows.len(), 1, "count query returned rows: {rows:?}");
+    rows[0][0].as_int().unwrap()
+}
+
+fn abandon_statement_after_explicit_yields(
+    conn: &Arc<Connection>,
+    sql: &str,
+    target_yields: usize,
+) {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let mut explicit_yields = 0;
+    while explicit_yields < target_yields {
+        match stmt.step().unwrap() {
+            crate::StepResult::Yield => explicit_yields += 1,
+            crate::StepResult::Done => {
+                panic!("{sql} finished before target yield {target_yields}")
+            }
+            crate::StepResult::IO => panic!("unexpected IO while abandoning {sql}"),
+            other => panic!("unexpected step result while abandoning {sql}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_mvcc_checkpoint_abandoned_delete_churn_preserves_index_integrity_after_reopen() {
+    const CASES: &[(i64, usize)] = &[(600, 1), (600, 3), (768, 2)];
+
+    for (seed, &(row_count, target_yields)) in CASES.iter().enumerate() {
+        let mut db = MvccTestDbNoConn::new_with_random_db();
+        let mut conn = db.connect();
+
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x UNIQUE, y UNIQUE)")
+            .unwrap();
+        conn.execute("CREATE TABLE marker(id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        for id in 1..=row_count {
+            conn.execute(format!("INSERT INTO t VALUES({id},{id},{id})"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        abandon_statement_after_explicit_yields(&conn, "DELETE FROM t", target_yields);
+        let expected_count = scalar_count(&conn, "SELECT count(*) FROM t");
+        assert!(
+            expected_count == 0 || expected_count == row_count,
+            "case {seed}: abandoned DELETE left partial row count {expected_count}"
+        );
+
+        conn.execute(format!("INSERT INTO marker VALUES({})", seed + 1))
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert_eq!(
+            scalar_count(&conn, "SELECT count(*) FROM t"),
+            expected_count,
+            "case {seed}: checkpoint changed abandoned-delete row count"
+        );
+
+        conn.close().unwrap();
+        drop(conn);
+        db.restart();
+        conn = db.connect();
+        conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+
+        assert_eq!(
+            scalar_count(&conn, "SELECT count(*) FROM t"),
+            expected_count,
+            "case {seed}: reopen changed abandoned-delete row count"
+        );
+        assert_integrity_ok(&conn);
+    }
+}
+
 #[test]
 fn test_mvcc_checkpoint_integrity_after_upsert_with_secondary_indexes() {
     let db = MvccTestDbNoConn::new_with_random_db();
