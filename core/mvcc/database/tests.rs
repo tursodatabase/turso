@@ -7396,6 +7396,44 @@ fn test_mvcc_repeated_delete_after_replace_delete_checkpoint_is_noop() {
 }
 
 #[test]
+fn test_mvcc_checkpoint_reopen_text_pk_upsert_delete_removes_autoindex_entry() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut conn = db.connect();
+    conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+    conn.execute("CREATE TABLE t(k TEXT PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES('k1','orig')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES('k1','u1') ON CONFLICT(k) DO UPDATE SET v=excluded.v")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES('k1','u2') ON CONFLICT(k) DO UPDATE SET v=excluded.v")
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    conn.close().unwrap();
+    drop(conn);
+    db.restart();
+    conn = db.connect();
+    conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+    conn.execute("DELETE FROM t WHERE k='k1'").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    assert_eq!(
+        get_rows(&conn, "SELECT count(*) FROM t WHERE k='k1'"),
+        vec![vec![Value::from_i64(0)]]
+    );
+    assert!(get_rows(&conn, "SELECT quote(k), quote(v) FROM t").is_empty());
+    assert!(get_rows(
+        &conn,
+        "SELECT quote(k), quote(v) FROM t NOT INDEXED WHERE k='k1'"
+    )
+    .is_empty());
+    assert_integrity_ok(&conn);
+}
+
+#[test]
 fn test_mvcc_checkpoint_integrity_after_upsert_with_secondary_indexes() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
