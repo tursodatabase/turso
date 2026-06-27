@@ -88,6 +88,9 @@ RUN chmod 777 -R /opt/antithesis/test/v1
 RUN mkdir /opt/antithesis/catalog
 RUN ln -s /opt/antithesis/test/v1/bank-test/*.py /opt/antithesis/catalog
 
+# Empty unless this is a diff-targeted run; consumed by docker-entrypoint.sh.
+COPY testing/stress/targeted_coverage.json /opt/antithesis/targeted_coverage.json
+
 ENV RUST_BACKTRACE=1
 
 ENTRYPOINT ["/bin/docker-entrypoint.sh"]

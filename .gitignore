@@ -49,6 +49,8 @@ perf/mobibench/plot/uv.lock
 examples/dotnet/obj/
 
 # testing
+testing/stress/git.diff
+testing/stress/targeted_coverage.json
 testing/limbo_output.txt
 **/limbo_output.txt
 testing/*.log
