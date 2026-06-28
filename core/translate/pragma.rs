@@ -225,9 +225,9 @@ pub fn translate_pragma(
         return Ok(());
     }
 
-    let pragma = match PragmaName::from_str(name.name.as_str()) {
-        Ok(pragma) => pragma,
-        Err(_) => bail_parse_error!("Not a valid pragma name"),
+    let Ok(pragma) = PragmaName::from_str(name.name.as_str()) else {
+        // SQLite silently ignores unknown PRAGMA names.
+        return Ok(());
     };
 
     let database_id = resolver.resolve_database_id(name)?;

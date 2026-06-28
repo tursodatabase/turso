@@ -1,7 +1,6 @@
 use crate::common::{limbo_exec_rows, TempDatabase};
 use rusqlite::types::Value as RValue;
 #[cfg(not(target_vendor = "apple"))]
-use turso_core::LimboError;
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
@@ -275,15 +274,8 @@ fn test_pragma_fullfsync(db: TempDatabase) {
     conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
         .unwrap();
 
-    // On non-Apple platforms, fullfsync pragma should not exist
-    let result = conn.execute("PRAGMA fullfsync=1");
-    assert!(
-        matches!(
-            result,
-            Err(LimboError::ParseError(e)) if e.contains("Not a valid pragma name")
-        ),
-        "fullfsync pragma should not be available on non-Apple platforms"
-    );
+    // On non-Apple platforms, fullfsync is unknown and silently ignored (SQLite behavior).
+    conn.execute("PRAGMA fullfsync=1").unwrap();
 }
 
 #[turso_macros::test(mvcc)]
