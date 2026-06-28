@@ -45,15 +45,25 @@ def test_basic():
 
 
 def test_single_line_hunk():
-    diff = "--- a/x\n+++ b/x\n@@ -5 +7 @@\n-a\n+b\n"
+    diff = "--- a/x.rs\n+++ b/x.rs\n@@ -5 +7 @@\n-a\n+b\n"
     locs = squash(diff)["antithesis_targeted_coverage"]["locations"]
-    assert locs == [{"file": "x", "begin_line": 7, "end_line": 7}], locs
+    assert locs == [{"file": "x.rs", "begin_line": 7, "end_line": 7}], locs
 
 
 def test_added_line_starting_with_plus_is_not_a_header():
-    diff = "--- a/x\n+++ b/x\n@@ -1,1 +1,2 @@\n a\n+++ not a header\n"
+    diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,2 @@\n a\n+++ not a header\n"
     locs = squash(diff)["antithesis_targeted_coverage"]["locations"]
-    assert locs == [{"file": "x", "begin_line": 1, "end_line": 2}], locs
+    assert locs == [{"file": "x.rs", "begin_line": 1, "end_line": 2}], locs
+
+
+def test_non_rust_files_are_excluded():
+    diff = (
+        "--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,1 +1,2 @@\n a\n+b\n"
+        "--- a/x.snap\n+++ b/x.snap\n@@ -1,1 +1,2 @@\n a\n+b\n"
+        "--- a/core/y.rs\n+++ b/core/y.rs\n@@ -1,1 +1,2 @@\n a\n+b\n"
+    )
+    locs = squash(diff)["antithesis_targeted_coverage"]["locations"]
+    assert locs == [{"file": "core/y.rs", "begin_line": 1, "end_line": 2}], locs
 
 
 def test_empty():
@@ -64,5 +74,6 @@ if __name__ == "__main__":
     test_basic()
     test_single_line_hunk()
     test_added_line_starting_with_plus_is_not_a_header()
+    test_non_rust_files_are_excluded()
     test_empty()
     print("ok")

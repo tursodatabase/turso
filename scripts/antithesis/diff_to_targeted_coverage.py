@@ -9,7 +9,10 @@ uses to focus the fuzzer on a slice of the code:
         {"file": "core/foo.rs", "begin_line": 10, "end_line": 13}, ...
     ]}}
 
-Deleted files and pure-deletion hunks have no new-side lines and are skipped.
+Only Rust sources are emitted: the coverage-instrumented binary baked into the
+workload (turso_stress) is pure Rust, so line ranges in lockfiles, snapshots,
+YAML, TypeScript, etc. cannot map to anything the fuzzer can target. Deleted
+files and pure-deletion hunks have no new-side lines and are skipped.
 """
 import argparse
 import json
@@ -17,6 +20,8 @@ import re
 import sys
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+SOURCE_SUFFIX = ".rs"
 
 
 def squash(diff_text):
@@ -55,6 +60,8 @@ def squash(diff_text):
             old_left = int(m.group(2)) if m.group(2) is not None else 1
             new_left = int(m.group(4)) if m.group(4) is not None else 1
             if skip or current_file is None or new_left == 0:
+                continue
+            if not current_file.endswith(SOURCE_SUFFIX):
                 continue
             begin = int(m.group(3))
             locations.append(
