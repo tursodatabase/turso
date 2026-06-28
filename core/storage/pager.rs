@@ -3158,6 +3158,12 @@ impl Pager {
             return Ok((page, c));
         }
 
+        // Lock the page before issuing the disk read, exactly as the no-WAL
+        // branch above does. `begin_read_disk_page` never locks, so without
+        // this the page would be in flight while `!loaded && !locked`: a state
+        // `PageCache::get` interprets as an aborted read and silently evicts,
+        // even though a disk read is actively writing into its buffer.
+        page.set_locked();
         let c =
             self.begin_read_disk_page(page_idx as usize, page.clone(), allow_empty_read, &io_ctx)?;
         Ok((page, c))
@@ -3203,11 +3209,27 @@ impl Pager {
                         "attempted to read page but got different page",
                         { "expected_page": page_idx, "actual_page": page.get().id }
                     );
+                    if !page.is_loaded() {
+                        // The page is cache-resident but its read is still in
+                        // flight: `read_page` publishes a page into the shared
+                        // cache (via `cache_insert` below) *before* its disk
+                        // read completes, and `PageCache::get` deliberately
+                        // hands out locked-but-unloaded in-flight pages. We have
+                        // no completion to surface on this path (the disk-read
+                        // completion was consumed by the original caller and the
+                        // `pending_reads` entry has already been removed), so
+                        // returning `Done((page, None))` would hand the caller a
+                        // locked, unloaded page with nothing to wait on: a torn
+                        // / uninitialized read, or a concurrent writer filling
+                        // the buffer underneath the reader.
+                        drop(page_cache);
+                        io_yield_one!(crate::Completion::new_yield());
+                    }
                     return Ok(IOResult::Done((page, None)));
                 }
             }
 
-            tracing::debug!("read_page_nonblock(page_idx = {page_idx}) = reading page from disk");
+            tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
             let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
             self.pending_reads.write().insert(
                 page_idx,
@@ -6158,6 +6180,61 @@ mod ptrmap_tests {
             pager.pending_reads.read().get(&target_idx).is_none(),
             "pending_reads entry must be cleared once read_page_nonblock returns Done"
         );
+    }
+
+    /// Concurrency contract: a page can be cache-resident while its disk read
+    /// is still in flight (locked, not loaded) — `read_page` inserts into the
+    /// shared cache before the read completes, and `PageCache::get` hands out
+    /// such in-flight pages. A second reader hitting the cache-hit fast path
+    /// must NOT receive that unloaded page with `None` (no completion to wait
+    /// on); it must yield and re-enter until the read completes. Otherwise the
+    /// caller reads a torn / uninitialized buffer, or races a writer filling
+    /// the buffer underneath it.
+    #[test]
+    fn read_page_nonblock_inflight_cache_hit_yields_not_done() {
+        let pager = test_pager_setup(4096, 10);
+
+        let target_idx: i64 = 9999;
+        assert!(
+            pager.cache_get(target_idx as usize).unwrap().is_none(),
+            "test precondition: target page must not be in cache"
+        );
+
+        // Synthesize an in-flight read that has already been published to the
+        // shared cache: locked (a read is outstanding) but not loaded (the
+        // buffer hasn't been filled yet). This is exactly the state a page is
+        // in between `cache_insert` and the disk-read completion firing.
+        let inflight: PageRef = Arc::new(Page::new(target_idx));
+        inflight.set_locked();
+        assert!(!inflight.is_loaded());
+        pager
+            .page_cache
+            .write()
+            .insert(PageCacheKey::new(target_idx as usize), inflight.clone())
+            .unwrap();
+
+        // The fast path finds the page in cache but must refuse to return it
+        // without a completion, because it is not yet loaded.
+        match pager.read_page(target_idx).unwrap() {
+            IOResult::IO(_) => {}
+            IOResult::Done((page, c)) => panic!(
+                "read_page handed out an in-flight (locked, unloaded) page on the \
+                 cache-hit fast path: loaded={}, completion={}",
+                page.is_loaded(),
+                c.is_some()
+            ),
+        }
+
+        // Once the read completes (page becomes loaded), the same cache-hit
+        // fast path returns Done with no completion, as before.
+        inflight.set_loaded();
+        match pager.read_page(target_idx).unwrap() {
+            IOResult::Done((page, c)) => {
+                assert!(Arc::ptr_eq(&page, &inflight));
+                assert!(c.is_none(), "loaded cache hit must not return a completion");
+            }
+            IOResult::IO(_) => panic!("loaded cache hit must not yield"),
+        }
     }
 }
 
