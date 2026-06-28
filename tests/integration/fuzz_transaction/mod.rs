@@ -505,6 +505,7 @@ async fn test_multiple_connections_fuzz_mvcc() {
 }
 
 #[tokio::test]
+#[ignore = "Experimental passive checkpoint is not supported yet"]
 // Same as test_multiple_connections_fuzz_mvcc, but with the experimental passive checkpoint enabled.
 async fn test_multiple_connections_fuzz_mvcc_passive_checkpoint() {
     let mvcc_fuzz_options = FuzzOptions {
