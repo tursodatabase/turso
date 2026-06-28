@@ -26,7 +26,7 @@ turso_ext.workspace = true
 turso_sdk_kit = { path = "../sdk-kit" }
 turso = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["collation"] }
 tempfile = { workspace = true }
 log = "0.4.22"
 assert_cmd = "^2"

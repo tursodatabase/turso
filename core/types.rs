@@ -2167,28 +2167,31 @@ where
     std::cmp::Ordering::Equal
 }
 
-pub fn compare_immutable_iter<V, E1, E2>(
+pub fn compare_iter_with<V1, V2, E1, E2, F>(
     mut l: E1,
     mut r: E2,
     column_info: &[KeyInfo],
+    mut compare_fn: F,
 ) -> Result<std::cmp::Ordering>
 where
-    V: AsValueRef,
-    E1: Iterator<Item = Result<V>>,
-    E2: Iterator<Item = Result<V>>,
+    V1: AsValueRef,
+    V2: AsValueRef,
+    E1: Iterator<Item = Result<V1>>,
+    E2: Iterator<Item = Result<V2>>,
+    F: FnMut(V1, V2, CollationSeq) -> Result<std::cmp::Ordering>,
 {
     for col_info in column_info.iter() {
         let l = match l.next() {
-            Some(v) => v,
+            Some(v) => v?,
             None => break,
         };
         let r = match r.next() {
-            Some(v) => v,
+            Some(v) => v?,
             None => break,
         };
         let column_order = col_info.sort_order;
         let collation = col_info.collation;
-        let cmp = compare_immutable_single(l?, r?, collation);
+        let cmp = compare_fn(l, r, collation)?;
         if !cmp.is_eq() {
             return match column_order {
                 SortOrder::Asc => Ok(cmp),
@@ -2197,6 +2200,21 @@ where
         }
     }
     Ok(std::cmp::Ordering::Equal)
+}
+
+pub fn compare_immutable_iter<V, E1, E2>(
+    l: E1,
+    r: E2,
+    column_info: &[KeyInfo],
+) -> Result<std::cmp::Ordering>
+where
+    V: AsValueRef,
+    E1: Iterator<Item = Result<V>>,
+    E2: Iterator<Item = Result<V>>,
+{
+    compare_iter_with(l, r, column_info, |l, r, collation| {
+        Ok(compare_immutable_single(l, r, collation))
+    })
 }
 
 pub fn compare_immutable_single<V1, V2>(l: V1, r: V2, collation: CollationSeq) -> std::cmp::Ordering

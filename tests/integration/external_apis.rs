@@ -963,3 +963,47 @@ fn custom_collations_cover_dotnet_create_collation_cases(
 
     Ok(())
 }
+
+#[turso_macros::test]
+#[serial]
+fn custom_collation_group_by_matches_sqlite(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let collation_name = "custom_nocase";
+    let query = format!(
+        "SELECT MIN(value), COUNT(*) \
+         FROM t \
+         GROUP BY value COLLATE {collation_name} \
+         ORDER BY MIN(value)"
+    );
+
+    let limbo_conn = tmp_db.connect_limbo();
+    limbo_conn.register_external_collation(
+        collation_name.to_string(),
+        0,
+        dotnet_nocase_collation,
+        None,
+    );
+    limbo_conn.execute("CREATE TABLE t(value TEXT)")?;
+    limbo_conn.execute("INSERT INTO t VALUES ('ALPHA'), ('alpha'), ('beta')")?;
+    let limbo_rows: Vec<(String, i64)> = limbo_conn.exec_rows(&query);
+    limbo_conn.unregister_external_collation(collation_name);
+
+    let sqlite_conn = rusqlite::Connection::open_in_memory()?;
+    sqlite_conn.create_collation(collation_name, |left, right| {
+        left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
+    })?;
+    sqlite_conn.execute("CREATE TABLE t(value TEXT)", ())?;
+    sqlite_conn.execute("INSERT INTO t VALUES ('ALPHA'), ('alpha'), ('beta')", ())?;
+    let mut stmt = sqlite_conn.prepare(&query)?;
+    let sqlite_rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<(String, i64)>>>()?;
+
+    assert_eq!(
+        sqlite_rows,
+        vec![("ALPHA".to_string(), 2), ("beta".to_string(), 1)]
+    );
+    assert_eq!(limbo_rows, sqlite_rows);
+    Ok(())
+}
