@@ -1249,6 +1249,29 @@ impl WalCoordination for InProcessWalCoordination {
     fn cache_frame(&self, page_id: u64, frame_id: u64) {
         let shared = self.shared.read();
         let mut frame_cache = shared.runtime.frame_cache.lock();
+        // Frame-slot reuse / append-position rewind guard. Within a WAL
+        // generation frames are appended with strictly increasing numbers, so
+        // a `frame_id` that does not exceed the current high-water means the
+        // slots from `frame_id` upward are being overwritten: by frames from a
+        // prior uncommitted/aborted append that was never rolled back out of
+        // the cache, or by another connection reusing the slots after a
+        // rewind. Drop every stale `page -> frame` mapping for those slots
+        // before recording the new one, otherwise `find_frame` can return a
+        // frame slot that now physically holds a different page (corruption).
+        // (Per-page frame lists are kept ascending, so popping the tail
+        // `>= frame_id` removes exactly the overwritten suffix.)
+        let high_water = shared
+            .runtime
+            .frame_cache_high_water
+            .load(Ordering::Acquire);
+        if frame_id <= high_water {
+            frame_cache.retain(|_page_id, frames| {
+                while frames.last().is_some_and(|&frame| frame >= frame_id) {
+                    frames.pop();
+                }
+                !frames.is_empty()
+            });
+        }
         match frame_cache.get_mut(&page_id) {
             Some(frames) => {
                 frames.push(frame_id);
@@ -1257,6 +1280,10 @@ impl WalCoordination for InProcessWalCoordination {
                 frame_cache.insert(page_id, vec![frame_id]);
             }
         }
+        shared
+            .runtime
+            .frame_cache_high_water
+            .store(frame_id, Ordering::Release);
     }
 
     fn rollback_cache(&self, max_frame: u64) {
@@ -1268,6 +1295,19 @@ impl WalCoordination for InProcessWalCoordination {
             }
             !frames.is_empty()
         });
+        // Keep the high-water consistent with the truncation so a subsequent
+        // append at `max_frame + 1` is not misread as a rewind.
+        if shared
+            .runtime
+            .frame_cache_high_water
+            .load(Ordering::Acquire)
+            > max_frame
+        {
+            shared
+                .runtime
+                .frame_cache_high_water
+                .store(max_frame, Ordering::Release);
+        }
     }
 
     fn should_checkpoint_on_close(&self) -> bool {
@@ -1442,6 +1482,10 @@ impl ShmWalCoordination {
         Self::install_local_snapshot(&mut shared, snapshot, true);
         shared.metadata.initialized.store(false, Ordering::Release);
         shared.runtime.frame_cache.lock().clear();
+        shared
+            .runtime
+            .frame_cache_high_water
+            .store(0, Ordering::Release);
         shared.runtime.overflow_fallback_coverage.lock().clear();
     }
 
@@ -1733,6 +1777,10 @@ impl ShmWalCoordination {
             Self::install_local_snapshot(&mut shared, restarted, true);
             shared.metadata.initialized.store(false, Ordering::Release);
             shared.runtime.frame_cache.lock().clear();
+            shared
+                .runtime
+                .frame_cache_high_water
+                .store(0, Ordering::Release);
             shared.runtime.overflow_fallback_coverage.lock().clear();
             shared.runtime.read_locks[0].set_value_exclusive(0);
             shared.runtime.read_locks[1].set_value_exclusive(0);
@@ -2677,6 +2725,15 @@ pub struct WalSharedRuntime {
     // we don't need WAL's index file. So we can do stuff like this without shared memory.
     // TODO: this will need refactoring because this is incredible memory inefficient.
     pub frame_cache: Arc<SpinLock<FxHashMap<u64, Vec<u64>>>>,
+    /// Highest frame number currently recorded in `frame_cache` for the active
+    /// WAL generation. Used to detect frame-slot reuse / append-position
+    /// rewinds: within a generation frames are appended with strictly
+    /// increasing numbers, so caching a frame that is not above this watermark
+    /// means the slots from that frame upward are being overwritten and any
+    /// stale `page -> frame` mappings for them must be purged (otherwise
+    /// `find_frame` can return a frame slot that now holds a different page).
+    /// Only read/written while holding the `frame_cache` lock.
+    pub frame_cache_high_water: AtomicU64,
     pub file: Option<Arc<dyn File>>,
     /// Read locks advertise the maximum WAL frame a reader may access.
     /// Slot 0 is special, when it is held (shared) the reader bypasses the WAL and uses the main DB file.
@@ -5405,6 +5462,7 @@ impl WalFileShared {
             },
             runtime: WalSharedRuntime {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
@@ -5480,6 +5538,7 @@ impl WalFileShared {
             },
             runtime: WalSharedRuntime {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache_high_water: AtomicU64::new(0),
                 file: None,
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
@@ -5521,6 +5580,7 @@ impl WalFileShared {
             },
             runtime: WalSharedRuntime {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
@@ -5571,6 +5631,9 @@ impl WalFileShared {
         }
 
         self.runtime.frame_cache.lock().clear();
+        self.runtime
+            .frame_cache_high_water
+            .store(0, Ordering::Release);
         // read-marks
         self.runtime.read_locks[0].set_value_exclusive(0);
         self.runtime.read_locks[1].set_value_exclusive(0);
@@ -6583,9 +6646,11 @@ pub mod test {
         let (shared, _wal) = make_test_wal();
         let coordination = make_test_coordination(&shared);
 
+        // Frames are cached in WAL append order (globally ascending): page 7 at
+        // frame 2, page 9 at frame 4, page 7 again at frame 5.
         coordination.cache_frame(7, 2);
-        coordination.cache_frame(7, 5);
         coordination.cache_frame(9, 4);
+        coordination.cache_frame(7, 5);
 
         assert_eq!(coordination.find_frame(7, 0, 5, None), Some(5));
         assert_eq!(coordination.iter_latest_frames(0, 5), vec![(7, 5), (9, 4)]);
@@ -6598,6 +6663,50 @@ pub mod test {
             shared.read().runtime.frame_cache.lock().get(&7),
             Some(&vec![2])
         );
+    }
+
+    /// Regression test for WAL frame-index aliasing corruption: when a WAL
+    /// frame slot is reused for a different page (the append position rewinds
+    /// to an already-cached frame — e.g. an aborted/uncommitted append's slots
+    /// being overwritten, or a different connection reusing the slots), the
+    /// stale `page -> frame` mapping for that slot must be purged. Otherwise
+    /// `find_frame` can hand a page a frame number whose slot now physically
+    /// holds a different page, and the reader gets the wrong page's bytes
+    /// (surfacing as "non-index page" / "Invalid page type" / corruption).
+    #[test]
+    fn cache_frame_purges_stale_mapping_on_frame_slot_reuse() {
+        let (shared, _wal) = make_test_wal();
+        let coordination = make_test_coordination(&shared);
+
+        // Ascending append: page 7 @3, page 9 @4, page 7 @5.
+        coordination.cache_frame(7, 3);
+        coordination.cache_frame(9, 4);
+        coordination.cache_frame(7, 5);
+        assert_eq!(coordination.find_frame(9, 0, 10, None), Some(4));
+
+        // The append position rewinds and frame slots 4 and 5 are overwritten,
+        // now belonging to page 11 (@4) and page 13 (@5). The earlier owners of
+        // those slots (page 9 @4, page 7 @5) must no longer be reachable.
+        coordination.cache_frame(11, 4);
+        coordination.cache_frame(13, 5);
+
+        assert_eq!(
+            coordination.find_frame(9, 0, 10, None),
+            None,
+            "stale page 9 -> frame 4 mapping must be purged once slot 4 is reused"
+        );
+        assert_eq!(
+            coordination.find_frame(11, 0, 10, None),
+            Some(4),
+            "page 11 now owns frame slot 4"
+        );
+        assert_eq!(
+            coordination.find_frame(13, 0, 10, None),
+            Some(5),
+            "page 13 now owns frame slot 5"
+        );
+        // Page 7's still-valid lower frame (3) survives; its stale 5 is gone.
+        assert_eq!(coordination.find_frame(7, 0, 10, None), Some(3));
     }
 
     #[test]
