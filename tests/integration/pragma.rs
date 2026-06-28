@@ -1,6 +1,5 @@
 use crate::common::{limbo_exec_rows, TempDatabase};
 use rusqlite::types::Value as RValue;
-#[cfg(not(target_vendor = "apple"))]
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
