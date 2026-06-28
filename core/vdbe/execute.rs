@@ -13821,8 +13821,6 @@ pub enum OpIntegrityCheckState {
     CheckingBTreeStructure {
         errors: Vec<IntegrityCheckError>,
         current_root_idx: usize,
-        /// Index into `dropped_roots`, processed after `roots`. Each is walked only if its page is
-        /// not already accounted for (reused/freed); see Insn::IntegrityCk::dropped_roots.
         current_dropped_idx: usize,
         state: IntegrityCheckState,
     },
@@ -13852,12 +13850,7 @@ pub fn op_integrity_check(
     } else {
         program.get_pager_from_database_index(db)?
     };
-    // PASSIVE-ONLY: source the physical header fields (freelist_trunk_page, freelist_pages,
-    // database_size) from the pager's live page 1 instead of the MVCC snapshot header, so they
-    // match the pages walked below at the same read frame. The MVCC header lags the pager's
-    // freelist across the off-lock checkpoint's commits, which would otherwise make the freelist
-    // walk read a freed-and-reused page as a trunk. Other modes keep the MVCC header path; passing
-    // `None` here routes `with_header` through `pager.with_header`.
+    // Passive MVCC: read page-1 freelist fields from the pager; the MVCC header can lag.
     let passive = mv_store.is_some()
         && program
             .connection
@@ -13918,11 +13911,10 @@ pub fn op_integrity_check(
 
             if errors.len() >= *max_errors {
                 errors.truncate(*max_errors);
-                let message = format_integrity_check_result(errors);
-                match message {
+                match format_integrity_check_result(errors) {
                     Some(msg) => state.registers[*message_register].set_text(Text::new(msg))?,
                     None => state.registers[*message_register].set_null(),
-                };
+                }
                 state.active_op_state.clear();
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
@@ -13934,11 +13926,6 @@ pub fn op_integrity_check(
                 return Ok(InsnFunctionStepResult::Step);
             }
 
-            // Dropped roots are walked after every live root (and the freelist) has populated
-            // `page_reference`, so a dropped page that was freed and reused — as another btree's
-            // child or a freelist entry — is already present and skipped here rather than
-            // double-referenced. A genuinely-orphaned dropped page (a drop not yet checkpointed)
-            // is absent, so it is still walked to account for its pages.
             while *current_dropped_idx < dropped_roots.len() {
                 let dropped_root = dropped_roots[*current_dropped_idx];
                 *current_dropped_idx += 1;
@@ -13994,11 +13981,10 @@ pub fn op_integrity_check(
             }
 
             errors.truncate(*max_errors);
-            let message = format_integrity_check_result(errors);
-            match message {
+            match format_integrity_check_result(errors) {
                 Some(msg) => state.registers[*message_register].set_text(Text::new(msg))?,
                 None => state.registers[*message_register].set_null(),
-            };
+            }
             state.active_op_state.clear();
             state.pc += 1;
         }

@@ -1690,14 +1690,13 @@ pub enum Insn {
     /// otherwise writes a textual error summary.
     /// Higher-level semantic checks (row/index consistency, constraints, etc.)
     /// are emitted as normal VDBE bytecode in translation.
+    ///
+    /// In passive MVCC mode, `dropped_roots` lists checkpointed objects dropped before the next
+    /// checkpoint; execute walks them after live roots and skips pages already accounted for.
     IntegrityCk {
         db: usize,
         max_errors: usize,
         roots: Vec<i64>,
-        /// Roots of dropped objects whose physical pages may not yet be freed. Walked tolerantly:
-        /// a page already accounted for (reused as another btree's child, or on the freelist) is
-        /// skipped rather than reported as doubly-referenced. Only genuinely-orphaned pages (a
-        /// drop not yet checkpointed) are walked, to avoid false "never used" reports.
         dropped_roots: Vec<i64>,
         message_register: usize,
     },

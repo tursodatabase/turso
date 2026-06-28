@@ -16554,6 +16554,7 @@ fn test_create_type_visible_to_second_connection_under_mvcc() {
     conn2.close().unwrap();
 }
 
+/// Dropped roots that are still live roots must not be walked twice.
 #[test]
 fn test_integrity_check_ignores_dropped_root_that_is_live_after_recovery() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
@@ -16587,22 +16588,14 @@ fn test_integrity_check_ignores_dropped_root_that_is_live_after_recovery() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
-/// A passive checkpoint can free a dropped object's root page and the btree can then reuse that
-/// page as another object's child before the stale `dropped_root_pages` entry clears (a schema
-/// reparse can even resurrect it). `integrity_check` must walk such dropped roots tolerantly: a
-/// page already accounted for (reused as a child, or on the freelist) is not leaked, so it must
-/// not be reported as `referenced multiple times`. Regression for the whopper false positive
-/// `Page N referenced multiple times (references=[P, 0])`.
+/// Passive mode: a stale dropped-root entry for a page already walked as a btree child must not
+/// report double-reference.
 #[test]
 fn test_integrity_check_tolerates_dropped_root_reused_as_btree_child() {
-    // The tolerant dropped-root walk is passive-only (other modes keep the strict walk), so this
-    // regression must run under a passive db.
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
-    // Enough rows (with a wide value) that t's btree grows past a single page, so the highest
-    // allocated page is a leaf *child* of t — referenced by its parent in t's btree.
     for i in 0..1000 {
         conn.execute(format!(
             "INSERT INTO t VALUES ({i}, 'wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww')"
@@ -16611,8 +16604,6 @@ fn test_integrity_check_tolerates_dropped_root_reused_as_btree_child() {
     }
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
-    // The last allocated page belongs to t's btree (only sqlite_schema + t exist, no freelist),
-    // so it is referenced as a child. Marking it dropped is exactly the freed+reused condition.
     let page_count = get_rows(&conn, "PRAGMA page_count")[0][0].as_int().unwrap();
     let root_page = get_rows(
         &conn,
@@ -16621,8 +16612,6 @@ fn test_integrity_check_tolerates_dropped_root_reused_as_btree_child() {
         .as_int()
         .unwrap();
     assert!(page_count > root_page, "t should span multiple pages");
-    // Inject into the shared db.schema, which is what integrity_check reads for the main MVCC db
-    // (the per-connection `with_schema_mut` copy is not consulted there).
     {
         let mut schema_guard = conn.db.schema.lock();
         let schema = std::sync::Arc::make_mut(&mut schema_guard);
@@ -16676,12 +16665,7 @@ fn test_begin_tx_schema_generation_gate() {
         .rollback_tx(tx, pager, &db.conn, crate::MAIN_DB_ID);
 }
 
-/// PASSIVE-ONLY: the off-lock checkpoint mutates the pager's page-1 freelist on every commit, but
-/// the MVCC `global_header` (and the per-tx header snapshot captured at begin) only catches up at
-/// publish — so a reader can see a freelist head pointing at a page that has since been reused as a
-/// live btree leaf. `integrity_check` must read the physical freelist/db-size from the pager's live
-/// page 1 (consistent with the pages it walks), not the stale MVCC header. Regression for the
-/// whopper false positive `Page N referenced multiple times [0,P]` + `Freelist: invalid page number`.
+/// Passive mode: freelist fields must come from the pager's live page 1, not a stale MVCC header.
 #[test]
 fn test_integrity_check_passive_reads_freelist_from_pager_not_stale_mvcc_header() {
     let db = MvccTestDbNoConn::new_with_random_db_passive();
@@ -16698,9 +16682,6 @@ fn test_integrity_check_passive_reads_freelist_from_pager_not_stale_mvcc_header(
     let page_count = get_rows(&conn, "PRAGMA page_count")[0][0].as_int().unwrap();
     assert!(page_count > 2, "t should span multiple pages");
 
-    // Simulate the lag: point the MVCC global_header's freelist head at the last page (an in-use
-    // btree leaf) while the pager's real page 1 has an empty freelist. A passive integrity_check
-    // must use the pager's live freelist and stay "ok" rather than walking a live page as a trunk.
     {
         let mv_guard = conn.db.get_mv_store();
         let mv = mv_guard.as_ref().expect("mvcc store");
@@ -19058,17 +19039,12 @@ fn mvcc_bug_repro_dropped_committed_delete_rewrites_all_tombstone_txids() {
         .expect("later public writer must not conflict on a stale removed tombstone TxID");
 }
 
-/// Reproducer for passive-checkpoint review finding #2 (fixed): concurrent `DROP TABLE` of an
-/// already-checkpointed table during a parked passive checkpoint must not trip
-/// `has_pending_root_publication` — that set tracks this checkpoint's own staged work, not
-/// unrelated live schema mutations.
+/// Concurrent DROP of a checkpointed table during a parked passive checkpoint must not panic.
 #[test]
 fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointed_table() {
     use crate::StepResult;
     let _ = tracing_subscriber::fmt::try_init();
     let db = MvccTestDbNoConn::new_with_random_db_passive();
-    // `keep` must be CHECKPOINTED (positive root) before the DROP: DROP only records
-    // positive root pages in `dropped_root_pages` (execute.rs:11507).
     let conn_keep = db.connect();
     conn_keep
         .execute("CREATE TABLE keep(x INTEGER PRIMARY KEY)")
@@ -19087,8 +19063,6 @@ fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointe
         keep_root > 0,
         "keep must be checkpointed (positive root) for the DROP to record it, got {keep_root}"
     );
-    // `conn_c` drives the parked checkpoint. A separate `other` table gives the checkpoint a
-    // write set without touching `keep`. threshold=0 forces a checkpoint on the next commit.
     let conn_c = db.connect();
     conn_c
         .execute("CREATE TABLE other(y INTEGER PRIMARY KEY)")
@@ -19099,7 +19073,6 @@ fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointe
     let injector =
         FixedYieldInjector::new([CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point()]);
     conn_c.set_yield_injector(Some(injector.clone()));
-    // This commit's post-commit auto-checkpoint is the one we park.
     let mut checkpoint = conn_c.prepare("INSERT INTO other VALUES (1)").unwrap();
     let pager_io = conn_c.pager.load().io.clone();
     let step_to_next_yield = |checkpoint: &mut crate::Statement, expect_remaining: usize| {
@@ -19121,16 +19094,10 @@ fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointe
         step_to_next_yield(&mut checkpoint, 0),
         "passive checkpoint must yield at AfterDurableBoundaryAdvanced (publish window done)"
     );
-    // At the park point the checkpoint has published all of ITS work and released the lock,
-    // so the live shared set is clean — proving the panic below is a FALSE positive, not the
-    // checkpoint's own residue.
     assert!(
         conn_c.db.schema.lock().dropped_root_pages.is_empty(),
         "parked checkpoint should have published its own pages; live set must be clean"
     );
-    // Concurrent committed DROP of the checkpointed table repopulates the live shared
-    // `dropped_root_pages` off-lock. (threshold=0 makes this commit attempt its own
-    // checkpoint, but the gate is held by the parked one, so it no-ops without clearing.)
     let conn_d = db.connect();
     conn_d.execute("DROP TABLE keep").unwrap();
     assert!(
@@ -19142,8 +19109,6 @@ fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointe
             .contains(&keep_root),
         "concurrent DROP must record keep's root in the live shared dropped_root_pages"
     );
-    // Resume the parked checkpoint — must complete without tripping a false-positive
-    // publication assert on the concurrent DROP's dropped_root_pages entry.
     for _ in 0..200_000 {
         match checkpoint.step().unwrap() {
             StepResult::Done => break,
