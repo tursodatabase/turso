@@ -11,7 +11,8 @@ use std::sync::Arc;
 use sha1::{Digest, Sha1};
 use std::num::NonZero;
 use turso_core::{
-    Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, StepResult, Value, IO,
+    Database, DatabaseOpts, EncryptionKey, EncryptionOpts, LimboError, OpenFlags, PlatformIO,
+    StepResult, Value, IO,
 };
 
 pub use encoder::encode_value;
@@ -26,6 +27,8 @@ pub struct DbHashOptions {
     pub without_schema: bool,
     /// If true, print each value to stderr as it's hashed.
     pub debug_trace: bool,
+    /// Encryption options for opening encrypted databases.
+    pub encryption: Option<EncryptionOpts>,
 }
 
 #[derive(Debug)]
@@ -60,14 +63,24 @@ pub fn hash_database_with_database_opts(
         "`schema_only` and `without_schema` cannot both be true"
     );
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+    let database_opts = if options.encryption.is_some() {
+        database_opts.with_encryption(true)
+    } else {
+        database_opts
+    };
+    let encryption_key = options
+        .encryption
+        .as_ref()
+        .map(|opts| EncryptionKey::from_hex_string(&opts.hexkey))
+        .transpose()?;
     let db = Database::open_file_with_flags(
         io.clone(),
         path,
         OpenFlags::default(),
         database_opts,
-        None,
+        options.encryption.clone(),
     )?;
-    let conn = db.connect()?;
+    let conn = db.connect_with_encryption(encryption_key)?;
 
     let mut hasher = Sha1::new();
     let mut tables_hashed = 0;

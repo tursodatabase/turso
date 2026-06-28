@@ -17,4 +17,7 @@ turso-dbhash --schema-only database.db
 
 # Hash only data (no schema)
 turso-dbhash --without-schema database.db
+
+# Hash an encrypted database; both encryption flags are required
+turso-dbhash --cipher aegis256 --hexkey "<hex-key>" database.db
 ```
