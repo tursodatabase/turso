@@ -900,8 +900,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let mut main_session = WalSession::new(main_conn.clone());
         main_session.begin()?;
 
-        // we need to make sure that updates from the session will not be commited accidentally in the middle of the pull process
-        // in order to achieve that we mark current session as "nested program" which eliminates possibility that data will be actually commited without our explicit command
+        // we need to make sure that updates from the session will not be committed accidentally in the middle of the pull process
+        // in order to achieve that we mark current session as "nested program" which eliminates possibility that data will be actually committed without our explicit command
         //
         // the reason to not use auto-commit is because it has its own rules which resets the flag in case of statement reset - which we do under the hood sometimes
         // that's why nested executed was chosen instead of auto-commit=false mode
@@ -988,7 +988,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         // Phase 5: collect local changes
         // note, that collecting chanages from main_conn will yield zero rows as we already rolled back everything from it
-        // but since we didn't commited these changes yet - we can just collect changes from another connection
+        // but since we didn't committed these changes yet - we can just collect changes from another connection
         let iterate_opts = DatabaseChangesIteratorOpts {
             first_change_id: last_change_id.map(|x| x + 1),
             mode: DatabaseChangesIteratorMode::Apply,

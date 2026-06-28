@@ -1407,7 +1407,7 @@ pub fn test_reopen_database_wal_restart() {
 /// Test for a bug found by whopper
 /// It is slightly fragile and can be removed if it will be unclear how to maintain it
 ///
-/// Here, we simulate BusySnapshot condition when during IO in between of begin_read_tx and begin_write_tx, another connection commited some change
+/// Here, we simulate BusySnapshot condition when during IO in between of begin_read_tx and begin_write_tx, another connection committed some change
 pub fn test_busy_snapshot_immediate() {
     let _ = env_logger::try_init();
     let db_path = tempfile::NamedTempFile::new().unwrap();
@@ -1460,7 +1460,7 @@ pub fn test_busy_snapshot_immediate() {
 /// Test for a bug found by whopper
 /// It is slightly fragile and can be removed if it will be unclear how to maintain it
 ///
-/// Here, we simulate BusySnapshot condition when transaction upgraded in the middle, but since its started another connection commited changes
+/// Here, we simulate BusySnapshot condition when transaction upgraded in the middle, but since its started another connection committed changes
 pub fn test_busy_snapshot_txn_upgrade() {
     let _ = env_logger::try_init();
     let db_path = tempfile::NamedTempFile::new().unwrap();

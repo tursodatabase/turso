@@ -375,7 +375,7 @@ do_test alter2-7.5 {
 
 #-----------------------------------------------------------------------
 # Test that UPDATE trigger tables work with default values, and that when
-# a row is updated the default values are correctly transfered to the 
+# a row is updated the default values are correctly transferred to the 
 # new row.
 # 
 ifcapable trigger {
@@ -406,7 +406,7 @@ ifcapable trigger {
 
 #-----------------------------------------------------------------------
 # Test that DELETE trigger tables work with default values, and that when
-# a row is updated the default values are correctly transfered to the 
+# a row is updated the default values are correctly transferred to the 
 # new row.
 # 
 ifcapable trigger {

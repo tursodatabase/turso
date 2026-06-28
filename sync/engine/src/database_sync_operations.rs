@@ -589,7 +589,7 @@ pub async fn wal_pull_to_file_legacy<IO: SyncEngineIo, Ctx>(
     };
 
     tracing::info!(
-        "wal_pull: generation={generation}, frame={start_frame}, last_offset={last_offset}, commited_len={committed_len}"
+        "wal_pull: generation={generation}, frame={start_frame}, last_offset={last_offset}, committed_len={committed_len}"
     );
     let c = Completion::new_trunc(move |result| {
         let Ok(rc) = result else {

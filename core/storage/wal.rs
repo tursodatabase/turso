@@ -354,7 +354,7 @@ impl TursoRwLock {
 
     /// upgrade read lock to the write lock
     /// only possible if there is exactly single reader at the moment
-    /// return true if lock was upgraded succesfully - and false otherwise
+    /// return true if lock was upgraded successfully - and false otherwise
     #[inline]
     pub fn upgrade(&self) -> bool {
         let cur = self.0.load(Ordering::Acquire);

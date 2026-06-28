@@ -220,7 +220,7 @@ impl BufferPool {
         // Tries to atomically (guarenteed by the OnceLock) initialize the page size for the inner pool.
         // If it succeeds, we now have to initialize the arenas.
         // If the initialization fails, this means the arenas have already been initialized by a previous thread
-        // This avoids a potential TOCTOU race, where 2 threads could try to initalize the arena at the same time
+        // This avoids a potential TOCTOU race, where 2 threads could try to initialize the arena at the same time
         // after checking the `db_page_size`
         if inner.db_page_size.set(page_size).is_ok() {
             inner.init_arenas()?;
