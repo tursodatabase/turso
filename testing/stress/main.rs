@@ -20,7 +20,7 @@ use turso_stress::sync::Arc;
 use turso_stress::sync::AsyncBarrier as Barrier;
 use turso_stress::sync::AsyncMutex as Mutex;
 
-use crate::conn::StressDb;
+use crate::conn::{StressConn, StressDb};
 use crate::counter::StressCounter;
 use crate::logging::Tracer;
 use crate::progress::ProgressBars;
@@ -237,6 +237,30 @@ impl ArbitrarySchema {
             })
             .collect()
     }
+
+    /// Emit a secondary index on a non-primary-key column of each table.
+    ///
+    /// Secondary indexes are load-bearing for the WAL frame-index (`frame_cache`)
+    /// aliasing corruption this stress test guards against: their b-tree growth
+    /// is what pulls a just-freed page back out of the freelist as a *different*
+    /// page type while the WAL frame slot is being reused, so without secondary
+    /// indexes the reuse path is hit far less often. The random schema only
+    /// creates indexes incidentally (via `UNIQUE`), so add one explicitly.
+    pub fn index_ddl(&self) -> Vec<String> {
+        self.tables
+            .iter()
+            .filter_map(|table| {
+                let col = table.columns.iter().find(|col| {
+                    !col.constraints.contains(&Constraint::PrimaryKey)
+                        && !col.constraints.contains(&Constraint::Unique)
+                })?;
+                Some(format!(
+                    "CREATE INDEX IF NOT EXISTS idx_{}_{} ON {} ({});",
+                    table.name, col.name, table.name, col.name
+                ))
+            })
+            .collect()
+    }
 }
 
 fn data_type_to_sql(data_type: &DataType) -> &'static str {
@@ -400,6 +424,55 @@ fn generate_random_statement(rng: &mut ThreadRng, schema: &ArbitrarySchema) -> S
         1 => generate_update(rng, table),
         _ => generate_delete(rng, table),
     }
+}
+
+/// Focused regression coverage for the WAL frame-index (`frame_cache`) aliasing
+/// corruption: hold a read snapshot open while the other threads keep writing.
+///
+/// In WAL mode a held read transaction pins a read-mark, which blocks WAL
+/// checkpoint/restart. That keeps the WAL growing within a single generation,
+/// so frame slots reused across a writer's append-position rewind (e.g. a
+/// rolled-back transaction) must not leave a stale `page -> frame` mapping in
+/// the shared frame index — otherwise `find_frame` hands a page a frame slot
+/// that now physically holds a different page and the scan reads the wrong
+/// page's bytes (surfacing as a `Corrupt` error / integrity-check failure).
+/// The full-table scans below materialize every row, following overflow chains,
+/// which is exactly the read pattern that tripped over the reused slots.
+async fn hold_read_snapshot_scan(
+    conn: &StressConn,
+    schema: &ArbitrarySchema,
+    rng: &mut ThreadRng,
+    thread: &ThreadId,
+) {
+    // Read-only transaction: holds the snapshot open across every awaited scan
+    // below, during which the other threads commit and roll back writes.
+    if conn.execute("BEGIN", ()).await.is_err() {
+        return;
+    }
+    let scans = 2 + (rng.get_random() % 4) as usize;
+    for _ in 0..scans {
+        let table = &schema.tables[rng.get_random() as usize % schema.tables.len()];
+        let sql = format!("SELECT * FROM {}", table.name);
+        match conn.query(&sql, ()).await {
+            Ok(mut rows) => loop {
+                match rows.next().await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(turso::Error::Corrupt(e)) => {
+                        turso_macros::turso_assert_unreachable!("corrupt error during read-snapshot scan", { "thread": thread, "error": e, "sql": sql });
+                    }
+                    Err(_) => break,
+                }
+            },
+            Err(turso::Error::Corrupt(e)) => {
+                turso_macros::turso_assert_unreachable!("corrupt error opening read-snapshot scan", { "thread": thread, "error": e, "sql": sql });
+            }
+            Err(_) => {}
+        }
+    }
+    // Best-effort: release the snapshot. If the connection somehow isn't in a
+    // transaction this is a harmless no-op error.
+    let _ = conn.execute("COMMIT", ()).await;
 }
 
 /// Convert SQLite type string to DataType
@@ -581,7 +654,8 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         gen_schema(&mut main_rng, opts.tables)
     };
 
-    let ddl_statements = schema.to_sql();
+    let mut ddl_statements = schema.to_sql();
+    ddl_statements.extend(schema.index_ddl());
     let schema = Arc::new(schema);
 
     let mut stop = false;
@@ -709,6 +783,22 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     if gen_bool(&mut rng, 0.02) {
                         // Reconnect to the database
                         conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
+                    }
+
+                    // Focused coverage: sometimes act as a long-lived reader,
+                    // holding a read snapshot open (which blocks WAL
+                    // checkpoint/restart) while the other threads keep writing
+                    // and rolling back. This is the workload that exposes the
+                    // WAL frame-index (`frame_cache`) aliasing corruption — see
+                    // `hold_read_snapshot_scan`.
+                    if gen_bool(&mut rng, 0.05) {
+                        hold_read_snapshot_scan(&conn, &schema_for_task, &mut rng, &thread).await;
+                        progress_bar.tick();
+                        iteration_count_this_batch += 1;
+                        if reopen_requested.load(Ordering::Acquire) {
+                            break;
+                        }
+                        continue;
                     }
 
                     let tx = match opts.tx_mode {
