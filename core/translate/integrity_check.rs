@@ -165,8 +165,7 @@ fn translate_integrity_check_impl(
     let mut live_root_pages = HashSet::default();
 
     // integrity_check verifies the physical file, so a placeholder (negative) root for an
-    // object a passive checkpoint has since materialized must be resolved to its real page —
-    // otherwise we skip it and report its live btree page as orphaned ("never used").
+    // object a passive checkpoint has since materialized must be resolved to its real page.
     let mv_store_guard = connection.db.get_mv_store();
     let resolve_root = |root_page: i64| -> i64 {
         match mv_store_guard.as_ref() {
@@ -195,28 +194,19 @@ fn translate_integrity_check_impl(
         }
     }
 
-    // PASSIVE-ONLY: walk dropped roots separately and tolerantly (see
-    // Insn::IntegrityCk::dropped_roots). Under a passive checkpoint a dropped page may already be
-    // freed and reused as another btree's child by the time integrity_check runs, so treating it
-    // as a hard root double-references it. In every other mode keep the original behavior: walk
-    // dropped roots as hard roots in the main `roots` list.
     let passive =
         mv_store_guard.is_some() && connection.experimental_mvcc_passive_checkpoint_enabled();
-    let dropped_roots: Vec<i64> = if passive {
-        schema
-            .dropped_root_pages
-            .iter()
-            .filter(|d| !live_root_pages.contains(d))
-            .copied()
-            .collect()
-    } else {
-        for &dropped_root in &schema.dropped_root_pages {
-            if !live_root_pages.contains(&dropped_root) {
-                root_pages.push(dropped_root);
-            }
+    let mut dropped_roots = Vec::new();
+    for &dropped_root in &schema.dropped_root_pages {
+        if live_root_pages.contains(&dropped_root) {
+            continue;
         }
-        Vec::new()
-    };
+        if passive {
+            dropped_roots.push(dropped_root);
+        } else {
+            root_pages.push(dropped_root);
+        }
+    }
 
     let remaining_errors_reg = program.alloc_register();
     program.emit_int((max_errors.saturating_sub(1)) as i64, remaining_errors_reg);
