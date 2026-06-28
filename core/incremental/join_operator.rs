@@ -546,7 +546,7 @@ impl JoinOperator {
 
 fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
     let record = ImmutableRecordRef::from_bin_record(blob);
-    let all_values: Vec<Value> = record.get_values_owned()?;
+    let all_values = record.get_values_owned()?;
 
     if all_values.is_empty() {
         return Err(crate::LimboError::InternalError(
@@ -565,6 +565,8 @@ fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
     };
 
     // Rest are the row values
+    // TODO: std boundary conversion; adjust once incremental uses the
+    // allocator with fallible allocations everywhere.
     let values = all_values[1..].to_vec();
 
     Ok(HashableRow::new(rowid, values))

@@ -45,6 +45,9 @@ perf/mobibench/plot/uv.lock
 # Javascript
 **/node_modules/
 
+# .NET build outputs
+examples/dotnet/obj/
+
 # testing
 testing/limbo_output.txt
 **/limbo_output.txt

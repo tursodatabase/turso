@@ -78,6 +78,7 @@ WORKDIR /app
 COPY ./testing/antithesis/bank-test/*.py /opt/antithesis/test/v1/bank-test/
 COPY ./testing/antithesis/stress-composer/*.py /opt/antithesis/test/v1/stress-composer/
 COPY ./testing/antithesis/stress /opt/antithesis/test/v1/stress
+COPY ./testing/antithesis/stress-memory_yield /opt/antithesis/test/v1/stress-memory_yield
 COPY ./testing/antithesis/stress-io_uring /opt/antithesis/test/v1/stress-io_uring
 COPY ./testing/antithesis/stress-mvcc /opt/antithesis/test/v1/stress-mvcc
 COPY ./testing/antithesis/stress-io_uring-mvcc /opt/antithesis/test/v1/stress-io_uring-mvcc

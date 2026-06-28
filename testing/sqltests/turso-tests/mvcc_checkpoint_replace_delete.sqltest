@@ -1,0 +1,94 @@
+@database :memory:
+
+test mvcc-checkpoint-insert-or-replace-then-delete-indexed-row {
+    PRAGMA journal_mode=mvcc;
+    PRAGMA mvcc_gc_threshold=1;
+
+    CREATE TABLE t_insert_replace(id INTEGER PRIMARY KEY, a, b);
+    CREATE INDEX t_insert_replace_a ON t_insert_replace(a);
+
+    INSERT INTO t_insert_replace VALUES
+        (1,10,100),(2,20,200),(3,30,300),(4,40,400),(5,50,500);
+
+    PRAGMA wal_checkpoint(TRUNCATE);
+
+    INSERT OR REPLACE INTO t_insert_replace(id,a,b) VALUES(5,25,325);
+    DELETE FROM t_insert_replace WHERE id=5;
+
+    PRAGMA wal_checkpoint(TRUNCATE);
+    PRAGMA integrity_check;
+    SELECT id,a,b FROM t_insert_replace ORDER BY id;
+}
+expect {
+    mvcc
+    0|0|0
+    0|0|0
+    ok
+    1|10|100
+    2|20|200
+    3|30|300
+    4|40|400
+}
+
+test mvcc-checkpoint-update-or-replace-then-delete-multi-index-row {
+    PRAGMA journal_mode=mvcc;
+    PRAGMA mvcc_gc_threshold=1;
+
+    CREATE TABLE t_update_replace(id INTEGER PRIMARY KEY, a, b);
+    CREATE INDEX t_update_replace_a ON t_update_replace(a);
+    CREATE INDEX t_update_replace_b ON t_update_replace(b);
+
+    INSERT INTO t_update_replace VALUES
+        (1,10,100),(2,20,200),(3,30,300),(4,40,400),(5,50,500);
+
+    PRAGMA wal_checkpoint(TRUNCATE);
+
+    UPDATE OR REPLACE t_update_replace SET a=25,b=325 WHERE id=5;
+    DELETE FROM t_update_replace WHERE id=5;
+
+    PRAGMA wal_checkpoint(TRUNCATE);
+    PRAGMA integrity_check;
+    SELECT id,a,b FROM t_update_replace ORDER BY id;
+}
+expect {
+    mvcc
+    0|0|0
+    0|0|0
+    ok
+    1|10|100
+    2|20|200
+    3|30|300
+    4|40|400
+}
+
+test mvcc-delete-after-replace-delete-checkpoint-is-noop {
+    PRAGMA journal_mode=mvcc;
+    PRAGMA mvcc_gc_threshold=1;
+
+    CREATE TABLE t_repeated_delete(id INTEGER PRIMARY KEY, a, b);
+    CREATE INDEX t_repeated_delete_a ON t_repeated_delete(a);
+
+    INSERT INTO t_repeated_delete VALUES
+        (1,10,100),(2,20,200),(3,30,300),(4,40,400),(5,50,500);
+
+    PRAGMA wal_checkpoint(TRUNCATE);
+
+    INSERT OR REPLACE INTO t_repeated_delete(id,a,b) VALUES(5,25,325);
+    DELETE FROM t_repeated_delete WHERE id=5;
+
+    PRAGMA wal_checkpoint(TRUNCATE);
+
+    DELETE FROM t_repeated_delete WHERE id=5;
+    PRAGMA integrity_check;
+    SELECT id,a,b FROM t_repeated_delete ORDER BY id;
+}
+expect {
+    mvcc
+    0|0|0
+    0|0|0
+    ok
+    1|10|100
+    2|20|200
+    3|30|300
+    4|40|400
+}

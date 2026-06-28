@@ -1,7 +1,7 @@
 use crate::sync::Arc;
 
 use crate::storage::sqlite3_ondisk::Version;
-use crate::{mvcc, LimboError, MvStore, OpenFlags, Result, IO};
+use crate::{alloc::DynAllocator, mvcc, LimboError, MvStore, OpenFlags, Result, IO};
 
 #[derive(
     Debug,
@@ -68,6 +68,7 @@ pub fn open_mv_store(
     flags: OpenFlags,
     durable_storage: Option<Arc<dyn mvcc::persistent_storage::DurableStorage>>,
     encryption_ctx: Option<crate::storage::encryption::EncryptionContext>,
+    allocator: DynAllocator,
 ) -> Result<Arc<MvStore>> {
     // `encryption_ctx` encrypts database pages, but a custom DurableStorage
     // writes the MVCC log itself. If the database is encrypted, the custom
@@ -98,5 +99,9 @@ pub fn open_mv_store(
             ))
         };
 
-    Ok(Arc::new(MvStore::new(mvcc::MvccClock::new(), storage)))
+    Ok(Arc::new(MvStore::new_in(
+        mvcc::MvccClock::new(),
+        storage,
+        allocator,
+    )?))
 }

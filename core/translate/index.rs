@@ -1,5 +1,6 @@
+use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
-use crate::function::{Deterministic, Func, ScalarFunc};
+use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
 use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
@@ -19,9 +20,12 @@ use crate::translate::{
 };
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
 use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
-use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID};
+use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
-    schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
+    schema::{
+        is_deterministic_schema_function_call, BTreeTable, Index, IndexColumn, PseudoCursorType,
+        SchemaObjectType,
+    },
     storage::pager::CreateBTreeFlags,
     util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
     vdbe::{
@@ -204,7 +208,7 @@ pub fn translate_create_index(
         name: idx_name.clone(),
         table_name: tbl.name.clone(),
         root_page: 0, //  we dont have access till its created, after we parse the schema table
-        columns: columns.clone(),
+        columns,
         unique,
         ephemeral: false,
         has_rowid: tbl.has_rowid,
@@ -225,49 +229,13 @@ pub fn translate_create_index(
         );
     }
 
-    // Allocate the necessary cursors:
-    //
-    // 1. sqlite_schema_cursor_id - sqlite_schema table
-    // 2. index_cursor_id         - new index cursor
-    // 3. table_cursor_id         - table we are creating the index on
-    // 4. sorter_cursor_id        - sorter
-    // 5. pseudo_cursor_id        - pseudo table to store the sorted index values
     let sqlite_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
-    let table_ref = program.table_reference_counter.next();
-    let index_cursor_id = program.alloc_cursor_index(None, &idx)?;
-    let table_cursor_id = program.alloc_cursor_id_keyed(
-        CursorKey::table(table_ref),
-        CursorType::BTreeTable(tbl.clone()),
-    );
-    let sorter_cursor_id = program.alloc_cursor_id(CursorType::Sorter);
-    let pseudo_cursor_id = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
-        column_count: tbl.columns().len(),
-    }));
-
-    let mut table_references = TableReferences::new(
-        vec![JoinedTable {
-            op: Operation::Scan(Scan::BTreeTable {
-                iter_dir: IterationDirection::Forwards,
-                index: None,
-            }),
-            table: Table::BTree(tbl.clone()),
-            identifier: tbl_name.clone(),
-            internal_id: table_ref,
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            column_use_counts: Vec::new(),
-            expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
-            indexed: None,
-        }],
-        vec![],
-    );
-    let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver);
 
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
+    let index_cursor_id = program.alloc_cursor_index(None, &idx)?;
     if idx.index_method.is_some() && !idx.is_backing_btree_index() {
         program.emit_insn(Insn::IndexMethodCreate {
             db: database_id,
@@ -302,276 +270,16 @@ pub fn translate_create_index(
         Some(sql),
     )?;
 
-    if index_method
-        .as_ref()
-        .is_some_and(|m| !m.definition().backing_btree)
-    {
-        // open the table we are creating the index on for reading
-        program.emit_insn(Insn::OpenRead {
-            cursor_id: table_cursor_id,
-            root_page: tbl.root_page,
-            db: database_id,
-        });
-
-        // Open the index btree we created for writing to insert the
-        // newly sorted index records.
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: index_cursor_id,
-            root_page: RegisterOrLiteral::Register(root_page_reg),
-            db: database_id,
-        });
-
-        let loop_start_label = program.allocate_label();
-        let loop_end_label = program.allocate_label();
-        program.emit_insn(Insn::Rewind {
-            cursor_id: table_cursor_id,
-            pc_if_empty: loop_end_label,
-        });
-        program.preassign_label_to_next_insn(loop_start_label);
-
-        // Loop start:
-        // Collect index values into start_reg..rowid_reg
-        // emit MakeRecord (index key + rowid) into record_reg.
-        //
-        // Then insert the record into the sorter
-        let mut skip_row_label = None;
-        if let Some(where_clause) = where_clause {
-            let label = program.allocate_label();
-            let condition_true_label = program.allocate_label();
-            translate_condition_expr(
-                program,
-                &table_references,
-                &where_clause,
-                ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_false: label,
-                    jump_target_when_true: condition_true_label,
-                    jump_target_when_null: label,
-                },
-                resolver,
-            )?;
-            program.preassign_label_to_next_insn(condition_true_label);
-            skip_row_label = Some(label);
-        }
-
-        let start_reg = program.alloc_registers(columns.len() + 1);
-        for (i, col) in columns.iter().enumerate() {
-            emit_index_column_value_from_cursor(
-                program,
-                resolver,
-                &mut table_references,
-                table_cursor_id,
-                &tbl,
-                col,
-                start_reg + i,
-            )?;
-        }
-        let rowid_reg = start_reg + columns.len();
-        program.emit_insn(Insn::RowId {
-            cursor_id: table_cursor_id,
-            dest: rowid_reg,
-        });
-        let record_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(start_reg),
-            count: to_u16(columns.len() + 1),
-            dest_reg: to_u16(record_reg),
-            index_name: Some(idx_name.clone()),
-            affinity_str: None,
-        });
-
-        // insert new index record
-        program.emit_insn(Insn::IdxInsert {
-            cursor_id: index_cursor_id,
-            record_reg,
-            unpacked_start: Some(start_reg),
-            unpacked_count: Some((columns.len() + 1) as u16),
-            flags: IdxInsertFlags::new().use_seek(false),
-        });
-
-        if let Some(skip_row_label) = skip_row_label {
-            program.preassign_label_to_next_insn(skip_row_label);
-        }
-        program.emit_insn(Insn::Next {
-            cursor_id: table_cursor_id,
-            pc_if_next: loop_start_label,
-        });
-        program.preassign_label_to_next_insn(loop_end_label);
-    } else if index_method.is_none() {
-        // determine the order, collation, and nulls ordering of the columns in the index for the sorter
-        let order_collations_nulls = idx
-            .columns
-            .iter()
-            .map(|c| (c.order, c.collation, None))
-            .collect();
-        // open the sorter and the pseudo table
-        program.emit_insn(Insn::SorterOpen {
-            cursor_id: sorter_cursor_id,
-            columns: columns.len(),
-            order_collations_nulls,
-            comparators: vec![],
-        });
-        let content_reg = program.alloc_register();
-        program.emit_insn(Insn::OpenPseudo {
-            cursor_id: pseudo_cursor_id,
-            content_reg,
-            num_fields: columns.len() + 1,
-        });
-
-        // open the table we are creating the index on for reading
-        program.emit_insn(Insn::OpenRead {
-            cursor_id: table_cursor_id,
-            root_page: tbl.root_page,
-            db: database_id,
-        });
-
-        let loop_start_label = program.allocate_label();
-        let loop_end_label = program.allocate_label();
-        program.emit_insn(Insn::Rewind {
-            cursor_id: table_cursor_id,
-            pc_if_empty: loop_end_label,
-        });
-        program.preassign_label_to_next_insn(loop_start_label);
-
-        // Loop start:
-        // Collect index values into start_reg..rowid_reg
-        // emit MakeRecord (index key + rowid) into record_reg.
-        //
-        // Then insert the record into the sorter
-        let mut skip_row_label = None;
-        if let Some(where_clause) = where_clause {
-            let label = program.allocate_label();
-            let condition_true_label = program.allocate_label();
-            translate_condition_expr(
-                program,
-                &table_references,
-                &where_clause,
-                ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_false: label,
-                    jump_target_when_true: condition_true_label,
-                    jump_target_when_null: label,
-                },
-                resolver,
-            )?;
-            program.preassign_label_to_next_insn(condition_true_label);
-            skip_row_label = Some(label);
-        }
-
-        let start_reg = program.alloc_registers(columns.len() + 1);
-        for (i, col) in columns.iter().enumerate() {
-            emit_index_column_value_from_cursor(
-                program,
-                resolver,
-                &mut table_references,
-                table_cursor_id,
-                &tbl,
-                col,
-                start_reg + i,
-            )?;
-        }
-        let rowid_reg = start_reg + columns.len();
-        program.emit_insn(Insn::RowId {
-            cursor_id: table_cursor_id,
-            dest: rowid_reg,
-        });
-        let record_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(start_reg),
-            count: to_u16(columns.len() + 1),
-            dest_reg: to_u16(record_reg),
-            index_name: Some(idx_name.clone()),
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::SorterInsert {
-            cursor_id: sorter_cursor_id,
-            record_reg,
-        });
-
-        if let Some(skip_row_label) = skip_row_label {
-            program.preassign_label_to_next_insn(skip_row_label);
-        }
-        program.emit_insn(Insn::Next {
-            cursor_id: table_cursor_id,
-            pc_if_next: loop_start_label,
-        });
-        program.preassign_label_to_next_insn(loop_end_label);
-
-        // Open the index btree we created for writing to insert the
-        // newly sorted index records.
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: index_cursor_id,
-            root_page: RegisterOrLiteral::Register(root_page_reg),
-            db: database_id,
-        });
-
-        let sorted_loop_start = program.allocate_label();
-        let sorted_loop_end = program.allocate_label();
-
-        // Sort the index records in the sorter
-        program.emit_insn(Insn::SorterSort {
-            cursor_id: sorter_cursor_id,
-            pc_if_empty: sorted_loop_end,
-        });
-
-        let sorted_record_reg = program.alloc_register();
-
-        if unique {
-            // Since the records to be inserted are sorted, we can compare prev with current and if they are equal,
-            // we fall through to Halt with a unique constraint violation error.
-            let goto_label = program.allocate_label();
-            let label_after_sorter_compare = program.allocate_label();
-            program.preassign_label_to_next_insn(goto_label);
-            program.emit_insn(Insn::Goto {
-                target_pc: label_after_sorter_compare,
-            });
-            program.preassign_label_to_next_insn(sorted_loop_start);
-            program.emit_insn(Insn::SorterCompare {
-                cursor_id: sorter_cursor_id,
-                sorted_record_reg,
-                num_regs: columns.len(),
-                pc_when_nonequal: goto_label,
-            });
-            program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT_UNIQUE,
-                description: format_unique_violation_desc(tbl_name.as_str(), &idx),
-                on_error: None,
-                description_reg: None,
-            });
-            program.preassign_label_to_next_insn(label_after_sorter_compare);
-        } else {
-            program.preassign_label_to_next_insn(sorted_loop_start);
-        }
-
-        program.emit_insn(Insn::SorterData {
-            pseudo_cursor: pseudo_cursor_id,
-            cursor_id: sorter_cursor_id,
-            dest_reg: sorted_record_reg,
-        });
-
-        // seek to the end of the index btree to position the cursor for appending
-        program.emit_insn(Insn::SeekEnd {
-            cursor_id: index_cursor_id,
-        });
-        // insert new index record
-        program.emit_insn(Insn::IdxInsert {
-            cursor_id: index_cursor_id,
-            record_reg: sorted_record_reg,
-            unpacked_start: None, // TODO: optimize with these to avoid decoding record twice
-            unpacked_count: None,
-            flags: IdxInsertFlags::new().use_seek(false),
-        });
-        program.emit_insn(Insn::SorterNext {
-            cursor_id: sorter_cursor_id,
-            pc_if_next: sorted_loop_start,
-        });
-        program.preassign_label_to_next_insn(sorted_loop_end);
-    }
-
-    // End of the outer loop
-    //
-    // Keep schema table open to emit ParseSchema, close the other cursors.
-    program.close_cursors(&[sorter_cursor_id, table_cursor_id, index_cursor_id]);
+    emit_refill_index(
+        program,
+        resolver,
+        database_id,
+        &tbl,
+        &idx,
+        index_cursor_id,
+        RegisterOrLiteral::Register(root_page_reg),
+        None,
+    )?;
 
     let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
@@ -595,10 +303,583 @@ pub fn translate_create_index(
     Ok(())
 }
 
+/// Emits the bytecode that rebuilds `idx` from a full scan of `tbl`.
+///
+/// `CREATE INDEX` calls this with a newly allocated root page. `REINDEX` calls it with
+/// `clear_existing_root` so the existing b-tree is emptied only after all replacement
+/// records have been collected and sorted. Statement journaling is therefore required
+/// around REINDEX callers so any later refill error restores the original index b-tree.
+#[allow(clippy::too_many_arguments)]
+fn emit_refill_index(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    tbl: &Arc<BTreeTable>,
+    idx: &Arc<Index>,
+    index_cursor_id: usize,
+    index_root_page: RegisterOrLiteral<i64>,
+    clear_existing_root: Option<i64>,
+) -> crate::Result<()> {
+    let table_ref = program.table_reference_counter.next();
+    let table_cursor_id = program.alloc_cursor_id_keyed(
+        CursorKey::table(table_ref),
+        CursorType::BTreeTable(tbl.clone()),
+    );
+    let sorter_cursor_id = program.alloc_cursor_id(CursorType::Sorter);
+    let pseudo_cursor_id = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+        column_count: tbl.columns().len(),
+    }));
+    let columns = &idx.columns;
+    let tbl_name = normalize_ident(tbl.name.as_str());
+
+    let mut table_references = TableReferences::new(
+        vec![JoinedTable {
+            op: Operation::Scan(Scan::BTreeTable {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            }),
+            table: Table::BTree(tbl.clone()),
+            identifier: tbl_name.clone(),
+            internal_id: table_ref,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id,
+            indexed: None,
+        }],
+        vec![],
+    );
+    let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver);
+
+    if idx
+        .index_method
+        .as_ref()
+        .is_some_and(|m| !m.definition().backing_btree)
+    {
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: table_cursor_id,
+            root_page: tbl.root_page,
+            db: database_id,
+        });
+
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: index_cursor_id,
+            root_page: index_root_page,
+            db: database_id,
+        });
+
+        let loop_start_label = program.allocate_label();
+        let loop_end_label = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: table_cursor_id,
+            pc_if_empty: loop_end_label,
+        });
+        program.preassign_label_to_next_insn(loop_start_label);
+
+        let mut skip_row_label = None;
+        if let Some(where_clause) = where_clause {
+            let label = program.allocate_label();
+            let condition_true_label = program.allocate_label();
+            translate_condition_expr(
+                program,
+                &table_references,
+                &where_clause,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_false: label,
+                    jump_target_when_true: condition_true_label,
+                    jump_target_when_null: label,
+                },
+                resolver,
+            )?;
+            program.preassign_label_to_next_insn(condition_true_label);
+            skip_row_label = Some(label);
+        }
+
+        let start_reg = program.alloc_registers(columns.len() + 1);
+        for (i, col) in columns.iter().enumerate() {
+            emit_index_column_value_from_cursor(
+                program,
+                resolver,
+                &mut table_references,
+                table_cursor_id,
+                tbl,
+                col,
+                start_reg + i,
+            )?;
+        }
+        let rowid_reg = start_reg + columns.len();
+        program.emit_insn(Insn::RowId {
+            cursor_id: table_cursor_id,
+            dest: rowid_reg,
+        });
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u16(start_reg),
+            count: to_u16(columns.len() + 1),
+            dest_reg: to_u16(record_reg),
+            index_name: Some(idx.name.clone()),
+            affinity_str: None,
+        });
+
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: index_cursor_id,
+            record_reg,
+            unpacked_start: Some(start_reg),
+            unpacked_count: Some((columns.len() + 1) as u16),
+            flags: IdxInsertFlags::new().use_seek(false),
+        });
+
+        if let Some(skip_row_label) = skip_row_label {
+            program.preassign_label_to_next_insn(skip_row_label);
+        }
+        program.emit_insn(Insn::Next {
+            cursor_id: table_cursor_id,
+            pc_if_next: loop_start_label,
+        });
+        program.preassign_label_to_next_insn(loop_end_label);
+    } else {
+        let order_collations_nulls = idx
+            .columns
+            .iter()
+            .map(|c| (c.order, c.collation, None))
+            .try_collect()
+            .expect("TODO: fallible allocations");
+        program.emit_insn(Insn::SorterOpen {
+            cursor_id: sorter_cursor_id,
+            columns: columns.len(),
+            order_collations_nulls,
+            comparators: crate::alloc::vec![],
+        });
+        let content_reg = program.alloc_register();
+        program.emit_insn(Insn::OpenPseudo {
+            cursor_id: pseudo_cursor_id,
+            content_reg,
+            num_fields: columns.len() + 1,
+        });
+
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: table_cursor_id,
+            root_page: tbl.root_page,
+            db: database_id,
+        });
+
+        let loop_start_label = program.allocate_label();
+        let loop_end_label = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: table_cursor_id,
+            pc_if_empty: loop_end_label,
+        });
+        program.preassign_label_to_next_insn(loop_start_label);
+
+        let mut skip_row_label = None;
+        if let Some(where_clause) = where_clause {
+            let label = program.allocate_label();
+            let condition_true_label = program.allocate_label();
+            translate_condition_expr(
+                program,
+                &table_references,
+                &where_clause,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_false: label,
+                    jump_target_when_true: condition_true_label,
+                    jump_target_when_null: label,
+                },
+                resolver,
+            )?;
+            program.preassign_label_to_next_insn(condition_true_label);
+            skip_row_label = Some(label);
+        }
+
+        let start_reg = program.alloc_registers(columns.len() + 1);
+        for (i, col) in columns.iter().enumerate() {
+            emit_index_column_value_from_cursor(
+                program,
+                resolver,
+                &mut table_references,
+                table_cursor_id,
+                tbl,
+                col,
+                start_reg + i,
+            )?;
+        }
+        let rowid_reg = start_reg + columns.len();
+        program.emit_insn(Insn::RowId {
+            cursor_id: table_cursor_id,
+            dest: rowid_reg,
+        });
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u16(start_reg),
+            count: to_u16(columns.len() + 1),
+            dest_reg: to_u16(record_reg),
+            index_name: Some(idx.name.clone()),
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::SorterInsert {
+            cursor_id: sorter_cursor_id,
+            record_reg,
+        });
+
+        if let Some(skip_row_label) = skip_row_label {
+            program.preassign_label_to_next_insn(skip_row_label);
+        }
+        program.emit_insn(Insn::Next {
+            cursor_id: table_cursor_id,
+            pc_if_next: loop_start_label,
+        });
+        program.preassign_label_to_next_insn(loop_end_label);
+
+        if let Some(root) = clear_existing_root {
+            program.emit_insn(Insn::ClearBtree {
+                db: database_id,
+                root,
+            });
+        }
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: index_cursor_id,
+            root_page: index_root_page,
+            db: database_id,
+        });
+
+        let sorted_loop_start = program.allocate_label();
+        let sorted_loop_end = program.allocate_label();
+
+        program.emit_insn(Insn::SorterSort {
+            cursor_id: sorter_cursor_id,
+            pc_if_empty: sorted_loop_end,
+        });
+
+        let sorted_record_reg = program.alloc_register();
+
+        if idx.unique {
+            let goto_label = program.allocate_label();
+            let label_after_sorter_compare = program.allocate_label();
+            program.preassign_label_to_next_insn(goto_label);
+            program.emit_insn(Insn::Goto {
+                target_pc: label_after_sorter_compare,
+            });
+            program.preassign_label_to_next_insn(sorted_loop_start);
+            program.emit_insn(Insn::SorterCompare {
+                cursor_id: sorter_cursor_id,
+                sorted_record_reg,
+                num_regs: columns.len(),
+                pc_when_nonequal: goto_label,
+            });
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_UNIQUE,
+                description: format_unique_violation_desc(tbl_name.as_str(), idx),
+                on_error: None,
+                description_reg: None,
+            });
+            program.preassign_label_to_next_insn(label_after_sorter_compare);
+        } else {
+            program.preassign_label_to_next_insn(sorted_loop_start);
+        }
+
+        program.emit_insn(Insn::SorterData {
+            pseudo_cursor: pseudo_cursor_id,
+            cursor_id: sorter_cursor_id,
+            dest_reg: sorted_record_reg,
+        });
+
+        program.emit_insn(Insn::SeekEnd {
+            cursor_id: index_cursor_id,
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: index_cursor_id,
+            record_reg: sorted_record_reg,
+            unpacked_start: None,
+            unpacked_count: None,
+            flags: IdxInsertFlags::new().use_seek(false),
+        });
+        program.emit_insn(Insn::SorterNext {
+            cursor_id: sorter_cursor_id,
+            pc_if_next: sorted_loop_start,
+        });
+        program.preassign_label_to_next_insn(sorted_loop_end);
+    }
+
+    program.close_cursors(&[sorter_cursor_id, table_cursor_id, index_cursor_id]);
+    Ok(())
+}
+
+type ReindexTarget = (usize, Arc<BTreeTable>, Arc<Index>);
+
+/// Translates a SQLite-compatible `REINDEX` statement into bytecode.
+///
+/// The supported scope is rowid b-tree indexes in non-MVCC mode. Target
+/// resolution accepts SQLite's all-index, collation-name, table-name, and
+/// index-name forms, then emits a destructive clear-plus-refill program for
+/// each resolved index.
+pub fn translate_reindex(
+    name: Option<QualifiedName>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> crate::Result<()> {
+    if connection.mvcc_enabled() {
+        bail_parse_error!("REINDEX is not supported in MVCC mode");
+    }
+
+    let opts = ProgramBuilderOpts::new(5, 40, 5);
+    program.extend(&opts);
+
+    let targets = resolve_reindex_targets(name.as_ref(), resolver, connection)?;
+    if targets.is_empty() {
+        return Ok(());
+    }
+    if connection.get_query_only() {
+        bail_parse_error!("Cannot execute write statement in query_only mode");
+    }
+
+    let mut write_databases = Vec::new();
+    for (database_id, _, _) in &targets {
+        if !write_databases.contains(database_id) {
+            let schema_cookie = resolver.with_schema(*database_id, |s| s.schema_version);
+            program.begin_write_on_database(*database_id, schema_cookie)?;
+            write_databases.push(*database_id);
+        }
+    }
+
+    for (database_id, table, index) in targets {
+        if index
+            .index_method
+            .as_ref()
+            .is_some_and(|m| !m.definition().backing_btree)
+        {
+            bail_parse_error!(
+                "REINDEX is not supported for custom index methods without a backing btree"
+            );
+        }
+        if !table.has_rowid {
+            bail_parse_error!("REINDEX on WITHOUT ROWID tables is not supported");
+        }
+        let index_cursor_id = program.alloc_cursor_index(None, &index)?;
+        emit_refill_index(
+            program,
+            resolver,
+            database_id,
+            &table,
+            &index,
+            index_cursor_id,
+            RegisterOrLiteral::Literal(index.root_page),
+            Some(index.root_page),
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Resolves the optional `REINDEX` target name to concrete `(database, table, index)` triples.
+///
+/// SQLite resolves unqualified targets as collation, then table, then index. Qualified
+/// names are schema-local and can only refer to a table or index in that database.
+fn resolve_reindex_targets(
+    name: Option<&QualifiedName>,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+) -> crate::Result<Vec<ReindexTarget>> {
+    let Some(name) = name else {
+        return Ok(collect_all_reindex_targets(resolver, connection));
+    };
+
+    let normalized_name = normalize_ident(name.name.as_str());
+    if name.db_name.is_none() {
+        if let Ok(collation) = CollationSeq::new(&normalized_name) {
+            return Ok(collect_reindex_targets_by_collation(
+                resolver, connection, collation,
+            ));
+        }
+        if let Some(targets) = find_reindex_table(&normalized_name, resolver, connection) {
+            return Ok(targets);
+        }
+        if let Some(target) = find_reindex_index(&normalized_name, resolver, connection) {
+            return Ok(vec![target]);
+        }
+        bail_parse_error!("unable to identify the object to be reindexed");
+    }
+
+    let database_id = resolver.resolve_database_id(name)?;
+    if let Some(targets) = find_reindex_table_in_db(&normalized_name, database_id, resolver) {
+        return Ok(targets);
+    }
+    if let Some(target) = find_reindex_index_in_db(&normalized_name, database_id, resolver) {
+        return Ok(vec![target]);
+    }
+    bail_parse_error!("unable to identify the object to be reindexed");
+}
+
+/// Returns every reindexable index across temp, main, and attached databases.
+fn collect_all_reindex_targets(
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+) -> Vec<ReindexTarget> {
+    let mut targets = Vec::new();
+    for (database_id, _, _) in connection.list_all_databases() {
+        targets.extend(collect_all_reindex_targets_in_db(database_id, resolver));
+    }
+    targets
+}
+
+/// Returns every index across all schemas that contains at least one column using `collation`.
+fn collect_reindex_targets_by_collation(
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    collation: CollationSeq,
+) -> Vec<ReindexTarget> {
+    let mut targets = Vec::new();
+    for (database_id, _, _) in connection.list_all_databases() {
+        targets.extend(
+            collect_all_reindex_targets_in_db(database_id, resolver)
+                .into_iter()
+                .filter(|(_, _, index)| index_matches_collation(index, collation)),
+        );
+    }
+    targets
+}
+
+/// Returns every reindexable index in one schema database.
+fn collect_all_reindex_targets_in_db(
+    database_id: usize,
+    resolver: &Resolver,
+) -> Vec<ReindexTarget> {
+    resolver.with_schema(database_id, |schema| {
+        schema
+            .indexes
+            .iter()
+            .filter_map(|(table_name, indexes)| {
+                schema
+                    .get_btree_table(table_name)
+                    .map(|table| (table, indexes))
+            })
+            .flat_map(|(table, indexes)| {
+                indexes
+                    .iter()
+                    .cloned()
+                    .map(move |index| (database_id, table.clone(), index))
+            })
+            .collect()
+    })
+}
+
+/// Finds the first table matching an unqualified `REINDEX table_name` target.
+///
+/// Search order follows SQLite name resolution for unqualified schema objects:
+/// temp first, main second, then attached databases by numeric database id.
+fn find_reindex_table(
+    table_name: &str,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+) -> Option<Vec<ReindexTarget>> {
+    for database_id in reindex_unqualified_search_database_ids(connection) {
+        if let Some(targets) = find_reindex_table_in_db(table_name, database_id, resolver) {
+            return Some(targets);
+        }
+    }
+    None
+}
+
+/// Returns all indexes belonging to `table_name` inside a single database.
+///
+/// A table or view without indexes is still a valid REINDEX target, so this
+/// returns an empty vector wrapped in `Some` when the object exists.
+fn find_reindex_table_in_db(
+    table_name: &str,
+    database_id: usize,
+    resolver: &Resolver,
+) -> Option<Vec<ReindexTarget>> {
+    resolver.with_schema(database_id, |schema| {
+        let object_type = schema.get_object_type(table_name)?;
+        if object_type == SchemaObjectType::View {
+            return Some(Vec::new());
+        }
+        let SchemaObjectType::Table = object_type else {
+            return None;
+        };
+        let Some(table) = schema.get_btree_table(table_name) else {
+            return Some(Vec::new());
+        };
+        let targets = schema
+            .indexes
+            .get(&normalize_ident(table.name.as_str()))
+            .map(|indexes| {
+                indexes
+                    .iter()
+                    .cloned()
+                    .map(|index| (database_id, table.clone(), index))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(targets)
+    })
+}
+
+/// Finds the first index matching an unqualified `REINDEX index_name` target.
+///
+/// This is tried only after collation and table lookup fail.
+fn find_reindex_index(
+    index_name: &str,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+) -> Option<ReindexTarget> {
+    for database_id in reindex_unqualified_search_database_ids(connection) {
+        if let Some(target) = find_reindex_index_in_db(index_name, database_id, resolver) {
+            return Some(target);
+        }
+    }
+    None
+}
+
+/// Finds one index by name inside a single database and returns its owning table.
+fn find_reindex_index_in_db(
+    index_name: &str,
+    database_id: usize,
+    resolver: &Resolver,
+) -> Option<ReindexTarget> {
+    resolver.with_schema(database_id, |schema| {
+        for (table_name, indexes) in &schema.indexes {
+            if let Some(index) = indexes
+                .iter()
+                .find(|index| index.name.eq_ignore_ascii_case(index_name))
+            {
+                let table = schema.get_btree_table(table_name)?;
+                return Some((database_id, table, index.clone()));
+            }
+        }
+        None
+    })
+}
+
+/// Returns database ids in SQLite's unqualified REINDEX search order.
+fn reindex_unqualified_search_database_ids(connection: &Arc<crate::Connection>) -> Vec<usize> {
+    let mut database_ids: Vec<_> = connection
+        .list_all_databases()
+        .into_iter()
+        .map(|(database_id, _, _)| database_id)
+        .collect();
+    database_ids.sort_by_key(|database_id| match *database_id {
+        TEMP_DB_ID => 0,
+        MAIN_DB_ID => 1,
+        _ => *database_id,
+    });
+    database_ids
+}
+
+/// Returns whether any indexed term explicitly uses `collation`.
+fn index_matches_collation(index: &Index, collation: CollationSeq) -> bool {
+    index
+        .columns
+        .iter()
+        .any(|column| column.collation.unwrap_or_default() == collation)
+}
+
 pub fn resolve_sorted_columns(
     table: &BTreeTable,
     cols: &[SortedColumn],
-) -> crate::Result<Vec<IndexColumn>> {
+) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
     resolve_sorted_columns_with_resolver(table, cols, None)
 }
 
@@ -606,8 +887,12 @@ fn resolve_sorted_columns_with_resolver(
     table: &BTreeTable,
     cols: &[SortedColumn],
     resolver: Option<&Resolver>,
-) -> crate::Result<Vec<IndexColumn>> {
-    let mut resolved = Vec::with_capacity(cols.len());
+) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
+    let mut resolved =
+        <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
+            cols.len(),
+        )
+        .expect("TODO: fallible allocations");
     for sc in cols {
         let order = sc.order.unwrap_or(SortOrder::Asc);
         let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref(), resolver)?;
@@ -653,18 +938,25 @@ fn extract_collation<'a>(
 ) -> crate::Result<(Option<CollationSeq>, &'a Expr)> {
     let mut current = expr;
     let mut coll = None;
-    while let Expr::Collate(inner, seq) = current {
-        let collation = match resolver {
-            Some(resolver) => resolver.resolve_collation(seq.as_str())?,
-            None => CollationSeq::new(seq.as_str())?,
-        };
-        if collation.is_custom() {
-            crate::bail_parse_error!("custom collations are not supported in indexes");
+    loop {
+        current = unwrap_parens(current)?;
+        match current {
+            Expr::Collate(inner, seq) => {
+                if coll.is_none() {
+                    let collation = match resolver {
+                        Some(resolver) => resolver.resolve_collation(seq.as_str())?,
+                        None => CollationSeq::new(seq.as_str())?,
+                    };
+                    if collation.is_custom() {
+                        crate::bail_parse_error!("custom collations are not supported in indexes");
+                    }
+                    coll = Some(collation);
+                }
+                current = inner.as_ref();
+            }
+            _ => return Ok((coll, current)),
         }
-        coll = Some(collation);
-        current = inner.as_ref();
     }
-    Ok((coll, current))
 }
 
 /// For a given Index Expression, attempts to resolve it to a column position in the table.
@@ -729,7 +1021,7 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
     let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
         let n = normalize_ident(name);
         Func::resolve_function(&n, args.len())
-            .is_ok_and(|f| f.is_some_and(|f| is_valid_index_function_call(&f, args)))
+            .is_ok_and(|f| f.is_some_and(|f| is_deterministic_schema_function_call(&f, args)))
     };
 
     let mut ok = true;
@@ -798,74 +1090,6 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
         })
     });
     ok
-}
-
-fn is_valid_index_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
-    match func {
-        Func::Scalar(
-            ScalarFunc::Date
-            | ScalarFunc::Time
-            | ScalarFunc::DateTime
-            | ScalarFunc::UnixEpoch
-            | ScalarFunc::JulianDay
-            | ScalarFunc::StrfTime
-            | ScalarFunc::TimeDiff,
-        ) => is_deterministic_datetime_index_call(func, args),
-        _ => func.is_deterministic(),
-    }
-}
-
-// SQLite allows date/time functions in expression indexes only when they do not
-// depend on the current clock or local timezone.
-fn is_deterministic_datetime_index_call(func: &Func, args: &[Box<Expr>]) -> bool {
-    match func {
-        Func::Scalar(ScalarFunc::Date)
-        | Func::Scalar(ScalarFunc::Time)
-        | Func::Scalar(ScalarFunc::DateTime)
-        | Func::Scalar(ScalarFunc::UnixEpoch)
-        | Func::Scalar(ScalarFunc::JulianDay) => {
-            !args.is_empty()
-                && !is_current_time_expr(args[0].as_ref())
-                && !args[1..]
-                    .iter()
-                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
-        }
-        Func::Scalar(ScalarFunc::StrfTime) => {
-            args.len() >= 2
-                && !is_current_time_expr(args[1].as_ref())
-                && !args[2..]
-                    .iter()
-                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
-        }
-        Func::Scalar(ScalarFunc::TimeDiff) => {
-            !args.iter().any(|arg| is_current_time_expr(arg.as_ref()))
-        }
-        _ => unreachable!("non-datetime function passed to datetime index validator"),
-    }
-}
-
-fn is_current_time_expr(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Literal(ast::Literal::String(value)) if string_literal_eq(value, "now")
-    ) || matches!(
-        expr,
-        Expr::Literal(
-            ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp
-        )
-    )
-}
-
-fn is_unsafe_datetime_modifier(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Literal(ast::Literal::String(value))
-            if string_literal_eq(value, "localtime") || string_literal_eq(value, "utc")
-    ) || is_current_time_expr(expr)
-}
-
-fn string_literal_eq(value: &str, expected: &str) -> bool {
-    value.trim_matches('\'').eq_ignore_ascii_case(expected)
 }
 
 fn emit_index_column_value_from_cursor(

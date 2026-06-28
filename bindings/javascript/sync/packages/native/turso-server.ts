@@ -92,7 +92,12 @@ export class TursoServer {
             let lastErr: unknown = null;
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
                 const port = await getFreePort();
-                const child = spawn(localSyncServer, ['--sync-server', `0.0.0.0:${port}`], {
+                const child = spawn(localSyncServer, [
+                    '--sync-server', `0.0.0.0:${port}`,
+                    // enable experimental features on the server so synced clients
+                    // can push schemas that use them (e.g. generated columns)
+                    '--experimental-generated-columns',
+                ], {
                     stdio: 'ignore',
                 });
                 const userUrl = `http://localhost:${port}`;

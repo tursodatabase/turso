@@ -51,9 +51,13 @@ cfg_block! {
 }
 
 mod memory;
+#[cfg(feature = "io_memory_yield")]
+mod memory_yield;
 #[cfg(feature = "fs")]
 mod vfs;
 pub use memory::MemoryIO;
+#[cfg(feature = "io_memory_yield")]
+pub use memory_yield::MemoryYieldIO;
 pub mod clock;
 mod common;
 mod completions;
@@ -521,8 +525,83 @@ impl<'a> WriteBatch<'a> {
 
 pub type BufferData = Pin<Box<[u8]>>;
 
+#[derive(Clone)]
+pub enum SharedBufferData {
+    Full(Arc<Box<[u8]>>),
+    View(SharedBufferView),
+}
+
+#[derive(Clone)]
+pub struct SharedBufferView {
+    data: Arc<Box<[u8]>>,
+    start: usize,
+}
+
+impl SharedBufferView {
+    fn new(data: Arc<Box<[u8]>>, start: usize) -> Self {
+        assert!(
+            start <= data.len(),
+            "SharedBufferData::new_view: start ({start}) > data.len() ({})",
+            data.len()
+        );
+        Self { data, start }
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len() - self.start
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data.as_ref().as_ref()[self.start..]
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        unsafe { self.data.as_ref().as_ptr().add(self.start) }
+    }
+}
+
+impl SharedBufferData {
+    pub fn new(data: Arc<Box<[u8]>>) -> Self {
+        Self::Full(data)
+    }
+
+    pub fn new_view(data: Arc<Box<[u8]>>, start: usize) -> Self {
+        Self::View(SharedBufferView::new(data, start))
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Full(data) => data.len(),
+            Self::View(view) => view.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Full(data) => data.as_ref().as_ref(),
+            Self::View(view) => view.as_slice(),
+        }
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        match self {
+            Self::Full(data) => data.as_ref().as_ptr(),
+            Self::View(view) => view.as_ptr(),
+        }
+    }
+}
+
 pub enum Buffer {
     Heap(BufferData),
+    Shared(SharedBufferData),
     /// A heap buffer with a logical start offset: only `data[start..]` is
     /// exposed via [`Buffer::as_slice`] / [`Buffer::len`]. Used to skip a
     /// pre-allocated prefix without shifting bytes in memory before I/O.
@@ -538,6 +617,7 @@ impl Debug for Buffer {
         match self {
             Self::Pooled(p) => write!(f, "Pooled(len={})", p.logical_len()),
             Self::Heap(buf) => write!(f, "{buf:?}: {}", buf.len()),
+            Self::Shared(buf) => write!(f, "Shared(len={})", buf.len()),
             Self::HeapView { data, start } => {
                 write!(
                     f,
@@ -562,7 +642,7 @@ impl Drop for Buffer {
                     cache.return_buffer(buffer, underlying_len);
                 });
             }
-            Self::Pooled(_) => {}
+            Self::Pooled(_) | Self::Shared(_) => {}
         }
     }
 }
@@ -571,6 +651,14 @@ impl Buffer {
     pub fn new(data: Vec<u8>) -> Self {
         tracing::trace!("buffer::new({:?})", data);
         Self::Heap(Pin::new(data.into_boxed_slice()))
+    }
+
+    pub fn new_shared(data: Arc<Box<[u8]>>) -> Self {
+        Self::Shared(SharedBufferData::new(data))
+    }
+
+    pub fn new_shared_data(data: SharedBufferData) -> Self {
+        Self::Shared(data)
     }
 
     /// Wraps `data` so that only bytes `[start..]` are visible via
@@ -594,7 +682,7 @@ impl Buffer {
     /// io_uring. Only for use with `UringIO` backend.
     pub fn fixed_id(&self) -> Option<u32> {
         match self {
-            Self::Heap(..) | Self::HeapView { .. } => None,
+            Self::Heap(..) | Self::HeapView { .. } | Self::Shared(..) => None,
             Self::Pooled(buf) => buf.fixed_id(),
         }
     }
@@ -616,6 +704,7 @@ impl Buffer {
     pub fn len(&self) -> usize {
         match self {
             Self::Heap(buf) => buf.len(),
+            Self::Shared(buf) => buf.len(),
             Self::HeapView { data, start } => data.len() - *start,
             Self::Pooled(buf) => buf.logical_len(),
         }
@@ -631,6 +720,7 @@ impl Buffer {
                 // SAFETY: The buffer is guaranteed to be valid for the lifetime of the slice
                 unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) }
             }
+            Self::Shared(buf) => buf.as_slice(),
             Self::HeapView { data, start } => {
                 // SAFETY: `start` was bounds-checked at construction; the buffer
                 // is valid for the lifetime of the returned slice.
@@ -650,6 +740,7 @@ impl Buffer {
     pub fn as_ptr(&self) -> *const u8 {
         match self {
             Self::Heap(buf) => buf.as_ptr(),
+            Self::Shared(buf) => buf.as_ptr(),
             Self::HeapView { data, start } => unsafe { data.as_ptr().add(*start) },
             Self::Pooled(buf) => buf.as_ptr(),
         }
@@ -658,6 +749,7 @@ impl Buffer {
     pub fn as_mut_ptr(&self) -> *mut u8 {
         match self {
             Self::Heap(buf) => buf.as_ptr() as *mut u8,
+            Self::Shared(_) => panic!("Buffer::Shared is immutable"),
             Self::HeapView { data, start } => unsafe { (data.as_ptr() as *mut u8).add(*start) },
             Self::Pooled(buf) => buf.as_ptr() as *mut u8,
         }
@@ -677,6 +769,37 @@ impl Buffer {
 crate::thread::thread_local! {
     /// thread local cache to re-use temporary buffers to prevent churn when pool overflows
     pub static TEMP_BUFFER_CACHE: RefCell<TempBufferCache> = RefCell::new(TempBufferCache::new());
+}
+
+#[cfg(test)]
+mod buffer_tests {
+    use super::*;
+
+    #[test]
+    fn shared_buffer_exposes_arc_bytes() {
+        let data = Arc::new(vec![1, 2, 3, 4].into_boxed_slice());
+        let buffer = Buffer::new_shared(data.clone());
+
+        assert_eq!(buffer.len(), 4);
+        assert_eq!(buffer.as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(buffer.as_ptr(), data.as_ref().as_ptr());
+        assert!(!buffer.is_heap());
+        assert!(!buffer.is_pooled());
+    }
+
+    #[test]
+    fn shared_buffer_view_exposes_tail_without_copying() {
+        let data = Arc::new(vec![0, 1, 2, 3, 4].into_boxed_slice());
+        let shared = SharedBufferData::new_view(data.clone(), 2);
+        let buffer = Buffer::new_shared_data(shared.clone());
+
+        assert_eq!(shared.len(), 3);
+        assert_eq!(shared.as_slice(), &[2, 3, 4]);
+        assert_eq!(shared.as_ptr(), unsafe { data.as_ref().as_ptr().add(2) });
+        assert_eq!(buffer.len(), 3);
+        assert_eq!(buffer.as_slice(), &[2, 3, 4]);
+        assert_eq!(buffer.as_ptr(), shared.as_ptr());
+    }
 }
 
 /// A cache for temporary or any additional `Buffer` allocations beyond

@@ -1709,3 +1709,50 @@ def test_named_params_missing_indexed_qmark_currently_allowed_difference(provide
         cur.execute("SELECT ?1, ?2", {"1": "ONE"})
         assert cur.fetchone() == ("ONE", None)
     conn.close()
+
+
+# --- Full-text search (Tantivy) ---------------------------------------------
+# FTS is Turso-only and gated behind the `index_method` experimental feature.
+# It is exposed purely through SQL: `CREATE INDEX ... USING fts (...)` plus the
+# fts_match()/fts_score()/fts_highlight() functions.
+
+
+def _fts_connection():
+    conn = turso.connect(":memory:", experimental_features="index_method")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE articles (id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+    cur.execute("INSERT INTO articles VALUES (1, 'Rust databases', 'Turso is a SQLite rewrite in Rust')")
+    cur.execute("INSERT INTO articles VALUES (2, 'Cooking', 'A recipe for tomato soup')")
+    cur.execute("CREATE INDEX fts_articles ON articles USING fts (title, body)")
+    return conn, cur
+
+
+def test_fts_match_filters_rows():
+    conn, cur = _fts_connection()
+    cur.execute("SELECT id, title FROM articles WHERE fts_match(title, body, 'rust')")
+    assert cur.fetchall() == [(1, "Rust databases")]
+    # A term present in neither document matches nothing.
+    cur.execute("SELECT id FROM articles WHERE fts_match(title, body, 'pizza')")
+    assert cur.fetchall() == []
+    conn.close()
+
+
+def test_fts_score_orders_results():
+    conn, cur = _fts_connection()
+    cur.execute(
+        "SELECT id, fts_score(title, body, 'rust') AS score FROM articles "
+        "WHERE fts_match(title, body, 'rust') ORDER BY score DESC LIMIT 5"
+    )
+    rows = cur.fetchall()
+    assert [r[0] for r in rows] == [1]
+    # Relevance score for a matching row is strictly positive.
+    assert rows[0][1] > 0
+    conn.close()
+
+
+def test_fts_highlight_wraps_matched_terms():
+    conn, cur = _fts_connection()
+    # Signature: fts_highlight(text..., before_tag, after_tag, query)
+    cur.execute("SELECT fts_highlight(body, '<b>', '</b>', 'rust') FROM articles WHERE fts_match(title, body, 'rust')")
+    assert cur.fetchall() == [("Turso is a SQLite rewrite in <b>Rust</b>",)]
+    conn.close()

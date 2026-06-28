@@ -592,6 +592,124 @@ pub extern "C" fn turso_statement_column_decltype(
     }
 }
 
+/// Sentinel value returned by `turso_statement_column_kind` when no type
+/// information is available (statement finalized, index out of bounds, or
+/// the result column is not a direct table-column reference).
+///
+/// Mirrors `c::TURSO_COLUMN_KIND_NONE`. The named-constant form is included
+/// so the value flows through the auto-generated bindings.
+const TURSO_COLUMN_KIND_NONE: i32 = -1;
+
+/// Maps a [`turso_core::ColumnTypeKind`] onto the C ABI int constants
+/// declared in `turso.h`. The constants are deliberately kept stable: new
+/// variants added to `ColumnTypeKind` upstream are surfaced here as
+/// `TURSO_COLUMN_KIND_NONE` until this mapping is updated, so a stale C
+/// caller sees "unknown kind" rather than a wrong-but-valid kind.
+fn column_type_kind_to_c(kind: turso_core::ColumnTypeKind) -> i32 {
+    match kind {
+        turso_core::ColumnTypeKind::Builtin => 0,
+        turso_core::ColumnTypeKind::Custom => 1,
+        turso_core::ColumnTypeKind::Domain => 2,
+        turso_core::ColumnTypeKind::Struct => 3,
+        turso_core::ColumnTypeKind::Union => 4,
+        // `ColumnTypeKind` is `#[non_exhaustive]`; treat unknown variants as
+        // "no info" rather than silently mapping them onto an existing kind.
+        _ => TURSO_COLUMN_KIND_NONE,
+    }
+}
+
+/// Get the declared type name of the column at `index` — same string as
+/// `turso_statement_column_decltype`, but resolved through the richer
+/// type-info path so the result is consistent with the other
+/// `_column_type_info_*` getters below.
+///
+/// Returns NULL when no type info is available (see [`TURSO_COLUMN_KIND_NONE`]).
+/// The returned C string must be freed with `turso_str_deinit`.
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_statement_column_declared_name(
+    statement: *const c::turso_statement_t,
+    index: usize,
+) -> *const std::ffi::c_char {
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(_) => return std::ptr::null(),
+    };
+    match statement.column_type_info(index) {
+        Some(info) => str_to_c_string(&info.declared_name),
+        None => std::ptr::null(),
+    }
+}
+
+/// Get the array depth of the column at `index`. `0` for scalar table
+/// columns, `n` for n-dimensional array columns (e.g. `INTEGER[][]` → 2),
+/// and `0` when no type info is available — call
+/// `turso_statement_column_kind` first to distinguish "scalar column"
+/// (returns 0) from "no info" (kind == -1).
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_statement_column_array_dimensions(
+    statement: *const c::turso_statement_t,
+    index: usize,
+) -> u32 {
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(_) => return 0,
+    };
+    statement
+        .column_type_info(index)
+        .map(|info| info.array_dimensions)
+        .unwrap_or(0)
+}
+
+/// Get the underlying primitive type name for columns declared with a
+/// `CREATE TYPE` or `CREATE DOMAIN`. Returns one of `"INTEGER"`, `"TEXT"`,
+/// `"REAL"`, `"BLOB"`, `"NUMERIC"`.
+///
+/// Returns NULL when the declared type is a built-in primitive directly,
+/// when no type info is available, or when the column is not a direct
+/// table-column reference. The returned C string must be freed with
+/// `turso_str_deinit`.
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_statement_column_base_type(
+    statement: *const c::turso_statement_t,
+    index: usize,
+) -> *const std::ffi::c_char {
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(_) => return std::ptr::null(),
+    };
+    match statement
+        .column_type_info(index)
+        .and_then(|info| info.base_type)
+    {
+        Some(s) => str_to_c_string(&s),
+        None => std::ptr::null(),
+    }
+}
+
+/// Classify the column's declared type: `0 = Builtin`, `1 = Custom`,
+/// `2 = Domain`, `3 = Struct`, `4 = Union`. Returns `-1` (`TURSO_COLUMN_KIND_NONE`)
+/// when no type information is available — statement finalized, index out
+/// of bounds, or the column is not a direct table-column reference (e.g.
+/// `SELECT id + 1`).
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_statement_column_kind(
+    statement: *const c::turso_statement_t,
+    index: usize,
+) -> i32 {
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(_) => return TURSO_COLUMN_KIND_NONE,
+    };
+    match statement.column_type_info(index) {
+        Some(info) => column_type_kind_to_c(info.kind),
+        None => TURSO_COLUMN_KIND_NONE,
+    }
+}
+
 /// Lock the statement handle and get a ValueRef for the given row index.
 /// Returns None if the statement is null, finalized, has no row, or index is out of bounds.
 /// The returned MutexGuard must be kept alive for the duration of ValueRef use.

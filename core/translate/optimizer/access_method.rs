@@ -11,8 +11,9 @@ use crate::stats::AnalyzeStats;
 use crate::translate::collate::CollationSeq;
 use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, ordered_materialized_key_columns, BinaryExprSide, Constraint,
-    ConstraintOperator, RangeConstraintRef,
+    convert_to_vtab_constraint, ordered_materialized_key_columns, partial_index,
+    partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
+    RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
 use crate::translate::optimizer::cost_params::CostModelParams;
@@ -170,6 +171,7 @@ pub(super) struct ChosenBtreeCandidate {
     pub(super) iter_dir: IterationDirection,
     pub(super) index: Option<Arc<Index>>,
     pub(super) constraint_refs: Vec<RangeConstraintRef>,
+    pub(super) base_row_count: RowCountEstimate,
     pub(super) cost: Cost,
 }
 
@@ -234,6 +236,7 @@ pub(super) fn choose_best_btree_candidate(
         iter_dir: IterationDirection::Forwards,
         index: None,
         constraint_refs: vec![],
+        base_row_count,
         cost: best_cost,
     };
     let mut best_adjusted_output = f64::MAX;
@@ -449,6 +452,7 @@ pub(super) fn choose_best_btree_candidate(
                 iter_dir,
                 index: candidate.index.clone(),
                 constraint_refs: usable_constraint_refs.clone(),
+                base_row_count: candidate_base_row_count,
                 cost,
             };
         }
@@ -478,6 +482,21 @@ fn consumed_where_terms_from_constraint_refs(
         }
     }
     consumed
+}
+
+fn consume_partial_index_predicate_terms(
+    consumed: &mut SmallVec<[usize; 4]>,
+    index: &Index,
+    rhs_table: &JoinedTable,
+    where_clause: &[WhereTerm],
+) {
+    let predicate_terms = partial_index_predicate_terms(index, rhs_table, where_clause)
+        .expect("selected partial index predicate must be implied by query");
+    for term_idx in predicate_terms {
+        if !consumed.contains(&term_idx) {
+            consumed.push(term_idx);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -575,6 +594,10 @@ pub(super) fn choose_best_in_seek_candidate(
                 let table_collation = constrained_column.collation();
                 let index_collation = index.columns[0].collation.unwrap_or_default();
                 if table_collation != index_collation {
+                    continue;
+                }
+                let idx_aff = constrained_column.affinity_with_strict(rhs_table.table.is_strict());
+                if !constraint.satisfies_index_affinity(idx_aff) {
                     continue;
                 }
             }
@@ -745,8 +768,9 @@ fn find_best_access_method_for_btree(
     )?
     .expect("btree candidate selection must always consider the rowid candidate");
 
+    let access_base_row_count = best.base_row_count;
     let estimated_rows_per_outer_row = if best.constraint_refs.is_empty() {
-        *base_row_count
+        *access_base_row_count
     } else {
         let index_info = match best.index.as_ref() {
             Some(index) => IndexInfo {
@@ -775,18 +799,27 @@ fn find_best_access_method_for_btree(
             index_info,
             &rhs_constraints.constraints,
             &best.constraint_refs,
-            base_row_count,
+            access_base_row_count,
             Some(&analyze_ctx),
         )
     };
+    let mut consumed_where_terms = consumed_where_terms_from_constraint_refs(
+        &rhs_constraints.constraints,
+        &best.constraint_refs,
+    );
+    if let Some(index) = partial_index(best.index.as_ref()) {
+        consume_partial_index_predicate_terms(
+            &mut consumed_where_terms,
+            index,
+            rhs_table,
+            where_clause,
+        );
+    }
     let mut best_access_method = AccessMethod {
         cost: best.cost,
         estimated_rows_per_outer_row,
         residual_constraints: ResidualConstraintMode::ApplyUnconsumed,
-        consumed_where_terms: consumed_where_terms_from_constraint_refs(
-            &rhs_constraints.constraints,
-            &best.constraint_refs,
-        ),
+        consumed_where_terms,
         params: AccessMethodParams::BTreeTable {
             iter_dir: best.iter_dir,
             index: best.index,
@@ -806,6 +839,17 @@ fn find_best_access_method_for_btree(
             params,
             best_access_method.cost,
         )? {
+            let mut in_seek_method = in_seek_method;
+            if let AccessMethodParams::InSeek { index, .. } = &in_seek_method.params {
+                if let Some(index) = partial_index(index.as_ref()) {
+                    consume_partial_index_predicate_terms(
+                        &mut in_seek_method.consumed_where_terms,
+                        index,
+                        rhs_table,
+                        where_clause,
+                    );
+                }
+            }
             best_access_method = in_seek_method;
         }
 
@@ -1402,18 +1446,16 @@ fn find_best_access_method_for_subquery(
         .iter()
         .enumerate()
         .filter(|(_, c)| {
-            c.usable
-                && c.table_col_pos.is_some()
-                && matches!(
-                    c.operator.as_ast_operator(),
-                    Some(
-                        ast::Operator::Equals
-                            | ast::Operator::Greater
-                            | ast::Operator::GreaterEquals
-                            | ast::Operator::Less
-                            | ast::Operator::LessEquals
-                    )
+            matches!(
+                c.operator.as_ast_operator(),
+                Some(
+                    ast::Operator::Equals
+                        | ast::Operator::Greater
+                        | ast::Operator::GreaterEquals
+                        | ast::Operator::Less
+                        | ast::Operator::LessEquals
                 )
+            ) && c.can_drive_index_seek(&subquery.columns, false)
         })
         .collect();
 
@@ -1614,7 +1656,7 @@ fn materialized_subquery_ephemeral_index(
     subquery: &FromClauseSubquery,
     key_col_positions: &[usize],
 ) -> Arc<Index> {
-    let mut index_columns: Vec<IndexColumn> = Vec::new();
+    let mut index_columns: crate::alloc::Vec<IndexColumn> = crate::alloc::vec![];
     let mut seen_col_positions = std::collections::HashSet::new();
 
     for &col_pos in key_col_positions {

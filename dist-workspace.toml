@@ -10,7 +10,7 @@ ci = "github"
 # The installers to generate for each app
 installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+targets = ["aarch64-apple-darwin", "aarch64-pc-windows-msvc", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Which actions to run on pull requests
 pr-run-mode = "plan"
 # Path that installers should place binaries in
@@ -23,3 +23,7 @@ dist = false
 github-attestations = true
 # Build only the required packages
 precise-builds = true
+# release.yml is hand-edited to add Azure Windows code signing (see PR #7618),
+# which cargo-dist can't generate itself. Allow the CI file to differ from
+# `dist generate` output so the `dist plan` check doesn't fail.
+allow-dirty = ["ci"]

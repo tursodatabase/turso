@@ -47,7 +47,7 @@ fn run_to_completion(
 ) -> turso_core::Result<()> {
     loop {
         match stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 db.io.step()?;
             }
             StepResult::Done => break,
@@ -68,7 +68,7 @@ fn run_and_count_rows(
     let mut count = 0;
     loop {
         match stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 db.io.step()?;
             }
             StepResult::Done => break,
@@ -147,6 +147,7 @@ fn setup_fts_db(temp_dir: &TempDir, row_count: usize) -> Arc<Database> {
 /// load hot files, create the Tantivy Index, build a Reader+Searcher,
 /// parse the query, and execute the search. Each iteration uses a fresh
 /// connection to avoid directory cache hits.
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_fts_cold_query(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("FTS Cold Query");
     group.sample_size(20); // Cold queries are slow; reduce samples
@@ -188,6 +189,7 @@ fn bench_fts_cold_query(criterion: &mut Criterion) {
 /// skip the catalog scan and PreloadingEssentials entirely. This measures
 /// the pure query execution path: Index::open (from cached directory),
 /// Reader+Searcher creation, query parsing, and search.
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_fts_warm_query(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("FTS Warm Query");
 
@@ -233,6 +235,7 @@ fn bench_fts_warm_query(criterion: &mut Criterion) {
 /// Measures how the number of matching documents affects query time.
 /// "database" matches ~1/7 of docs, "performance" matches ~1/7,
 /// "database performance" (AND) matches fewer.
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_fts_query_selectivity(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("FTS Query Selectivity");
 
@@ -280,6 +283,7 @@ fn bench_fts_query_selectivity(criterion: &mut Criterion) {
 /// Measures the cost of inserting new rows, committing, and then querying.
 /// This exercises the full write path (IndexWriter, segment creation, BTree flush)
 /// followed by directory cache invalidation and a cold re-query.
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_fts_insert_then_query(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("FTS Insert+Query Lifecycle");
     group.sample_size(20);

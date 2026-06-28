@@ -1,0 +1,367 @@
+@database :memory:
+
+# Adversarial coverage for sequence-backed tables under MVCC.
+# Companion to mvcc_sequence.sqltest; targets MVCC-specific paths the base
+# file doesn't exercise: autonomous inner-tx commits surviving rollback,
+# UPSERT-with-rowid-change advancing the watermark (regression for the
+# inner-tx allocator never falling back to MAX(rowid)), and DROP TABLE
+# lifecycle on AUTOINCREMENT.
+
+# --- UPSERT DO UPDATE SET <rowid> = … under MVCC ---
+
+# Bug regression: prior to the fix, ON CONFLICT DO UPDATE SET id=<large>
+# did NOT advance the implicit AUTOINCREMENT sequence under MVCC. The
+# MVCC allocator trusts the backing-table watermark only (no MAX(rowid)
+# fallback), so the next auto-INSERT eventually collided with the
+# manually-set rowid. Fixed by emitting `emit_disk_advance_past` in the
+# upsert rowid-change branch — mirrors what UPDATE already does.
+# Empirically SQLite returns 1000/1001/1002 here.
+test mvcc-upsert-rowid-change-advances-sequence {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT UNIQUE);
+    INSERT INTO t(v) VALUES('a');
+    INSERT INTO t(v) VALUES('a') ON CONFLICT(v) DO UPDATE SET id=1000;
+    INSERT INTO t(v) VALUES('b');
+    INSERT INTO t(v) VALUES('c');
+    SELECT id, v FROM t ORDER BY id;
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    mvcc
+    1000|a
+    1001|b
+    1002|c
+    t|1002
+}
+
+# UPSERT that does NOT change the rowid does not need an extra
+# `advance_past` — the watermark advance happened (and was burned) when
+# the would-be-conflicting INSERT allocated its rowid up front. Asserted
+# here so the upsert fix can't accidentally double-advance on the no-
+# rowid-change path. Matches SQLite (burns the would-be id=2 and the
+# next INSERT lands at id=3).
+test mvcc-upsert-no-rowid-change-no-double-advance {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v UNIQUE, n);
+    INSERT INTO t(v, n) VALUES('a', 1);
+    INSERT INTO t(v, n) VALUES('a', 2)
+        ON CONFLICT(v) DO UPDATE SET n=excluded.n;
+    INSERT INTO t(v, n) VALUES('b', 3);
+    SELECT id, v, n FROM t ORDER BY id;
+    SELECT seq FROM sqlite_sequence;
+}
+expect {
+    mvcc
+    1|a|2
+    3|b|3
+    3
+}
+
+# Plain UPDATE that moves rowid forward (no UPSERT) must also advance the
+# watermark. Regression guard for emitter/update.rs path (already covered
+# in core flow, repeated here for symmetry with the UPSERT case).
+test mvcc-update-rowid-change-advances-sequence {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES('a');
+    UPDATE t SET id=500 WHERE v='a';
+    INSERT INTO t(v) VALUES('b');
+    SELECT id, v FROM t ORDER BY id;
+    SELECT seq FROM sqlite_sequence;
+}
+expect {
+    mvcc
+    500|a
+    501|b
+    501
+}
+
+# --- DROP TABLE lifecycle under MVCC ---
+
+# DROP TABLE on AUTOINCREMENT must release the implicit sequence in MVCC.
+# Pre-fix this regressed because the orphan backing table held multiple
+# watermark rows (no inline compaction outside CYCLE) and a same-name
+# re-CREATE resumed nextval from the old MAX(value).
+test mvcc-drop-table-releases-autoincrement-sequence {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES('a'),('b'),('c');
+    DROP TABLE t;
+    SELECT count(*) FROM sqlite_schema WHERE name LIKE '__turso_internal_seq_%';
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES('x'),('y');
+    SELECT id, v FROM t ORDER BY id;
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    mvcc
+    0
+    1|x
+    2|y
+    t|2
+}
+
+# --- Transactional vs autonomous nextval semantics ---
+
+# autocommit BEGIN takes an *exclusive* outer tx, so the sequence RMW
+# takes the SKIPPED inner-tx path (op_sequence_begin_inner_tx) and the
+# watermark write is bundled with the outer tx — rollback undoes it.
+# Repro for the within-MVCC consistency contract documented on
+# `Insn::SequenceBeginInnerTx`.
+test mvcc-exclusive-tx-rollback-unburns-sequence {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    BEGIN;
+    INSERT INTO t(v) VALUES('a');
+    ROLLBACK;
+    INSERT INTO t(v) VALUES('b');
+    SELECT id, v FROM t;
+}
+expect {
+    mvcc
+    1|b
+}
+
+# BEGIN CONCURRENT, by contrast, takes the WRAPPED inner-tx path: the
+# autonomous inner tx commits the watermark advance independently of the
+# outer tx's eventual fate. A rollback therefore leaves the watermark
+# *advanced* — the documented "relaxed burnt-value" tradeoff that buys
+# conflict-free concurrent nextval under MVCC. Pinned here so a future
+# change to the inner-tx wrapping makes a deliberate decision.
+test mvcc-concurrent-tx-rollback-burns-rowid {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    BEGIN CONCURRENT;
+    INSERT INTO t(v) VALUES('a');
+    ROLLBACK;
+    INSERT INTO t(v) VALUES('b');
+    SELECT id, v FROM t;
+}
+expect {
+    mvcc
+    2|b
+}
+
+# --- Backing-table compaction gate under MVCC ---
+
+# MVCC autocommit-write takes the SKIPPED path in
+# `op_sequence_begin_inner_tx` (autocommit Write is treated as
+# exclusive: it holds `pager_commit_lock` for the duration), so the
+# inline compaction fires and the backing table stays at one row even
+# without an MVCC checkpoint. Pre-gate the WAL path leaked a row per
+# nextval; MVCC autocommit was unaffected only because the checkpoint
+# compactor caught up later.
+test mvcc-autocommit-non-cycle-backing-table-compacts-inline {
+    PRAGMA journal_mode='mvcc';
+    CREATE SEQUENCE s;
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT count(*), max(value) FROM "__turso_internal_seq_s";
+}
+expect {
+    mvcc
+    1
+    2
+    3
+    4
+    1|4
+}
+
+# MVCC `BEGIN ... COMMIT` (exclusive outer) → SKIPPED path → compaction
+# fires inside the user's transaction. Watermark survives the commit.
+test mvcc-exclusive-tx-non-cycle-backing-table-compacts-inline {
+    PRAGMA journal_mode='mvcc';
+    CREATE SEQUENCE s;
+    BEGIN;
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT nextval('s');
+    COMMIT;
+    SELECT count(*), max(value) FROM "__turso_internal_seq_s";
+    SELECT nextval('s');
+}
+expect {
+    mvcc
+    1
+    2
+    3
+    1|3
+    4
+}
+
+# MVCC `BEGIN CONCURRENT` (WRAPPED path) deliberately SKIPS inline
+# compaction to avoid WW conflicts on the shared prior-watermark row.
+# Rows accumulate until the MVCC checkpoint's `SeqCompactDriver`
+# reclaims them. Pinned so any future change to the gate has to make
+# a deliberate decision about the contention tradeoff.
+test mvcc-concurrent-tx-non-cycle-backing-table-accumulates {
+    PRAGMA journal_mode='mvcc';
+    CREATE SEQUENCE s;
+    BEGIN CONCURRENT;
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT nextval('s');
+    COMMIT;
+    -- Each nextval committed its autonomous inner tx, leaving N rows
+    -- (one per nextval) for the checkpoint compactor to reclaim.
+    SELECT count(*), max(value) FROM "__turso_internal_seq_s";
+}
+expect {
+    mvcc
+    1
+    2
+    3
+    3|3
+}
+
+# CYCLE keeps unconditional inline compaction (load-bearing for
+# wrap-correctness on the WRAPPED path too — Last/Rewind would
+# otherwise return a pre-wrap extreme). Regression guard.
+test mvcc-cycle-non-cycle-gate-does-not-bypass-cycle-compaction {
+    PRAGMA journal_mode='mvcc';
+    CREATE SEQUENCE c START WITH 1 INCREMENT BY 1 MINVALUE 1 MAXVALUE 3 CYCLE;
+    BEGIN CONCURRENT;
+    SELECT nextval('c');
+    SELECT nextval('c');
+    SELECT nextval('c');
+    SELECT nextval('c');
+    COMMIT;
+    -- Even under WRAPPED (BEGIN CONCURRENT), CYCLE must keep the
+    -- backing table at one row so the post-wrap value (1) is what
+    -- Last reads next.
+    SELECT count(*), value FROM "__turso_internal_seq_c";
+    SELECT nextval('c');
+}
+expect {
+    mvcc
+    1
+    2
+    3
+    1
+    1|1
+    2
+}
+
+# --- ALTER TABLE RENAME on AUTOINCREMENT under MVCC ---
+
+# Pre-fix this CRASHED MVCC inserts after RENAME with
+# `Internal error: missing implicit sequence for AUTOINCREMENT table
+# "<new>"` because the hidden sequence
+# `__turso_internal_autoincrement_<old>` was never renamed to track the
+# parent. Now both the in-memory `schema.sequences` and `schema.tables`
+# entries and the persistent sqlite_schema row for the backing table
+# follow the rename.
+test mvcc-alter-rename-autoincrement-table-keeps-sequence-attached {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE old(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO old(v) VALUES('a'),('b');
+    ALTER TABLE old RENAME TO new;
+    INSERT INTO new(v) VALUES('c'),('d');
+    SELECT id, v FROM new ORDER BY id;
+    SELECT name FROM sqlite_schema WHERE name LIKE '__turso_internal_seq_%';
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    mvcc
+    1|a
+    2|b
+    3|c
+    4|d
+    __turso_internal_seq___turso_internal_autoincrement_new
+    new|4
+}
+
+# After the rename, DROP TABLE on the *new* name must release the
+# (renamed) implicit sequence. Combined regression for the rename +
+# orphan-cleanup paths.
+test mvcc-rename-then-drop-table-releases-renamed-sequence {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE old(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO old(v) VALUES('a'),('b');
+    ALTER TABLE old RENAME TO new;
+    DROP TABLE new;
+    SELECT count(*) FROM sqlite_schema WHERE name LIKE '__turso_internal_seq_%';
+    SELECT count(*) FROM sqlite_sequence;
+}
+expect {
+    mvcc
+    0
+    0
+}
+
+# Same tradeoff applies to user CREATE SEQUENCE under BEGIN CONCURRENT:
+# nextval in a rolled-back concurrent tx burns the value.
+test mvcc-concurrent-tx-rollback-burns-nextval {
+    PRAGMA journal_mode='mvcc';
+    CREATE SEQUENCE s;
+    BEGIN CONCURRENT;
+    SELECT nextval('s');
+    ROLLBACK;
+    SELECT nextval('s');
+}
+expect {
+    mvcc
+    1
+    2
+}
+
+# --- AUTOINCREMENT exhaustion under MVCC uses canonical SQLITE_FULL ---
+
+# AUTOINCREMENT-exhaustion message is "database or disk is full" (the
+# SQLite-canonical phrasing) regardless of the underlying allocator,
+# so portable tools/tests can match on it.
+test mvcc-autoinc-exhaustion-uses-canonical-message {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(id, v) VALUES(9223372036854775807, 'last');
+    INSERT INTO t(v) VALUES('overflow');
+}
+expect error {
+    database or disk is full
+}
+
+# --- Multi-row INSERT under MVCC ---
+
+# Single multi-row INSERT under MVCC must allocate distinct ids per row.
+# Each row triggers a separate inner-tx + watermark advance; the autonomous
+# wrapping must not coalesce them.
+test mvcc-multi-row-autoincrement-allocates-per-row {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES('a'),('b'),('c'),('d'),('e');
+    SELECT id, v FROM t ORDER BY id;
+    SELECT seq FROM sqlite_sequence;
+}
+expect {
+    mvcc
+    1|a
+    2|b
+    3|c
+    4|d
+    5|e
+    5
+}
+
+# --- nextval inside an explicit MVCC concurrent transaction ---
+
+# nextval inside BEGIN CONCURRENT bundles the watermark advance with the
+# autonomous inner tx; the user's outer tx can still commit/rollback the
+# *INSERTs*, while the watermark advance lives in the inner tx.
+test mvcc-user-sequence-survives-concurrent-tx-rollback {
+    PRAGMA journal_mode='mvcc';
+    CREATE SEQUENCE s START WITH 100;
+    CREATE TABLE t(n INTEGER);
+    BEGIN CONCURRENT;
+    INSERT INTO t VALUES(nextval('s'));
+    INSERT INTO t VALUES(nextval('s'));
+    ROLLBACK;
+    SELECT count(*) FROM t;
+    SELECT nextval('s');
+}
+expect {
+    mvcc
+    0
+    102
+}

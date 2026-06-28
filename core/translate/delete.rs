@@ -1,4 +1,4 @@
-use crate::schema::Table;
+use crate::schema::{BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
@@ -16,7 +16,8 @@ use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
-use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn, TriggerEvent, With};
+use smallvec::SmallVec;
+use turso_parser::ast::{Expr, Limit, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
 
@@ -258,9 +259,17 @@ pub fn prepare_delete_plan(
         })
         .unwrap_or(false);
 
+    let has_fk_cascade_triggers = match btree_table_for_triggers.as_ref() {
+        Some(bt) => table_has_fk_cascade_triggers(resolver, database_id, &bt.name)?,
+        None => false,
+    };
+
     let mut safety = DmlSafety::default();
     if has_delete_triggers {
         safety.require(DmlSafetyReason::Trigger);
+    }
+    if has_fk_cascade_triggers {
+        safety.require(DmlSafetyReason::FkCascade);
     }
     if where_clause_has_subquery(&where_predicates) {
         safety.require(DmlSafetyReason::SubqueryInWhere);
@@ -286,6 +295,62 @@ pub fn prepare_delete_plan(
     }
 
     Ok(Plan::Delete(Box::new(delete_plan)))
+}
+
+/// Returns true if any FK referencing `table_name` (transitively, following CASCADE chains)
+/// has triggers on the child table side, which could write back to `table_name` and
+/// invalidate a live DELETE scan iterator.
+fn table_has_fk_cascade_triggers(
+    resolver: &crate::translate::emitter::Resolver,
+    database_id: usize,
+    table_name: &str,
+) -> Result<bool> {
+    let check_temp = database_id != crate::TEMP_DB_ID && resolver.has_temp_database();
+
+    let mut visited: SmallVec<[Arc<BTreeTable>; 2]> = SmallVec::new();
+    let mut worklist: SmallVec<[Arc<BTreeTable>; 2]> = SmallVec::new();
+
+    let start = resolver
+        .with_schema(database_id, |s| s.get_btree_table(table_name))
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "btree table {table_name} missing from schema after delete validation"
+            ))
+        })?;
+    worklist.push(start);
+
+    while let Some(current) = worklist.pop() {
+        if visited.iter().any(|t| Arc::ptr_eq(t, &current)) {
+            continue;
+        }
+        visited.push(current.clone());
+
+        let referencing_fks =
+            resolver.with_schema(database_id, |s| s.resolved_fks_referencing(&current.name))?;
+
+        for fk_ref in referencing_fks {
+            if matches!(fk_ref.fk.on_delete, RefAct::NoAction | RefAct::Restrict) {
+                continue;
+            }
+            let child_name = fk_ref.child_table.name.as_str();
+            let has_triggers = resolver.with_schema(database_id, |s| {
+                s.get_triggers_for_table(child_name).next().is_some()
+            });
+            if has_triggers {
+                return Ok(true);
+            }
+            if check_temp {
+                let has_temp = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+                    s.get_triggers_for_table(child_name).next().is_some()
+                });
+                if has_temp {
+                    return Ok(true);
+                }
+            }
+            worklist.push(fk_ref.child_table);
+        }
+    }
+    Ok(false)
 }
 
 /// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).

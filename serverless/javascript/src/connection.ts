@@ -3,6 +3,7 @@ import { Session, type SessionConfig, type BatchMode } from './session.js';
 import { Statement } from './statement.js';
 import { type QueryOptions } from './protocol.js';
 import { normalizeArgs, splitBindParameters } from './args.js';
+import { createExpandedRow } from './row.js';
 
 export type { BatchMode } from './session.js';
 
@@ -15,6 +16,37 @@ export type BatchStatement = string | {
   sql: string;
   args?: any[] | Record<string, any>;
 };
+
+export interface BatchOptions {
+  mode?: BatchMode;
+  raw?: boolean;
+}
+
+function normalizeBatchOptions(options?: BatchMode | BatchOptions): { mode?: BatchMode; raw: boolean } {
+  if (options != null && typeof options === 'object') {
+    return {
+      mode: options.mode,
+      raw: options.raw === true,
+    };
+  }
+  return {
+    mode: options,
+    raw: false,
+  };
+}
+
+/**
+ * Shapes a raw per-statement result from `session.batch()` into the
+ * libsql-js batch ResultSet shape.
+ */
+function toResultSet(result: any): any {
+  return {
+    columns: result.columns ?? [],
+    columnTypes: result.columnTypes ?? [],
+    rows: result.rows ?? [],
+    rowsAffected: result.rowsAffected ?? 0,
+  };
+}
 
 
 /**
@@ -160,9 +192,7 @@ export class Connection {
       const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
       const row = result.rows[0];
       if (!row) return undefined;
-      const obj: any = {};
-      result.columns.forEach((col: string, i: number) => { obj[col] = row[i]; });
-      return obj;
+      return createExpandedRow(row, result.columns);
     } finally {
       this.execLock.release();
     }
@@ -177,11 +207,7 @@ export class Connection {
     await this.execLock.acquire();
     try {
       const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
-      return result.rows.map((row: any) => {
-        const obj: any = {};
-        result.columns.forEach((col: string, i: number) => { obj[col] = row[i]; });
-        return obj;
-      });
+      return result.rows.map((row: any) => createExpandedRow(row, result.columns));
     } finally {
       this.execLock.release();
     }
@@ -271,8 +297,9 @@ export class Connection {
    *   values as `connection.transaction(...)` variants: `"deferred"`,
    *   `"immediate"`, `"exclusive"`, `"concurrent"`. Ignored when already
    *   inside a transaction.
-   * @returns An object with `rowsAffected` (sum of affected rows) and
-   *   `lastInsertRowid` (rowid of the last successful insert).
+   * @returns An array of `ResultSet`s — one per input statement, in order —
+   *   matching the libsql-js batch contract. Each `ResultSet` carries that
+   *   statement's `columns`, `columnTypes`, `rows`, and `rowsAffected`.
    *
    * @example
    * // Plain SQL strings (non-atomic).
@@ -303,17 +330,28 @@ export class Connection {
    * });
    * await txn.immediate();
    */
-  async batch(statements: BatchStatement[], mode?: BatchMode, queryOptions?: QueryOptions): Promise<any> {
+  async batch(statements: BatchStatement[], options?: BatchMode | BatchOptions, queryOptions?: QueryOptions): Promise<any> {
+    if (!Array.isArray(statements)) {
+      throw new TypeError("Expected first argument to be an array of statements");
+    }
     if (!this.isOpen) {
       throw new TypeError("The database connection is not open");
     }
     await this.execLock.acquire();
     try {
+      const { mode, raw } = normalizeBatchOptions(options);
       // Inside an outer transaction(...) callback the surrounding BEGIN
       // already opened a transaction on this stream; emitting another
       // `BEGIN` step would fail, so ignore the user-supplied mode.
       const effectiveMode = this.session.inTransaction ? undefined : mode;
-      return await this.session.batch(statements, effectiveMode, queryOptions);
+      const results = await this.session.batch(
+        statements,
+        effectiveMode,
+        queryOptions,
+        this.defaultSafeIntegerMode,
+        raw,
+      );
+      return results.map((result: any) => toResultSet(result));
     } finally {
       this.execLock.release();
     }

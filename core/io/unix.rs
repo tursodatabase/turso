@@ -497,7 +497,7 @@ impl File for UnixFile {
             .len())
     }
 
-    #[instrument(err, skip_all, level = Level::INFO)]
+    #[instrument(err, skip_all, level = Level::DEBUG)]
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         let result = self.file.set_len(len);
         match result {

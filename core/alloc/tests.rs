@@ -1,4 +1,11 @@
 use super::*;
+use std::{
+    ptr::NonNull,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc as StdArc,
+    },
+};
 
 struct LowerBoundOnly {
     next: usize,
@@ -18,13 +25,101 @@ impl Iterator for LowerBoundOnly {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, None)
+        (self.end - self.next, None)
+    }
+}
+
+struct UnderreportedLowerBound {
+    next: usize,
+    end: usize,
+}
+
+impl Iterator for UnderreportedLowerBound {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.end {
+            return None;
+        }
+        let value = self.next;
+        self.next += 1;
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        ((self.end - self.next).saturating_sub(1), None)
+    }
+}
+
+struct CountingAlloc {
+    allocations: StdArc<AtomicUsize>,
+}
+
+unsafe impl ApiAllocator for CountingAlloc {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        self.allocations.fetch_add(1, Ordering::Relaxed);
+        <Global as ApiAllocator>::allocate(&Global, layout)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        unsafe {
+            <Global as ApiAllocator>::deallocate(&Global, ptr, layout);
+        }
     }
 }
 
 #[test]
+fn dyn_allocator_delegates_skiplist_allocations() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let alloc = DynAllocator::new(CountingAlloc {
+        allocations: allocations.clone(),
+    });
+    let map: crate::skiplist::SkipMap<i32, i32, _, DynAllocator> =
+        crate::skiplist::SkipMap::new_in(alloc);
+
+    map.try_insert(1, 2).unwrap();
+
+    assert!(allocations.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
+fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let alloc = DynAllocator::new(CountingAlloc {
+        allocations: allocations.clone(),
+    });
+    let io = StdArc::new(crate::MemoryIO::new());
+    let file = crate::IO::open_file(
+        io.as_ref(),
+        "open-with-allocator.db",
+        crate::OpenFlags::Create,
+        true,
+    )
+    .unwrap();
+    let db_file = StdArc::new(crate::storage::database::DatabaseFile::new(file));
+    let db = crate::Database::open_with_flags_with_allocator(
+        io,
+        "open-with-allocator.db",
+        db_file,
+        crate::OpenFlags::default(),
+        crate::DatabaseOpts::new(),
+        None,
+        None,
+        alloc,
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+
+    allocations.store(0, Ordering::Relaxed);
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+    assert!(db.get_mv_store().is_some());
+    assert!(allocations.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
 fn try_extend_accepts_exact_size_iterators() {
-    let mut values = Vec::new();
+    let mut values: Vec<_> = TursoAllocExt::new();
 
     values.try_extend([1, 2, 3]).unwrap();
 
@@ -33,7 +128,7 @@ fn try_extend_accepts_exact_size_iterators() {
 
 #[test]
 fn try_extend_accepts_iterators_without_upper_bounds() {
-    let mut values = Vec::new();
+    let mut values: Vec<_> = TursoAllocExt::new();
 
     values
         .try_extend(LowerBoundOnly { next: 0, end: 3 })
@@ -43,22 +138,32 @@ fn try_extend_accepts_iterators_without_upper_bounds() {
 }
 
 #[test]
-fn hash_map_try_insert_and_extend_reserve_before_mutation() {
-    let mut values: HashMap<&str, usize> = HashMap::default();
+fn try_extend_accepts_underreported_lower_bound_iterators() {
+    let mut values = <Vec<usize> as TursoTryWithCapacityExt>::try_with_capacity_ext(4).unwrap();
 
-    assert_eq!(
-        TursoHashMapExt::try_insert(&mut values, "one", 1).unwrap(),
-        None
-    );
-    assert_eq!(
-        TursoHashMapExt::try_insert(&mut values, "one", 11).unwrap(),
-        Some(1)
-    );
-    values.try_extend([("two", 2), ("three", 3)]).unwrap();
+    values
+        .try_extend(UnderreportedLowerBound { next: 0, end: 4 })
+        .unwrap();
 
-    assert_eq!(values.get("one"), Some(&11));
-    assert_eq!(values.get("two"), Some(&2));
-    assert_eq!(values.get("three"), Some(&3));
+    assert_eq!(values.as_slice(), &[0, 1, 2, 3]);
+}
+
+#[test]
+fn iterator_try_collect_accepts_iterators_without_upper_bounds() {
+    let values: Vec<_> = LowerBoundOnly { next: 0, end: 3 }.try_collect().unwrap();
+
+    assert_eq!(values.as_slice(), &[0, 1, 2]);
+}
+
+#[cfg(nightly)]
+#[test]
+fn vec_try_extend_reserves_before_mutation() {
+    let mut values = self::vec![1];
+
+    let result = values.try_extend(std::iter::repeat(2).take(usize::MAX));
+
+    assert!(result.is_err());
+    assert_eq!(values.as_slice(), &[1]);
 }
 
 #[test]
@@ -109,31 +214,19 @@ fn iterator_try_collect_builds_turso_vec() {
     assert_eq!(values.as_slice(), &[1, 2, 3]);
 }
 
+#[cfg(nightly)]
 #[test]
-fn iterator_try_collect_builds_boxed_slice() {
-    let values: Box<[_]> = [1, 2, 3].into_iter().try_collect().unwrap();
-
-    assert_eq!(&*values, &[1, 2, 3]);
-}
-
-#[test]
-fn try_extend_extends_existing_collection() {
-    let mut values = try_vec![1].unwrap();
-
-    values.try_extend([2, 3]).unwrap();
+fn iterator_try_collect_in_builds_global_vec() {
+    let values: Vec<_, Global> = [1, 2, 3].into_iter().try_collect_in(Global).unwrap();
 
     assert_eq!(values.as_slice(), &[1, 2, 3]);
 }
 
 #[test]
-fn try_vec_macro_builds_turso_vecs() {
-    let empty: Vec<usize> = try_vec![].unwrap();
-    let repeated: Vec<_> = try_vec![7; 3].unwrap();
-    let listed: Vec<_> = try_vec![1, 2, 3].unwrap();
+fn iterator_try_collect_builds_boxed_slice() {
+    let values: Box<[_]> = [1, 2, 3].into_iter().try_collect().unwrap();
 
-    assert!(empty.is_empty());
-    assert_eq!(repeated.as_slice(), &[7, 7, 7]);
-    assert_eq!(listed.as_slice(), &[1, 2, 3]);
+    assert_eq!(&*values, &[1, 2, 3]);
 }
 
 #[test]
@@ -203,21 +296,8 @@ fn iterator_try_collect_converts_result_error() {
 }
 
 #[test]
-fn iterator_try_collect_accepts_try_vec_results() {
-    let values: crate::Result<Vec<_>> = [1usize, 2]
-        .into_iter()
-        .map(|count| try_vec![false; count])
-        .try_collect::<crate::Result<Vec<_>>>()
-        .unwrap();
-    let values = values.unwrap();
-
-    assert_eq!(values[0].as_slice(), &[false]);
-    assert_eq!(values[1].as_slice(), &[false, false]);
-}
-
-#[test]
 fn tuple_try_extend_extends_both_collections() {
-    let mut values: (Vec<_>, VecDeque<_>) = (Vec::new(), VecDeque::new());
+    let mut values: (Vec<_>, VecDeque<_>) = (TursoAllocExt::new(), VecDeque::new());
 
     values
         .try_extend([(1, "one"), (2, "two"), (3, "three")])
@@ -261,6 +341,25 @@ fn iterator_try_unzip_builds_turso_collections() {
 }
 
 #[test]
+fn into_boxed_slice_builds_boxed_slice_alias() {
+    let values: Vec<u32> = self::vec![1, 2, 3];
+
+    let boxed: BoxedSlice<u32> = values.into_boxed_slice();
+
+    assert_eq!(&*boxed, &[1, 2, 3]);
+}
+
+#[test]
+fn slice_try_to_vec_builds_turso_vec() {
+    let slice: &[u8] = &[1, 2, 3];
+
+    let values: Vec<u8> = slice.try_to_vec().unwrap();
+
+    assert_eq!(values.as_slice(), slice);
+    assert!(values.capacity() >= 3);
+}
+
+#[test]
 fn try_with_capacity_builds_turso_collections() {
     let values: Vec<usize> = TursoTryWithCapacityExt::try_with_capacity_ext(3).unwrap();
     let map: HashMap<usize, usize> = TursoTryWithCapacityExt::try_with_capacity_ext(3).unwrap();
@@ -273,51 +372,4 @@ fn try_with_capacity_builds_turso_collections() {
     assert!(set.capacity() >= 3);
     assert!(queue.capacity() >= 3);
     assert!(heap.capacity() >= 3);
-}
-
-#[test]
-fn try_clone_builds_independent_alloc_collections() {
-    let values: Vec<_> = try_vec![1, 2, 3].unwrap();
-    let cloned = values.try_clone().unwrap();
-    assert_eq!(cloned.as_slice(), values.as_slice());
-    assert_ne!(cloned.as_ptr(), values.as_ptr());
-
-    let boxed: Box<_> = TursoTryNewExt::try_new(String::from("turso")).unwrap();
-    let cloned = boxed.try_clone().unwrap();
-    assert_eq!(&*cloned, &*boxed);
-
-    let queue: VecDeque<_> = [1, 2, 3].into_iter().try_collect().unwrap();
-    let mut cloned = queue.try_clone().unwrap();
-    assert_eq!(cloned.pop_front(), Some(1));
-    assert_eq!(cloned.pop_front(), Some(2));
-    assert_eq!(cloned.pop_front(), Some(3));
-
-    let heap: BinaryHeap<_> = [1, 3, 2].into_iter().try_collect().unwrap();
-    let mut cloned = heap.try_clone().unwrap();
-    assert_eq!(cloned.pop(), Some(3));
-    assert_eq!(cloned.pop(), Some(2));
-    assert_eq!(cloned.pop(), Some(1));
-}
-
-#[test]
-fn try_clone_builds_independent_hash_collections() {
-    let map: HashMap<_, _> = [
-        ("one".to_string(), try_vec![1].unwrap()),
-        ("two".to_string(), try_vec![2].unwrap()),
-    ]
-    .into_iter()
-    .try_collect()
-    .unwrap();
-    let set: HashSet<_> = ["one".to_string(), "two".to_string()]
-        .into_iter()
-        .try_collect()
-        .unwrap();
-
-    let cloned_map = map.try_clone().unwrap();
-    let cloned_set = set.try_clone().unwrap();
-
-    assert_eq!(cloned_map.get("one").unwrap().as_slice(), &[1]);
-    assert_eq!(cloned_map.get("two").unwrap().as_slice(), &[2]);
-    assert!(cloned_set.contains("one"));
-    assert!(cloned_set.contains("two"));
 }

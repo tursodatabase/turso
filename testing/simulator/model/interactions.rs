@@ -585,11 +585,13 @@ impl Shadow for InteractionType {
 }
 
 impl InteractionType {
-    pub fn is_ddl(&self) -> bool {
+    /// Statements that, in MVCC mode, require an exclusive transaction and
+    /// are rejected inside BEGIN CONCURRENT. See `Query::requires_exclusive_tx`.
+    pub fn requires_exclusive_tx(&self) -> bool {
         match self {
             InteractionType::Query(query)
             | InteractionType::FsyncQuery(query)
-            | InteractionType::FaultyQuery(query) => query.is_ddl(),
+            | InteractionType::FaultyQuery(query) => query.requires_exclusive_tx(),
             _ => false,
         }
     }
@@ -745,7 +747,7 @@ impl InteractionType {
                         }
                         out.push(r);
                     }
-                    StepResult::IO => {
+                    StepResult::IO | StepResult::Yield => {
                         let syncing = env.io.syncing();
                         if syncing {
                             reopen_database(env);
@@ -786,7 +788,20 @@ impl InteractionType {
                     err
                 );
                 if let Some(turso_core::LimboError::ParseError(e)) = err {
-                    panic!("Unexpected parse error: {e}");
+                    // Cross-connection sequence-schema lag is a benign
+                    // transient: connection A's CREATE SEQUENCE commits;
+                    // connection B picks the seq from the consistent
+                    // model and runs nextval before B's per-connection
+                    // schema reparse has observed A's commit. The model
+                    // and engine are both internally consistent. Let it
+                    // through as a normal error instead of aborting the
+                    // run.
+                    let is_seq_schema_lag =
+                        e.starts_with("sequence \"") && e.contains("does not exist");
+                    if !is_seq_schema_lag {
+                        panic!("Unexpected parse error: {e}");
+                    }
+                    return Err(turso_core::LimboError::ParseError(e));
                 }
                 return Err(err.unwrap());
             }

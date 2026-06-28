@@ -188,7 +188,7 @@ public partial class SqliteConnection
             long longValue => CreateInteger(longValue),
             float floatValue => CreateReal(floatValue),
             double doubleValue => CreateReal(doubleValue),
-            decimal decimalValue => CreateReal((double)decimalValue),
+            decimal decimalValue => CreateText(decimalValue.ToString(CultureInfo.InvariantCulture)),
             byte[] bytes => CreateBlob(bytes),
             _ => CreateText(Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty),
         };

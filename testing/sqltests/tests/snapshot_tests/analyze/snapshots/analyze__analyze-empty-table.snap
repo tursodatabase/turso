@@ -12,7 +12,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode       p1  p2  p3  p4                                               p5  comment
-   0  Init          0  92   0                                                    0  Start at 92
+   0  Init          0  84   0                                                    0  Start at 84
    1  Null          0   1   0                                                    0  r[1]=NULL
    2  CreateBtree   0   2   1                                                    0  r[2]=root iDb=0 flags=1
    3  OpenWrite     0   1   0                                                    0  root=1; iDb=0
@@ -35,82 +35,74 @@ addr  opcode       p1  p2  p3  p4                                               
   20    Next        1  16   0                                                    0
   21  Next          1  16   0                                                    0
   22  OpenRead      2   2   0  k(6,B,B,B,B,B,B)                                  0  =products, root=2, iDb=0
-  23  Count         2  18   0                                                    0
-  24  IfNot        18  31   0                                                    0  if !r[18] goto 31
-  25  Null          0  15   0                                                    0  r[15]=NULL
-  26  Copy         18  16   0                                                    0  r[16]=r[18]
-  27  Cast         16   0   0                                                    0  affinity(r[16]=Text)
-  28  MakeRecord   14   3  17                                                    0  r[17]=mkrec(r[14..16])
-  29  NewRowid      1  13   0                                                    0  r[13]=rowid
-  30  Insert        1  17  13  sqlite_stat1                                      0  intkey=r[13] data=r[17]
-  31  OpenRead      3   5   0  k(2,B)                                            0  =idx_products_price, root=5, iDb=0
-  32  Integer       1  20   0                                                    0  r[20]=1
-  33  Function      0  20  19  stat_init                                         0  r[19]=func(r[20])
-  34  Rewind        3  51   0                                                    0  Rewind  idx_products_price
-  35  Integer       0  20   0                                                    0  r[20]=0
-  36  Goto          0  42   0                                                    0
-  37    Integer     0  20   0                                                    0  r[20]=0
-  38    Column      3   0  22                                                    0  r[22]=idx_products_price.price
-  39    Ne         22  21  42                                                    0  if r[22]!=r[21] goto 42
-  40    Integer     1  20   0                                                    0  r[20]=1
-  41    Goto        0  43   0                                                    0
-  42    Column      3   0  21                                                    0  r[21]=idx_products_price.price
-  43    Function    0  19  19  stat_push                                         0  r[19]=func(r[19..20])
-  44  Next          3  37   0                                                    0
-  45  Function      0  19  23  stat_get                                          0  r[23]=func(r[19])
-  46  IsNull       23  51   0                                                    0  if (r[23]==NULL) goto 51
-  47  Copy         23  26   0                                                    0  r[26]=r[23]
-  48  MakeRecord   24   3  27                                                    0  r[27]=mkrec(r[24..26])
-  49  NewRowid      1  28   0                                                    0  r[28]=rowid
-  50  Insert        1  27  28  sqlite_stat1                                      0  intkey=r[28] data=r[27]
-  51  OpenRead      4   4   0  k(2,B)                                            0  =idx_products_category, root=4, iDb=0
-  52  Integer       1  30   0                                                    0  r[30]=1
-  53  Function      0  30  29  stat_init                                         0  r[29]=func(r[30])
-  54  Rewind        4  71   0                                                    0  Rewind  idx_products_category
-  55  Integer       0  30   0                                                    0  r[30]=0
-  56  Goto          0  62   0                                                    0
-  57    Integer     0  30   0                                                    0  r[30]=0
-  58    Column      4   0  32                                                    0  r[32]=idx_products_category.category
-  59    Ne         32  31  62                                                    0  if r[32]!=r[31] goto 62
-  60    Integer     1  30   0                                                    0  r[30]=1
-  61    Goto        0  63   0                                                    0
-  62    Column      4   0  31                                                    0  r[31]=idx_products_category.category
-  63    Function    0  29  29  stat_push                                         0  r[29]=func(r[29..30])
-  64  Next          4  57   0                                                    0
-  65  Function      0  29  33  stat_get                                          0  r[33]=func(r[29])
-  66  IsNull       33  71   0                                                    0  if (r[33]==NULL) goto 71
-  67  Copy         33  36   0                                                    0  r[36]=r[33]
-  68  MakeRecord   34   3  37                                                    0  r[37]=mkrec(r[34..36])
-  69  NewRowid      1  38   0                                                    0  r[38]=rowid
-  70  Insert        1  37  38  sqlite_stat1                                      0  intkey=r[38] data=r[37]
-  71  OpenRead      5   3   0  k(2,B)                                            0  =idx_products_sku, root=3, iDb=0
-  72  Integer       1  40   0                                                    0  r[40]=1
-  73  Function      0  40  39  stat_init                                         0  r[39]=func(r[40])
-  74  Rewind        5  91   0                                                    0  Rewind  idx_products_sku
-  75  Integer       0  40   0                                                    0  r[40]=0
-  76  Goto          0  82   0                                                    0
-  77    Integer     0  40   0                                                    0  r[40]=0
-  78    Column      5   0  42                                                    0  r[42]=idx_products_sku.sku
-  79    Ne         42  41  82                                                    0  if r[42]!=r[41] goto 82
-  80    Integer     1  40   0                                                    0  r[40]=1
-  81    Goto        0  83   0                                                    0
-  82    Column      5   0  41                                                    0  r[41]=idx_products_sku.sku
-  83    Function    0  39  39  stat_push                                         0  r[39]=func(r[39..40])
-  84  Next          5  77   0                                                    0
-  85  Function      0  39  43  stat_get                                          0  r[43]=func(r[39])
-  86  IsNull       43  91   0                                                    0  if (r[43]==NULL) goto 91
-  87  Copy         43  46   0                                                    0  r[46]=r[43]
-  88  MakeRecord   44   3  47                                                    0  r[47]=mkrec(r[44..46])
-  89  NewRowid      1  48   0                                                    0  r[48]=rowid
-  90  Insert        1  47  48  sqlite_stat1                                      0  intkey=r[48] data=r[47]
-  91  Halt          0   0   0                                                    0
-  92  Transaction   0   2   9                                                    0  iDb=0 tx_mode=Write
-  93  String8       0  11   0  products                                          0  r[11]='products'
-  94  String8       0  14   0  products                                          0  r[14]='products'
-  95  String8       0  24   0  products                                          0  r[24]='products'
-  96  String8       0  25   0  idx_products_price                                0  r[25]='idx_products_price'
-  97  String8       0  34   0  products                                          0  r[34]='products'
-  98  String8       0  35   0  idx_products_category                             0  r[35]='idx_products_category'
-  99  String8       0  44   0  products                                          0  r[44]='products'
- 100  String8       0  45   0  idx_products_sku                                  0  r[45]='idx_products_sku'
- 101  Goto          0   1   0                                                    0
+  23  OpenRead      3   5   0  k(2,B)                                            0  =idx_products_price, root=5, iDb=0
+  24  Integer       1  15   0                                                    0  r[15]=1
+  25  Function      0  15  14  stat_init                                         0  r[14]=func(r[15])
+  26  Rewind        3  43   0                                                    0  Rewind  idx_products_price
+  27  Integer       0  15   0                                                    0  r[15]=0
+  28  Goto          0  34   0                                                    0
+  29    Integer     0  15   0                                                    0  r[15]=0
+  30    Column      3   0  17                                                    0  r[17]=idx_products_price.price
+  31    Ne         17  16  34                                                    0  if r[17]!=r[16] goto 34
+  32    Integer     1  15   0                                                    0  r[15]=1
+  33    Goto        0  35   0                                                    0
+  34    Column      3   0  16                                                    0  r[16]=idx_products_price.price
+  35    Function    0  14  14  stat_push                                         0  r[14]=func(r[14..15])
+  36  Next          3  29   0                                                    0
+  37  Function      0  14  18  stat_get                                          0  r[18]=func(r[14])
+  38  IsNull       18  43   0                                                    0  if (r[18]==NULL) goto 43
+  39  Copy         18  21   0                                                    0  r[21]=r[18]
+  40  MakeRecord   19   3  22                                                    0  r[22]=mkrec(r[19..21])
+  41  NewRowid      1  23   0                                                    0  r[23]=rowid
+  42  Insert        1  22  23  sqlite_stat1                                      0  intkey=r[23] data=r[22]
+  43  OpenRead      4   4   0  k(2,B)                                            0  =idx_products_category, root=4, iDb=0
+  44  Integer       1  25   0                                                    0  r[25]=1
+  45  Function      0  25  24  stat_init                                         0  r[24]=func(r[25])
+  46  Rewind        4  63   0                                                    0  Rewind  idx_products_category
+  47  Integer       0  25   0                                                    0  r[25]=0
+  48  Goto          0  54   0                                                    0
+  49    Integer     0  25   0                                                    0  r[25]=0
+  50    Column      4   0  27                                                    0  r[27]=idx_products_category.category
+  51    Ne         27  26  54                                                    0  if r[27]!=r[26] goto 54
+  52    Integer     1  25   0                                                    0  r[25]=1
+  53    Goto        0  55   0                                                    0
+  54    Column      4   0  26                                                    0  r[26]=idx_products_category.category
+  55    Function    0  24  24  stat_push                                         0  r[24]=func(r[24..25])
+  56  Next          4  49   0                                                    0
+  57  Function      0  24  28  stat_get                                          0  r[28]=func(r[24])
+  58  IsNull       28  63   0                                                    0  if (r[28]==NULL) goto 63
+  59  Copy         28  31   0                                                    0  r[31]=r[28]
+  60  MakeRecord   29   3  32                                                    0  r[32]=mkrec(r[29..31])
+  61  NewRowid      1  33   0                                                    0  r[33]=rowid
+  62  Insert        1  32  33  sqlite_stat1                                      0  intkey=r[33] data=r[32]
+  63  OpenRead      5   3   0  k(2,B)                                            0  =idx_products_sku, root=3, iDb=0
+  64  Integer       1  35   0                                                    0  r[35]=1
+  65  Function      0  35  34  stat_init                                         0  r[34]=func(r[35])
+  66  Rewind        5  83   0                                                    0  Rewind  idx_products_sku
+  67  Integer       0  35   0                                                    0  r[35]=0
+  68  Goto          0  74   0                                                    0
+  69    Integer     0  35   0                                                    0  r[35]=0
+  70    Column      5   0  37                                                    0  r[37]=idx_products_sku.sku
+  71    Ne         37  36  74                                                    0  if r[37]!=r[36] goto 74
+  72    Integer     1  35   0                                                    0  r[35]=1
+  73    Goto        0  75   0                                                    0
+  74    Column      5   0  36                                                    0  r[36]=idx_products_sku.sku
+  75    Function    0  34  34  stat_push                                         0  r[34]=func(r[34..35])
+  76  Next          5  69   0                                                    0
+  77  Function      0  34  38  stat_get                                          0  r[38]=func(r[34])
+  78  IsNull       38  83   0                                                    0  if (r[38]==NULL) goto 83
+  79  Copy         38  41   0                                                    0  r[41]=r[38]
+  80  MakeRecord   39   3  42                                                    0  r[42]=mkrec(r[39..41])
+  81  NewRowid      1  43   0                                                    0  r[43]=rowid
+  82  Insert        1  42  43  sqlite_stat1                                      0  intkey=r[43] data=r[42]
+  83  Halt          0   0   0                                                    0
+  84  Transaction   0   2   9                                                    0  iDb=0 tx_mode=Write
+  85  String8       0  11   0  products                                          0  r[11]='products'
+  86  String8       0  13   0  products                                          0  r[13]='products'
+  87  String8       0  19   0  products                                          0  r[19]='products'
+  88  String8       0  20   0  idx_products_price                                0  r[20]='idx_products_price'
+  89  String8       0  29   0  products                                          0  r[29]='products'
+  90  String8       0  30   0  idx_products_category                             0  r[30]='idx_products_category'
+  91  String8       0  39   0  products                                          0  r[39]='products'
+  92  String8       0  40   0  idx_products_sku                                  0  r[40]='idx_products_sku'
+  93  Goto          0   1   0                                                    0

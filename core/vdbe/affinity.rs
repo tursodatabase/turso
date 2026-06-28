@@ -126,7 +126,7 @@ impl Affinity {
     }
 
     /// Convert affinity to the corresponding Type enum
-    pub fn to_type(&self) -> crate::schema::Type {
+    pub fn to_type(self) -> crate::schema::Type {
         use crate::schema::Type;
         match self {
             Affinity::Blob => Type::Blob,
@@ -277,6 +277,31 @@ impl Affinity {
                 .map(Either::Left),
             Affinity::Text => self.convert(val),
             Affinity::Blob => None,
+        }
+    }
+
+    /// Can an index column with `self` affinity drive a seek for a
+    /// comparison whose resolved affinity is `comparison_aff`?
+    ///
+    /// Port of SQLite's `sqlite3IndexAffinityOk` (src/expr.c).
+    /// The basic idea is: an index can be used if probing it would
+    /// produce the same result as a scan + WHERE filter.
+    ///
+    /// - `Blob`: e.g. `x IS NULL`. No coercion either way. Any index OK.
+    /// - `Text`: e.g. `WHERE txt = 5` (txt TEXT). WHERE coerces `5` to
+    ///   `'5'`. Only a TEXT index's keys are stored as text, so it can
+    ///   match `'5'` directly.
+    /// - `Numeric`: e.g. `WHERE l.txt = r.flag` (l.txt TEXT, r.flag
+    ///   INTEGER). WHERE NUMERIC-coerces both sides: `'6'` → 6, 6 = 6,
+    ///   match. A TEXT-index seek would probe stored text `'6'` with
+    ///   integer 6, but the b-tree comparator orders every integer
+    ///   below every text (INTEGER < TEXT) and finds nothing — opposite
+    ///   answer from the scan. Only a numeric-affinity index is safe.
+    pub fn index_affinity_ok(self, comparison_aff: Affinity) -> bool {
+        match comparison_aff {
+            Affinity::Blob => true,
+            Affinity::Text => matches!(self, Affinity::Text),
+            Affinity::Numeric | Affinity::Integer | Affinity::Real => self.is_numeric(),
         }
     }
 

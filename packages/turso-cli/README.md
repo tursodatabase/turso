@@ -141,7 +141,7 @@ Inside the interactive shell, use `.commands` for database operations:
 |-----------------------|-------------|
 | macOS                 | ARM64, x64  |
 | Linux (glibc)         | ARM64, x64  |
-| Windows               | x64         |
+| Windows               | ARM64, x64  |
 
 ## Links
 

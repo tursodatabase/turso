@@ -70,6 +70,18 @@ export declare class Database {
    */
   totalChanges(): number
   /**
+   * Returns whether the connection is currently inside a transaction.
+   *
+   * This is the inverse of `sqlite3_get_autocommit()`: a connection in
+   * autocommit mode is not in a transaction. It reflects the connection's
+   * real state, including transactions opened with a raw `BEGIN`.
+   *
+   * # Returns
+   *
+   * `true` if a transaction is open, `false` if in autocommit mode.
+   */
+  inTransaction(): boolean
+  /**
    * Closes the database connection.
    *
    * # Returns
@@ -290,6 +302,12 @@ export interface SyncEngineOpts {
   useTransform: boolean
   protocolVersion?: SyncEngineProtocolVersion
   bootstrapIfEmpty: boolean
+  /**
+   * Experimental features to enable on the local database (e.g. "views",
+   * "index_method", "vacuum"). Mirrors the `experimental` option of the
+   * non-sync `Database`.
+   */
+  experimental?: Array<string>
   /** Encryption cipher for the Turso Cloud database. */
   remoteEncryptionCipher?: string
   /**

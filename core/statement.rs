@@ -74,6 +74,217 @@ impl StatementOrigin {
     }
 }
 
+/// Structured type information for a result column.
+///
+/// Returned by [`Statement::get_column_type_info`]. Surfaces the array depth
+/// and custom-type resolution that the SQLite-compat `get_column_decltype`
+/// API does not expose, and also carries the inferred-affinity result for
+/// computed expressions (`SELECT 1+1`, function calls in subqueries, etc.)
+/// — the consumer asks one question, the API decides which path applies.
+///
+/// For a direct table-column reference, `declared_name` is the literal
+/// string the user wrote in CREATE TABLE (`"INTEGER"`, `"cents"`,
+/// `"VARCHAR"`), `array_dimensions` is the bracket depth, and `base_type` /
+/// `kind` carry any CREATE TYPE / CREATE DOMAIN resolution.
+///
+/// For a literal (`SELECT 42`, `SELECT 'x'`, `SELECT 3.14`), `declared_name`
+/// is the primitive that matches the literal's parsed value type
+/// (`"INTEGER"`, `"TEXT"`, `"REAL"`). For a typed expression — CAST, rowid,
+/// or anything else SQLite's affinity rules can pin down — it's the
+/// inferred primitive. In both cases `array_dimensions` is `0`, `base_type`
+/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. When neither path
+/// produces a usable primitive (binary arithmetic that SQLite refuses to
+/// propagate through, BLOB literals, NULL literals, function calls without
+/// declared return affinity), `get_column_type_info` returns `Ok(None)`
+/// rather than fabricating a name — callers can fall through to their own
+/// default.
+///
+/// New fields may be added over time; the struct is marked
+/// `#[non_exhaustive]` so consumers must use struct-update or accessor
+/// patterns rather than exhaustive matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ColumnTypeInfo {
+    /// The declared type name as written in CREATE TABLE — e.g. `"INTEGER"`,
+    /// `"VARCHAR"`, or the name of a `CREATE TYPE` / `CREATE DOMAIN` such as
+    /// `"cents"`. This is the same string `get_column_decltype` returns.
+    pub declared_name: String,
+    /// Array dimensionality: `0` for scalar columns, `1` for `INTEGER[]`,
+    /// `2` for `TEXT[][]`, etc.
+    pub array_dimensions: u32,
+    /// For columns whose declared type resolves to a `CREATE TYPE` or
+    /// `CREATE DOMAIN` definition, this is the underlying primitive type name
+    /// (`"INTEGER"`, `"TEXT"`, `"REAL"`, `"BLOB"`, or `"NUMERIC"`). `None`
+    /// when the declared name is a built-in primitive directly.
+    ///
+    /// Use this to distinguish "the user wrote `INTEGER`" (base_type: `None`)
+    /// from "the user wrote `cents`, which happens to be INTEGER underneath"
+    /// (base_type: `Some("INTEGER")`).
+    pub base_type: Option<String>,
+    /// Classification of the declared type. Distinguishes `BUILTIN` (the
+    /// declared name is a primitive) from the four `CREATE TYPE`/`CREATE
+    /// DOMAIN` flavours.
+    ///
+    /// This matters for callers like wire-protocol layers that need to map
+    /// a column to its native type code: a column declared as a `STRUCT`
+    /// type stores a BLOB on disk (`base_type` is `Some("BLOB")`), but the
+    /// caller usually wants to expose it as a composite/JSON type rather
+    /// than raw bytes. The `kind` field carries that distinction directly
+    /// without forcing the caller to re-query the schema.
+    pub kind: ColumnTypeKind,
+}
+
+/// Classification of a result column's declared type.
+///
+/// Returned as part of [`ColumnTypeInfo`]. `#[non_exhaustive]` so that new
+/// kinds (e.g. for future enum or table-row types) can be added without a
+/// breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ColumnTypeKind {
+    /// A SQLite-style primitive type: `INTEGER`, `TEXT`, `REAL`, `BLOB`,
+    /// `NUMERIC`, `ANY`. The declared name is itself the primitive.
+    Builtin,
+    /// A user- or built-in custom type defined with
+    /// `CREATE TYPE name BASE primitive ENCODE ... DECODE ...`. Has an
+    /// underlying primitive (see `base_type`) and an encode/decode pipeline.
+    /// Built-in types like `uuid`, `boolean`, `numeric` register through
+    /// this path too.
+    Custom,
+    /// A domain defined with `CREATE DOMAIN name AS base [CHECK ...]`.
+    /// Shares an underlying primitive with its base type but adds CHECK
+    /// constraints; values are otherwise identical to the base.
+    Domain,
+    /// A composite type defined with `CREATE TYPE name AS STRUCT(...)`.
+    /// Values are stored as BLOBs containing the packed record; the
+    /// declared name carries the field schema.
+    Struct,
+    /// A tagged union defined with `CREATE TYPE name AS UNION(...)`.
+    /// Values are stored as BLOBs containing a tag and a payload; the
+    /// declared name carries the variant schema.
+    Union,
+}
+
+/// Recursively infer the result primitive of a non-table-column expression
+/// and return its uppercase name (`"INTEGER"`, `"REAL"`, `"TEXT"`,
+/// `"NUMERIC"`, `"BLOB"`) or `None` when no determination can be made.
+///
+/// Used by [`Statement::get_column_type_info`] to give wire-protocol layers
+/// a usable type for `SELECT 1+1`-style result columns. Goes beyond SQLite's
+/// `get_expr_affinity` (which deliberately stops at binary operators because
+/// SQLite's affinity model is about *column* coercion, not expression
+/// inference) by walking through arithmetic, bitwise, comparison, logical,
+/// and concat operators — letting `SELECT 42 + 1` report INT4 to a
+/// PostgreSQL client the way PG itself does.
+fn infer_expression_primitive(
+    expr: &turso_parser::ast::Expr,
+    referenced_tables: Option<&translate::plan::TableReferences>,
+) -> Option<&'static str> {
+    use turso_parser::ast::{Expr, Operator};
+
+    match expr {
+        // Bare literal: read the parsed concrete value type.
+        Expr::Literal(lit) => match translate::alter::literal_default_value(lit)
+            .ok()?
+            .value_type()
+        {
+            crate::types::ValueType::Integer => Some("INTEGER"),
+            crate::types::ValueType::Float => Some("REAL"),
+            crate::types::ValueType::Text => Some("TEXT"),
+            _ => None,
+        },
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            infer_expression_primitive(exprs.first().unwrap(), referenced_tables)
+        }
+        Expr::Collate(inner, _) => infer_expression_primitive(inner, referenced_tables),
+        Expr::Unary(_, inner) => {
+            // Unary +/-/NOT preserve the operand's primitive (NOT on INTEGER
+            // is still INTEGER in SQLite).
+            infer_expression_primitive(inner, referenced_tables)
+        }
+        Expr::Binary(left, op, right) => match op {
+            // Arithmetic: widen INTEGER × INTEGER to INTEGER, anything mixed
+            // with REAL becomes REAL, fall through to NUMERIC otherwise.
+            Operator::Add
+            | Operator::Subtract
+            | Operator::Multiply
+            | Operator::Divide
+            | Operator::Modulus => {
+                let l = infer_expression_primitive(left, referenced_tables);
+                let r = infer_expression_primitive(right, referenced_tables);
+                Some(combine_arithmetic_primitive(l, r))
+            }
+            // Bitwise: result is always INTEGER in both SQLite and PG.
+            Operator::BitwiseAnd
+            | Operator::BitwiseOr
+            | Operator::BitwiseNot
+            | Operator::LeftShift
+            | Operator::RightShift => Some("INTEGER"),
+            // Comparison and logical: SQLite returns 0/1 INTEGER; pgmicro
+            // maps INTEGER to BOOL at the wire layer for boolean columns,
+            // but the type the wire layer reports is still INTEGER here.
+            Operator::Equals
+            | Operator::NotEquals
+            | Operator::Less
+            | Operator::LessEquals
+            | Operator::Greater
+            | Operator::GreaterEquals
+            | Operator::Is
+            | Operator::IsNot
+            | Operator::And
+            | Operator::Or
+            | Operator::ArrayContains
+            | Operator::ArrayOverlap => Some("INTEGER"),
+            // Concat is always TEXT.
+            Operator::Concat => Some("TEXT"),
+            // JSON ops fall through to the affinity machinery — `->` returns
+            // JSON / blob, `->>` returns TEXT; the existing affinity rules
+            // give the correct answer.
+            Operator::ArrowRight | Operator::ArrowRightShift => affinity_to_primitive(
+                translate::expr::get_expr_affinity(expr, referenced_tables, None),
+            ),
+        },
+        Expr::RowId { .. } => Some("INTEGER"),
+        // CAST, column references, and anything else: defer to the affinity
+        // machinery, which handles these shapes correctly.
+        _ => affinity_to_primitive(translate::expr::get_expr_affinity(
+            expr,
+            referenced_tables,
+            None,
+        )),
+    }
+}
+
+/// Map [`crate::vdbe::affinity::Affinity`] to the uppercase primitive name
+/// `infer_expression_primitive` returns. `Blob` collapses to `None` because
+/// SQLite's "no determined affinity" sentinel isn't a usable wire type.
+fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'static str> {
+    match affinity {
+        crate::vdbe::affinity::Affinity::Integer => Some("INTEGER"),
+        crate::vdbe::affinity::Affinity::Real => Some("REAL"),
+        crate::vdbe::affinity::Affinity::Text => Some("TEXT"),
+        crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC"),
+        crate::vdbe::affinity::Affinity::Blob => None,
+    }
+}
+
+/// Pick the widening primitive for an arithmetic binary op given each
+/// operand's inferred primitive. `INTEGER + INTEGER -> INTEGER`,
+/// `INTEGER + REAL -> REAL`, everything else collapses to `NUMERIC` (the
+/// safe wire default for a mixed-affinity numeric result).
+fn combine_arithmetic_primitive(
+    left: Option<&'static str>,
+    right: Option<&'static str>,
+) -> &'static str {
+    match (left, right) {
+        (Some("INTEGER"), Some("INTEGER")) => "INTEGER",
+        (Some("INTEGER"), Some("REAL"))
+        | (Some("REAL"), Some("INTEGER"))
+        | (Some("REAL"), Some("REAL")) => "REAL",
+        _ => "NUMERIC",
+    }
+}
+
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
@@ -297,7 +508,9 @@ impl Statement {
                 .fetch_add(1, Ordering::SeqCst);
             self.counted_as_active_root = true;
         }
-        if matches!(self.state.execution_state, ProgramExecutionState::Init) {
+        if matches!(self.state.execution_state, ProgramExecutionState::Init)
+            && self.origin != StatementOrigin::InternalHelper
+        {
             if self.program.connection.mvcc_enabled() {
                 // MVCC checkpoints can publish internal schema roots without changing
                 // SQLite's schema cookie, so refresh before deciding whether to reprepare.
@@ -419,6 +632,18 @@ impl Statement {
             self.release_active_root_if_counted();
         }
 
+        // If the bytecode aborted between SequenceBeginInnerTx and
+        // SequenceCommitInnerTx, the connection's mv_tx is still pointing
+        // at the orphan inner; subsequent statements (e.g. reparse_schema
+        // SELECTs from _step's own reprepare path) would inherit it and
+        // deadlock in commit_txn's WaitForDependencies. Roll back and
+        // restore the outer eagerly here — reset_internal alone is not
+        // enough because callers do not always reset on error before
+        // running another statement.
+        if res.is_err() {
+            self.cleanup_orphaned_seq_inner_tx();
+        }
+
         res
     }
 
@@ -445,7 +670,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
                     return Err(LimboError::Busy)
@@ -459,7 +684,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
                 vdbe::StepResult::Row => {
                     values.push(self.row().unwrap().get_values().cloned().collect());
                     continue;
@@ -479,7 +704,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => break,
-                vdbe::StepResult::IO => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
                 }
@@ -488,6 +713,65 @@ impl Statement {
             }
         }
         Ok(())
+    }
+
+    /// Non-blocking counterpart of [`Self::run_ignore_rows`]: drives the
+    /// statement to completion, ignoring rows, but instead of pumping IO
+    /// synchronously it yields the pending completion to the caller. Re-invoke
+    /// after the yielded completion finishes; the program resumes at the same
+    /// pc. Rows are discarded.
+    ///
+    /// Used by engine-internal callers that must stay non-blocking (MVCC
+    /// bootstrap/recovery) so they don't call `io.step()` on backends that have
+    /// no synchronous IO pump (e.g. WASM).
+    pub fn run_ignore_rows_nonblock(&mut self) -> Result<crate::IOResult<()>> {
+        loop {
+            match self.step()? {
+                vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
+                vdbe::StepResult::Row => continue,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
+                    let io = self.take_io_completions().unwrap_or_else(|| {
+                        crate::types::IOCompletions::Single(crate::io::Completion::new_yield())
+                    });
+                    return Ok(crate::IOResult::IO(io));
+                }
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+            }
+        }
+    }
+
+    /// Non-blocking counterpart of [`Self::run_with_row_callback`]: drives the
+    /// statement to completion, invoking `func` once per emitted row, but
+    /// yields the pending completion to the caller instead of pumping IO
+    /// synchronously.
+    ///
+    /// Re-entrancy: on an IO yield the program is paused mid-opcode (never
+    /// between emitting a row and this loop observing it), so on re-invocation
+    /// stepping resumes without replaying the last row — every row's `func`
+    /// runs exactly once. Because the runner restarts from the top on each
+    /// re-entry, `func` must append to caller-owned state that persists across
+    /// yields (e.g. a field in the driving state machine), not to a local.
+    pub fn run_with_row_callback_nonblock(
+        &mut self,
+        mut func: impl FnMut(&Row) -> Result<()>,
+    ) -> Result<crate::IOResult<()>> {
+        loop {
+            match self.step()? {
+                vdbe::StepResult::Done => return Ok(crate::IOResult::Done(())),
+                vdbe::StepResult::Row => {
+                    func(self.row().expect("row should be present"))?;
+                }
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
+                    let io = self.take_io_completions().unwrap_or_else(|| {
+                        crate::types::IOCompletions::Single(crate::io::Completion::new_yield())
+                    });
+                    return Ok(crate::IOResult::IO(io));
+                }
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+            }
+        }
     }
 
     /// Blocks execution, advances IO, and stops at any StepResult except IO
@@ -500,7 +784,7 @@ impl Statement {
         let result = loop {
             match self.step()? {
                 vdbe::StepResult::Done => break None,
-                vdbe::StepResult::IO => {
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     pre_io_func()?;
                     self.pager.io.step()?;
                     post_io_func()?;
@@ -773,6 +1057,118 @@ impl Statement {
         }
     }
 
+    /// Returns rich type information for a result column.
+    ///
+    /// This is Turso's single entry point for "what is the type of this
+    /// column?" — covering both **direct table-column references** (where the
+    /// schema carries declared name, array depth, custom-type kind, and the
+    /// resolved primitive) and **computed expressions** (where the SQLite-
+    /// style affinity machinery infers a primitive type from the expression
+    /// shape). One call, one shape, regardless of which path applies.
+    ///
+    /// ### Return value
+    ///
+    /// - `Err(_)` when this connection does not have the experimental
+    ///   custom-types feature enabled. This API is the public surface of the
+    ///   custom-types system; callers must opt in by enabling
+    ///   `--experimental-custom-types` (or `DatabaseOpts::with_custom_types`)
+    ///   before they can rely on it.
+    /// - `Ok(None)` when the statement is in EXPLAIN mode, when `idx` is out
+    ///   of bounds, when the result column has no schema column behind it
+    ///   AND the affinity machinery returns `BLOB` (i.e. "no determined
+    ///   affinity"), or when a join/CTE reference can't be resolved.
+    /// - `Ok(Some(info))` otherwise. For a table-column reference, `info`
+    ///   carries the declared name verbatim; for an expression, `declared_name`
+    ///   is the inferred-affinity primitive (`"INTEGER"`, `"TEXT"`, `"REAL"`,
+    ///   or `"NUMERIC"`) and `kind` is `Builtin`.
+    ///
+    /// This is a Turso-specific API; it has no `sqlite3_*` counterpart. The
+    /// returned struct is `#[non_exhaustive]` so additional metadata can be
+    /// added over time without breaking callers.
+    pub fn get_column_type_info(&self, idx: usize) -> Result<Option<ColumnTypeInfo>> {
+        if !self.program.connection.experimental_custom_types_enabled() {
+            return Err(LimboError::ParseError(
+                "get_column_type_info requires --experimental-custom-types".to_string(),
+            ));
+        }
+        if self.query_mode != QueryMode::Normal {
+            return Ok(None);
+        }
+        let Some(column) = self.program.result_columns.get(idx) else {
+            return Ok(None);
+        };
+        // Direct table-column reference: pull declared name, array depth, and
+        // any registered CREATE TYPE / CREATE DOMAIN resolution out of the
+        // schema. Anything else falls through to the expression-affinity
+        // inference path below.
+        if let turso_parser::ast::Expr::Column {
+            table,
+            column: column_idx,
+            ..
+        } = &column.expr
+        {
+            let Some((_, table_ref)) = self
+                .program
+                .table_references
+                .find_table_by_internal_id(*table)
+            else {
+                return Ok(None);
+            };
+            let Some(table_column) = table_ref.get_column_at(*column_idx) else {
+                return Ok(None);
+            };
+            let declared_name = table_column.ty_str.clone();
+            let array_dimensions = table_column.array_dimensions();
+            let schema = self.program.connection.schema.read();
+            let resolved = schema
+                .resolve_type(&declared_name, table_ref.is_strict())
+                .ok()
+                .flatten();
+            // `kind` is computed from the leaf TypeDef in the resolution chain:
+            // STRUCT and UNION are tagged on `TypeDefKind`, DOMAIN is tagged
+            // separately on `TypeDef.is_domain`, and anything else registered
+            // through CREATE TYPE is a Custom. A column whose declared name
+            // does not appear in the type registry is a Builtin.
+            let (base_type, kind) = match resolved {
+                Some(resolved) => {
+                    let leaf = resolved.leaf();
+                    let kind = if leaf.is_struct() {
+                        ColumnTypeKind::Struct
+                    } else if leaf.is_union() {
+                        ColumnTypeKind::Union
+                    } else if leaf.is_domain {
+                        ColumnTypeKind::Domain
+                    } else {
+                        ColumnTypeKind::Custom
+                    };
+                    (Some(resolved.primitive.to_uppercase()), kind)
+                }
+                None => (None, ColumnTypeKind::Builtin),
+            };
+            drop(schema);
+            return Ok(Some(ColumnTypeInfo {
+                declared_name,
+                array_dimensions,
+                base_type,
+                kind,
+            }));
+        }
+        // Not a table column: infer the result primitive from the
+        // expression's shape (literal value type, operand types of a binary
+        // op, the CAST target, etc.).
+        let Some(name) =
+            infer_expression_primitive(&column.expr, Some(&self.program.table_references))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ColumnTypeInfo {
+            declared_name: name.to_string(),
+            array_dimensions: 0,
+            base_type: None,
+            kind: ColumnTypeKind::Builtin,
+        }))
+    }
+
     /// Returns the type affinity name of a result column (e.g., "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC").
     ///
     /// Unlike `get_column_decltype` which returns the original declared type string,
@@ -844,6 +1240,41 @@ impl Statement {
         self.reset_internal(None, None, false)
     }
 
+    /// If `Insn::SequenceBeginInnerTx` swapped the connection's mv_tx to
+    /// an inner tx and the statement aborted before `SequenceCommitInnerTx`
+    /// could clean it up, roll back the inner and restore the outer
+    /// mv_tx. Otherwise the inner is leaked: it stays in `mv_store.txs`
+    /// (so subsequent `commit_dep_counter` walks may wait on it forever)
+    /// and the connection's mv_tx points to a dead tx, breaking the
+    /// next statement that runs on the connection.
+    fn cleanup_orphaned_seq_inner_tx(&mut self) {
+        let Some(pending) = self.state.sequence_inner_tx_pending.take() else {
+            return;
+        };
+        let conn = self.program.connection.clone();
+        let Some(mv_store) = conn.mv_store_for_db(pending.db) else {
+            return;
+        };
+        if mv_store.is_tx_rollbackable(pending.inner_tx_id) {
+            mv_store.rollback_tx(pending.inner_tx_id, self.pager.clone(), &conn, pending.db);
+        }
+        conn.set_mv_tx_for_db(pending.db, pending.saved_outer);
+        // When the inner tx aborted via the vdbe's catch-all error path
+        // (e.g. DatabaseFull on sequence exhaustion), rollback_current_txn_state
+        // rolled back what mv_tx pointed at — the inner — and set
+        // auto_commit=true under the assumption it was the only live tx.
+        // Restoring mv_tx to the outer without also restoring auto_commit=false
+        // leaves the connection in an inconsistent state where auto_commit=true
+        // but mv_tx points to a live outer tx, which causes subsequent BEGINs
+        // to silently no-op and pins the caller to the outer's stale snapshot.
+        if pending.saved_outer.is_some() {
+            conn.auto_commit.store(false, Ordering::SeqCst);
+        }
+        // The commit-state-machine, if any was in flight, is now dead:
+        // the inner tx it was committing is gone.
+        self.state.sequence_inner_commit = None;
+    }
+
     pub fn reset_best_effort(&mut self) {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.reset())) {
             Ok(Ok(())) => {}
@@ -861,6 +1292,7 @@ impl Statement {
     /// already handled trigger execution tracking. Only resets ProgramState
     /// fields so the subprogram can run again from the beginning.
     pub fn reset_for_subprogram_reuse(&mut self) {
+        self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(None, None);
         self.state
             .n_change
@@ -1001,6 +1433,7 @@ impl Statement {
         if self.counted_as_active_root && !preserve_active_root_count {
             self.release_active_root_if_counted();
         }
+        self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
         self.busy_handler_state = None;
@@ -1084,6 +1517,51 @@ mod tests {
 
         stmt.reset_metrics();
         assert_eq!(stmt.metrics().rows_written, 0);
+    }
+
+    #[test]
+    fn test_run_with_row_callback_nonblock_collects_all_rows() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+            .unwrap();
+
+        let io = conn.db.io.clone();
+        let mut stmt = conn.prepare("SELECT x FROM t ORDER BY x").unwrap();
+
+        // Drive the non-blocking runner via the IOResult loop, exactly as a
+        // state-machine caller would: collect into an accumulator that persists
+        // across yields and wait on each yielded completion.
+        let mut collected: Vec<i64> = Vec::new();
+        loop {
+            let res = stmt
+                .run_with_row_callback_nonblock(|row| {
+                    collected.push(row.get::<i64>(0)?);
+                    Ok(())
+                })
+                .unwrap();
+            match res {
+                crate::IOResult::Done(()) => break,
+                crate::IOResult::IO(c) => c.wait(io.as_ref()).unwrap(),
+            }
+        }
+        assert_eq!(collected, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_run_ignore_rows_nonblock_completes() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+
+        let io = conn.db.io.clone();
+        let mut stmt = conn.prepare("INSERT INTO t VALUES (1), (2)").unwrap();
+        loop {
+            match stmt.run_ignore_rows_nonblock().unwrap() {
+                crate::IOResult::Done(()) => break,
+                crate::IOResult::IO(c) => c.wait(io.as_ref()).unwrap(),
+            }
+        }
+        assert_eq!(stmt.metrics().rows_written, 2);
     }
 
     #[test]

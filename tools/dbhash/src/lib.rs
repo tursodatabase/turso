@@ -126,6 +126,7 @@ fn get_table_names(
                 names.push(name.to_string());
             }
             StepResult::IO => io.step()?,
+            StepResult::Yield => continue,
             StepResult::Done => break,
             StepResult::Busy | StepResult::Interrupt => {
                 return Err(LimboError::Busy);
@@ -161,6 +162,7 @@ fn hash_rows(
                 }
             }
             StepResult::IO => io.step()?,
+            StepResult::Yield => continue,
             StepResult::Done => break,
             StepResult::Busy | StepResult::Interrupt => {
                 return Err(LimboError::Busy);

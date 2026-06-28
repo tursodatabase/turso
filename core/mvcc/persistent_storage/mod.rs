@@ -34,10 +34,10 @@ pub trait DurableStorage: Send + Sync + Debug {
 
     /// Write a transaction to the logical log without advancing the writer offset.
     ///
-    /// If `on_serialization_complete` is provided, it is called with a zero-copy
-    /// reference to the framed bytes and the running CRC after framing but
+    /// If `on_serialization_complete` is provided, it is called with shared
+    /// ownership of the framed bytes and the running CRC after framing but
     /// before the disk write. The callback runs while the internal write lock
-    /// is held, so it should be fast (e.g. memcpy to a side buffer).
+    /// is held, so it should be fast.
     fn log_tx(
         &self,
         m: LogRecord,
@@ -53,8 +53,11 @@ pub trait DurableStorage: Send + Sync + Debug {
 
     /// Called after a logical-log write completed successfully, before the
     /// transaction is made visible by advancing the logical-log offset.
-    fn on_log_write_complete(&self) -> Result<()> {
-        Ok(())
+    ///
+    /// Implementations may return a completion for any additional durability
+    /// work that must finish before commit publication.
+    fn on_log_write_complete(&self) -> Result<Completion> {
+        Ok(Completion::new_yield())
     }
 
     /// Persist the current logical-log header to durable storage.
@@ -89,19 +92,13 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn set_header(&self, header: logical_log::LogHeader);
 
     /// Called when a checkpoint begins, before any rows are written to the B-tree.
-    /// `durable_txid_max` is the transaction watermark that will be durably persisted
-    /// once the checkpoint completes.
-    fn on_checkpoint_start(&self, _durable_txid_max: u64) -> Result<()> {
+    fn on_checkpoint_start(&self) -> Result<()> {
         Ok(())
     }
 
     /// Called after the checkpoint has fully completed: rows are flushed, WAL is
     /// truncated, and the logical log is reset.
-    fn on_checkpoint_end(
-        &self,
-        _durable_txid_max: u64,
-        _result: Result<&CheckpointResult>,
-    ) -> Result<()> {
+    fn on_checkpoint_end(&self, _result: Result<&CheckpointResult>) -> Result<()> {
         Ok(())
     }
 

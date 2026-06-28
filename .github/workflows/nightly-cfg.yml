@@ -1,0 +1,51 @@
+name: Nightly cfg
+
+# Checks that core still compiles with `--cfg nightly`, where the
+# crate::alloc aliases become real allocator-parametric collections
+# (Vec<T, TursoAllocator>) instead of std type aliases. Stable builds
+# cannot catch mixups between std and allocator collections because the
+# types are identical there.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+
+jobs:
+  nightly-cfg-check:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # Pinned so upstream nightly regressions can't break this job
+          # independently of our changes; bump deliberately when needed.
+          toolchain: nightly-2025-12-17
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache from the stable v1-rust caches: nightly rustc
+          # artifacts are not interchangeable with stable ones and would
+          # otherwise evict/thrash the stable cache entries.
+          prefix-key: "v1-rust-nightly-cfg"
+          cache-on-failure: true
+      - uses: "./.github/shared/setup-sccache"
+      - name: Check core with the nightly allocator cfg
+        env:
+          RUSTFLAGS: "--cfg nightly"
+        # The explicit toolchain bypasses the rust-toolchain.toml stable pin.
+        # --all-targets so cfg(test) code is covered too.
+        run: cargo +nightly-2025-12-17 check -p turso_core --all-targets --locked

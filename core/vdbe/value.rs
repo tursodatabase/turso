@@ -506,7 +506,11 @@ impl Value {
             if p1 < 0 {
                 p1 = p1.wrapping_add(len);
                 if p1 < 0 {
-                    p2 = p2.wrapping_add(p1);
+                    if p2 < 0 {
+                        p2 = 0;
+                    } else {
+                        p2 += p1;
+                    }
                     p1 = 0;
                 }
             } else if p1 > 0 {
@@ -1142,7 +1146,7 @@ impl Value {
 
     pub fn exec_concat(&self, rhs: &Value) -> Value {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
-            return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat().to_vec());
+            return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat());
         }
 
         let Some(lhs) = self.cast_text() else {
@@ -2826,6 +2830,15 @@ mod tests {
         let start_value = Value::from_i64(10);
         let length_value = Value::Null;
         let expected_val = Value::Null;
+        assert_eq!(
+            Value::exec_substring(&str_value, &start_value, Some(&length_value)),
+            expected_val
+        );
+
+        let str_value = Value::build_text("limbo");
+        let start_value = Value::from_i64(-7_096_519_388_852_014_892);
+        let length_value = Value::from_i64(-4_829_175_794_346_763_833);
+        let expected_val = Value::build_text("");
         assert_eq!(
             Value::exec_substring(&str_value, &start_value, Some(&length_value)),
             expected_val

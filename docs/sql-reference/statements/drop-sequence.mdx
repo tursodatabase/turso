@@ -1,0 +1,81 @@
+---
+title: DROP SEQUENCE
+description: Remove a named sequence generator from the database
+sidebarTitle: DROP SEQUENCE
+---
+
+# DROP SEQUENCE
+
+<Info>
+**Turso Extension**: DROP SEQUENCE is a Turso-specific statement not available in standard SQLite.
+</Info>
+
+The DROP SEQUENCE statement removes a sequence object from the database. Once dropped, the sequence name can no longer be used with `nextval()`, `currval()`, or `setval()`.
+
+## Syntax
+
+```sql
+DROP SEQUENCE [IF EXISTS] [schema-name.]sequence-name;
+```
+
+## Description
+
+DROP SEQUENCE removes the named sequence from the database schema. The sequence must exist unless the `IF EXISTS` clause is specified.
+
+### Clauses
+
+| Clause | Description |
+|--------|-------------|
+| `IF EXISTS` | Suppresses the error that would occur if the sequence does not exist. The statement is a no-op when the sequence is not found. |
+| `schema-name` | The name of an attached database. Defaults to the main database if omitted. |
+| `sequence-name` | The name of the sequence to remove. |
+
+## Examples
+
+### Drop a Sequence
+
+```sql
+CREATE SEQUENCE my_seq;
+SELECT nextval('my_seq');
+-- 1
+
+DROP SEQUENCE my_seq;
+
+SELECT nextval('my_seq');
+-- Error: sequence "my_seq" does not exist
+```
+
+### Drop with IF EXISTS
+
+```sql
+-- Safe to run even if the sequence does not exist
+DROP SEQUENCE IF EXISTS nonexistent;
+```
+
+### Recreate After Drop
+
+Dropping and recreating a sequence resets it to its initial state:
+
+```sql
+CREATE SEQUENCE counter;
+SELECT nextval('counter');
+-- 1
+SELECT nextval('counter');
+-- 2
+
+DROP SEQUENCE counter;
+CREATE SEQUENCE counter;
+
+SELECT nextval('counter');
+-- 1
+```
+
+## Errors
+
+| Error | Cause |
+|-------|-------|
+| `sequence "name" does not exist` | No sequence with that name exists and `IF EXISTS` was not specified. |
+
+## See Also
+
+- [CREATE SEQUENCE](/docs/sql-reference/statements/create-sequence) for defining sequences

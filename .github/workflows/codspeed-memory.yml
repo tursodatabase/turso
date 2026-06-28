@@ -1,0 +1,106 @@
+# Memory benchmarks measured with CodSpeed's memory instrument (eBPF
+# allocation tracking: peak memory, total allocated, allocation count).
+#
+# The bench binary is built once, then each workload profile runs in its own
+# sharded job for speed, following the pattern used by astral-sh/ruff and
+# webpack (see https://codspeed.io/docs and their sharded-benchmarks docs).
+# CodSpeed aggregates shards that run within the same workflow.
+name: CodSpeed Memory
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write # required for OIDC authentication with CodSpeed
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-codspeed-memory"
+          cache-on-failure: true
+
+      - uses: "./.github/shared/setup-sccache"
+
+      - name: Install cargo-codspeed
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed
+
+      - name: Build memory benchmarks
+        run: cargo codspeed build -m memory -p memory-benchmark-codspeed --features codspeed
+
+      - name: Upload benchmark binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: codspeed-memory-binary
+          compression-level: 1
+          path: target/codspeed
+          if-no-files-found: "error"
+          retention-days: 1
+
+  run:
+    name: "memory benchmarks (${{ matrix.workload }})"
+    runs-on: ubuntu-24.04
+    needs: build
+    timeout-minutes: 30
+    # Allow this job to fail without failing the entire CI run
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        # One shard per workload profile; each shard runs the WAL and MVCC
+        # variants of that workload (benchmarks are named "<mode>/<workload>"
+        # and the filter is a regex over benchmark names).
+        workload:
+          - insert-heavy
+          - read-heavy
+          - mixed
+          - scan-heavy
+          - series-blob
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Install cargo-codspeed
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed
+
+      - name: Download benchmark binary
+        uses: actions/download-artifact@v4
+        with:
+          name: codspeed-memory-binary
+          path: target/codspeed
+
+      - name: Restore binary permissions
+        # artifacts do not preserve the executable bit
+        run: find target/codspeed -type f -exec chmod +x {} +
+
+      - name: Run memory benchmarks
+        uses: CodSpeedHQ/action@v4.17.0
+        with:
+          mode: memory
+          run: cargo codspeed run -m memory -p memory-benchmark-codspeed --bench memory_profiles "${{ matrix.workload }}"

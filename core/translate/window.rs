@@ -1,3 +1,4 @@
+use crate::alloc::TursoSliceExt;
 use crate::function::AccumulatorFunc;
 use crate::schema::{BTreeCharacteristics, BTreeTable, Table};
 use crate::sync::Arc;
@@ -130,7 +131,12 @@ fn prepare_window_subquery(
         return Ok(());
     }
 
-    let mut current_window = windows.swap_remove(0);
+    // Layer windows in their declaration order: the first-declared window
+    // becomes the outermost subquery (its PARTITION/ORDER drives the
+    // user-visible row order), and later-declared windows nest deeper. Each
+    // window function evaluates against rows in its own layer's order, so
+    // the relative position of unordered windows like `OVER ()` matters.
+    let mut current_window = windows.remove(0);
     let mut subquery_result_columns = Vec::new();
     let mut subquery_order_by = Vec::new();
     let subquery_id = program.table_reference_counter.next();
@@ -573,7 +579,10 @@ impl EmitWindow {
                     src_table.table
                 );
             };
-        let src_columns = src_table.columns().to_vec();
+        let src_columns = src_table
+            .columns()
+            .try_to_vec()
+            .expect("TODO: fallible allocations");
         let src_column_count = src_columns.len();
         let window_name = window.name.clone().expect("window name is missing");
         let partition_by_len = window
@@ -590,12 +599,12 @@ impl EmitWindow {
             //  as-is for now. Ideally, there should be a way to mark tables as ephemeral so
             //  they can be handled differently from regular tables.
             format!("buffer_table_{window_name}"),
-            vec![],
+            crate::alloc::vec![],
             src_columns,
             BTreeCharacteristics::HAS_ROWID,
-            vec![],
-            vec![],
-            vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         ));
         let cursor_buffer_read =

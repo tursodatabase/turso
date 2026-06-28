@@ -1,0 +1,164 @@
+@database :memory:
+
+# SQL-standard math and string functions present in PG, MySQL, Oracle but
+# not in SQLite. Each test pins one canonical behavior; overflow/NULL paths
+# are covered in the Rust unit tests next to each function.
+
+# -----------------------------------------------------------------------------
+# gcd(a, b)
+# -----------------------------------------------------------------------------
+
+test gcd-basic {
+    SELECT gcd(12, 8);
+    SELECT gcd(0, 7);
+    SELECT gcd(7, 0);
+    SELECT gcd(0, 0);
+}
+expect {
+    4
+    7
+    7
+    0
+}
+
+test gcd-negative-operands {
+    SELECT gcd(-12, 8);
+    SELECT gcd(-12, -8);
+    SELECT gcd(12, -8);
+}
+expect {
+    4
+    4
+    4
+}
+
+test gcd-null {
+    SELECT gcd(NULL, 5) IS NULL;
+    SELECT gcd(5, NULL) IS NULL;
+    SELECT gcd(NULL, NULL) IS NULL;
+}
+expect {
+    1
+    1
+    1
+}
+
+# -----------------------------------------------------------------------------
+# lcm(a, b)
+# -----------------------------------------------------------------------------
+
+test lcm-basic {
+    SELECT lcm(4, 6);
+    SELECT lcm(2, 3);
+    SELECT lcm(0, 5);
+    SELECT lcm(5, 0);
+}
+expect {
+    12
+    6
+    0
+    0
+}
+
+test lcm-negative-operands {
+    SELECT lcm(-4, 6);
+    SELECT lcm(-4, -6);
+}
+expect {
+    12
+    12
+}
+
+test lcm-null {
+    SELECT lcm(NULL, 5) IS NULL;
+    SELECT lcm(5, NULL) IS NULL;
+}
+expect {
+    1
+    1
+}
+
+# -----------------------------------------------------------------------------
+# repeat(string, n)
+# -----------------------------------------------------------------------------
+
+test repeat-basic {
+    SELECT repeat('ab', 3);
+    SELECT repeat('x', 0);
+    SELECT repeat('x', -1);
+    SELECT repeat('', 5);
+}
+expect {
+    ababab
+
+
+
+}
+
+test repeat-null {
+    SELECT repeat(NULL, 3) IS NULL;
+    SELECT repeat('x', NULL) IS NULL;
+}
+expect {
+    1
+    1
+}
+
+# -----------------------------------------------------------------------------
+# lpad / rpad
+# -----------------------------------------------------------------------------
+
+test lpad-default-fill {
+    SELECT '|' || lpad('abc', 6) || '|';
+}
+expect {
+    |   abc|
+}
+
+test lpad-custom-fill {
+    SELECT '|' || lpad('abc', 6, 'xy') || '|';
+}
+expect {
+    |xyxabc|
+}
+
+test rpad-default-fill {
+    SELECT '|' || rpad('abc', 6) || '|';
+}
+expect {
+    |abc   |
+}
+
+test rpad-custom-fill {
+    SELECT '|' || rpad('abc', 6, 'xy') || '|';
+}
+expect {
+    |abcxyx|
+}
+
+test pad-truncates-when-too-long {
+    SELECT lpad('abcdef', 3);
+    SELECT rpad('abcdef', 3);
+}
+expect {
+    abc
+    abc
+}
+
+test pad-empty-fill-returns-input {
+    SELECT lpad('abc', 10, '');
+    SELECT rpad('abc', 10, '');
+}
+expect {
+    abc
+    abc
+}
+
+test pad-zero-length-returns-empty {
+    SELECT lpad('abc', 0);
+    SELECT rpad('abc', 0);
+}
+expect {
+
+
+}

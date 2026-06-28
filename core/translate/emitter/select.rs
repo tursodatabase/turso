@@ -452,7 +452,7 @@ pub(crate) fn emit_materialized_build_inputs(
         };
         let internal_id = program.table_reference_counter.next();
         let columns = match &spec.mode {
-            MaterializedBuildInputMode::RowidOnly => vec![build_rowid_column()],
+            MaterializedBuildInputMode::RowidOnly => crate::alloc::vec![build_rowid_column()],
             MaterializedBuildInputMode::KeyPayload {
                 num_keys,
                 payload_columns,
@@ -461,12 +461,12 @@ pub(crate) fn emit_materialized_build_inputs(
         let ephemeral_table = Arc::new(BTreeTable::new(
             0,
             format!("hash_build_input_{internal_id}"),
-            vec![],
+            crate::alloc::vec![],
             columns,
             BTreeCharacteristics::HAS_ROWID,
-            vec![],
-            vec![],
-            vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         ));
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
@@ -737,8 +737,11 @@ fn collect_materialized_payload_columns(
 fn build_materialized_input_columns(
     num_keys: usize,
     payload_columns: &[MaterializedColumnRef],
-) -> Vec<Column> {
-    let mut columns = Vec::with_capacity(num_keys + payload_columns.len());
+) -> crate::alloc::Vec<Column> {
+    let mut columns = crate::alloc::vec![];
+    columns
+        .try_reserve(num_keys + payload_columns.len())
+        .expect("TODO: fallible allocations");
     for i in 0..num_keys {
         columns.push(Column::new_default_text(
             Some(format!("key_{i}")),

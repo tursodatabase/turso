@@ -31,6 +31,14 @@ pub struct QueryProfile {
     pub drop_index: u32,
     #[garde(skip)]
     pub pragma_weight: u32,
+    #[garde(skip)]
+    pub create_sequence_weight: u32,
+    #[garde(skip)]
+    pub drop_sequence_weight: u32,
+    #[garde(skip)]
+    pub nextval_weight: u32,
+    #[garde(skip)]
+    pub setval_weight: u32,
 }
 
 impl Default for QueryProfile {
@@ -48,6 +56,10 @@ impl Default for QueryProfile {
             alter_table_weight: 2,
             drop_index: 2,
             pragma_weight: 2,
+            create_sequence_weight: 3,
+            drop_sequence_weight: 1,
+            nextval_weight: 10,
+            setval_weight: 2,
         }
     }
 }
@@ -65,6 +77,10 @@ impl QueryProfile {
             + self.alter_table_weight
             + self.drop_index
             + self.pragma_weight
+            + self.create_sequence_weight
+            + self.drop_sequence_weight
+            + self.nextval_weight
+            + self.setval_weight
     }
 }
 

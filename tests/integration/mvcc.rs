@@ -64,7 +64,9 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
     fn log_tx(
         &self,
         m: turso_core::mvcc::database::LogRecord,
-        on_serialization_complete: Option<&dyn Fn(&[u8], u32) -> turso_core::Result<()>>,
+        on_serialization_complete: Option<
+            &dyn Fn(turso_core::SharedBufferData, u32) -> turso_core::Result<()>,
+        >,
     ) -> turso_core::Result<(turso_core::Completion, u64)> {
         self.used_log_tx
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -237,7 +239,7 @@ fn test_newrowid_mvcc_concurrent(tmp_db: TempDatabase) -> anyhow::Result<()> {
                 'retry: loop {
                     loop {
                         match stmt.step()? {
-                            StepResult::IO => {
+                            StepResult::IO | StepResult::Yield => {
                                 stmt._io().step()?;
                             }
                             StepResult::Done => {
@@ -553,6 +555,56 @@ fn test_drop_cleans_up_mvcc_transactions(tmp_db: TempDatabase) -> anyhow::Result
 
     let rows: Vec<(i64,)> = conn2.exec_rows("SELECT x FROM aux.t");
     assert_eq!(rows, vec![(2,)], "Only post-drop insert should be visible");
+
+    Ok(())
+}
+
+/// `PRAGMA aux.wal_checkpoint(TRUNCATE)` on an attached MVCC database must use
+/// the *attached* database's schema, not the main database's. Otherwise the
+/// `CheckpointStateMachine`'s `index_id_to_index` map is built from the wrong
+/// indexes and the WriteRow phase either misses index updates or trips on
+/// table-id lookups that don't exist in the wrong schema.
+///
+/// Regression: `CheckpointStateMachine::new` used to unconditionally call
+/// `connection.db.clone_schema()` (the main DB's schema), so an attached DB
+/// whose schema diverged from main — here, aux has an indexed table that main
+/// doesn't — would checkpoint with the wrong index set.
+#[turso_macros::test]
+fn test_mvcc_qualified_checkpoint_uses_attached_db_schema(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+
+    let aux_path = tmp_db.path.with_extension("aux_qualified_ckpt.db");
+    create_mvcc_db(&tmp_db.io, &aux_path)?;
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+
+    // Schema divergence: aux carries an indexed table that main does not. If
+    // checkpoint pulls the schema from main, this index is invisible and the
+    // checkpoint either skips updating it or panics on a missing table id.
+    conn.execute("CREATE TABLE aux.indexed_t(id INTEGER PRIMARY KEY, val INTEGER)")?;
+    conn.execute("CREATE INDEX aux.idx_indexed_t_val ON indexed_t(val)")?;
+
+    for i in 0..32 {
+        conn.execute(format!(
+            "INSERT INTO aux.indexed_t VALUES ({i}, {})",
+            i * 10
+        ))?;
+    }
+
+    // Should complete without panicking. The pre-fix panic was
+    // "checkpoint index struct missing before BTreeCreateIndex" — the
+    // CheckpointStateMachine built its index_id_to_index from the main DB's
+    // schema, which doesn't contain aux's index, so a WriteRow phase referencing
+    // aux's index tripped on the missing entry.
+    let rows = conn.pragma_query("aux.wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(
+        rows.len(),
+        1,
+        "wal_checkpoint(TRUNCATE) should return exactly one row"
+    );
 
     Ok(())
 }

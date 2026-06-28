@@ -81,6 +81,9 @@ struct Args {
     /// Probability of restarting the full worker cohort per step (multiprocess mode only)
     #[arg(long, default_value_t = 0.0)]
     restart_probability: f64,
+    /// Probability of failing a scoped Turso allocation while stepping a statement.
+    #[arg(long, default_value_t = 0.05)]
+    allocation_fault_probability: f64,
     /// Stream multiprocess operation/lifecycle history as JSONL for deterministic debugging
     #[arg(long)]
     history_output: Option<PathBuf>,
@@ -196,6 +199,13 @@ fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     if args.restart_probability > 0.0 {
         println!("restart_probability = {}", args.restart_probability);
     }
+    if args.allocation_fault_probability > 0.0 {
+        println!(
+            "allocation fault injection disabled in multiprocess mode \
+             (requested probability = {})",
+            args.allocation_fault_probability
+        );
+    }
     if let Some(path) = &args.history_output {
         println!("history_output = {}", path.display());
     }
@@ -249,6 +259,12 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     if opts.cosmic_ray_probability > 0.0 {
         println!("cosmic ray probability = {}", opts.cosmic_ray_probability);
     }
+    if opts.allocation_fault_probability > 0.0 {
+        println!(
+            "allocation fault probability = {}",
+            opts.allocation_fault_probability
+        );
+    }
 
     let reopen_probability = args.reopen_probability.unwrap_or(opts.reopen_probability);
 
@@ -262,13 +278,21 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     println!("{}", progress_stages[progress_index]);
     progress_index += 1;
 
+    let mut loop_err: Option<anyhow::Error> = None;
     while !whopper.is_done() {
         if whopper.rng.random_bool(reopen_probability) {
-            whopper.reopen().unwrap();
+            if let Err(e) = whopper.reopen() {
+                loop_err = Some(e);
+                break;
+            }
         }
-        match whopper.step()? {
-            StepResult::Ok => {}
-            StepResult::WalSizeLimitExceeded => break,
+        match whopper.step() {
+            Ok(StepResult::Ok) => {}
+            Ok(StepResult::WalSizeLimitExceeded) => break,
+            Err(e) => {
+                loop_err = Some(e);
+                break;
+            }
         }
 
         if progress_interval > 0 && whopper.current_step % progress_interval == 0 {
@@ -279,10 +303,24 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         }
     }
 
-    whopper.finalize_properties()?;
+    let prop_result = if loop_err.is_none() {
+        whopper.finalize_properties()
+    } else {
+        Ok(())
+    };
 
     if args.dump_db {
-        whopper.dump_db_files()?;
+        let _ = whopper.dump_db_files();
+    }
+
+    if let Some(e) = loop_err {
+        return Err(e);
+    }
+    prop_result?;
+
+    let allocation_faults = whopper.allocation_fault_count();
+    if allocation_faults > 0 {
+        println!("\n{allocation_faults} allocation faults injected");
     }
 
     if args.elle.is_some() {
@@ -359,6 +397,16 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             (15, Box::new(DeleteWorkload)),
             (2, Box::new(CreateIndexWorkload)),
             (2, Box::new(DropIndexWorkload)),
+            (5, Box::new(CreateSequenceWorkload)),
+            (15, Box::new(NextValWorkload)),
+            (5, Box::new(CurrValWorkload)),
+            (5, Box::new(SetValWorkload)),
+            (2, Box::new(DropSequenceWorkload)),
+            (3, Box::new(CreateTableWithSeqDefaultWorkload)),
+            (8, Box::new(InsertSeqDefaultWorkload)),
+            (10, Box::new(AutoincInsertWorkload)),
+            (5, Box::new(AutoincUpdateRowidWorkload)),
+            (3, Box::new(AutoincDeleteWorkload)),
             (30, Box::new(BeginWorkload)),
             (10, Box::new(CommitWorkload)),
             (10, Box::new(RollbackWorkload)),
@@ -367,6 +415,8 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
         let p: Vec<Box<dyn Property>> = vec![
             Box::new(IntegrityCheckProperty),
             Box::new(SimpleKeysDoNotDisappear::new()),
+            Box::new(SequenceCorrectnessProperty::new()),
+            Box::new(AutoincWatermarkMonotonicity::new()),
         ];
 
         (w, p, vec![], vec![])
@@ -407,7 +457,8 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_elle_tables(elle_tables)
         .with_workloads(workloads)
         .with_properties(properties)
-        .with_chaotic_profiles(chaotic_profiles);
+        .with_chaotic_profiles(chaotic_profiles)
+        .with_allocation_fault_probability(args.allocation_fault_probability);
 
     Ok(opts)
 }
@@ -417,8 +468,12 @@ fn format_stats(stats: &turso_whopper::Stats, elle_mode: bool) -> String {
         format!("{}/{}", stats.elle_writes, stats.elle_reads)
     } else {
         format!(
-            "{}/{}/{}/{}",
-            stats.inserts, stats.updates, stats.deletes, stats.integrity_checks
+            "{}/{}/{}/{}/{}",
+            stats.inserts,
+            stats.updates,
+            stats.deletes,
+            stats.integrity_checks,
+            stats.sequence_nextvals
         )
     }
 }
@@ -428,7 +483,7 @@ fn progress_art(elle_mode: bool) -> [&'static str; 11] {
         if elle_mode {
             "       .             W/R"
         } else {
-            "       .             I/U/D/C"
+            "       .             I/U/D/C/S"
         },
         "       .             ",
         "       .             ",

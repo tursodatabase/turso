@@ -34,6 +34,7 @@ pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
 pub(crate) mod select;
+pub(crate) mod sequence;
 pub(crate) mod stmt_journal;
 pub(crate) mod subquery;
 pub(crate) mod transaction;
@@ -56,7 +57,7 @@ use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
-use index::{translate_create_index, translate_drop_index, translate_optimize};
+use index::{translate_create_index, translate_drop_index, translate_optimize, translate_reindex};
 use insert::translate_insert;
 use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
@@ -155,10 +156,11 @@ pub fn translate_inner(
             | ast::Stmt::DropType { .. }
             | ast::Stmt::DropDomain { .. }
             | ast::Stmt::DropView { .. }
-            | ast::Stmt::Reindex { .. }
             | ast::Stmt::Optimize { .. }
             | ast::Stmt::Update { .. }
             | ast::Stmt::Insert { .. }
+            | ast::Stmt::CreateSequence { .. }
+            | ast::Stmt::DropSequence { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -241,14 +243,26 @@ pub fn translate_inner(
             view_name,
             select,
             columns,
+            if_not_exists,
             ..
-        } => view::translate_create_view(&view_name, resolver, &select, &columns, program)?,
+        } => view::translate_create_view(
+            &view_name,
+            resolver,
+            &select,
+            &columns,
+            if_not_exists,
+            program,
+        )?,
         ast::Stmt::CreateMaterializedView {
-            view_name, select, ..
+            view_name,
+            select,
+            if_not_exists,
+            ..
         } => view::translate_create_materialized_view(
             &view_name,
             resolver,
             &select,
+            if_not_exists,
             connection.clone(),
             program,
         )?,
@@ -356,7 +370,7 @@ pub fn translate_inner(
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
-        ast::Stmt::Reindex { .. } => bail_parse_error!("REINDEX not supported yet"),
+        ast::Stmt::Reindex { name } => translate_reindex(name, resolver, program, connection)?,
         ast::Stmt::Optimize { idx_name } => {
             translate_optimize(idx_name, resolver, program, connection)?
         }
@@ -404,6 +418,33 @@ pub fn translate_inner(
             program,
             connection,
         )?,
+        ast::Stmt::CreateSequence {
+            if_not_exists,
+            seq_name,
+            start,
+            increment,
+            min_value,
+            max_value,
+            cycle,
+        } => {
+            sequence::translate_create_sequence(
+                &seq_name,
+                if_not_exists,
+                &start,
+                &increment,
+                &min_value,
+                &max_value,
+                cycle,
+                resolver,
+                program,
+            )?;
+        }
+        ast::Stmt::DropSequence {
+            if_exists,
+            seq_name,
+        } => {
+            sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
+        }
     };
 
     // Indicate write operations so that in the epilogue we can emit the correct type of transaction
@@ -452,6 +493,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::Update { .. } => "update",
         ast::Stmt::Vacuum { .. } => "vacuum",
         ast::Stmt::Optimize { .. } => "optimize",
+        ast::Stmt::CreateSequence { .. } => "create_sequence",
+        ast::Stmt::DropSequence { .. } => "drop_sequence",
     }
 }
 

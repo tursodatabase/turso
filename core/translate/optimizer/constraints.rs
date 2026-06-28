@@ -3,16 +3,23 @@ use crate::{
     schema::{Column, Index, Schema},
     translate::{
         collate::get_collseq_from_expr,
-        expr::{as_binary_components, comparison_affinity, walk_expr_mut, WalkControl},
+        expr::{
+            as_binary_components, comparison_affinity, get_expr_affinity, unwrap_parens,
+            walk_expr_mut, WalkControl,
+        },
         expression_index::normalize_expr_for_index_matching,
         plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences, WhereTerm},
-        planner::{break_predicate_at_and_boundaries, table_mask_from_expr, TableMask, ROWID_STRS},
+        planner::{
+            break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
+            TableMask, ROWID_STRS,
+        },
     },
     util::exprs_are_equivalent,
     vdbe::affinity::Affinity,
     Result,
 };
 use crate::{turso_assert, turso_debug_assert};
+use smallvec::SmallVec;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
@@ -70,6 +77,18 @@ pub struct Constraint {
     /// Whether this constraint references the implicit rowid (tables without an INTEGER PRIMARY KEY alias).
     /// When true and `table_col_pos` is None, this constraint targets the rowid pseudo-column.
     pub is_rowid: bool,
+    /// The constraint's resolved comparison affinity, as defined by SQLite's
+    /// `comparisonAffinity` in `expr.c`. Cached at construction time so the
+    /// `sqlite3IndexAffinityOk` check can run without re-resolving the
+    /// WhereTerm at every index-selection callsite.
+    ///
+    /// `None` for forms whose comparison affinity has no single resolved value:
+    /// FTS MATCH and virtual-table push-downs (operators outside SQLite's
+    /// comparison set), and row-value IN (`(a,b) IN (...)`, which SQLite
+    /// handles per-LHS-column via `sqlite3VectorFieldSubexpr` — Turso does
+    /// not yet plumb per-column affinity into the index-selection path, so
+    /// such constraints fall through to scans).
+    pub comparison_affinity: Option<Affinity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,8 +137,7 @@ impl Constraint {
             panic!("Expected a valid binary expression");
         };
         let mut affinity = Affinity::Blob;
-        if op.as_ast_operator().is_some_and(|op| op.is_comparison()) && self.table_col_pos.is_some()
-        {
+        if op.as_ast_operator().is_some_and(|op| op.is_comparison()) {
             affinity = comparison_affinity(lhs, rhs, referenced_tables, None);
         }
 
@@ -159,6 +177,35 @@ impl Constraint {
         } else {
             rhs
         }
+    }
+
+    /// Returns true when an index column with affinity `idx_aff` can satisfy
+    /// this constraint per SQLite's `sqlite3IndexAffinityOk`. Constraints
+    /// whose form has no SQLite-defined comparison affinity (FTS MATCH,
+    /// virtual-table push-downs, row-value IN) carry `None` and bypass the
+    /// check — those paths handle types themselves.
+    pub fn satisfies_index_affinity(&self, idx_aff: Affinity) -> bool {
+        match self.comparison_affinity {
+            Some(comparison_aff) => idx_aff.index_affinity_ok(comparison_aff),
+            None => true,
+        }
+    }
+
+    /// Whether this constraint can drive an index seek on its target column.
+    /// Composes the `usable`/`table_col_pos` gates with the affinity check
+    /// against the column at `table_col_pos` in `columns` (set `is_strict`
+    /// only for STRICT tables; subqueries pass `false`).
+    pub fn can_drive_index_seek(&self, columns: &[Column], is_strict: bool) -> bool {
+        if !self.usable {
+            return false;
+        }
+        let Some(pos) = self.table_col_pos else {
+            return false;
+        };
+        let col = columns.get(pos).unwrap_or_else(|| {
+            unreachable!("constraint table_col_pos {pos} out of bounds for {columns:?}")
+        });
+        self.satisfies_index_affinity(col.affinity_with_strict(is_strict))
     }
 }
 
@@ -449,6 +496,13 @@ pub fn constraints_from_where_clause(
 
             // Try to extract as binary expression first
             if let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? {
+                // Resolve the comparison affinity once per term per SQLite's
+                // `comparisonAffinity` (see `Constraint::comparison_affinity`)
+                // and propagate it to every constraint derived from this term.
+                let cmp_aff = operator
+                    .as_ast_operator()
+                    .filter(|op| op.is_comparison())
+                    .map(|_| comparison_affinity(lhs, rhs, Some(table_references), None));
                 // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
                 match lhs {
                     ast::Expr::Column { table, column, .. } => {
@@ -472,6 +526,7 @@ pub fn constraints_from_where_clause(
                                 ),
                                 usable: true,
                                 is_rowid: false,
+                                comparison_affinity: cmp_aff,
                             });
                         }
                     }
@@ -500,6 +555,7 @@ pub fn constraints_from_where_clause(
                                 ),
                                 usable: true,
                                 is_rowid: true,
+                                comparison_affinity: cmp_aff,
                             });
                         }
                     }
@@ -537,6 +593,7 @@ pub fn constraints_from_where_clause(
                             selectivity,
                             usable: true,
                             is_rowid: false,
+                            comparison_affinity: cmp_aff,
                         });
                     }
                     _ => {}
@@ -563,6 +620,7 @@ pub fn constraints_from_where_clause(
                                 ),
                                 usable: true,
                                 is_rowid: false,
+                                comparison_affinity: cmp_aff,
                             });
                         }
                     }
@@ -591,6 +649,7 @@ pub fn constraints_from_where_clause(
                                 ),
                                 usable: true,
                                 is_rowid: true,
+                                comparison_affinity: cmp_aff,
                             });
                         }
                     }
@@ -628,6 +687,7 @@ pub fn constraints_from_where_clause(
                             selectivity,
                             usable: true,
                             is_rowid: false,
+                            comparison_affinity: cmp_aff,
                         });
                     }
                     _ => {}
@@ -658,6 +718,9 @@ pub fn constraints_from_where_clause(
                     .unwrap_or(params.rows_per_table_fallback as u64)
                     as f64;
                 let selectivity = estimate_in_selectivity(estimated_values, row_count, *not);
+                // SQLite's `comparisonAffinity` for IN-list (`x IN (lit, ...)`)
+                // is the LHS column's affinity; the RHS literals are not folded.
+                let cmp_aff = Some(get_expr_affinity(lhs, Some(table_references), None));
 
                 match lhs.as_ref() {
                     ast::Expr::Column { table, column, .. }
@@ -677,6 +740,7 @@ pub fn constraints_from_where_clause(
                             selectivity,
                             usable: false, // IN uses a separate seek path, not the range-seek model
                             is_rowid,
+                            comparison_affinity: cmp_aff,
                         });
                     }
                     ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -693,6 +757,7 @@ pub fn constraints_from_where_clause(
                             selectivity,
                             usable: false,
                             is_rowid: true,
+                            comparison_affinity: cmp_aff,
                         });
                     }
                     _ => {}
@@ -704,7 +769,7 @@ pub fn constraints_from_where_clause(
                 subquery_id,
                 lhs: Some(lhs_expr),
                 not_in,
-                query_type: ast::SubqueryType::In { .. },
+                query_type: ast::SubqueryType::In { affinity_str, .. },
             } = &term.expr
             {
                 // Find the subquery to check if it's correlated
@@ -723,6 +788,19 @@ pub fn constraints_from_where_clause(
                         .unwrap_or(params.rows_per_table_fallback as u64)
                         as f64;
                     let selectivity = estimate_in_selectivity(estimated_values, row_count, *not_in);
+                    // SQLite's `comparisonAffinity` for IN-subquery combines the
+                    // LHS column affinity with each result column via
+                    // `sqlite3CompareAffinity` — that result is already cached on
+                    // `SubqueryType::In::affinity_str`. For a single-LHS-column
+                    // IN it is the first character; row-value IN has no single
+                    // resolved affinity and is left as `None`.
+                    let is_row_value = matches!(
+                        unwrap_parens(lhs_expr.as_ref()).ok(),
+                        Some(ast::Expr::Parenthesized(exprs)) if exprs.len() != 1
+                    );
+                    let cmp_aff = (!is_row_value)
+                        .then(|| affinity_str.chars().next().map(Affinity::from_char))
+                        .flatten();
 
                     match lhs_expr.as_ref() {
                         ast::Expr::Column { table, column, .. }
@@ -742,6 +820,7 @@ pub fn constraints_from_where_clause(
                                 selectivity,
                                 usable: false, // IN uses a separate seek path (consider_in_list_seek)
                                 is_rowid,
+                                comparison_affinity: cmp_aff,
                             });
                         }
                         ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -758,6 +837,7 @@ pub fn constraints_from_where_clause(
                                 selectivity,
                                 usable: false,
                                 is_rowid: true,
+                                comparison_affinity: cmp_aff,
                             });
                         }
                         _ => {}
@@ -862,11 +942,17 @@ pub fn constraints_from_where_clause(
                         {
                             continue;
                         }
+                        let idx_col_aff = constrained_column
+                            .affinity_with_strict(table_reference.table.is_strict());
+                        if !constraint.satisfies_index_affinity(idx_col_aff) {
+                            continue;
+                        }
                     }
                     if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
                         if candidate.index.as_ref().is_some_and(|i| {
                             Arc::ptr_eq(index, i)
-                                && can_use_partial_index(index, table_reference, where_clause)
+                                && (index.where_clause.is_none()
+                                    || can_use_partial_index(index, table_reference, where_clause))
                         }) {
                             Some(candidate)
                         } else {
@@ -1191,14 +1277,26 @@ pub fn ordered_materialized_key_columns(constraints: &[&Constraint]) -> Vec<usiz
     ordered
 }
 
-fn can_use_partial_index(
+pub(super) fn partial_index_predicate_terms(
     index: &Index,
     table_reference: &JoinedTable,
     query_where_clause: &[WhereTerm],
-) -> bool {
-    let Some(index_where) = &index.where_clause else {
-        // Full index, always usable
-        return true;
+) -> Option<SmallVec<[usize; 4]>> {
+    let index_where = index
+        .where_clause
+        .as_ref()
+        .expect("partial_index_predicate_terms requires a partial index");
+    let can_use_query_term = |term: &WhereTerm| -> bool {
+        let Some(join_info) = &table_reference.join_info else {
+            return true;
+        };
+        if join_info.is_full_outer() {
+            return false;
+        }
+        if join_info.is_outer() {
+            return term.from_outer_join == Some(table_reference.internal_id);
+        }
+        true
     };
     // Bind the index WHERE expression's column references to this query's
     // table reference so it can be compared symmetrically against bound query
@@ -1206,15 +1304,39 @@ fn can_use_partial_index(
     // WHERE term for the partial index to be safe to use.
     let mut bound = (**index_where).clone();
     bind_partial_index_columns(&mut bound, table_reference);
+    rewrite_between_exprs(&mut bound).ok()?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
-    index_conjuncts.iter().all(|ic| {
-        query_where_clause
-            .iter()
-            .any(|t| exprs_are_equivalent(ic, &t.expr))
-    })
+    let mut matched_terms = SmallVec::<[usize; 4]>::new();
+    for index_conjunct in index_conjuncts.iter() {
+        let (term_idx, _) = query_where_clause.iter().enumerate().find(|(_, term)| {
+            can_use_query_term(term) && exprs_are_equivalent(index_conjunct, &term.expr)
+        })?;
+        if !matched_terms.contains(&term_idx) {
+            matched_terms.push(term_idx);
+        }
+    }
+    Some(matched_terms)
     // TODO: recognize implication beyond syntactic equivalence (e.g. `x = 5` implies
     // `x IS NOT NULL`, `x > 10` implies `x > 5`).
+}
+
+pub(super) fn partial_index(index: Option<&Arc<Index>>) -> Option<&Index> {
+    let index = index?;
+    index.where_clause.as_ref()?;
+    Some(index.as_ref())
+}
+
+pub(super) fn can_use_partial_index(
+    index: &Index,
+    table_reference: &JoinedTable,
+    query_where_clause: &[WhereTerm],
+) -> bool {
+    assert!(
+        index.where_clause.is_some(),
+        "can_use_partial_index requires a partial index"
+    );
+    partial_index_predicate_terms(index, table_reference, query_where_clause).is_some()
 }
 
 /// Rewrite identifier nodes in a partial-index WHERE expression to bound
@@ -1592,6 +1714,8 @@ fn analyze_binary_term_index_info<'a>(
 pub(crate) fn summarize_binary_term_for_index(
     expr: &ast::Expr,
     table_id: TableInternalId,
+    table_reference: &JoinedTable,
+    query_where_clause: &[WhereTerm],
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
     table_references: &TableReferences,
@@ -1611,6 +1735,8 @@ pub(crate) fn summarize_binary_term_for_index(
         indexes,
         rowid_alias_column,
         is_rowid,
+        table_reference,
+        query_where_clause,
     );
     if constraint_refs.is_empty() {
         return None;
@@ -1646,6 +1772,7 @@ pub(crate) fn analyze_binary_term_for_index(
     where_term_idx: usize,
     table_id: TableInternalId,
     table_reference: &JoinedTable,
+    query_where_clause: &[WhereTerm],
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
     table_references: &TableReferences,
@@ -1670,6 +1797,8 @@ pub(crate) fn analyze_binary_term_for_index(
         indexes,
         rowid_alias_column,
         is_rowid,
+        table_reference,
+        query_where_clause,
     );
 
     // If no index can be used, this term is not indexable
@@ -1731,6 +1860,7 @@ pub(crate) fn analyze_binary_term_for_index(
         selectivity,
         usable: true,
         is_rowid,
+        comparison_affinity: Some(affinity),
     };
 
     Some(AnalyzedTerm {
@@ -1747,6 +1877,8 @@ fn find_best_index_for_constraint(
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
     is_rowid: bool,
+    table_reference: &JoinedTable,
+    query_where_clause: &[WhereTerm],
 ) -> (Option<Arc<Index>>, Vec<RangeConstraintRef>) {
     // Handle implicit rowid (no alias column, table_col_pos is None)
     if is_rowid && table_col_pos.is_none() {
@@ -1807,6 +1939,11 @@ fn find_best_index_for_constraint(
     // Find the best index that has this column as its first column
     if let Some(indexes) = indexes {
         for index in indexes.iter().filter(|idx| idx.index_method.is_none()) {
+            if index.where_clause.is_some()
+                && !can_use_partial_index(index.as_ref(), table_reference, query_where_clause)
+            {
+                continue;
+            }
             if let Some(idx_col_pos) = index.column_table_pos_to_index_pos(col_pos) {
                 // For multi-index OR, we prefer indexes where the constraint column
                 // is the first column (leftmost prefix)

@@ -202,6 +202,39 @@ jobs:
         shell: bash
       - name: Test bindings
         run: docker run --rm -v $(pwd):/build -w /build node:${{ matrix.node }}-slim yarn workspace @tursodatabase/database test
+  test-db-windows-x64-msvc-binding:
+    name: Test DB bindings on Windows-x64-msvc - node@${{ matrix.node }}
+    timeout-minutes: 30
+    needs:
+      - build
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - "20"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: x64
+      - name: Install dependencies
+        run: yarn install
+      - name: Build common
+        run: yarn workspace @tursodatabase/database-common build
+      - name: Download all DB artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bindings/javascript
+          merge-multiple: true
+          pattern: 'db*'
+      - name: List packages
+        run: ls -R .
+        shell: bash
+      - name: Test bindings
+        run: yarn workspace @tursodatabase/database test
   test-db-wasm-binding:
     name: Test DB bindings on browser@${{ matrix.node }}
     timeout-minutes: 30
@@ -216,7 +249,7 @@ jobs:
     # Image ships node 20 + chromium + firefox + system deps. Bump the tag
     # whenever the `playwright` dep in bindings/javascript/yarn.lock changes.
     container:
-      image: mcr.microsoft.com/playwright:v1.60.0-jammy
+      image: mcr.microsoft.com/playwright:v1.61.0-jammy
     # GitHub mounts /github/home (uid 1001) as $HOME, but the image runs as
     # root — Firefox refuses to launch unless HOME is root-owned.
     env:
@@ -294,6 +327,59 @@ jobs:
         env:
           LOCAL_SYNC_SERVER: ${{ github.workspace }}/target/debug/tursodb
         run: yarn workspace @tursodatabase/sync test
+  test-sync-windows-x64-msvc-binding:
+    name: Test sync bindings on Windows-x64-msvc - node@${{ matrix.node }}
+    timeout-minutes: 45
+    needs:
+      - build
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - "20"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: x64
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Build tursodb
+        working-directory: .
+        run: cargo build --bin tursodb --locked
+      - name: Install dependencies
+        run: yarn install
+      - name: Build common
+        run: yarn workspace @tursodatabase/database-common build
+      - name: Build sync common
+        run: yarn workspace @tursodatabase/sync-common build
+      - name: Download all DB artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bindings/javascript
+          merge-multiple: true
+          pattern: 'db*'
+      - name: Download all sync artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bindings/javascript
+          merge-multiple: true
+          pattern: 'sync*'
+      - name: List packages
+        run: ls -R .
+        shell: bash
+      - name: Test bindings
+        env:
+          LOCAL_SYNC_SERVER: ${{ github.workspace }}/target/debug/tursodb
+        run: yarn workspace @tursodatabase/sync test
   test-sync-wasm-binding:
     name: Test sync bindings on browser@${{ matrix.node }}
     timeout-minutes: 30
@@ -308,7 +394,7 @@ jobs:
     # Image ships node 20 + chromium + firefox + system deps. Bump the tag
     # whenever the `playwright` dep in bindings/javascript/yarn.lock changes.
     container:
-      image: mcr.microsoft.com/playwright:v1.60.0-jammy
+      image: mcr.microsoft.com/playwright:v1.61.0-jammy
     # GitHub mounts /github/home (uid 1001) as $HOME, but the image runs as
     # root — Firefox refuses to launch unless HOME is root-owned.
     env:
@@ -365,8 +451,10 @@ jobs:
       id-token: write
     needs:
       - test-db-linux-x64-gnu-binding
+      - test-db-windows-x64-msvc-binding
       - test-db-wasm-binding
       - test-sync-linux-x64-gnu-binding
+      - test-sync-windows-x64-msvc-binding
       - test-sync-wasm-binding
     steps:
       - uses: actions/checkout@v4

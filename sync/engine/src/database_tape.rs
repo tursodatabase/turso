@@ -39,13 +39,42 @@ pub struct DatabaseTapeOpts {
     pub disable_auto_checkpoint: bool,
 }
 
+/// Async, coro-threaded counterpart to
+/// [`turso_core::Connection::try_wal_watermark_read_page`]. It drives the
+/// begin / wait-for-completion / end sequence in one place so the Windows-IOCP
+/// `UnexpectedEof -> absent page` handling cannot drift across the watermark
+/// read call sites. Returns `Ok(false)` when the page is absent at
+/// `frame_watermark` (i.e. allocated only in the WAL portion past it).
+pub(crate) async fn try_wal_watermark_read_page<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &turso_core::Connection,
+    page_idx: u32,
+    page: &mut [u8],
+    frame_watermark: Option<u64>,
+) -> Result<bool> {
+    let Some((page_ref, c)) = conn.try_wal_watermark_read_page_begin(page_idx, frame_watermark)?
+    else {
+        return Ok(false);
+    };
+    while !c.finished() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    if let Some(err) = c.get_error() {
+        if turso_core::Connection::wal_watermark_read_error_is_absent_page(&err) {
+            return Ok(false);
+        }
+        return Err(LimboError::CompletionError(err).into());
+    }
+    Ok(conn.try_wal_watermark_read_page_end(page, page_ref)?)
+}
+
 pub(crate) async fn run_stmt_once<'a, Ctx>(
     coro: &'_ Coro<Ctx>,
     stmt: &'a mut turso_core::Statement,
 ) -> Result<Option<&'a turso_core::Row>> {
     loop {
         match stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 coro.yield_(SyncEngineIoResult::IO).await?;
             }
             StepResult::Done => {
@@ -92,7 +121,7 @@ pub(crate) async fn exec_stmt<Ctx>(
 ) -> Result<()> {
     loop {
         match stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 coro.yield_(SyncEngineIoResult::IO).await?;
             }
             StepResult::Done => {
@@ -310,17 +339,14 @@ impl DatabaseWalSession {
 
         let conn = self.wal_session.conn();
         let mut frame = vec![0u8; WAL_FRAME_HEADER + self.page_size];
-        let begin_read_result =
-            conn.try_wal_watermark_read_page_begin(page_no, Some(frame_watermark))?;
-        let end_read_result = match begin_read_result {
-            Some((page_ref, c)) => {
-                while !c.succeeded() {
-                    let _ = coro.yield_(SyncEngineIoResult::IO).await;
-                }
-                conn.try_wal_watermark_read_page_end(&mut frame[WAL_FRAME_HEADER..], page_ref)?
-            }
-            None => false,
-        };
+        let end_read_result = try_wal_watermark_read_page(
+            coro,
+            conn,
+            page_no,
+            &mut frame[WAL_FRAME_HEADER..],
+            Some(frame_watermark),
+        )
+        .await?;
         if end_read_result {
             tracing::trace!("rollback page {}", page_no);
             self.prepared_frame = Some((page_no, frame));
@@ -347,15 +373,6 @@ impl DatabaseWalSession {
             self.rollback_page(coro, page_no, frame_watermark).await?;
         }
         Ok(pages_cnt)
-    }
-
-    pub fn db_size(&self) -> Result<u32> {
-        let frames_count = self.frames_count()?;
-        let conn = self.wal_session.conn();
-        let mut page = vec![0u8; self.page_size];
-        assert!(conn.try_wal_watermark_read_page(1, &mut page, Some(frames_count))?);
-        let db_size = u32::from_be_bytes(page[28..32].try_into().unwrap());
-        Ok(db_size)
     }
 
     pub fn commit(&mut self, db_size: u32) -> Result<()> {
@@ -543,7 +560,7 @@ pub struct DatabaseReplaySession {
 async fn replay_stmt<Ctx>(
     coro: &Coro<Ctx>,
     stmt: &mut turso_core::Statement,
-    values: Vec<turso_core::Value>,
+    values: impl IntoIterator<Item = turso_core::Value>,
 ) -> Result<()> {
     stmt.reset()?;
     for (i, value) in values.into_iter().enumerate() {
@@ -1176,7 +1193,13 @@ mod tests {
                 let mut rows = Vec::new();
                 let mut stmt = conn3
                     .prepare(
-                        "SELECT * FROM sqlite_schema WHERE name NOT IN ('turso_cdc', 'turso_cdc_version') AND type = 'table'",
+                        // Exclude sequence backing tables created implicitly
+                        // for AUTOINCREMENT (e.g. for turso_cdc) so this test
+                        // remains focused on user-created tables.
+                        "SELECT * FROM sqlite_schema \
+                         WHERE name NOT IN ('turso_cdc', 'turso_cdc_version') \
+                         AND name NOT LIKE '\\_\\_turso\\_internal\\_seq\\_%' ESCAPE '\\' \
+                         AND type = 'table'",
                     )
                     .unwrap();
                 while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
@@ -1202,7 +1225,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("table")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
-                            turso_core::Value::from_i64(6),
+                            turso_core::Value::from_i64(7),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE t (x TEXT PRIMARY KEY, y)"
                             )),
@@ -1211,7 +1234,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("table")),
                             turso_core::Value::Text(turso_core::types::Text::new("q")),
                             turso_core::Value::Text(turso_core::types::Text::new("q")),
-                            turso_core::Value::from_i64(8),
+                            turso_core::Value::from_i64(9),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE q (x TEXT PRIMARY KEY, y)"
                             )),
@@ -1286,7 +1309,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("table")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
-                            turso_core::Value::from_i64(6),
+                            turso_core::Value::from_i64(7),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE t (x TEXT PRIMARY KEY, y)"
                             )),
@@ -1295,7 +1318,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("index")),
                             turso_core::Value::Text(turso_core::types::Text::new("t_idx")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
-                            turso_core::Value::from_i64(8),
+                            turso_core::Value::from_i64(9),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE INDEX IF NOT EXISTS t_idx ON t (y)"
                             )),
@@ -1370,7 +1393,7 @@ mod tests {
                         turso_core::Value::Text(turso_core::types::Text::new("table")),
                         turso_core::Value::Text(turso_core::types::Text::new("t")),
                         turso_core::Value::Text(turso_core::types::Text::new("t")),
-                        turso_core::Value::from_i64(6),
+                        turso_core::Value::from_i64(7),
                         turso_core::Value::Text(turso_core::types::Text::new(
                             "CREATE TABLE t (x TEXT PRIMARY KEY, z)"
                         )),
@@ -1553,6 +1576,8 @@ mod tests {
                     vec![
                         "sqlite_sequence".to_string(),
                         "turso_cdc".to_string(),
+                        // Implicit AUTOINCREMENT backing table for turso_cdc.
+                        "__turso_internal_seq___turso_internal_autoincrement_turso_cdc".to_string(),
                         "turso_cdc_version".to_string(),
                         "sqlite_autoindex_turso_cdc_version_1".to_string(),
                         "t".to_string(),

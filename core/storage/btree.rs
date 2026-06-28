@@ -11,6 +11,8 @@ use super::{
         write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
     },
 };
+#[cfg(test)]
+use crate::alloc::TursoIteratorExt;
 use crate::{
     io::CompletionGroup,
     io_yield_one,
@@ -490,11 +492,10 @@ enum OverflowState {
         next_page: PageRef,
     },
     /// Transitional state used to make `OverflowState::ProcessPage`
-    /// re-entry-safe across spill yields. Once `free_page` has returned
-    /// `Done` for the current page, we move to this state so that a
-    /// subsequent spill yield on the read of the next page does NOT cause
-    /// `free_page` to be invoked a second time on a page that is already in
-    /// the freelist.
+    /// re-entry-safe across yields. Once `free_page` has returned `Done` for
+    /// the current page, we move to this state before validating or reading
+    /// the next page so `free_page` cannot be invoked a second time on a page
+    /// that is already in the freelist.
     ReadNext {
         next: u32,
     },
@@ -869,26 +870,20 @@ impl BTreeCursor {
         num_columns: usize,
     ) -> Self {
         let mut cursor = Self::new(pager, root_page, num_columns);
-        let key_info = table
-            .primary_key_columns
-            .iter()
-            .map(|(col_name, order)| {
-                let (_, column) = table
-                    .get_column(col_name)
-                    .expect("WITHOUT ROWID primary key column should exist");
-                crate::types::KeyInfo {
-                    sort_order: *order,
-                    collation: column.collation_opt().unwrap_or_default(),
-                    nulls_order: None,
-                }
-            })
-            .collect::<Vec<_>>();
-        cursor.index_info = Some(Arc::new(IndexInfo {
-            key_info,
-            has_rowid: false,
-            num_cols: table.primary_key_columns.len(),
-            is_unique: true,
-        }));
+        let key_info = table.primary_key_columns.iter().map(|(col_name, order)| {
+            let (_, column) = table
+                .get_column(col_name)
+                .expect("WITHOUT ROWID primary key column should exist");
+            crate::types::KeyInfo {
+                sort_order: *order,
+                collation: column.collation_opt().unwrap_or_default(),
+                nulls_order: None,
+            }
+        });
+        cursor.index_info = Some(Arc::new(
+            IndexInfo::new(key_info, false, table.primary_key_columns.len(), true)
+                .expect("TODO: fallible allocations"),
+        ));
         cursor
     }
 
@@ -3013,7 +3008,9 @@ impl BTreeCursor {
                         if matches!(page_type, PageType::IndexInterior) {
                             turso_assert!(parent_contents.overflow_cells.len() == 1, "index interior page must have no more than 1 overflow cell, as a result of InteriorNodeReplacement");
                         } else {
-                            turso_assert!(false, "page type must have no overflow cells", { "page_type": page_type });
+                            turso_assert!(false, "page type must have no overflow cells", {
+                                "page_type": page_type
+                            });
                         }
                         let overflow_cell = parent_contents.overflow_cells.first().unwrap();
                         let parent_page_cell_idx = self.stack.current_cell_index() as usize;
@@ -4827,6 +4824,10 @@ impl BTreeCursor {
     /// resumed from last point after IO interruption
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn clear_overflow_pages(&mut self, cell: &BTreeCell) -> Result<IOResult<()>> {
+        // `database_size` is invariant for the duration of this invocation, so
+        // read the page-1 header at most once and reuse it for every overflow
+        // page validation below instead of re-reading it per `ReadNext`.
+        let mut database_size: Option<u32> = None;
         loop {
             match self.overflow_state.clone() {
                 OverflowState::Start => {
@@ -4840,17 +4841,9 @@ impl BTreeCursor {
                     };
 
                     if let Some(next_page) = first_overflow_page {
-                        if unlikely(
-                            next_page < 2
-                                || next_page
-                                    > self
-                                        .pager
-                                        .io
-                                        .block(|| {
-                                            self.pager.with_header(|header| header.database_size)
-                                        })?
-                                        .get(),
-                        ) {
+                        let database_size =
+                            return_if_io!(self.overflow_database_size(&mut database_size));
+                        if unlikely(!Self::valid_overflow_page_id(next_page, database_size)) {
                             self.overflow_state = OverflowState::Start;
                             return Err(LimboError::Corrupt("Invalid overflow page number".into()));
                         }
@@ -4875,31 +4868,21 @@ impl BTreeCursor {
                     return_if_io!(self.pager.free_page(Some(page), next_page_id));
 
                     // free_page returned `Done` — commit `next` to state
-                    // BEFORE the next read so that a spill yield from the
-                    // read does not cause re-entry into `ProcessPage` with
-                    // the now-freed page, which would re-invoke `free_page`
-                    // and corrupt the freelist.
+                    // BEFORE any fallible IO so re-entry cannot invoke
+                    // `free_page` again on the now-freed page.
                     if next != 0 {
-                        if unlikely(
-                            next < 2
-                                || next
-                                    > self
-                                        .pager
-                                        .io
-                                        .block(|| {
-                                            self.pager.with_header(|header| header.database_size)
-                                        })?
-                                        .get(),
-                        ) {
-                            self.overflow_state = OverflowState::Start;
-                            return Err(LimboError::Corrupt("Invalid overflow page number".into()));
-                        }
                         self.overflow_state = OverflowState::ReadNext { next };
                     } else {
                         self.overflow_state = OverflowState::Done;
                     }
                 }
                 OverflowState::ReadNext { next } => {
+                    let database_size =
+                        return_if_io!(self.overflow_database_size(&mut database_size));
+                    if unlikely(!Self::valid_overflow_page_id(next, database_size)) {
+                        self.overflow_state = OverflowState::Start;
+                        return Err(LimboError::Corrupt("Invalid overflow page number".into()));
+                    }
                     let (page, c) = return_if_io!(self.pager.read_page(next as i64));
                     self.overflow_state = OverflowState::ProcessPage { next_page: page };
                     if let Some(c) = c {
@@ -4912,6 +4895,22 @@ impl BTreeCursor {
                 }
             };
         }
+    }
+
+    /// Read `database_size` from the page-1 header at most once per
+    /// `clear_overflow_pages` invocation, memoizing it in `cache`.
+    fn overflow_database_size(&self, cache: &mut Option<u32>) -> Result<IOResult<u32>> {
+        if let Some(database_size) = cache {
+            return Ok(IOResult::Done(*database_size));
+        }
+        let database_size =
+            return_if_io!(self.pager.with_header(|header| header.database_size)).get();
+        *cache = Some(database_size);
+        Ok(IOResult::Done(database_size))
+    }
+
+    fn valid_overflow_page_id(page_id: u32, database_size: u32) -> bool {
+        page_id >= 2 && page_id <= database_size
     }
 
     /// Deletes all contents of the B-tree by freeing all its pages in an iterative depth-first order.
@@ -5301,6 +5300,20 @@ impl BTreeCursor {
 
     pub fn is_write_in_progress(&self) -> bool {
         matches!(self.state, CursorState::Write(_))
+    }
+
+    /// True iff the cursor sits on a valid record that is NOT the first cell of
+    /// its page. Used by the MVCC checkpoint's sequential-write optimization:
+    /// only at such a position is "insert the next adjacent rowid here, without
+    /// re-seeking" provably within the page's divider bounds (the previous,
+    /// strictly smaller rowid is in this same page, and so is a strictly larger
+    /// one). At cell 0 the cursor has just crossed a leaf boundary, and the
+    /// adjacent rowid may belong on the LEFT side of the parent divider — a
+    /// divider whose row was deleted keeps its key, so the divider can
+    /// be >= the rowid being inserted — in which case the caller must re-seek
+    /// from the root.
+    pub fn is_positioned_past_page_start(&self) -> bool {
+        self.has_record() && self.stack.current_cell_index() > 0
     }
 
     /// saveAllCursors pass for this cursor's insert/delete entry. Iteration
@@ -6309,10 +6322,7 @@ impl CursorTrait for BTreeCursor {
     /// valid_state stays Valid — only rewind/seek-style entry points are safe
     /// next; next/prev land on `current_page == -1` and return Done(false).
     fn invalidate_btree_cache(&mut self) {
-        for slot in self.stack.stack.iter_mut() {
-            *slot = None;
-        }
-        self.stack.current_page = -1;
+        self.stack.clear();
         self.has_record = false;
         self.move_to_right_state.1 = None;
         self.invalidate_count_cache();
@@ -9739,7 +9749,8 @@ mod tests {
                         default: None,
                         expr: None,
                     })
-                    .collect(),
+                    .try_collect()
+                    .unwrap(),
                 table_name: "test".to_string(),
                 root_page: index_root_page,
                 unique: false,
@@ -9910,7 +9921,7 @@ mod tests {
             let index_def = Index {
                 name: "testindex".to_string(),
                 where_clause: None,
-                columns: vec![IndexColumn {
+                columns: crate::alloc::vec![IndexColumn {
                     name: "testcol".to_string(),
                     order: SortOrder::Asc,
                     collation: None,

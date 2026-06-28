@@ -8,6 +8,7 @@ const PLATFORMS = {
   "darwin-x64": "@tursodatabase/cli-darwin-x64",
   "linux-arm64": "@tursodatabase/cli-linux-arm64-gnu",
   "linux-x64": "@tursodatabase/cli-linux-x64-gnu",
+  "win32-arm64": "@tursodatabase/cli-win32-arm64-msvc",
   "win32-x64": "@tursodatabase/cli-win32-x64-msvc",
 };
 
@@ -18,7 +19,7 @@ function getBinaryPath() {
   if (!pkg) {
     console.error(
       `Unsupported platform: ${process.platform}-${process.arch}\n` +
-        `Turso CLI supports: macOS (arm64, x64), Linux (arm64, x64), Windows (x64)`
+        `Turso CLI supports: macOS (arm64, x64), Linux (arm64, x64), Windows (arm64, x64)`
     );
     process.exit(1);
   }

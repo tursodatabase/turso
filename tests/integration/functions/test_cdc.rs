@@ -588,10 +588,10 @@ fn test_cdc_ddl_in_explicit_transaction(db: TempDatabase) {
         rows,
         vec![
             // All DDL and DML in explicit transaction: no per-statement COMMITs
-            v2_row(1, "sqlite_schema", 5, None, None, None), // CREATE TABLE t
+            v2_row(1, "sqlite_schema", 6, None, None, None), // CREATE TABLE t
             v2_row(1, "t", 1, None, None, None),             // INSERT (1, 10)
             v2_row(1, "t", 2, None, None, None),             // INSERT (2, 20)
-            v2_row(1, "sqlite_schema", 6, None, None, None), // CREATE TABLE q
+            v2_row(1, "sqlite_schema", 7, None, None, None), // CREATE TABLE q
             v2_commit(),                                     // single COMMIT at end
         ]
     );
@@ -755,8 +755,9 @@ fn test_cdc_schema_changes(db: TempDatabase) {
     conn.execute("DROP INDEX q_abc").unwrap();
     let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
 
-    // turso_cdc_version table + its auto-index add 2 entries to sqlite_schema,
-    // shifting rowids and rootpages by +2 compared to before version tracking
+    // turso_cdc_version table + its auto-index + autoincrement backing table
+    // add 3 entries to sqlite_schema, shifting rowids and rootpages by +3
+    // compared to before version tracking
     assert_eq!(
         rows,
         vec![
@@ -764,13 +765,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
             v2_row(
                 1,
                 "sqlite_schema",
-                5,
+                6,
                 None,
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -782,13 +783,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
             v2_row(
                 1,
                 "sqlite_schema",
-                8,
+                9,
                 None,
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("q".to_string()),
                     Value::Text("q".to_string()),
-                    Value::Integer(9),
+                    Value::Integer(10),
                     Value::Text("CREATE TABLE q (a, b, c)".to_string())
                 ])),
                 None,
@@ -798,13 +799,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
             v2_row(
                 1,
                 "sqlite_schema",
-                9,
+                10,
                 None,
                 Some(record([
                     Value::Text("index".to_string()),
                     Value::Text("t_q".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(10),
+                    Value::Integer(11),
                     Value::Text("CREATE INDEX t_q ON t (q)".to_string())
                 ])),
                 None,
@@ -814,13 +815,13 @@ fn test_cdc_schema_changes(db: TempDatabase) {
             v2_row(
                 1,
                 "sqlite_schema",
-                10,
+                11,
                 None,
                 Some(record([
                     Value::Text("index".to_string()),
                     Value::Text("q_abc".to_string()),
                     Value::Text("q".to_string()),
-                    Value::Integer(11),
+                    Value::Integer(12),
                     Value::Text("CREATE INDEX q_abc ON q (a, b, c)".to_string())
                 ])),
                 None,
@@ -830,12 +831,12 @@ fn test_cdc_schema_changes(db: TempDatabase) {
             v2_row(
                 -1,
                 "sqlite_schema",
-                5,
+                6,
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -848,12 +849,12 @@ fn test_cdc_schema_changes(db: TempDatabase) {
             v2_row(
                 -1,
                 "sqlite_schema",
-                10,
+                11,
                 Some(record([
                     Value::Text("index".to_string()),
                     Value::Text("q_abc".to_string()),
                     Value::Text("q".to_string()),
-                    Value::Integer(11),
+                    Value::Integer(12),
                     Value::Text("CREATE INDEX q_abc ON q (a, b, c)".to_string())
                 ])),
                 None,
@@ -876,8 +877,8 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
     conn.execute("ALTER TABLE t ADD COLUMN t").unwrap();
     let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
 
-    // turso_cdc_version table + its auto-index add 2 entries to sqlite_schema,
-    // shifting rowids and rootpages by +2 compared to before version tracking
+    // turso_cdc_version table + its auto-index + autoincrement backing table
+    // add 3 entries to sqlite_schema, shifting rowids and rootpages by +3
     assert_eq!(
         rows,
         vec![
@@ -885,13 +886,13 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
             v2_row(
                 1,
                 "sqlite_schema",
-                5,
+                6,
                 None,
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -903,12 +904,12 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
             v2_row(
                 0,
                 "sqlite_schema",
-                5,
+                6,
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
@@ -917,7 +918,7 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text("CREATE TABLE t (x, y, z UNIQUE, PRIMARY KEY (x, y))".to_string())
                 ])),
                 Some(record([
@@ -938,19 +939,19 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
             v2_row(
                 0,
                 "sqlite_schema",
-                5,
+                6,
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text("CREATE TABLE t (x, y, z UNIQUE, PRIMARY KEY (x, y))".to_string())
                 ])),
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, t, PRIMARY KEY (x, y))".to_string()
                     )
@@ -1709,13 +1710,13 @@ fn test_cdc_no_internal_table_changes(db: TempDatabase) {
             v2_row(
                 1,
                 "sqlite_schema",
-                5,
+                6,
                 None,
                 Some(record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(6),
+                    Value::Integer(7),
                     Value::Text("CREATE TABLE t (x)".to_string())
                 ])),
                 None,
@@ -1725,13 +1726,13 @@ fn test_cdc_no_internal_table_changes(db: TempDatabase) {
             v2_row(
                 1,
                 "sqlite_schema",
-                6,
+                7,
                 None,
                 Some(record([
                     Value::Text("index".to_string()),
                     Value::Text("t_idx".to_string()),
                     Value::Text("t".to_string()),
-                    Value::Integer(7),
+                    Value::Integer(8),
                     Value::Text("CREATE INDEX t_idx ON t (x)".to_string())
                 ])),
                 None,

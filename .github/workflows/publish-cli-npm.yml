@@ -75,6 +75,7 @@ jobs:
             --pattern "turso_cli-x86_64-apple-darwin.tar.xz" \
             --pattern "turso_cli-aarch64-unknown-linux-gnu.tar.xz" \
             --pattern "turso_cli-x86_64-unknown-linux-gnu.tar.xz" \
+            --pattern "turso_cli-aarch64-pc-windows-msvc.zip" \
             --pattern "turso_cli-x86_64-pc-windows-msvc.zip" \
             --dir "$TMPDIR"
 
@@ -93,6 +94,9 @@ jobs:
 
           unzip -o "$TMPDIR/turso_cli-x86_64-pc-windows-msvc.zip" -d "$TMPDIR/turso_cli-x86_64-pc-windows-msvc"
           cp "$TMPDIR/turso_cli-x86_64-pc-windows-msvc/tursodb.exe" packages/turso-cli/npm/win32-x64-msvc/tursodb.exe
+
+          unzip -o "$TMPDIR/turso_cli-aarch64-pc-windows-msvc.zip" -d "$TMPDIR/turso_cli-aarch64-pc-windows-msvc"
+          cp "$TMPDIR/turso_cli-aarch64-pc-windows-msvc/tursodb.exe" packages/turso-cli/npm/win32-arm64-msvc/tursodb.exe
 
           # Set executable permissions
           chmod +x packages/turso-cli/npm/darwin-arm64/tursodb
@@ -119,6 +123,7 @@ jobs:
             ./packages/turso-cli/npm/darwin-x64 \
             ./packages/turso-cli/npm/linux-arm64-gnu \
             ./packages/turso-cli/npm/linux-x64-gnu \
+            ./packages/turso-cli/npm/win32-arm64-msvc \
             ./packages/turso-cli/npm/win32-x64-msvc; do
             npm publish "$dir" --access public --provenance --tag ${{ steps.npm-tag.outputs.tag }}
           done

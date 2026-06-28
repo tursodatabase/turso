@@ -1,0 +1,28 @@
+# Bench-only crate, separate from the memory-benchmark package on purpose:
+# cargo builds a package's bins (panic=abort under the release profile)
+# whenever it builds one of its benches (panic=unwind), and the resulting
+# duplicate turso_sdk_kit cdylib/staticlib units collide on their unhashed
+# output filenames. A crate with no bins only ever builds the unwind chain.
+[package]
+name = "memory-benchmark-codspeed"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)'] }
+
+[features]
+codspeed = []
+
+[dev-dependencies]
+memory-benchmark = { path = ".." }
+tokio = { workspace = true, default-features = true, features = ["full"] }
+criterion = { workspace = true }
+codspeed-criterion-compat = { workspace = true }
+turso_macros = { workspace = true }
+
+[[bench]]
+name = "memory_profiles"
+harness = false

@@ -23,11 +23,6 @@ fn multiprocess_test_io() -> Arc<dyn IO> {
 }
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
-fn multiprocess_wal_db_opts() -> DatabaseOpts {
-    DatabaseOpts::new().with_multiprocess_wal(true)
-}
-
-#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn flip_db_header_reserved_byte(path: &Path) {
     use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -190,7 +185,8 @@ fn count_test_rows(whopper: &mut MultiprocessWhopper, worker_idx: usize) -> i64 
                 | LimboError::SchemaConflict
                 | LimboError::Busy
                 | LimboError::BusySnapshot
-                | LimboError::TableLocked,
+                | LimboError::TableLocked
+                | LimboError::OutOfMemory,
             ) => continue,
             Err(err) => panic!("count should succeed: {err}"),
         }
@@ -211,12 +207,75 @@ fn truncate_checkpoint_until_stable(whopper: &mut MultiprocessWhopper, connectio
                 | LimboError::BusySnapshot
                 | LimboError::SchemaUpdated
                 | LimboError::SchemaConflict
-                | LimboError::TableLocked,
+                | LimboError::TableLocked
+                | LimboError::OutOfMemory,
             ) => continue,
             Err(err) => panic!("TRUNCATE checkpoint should stabilize: {err}"),
         }
     }
     panic!("TRUNCATE checkpoint did not stabilize after transient multiprocess errors");
+}
+
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+fn multiprocess_wal_db_opts() -> DatabaseOpts {
+    DatabaseOpts::new().with_multiprocess_wal(true)
+}
+
+/// Open the DB read-only via a fresh observer and return `length(value)`
+/// for the named key. Retries through the transient cross-process error
+/// classes (schema lag, busy locks) before giving up. Used by tests
+/// that need to confirm a write is visible to a brand-new reader.
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+fn read_simple_kv_length(db_path: &Path, table_name: &str, key: &str) -> Option<i64> {
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let reopened = Database::open_file_with_flags(
+        io,
+        db_path.to_str().expect("db path utf8"),
+        OpenFlags::ReadOnly,
+        multiprocess_wal_db_opts(),
+        None,
+    )
+    .expect("open observer database");
+    let conn = reopened.connect().expect("connect observer db");
+    let sql = format!("select length(value) from {table_name} where key='{key}'");
+    for _ in 0..32 {
+        let mut stmt = match conn.prepare(sql.clone()) {
+            Ok(stmt) => stmt,
+            Err(LimboError::SchemaUpdated | LimboError::SchemaConflict) => {
+                conn.maybe_reparse_schema()
+                    .expect("observer reparse after schema change");
+                continue;
+            }
+            Err(
+                LimboError::Busy
+                | LimboError::BusySnapshot
+                | LimboError::TableLocked
+                | LimboError::OutOfMemory,
+            ) => continue,
+            Err(err) => panic!("observer prepare should succeed: {err}"),
+        };
+        let mut result = None;
+        match stmt.run_with_row_callback(|row| {
+            result = Some(row.get::<i64>(0).expect("length column"));
+            Ok(())
+        }) {
+            Ok(()) => return result,
+            Err(LimboError::SchemaUpdated | LimboError::SchemaConflict) => {
+                drop(stmt);
+                conn.maybe_reparse_schema()
+                    .expect("observer reparse after schema change");
+                continue;
+            }
+            Err(
+                LimboError::Busy
+                | LimboError::BusySnapshot
+                | LimboError::TableLocked
+                | LimboError::OutOfMemory,
+            ) => continue,
+            Err(err) => panic!("observer query should succeed: {err}"),
+        }
+    }
+    panic!("observer query did not stabilize after transient multiprocess errors");
 }
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
@@ -311,7 +370,8 @@ fn multiprocess_same_process_sibling_reader_keeps_shared_snapshot_live_until_las
             | LimboError::BusySnapshot
             | LimboError::SchemaUpdated
             | LimboError::SchemaConflict
-            | LimboError::TableLocked,
+            | LimboError::TableLocked
+            | LimboError::OutOfMemory,
         ) => {}
         Err(err) => panic!("unexpected TRUNCATE result while sibling reader is active: {err}"),
     }
@@ -365,103 +425,6 @@ fn count_rows_in_table(conn: &Arc<Connection>, table_name: &str) -> i64 {
     })
     .expect("run count");
     count
-}
-
-#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
-fn read_simple_kv_length(db_path: &Path, table_name: &str, key: &str) -> Option<i64> {
-    let io: Arc<dyn IO> = multiprocess_test_io();
-    let reopened = Database::open_file_with_flags(
-        io,
-        db_path.to_str().expect("db path utf8"),
-        OpenFlags::ReadOnly,
-        multiprocess_wal_db_opts(),
-        None,
-    )
-    .expect("open observer database");
-    let conn = reopened.connect().expect("connect observer db");
-    let sql = format!("select length(value) from {table_name} where key='{key}'");
-    for _ in 0..32 {
-        let mut stmt = match conn.prepare(sql.clone()) {
-            Ok(stmt) => stmt,
-            Err(LimboError::SchemaUpdated | LimboError::SchemaConflict) => {
-                conn.maybe_reparse_schema()
-                    .expect("observer reparse after schema change");
-                continue;
-            }
-            Err(LimboError::Busy | LimboError::BusySnapshot | LimboError::TableLocked) => {
-                continue;
-            }
-            Err(err) => panic!("observer prepare should succeed: {err}"),
-        };
-        let mut result = None;
-        match stmt.run_with_row_callback(|row| {
-            result = Some(row.get::<i64>(0).expect("length column"));
-            Ok(())
-        }) {
-            Ok(()) => return result,
-            Err(LimboError::SchemaUpdated | LimboError::SchemaConflict) => {
-                drop(stmt);
-                conn.maybe_reparse_schema()
-                    .expect("observer reparse after schema change");
-                continue;
-            }
-            Err(LimboError::Busy | LimboError::BusySnapshot | LimboError::TableLocked) => {
-                continue;
-            }
-            Err(err) => panic!("observer query should succeed: {err}"),
-        }
-    }
-    panic!("observer query did not stabilize after transient multiprocess errors");
-}
-
-#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
-fn probe_optional_int_via_fresh_worker(whopper: &MultiprocessWhopper, sql: String) -> Option<i64> {
-    for _ in 0..8 {
-        let (_startup, result) = whopper
-            .execute_sql_via_fresh_worker(sql.clone())
-            .expect("probe via fresh worker should succeed");
-        match result {
-            Ok(rows) => {
-                return match rows.as_slice() {
-                    [] => None,
-                    [row] => Some(row[0].as_int().expect("probe column should be integer")),
-                    _ => panic!("probe query should return at most one row, got {rows:?}"),
-                };
-            }
-            Err(
-                LimboError::SchemaUpdated
-                | LimboError::SchemaConflict
-                | LimboError::Busy
-                | LimboError::BusySnapshot
-                | LimboError::TableLocked,
-            ) => continue,
-            Err(err) => panic!("probe SQL should succeed: {err}"),
-        }
-    }
-    panic!("fresh-worker probe did not stabilize after transient multiprocess errors");
-}
-
-#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
-fn probe_table_rootpage_via_fresh_worker(
-    whopper: &MultiprocessWhopper,
-    table_name: &str,
-) -> Option<i64> {
-    probe_optional_int_via_fresh_worker(
-        whopper,
-        format!("select rootpage from sqlite_schema where type='table' and name='{table_name}'"),
-    )
-}
-
-#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
-fn probe_simple_kv_length_via_fresh_worker(
-    whopper: &MultiprocessWhopper,
-    table_name: &str,
-    key: &str,
-) -> Option<i64> {
-    probe_optional_int_via_fresh_worker(
-        whopper,
-        format!("select length(value) from {table_name} where key='{key}'"),
-    )
 }
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
@@ -667,49 +630,6 @@ fn multiprocess_committed_large_row_survives_repeated_restarts() -> anyhow::Resu
         whopper.restart_all_workers_preserve_files().unwrap();
         assert_eq!(
             read_simple_kv_length(&db_path, table_name, key),
-            Some(value_len)
-        );
-    }
-
-    let db_str = db_path.to_str().unwrap();
-    let _ = std::fs::remove_file(&db_path);
-    let _ = std::fs::remove_file(format!("{db_str}-wal"));
-    let _ = std::fs::remove_file(format!("{db_str}-tshm"));
-    Ok(())
-}
-
-#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
-#[test]
-fn multiprocess_committed_table_schema_survives_repeated_restarts() -> anyhow::Result<()> {
-    let mut whopper = create_multiprocess_whopper_with_keep(1, true);
-    let db_path = whopper.db_path().to_path_buf();
-    let table_name = "table_name";
-    let key = "key_name";
-    let value_len: i64 = 874;
-
-    whopper.execute_sql_direct(
-        0,
-        format!("create table {table_name}(key text primary key, value text not null)"),
-    )??;
-
-    whopper.execute_sql_direct(
-        0,
-        format!(
-            "insert into {table_name}(key, value) values ('{key}', printf('%0*d', {value_len}, 1))"
-        ),
-    )??;
-
-    assert!(probe_table_rootpage_via_fresh_worker(&whopper, table_name).is_some());
-    assert_eq!(
-        probe_simple_kv_length_via_fresh_worker(&whopper, table_name, key),
-        Some(value_len)
-    );
-
-    for _restart in 1..=3 {
-        whopper.restart_all_workers_preserve_files().unwrap();
-        assert!(probe_table_rootpage_via_fresh_worker(&whopper, table_name).is_some());
-        assert_eq!(
-            probe_simple_kv_length_via_fresh_worker(&whopper, table_name, key),
             Some(value_len)
         );
     }

@@ -1,6 +1,24 @@
 import { unlinkSync } from "node:fs";
 import { expect, test } from 'vitest'
 import { Database } from './compat.js'
+import { Database as NativeDatabase } from '#index'
+
+test('classifySql treats reindex as write', () => {
+    const db = new NativeDatabase(':memory:');
+    db.connectSync();
+    try {
+        expect(db.classifySql('SELECT 1')).toEqual('read');
+        expect(db.classifySql('BEGIN')).toEqual('begin');
+        expect(db.classifySql('COMMIT')).toEqual('commit');
+        expect(db.classifySql('ROLLBACK')).toEqual('rollback');
+
+        expect(db.classifySql('REINDEX')).toEqual('write');
+        expect(db.classifySql('REINDEX idx')).toEqual('write');
+        expect(db.classifySql('REINDEX main.idx')).toEqual('write');
+    } finally {
+        db.close();
+    }
+})
 
 test('insert returning test', () => {
     const db = new Database(':memory:');
@@ -28,6 +46,20 @@ test('exec multiple statements', async () => {
     const stmt = db.prepare("SELECT * FROM t");
     const rows = stmt.all();
     expect(rows).toEqual([{ x: 1 }, { x: 2 }]);
+})
+
+test('expanded rows preserve positional values for duplicate column names', () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE role(path TEXT); CREATE TABLE org_unit(path TEXT)");
+    db.exec("INSERT INTO role VALUES ('/Employee'); INSERT INTO org_unit VALUES ('/')");
+
+    const row = db.prepare("SELECT role.path, org_unit.path FROM role JOIN org_unit").get();
+
+    expect(Object.keys(row)).toEqual(["path"]);
+    expect(row.path).toBe("/");
+    expect(row[0]).toBe("/Employee");
+    expect(row[1]).toBe("/");
+    expect(row).toEqual({ path: "/" });
 })
 
 test('readonly-db', () => {

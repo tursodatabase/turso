@@ -3343,8 +3343,12 @@ impl Pager {
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id as u32);
         // Notify cache before marking dirty (page was evictable, now it won't be)
-        // Only notify if page wasn't already dirty
-        if !page.is_dirty() {
+        // Only notify if page wasn't already dirty, or if it was spilled
+        // State before set_dirty():
+        // - clean page: evictable -> set_dirty() makes it dirty and unevictable
+        // - dirty + spilled page: evictable -> set_dirty() clears spilled and makes it unevictable
+        // - dirty + not spilled page: already unevictable -> no cache accounting change
+        if !page.is_dirty() || page.is_spilled() {
             let key = PageCacheKey::new(page.get().id);
             self.page_cache.write().notify_page_dirty(key);
         }
@@ -3367,7 +3371,7 @@ impl Pager {
 
     /// Flush all dirty pages to disk (async/re-entrant).
     /// Unlike commit_dirty_pages, this function does not commit, checkpoint nor sync the WAL/Database.
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn cacheflush(&self) -> Result<IOResult<Vec<Completion>>> {
         let wal = self
             .wal
@@ -4876,7 +4880,7 @@ impl Pager {
         // Number of reserved slots in trunk header (next pointer + leaf count)
         const RESERVED_SLOTS: usize = 2;
 
-        let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
+        let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
 
         let mut state = self.free_page_state.write();
@@ -4890,16 +4894,20 @@ impl Pager {
                         )));
                     }
 
-                    // The non-blocking read fork here is safe: if the caller
-                    // passes `Some(page)`, no IO occurs and the mutations
-                    // below run synchronously. If the caller passes `None`
-                    // and `read_page_nonblock` yields for spill, we leave
-                    // `state` at `Start` so re-entry re-takes either branch
-                    // (the pager's `pending_reads` memoization returns the
-                    // same `PageRef` the next time). Crucially, the
-                    // non-idempotent mutations (`freelist_pages` increment,
-                    // `page.pin()`, state advance) all happen AFTER both
-                    // branches converge.
+                    // The first yield point is the `HeaderRefMut::from_pager`
+                    // acquisition above the loop, not this read fork: if it
+                    // yields for the page-1 read, re-entry re-runs that prefix
+                    // (it is idempotent — the pager cache returns the same
+                    // header page) before reaching `Start` again, where `state`
+                    // is still `Start`. The read fork below is likewise safe:
+                    // if the caller passes `Some(page)`, no IO occurs and the
+                    // mutations below run synchronously. If the caller passes
+                    // `None` and `read_page` yields for spill, we leave `state`
+                    // at `Start` so re-entry re-takes either branch (the
+                    // pager's `pending_reads` memoization returns the same
+                    // `PageRef` the next time). Crucially, the non-idempotent
+                    // mutations (`freelist_pages` increment, `page.pin()`,
+                    // state advance) all happen AFTER both branches converge.
                     let (page, c) = match page.take() {
                         Some(page) => {
                             turso_assert_eq!(
@@ -5105,7 +5113,7 @@ impl Pager {
         // Ensure cache has room before allocating (we may spill dirty pages first)
         return_if_io!(self.ensure_cache_space());
 
-        let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
+        let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
 
         loop {
@@ -6124,7 +6132,7 @@ mod ptrmap_tests {
             target_idx,
             PendingRead {
                 page: synthetic_page.clone(),
-                disk_read: Some(stub_disk_read.clone()),
+                disk_read: Some(stub_disk_read),
             },
         );
 

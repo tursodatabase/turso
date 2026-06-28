@@ -1,3 +1,4 @@
+use crate::alloc::ALLOC_ERR_MSG;
 use crate::sync::Arc;
 use crate::turso_assert;
 use crate::turso_debug_assert;
@@ -689,12 +690,15 @@ impl HybridBTreeDirectory {
         // Create cursor and seek to first uncached chunk
         let mut cursor =
             BTreeCursor::new(self.pager.clone(), self.btree_root_page, Self::CHUNK_LEN);
-        cursor.index_info = Some(Arc::new(IndexInfo {
-            has_rowid: false,
-            num_cols: Self::CHUNK_LEN,
-            key_info: vec![key_info(), key_info(), key_info()],
-            is_unique: false,
-        }));
+        cursor.index_info = Some(Arc::new(
+            IndexInfo::new(
+                [key_info(), key_info(), key_info()],
+                false,
+                Self::CHUNK_LEN,
+                false,
+            )
+            .expect(ALLOC_ERR_MSG),
+        ));
 
         let seek_key = ImmutableRecord::from_values(
             &[
@@ -1868,12 +1872,12 @@ impl FtsCursor {
         self.btree_root_page = Some(root_page);
 
         let mut cursor = BTreeCursor::new(pager, root_page, 3);
-        cursor.index_info = Some(Arc::new(IndexInfo {
-            has_rowid: false,
-            num_cols: 3,
-            key_info: vec![key_info(), key_info(), key_info()],
-            is_unique: false,
-        }));
+        cursor.index_info = Some(Arc::new(IndexInfo::new(
+            [key_info(), key_info(), key_info()],
+            false,
+            3,
+            false,
+        )?));
         self.fts_dir_cursor = Some(cursor);
         Ok(())
     }
@@ -2462,7 +2466,10 @@ impl Drop for FtsCursor {
         );
 
         if is_flushing {
-            turso_assert!(conn.is_in_write_tx(), "FTS Drop: in-progress flush abandoned (transaction already committed). pre_commit should have completed the flush.");
+            turso_assert!(
+                conn.is_in_write_tx(),
+                "FTS Drop: in-progress flush abandoned (transaction already committed). pre_commit should have completed the flush."
+            );
 
             tracing::debug!("FTS Drop: completing in-progress flush");
             loop {

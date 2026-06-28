@@ -204,7 +204,7 @@ fn step_sync(stmt: &StatementHandle) -> napi::Result<u32> {
         .ok_or_else(|| create_generic_error("statement has been finalized"))?;
     match core_stmt.step() {
         Ok(turso_core::StepResult::Row) => Ok(STEP_ROW),
-        Ok(turso_core::StepResult::IO) => Ok(STEP_IO),
+        Ok(turso_core::StepResult::IO | turso_core::StepResult::Yield) => Ok(STEP_IO),
         Ok(turso_core::StepResult::Done) => Ok(STEP_DONE),
         Ok(turso_core::StepResult::Interrupt) => {
             Err(create_generic_error("statement was interrupted"))
@@ -246,6 +246,35 @@ fn query_timeout_override_from_query_options(
         .map(query_timeout_duration)
 }
 
+/// Apply the JS-facing experimental feature list (e.g. `["views", "vacuum"]`)
+/// to [`turso_core::DatabaseOpts`]. The feature-name tokens match the SDK/CLI
+/// names; unknown names are ignored and `"strict"` is a no-op (strict tables
+/// are always enabled). This lives in the binding layer (and is shared with the
+/// sync binding) rather than in `turso_core`, because the string feature-name
+/// representation is a binding concern, not an engine one.
+pub fn apply_experimental_features(
+    mut opts: turso_core::DatabaseOpts,
+    experimental: &[String],
+) -> turso_core::DatabaseOpts {
+    for feature in experimental {
+        opts = match feature.as_str() {
+            "views" => opts.with_views(true),
+            "strict" => opts, // strict is always enabled, kept for backwards compatibility
+            "custom_types" => opts.with_custom_types(true),
+            "encryption" => opts.with_encryption(true),
+            "index_method" => opts.with_index_method(true),
+            "autovacuum" => opts.with_autovacuum(true),
+            "vacuum" => opts.with_vacuum(true),
+            "attach" => opts.with_attach(true),
+            "generated_columns" => opts.with_generated_columns(true),
+            "multiprocess_wal" => opts.with_multiprocess_wal(true),
+            "without_rowid" => opts.with_without_rowid(true),
+            _ => opts,
+        };
+    }
+    opts
+}
+
 fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
     if db.connect.get().is_some() {
         return Ok(());
@@ -271,22 +300,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
             query_timeout = query_timeout_duration(timeout);
         }
         if let Some(experimental) = &opts.experimental {
-            for feature in experimental {
-                core_opts = match feature.as_str() {
-                    "views" => core_opts.with_views(true),
-                    "strict" => core_opts, // strict is always enabled, kept for backwards compatibility
-                    "custom_types" => core_opts.with_custom_types(true),
-                    "encryption" => core_opts.with_encryption(true),
-                    "index_method" => core_opts.with_index_method(true),
-                    "autovacuum" => core_opts.with_autovacuum(true),
-                    "vacuum" => core_opts.with_vacuum(true),
-                    "attach" => core_opts.with_attach(true),
-                    "generated_columns" => core_opts.with_generated_columns(true),
-                    "multiprocess_wal" => core_opts.with_multiprocess_wal(true),
-                    "without_rowid" => core_opts.with_without_rowid(true),
-                    _ => core_opts,
-                };
-            }
+            core_opts = apply_experimental_features(core_opts, experimental);
         }
         if let Some(encryption) = &opts.encryption {
             encryption_opts = Some(turso_core::EncryptionOpts {
@@ -609,8 +623,7 @@ impl Database {
                     Stmt::Select(..)
                     | Stmt::Pragma { .. }
                     | Stmt::Attach { .. }
-                    | Stmt::Detach { .. }
-                    | Stmt::Reindex { .. } => "read",
+                    | Stmt::Detach { .. } => "read",
                     Stmt::Begin { .. } | Stmt::Savepoint { .. } => "begin",
                     Stmt::Commit { .. } | Stmt::Release { .. } => "commit",
                     Stmt::Rollback { .. } => "rollback",
@@ -848,22 +861,32 @@ impl Statement {
                 to_js_value(env, value, safe_integers)?
             }
             PresentationMode::Expanded => {
-                let row = Object::new(env)?;
+                let mut row = Object::new(env)?;
                 let raw_row = row.raw();
                 let raw_env = env.raw();
+                let mut positional_properties = Vec::with_capacity(row_data.len());
                 for idx in 0..row_data.len() {
                     let value = row_data.get_value(idx);
                     let column_name = &self.column_names[idx];
                     let js_value = to_js_value(env, value, safe_integers)?;
-                    unsafe {
+                    check_status!(unsafe {
                         napi::sys::napi_set_named_property(
                             raw_env,
                             raw_row,
                             column_name.as_ptr(),
                             js_value.raw(),
-                        );
-                    }
+                        )
+                    })?;
+                    positional_properties.push(
+                        Property::new()
+                            .with_utf8_name(&idx.to_string())?
+                            .with_value(&js_value)
+                            .with_property_attributes(
+                                PropertyAttributes::Writable | PropertyAttributes::Configurable,
+                            ),
+                    );
                 }
+                row.define_properties(&positional_properties)?;
                 row.to_unknown()
             }
         };
@@ -997,5 +1020,55 @@ fn to_js_value<'a>(
                 ToNapiValue::into_unknown(buffer, env)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_experimental_features;
+
+    #[test]
+    fn apply_experimental_features_maps_feature_list() {
+        // No features -> defaults.
+        assert_eq!(
+            apply_experimental_features(turso_core::DatabaseOpts::new(), &[]),
+            turso_core::DatabaseOpts::new()
+        );
+
+        let features: Vec<String> = [
+            "views",
+            "index_method",
+            "custom_types",
+            "autovacuum",
+            "vacuum",
+            "encryption",
+            "attach",
+            "generated_columns",
+            "multiprocess_wal",
+            "without_rowid",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let opts = apply_experimental_features(turso_core::DatabaseOpts::new(), &features);
+        assert!(opts.enable_views);
+        assert!(opts.enable_index_method);
+        assert!(opts.enable_custom_types);
+        assert!(opts.enable_autovacuum);
+        assert!(opts.enable_vacuum);
+        assert!(opts.enable_encryption);
+        assert!(opts.enable_attach);
+        assert!(opts.enable_generated_columns);
+        assert!(opts.enable_multiprocess_wal);
+        assert!(opts.enable_without_rowid);
+
+        // `strict` and unknown names are no-ops.
+        assert_eq!(
+            apply_experimental_features(
+                turso_core::DatabaseOpts::new(),
+                &["strict".to_string(), "unknown".to_string()]
+            ),
+            turso_core::DatabaseOpts::new()
+        );
     }
 }

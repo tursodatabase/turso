@@ -1,5 +1,5 @@
 use crate::sync::Arc;
-use crate::{schema::BTreeTable, turso_assert_eq, turso_assert_ne};
+use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
@@ -151,6 +151,126 @@ fn default_requires_empty_table(expr: &ast::Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// Rewrite the sqlite_schema row for the AUTOINCREMENT backing table when
+/// the parent table is renamed. The backing table is keyed by name
+/// `__turso_internal_seq___turso_internal_autoincrement_<table>`, so its
+/// row is not touched by the general `Func::AlterTable::RenameTable` sweep
+/// (which only matches rows whose `tbl_name` column equals the renamed
+/// user table). Without this rewrite, the persistent sqlite_schema row
+/// keeps the old backing-table name and SQL, so the next process to open
+/// the DB rebuilds the in-memory schema with the stale backing table —
+/// and an INSERT into the renamed table fails with "missing implicit
+/// sequence for AUTOINCREMENT table".
+///
+/// Mirrors the existing `emit_rename_sqlite_sequence_entry` helper for
+/// the `sqlite_sequence` row; the in-memory rename of `schema.sequences`
+/// and `schema.tables` happens in `op_rename_table`.
+fn emit_rename_autoincrement_backing_table_entry(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
+    old_table_name_norm: &str,
+    new_table_name_norm: &str,
+) {
+    use crate::schema::autoincrement_sequence_name;
+    use crate::translate::sequence::{sequence_backing_table_name, sequence_backing_table_sql};
+
+    let old_backing_name =
+        sequence_backing_table_name(&autoincrement_sequence_name(old_table_name_norm));
+    let new_seq_name = autoincrement_sequence_name(new_table_name_norm);
+    let new_backing_name = sequence_backing_table_name(&new_seq_name);
+    let new_backing_sql = sequence_backing_table_sql(&new_seq_name);
+
+    let Some(sqlite_schema) =
+        resolver.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
+    else {
+        return;
+    };
+
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
+        db: database_id,
+    });
+
+    let old_backing_reg = program.emit_string8_new_reg(old_backing_name);
+    program.mark_last_insn_constant();
+    let new_backing_reg = program.emit_string8_new_reg(new_backing_name);
+    program.mark_last_insn_constant();
+    let new_sql_reg = program.emit_string8_new_reg(new_backing_sql);
+    program.mark_last_insn_constant();
+
+    program.cursor_loop(cursor_id, |program, rowid| {
+        let name_reg = program.alloc_register();
+        program.emit_column_or_rowid(cursor_id, 1, name_reg);
+
+        let continue_label = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: name_reg,
+            rhs: old_backing_reg,
+            target_pc: continue_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+
+        // Preserve type (col 0) and rootpage (col 3); overwrite name/tbl_name
+        // (cols 1, 2) and sql (col 4). The backing table is INTERNAL — its
+        // sql is regenerated from `sequence_backing_table_sql(new_seq_name)`
+        // and never altered by user DDL, so we don't need to AST-rewrite it.
+        let rec_start = program.alloc_registers(5);
+        program.emit_column_or_rowid(cursor_id, 0, rec_start); // type
+        program.emit_insn(Insn::Copy {
+            src_reg: new_backing_reg,
+            dst_reg: rec_start + 1, // name
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: new_backing_reg,
+            dst_reg: rec_start + 2, // tbl_name
+            extra_amount: 0,
+        });
+        program.emit_column_or_rowid(cursor_id, 3, rec_start + 3); // rootpage
+        program.emit_insn(Insn::Copy {
+            src_reg: new_sql_reg,
+            dst_reg: rec_start + 4, // sql
+            extra_amount: 0,
+        });
+
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u16(rec_start),
+            count: to_u16(5),
+            dest_reg: to_u16(record_reg),
+            index_name: None,
+            affinity_str: None,
+        });
+
+        // MVCC: end the old version before writing the new one
+        // (Hekaton-style UPDATE = DELETE + INSERT), mirroring the
+        // pattern used by `emit_rename_sqlite_sequence_entry` and the
+        // main-table rewrite cursor_loop.
+        if database_uses_mvcc(connection, database_id) {
+            program.emit_insn(Insn::Delete {
+                cursor_id,
+                table_name: SQLITE_TABLEID.to_string(),
+                is_part_of_update: true,
+            });
+        }
+
+        program.emit_insn(Insn::Insert {
+            cursor: cursor_id,
+            key_reg: rowid,
+            record_reg,
+            flag: crate::vdbe::insn::InsertFlags(0),
+            table_name: SQLITE_TABLEID.to_string(),
+        });
+
+        program.preassign_label_to_next_insn(continue_label);
+    });
 }
 
 fn emit_rename_sqlite_sequence_entry(
@@ -360,6 +480,12 @@ fn strict_default_type_mismatch(column: &Column) -> Result<bool> {
     let Some(default_expr) = column.default.as_ref() else {
         return Ok(false);
     };
+
+    // Non-constant defaults cannot be evaluated here; they are only legal on
+    // an empty table (enforced at runtime), where no backfill value is needed.
+    if !is_strict_constant_default(default_expr) {
+        return Ok(false);
+    }
 
     let mut value = eval_constant_default_value(default_expr)?;
     if matches!(value, Value::Null) {
@@ -1100,6 +1226,11 @@ pub fn translate_alter_table(
                     "cannot add a STORED column".to_string(),
                 ));
             }
+            if is_generated && !connection.experimental_generated_columns_enabled() {
+                bail_parse_error!(
+                    "Generated columns require --experimental-generated-columns flag"
+                );
+            }
             if is_generated {
                 for c in &col_def.constraints {
                     if let ast::ColumnConstraint::Generated { expr, .. } = &c.constraint {
@@ -1109,20 +1240,6 @@ pub fn translate_alter_table(
             }
             let constraints = col_def.constraints.clone();
             let mut column = Column::try_from(&col_def)?;
-
-            // SQLite is very strict about what constitutes a "constant" default for
-            // ALTER TABLE ADD COLUMN. It only allows literals and signed literals,
-            // not arbitrary constant expressions like (5 + 3) or COALESCE(NULL, 5).
-            if !is_generated
-                && column
-                    .default
-                    .as_ref()
-                    .is_some_and(|default| !is_strict_constant_default(default))
-            {
-                return Err(LimboError::ParseError(
-                    "Cannot add a column with non-constant default".to_string(),
-                ));
-            }
 
             let new_column_name = column.name.clone().ok_or_else(|| {
                 LimboError::ParseError(
@@ -1283,8 +1400,8 @@ pub fn translate_alter_table(
             // added column. Without this, columns typed with a domain would
             // silently skip domain-level enforcement after ALTER TABLE.
             resolver.with_schema(database_id, |schema| {
-                btree.propagate_domain_constraints(schema);
-            });
+                btree.propagate_domain_constraints(schema)
+            })?;
             // Refresh local `column` from btree so that domain NOT NULL is
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
@@ -1331,10 +1448,14 @@ pub fn translate_alter_table(
                 let needs_notnull_check = column.notnull()
                     && effective_default.is_none_or(crate::util::expr_contains_null);
 
-                let needs_nondeterministic_check = column
-                    .default
-                    .as_ref()
-                    .is_some_and(|default| default_requires_empty_table(default));
+                // SQLite is very strict about what constitutes a "constant" default
+                // for ALTER TABLE ADD COLUMN: only literals, signed literals, and
+                // bare identifiers qualify. Anything else — (5 + 3), random(),
+                // CURRENT_TIMESTAMP — is permitted only if the table is empty,
+                // checked at runtime (mirroring SQLite's sqlite3ErrorIfNotEmpty).
+                let needs_nondeterministic_check = column.default.as_ref().is_some_and(|default| {
+                    default_requires_empty_table(default) || !is_strict_constant_default(default)
+                });
 
                 let (needs_empty_table_check, error_message) = if needs_notnull_check {
                     (true, "Cannot add a NOT NULL column with default value NULL")
@@ -1402,8 +1523,8 @@ pub fn translate_alter_table(
                         db: database_id,
                         table: table_name.to_owned(),
                         column: Box::new(column),
-                        check_constraints: btree.check_constraints.clone(),
-                        foreign_keys: btree.foreign_keys.clone(),
+                        check_constraints: btree.check_constraints.to_vec(),
+                        foreign_keys: btree.foreign_keys.to_vec(),
                     });
                 },
             )?
@@ -1549,6 +1670,30 @@ pub fn translate_alter_table(
                 &normalized_old_name,
                 &normalized_new_name,
             );
+
+            // For AUTOINCREMENT tables, also rewrite the persistent
+            // sqlite_schema row for the hidden backing table. The in-memory
+            // rename happens in `op_rename_table`; without this bytecode the
+            // schema state on disk and in memory would diverge across a
+            // reopen. Cheap no-op for non-AUTOINCREMENT tables: we look up
+            // the implicit sequence via `autoincrement_sequence_name` and
+            // only emit the sweep when the descriptor is present.
+            let has_implicit_seq = resolver.with_schema(database_id, |s| {
+                s.get_sequence(&crate::schema::autoincrement_sequence_name(
+                    &normalized_old_name,
+                ))
+                .is_some()
+            });
+            if has_implicit_seq {
+                emit_rename_autoincrement_backing_table_entry(
+                    program,
+                    resolver,
+                    connection,
+                    database_id,
+                    &normalized_old_name,
+                    &normalized_new_name,
+                );
+            }
 
             for (trigger_name, new_sql) in temp_triggers_to_rewrite {
                 let escaped_sql = escape_sql_string_literal(&new_sql);

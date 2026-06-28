@@ -22,7 +22,7 @@ use crate::{
 /// **Pre defined collation sequences**\
 /// Collating functions only matter when comparing string values.
 /// Numeric values are always compared numerically, and BLOBs are always compared byte-by-byte using memcmp().
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub enum CollationSeq {
     Unset,
     Binary,
@@ -170,9 +170,17 @@ impl CollationSeq {
 
     #[inline(always)]
     fn nocase_cmp(lhs: &str, rhs: &str) -> Ordering {
-        let nocase_lhs = uncased::UncasedStr::new(lhs);
-        let nocase_rhs = uncased::UncasedStr::new(rhs);
-        nocase_lhs.cmp(nocase_rhs)
+        for (left, right) in lhs.bytes().zip(rhs.bytes()) {
+            let left = left.to_ascii_lowercase();
+            let right = right.to_ascii_lowercase();
+            if left != right {
+                return left.cmp(&right);
+            }
+            if left == 0 {
+                return lhs.len().cmp(&rhs.len());
+            }
+        }
+        lhs.len().cmp(&rhs.len())
     }
 
     #[inline(always)]
@@ -215,7 +223,7 @@ impl std::fmt::Display for CollationSeq {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub struct LocaleCollationId(u16);
 
 impl LocaleCollationId {
@@ -511,6 +519,7 @@ fn get_collseq_parts_from_expr_with_symbols(
 
 #[cfg(test)]
 mod tests {
+    use crate::alloc::vec;
     use crate::{sync::Arc, MAIN_DB_ID};
 
     use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
@@ -618,7 +627,7 @@ mod tests {
             Name::exact("NOCASE".to_string()),
         );
         let expr = Expr::Collate(
-            Box::new(Expr::Parenthesized(vec![Box::new(inner)])),
+            Box::new(Expr::Parenthesized(std::vec![Box::new(inner)])),
             Name::exact("RTRIM".to_string()),
         );
         let collseq = get_collseq_from_expr(&expr, &table_references).unwrap();
@@ -675,7 +684,7 @@ mod tests {
             column: 0,
             is_rowid_alias: false,
         };
-        let rhs = Expr::Parenthesized(vec![Box::new(Expr::Collate(
+        let rhs = Expr::Parenthesized(std::vec![Box::new(Expr::Collate(
             Box::new(Expr::Literal(Literal::String("x".to_string()))),
             Name::exact("RTRIM".to_string()),
         ))]);

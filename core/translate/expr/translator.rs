@@ -1235,7 +1235,8 @@ pub fn translate_expr(
                         | ScalarFunc::RandomBlob
                         | ScalarFunc::Sign
                         | ScalarFunc::Soundex
-                        | ScalarFunc::ZeroBlob => {
+                        | ScalarFunc::ZeroBlob
+                        | ScalarFunc::SequenceWatermark => {
                             let args = expect_arguments_exact!(args, 1, srf);
                             let start_reg = program.alloc_register();
                             translate_expr(
@@ -1821,6 +1822,11 @@ pub fn translate_expr(
                         | ScalarFunc::TestUintLt
                         | ScalarFunc::TestUintEq
                         | ScalarFunc::StringReverse
+                        | ScalarFunc::Gcd
+                        | ScalarFunc::Lcm
+                        | ScalarFunc::Repeat
+                        | ScalarFunc::Lpad
+                        | ScalarFunc::Rpad
                         | ScalarFunc::BooleanToInt
                         | ScalarFunc::IntToBoolean
                         | ScalarFunc::ValidateIpAddr
@@ -1962,6 +1968,22 @@ pub fn translate_expr(
                                 [src_reg <- 0],
                                 Insn::StructField { src_reg, field_index, dest: target_register })
                         }
+                        ScalarFunc::NextVal | ScalarFunc::SetVal => translate_sequence_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        ),
+                        ScalarFunc::CurrVal => translate_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        ),
                     }
                 }
                 Func::Math(math_func) => match math_func.arity() {

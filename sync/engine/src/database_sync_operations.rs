@@ -677,7 +677,9 @@ pub const TURSO_SYNC_UPDATE_LAST_CHANGE_ID: &str =
 const TURSO_SYNC_SELECT_LAST_CHANGE_ID: &str =
     "SELECT pull_gen, change_id FROM turso_sync_last_change_id WHERE client_id = ?";
 
-fn convert_to_args(values: Vec<turso_core::Value>) -> Vec<server_proto::Value> {
+fn convert_to_args(
+    values: impl IntoIterator<Item = turso_core::Value>,
+) -> Vec<server_proto::Value> {
     values
         .into_iter()
         .map(|value| match value {
@@ -1252,7 +1254,10 @@ pub async fn checkpoint_wal_file<Ctx>(
     let mut checkpoint_stmt = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
     loop {
         match checkpoint_stmt.step()? {
-            turso_core::StepResult::IO => coro.yield_(SyncEngineIoResult::IO).await?,
+            turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                // todo(sivukhin): introduce Yield result in the sync engine
+                coro.yield_(SyncEngineIoResult::IO).await?
+            }
             turso_core::StepResult::Done => break,
             turso_core::StepResult::Row => continue,
             r => {

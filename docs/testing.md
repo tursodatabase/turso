@@ -1,12 +1,12 @@
-# Testing in Limbo
+# Testing in Turso
 
-Limbo supports a comprehensive testing system to ensure correctness, performance, and compatibility with SQLite.
+Turso supports a comprehensive testing system to ensure correctness, performance, and compatibility with SQLite.
 
 ## 1. Compatibility Tests
 
 The `make test` target is the main entry point.
 
-Most compatibility tests live in the testing/ directory and are written in SQLite’s TCL test format. These tests ensure that Limbo matches SQLite’s behavior exactly. The database used during these tests is located at testing/testing.db, which includes the following schema:
+Most compatibility tests live in the testing/ directory and are written in SQLite’s TCL test format. These tests ensure that Turso matches SQLite’s behavior exactly. The database used during these tests is located at testing/testing.db, which includes the following schema:
 
 ```sql
 CREATE TABLE users (
@@ -55,7 +55,7 @@ Use these Python-based tests for validating:
 
   - Shell commands and .dot interactions
 
-  - Limbo-specific extensions in `testing/cli_tests/extensions.py`
+  - Turso-specific extensions in `testing/cli_tests/extensions.py`
 
   - Any known divergence from SQLite behavior
 
@@ -74,7 +74,7 @@ This will enable trace-level logs for the turso_core crate and disable logs else
 
 ## Deterministic Simulation Testing (DST):
 
-Limbo simulator uses randomized deterministic simulations to test the Limbo database behaviors.
+The Turso simulator uses randomized deterministic simulations to test Turso database behaviors.
 
 Each simulation begins with a random configurations:
 
@@ -115,7 +115,7 @@ RUST_LOG=limbo_sim=debug cargo run --bin limbo_sim
 The simulator CLI has a few configuration options that you can explore via `--help` flag.
 
 ```txt
-The Limbo deterministic simulator
+The Turso deterministic simulator
 
 Usage: limbo_sim [OPTIONS]
 
@@ -127,7 +127,7 @@ Options:
   -t, --maximum-time <MAXIMUM_TIME>  change the maximum time of the simulation(in seconds) [default: 3600]
   -l, --load <LOAD>                  load plan from the bug base
   -w, --watch                        enable watch mode that reruns the simulation on file changes
-      --differential                 run differential testing between sqlite and Limbo
+      --differential                 run differential testing between sqlite and Turso
   -h, --help                         Print help
   -V, --version                      Print version
 ```

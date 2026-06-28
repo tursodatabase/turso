@@ -149,6 +149,38 @@ pub struct TursoDatabaseConfig {
     pub db_file: Option<Arc<dyn DatabaseStorage>>,
 }
 
+impl TursoDatabaseConfig {
+    /// Build the typed [`turso_core::DatabaseOpts`] from the comma-separated
+    /// [`Self::experimental_features`] string. The feature-name tokens are the
+    /// SDK/CLI-facing names; unknown names are ignored and `"strict"` is a
+    /// no-op (strict tables are always enabled). This keeps the
+    /// string -> typed-options translation in the SDK layer where the string
+    /// representation lives, instead of in `turso_core`.
+    pub fn database_opts(&self) -> DatabaseOpts {
+        let mut opts = DatabaseOpts::new();
+        let Some(experimental_features) = &self.experimental_features else {
+            return opts;
+        };
+        for feature in experimental_features.split(',').map(|s| s.trim()) {
+            opts = match feature {
+                "views" => opts.with_views(true),
+                "index_method" => opts.with_index_method(true),
+                "custom_types" => opts.with_custom_types(true),
+                "autovacuum" => opts.with_autovacuum(true),
+                "vacuum" => opts.with_vacuum(true),
+                "encryption" => opts.with_encryption(true),
+                "attach" => opts.with_attach(true),
+                "generated_columns" => opts.with_generated_columns(true),
+                "multiprocess_wal" => opts.with_multiprocess_wal(true),
+                "without_rowid" => opts.with_without_rowid(true),
+                // "strict" is always enabled, kept for backwards compatibility
+                _ => opts,
+            };
+        }
+        opts
+    }
+}
+
 pub fn turso_slice_from_bytes(bytes: &[u8]) -> capi::c::turso_slice_ref_t {
     capi::c::turso_slice_ref_t {
         ptr: bytes.as_ptr() as *const std::ffi::c_void,
@@ -656,25 +688,7 @@ impl TursoDatabase {
                     // OpenFlags::NoLock when multiprocess WAL is enabled — taking
                     // the OS-level fcntl lock here would block every other
                     // multiprocess process from opening the same file.
-                    let mut opts = DatabaseOpts::new();
-                    if let Some(experimental_features) = &self.config.experimental_features {
-                        for features in experimental_features.split(",").map(|s| s.trim()) {
-                            opts = match features {
-                                "views" => opts.with_views(true),
-                                "index_method" => opts.with_index_method(true),
-                                "strict" => opts, // strict is always enabled, kept for backwards compatibility
-                                "custom_types" => opts.with_custom_types(true),
-                                "autovacuum" => opts.with_autovacuum(true),
-                                "vacuum" => opts.with_vacuum(true),
-                                "encryption" => opts.with_encryption(true),
-                                "attach" => opts.with_attach(true),
-                                "generated_columns" => opts.with_generated_columns(true),
-                                "multiprocess_wal" => opts.with_multiprocess_wal(true),
-                                "without_rowid" => opts.with_without_rowid(true),
-                                _ => opts,
-                            };
-                        }
-                    }
+                    let opts = self.config.database_opts();
 
                     if self.config.encryption.is_some() && !opts.enable_encryption {
                         return Err(TursoError::Error(
@@ -1135,7 +1149,7 @@ fn step_inner(
             StepResult::Row => Ok(TursoStatusCode::Row),
             StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
             StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 if async_io {
                     Ok(TursoStatusCode::Io)
                 } else {
@@ -1345,6 +1359,24 @@ impl TursoStatement {
         }
         stmt.get_column_decltype(index)
     }
+
+    /// Returns rich type information for the column at `index`.
+    ///
+    /// Wraps [`turso_core::Statement::get_column_type_info`]. Returns `None`
+    /// when the statement has been finalized, when the index is out of
+    /// bounds, when the connection does not have the experimental custom-
+    /// types feature enabled (the underlying call errors and we surface that
+    /// as "no info"; the C ABI has no error channel), when the statement is
+    /// in EXPLAIN mode, or when the expression behind the column has no
+    /// determined affinity.
+    pub fn column_type_info(&self, index: usize) -> Option<turso_core::ColumnTypeInfo> {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle.as_ref()?;
+        if index >= stmt.num_columns() {
+            return None;
+        }
+        stmt.get_column_type_info(index).ok().flatten()
+    }
     /// finalize statement execution
     /// this method must be called in the end of statement execution (either successfull or not)
     pub fn finalize(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
@@ -1411,6 +1443,51 @@ mod tests {
         TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR,
     };
     use turso_core::Value;
+
+    fn config_with_features(features: Option<&str>) -> TursoDatabaseConfig {
+        TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: features.map(str::to_string),
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        }
+    }
+
+    #[test]
+    pub fn database_opts_maps_experimental_features() {
+        // No features -> all defaults.
+        assert_eq!(
+            config_with_features(None).database_opts(),
+            turso_core::DatabaseOpts::new()
+        );
+
+        // Each token toggles its corresponding flag.
+        let opts = config_with_features(Some(
+            "views,index_method,custom_types,autovacuum,vacuum,encryption,attach,generated_columns,multiprocess_wal,without_rowid",
+        ))
+        .database_opts();
+        assert!(opts.enable_views);
+        assert!(opts.enable_index_method);
+        assert!(opts.enable_custom_types);
+        assert!(opts.enable_autovacuum);
+        assert!(opts.enable_vacuum);
+        assert!(opts.enable_encryption);
+        assert!(opts.enable_attach);
+        assert!(opts.enable_generated_columns);
+        assert!(opts.enable_multiprocess_wal);
+        assert!(opts.enable_without_rowid);
+
+        // Whitespace is trimmed; `strict` and unknown names are ignored.
+        let opts = config_with_features(Some(" views , strict , unknown_one ")).database_opts();
+        assert!(opts.enable_views);
+        assert_eq!(
+            config_with_features(Some("strict,unknown")).database_opts(),
+            turso_core::DatabaseOpts::new()
+        );
+    }
 
     #[test]
     pub fn test_db_concurrent_use() {

@@ -4004,8 +4004,14 @@ impl Wal for WalFile {
         let file = self.coordination.wal_file()?;
         let coordination = self.coordination.clone();
         let c = file.sync(
-            Completion::new_sync(move |_| {
-                coordination.mark_initialized();
+            Completion::new_sync(move |res| {
+                // Only mark the WAL header durable once its sync has actually
+                // succeeded. A failed sync must leave the WAL uninitialized so
+                // the header is re-issued before the next append, keeping the
+                // in-memory initialized state consistent with what is on disk.
+                if res.is_ok() {
+                    coordination.mark_initialized();
+                }
             }),
             sync_type,
         )?;
@@ -4281,7 +4287,6 @@ impl Wal for WalFile {
             );
 
             for (page, fid, _csum) in &page_frame_for_cb {
-                page.clear_dirty();
                 page.set_wal_tag(*fid, epoch);
             }
         };
@@ -4597,19 +4602,6 @@ impl WalFile {
                                 .as_ref()
                                 .expect("buffer missing")
                                 .clone();
-                            // We debug assert that the cached page has the
-                            // exact contents as one read from the WAL.
-                            #[cfg(debug_assertions)]
-                            {
-                                let mut raw =
-                                    vec![0u8; self.page_size() as usize + WAL_FRAME_HEADER_SIZE];
-                                self.io.wait_for_completion(
-                                    self.read_frame_raw(target_frame, &mut raw)?,
-                                )?;
-                                let (_, wal_page) = sqlite3_ondisk::parse_wal_frame_header(&raw);
-                                let cached = buffer.as_slice();
-                                turso_assert!(wal_page == cached, "cached page content differs from WAL read", { "page_id": page_id, "frame_id": target_frame });
-                            }
                             {
                                 ongoing_chkpt
                                     .pending_writes

@@ -1227,12 +1227,6 @@ pub fn translate_create_table(
         }
     }
 
-    if has_autoincrement && connection.mv_store_for_db(database_id).is_some() {
-        bail_parse_error!(
-            "AUTOINCREMENT is not supported in MVCC mode (journal_mode=experimental_mvcc)"
-        );
-    }
-
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
 
     let create_btree_label = program.allocate_label();
@@ -1395,6 +1389,34 @@ pub fn translate_create_table(
                 &normalized_tbl_name,
                 index_reg,
                 None,
+            )?;
+        }
+    }
+
+    // Create the backing table for the hidden AUTOINCREMENT sequence. The
+    // `__turso_internal_autoincrement_` prefix identifies the sequence object;
+    // `sequence_backing_table_name` then maps it to the physical
+    // `__turso_internal_seq_<sequence-name>` table.
+    // Skip if it already exists (e.g. VACUUM INTO copies all tables first).
+    if has_autoincrement {
+        let autoinc_seq_name = crate::schema::autoincrement_sequence_name(&normalized_tbl_name);
+        let backing_table_name =
+            crate::translate::sequence::sequence_backing_table_name(&autoinc_seq_name);
+        let already_exists = resolver.with_schema(database_id, |s| {
+            s.get_btree_table(&backing_table_name).is_some()
+        });
+        if !already_exists {
+            crate::translate::sequence::emit_sequence_backing_table(
+                program,
+                resolver,
+                database_id,
+                sqlite_schema_cursor_id,
+                &autoinc_seq_name,
+                1,        // start
+                1,        // increment
+                1,        // min
+                i64::MAX, // max
+                false,    // cycle
             )?;
         }
     }
@@ -2095,7 +2117,7 @@ pub fn translate_drop_table(
         // cursor id 1
         let sqlite_schema_cursor_id_1 =
             program.alloc_cursor_id(CursorType::BTreeTable(schema_table.clone()));
-        let columns = vec![Column::new(
+        let columns = crate::alloc::vec![Column::new(
             Some("rowid".to_string()),
             "INTEGER".to_string(),
             None,
@@ -2107,12 +2129,12 @@ pub fn translate_drop_table(
         let simple_table_rc = Arc::new(BTreeTable::new(
             0, // root_page, not relevant for ephemeral table definition
             "ephemeral_scratch".to_string(),
-            vec![],
+            crate::alloc::vec![],
             columns,
             BTreeCharacteristics::HAS_ROWID,
-            vec![],
-            vec![],
-            vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         ));
         // cursor id 2
@@ -2248,12 +2270,19 @@ pub fn translate_drop_table(
         // End loop to copy over row id's from the ephemeral table and then re-insert into the schema table with the correct root page
     }
 
-    // if drops table, sequence table should reset.
-    if let Some(seq_table) = resolver
-        .schema()
-        .get_table(SQLITE_SEQUENCE_TABLE_NAME)
-        .and_then(|t| t.btree())
-    {
+    // If the dropped table had AUTOINCREMENT, clear its `sqlite_sequence` row.
+    // Look up the table in the TARGET database's schema (not the main one).
+    // `resolver.schema()` returns the MAIN schema, so for `DROP TABLE aux.t`
+    // it would either (a) skip the cleanup entirely when main lacks
+    // `sqlite_sequence`, leaving a stale high-water-mark in `aux.sqlite_sequence`
+    // that the next AUTOINCREMENT INSERT into a same-named table would
+    // resume from, or (b) — worse — open the cursor against the attached
+    // database using main's root page, corrupting whatever lived there.
+    // The matching `OpenWrite` below passes `db: database_id`, so the root
+    // page must come from the same schema.
+    if let Some(seq_table) = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+    }) {
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
         let seq_table_name_reg = program.alloc_register();
         let dropped_table_name_reg =
@@ -2363,6 +2392,28 @@ pub fn translate_drop_table(
         _p3: 0,
         table_name: tbl_name.name.as_str().to_string(),
     });
+
+    // If the dropped table owned an implicit AUTOINCREMENT sequence, tear
+    // down its backing table too: destroy the B-tree root, remove the
+    // sqlite_schema entry, and drop the in-memory `Sequence`. Without this
+    // the `__turso_internal_seq_<…>` backing table outlives its parent,
+    // and a subsequent `CREATE TABLE <name>` with the same name and
+    // AUTOINCREMENT under MVCC would resume nextval at the old watermark
+    // (and the orphan table bloats the DB indefinitely in WAL mode).
+    // Schema-cookie bump is shared with the table-drop below; the helper
+    // never touches it. No-op when has_autoincrement is false or the
+    // sequence/backing-table is somehow already missing — same idempotency
+    // contract as DROP SEQUENCE IF EXISTS.
+    if table.btree().is_some_and(|bt| bt.has_autoincrement) {
+        let seq_name =
+            crate::schema::autoincrement_sequence_name(&normalize_ident(tbl_name.name.as_str()));
+        crate::translate::sequence::emit_drop_sequence_cleanup(
+            program,
+            resolver,
+            database_id,
+            &seq_name,
+        )?;
+    }
 
     let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {

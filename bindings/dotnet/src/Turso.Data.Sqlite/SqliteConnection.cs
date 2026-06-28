@@ -123,6 +123,13 @@ public partial class SqliteConnection : DbConnection
         }
     }
 
+    public override Task OpenAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Open();
+        return Task.CompletedTask;
+    }
+
     public override void Close()
     {
         if (_database is null)
@@ -166,6 +173,8 @@ public partial class SqliteConnection : DbConnection
             table.Columns.Add(DbMetaDataColumnNames.NumberOfIdentifierParts, typeof(int));
             table.Rows.Add(DbMetaDataCollectionNames.MetaDataCollections, 0, 0);
             table.Rows.Add(DbMetaDataCollectionNames.ReservedWords, 0, 0);
+            table.Rows.Add("Tables", 4, 4);
+            table.Rows.Add("Columns", 4, 4);
             return table;
         }
 
@@ -179,6 +188,12 @@ public partial class SqliteConnection : DbConnection
 
             return table;
         }
+
+        if (string.Equals(collectionName, "Tables", StringComparison.OrdinalIgnoreCase))
+            return GetTablesSchema(collectionName, restrictionValues);
+
+        if (string.Equals(collectionName, "Columns", StringComparison.OrdinalIgnoreCase))
+            return GetColumnsSchema(collectionName, restrictionValues);
 
         throw new ArgumentException(Properties.Resources.UnknownCollection(collectionName));
     }
@@ -414,6 +429,84 @@ public partial class SqliteConnection : DbConnection
         return tables;
     }
 
+    private DataTable GetTablesSchema(string collectionName, string?[]? restrictionValues)
+    {
+        EnsureOpen();
+        ValidateRestrictions(collectionName, restrictionValues, 4);
+        var table = new DataTable("Tables");
+        table.Columns.Add("TABLE_CATALOG", typeof(string));
+        table.Columns.Add("TABLE_SCHEMA", typeof(string));
+        table.Columns.Add("TABLE_NAME", typeof(string));
+        table.Columns.Add("TABLE_TYPE", typeof(string));
+
+        var tableNameRestriction = GetRestriction(restrictionValues, 2);
+        using var command = CreateCommand();
+        command.CommandText = "SELECT name, type, sql FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'"
+                              + (tableNameRestriction is null ? "" : " AND name COLLATE NOCASE = $table")
+                              + " ORDER BY name;";
+        if (tableNameRestriction is not null)
+            command.Parameters.AddWithValue("$table", tableNameRestriction);
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var type = reader.GetString(1).Equals("view", StringComparison.OrdinalIgnoreCase) ? "VIEW" : "BASE TABLE";
+            var tableName = GetDeclaredSchemaObjectName(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.IsDBNull(2) ? null : reader.GetString(2));
+            table.Rows.Add("main", DBNull.Value, tableName, type);
+        }
+
+        return table;
+    }
+
+    private DataTable GetColumnsSchema(string collectionName, string?[]? restrictionValues)
+    {
+        EnsureOpen();
+        ValidateRestrictions(collectionName, restrictionValues, 4);
+        var table = new DataTable("Columns");
+        table.Columns.Add("TABLE_CATALOG", typeof(string));
+        table.Columns.Add("TABLE_SCHEMA", typeof(string));
+        table.Columns.Add("TABLE_NAME", typeof(string));
+        table.Columns.Add("COLUMN_NAME", typeof(string));
+        table.Columns.Add("ORDINAL_POSITION", typeof(int));
+        table.Columns.Add("COLUMN_DEFAULT", typeof(string));
+        table.Columns.Add("IS_NULLABLE", typeof(bool));
+        table.Columns.Add("DATA_TYPE", typeof(string));
+
+        var tableNameRestriction = GetRestriction(restrictionValues, 2);
+        var columnNameRestriction = GetRestriction(restrictionValues, 3);
+        var tableNames = tableNameRestriction is null ? GetUserTableNames() : [tableNameRestriction];
+        foreach (var tableName in tableNames)
+        {
+            using var command = CreateCommand();
+            command.CommandText = $"PRAGMA table_info({QuoteIdentifier(tableName)});";
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                var columnName = reader.GetString(1);
+                if (columnNameRestriction is not null
+                    && !string.Equals(columnNameRestriction, columnName, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                table.Rows.Add(
+                    "main",
+                    DBNull.Value,
+                    tableName,
+                    columnName,
+                    reader.GetInt32(0),
+                    reader.IsDBNull(4) ? DBNull.Value : reader.GetValue(4),
+                    reader.GetInt64(3) == 0,
+                    reader.GetString(2));
+            }
+        }
+
+        return table;
+    }
+
     private void CopyTableRows(SqliteConnection destination, string tableName)
     {
         using var select = new SqliteCommand("SELECT * FROM " + QuoteIdentifier(tableName) + ";", this);
@@ -486,6 +579,149 @@ public partial class SqliteConnection : DbConnection
         if (restrictionValues is not null && restrictionValues.Length > maxRestrictions)
             throw new ArgumentException(Properties.Resources.TooManyRestrictions(collectionName));
     }
+
+    private static string? GetRestriction(string?[]? restrictionValues, int index)
+        => restrictionValues is not null && restrictionValues.Length > index && !string.IsNullOrEmpty(restrictionValues[index])
+            ? restrictionValues[index]
+            : null;
+
+    private static string GetDeclaredSchemaObjectName(string storedName, string type, string? createSql)
+    {
+        if (string.IsNullOrWhiteSpace(createSql))
+            return storedName;
+
+        var index = 0;
+        if (!TryReadKeyword(createSql, ref index, "CREATE"))
+            return storedName;
+
+        _ = TryReadKeyword(createSql, ref index, "TEMP")
+            || TryReadKeyword(createSql, ref index, "TEMPORARY");
+
+        var expectedType = type.Equals("view", StringComparison.OrdinalIgnoreCase) ? "VIEW" : "TABLE";
+        if (!TryReadKeyword(createSql, ref index, expectedType))
+            return storedName;
+
+        var beforeIf = index;
+        if (TryReadKeyword(createSql, ref index, "IF"))
+        {
+            if (!TryReadKeyword(createSql, ref index, "NOT")
+                || !TryReadKeyword(createSql, ref index, "EXISTS"))
+            {
+                index = beforeIf;
+            }
+        }
+
+        return TryReadSchemaObjectName(createSql, ref index, out var objectName)
+            ? objectName
+            : storedName;
+    }
+
+    private static bool TryReadKeyword(string sql, ref int index, string keyword)
+    {
+        SkipSqlWhitespace(sql, ref index);
+        if (sql.Length - index < keyword.Length
+            || !sql.AsSpan(index, keyword.Length).Equals(keyword, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var end = index + keyword.Length;
+        if (end < sql.Length && IsSqlIdentifierPart(sql[end]))
+            return false;
+
+        index = end;
+        return true;
+    }
+
+    private static bool TryReadSchemaObjectName(string sql, ref int index, [NotNullWhen(true)] out string? objectName)
+    {
+        objectName = null;
+        do
+        {
+            if (!TryReadIdentifier(sql, ref index, out var part))
+                return objectName is not null;
+
+            objectName = part;
+            SkipSqlWhitespace(sql, ref index);
+            if (index >= sql.Length || sql[index] != '.')
+                return true;
+
+            index++;
+        }
+        while (true);
+    }
+
+    private static bool TryReadIdentifier(string sql, ref int index, [NotNullWhen(true)] out string? identifier)
+    {
+        identifier = null;
+        SkipSqlWhitespace(sql, ref index);
+        if (index >= sql.Length)
+            return false;
+
+        var quote = sql[index];
+        if (quote is '"' or '\'' or '`')
+        {
+            index++;
+            var start = index;
+            var builder = new System.Text.StringBuilder();
+            while (index < sql.Length)
+            {
+                if (sql[index] == quote)
+                {
+                    if (index + 1 < sql.Length && sql[index + 1] == quote)
+                    {
+                        builder.Append(sql.AsSpan(start, index - start));
+                        builder.Append(quote);
+                        index += 2;
+                        start = index;
+                        continue;
+                    }
+
+                    builder.Append(sql.AsSpan(start, index - start));
+                    index++;
+                    identifier = builder.ToString();
+                    return true;
+                }
+
+                index++;
+            }
+
+            return false;
+        }
+
+        if (quote == '[')
+        {
+            index++;
+            var start = index;
+            while (index < sql.Length && sql[index] != ']')
+                index++;
+            if (index >= sql.Length)
+                return false;
+
+            identifier = sql[start..index];
+            index++;
+            return true;
+        }
+
+        var tokenStart = index;
+        while (index < sql.Length && IsSqlIdentifierPart(sql[index]))
+            index++;
+
+        if (index == tokenStart)
+            return false;
+
+        identifier = sql[tokenStart..index];
+        return true;
+    }
+
+    private static void SkipSqlWhitespace(string sql, ref int index)
+    {
+        while (index < sql.Length && char.IsWhiteSpace(sql[index]))
+            index++;
+    }
+
+    private static bool IsSqlIdentifierPart(char value)
+        => char.IsLetterOrDigit(value) || value == '_' || value == '$';
 
     private static string NormalizeDataSource(SqliteConnectionStringBuilder options)
     {

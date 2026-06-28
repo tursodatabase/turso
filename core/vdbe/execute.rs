@@ -1,8 +1,9 @@
+use crate::alloc::{DynAllocator, TursoSliceExt, TursoTryWithCapacityExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
-use crate::mvcc::database::CheckpointStateMachine;
+use crate::mvcc::database::{BootstrapState, CheckpointStateMachine, TxID};
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
@@ -71,7 +72,7 @@ use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
-        SQLITE_ERROR,
+        SQLITE_ERROR, SQLITE_FULL,
     },
     function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
@@ -101,11 +102,11 @@ use crate::storage::btree::{BTreeCursor, BTreeKey};
 
 use super::{
     array::{
-        array_values_from_blob, compare_arrays, compute_array_length, exec_array_append,
-        exec_array_cat, exec_array_contains, exec_array_contains_all, exec_array_overlap,
-        exec_array_position, exec_array_prepend, exec_array_remove, exec_array_slice,
-        exec_array_to_string, exec_string_to_array, make_array_from_registers, parse_text_array,
-        serialize_array_from_blob, values_to_record_blob,
+        array_values_from_blob, compare_arrays, compute_array_length, compute_array_length_at_dim,
+        exec_array_append, exec_array_cat, exec_array_contains, exec_array_contains_all,
+        exec_array_overlap, exec_array_position, exec_array_prepend, exec_array_remove,
+        exec_array_slice, exec_array_to_string, exec_string_to_array, make_array_from_registers,
+        parse_text_array, serialize_array_from_blob, values_to_record_blob,
     },
     insn::{Cookie, RegisterOrLiteral, SortComparatorType},
     CommitState,
@@ -137,6 +138,8 @@ use super::{make_record, Program, ProgramState, Register};
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
 use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
+
+type MvccCheckpointStateMachine = CheckpointStateMachine<MvccClock, DynAllocator>;
 
 /// Macro to destructure an Insn enum variant, only to be used when it
 /// is *impossible* to be another variant.
@@ -605,6 +608,7 @@ pub fn op_checkpoint(
             program.connection.clone(),
             true,
             program.connection.get_sync_mode(),
+            *database,
         );
         let CheckpointResult {
             wal_max_frame,
@@ -616,7 +620,7 @@ pub fn op_checkpoint(
                 Ok(TransitionResult::Done(result)) => break result,
                 Ok(TransitionResult::Io(iocompletions)) => {
                     if let Err(err) = iocompletions.wait(pager.io.as_ref()) {
-                        ckpt_sm.cleanup_after_external_io_error();
+                        ckpt_sm.cleanup_after_external_io_error(err.clone())?;
                         return Err(err);
                     }
                 }
@@ -1263,7 +1267,11 @@ pub fn op_open_read(
                 index.as_ref(),
                 num_columns,
             )?);
-            let index_info = Arc::new(IndexInfo::new_from_index(index)?);
+            let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
+                IndexInfo::new_from_index_in(index, mv_store.allocator())?
+            } else {
+                IndexInfo::new_from_index(index)?
+            });
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
@@ -2981,6 +2989,7 @@ pub fn halt(
             Some(LimboError::ForeignKeyConstraint(description.to_string()))
         }
         SQLITE_CONSTRAINT_TRIGGER => Some(LimboError::Constraint(description.to_string())),
+        SQLITE_FULL => Some(LimboError::DatabaseFull(description.to_string())),
         // SQLITE_ERROR is a generic error (e.g. ALTER TABLE validation), not a constraint.
         // Use InternalError so abort() doesn't apply ON CONFLICT resolution to it.
         SQLITE_ERROR => Some(LimboError::InternalError(description.to_string())),
@@ -3073,6 +3082,15 @@ pub fn halt(
         if owns_auto_txn {
             vtab_commit_all(&program.connection)?;
             index_method_pre_commit_all(state, pager)?;
+            // Sequence backing-table compaction and sqlite_sequence sync
+            // are emitted as straight-line bytecode inside the
+            // nextval / advance_past / setval translators
+            // (`core/translate/sequence.rs`,
+            // `core/translate/expr/functions.rs`). By the time we reach
+            // the commit the backing tables are already single-row and
+            // `sqlite_sequence` is already in sync, so the commit does
+            // not invoke a sequence flush — keeping op_halt within the
+            // vdbe async contract.
             let result = program
                 .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
                 .map(Into::into);
@@ -3458,7 +3476,10 @@ pub fn op_transaction_inner(
         match *state.active_op_state.transaction() {
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
-                let write = matches!(tx_mode, TransactionMode::Write);
+                let write = matches!(
+                    tx_mode,
+                    TransactionMode::Write | TransactionMode::Concurrent
+                );
                 let mut started_secondary_tx = false;
                 if write && conn.is_readonly(*db) {
                     return Err(LimboError::ReadOnly);
@@ -4065,9 +4086,15 @@ pub fn op_auto_commit(
         };
     }
 
-    turso_debug_assert!(matches!(tx_op, TxOp::Commit | TxOp::Rollback), "tx_op should be commit or rollback by now", {"tx_op": tx_op});
+    turso_debug_assert!(
+        matches!(tx_op, TxOp::Commit | TxOp::Rollback),
+        "tx_op should be commit or rollback by now",
+        { "tx_op": tx_op }
+    );
 
-    // For explicit COMMIT, flush any pending index method writes first
+    // For explicit COMMIT, flush pending writes before the actual commit
+    // so they are part of the same transaction. Sequence flush no longer
+    // belongs here — see the long-form comment in `op_halt` above.
     if matches!(tx_op, TxOp::Commit) {
         index_method_pre_commit_all(state, pager)?;
     }
@@ -4120,89 +4147,92 @@ pub fn op_savepoint(
 
     match *op {
         SavepointOp::Begin => {
-            conn.with_snapshot_non_main_schemas(|temp_schema_snapshot, staged_schema_snapshot| {
-                let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
-                let deferred_fk_violations = conn.get_deferred_foreign_key_violations();
+            conn.with_savepoint_schema_snapshot(
+                |main_schema_snapshot, temp_schema_snapshot, staged_schema_snapshot| {
+                    let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
+                    let deferred_fk_violations = conn.get_deferred_foreign_key_violations();
 
-                if let Some(mv_store) = mv_store.as_ref() {
-                    let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
-                        tx_id
+                    if let Some(mv_store) = mv_store.as_ref() {
+                        let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
+                            tx_id
+                        } else {
+                            let tx_id = mv_store.begin_tx(pager.clone())?;
+                            conn.set_mv_tx(Some((tx_id, TransactionMode::Read)));
+                            if matches!(conn.get_tx_state(), TransactionState::None) {
+                                conn.set_tx_state(TransactionState::Read);
+                            }
+                            tx_id
+                        };
+                        mv_store.begin_named_savepoint(
+                            tx_id,
+                            name.clone(),
+                            starts_transaction,
+                            deferred_fk_violations,
+                        );
                     } else {
-                        let tx_id = mv_store.begin_tx(pager.clone())?;
-                        conn.set_mv_tx(Some((tx_id, TransactionMode::Read)));
+                        if !pager.holds_read_lock() {
+                            pager.begin_read_tx()?;
+                        }
                         if matches!(conn.get_tx_state(), TransactionState::None) {
                             conn.set_tx_state(TransactionState::Read);
                         }
-                        tx_id
+                        pager.open_subjournal()?;
+                        let db_size =
+                            return_if_io!(pager.with_header(|header| header.database_size.get()));
+                        pager.open_named_savepoint(
+                            name.clone(),
+                            db_size,
+                            starts_transaction,
+                            deferred_fk_violations,
+                        )?;
+                    }
+                    let frame = crate::connection::NamedSavepointFrame {
+                        name: name.clone(),
+                        starts_transaction,
+                        deferred_fk_violations,
+                        main_schema_snapshot,
+                        temp_schema_snapshot,
+                        staged_schema_snapshot,
                     };
-                    mv_store.begin_named_savepoint(
-                        tx_id,
-                        name.clone(),
-                        starts_transaction,
-                        deferred_fk_violations,
-                    );
-                } else {
-                    if !pager.holds_read_lock() {
-                        pager.begin_read_tx()?;
-                    }
-                    if matches!(conn.get_tx_state(), TransactionState::None) {
-                        conn.set_tx_state(TransactionState::Read);
-                    }
-                    pager.open_subjournal()?;
-                    let db_size =
-                        return_if_io!(pager.with_header(|header| header.database_size.get()));
-                    pager.open_named_savepoint(
-                        name.clone(),
-                        db_size,
-                        starts_transaction,
-                        deferred_fk_violations,
-                    )?;
-                }
-                let frame = crate::connection::NamedSavepointFrame {
-                    name: name.clone(),
-                    starts_transaction,
-                    deferred_fk_violations,
-                    temp_schema_snapshot,
-                    staged_schema_snapshot,
-                };
-                // Mirror onto attached/temp pagers. If any pager fails
-                // mid-flight, earlier ones already opened a savepoint
-                // with this name — and main's savepoint is already
-                // open too. Undo the partial state atomically so the
-                // connection's and pagers' savepoint stacks stay in
-                // sync. `release_named_savepoint` is idempotent on a
-                // missing name, so we can blind-release on all non-
-                // main pagers.
-                if let Err(mirror_err) = mirror_named_savepoint_to_active_non_main_databases(
-                    &conn,
-                    SavepointMirror::Begin(&frame),
-                ) {
-                    // Release the partially-opened mirror savepoints.
-                    let _ = mirror_named_savepoint_to_active_non_main_databases(
+                    // Mirror onto attached/temp pagers. If any pager fails
+                    // mid-flight, earlier ones already opened a savepoint
+                    // with this name — and main's savepoint is already
+                    // open too. Undo the partial state atomically so the
+                    // connection's and pagers' savepoint stacks stay in
+                    // sync. `release_named_savepoint` is idempotent on a
+                    // missing name, so we can blind-release on all non-
+                    // main pagers.
+                    if let Err(mirror_err) = mirror_named_savepoint_to_active_non_main_databases(
                         &conn,
-                        SavepointMirror::Release(name),
-                    );
-                    // Release the main savepoint we just opened so it
-                    // does not linger without a connection-level frame
-                    // recording it (which would leak past commit /
-                    // rollback).
-                    if let Some(mv_store) = mv_store.as_ref() {
-                        if let Some(tx_id) = conn.get_mv_tx_id() {
-                            let _ = mv_store.release_named_savepoint(tx_id, name);
+                        SavepointMirror::Begin(&frame),
+                    ) {
+                        // Release the partially-opened mirror savepoints.
+                        let _ = mirror_named_savepoint_to_active_non_main_databases(
+                            &conn,
+                            SavepointMirror::Release(name),
+                        );
+                        // Release the main savepoint we just opened so it
+                        // does not linger without a connection-level frame
+                        // recording it (which would leak past commit /
+                        // rollback).
+                        if let Some(mv_store) = mv_store.as_ref() {
+                            if let Some(tx_id) = conn.get_mv_tx_id() {
+                                let _ = mv_store.release_named_savepoint(tx_id, name);
+                            }
+                        } else {
+                            let _ = pager.release_named_savepoint(name);
                         }
-                    } else {
-                        let _ = pager.release_named_savepoint(name);
+                        return Err(mirror_err);
                     }
-                    return Err(mirror_err);
-                }
-                conn.push_named_savepoint(frame);
-                if starts_transaction {
-                    conn.auto_commit.store(false, Ordering::SeqCst);
-                }
+                    conn.push_named_savepoint(frame);
+                    if starts_transaction {
+                        conn.auto_commit.store(false, Ordering::SeqCst);
+                    }
 
-                state.pc += 1;
-                Ok(InsnFunctionStepResult::Step)
-            })
+                    state.pc += 1;
+                    Ok(InsnFunctionStepResult::Step)
+                },
+            )
         }
         SavepointOp::Release => {
             let release_result = if let Some(mv_store) = mv_store.as_ref() {
@@ -4244,13 +4274,9 @@ pub fn op_savepoint(
             Ok(InsnFunctionStepResult::Step)
         }
         SavepointOp::RollbackTo => {
-            let mut mvcc_tx_id = None;
             let deferred_fk_snapshot = if let Some(mv_store) = mv_store.as_ref() {
                 match conn.get_mv_tx_id() {
-                    Some(tx_id) => {
-                        mvcc_tx_id = Some(tx_id);
-                        mv_store.rollback_to_named_savepoint(tx_id, name)?
-                    }
+                    Some(tx_id) => mv_store.rollback_to_named_savepoint(tx_id, name)?,
                     None => None,
                 }
             } else {
@@ -4269,11 +4295,24 @@ pub fn op_savepoint(
             conn.fk_deferred_violations
                 .store(deferred_fk_snapshot, Ordering::Release);
 
-            // Restore non-main in-memory schemas from the frame's snapshot.
-            // The mirror call above rolled back on-disk pages for temp and
-            // attached pagers; without this restore, the in-memory schemas
-            // would keep DDL that the disk-level rollback just undid.
+            // Restore all in-memory schemas (main, temp, attached) from the
+            // frame's snapshot. The mirror call above rolled back on-disk
+            // pages for temp and attached pagers; main DB pages are rolled
+            // back by `pager.rollback_to_named_savepoint`. Without this
+            // restore, the in-memory schemas would keep DDL that the disk-
+            // level rollback just undid.
+            //
+            // The main-DB snapshot replaces an older code path that
+            // reparsed `sqlite_schema` from disk here. That path blocked
+            // on cursor I/O (and, with sequences, on `prepare_internal +
+            // run_with_row_callback` driving `pager.io.step` synchronously)
+            // — both vdbe async-contract violations. The snapshot is cheap
+            // (`Arc<Schema>` clone at SAVEPOINT begin) and carries the full
+            // schema including the sequences map, so the restore is
+            // consistent across tables / indexes / sequences without any
+            // I/O.
             if let Some(info) = frame_info {
+                *conn.schema.write() = info.main_schema_snapshot;
                 if let Some(temp_db) = conn.temp.database.read().as_ref() {
                     match info.temp_schema_snapshot {
                         Some(snap) => *temp_db.db.schema.lock() = snap,
@@ -4284,55 +4323,16 @@ pub fn op_savepoint(
                 conn.bump_prepare_context_generation();
             }
 
-            // Invalidate cached schema cookies on ALL non-main pagers whose
-            // pages may have been rolled back. The main pager is handled
-            // below. Next header read will re-populate the cached cookie.
+            // Invalidate cached schema cookies on ALL pagers whose pages may
+            // have been rolled back. Next header read repopulates them from
+            // the restored on-disk pages — which now match the in-memory
+            // snapshot we just installed.
             conn.with_all_attached_pagers_with_index(|pagers| {
                 for (_db_id, attached_pager) in pagers {
                     attached_pager.set_schema_cookie(None);
                 }
             });
-
-            // After rolling back pages, the in-memory schema cache may be stale
-            // if DDL was executed within the savepoint. Invalidate the pager's
-            // cached schema cookie and check if a schema reparse is needed.
             pager.set_schema_cookie(None);
-            let in_memory_version = conn.schema.read().schema_version;
-            let current_cookie = if let Some(mv_store) = mv_store.as_ref() {
-                mv_store.with_header(|header| header.schema_cookie.get(), mvcc_tx_id.as_ref())
-            } else {
-                conn.read_current_schema_cookie()
-            };
-            match current_cookie {
-                Ok(current_cookie)
-                    if mv_store.is_some()
-                        && current_cookie == conn.db.schema.lock().schema_version =>
-                {
-                    *conn.schema.write() = conn.db.clone_schema();
-                }
-                Ok(current_cookie) if in_memory_version != current_cookie => {
-                    // Schema was modified during the savepoint. Try to reparse
-                    // from the restored database pages. If that fails (e.g. the
-                    // database was empty at the savepoint), use an empty schema.
-                    if let Err(err) = conn.reparse_schema_with_cookie(current_cookie) {
-                        if current_cookie != 0 {
-                            return Err(err);
-                        }
-                        conn.with_schema_mut(|schema| {
-                            *schema = Schema::new();
-                        });
-                    }
-                }
-                Err(LimboError::Page1NotAlloc) => {
-                    // Header page is not readable (database empty after rollback).
-                    // Reset to an empty schema.
-                    conn.with_schema_mut(|schema| {
-                        *schema = Schema::new();
-                    });
-                }
-                Err(err) => return Err(err),
-                _ => {} // Schema unchanged, nothing to do.
-            }
 
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -4583,7 +4583,7 @@ pub fn op_program(
                     match res {
                         Ok(step_result) => match step_result {
                             StepResult::Done => break,
-                            StepResult::IO => {
+                            StepResult::IO | StepResult::Yield => {
                                 let io = statement.take_io_completions().unwrap_or_else(|| {
                                     IOCompletions::Single(Completion::new_yield())
                                 });
@@ -5806,7 +5806,7 @@ fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// - GroupConcat/StringAgg: [Null] (becomes Text on first non-null value)
 /// - JsonGroupObject/JsonbGroupObject: [Blob([])]
 /// - JsonGroupArray/JsonbGroupArray: [Blob([])]
-fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
+fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
     match func {
         AggFunc::Count | AggFunc::Count0 => payload.push(Value::from_i64(0)),
         AggFunc::Sum | AggFunc::Total => {
@@ -5953,13 +5953,22 @@ fn update_agg_payload(
                 Value::Numeric(Numeric::Float(f)) => {
                     apply_kbn_step(sum_val, f64::from(f), &mut sum_state);
                 }
-                Value::Text(t) => match try_for_float(t.as_str().as_bytes()).1 {
-                    ParsedNumber::Integer(i) => apply_kbn_step_int(sum_val, i, &mut sum_state),
-                    ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
-                    ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
-                },
+                Value::Text(t) => {
+                    let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
+                    match parsed_number {
+                        ParsedNumber::Integer(i) => {
+                            if matches!(parse_result, NumericParseResult::ValidPrefixOnly) {
+                                apply_kbn_step(sum_val, i as f64, &mut sum_state);
+                            } else {
+                                apply_kbn_step_int(sum_val, i, &mut sum_state);
+                            }
+                        }
+                        ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
+                        ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
+                    }
+                }
                 Value::Blob(b) => match try_for_float(&b).1 {
-                    ParsedNumber::Integer(i) => apply_kbn_step_int(sum_val, i, &mut sum_state),
+                    ParsedNumber::Integer(i) => apply_kbn_step(sum_val, i as f64, &mut sum_state),
                     ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
                     ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
                 },
@@ -6393,8 +6402,9 @@ fn op_window_step(
     match func {
         WindowFunc::RowNumber => {
             if let Register::Value(Value::Null) = state.registers[acc_reg] {
-                state.registers[acc_reg] =
-                    Register::Aggregate(AggContext::Builtin(vec![Value::from_i64(0)]));
+                state.registers[acc_reg] = Register::Aggregate(AggContext::Builtin(
+                    crate::alloc::vec![Value::from_i64(0)],
+                ));
             }
             let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
             else {
@@ -6490,7 +6500,7 @@ pub fn op_agg_step(
             },
             _ => {
                 // Built-in aggregates use flat payload
-                let mut payload = Vec::new();
+                let mut payload = crate::alloc::vec![];
                 init_agg_payload(func, &mut payload)?;
                 Register::Aggregate(AggContext::Builtin(payload))
             }
@@ -6776,15 +6786,20 @@ pub fn op_sorter_open(
     } else {
         (cache_size as usize) * page_size
     };
-    let mut order = Vec::with_capacity(order_collations_nulls.len());
-    let mut collations = Vec::with_capacity(order_collations_nulls.len());
-    let mut nulls_orders = Vec::with_capacity(order_collations_nulls.len());
+    let mut order = Vec::try_with_capacity_ext(order_collations_nulls.len())
+        .expect("TODO: fallible allocations");
+    let mut collations = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
+        .expect("TODO: fallible allocations");
+    let mut nulls_orders = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
+        .expect("TODO: fallible allocations");
     for (ord, coll, nulls) in order_collations_nulls.iter() {
         order.push(*ord);
         collations.push(coll.unwrap_or_default());
         nulls_orders.push(*nulls);
     }
-    let mut sort_comparators = Vec::with_capacity(order_collations_nulls.len());
+    let mut sort_comparators =
+        crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
+            .expect("TODO: fallible allocations");
     for (idx, (_, coll, _)) in order_collations_nulls.iter().enumerate() {
         let comparator = match comparators.get(idx).and_then(|c| c.as_ref()) {
             Some(comparator) => Some(make_sort_comparator(comparator)?),
@@ -7593,6 +7608,93 @@ pub fn op_function(
                     }
                 }
             }
+            ScalarFunc::NextVal => {
+                // The translator no longer emits `Function NextVal` — nextval
+                // is now handled entirely by the SequenceComputeNext +
+                // SetSequenceCurrval opcode pair plus surrounding cursor ops.
+                // Reaching this handler means stale bytecode somewhere.
+                return Err(crate::LimboError::InternalError(
+                    "ScalarFunc::NextVal handler should be unreachable under \
+                     the disk-only sequence design"
+                        .to_string(),
+                ));
+            }
+            ScalarFunc::CurrVal => {
+                let seq_name = match state.registers[*start_reg].get_value() {
+                    Value::Text(t) => t.as_str().to_string(),
+                    _ => {
+                        return Err(crate::LimboError::ParseError(
+                            "currval() requires a text argument".to_string(),
+                        ));
+                    }
+                };
+                // The connection's currval session map persists across
+                // DROP SEQUENCE (the entry is keyed by name with no link
+                // to the schema). Resolve the sequence first so currval
+                // on a dropped sequence reports "does not exist" rather
+                // than silently returning the stale per-session value.
+                program.connection.find_sequence(&seq_name)?;
+                match program.connection.get_sequence_currval(&seq_name) {
+                    Some(val) => {
+                        state.registers[*dest].set_value(Value::from_i64(val));
+                    }
+                    None => {
+                        return Err(crate::LimboError::ParseError(format!(
+                            "currval of sequence \"{seq_name}\" is not yet defined in this session",
+                        )));
+                    }
+                }
+            }
+            ScalarFunc::SetVal => {
+                // Pre-write validation: argument type + range check. The
+                // translator emits this Function call before the inline
+                // DELETE-all + INSERT bytecode, so any error returned here
+                // aborts the statement BEFORE any disk write — which is what
+                // keeps the op_insert "expected integer key" assertion safe
+                // and the user-facing error message intact. After validation
+                // the result value is placed in `dest`; currval bookkeeping
+                // and dirty-marking are emitted by the translator via the
+                // separate SetSequenceCurrval opcode.
+                //
+                // Note: in the disk-only design there is no pending-setval
+                // queue, no in-memory atomic to mutate, and no exclusive-tx
+                // requirement. The autonomous-tx mechanism (planned for MVCC
+                // concurrency in a follow-up) will subsume serialization.
+                let seq_name = match state.registers[*start_reg].get_value() {
+                    Value::Text(t) => t.as_str().to_string(),
+                    _ => {
+                        return Err(crate::LimboError::ParseError(
+                            "setval() requires a text argument".to_string(),
+                        ));
+                    }
+                };
+                let value = match state.registers[*start_reg + 1].get_value().as_int() {
+                    Some(v) => v,
+                    None => {
+                        return Err(crate::LimboError::ParseError(
+                            "setval() requires an integer value".to_string(),
+                        ));
+                    }
+                };
+                if arg_count > 2
+                    && state.registers[*start_reg + 2]
+                        .get_value()
+                        .as_int()
+                        .is_none()
+                {
+                    return Err(crate::LimboError::ParseError(
+                        "setval() requires an integer is_called argument".to_string(),
+                    ));
+                }
+                let seq = program.connection.find_sequence(&seq_name)?;
+                if value < seq.min_value || value > seq.max_value {
+                    return Err(crate::LimboError::ParseError(format!(
+                        "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
+                        value, seq.name, seq.min_value, seq.max_value
+                    )));
+                }
+                state.registers[*dest].set_value(Value::from_i64(value));
+            }
             ScalarFunc::Abs
             | ScalarFunc::Lower
             | ScalarFunc::Upper
@@ -7992,10 +8094,20 @@ pub fn op_function(
                     ));
                 };
 
-                program
-                    .connection
-                    .attach_database(filename_str.as_str(), dbname_str.as_str())?;
+                return_if_io!(program.connection.attach_database(
+                    filename_str.as_str(),
+                    dbname_str.as_str(),
+                    state.active_op_state.attach(),
+                ));
+                // Sequence descriptors for the attached database are
+                // loaded lazily by `maybe_reparse_schema` on the next
+                // statement (ATTACH bumps the schema cookie, so the
+                // very next prepare reparses). Issuing a SQL load via
+                // `prepare_internal` from inside this opcode handler
+                // would drive `pager.io.step()` synchronously and break
+                // the vdbe async contract.
 
+                state.active_op_state.clear();
                 state.registers[*dest].set_null();
             }
             ScalarFunc::Detach => {
@@ -8096,6 +8208,39 @@ pub fn op_function(
                 // is_autocommit(): returns 1 if autocommit, 0 otherwise.
                 let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
                 state.registers[*dest].set_int(if auto_commit { 1 } else { 0 });
+            }
+            ScalarFunc::SequenceWatermark => {
+                assert_eq!(arg_count, 1);
+                let sequence_name = match state.registers[*start_reg].get_value() {
+                    Value::Text(text) => text.as_str(),
+                    Value::Null => {
+                        state.registers[*dest].set_value(Value::Null);
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                    _ => {
+                        return Err(LimboError::InternalError(
+                            "sequence_watermark_experimental() argument must be TEXT".to_string(),
+                        ));
+                    }
+                };
+                let (db_id, sequence_key) =
+                    if let Some((schema_name, sequence_name)) = sequence_name.split_once('.') {
+                        (
+                            program.connection.get_database_id_by_name(schema_name)?,
+                            crate::util::normalize_ident(sequence_name),
+                        )
+                    } else {
+                        (MAIN_DB_ID, crate::util::normalize_ident(sequence_name))
+                    };
+                program.connection.find_sequence(sequence_name)?;
+                let watermark = program
+                    .connection
+                    .mv_store_for_db(db_id)
+                    .and_then(|mv_store| mv_store.sequence_watermark(&sequence_key));
+                match watermark {
+                    Some(watermark) => state.registers[*dest].set_int(watermark),
+                    None => state.registers[*dest].set_value(Value::Null),
+                }
             }
             ScalarFunc::TestUintEncode => {
                 check_arg_count!(arg_count, 1);
@@ -8212,6 +8357,47 @@ pub fn op_function(
                     }
                 };
                 state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::Gcd => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(crate::functions::math::exec_gcd(a, b)?);
+            }
+            ScalarFunc::Lcm => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(crate::functions::math::exec_lcm(a, b)?);
+            }
+            ScalarFunc::Repeat => {
+                check_arg_count!(arg_count, 2);
+                let input = state.registers[*start_reg].get_value();
+                let count = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest]
+                    .set_value(crate::functions::string::exec_repeat(input, count));
+            }
+            ScalarFunc::Lpad => {
+                let input = state.registers[*start_reg].get_value();
+                let length = state.registers[*start_reg + 1].get_value();
+                let fill = if arg_count >= 3 {
+                    Some(state.registers[*start_reg + 2].get_value())
+                } else {
+                    None
+                };
+                state.registers[*dest]
+                    .set_value(crate::functions::string::exec_lpad(input, length, fill));
+            }
+            ScalarFunc::Rpad => {
+                let input = state.registers[*start_reg].get_value();
+                let length = state.registers[*start_reg + 1].get_value();
+                let fill = if arg_count >= 3 {
+                    Some(state.registers[*start_reg + 2].get_value())
+                } else {
+                    None
+                };
+                state.registers[*dest]
+                    .set_value(crate::functions::string::exec_rpad(input, length, fill));
             }
             ScalarFunc::BooleanToInt => {
                 check_arg_count!(arg_count, 1);
@@ -8432,9 +8618,20 @@ pub fn op_function(
                 state.registers[*dest].set_value(exec_array_position(&arr_val, &target));
             }
             ScalarFunc::ArrayLength => {
-                // Accept 1 or 2 args; dimension arg (PG compat) ignored for 1D arrays
+                // 1-arg form: equivalent to `array_length(arr, 1)`. 2-arg form
+                // honors the dimension and walks into nested arrays for dim > 1
+                // (Turso arrays are 1-indexed, so `array_upper(arr, dim)` shares
+                // this code path via its alias and produces the same result).
                 let arr_val = state.registers[*start_reg].get_value();
-                match compute_array_length(arr_val) {
+                let dim = if arg_count >= 2 {
+                    state.registers[*start_reg + 1]
+                        .get_value()
+                        .as_int()
+                        .unwrap_or(0)
+                } else {
+                    1
+                };
+                match compute_array_length_at_dim(arr_val, dim) {
                     Some(count) => state.registers[*dest].set_int(count),
                     None => state.registers[*dest].set_null(),
                 };
@@ -9347,6 +9544,8 @@ pub fn op_function(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub(crate) type OpAttachState = crate::connection::AttachDatabaseState;
+
 pub fn op_sequence(
     _program: &Program,
     state: &mut ProgramState,
@@ -9501,7 +9700,7 @@ pub fn op_yield(
 
 pub struct OpInsertState {
     pub sub_state: OpInsertSubState,
-    pub old_record: Option<(i64, Vec<Value>)>,
+    pub old_record: Option<(i64, crate::alloc::Vec<Value>)>,
     /// Set by the NoopCheck sub-state to indicate the row already has the exact
     /// same payload, so the physical write can be skipped.
     pub is_noop_update: bool,
@@ -9851,7 +10050,7 @@ pub fn op_insert(
                             .connection
                             .view_transaction_states
                             .get_or_create(view_name);
-                        tx_state.delete(table_name, key, values.clone());
+                        tx_state.delete(table_name, key, values.to_vec());
                     }
                 }
                 for view_name in dependent_views.iter() {
@@ -9860,7 +10059,7 @@ pub fn op_insert(
                         .view_transaction_states
                         .get_or_create(view_name);
 
-                    tx_state.insert(table_name, key, values.clone());
+                    tx_state.insert(table_name, key, values.to_vec());
                 }
 
                 break;
@@ -9895,7 +10094,7 @@ pub fn op_int_64(
 
 pub struct OpDeleteState {
     pub sub_state: OpDeleteSubState,
-    pub deleted_record: Option<(i64, Vec<Value>)>,
+    pub deleted_record: Option<(i64, crate::alloc::Vec<Value>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -9990,7 +10189,7 @@ pub fn op_delete(
                             .connection
                             .view_transaction_states
                             .get_or_create(&view_name);
-                        tx_state.delete(table_name, key, values.clone());
+                        tx_state.delete(table_name, key, values.to_vec());
                     }
                 }
                 break;
@@ -10370,10 +10569,9 @@ fn new_rowid_inner(
                                     state.registers[*prev_largest_reg]
                                         .set_int(prev_rowid.unwrap_or(0));
                                 }
-                                *state.active_op_state.new_rowid() =
-                                    OpNewRowidState::SeekingToLast {
-                                        mvcc_already_initialized: true,
-                                    };
+                                state.active_op_state.clear();
+                                state.pc += 1;
+                                return Ok(InsnFunctionStepResult::Step);
                             }
                             NextRowidResult::FindRandom => {
                                 mvcc_cursor.end_new_rowid();
@@ -10885,7 +11083,11 @@ pub fn op_open_write(
                 index.as_ref(),
                 num_columns,
             )?);
-            let index_info = Arc::new(IndexInfo::new_from_index(index)?);
+            let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
+                IndexInfo::new_from_index_in(index, mv_store.allocator())?
+            } else {
+                IndexInfo::new_from_index(index)?
+            });
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
@@ -11130,6 +11332,15 @@ pub enum OpDestroyState {
     DestroyBtree(Arc<RwLock<BTreeCursor>>),
 }
 
+/// State carried across asynchronous steps while clearing an existing b-tree.
+pub enum OpClearBtreeState {
+    CreateCursor,
+    ClearBtree {
+        pager: Arc<Pager>,
+        cursor: Arc<RwLock<BTreeCursor>>,
+    },
+}
+
 pub fn op_destroy(
     program: &Program,
     state: &mut ProgramState,
@@ -11171,6 +11382,76 @@ pub fn op_destroy(
                 let maybe_former_root_page = return_if_io!(cursor.write().btree_destroy());
                 state.registers[*former_root_reg]
                     .set_int(maybe_former_root_page.unwrap_or(0) as i64);
+                state.active_op_state.clear();
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
+}
+
+/// Executes `ClearBtree` by deleting all cells from a persistent b-tree root.
+///
+/// REINDEX uses this after sorting all replacement index records and before
+/// refilling the existing root page. The operation invalidates other b-tree
+/// cursors on the same pager because page contents and cursor positions may no
+/// longer be valid after the clear.
+pub fn op_clear_btree(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    match op_clear_btree_inner(program, state, insn, pager) {
+        Ok(result) => Ok(result),
+        Err(err) => {
+            if !matches!(err, LimboError::Busy | LimboError::BusySnapshot) {
+                state.active_op_state.clear();
+            }
+            Err(err)
+        }
+    }
+}
+
+fn op_clear_btree_inner(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(ClearBtree { db, root }, insn);
+
+    let mv_store = program.connection.mv_store_for_db(*db);
+    if mv_store.is_some() {
+        return Err(LimboError::InternalError(
+            "ClearBtree is not supported in MVCC mode".to_string(),
+        ));
+    }
+
+    let clear_pager = if *db != MAIN_DB_ID {
+        program.get_pager_from_database_index(db)?
+    } else {
+        pager.clone()
+    };
+
+    loop {
+        match state.active_op_state.clear_btree() {
+            OpClearBtreeState::CreateCursor => {
+                let cursor = BTreeCursor::new(clear_pager.clone(), *root, 0);
+                *state.active_op_state.clear_btree() = OpClearBtreeState::ClearBtree {
+                    pager: clear_pager.clone(),
+                    cursor: Arc::new(RwLock::new(cursor)),
+                };
+            }
+            OpClearBtreeState::ClearBtree { pager, cursor } => {
+                return_if_io!(cursor.write().clear_btree());
+                for other_cursor_opt in state.cursors.iter_mut().flatten() {
+                    if let Cursor::BTree(ref mut btree_cursor) = other_cursor_opt {
+                        if Arc::ptr_eq(&btree_cursor.get_pager(), pager) {
+                            btree_cursor.invalidate_btree_cache();
+                        }
+                    }
+                }
                 state.active_op_state.clear();
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
@@ -11278,6 +11559,7 @@ pub fn op_drop_view(
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_view(view_name).ok();
+        schema.broken_views.remove(view_name);
     });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -11299,6 +11581,64 @@ pub fn op_drop_type(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_add_sequence(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        AddSequence {
+            db,
+            name,
+            start,
+            increment,
+            min_value,
+            max_value,
+            cycle,
+        },
+        insn
+    );
+    let seq = crate::schema::Sequence::new(
+        name.clone(),
+        Some(*start),
+        Some(*increment),
+        Some(*min_value),
+        Some(*max_value),
+        *cycle,
+    )?;
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(*db, |schema| {
+        schema
+            .sequences
+            .insert(crate::util::normalize_ident(name), std::sync::Arc::new(seq));
+    });
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_drop_sequence(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(DropSequence { db, seq_name }, insn);
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.remove_sequence(seq_name);
+    });
+    // Drop this connection's stale currval. Otherwise a same-session
+    // DROP SEQUENCE + CREATE SEQUENCE <same name> would let currval()
+    // return the prior sequence's last value instead of erroring with
+    // "not yet defined in this session" — covered by the regression
+    // test `currval-after-drop-then-recreate-uses-new-sequence-currval`
+    // in `sequence_adversarial.sqltest`.
+    conn.clear_sequence_currval(seq_name);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_add_type(
     program: &Program,
     state: &mut ProgramState,
@@ -11310,6 +11650,604 @@ pub fn op_add_type(
     conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql))?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Compute the next value of a sequence from a watermark row that has
+/// already been loaded into registers by the surrounding bytecode. Pure
+/// arithmetic — no I/O. The translator emits a cursor seek + Column reads
+/// to populate `in_value_reg` and `in_is_called_reg`; this opcode applies
+/// the start/increment/cycle/exhaustion logic to produce the next value.
+///
+/// When the backing table is empty (`was_empty_reg` holds 1), the next
+/// value is `start_value`. When the row exists and `is_called` is false,
+/// the next value is the existing value (the start has not yet been
+/// emitted). Otherwise the next value is `value + increment`, wrapping
+/// to the opposite bound when `cycle` is set, or returning
+/// `LimboError::DatabaseFull` on exhaustion.
+pub fn op_sequence_compute_next(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        SequenceComputeNext {
+            db,
+            seq_name_reg,
+            in_value_reg,
+            in_is_called_reg,
+            was_empty_reg,
+            out_value_reg,
+        },
+        insn
+    );
+
+    let seq_name = match state.registers[*seq_name_reg].get_value() {
+        Value::Text(t) => t.as_str().to_string(),
+        _ => {
+            return Err(crate::LimboError::ParseError(
+                "SequenceComputeNext: seq_name_reg must be text".to_string(),
+            ));
+        }
+    };
+
+    // Strip the schema-qualifier from the user's spelling when the
+    // register contains a qualified name like "aux.my_seq" — the
+    // schema's sequences map is keyed by the bare name. The opcode's
+    // `db` field already encodes the target database.
+    let bare_seq_name = seq_name
+        .rsplit_once('.')
+        .map(|(_, n)| n)
+        .unwrap_or(&seq_name);
+    let seq = program
+        .connection
+        .with_schema(*db, |s| s.get_sequence(bare_seq_name).cloned())
+        .ok_or_else(|| {
+            crate::LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
+        })?;
+
+    let was_empty = state.registers[*was_empty_reg]
+        .get_value()
+        .as_int()
+        .unwrap_or(0)
+        != 0;
+
+    let next = if was_empty {
+        seq.start_value
+    } else {
+        let current = state.registers[*in_value_reg]
+            .get_value()
+            .as_int()
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(
+                    "SequenceComputeNext: in_value_reg must be integer".to_string(),
+                )
+            })?;
+        let is_called = state.registers[*in_is_called_reg]
+            .get_value()
+            .as_int()
+            .unwrap_or(0)
+            != 0;
+        if !is_called {
+            current
+        } else {
+            let exhausted_max = current.checked_add(seq.increment_by).is_none()
+                || (seq.increment_by > 0
+                    && current.saturating_add(seq.increment_by) > seq.max_value)
+                || (seq.increment_by < 0
+                    && current.saturating_add(seq.increment_by) < seq.min_value);
+
+            if exhausted_max {
+                if seq.cycle {
+                    if seq.increment_by > 0 {
+                        seq.min_value
+                    } else {
+                        seq.max_value
+                    }
+                } else if seq
+                    .name
+                    .starts_with(crate::schema::AUTOINCREMENT_SEQ_PREFIX)
+                {
+                    // AUTOINCREMENT exhaustion uses SQLite's canonical
+                    // SQLITE_FULL "database or disk is full" message so
+                    // callers and tests don't have to know whether the
+                    // rowid came from a SERIAL-style implicit sequence
+                    // or any other autoinc path.
+                    return Err(crate::LimboError::DatabaseFull(
+                        "database or disk is full".to_string(),
+                    ));
+                } else {
+                    return Err(crate::LimboError::DatabaseFull(format!(
+                        "nextval: reached {} value of sequence \"{}\"",
+                        if seq.increment_by > 0 {
+                            "maximum"
+                        } else {
+                            "minimum"
+                        },
+                        seq.name
+                    )));
+                }
+            } else {
+                current + seq.increment_by
+            }
+        }
+    };
+
+    state.registers[*out_value_reg].set_value(Value::from_i64(next));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Record the value produced by a nextval/setval call as this connection's
+/// currval for the named sequence. Pure synchronous register operation —
+/// backing-table compaction and `sqlite_sequence` synchronization for
+/// AUTOINCREMENT sequences are emitted as inline bytecode by the translator
+/// (see `core/translate/sequence.rs::emit_backing_table_compaction` and
+/// `emit_autoincrement_sqlite_sequence_sync`).
+pub fn op_set_sequence_currval(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        SetSequenceCurrval {
+            seq_name_reg,
+            value_reg,
+        },
+        insn
+    );
+
+    let seq_name = match state.registers[*seq_name_reg].get_value() {
+        Value::Text(t) => t.as_str().to_string(),
+        _ => {
+            return Err(crate::LimboError::ParseError(
+                "SetSequenceCurrval: seq_name_reg must be text".to_string(),
+            ));
+        }
+    };
+    let value = state.registers[*value_reg]
+        .get_value()
+        .as_int()
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "SetSequenceCurrval: value_reg must be integer".to_string(),
+            )
+        })?;
+
+    program.connection.set_sequence_currval(&seq_name, value);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Publish sequence allocation metadata used by `sequence_watermark_experimental()`.
+///
+/// The translator emits this only after the sequence backing-table RMW has
+/// committed successfully. At that point `SequenceCommitInnerTx` has restored
+/// the connection's MVCC transaction to the outer tx, so any active allocation
+/// is attributed to the transaction whose row changes may become visible later.
+pub fn op_sequence_track_allocation(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        SequenceTrackAllocation {
+            db,
+            seq_name_reg,
+            value_reg,
+        },
+        insn
+    );
+
+    let seq_name = match state.registers[*seq_name_reg].get_value() {
+        Value::Text(t) => t.as_str().to_string(),
+        _ => {
+            return Err(crate::LimboError::ParseError(
+                "SequenceTrackAllocation: seq_name_reg must be text".to_string(),
+            ));
+        }
+    };
+    let value = state.registers[*value_reg]
+        .get_value()
+        .as_int()
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "SequenceTrackAllocation: value_reg must be integer".to_string(),
+            )
+        })?;
+
+    let bare_seq_name = seq_name
+        .rsplit_once('.')
+        .map(|(_, n)| n)
+        .unwrap_or(&seq_name);
+    let normalized_seq_name = crate::util::normalize_ident(bare_seq_name);
+
+    if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
+        let seq = program
+            .connection
+            .with_schema(*db, |s| s.get_sequence(&normalized_seq_name).cloned())
+            .ok_or_else(|| {
+                crate::LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
+            })?;
+        let current_watermark =
+            crate::mvcc::database::first_unsafe_sequence_watermark(&seq, value, true);
+        mv_store.set_sequence_watermark(&normalized_seq_name, current_watermark);
+
+        if let Some((tx_id, _)) = program.connection.get_mv_tx_for_db(*db) {
+            if mv_store.is_tx_rollbackable(tx_id) {
+                mv_store.register_sequence_allocation(tx_id, &normalized_seq_name, value)?;
+            }
+        }
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Register an in-flight sequence allocation against the *outer* transaction
+/// *before* the paired `SequenceCommitInnerTx` publishes the new boundary.
+///
+/// Without this, there is a window where one connection has committed the
+/// inner-tx RMW (so its allocated value is now readable by other connections
+/// and the next allocator can advance the stored watermark past it) but has not
+/// yet run `SequenceTrackAllocation` to register its allocation. A reader that
+/// computes `sequence_watermark_experimental()` in that window sees the
+/// advanced boundary without the lower active allocation, claims the value
+/// safe, and a forward-only cursor advances past a row the outer tx still holds
+/// uncommitted — skipping it once the outer tx commits.
+///
+/// Registering here, ahead of the commit that makes the value observable,
+/// guarantees the active allocation is in place before any other connection can
+/// advance the watermark past it. The post-commit `SequenceTrackAllocation`
+/// re-registers the same `(tx, value)` (an idempotent `min`) and additionally
+/// covers the skipped-inner-tx (exclusive outer / WAL) and autocommit paths,
+/// where the outer tx is not encoded in `saved_outer_reg`.
+pub fn op_sequence_register_allocation(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        SequenceRegisterAllocation {
+            db,
+            seq_name_reg,
+            value_reg,
+            saved_outer_reg,
+        },
+        insn
+    );
+
+    // Only the wrapped inner-tx path encodes a saved outer mv_tx. An empty
+    // blob means there is no outer tx whose uncommitted row needs protecting
+    // (autocommit) or the inner tx was skipped (exclusive / WAL) — both are
+    // handled by the post-commit `SequenceTrackAllocation`.
+    let saved_outer = match state.registers[*saved_outer_reg].get_value() {
+        Value::Blob(bytes) => decode_saved_outer_mv_tx(bytes.as_slice()),
+        _ => None,
+    };
+    let Some((outer_tx_id, _)) = saved_outer else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+
+    let seq_name = match state.registers[*seq_name_reg].get_value() {
+        Value::Text(t) => t.as_str().to_string(),
+        _ => {
+            return Err(crate::LimboError::ParseError(
+                "SequenceRegisterAllocation: seq_name_reg must be text".to_string(),
+            ));
+        }
+    };
+    let value = state.registers[*value_reg]
+        .get_value()
+        .as_int()
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "SequenceRegisterAllocation: value_reg must be integer".to_string(),
+            )
+        })?;
+
+    let bare_seq_name = seq_name
+        .rsplit_once('.')
+        .map(|(_, n)| n)
+        .unwrap_or(&seq_name);
+    let normalized_seq_name = crate::util::normalize_ident(bare_seq_name);
+
+    if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
+        if mv_store.is_tx_rollbackable(outer_tx_id) {
+            mv_store.register_sequence_allocation(outer_tx_id, &normalized_seq_name, value)?;
+        }
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+// Path-kind sentinel values for the SequenceBeginInnerTx /
+// SequenceCommitInnerTx pair. The translator emits a literal compare
+// against `PATH_KIND_CONFLICT_RETRY` to decide whether to jump back to
+// the retry-top label.
+const SEQ_PATH_SKIPPED: i64 = 0;
+const SEQ_PATH_WRAPPED: i64 = 1;
+const SEQ_COMMIT_STATUS_OK: i64 = 0;
+const SEQ_COMMIT_STATUS_CONFLICT_RETRY: i64 = 1;
+
+/// Saved outer mv_tx state, encoded in a register payload via a Blob.
+/// Format: 9 bytes — 8-byte little-endian u64 tx_id followed by 1-byte
+/// mode tag (0=Read, 1=Write/exclusive, 2=Concurrent). Empty Blob means
+/// "no prior mv_tx for this db" (must be restored to `None`).
+fn encode_saved_outer_mv_tx(
+    outer: Option<(TxID, crate::translate::emitter::TransactionMode)>,
+) -> Vec<u8> {
+    use crate::translate::emitter::TransactionMode;
+    let Some((tx_id, mode)) = outer else {
+        return Vec::new();
+    };
+    let mut buf = Vec::with_capacity(9);
+    buf.extend_from_slice(&tx_id.to_le_bytes());
+    let mode_tag: u8 = match mode {
+        TransactionMode::None => 0,
+        TransactionMode::Read => 0,
+        TransactionMode::Write => 1,
+        TransactionMode::Concurrent => 2,
+    };
+    buf.push(mode_tag);
+    buf
+}
+
+fn decode_saved_outer_mv_tx(
+    bytes: &[u8],
+) -> Option<(TxID, crate::translate::emitter::TransactionMode)> {
+    use crate::translate::emitter::TransactionMode;
+    if bytes.is_empty() {
+        return None;
+    }
+    let tx_id =
+        u64::from_le_bytes(bytes[0..8].try_into().expect("blob has at least 9 bytes")) as TxID;
+    let mode = match bytes[8] {
+        0 => TransactionMode::Read,
+        1 => TransactionMode::Write,
+        2 => TransactionMode::Concurrent,
+        _ => panic!("invalid mode tag in saved outer mv_tx"),
+    };
+    Some((tx_id, mode))
+}
+
+/// Maximum number of consecutive `WriteWriteConflict` / `BusySnapshot`
+/// retries `op_sequence_commit_inner_tx` will absorb before bailing out
+/// with `LimboError::Busy`. Tracks per-`ProgramState` via
+/// `sequence_inner_retry_count`; the count resets on the first
+/// successful commit. Higher than typical contention windows but
+/// bounded so a structurally-degenerate conflict pattern surfaces as
+/// Busy rather than spinning forever.
+const SEQUENCE_INNER_TX_RETRY_BUDGET: u32 = 100;
+
+/// Begin the autonomous inner tx for a sequence RMW. Single-step. See
+/// `Insn::SequenceBeginInnerTx` doc for full semantics.
+///
+/// Skipped path: when MVCC is not in use for this db, OR the connection
+/// already holds an exclusive outer tx. Reason: an exclusive outer
+/// holds `pager_commit_lock` for its entire lifetime; an inner
+/// Concurrent tx on the SAME connection would yield forever waiting
+/// for the lock (which only releases at outer commit/rollback), and
+/// since the outer is suspended inside this opcode, the lock can
+/// never release. Same-thread deadlock. We avoid the inner-tx wrap
+/// entirely in that case — the cursor RMW below runs in the outer tx,
+/// and the matching `SequenceCommitInnerTx` is a no-op. Per the
+/// contract, exclusive blocks all other writers (in-process and
+/// cross-process), so any value emitted-then-rolled-back was never
+/// observed by a live reader; re-emission after rollback is acceptable.
+pub fn op_sequence_begin_inner_tx(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        SequenceBeginInnerTx {
+            db,
+            path_kind_reg,
+            saved_outer_reg,
+        },
+        insn
+    );
+
+    let conn = program.connection.clone();
+    let Some(mv_store) = conn.mv_store_for_db(*db) else {
+        // WAL mode: no inner tx needed. The WAL single-writer lock
+        // already serializes writes across processes.
+        state.registers[*path_kind_reg].set_value(Value::from_i64(SEQ_PATH_SKIPPED));
+        state.registers[*saved_outer_reg].set_value(Value::Blob(Vec::new()));
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+
+    let outer_tx = conn.get_mv_tx_for_db(*db);
+    if let Some((outer_id, _)) = outer_tx {
+        if mv_store.is_exclusive_tx(&outer_id) {
+            state.registers[*path_kind_reg].set_value(Value::from_i64(SEQ_PATH_SKIPPED));
+            state.registers[*saved_outer_reg].set_value(Value::Blob(Vec::new()));
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
+
+    let inner_tx_id = mv_store.begin_tx(pager.clone())?;
+    conn.set_mv_tx_for_db(
+        *db,
+        Some((
+            inner_tx_id,
+            crate::translate::emitter::TransactionMode::Concurrent,
+        )),
+    );
+
+    let saved = encode_saved_outer_mv_tx(outer_tx);
+    state.registers[*path_kind_reg].set_value(Value::from_i64(SEQ_PATH_WRAPPED));
+    state.registers[*saved_outer_reg].set_value(Value::Blob(saved));
+    // Record the in-flight inner-tx state so a statement reset / abort
+    // before the matching SequenceCommitInnerTx can roll it back. See
+    // `Statement::cleanup_orphaned_seq_inner_tx`.
+    state.sequence_inner_tx_pending = Some(crate::vdbe::SequenceInnerTxState {
+        db: *db,
+        inner_tx_id,
+        saved_outer: outer_tx,
+    });
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Commit the autonomous inner tx started by a paired
+/// `SequenceBeginInnerTx`. Multi-step. Drives the inner's
+/// `CommitStateMachine` one step per opcode call, yielding
+/// `InsnFunctionStepResult::IO(io)` to the VDBE driver when commit
+/// state machine wants IO. Mirrors `op_auto_commit`'s drive of the
+/// outer commit's state machine.
+///
+/// On Done: restores the connection's mv_tx for `db` to the saved
+/// outer, sets `status_reg = SEQ_COMMIT_STATUS_OK`, advances pc.
+///
+/// On WriteWriteConflict / BusySnapshot / Conflict: rolls back the
+/// inner tx, restores outer mv_tx, sets `status_reg = SEQ_COMMIT_
+/// STATUS_CONFLICT_RETRY`, advances pc. The translator emits a
+/// conditional jump back to the retry-top label so the RMW retries
+/// under a fresh inner tx.
+pub fn op_sequence_commit_inner_tx(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        SequenceCommitInnerTx {
+            db,
+            path_kind_reg,
+            saved_outer_reg,
+            status_reg,
+        },
+        insn
+    );
+
+    let path_kind = state.registers[*path_kind_reg]
+        .get_value()
+        .as_int()
+        .ok_or_else(|| {
+            LimboError::InternalError(
+                "SequenceCommitInnerTx: path_kind_reg must be integer".to_string(),
+            )
+        })?;
+    if path_kind == SEQ_PATH_SKIPPED {
+        // No inner tx to commit. The cursor RMW ran inline in the
+        // outer tx.
+        state.registers[*status_reg].set_value(Value::from_i64(SEQ_COMMIT_STATUS_OK));
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let conn = program.connection.clone();
+    let mv_store = conn.mv_store_for_db(*db).ok_or_else(|| {
+        LimboError::InternalError(
+            "SequenceCommitInnerTx: no MV store for db but path was Wrapped".to_string(),
+        )
+    })?;
+
+    let saved_outer = match state.registers[*saved_outer_reg].get_value() {
+        Value::Blob(bytes) => decode_saved_outer_mv_tx(bytes.as_slice()),
+        _ => {
+            return Err(LimboError::InternalError(
+                "SequenceCommitInnerTx: saved_outer_reg must be blob".to_string(),
+            ))
+        }
+    };
+
+    // First entry for this opcode invocation: build the
+    // CommitStateMachine. On subsequent re-entries (after a yielded
+    // IO completes), we pick up the already-constructed state machine
+    // from ProgramState.
+    if state.sequence_inner_commit.is_none() {
+        let inner_tx_id = match conn.get_mv_tx_for_db(*db) {
+            Some((tx_id, _)) => tx_id,
+            None => {
+                return Err(LimboError::InternalError(
+                    "SequenceCommitInnerTx: connection has no mv_tx but path was Wrapped"
+                        .to_string(),
+                ))
+            }
+        };
+        state.sequence_inner_commit = Some(mv_store.commit_tx(inner_tx_id, &conn, *db)?);
+    }
+
+    let commit_sm = state.sequence_inner_commit.as_mut().expect("just set");
+
+    match commit_sm.step(&mv_store) {
+        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Ok(IOResult::Done(())) => {
+            state.sequence_inner_commit = None;
+            state.sequence_inner_tx_pending = None;
+            state.sequence_inner_retry_count = 0;
+            conn.set_mv_tx_for_db(*db, saved_outer);
+            state.registers[*status_reg].set_value(Value::from_i64(SEQ_COMMIT_STATUS_OK));
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        Err(
+            err @ (LimboError::WriteWriteConflict
+            | LimboError::BusySnapshot
+            | LimboError::Conflict(_)),
+        ) => {
+            state.sequence_inner_commit = None;
+            // Inner tx may already be in a state where rollback is a
+            // no-op (e.g. self-aborted); `is_tx_rollbackable` guards.
+            if let Some((inner_tx_id, _)) = conn.get_mv_tx_for_db(*db) {
+                if mv_store.is_tx_rollbackable(inner_tx_id) {
+                    mv_store.rollback_tx(inner_tx_id, pager.clone(), &conn, *db);
+                }
+            }
+            state.sequence_inner_tx_pending = None;
+            conn.set_mv_tx_for_db(*db, saved_outer);
+            // Bail out with Busy when the retry budget is exhausted.
+            // Routing this through `Insn::Halt { err_code: SQLITE_BUSY }`
+            // would land in `op_halt`'s constraint_error catch-all and be
+            // mis-wrapped as `LimboError::Constraint("undocumented halt
+            // error code ...")` — `halt()` is for permanent statement
+            // errors, not transient retryable ones. Returning Err here
+            // surfaces as a proper `LimboError::Busy` to the caller.
+            state.sequence_inner_retry_count = state.sequence_inner_retry_count.saturating_add(1);
+            // Mirror onto the connection so cross-statement observers (tests
+            // asserting that the non-CYCLE hot path is conflict-free) can
+            // witness retries that the per-statement counter would discard.
+            program
+                .connection
+                .sequence_inner_retries
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if state.sequence_inner_retry_count > SEQUENCE_INNER_TX_RETRY_BUDGET {
+                state.sequence_inner_retry_count = 0;
+                let _ = err;
+                return Err(LimboError::Busy);
+            }
+            // Re-export the specific class via the status register —
+            // the translator-emitted retry uses it to decide whether
+            // to jump back.
+            let _ = err;
+            state.registers[*status_reg]
+                .set_value(Value::from_i64(SEQ_COMMIT_STATUS_CONFLICT_RETRY));
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        Err(e) => {
+            state.sequence_inner_commit = None;
+            if let Some((inner_tx_id, _)) = conn.get_mv_tx_for_db(*db) {
+                if mv_store.is_tx_rollbackable(inner_tx_id) {
+                    mv_store.rollback_tx(inner_tx_id, pager.clone(), &conn, *db);
+                }
+            }
+            state.sequence_inner_tx_pending = None;
+            conn.set_mv_tx_for_db(*db, saved_outer);
+            Err(e)
+        }
+    }
 }
 
 pub fn op_drop_trigger(
@@ -11413,8 +12351,8 @@ pub fn op_page_count(
 pub struct OpParseSchemaInner {
     stmt: crate::Statement,
     schema_arc: Arc<Schema>,
-    from_sql_indexes: Vec<crate::util::UnparsedFromSqlIndex>,
-    automatic_indices: crate::HashMap<String, Vec<(String, i64)>>,
+    from_sql_indexes: crate::alloc::Vec<crate::util::UnparsedFromSqlIndex>,
+    automatic_indices: crate::HashMap<String, crate::alloc::Vec<(String, i64)>>,
     dbsp_state_roots: crate::HashMap<String, i64>,
     dbsp_state_index_roots: crate::HashMap<String, i64>,
     materialized_view_info: crate::HashMap<String, (String, i64)>,
@@ -11509,7 +12447,8 @@ pub fn op_parse_schema(
     *state.active_op_state.parse_schema() = Some(Box::new(OpParseSchemaInner {
         stmt,
         schema_arc,
-        from_sql_indexes: Vec::with_capacity(10),
+        from_sql_indexes: crate::alloc::Vec::try_with_capacity_ext(10)
+            .expect("TODO: fallible allocations"),
         automatic_indices: Default::default(),
         dbsp_state_roots: Default::default(),
         dbsp_state_index_roots: Default::default(),
@@ -11532,7 +12471,7 @@ fn op_parse_schema_step(
     loop {
         let inner = state.active_op_state.parse_schema().as_mut().unwrap();
         match inner.stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 let io = inner
                     .stmt
                     .take_io_completions()
@@ -11791,7 +12730,7 @@ fn drive_init_cdc_version(
     loop {
         let inner = state.active_op_state.init_cdc_version().as_mut().unwrap();
         match inner.stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 let io = inner
                     .stmt
                     .take_io_completions()
@@ -13192,6 +14131,42 @@ pub fn op_rename_table(
             schema.triggers.insert(normalized_to.to_owned(), triggers);
         }
 
+        // If the renamed table owned an implicit AUTOINCREMENT sequence,
+        // the sequence's name (`__turso_internal_autoincrement_<old>`) and
+        // its backing table's name (`__turso_internal_seq_<…>`) are both
+        // derived from the parent table. The bytecode-side rewrite in
+        // `emit_rename_autoincrement_backing_table_entry` already updated
+        // the persistent sqlite_schema row; here we mirror the rename in
+        // the in-memory `schema.sequences` and `schema.tables` maps so a
+        // subsequent INSERT under MVCC can find the sequence via
+        // `autoincrement_sequence_name(<new>)`. Without this, every
+        // INSERT into the renamed table would error with "missing
+        // implicit sequence for AUTOINCREMENT table" until the next
+        // schema reparse.
+        let old_seq_name = crate::schema::autoincrement_sequence_name(&normalized_from);
+        if let Some(mut seq_arc) = schema.sequences.remove(&old_seq_name) {
+            let new_seq_name = crate::schema::autoincrement_sequence_name(&normalized_to);
+            // Mutate the Sequence's `name` field so its internal identity
+            // tracks the new table. `seq.name` is used by the exhaustion
+            // error message in `op_sequence_compute_next` and by the
+            // `AUTOINCREMENT_SEQ_PREFIX` strip-check in
+            // `emit_autoincrement_sqlite_sequence_sync` — keeping it in
+            // sync with the map key avoids a misleading error and a
+            // missed sqlite_sequence mirror.
+            Arc::make_mut(&mut seq_arc).name.clone_from(&new_seq_name);
+            let old_backing_table =
+                crate::translate::sequence::sequence_backing_table_name(&old_seq_name);
+            let new_backing_table =
+                crate::translate::sequence::sequence_backing_table_name(&new_seq_name);
+            schema.sequences.insert(new_seq_name, seq_arc);
+            if let Some(mut backing_arc) = schema.tables.remove(&old_backing_table) {
+                if let Table::BTree(btree_arc) = Arc::make_mut(&mut backing_arc) {
+                    Arc::make_mut(btree_arc).name.clone_from(&new_backing_table);
+                }
+                schema.tables.insert(new_backing_table, backing_arc);
+            }
+        }
+
         // Also update triggers on OTHER tables that reference the renamed table
         // in their body commands (e.g., INSERT INTO old_name in a trigger on another table)
         for (_, triggers) in schema.triggers.iter_mut() {
@@ -13386,9 +14361,13 @@ pub fn op_add_column(
         let btree = Arc::make_mut(btree);
         btree.columns_mut().push((**column).clone());
         // Update CHECK constraints to include any constraints from the new column
-        btree.check_constraints.clone_from(check_constraints);
+        btree.check_constraints = check_constraints
+            .try_to_vec()
+            .expect("TODO: fallible allocations");
         // Update foreign keys to include any FK constraints from the new column
-        btree.foreign_keys.clone_from(foreign_keys);
+        btree.foreign_keys = foreign_keys
+            .try_to_vec()
+            .expect("TODO: fallible allocations");
 
         // Resolve generated column expressions and update virtual column metadata
         btree.prepare_generated_columns()?;
@@ -13507,12 +14486,15 @@ pub fn op_alter_column(
             .expect("btree column should be named")
             .clone();
 
-        // Update indexes on THIS table that name the old column (you already had this)
+        // Update this table's indexes that reference the old column.
         if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
             for idx in idxs {
                 let idx = Arc::make_mut(idx);
                 for ic in &mut idx.columns {
-                    if ic.name.eq_ignore_ascii_case(&existing_column_name) {
+                    if let Some(expr) = &mut ic.expr {
+                        rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
+                        ic.name = expr.to_string();
+                    } else if ic.name.eq_ignore_ascii_case(&existing_column_name) {
                         ic.name.clone_from(&new_name);
                     }
                 }
@@ -13893,9 +14875,11 @@ pub fn op_hash_build(
                 && s.num_keys == data.num_keys
         })
         .unwrap_or_else(|| OpHashBuildState {
-            key_values: Vec::with_capacity(data.num_keys),
+            key_values: crate::alloc::Vec::try_with_capacity_ext(data.num_keys)
+                .expect("TODO: fallible allocations"),
             key_idx: 0,
-            payload_values: Vec::with_capacity(data.num_payload),
+            payload_values: crate::alloc::Vec::try_with_capacity_ext(data.num_payload)
+                .expect("TODO: fallible allocations"),
             payload_idx: 0,
             rowid: None,
             cursor_id: data.cursor_id,
@@ -13920,7 +14904,10 @@ pub fn op_hash_build(
             initial_buckets: 1024,
             mem_budget,
             num_keys: data.num_keys,
-            collations: data.collations.clone(),
+            collations: data
+                .collations
+                .try_to_vec()
+                .expect("TODO: fallible allocations"),
             temp_store,
             track_matched: data.track_matched,
             partition_count: None,
@@ -13981,9 +14968,9 @@ pub fn op_hash_build(
     if let Some(ht) = state.hash_tables.get_mut(&data.hash_table_id) {
         let rowid = op_state.rowid.expect("rowid set");
         let pending = PendingHashInsert {
-            key_values: std::mem::take(&mut op_state.key_values),
+            key_values: std::mem::replace(&mut op_state.key_values, crate::alloc::vec![]),
             rowid,
-            payload_values: std::mem::take(&mut op_state.payload_values),
+            payload_values: std::mem::replace(&mut op_state.payload_values, crate::alloc::vec![]),
         };
         match ht.insert_pending(pending, Some(&mut state.metrics.hash_join))? {
             HashInsertResult::Done => {}
@@ -14024,7 +15011,10 @@ pub fn op_hash_distinct(
             initial_buckets: 1024,
             mem_budget,
             num_keys: data.num_keys,
-            collations: data.collations.clone(),
+            collations: data
+                .collations
+                .try_to_vec()
+                .expect("TODO: fallible allocations"),
             temp_store,
             track_matched: false,
             partition_count: None,
@@ -14129,7 +15119,8 @@ pub fn op_hash_probe(
                 )
             } else {
                 // Different hash table, read fresh keys
-                let mut keys = Vec::with_capacity(num_keys);
+                let mut keys = crate::alloc::Vec::try_with_capacity_ext(num_keys)
+                    .expect("TODO: fallible allocations");
                 for i in 0..num_keys {
                     let reg = &state.registers[key_start_reg + i];
                     keys.push(reg.get_value().clone());
@@ -14138,7 +15129,8 @@ pub fn op_hash_probe(
             }
         } else {
             // First entry, read probe keys from registers
-            let mut keys = Vec::with_capacity(num_keys);
+            let mut keys = crate::alloc::Vec::try_with_capacity_ext(num_keys)
+                .expect("TODO: fallible allocations");
             for i in 0..num_keys {
                 let reg = &state.registers[key_start_reg + i];
                 keys.push(reg.get_value().clone());
@@ -14182,7 +15174,7 @@ pub fn op_hash_probe(
                     IOResult::Done(()) => {}
                     IOResult::IO(io) => {
                         *state.active_op_state.hash_probe() = Some(OpHashProbeState {
-                            probe_keys: Vec::new(), // keys consumed
+                            probe_keys: crate::alloc::vec![], // keys consumed
                             hash_table_id,
                             partition_idx,
                             probe_buffered: true,
@@ -14845,6 +15837,8 @@ pub enum OpJournalModeSubState {
     WritePage,
     /// Finalize - clear cache and setup new mode
     Finalize,
+    /// Bootstrap the MV store after switching to MVCC mode
+    BootstrapMvStore,
 }
 
 /// Holds the state for the journal mode change operation
@@ -14856,9 +15850,61 @@ pub struct OpJournalModeState {
     /// The new journal mode we're changing to
     pub new_mode: Option<journal_mode::JournalMode>,
     /// Checkpoint state machine for MVCC mode
-    pub checkpoint_sm: Option<StateMachine<Box<CheckpointStateMachine<MvccClock>>>>,
+    pub checkpoint_sm: Option<StateMachine<Box<MvccCheckpointStateMachine>>>,
+    /// Bootstrap state machine when switching into MVCC mode
+    pub bootstrap_state: BootstrapState,
     /// Page reference for writing header
     pub page_ref: Option<PageRef>,
+    /// Abandonment guard for the WAL→MVCC switch. Armed in `Finalize` once the
+    /// store is installed and the connection demoted; disarmed only on
+    /// successful bootstrap. If the statement is reset/dropped while parked at a
+    /// bootstrap yield, dropping this guard restores in-memory state.
+    pub bootstrap_guard: Option<MvccBootstrapGuard>,
+}
+
+/// Restores in-memory MVCC state if a `PRAGMA journal_mode=mvcc` bootstrap is
+/// abandoned (statement reset/dropped) or errors after the connection has been
+/// demoted and the shared `MvStore` installed.
+///
+/// Without this, `ProgramState::reset()` would clear `active_op_state` while
+/// leaving `is_mvcc_bootstrap_connection` set forever (silently bypassing MVCC)
+/// and the DB-wide `mv_store` installed but un-bootstrapped (`global_header =
+/// None`), which other connections can trip an assertion on at commit. Mirrors
+/// `MvccVacuumGuard` in `vacuum.rs`.
+pub struct MvccBootstrapGuard {
+    connection: Arc<Connection>,
+    completed: bool,
+}
+
+impl MvccBootstrapGuard {
+    fn new(connection: Arc<Connection>) -> Self {
+        Self {
+            connection,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for MvccBootstrapGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        // Bootstrap did not finish: re-promote the connection if it is still
+        // demoted (bootstrap promotes itself only at `Recover`) and uninstall
+        // the un-bootstrapped store so neither this connection nor others on
+        // the same `Database` observe a demoted-but-unbootstrapped MVCC store.
+        // The on-disk header already reads MVCC, so the database recovers on
+        // the next fresh open via the regular MVCC bootstrap path.
+        if self.connection.is_mvcc_bootstrap_connection() {
+            self.connection.promote_to_regular_connection();
+        }
+        self.connection.db.mv_store.store(None);
+    }
 }
 
 pub fn op_journal_mode(
@@ -14970,6 +16016,7 @@ fn op_journal_mode_inner(
                                 program.connection.clone(),
                                 true,
                                 program.connection.get_sync_mode(),
+                                *db,
                             ))));
                     }
 
@@ -15062,10 +16109,20 @@ fn op_journal_mode_inner(
                         program.connection.db.open_flags,
                         program.connection.db.durable_storage.clone(),
                         enc_ctx,
+                        program.connection.db.mv_store_allocator.clone(),
                     )?;
+                    // Arm the abandonment guard *before* the irreversible
+                    // store install + demote so a reset/drop at any subsequent
+                    // bootstrap yield restores in-memory state.
+                    let guard = MvccBootstrapGuard::new(program.connection.clone());
                     program.connection.db.mv_store.store(Some(mv_store.clone()));
                     program.connection.demote_to_mvcc_connection();
-                    mv_store.bootstrap(program.connection.clone())?;
+                    state.active_op_state.journal_mode().bootstrap_guard = Some(guard);
+                    state.active_op_state.journal_mode().bootstrap_state =
+                        BootstrapState::default();
+                    state.active_op_state.journal_mode().sub_state =
+                        OpJournalModeSubState::BootstrapMvStore;
+                    continue;
                 }
 
                 if matches!(new_mode, journal_mode::JournalMode::Wal) {
@@ -15074,6 +16131,36 @@ fn op_journal_mode_inner(
 
                 // Return result
                 let ret: &'static str = new_mode.into();
+                state.registers[*dest].set_text(Text::new(ret))?;
+                state.pc += 1;
+
+                return Ok(InsnFunctionStepResult::Step);
+            }
+
+            OpJournalModeSubState::BootstrapMvStore => {
+                let mv_store_guard = program.connection.db.get_mv_store();
+                let Some(mv_store) = mv_store_guard.as_ref() else {
+                    return Err(LimboError::InternalError(
+                        "MVCC journal mode bootstrap missing MV store".to_string(),
+                    ));
+                };
+                return_if_io!(mv_store.bootstrap_nonblock(
+                    &program.connection,
+                    &mut state.active_op_state.journal_mode().bootstrap_state
+                ));
+
+                // Bootstrap finished: disarm the abandonment guard so it does
+                // not roll back the now-published MVCC store on drop.
+                if let Some(guard) = state
+                    .active_op_state
+                    .journal_mode()
+                    .bootstrap_guard
+                    .as_mut()
+                {
+                    guard.complete();
+                }
+
+                let ret: &'static str = journal_mode::JournalMode::Mvcc.into();
                 state.registers[*dest].set_text(Text::new(ret))?;
                 state.pc += 1;
 
@@ -15629,6 +16716,7 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
     use crate::{Database, DatabaseOpts, MemoryIO, IO};
@@ -15647,7 +16735,7 @@ mod tests {
         conn.prepare("SELECT 1;").unwrap()
     }
 
-    fn make_spilled_hash_table() -> (HashTable, Vec<Value>, usize) {
+    fn make_spilled_hash_table() -> (HashTable, crate::alloc::Vec<Value>, usize) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let config = HashTableConfig {
             initial_buckets: 4,
@@ -16115,7 +17203,7 @@ mod tests {
 
     #[test]
     fn test_init_agg_payload_count() {
-        let mut payload = Vec::new();
+        let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::Count, &mut payload).unwrap();
         assert_eq!(payload.len(), 1);
         assert_eq!(payload[0], Value::from_i64(0));
@@ -16123,7 +17211,7 @@ mod tests {
 
     #[test]
     fn test_init_agg_payload_sum() {
-        let mut payload = Vec::new();
+        let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::Sum, &mut payload).unwrap();
         assert_eq!(payload.len(), 4);
         assert_eq!(payload[0], Value::Null); // acc
@@ -16134,7 +17222,7 @@ mod tests {
 
     #[test]
     fn test_init_agg_payload_avg() {
-        let mut payload = Vec::new();
+        let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::Avg, &mut payload).unwrap();
         assert_eq!(payload.len(), 3);
         assert_eq!(payload[0], Value::from_f64(0.0)); // sum
@@ -16362,7 +17450,7 @@ mod tests {
     fn test_array_agg_accumulates_correctly() {
         // Verify that array_agg produces correct results when accumulating
         // multiple values. Uses the direct payload approach (O(1) per row).
-        let mut payload = Vec::new();
+        let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::ArrayAgg, &mut payload).unwrap();
 
         // Simulate how AggStep accumulates values directly into the payload Vec.
@@ -16388,7 +17476,7 @@ mod tests {
     fn test_array_agg_zero_rows_produces_valid_result() {
         // array_agg with zero rows should return NULL, matching PostgreSQL.
         // The result must not be an invalid empty blob that crashes on decode.
-        let mut payload = Vec::new();
+        let mut payload = crate::alloc::vec![];
         init_agg_payload(&AggFunc::ArrayAgg, &mut payload).unwrap();
         // No values accumulated — count stays 0.
         let result = finalize_agg_payload(&AggFunc::ArrayAgg, &payload).unwrap();

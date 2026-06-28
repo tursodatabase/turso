@@ -3,6 +3,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::schema::Schema;
 use crate::translate::emitter::TransactionMode;
+use crate::types::IOResult;
 use crate::util::normalize_ident;
 use crate::{Connection, Result, Statement, TransactionState, Value};
 pub const STATS_TABLE: &str = "sqlite_stat1";
@@ -125,66 +126,156 @@ pub fn refresh_analyze_stats(conn: &Arc<Connection>) {
     }
 }
 
+/// Carries the in-progress `sqlite_stat1` scan across IO yields for
+/// [`refresh_analyze_stats_nonblock`].
+#[derive(Default)]
+pub enum RefreshAnalyzeStatsState {
+    #[default]
+    Start,
+    Running {
+        stmt: Box<Statement>,
+        schema_snapshot: Arc<Schema>,
+        stats: AnalyzeStats,
+    },
+}
+
+/// Non-blocking variant of [`refresh_analyze_stats`]: best-effort refresh of
+/// the connection's in-memory ANALYZE stats from `sqlite_stat1`, yielding IO
+/// via the supplied state instead of pumping it. Errors are swallowed (matches
+/// the blocking variant's best-effort contract).
+pub fn refresh_analyze_stats_nonblock(
+    conn: &Arc<Connection>,
+    st: &mut RefreshAnalyzeStatsState,
+) -> Result<IOResult<()>> {
+    loop {
+        match st {
+            RefreshAnalyzeStatsState::Start => {
+                if !conn.is_db_initialized() || conn.is_nested_stmt() {
+                    return Ok(IOResult::Done(()));
+                }
+                if matches!(conn.get_tx_state(), TransactionState::Write { .. }) {
+                    return Ok(IOResult::Done(()));
+                }
+                let schema_snapshot = { conn.schema.read().clone() };
+                if schema_snapshot.get_btree_table(STATS_TABLE).is_none() {
+                    return Ok(IOResult::Done(()));
+                }
+                let mv_tx = conn.get_mv_tx();
+                let mut stmt = conn.prepare(STATS_QUERY)?;
+                stmt.set_mv_tx(mv_tx);
+                *st = RefreshAnalyzeStatsState::Running {
+                    stmt: Box::new(stmt),
+                    schema_snapshot,
+                    stats: AnalyzeStats::default(),
+                };
+            }
+            RefreshAnalyzeStatsState::Running {
+                stmt,
+                schema_snapshot,
+                stats,
+            } => {
+                let scan = load_sqlite_stat1_rows_nonblock(stmt, schema_snapshot, stats);
+                match scan {
+                    Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                    Ok(IOResult::Done(())) => {
+                        let stats = std::mem::take(stats);
+                        conn.with_schema_mut(|schema| {
+                            schema.analyze_stats = stats;
+                        });
+                        *st = RefreshAnalyzeStatsState::Start;
+                        return Ok(IOResult::Done(()));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to refresh analyze stats: {e}");
+                        *st = RefreshAnalyzeStatsState::Start;
+                        return Ok(IOResult::Done(()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Non-blocking row scan shared by [`refresh_analyze_stats_nonblock`]. Steps the
+/// prepared `sqlite_stat1` statement, accumulating into `stats`.
+fn load_sqlite_stat1_rows_nonblock(
+    stmt: &mut Statement,
+    schema: &Schema,
+    stats: &mut AnalyzeStats,
+) -> Result<crate::types::IOResult<()>> {
+    crate::return_if_io!(
+        stmt.run_with_row_callback_nonblock(|row| { load_sqlite_stat1_row(row, schema, stats) })
+    );
+    Ok(crate::types::IOResult::Done(()))
+}
+
+/// Apply a single `sqlite_stat1` row to the accumulating [`AnalyzeStats`].
+/// Shared by the blocking and non-blocking scanners.
+fn load_sqlite_stat1_row(
+    row: &crate::vdbe::Row,
+    schema: &Schema,
+    stats: &mut AnalyzeStats,
+) -> Result<()> {
+    let table_name = row.get::<&str>(0)?;
+    let idx_value = row.get::<&Value>(1)?;
+    let stat_value = row.get::<&Value>(2)?;
+
+    let idx_name = match idx_value {
+        Value::Null => None,
+        Value::Text(s) => Some(s.as_str()),
+        _ => None,
+    };
+    let stat = match stat_value {
+        Value::Text(s) => s.as_str(),
+        _ => return Ok(()),
+    };
+
+    // Skip if table is not a regular B-tree.
+    if schema.get_btree_table(table_name).is_none() {
+        return Ok(());
+    }
+    let Some(numbers) = parse_stat_numbers(stat) else {
+        return Ok(());
+    };
+    if numbers.is_empty() {
+        return Ok(());
+    }
+    if idx_name.is_none() {
+        if let Some(total_rows) = numbers.first().copied() {
+            stats.table_stats_mut(table_name).row_count = Some(total_rows);
+        }
+        return Ok(());
+    }
+
+    // Index-level entry: only keep if the index exists on this table.
+    let idx_name = normalize_ident(idx_name.unwrap());
+    if schema.get_index(table_name, &idx_name).is_none() {
+        return Ok(());
+    }
+
+    let total_rows = numbers.first().copied();
+    {
+        let idx_stats = stats.table_stats_mut(table_name).index_stats_mut(&idx_name);
+        idx_stats.total_rows = total_rows;
+        idx_stats.avg_rows_per_distinct_prefix = numbers.iter().skip(1).copied().collect();
+    }
+
+    // If we didn't see a table-level row yet, seed row_count from index stats.
+    if let Some(total_rows) = total_rows {
+        let table_stats = stats.table_stats_mut(table_name);
+        if table_stats.row_count.is_none() {
+            table_stats.row_count = Some(total_rows);
+        }
+    }
+    Ok(())
+}
+
 fn load_sqlite_stat1_from_stmt(
     mut stmt: Statement,
     schema: &Schema,
     stats: &mut AnalyzeStats,
 ) -> Result<()> {
-    stmt.run_with_row_callback(|row| {
-        let table_name = row.get::<&str>(0)?;
-        let idx_value = row.get::<&Value>(1)?;
-        let stat_value = row.get::<&Value>(2)?;
-
-        let idx_name = match idx_value {
-            Value::Null => None,
-            Value::Text(s) => Some(s.as_str()),
-            _ => None,
-        };
-        let stat = match stat_value {
-            Value::Text(s) => s.as_str(),
-            _ => return Ok(()),
-        };
-
-        // Skip if table is not a regular B-tree.
-        if schema.get_btree_table(table_name).is_none() {
-            return Ok(());
-        }
-        let Some(numbers) = parse_stat_numbers(stat) else {
-            return Ok(());
-        };
-        if numbers.is_empty() {
-            return Ok(());
-        }
-        if idx_name.is_none() {
-            if let Some(total_rows) = numbers.first().copied() {
-                stats.table_stats_mut(table_name).row_count = Some(total_rows);
-            }
-            return Ok(());
-        }
-
-        // Index-level entry: only keep if the index exists on this table.
-        let idx_name = normalize_ident(idx_name.unwrap());
-        if schema.get_index(table_name, &idx_name).is_none() {
-            return Ok(());
-        }
-
-        let total_rows = numbers.first().copied();
-        {
-            let idx_stats = stats.table_stats_mut(table_name).index_stats_mut(&idx_name);
-            idx_stats.total_rows = total_rows;
-            idx_stats.avg_rows_per_distinct_prefix = numbers.iter().skip(1).copied().collect();
-        }
-
-        // If we didn't see a table-level row yet, seed row_count from index stats.
-        if let Some(total_rows) = total_rows {
-            let table_stats = stats.table_stats_mut(table_name);
-            if table_stats.row_count.is_none() {
-                table_stats.row_count = Some(total_rows);
-            }
-        }
-        Ok(())
-    })?;
-
+    stmt.run_with_row_callback(|row| load_sqlite_stat1_row(row, schema, stats))?;
     Ok(())
 }
 

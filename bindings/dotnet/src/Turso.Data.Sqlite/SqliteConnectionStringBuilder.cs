@@ -19,6 +19,10 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         "Default Timeout",
         "Pooling",
         "Vfs",
+        "DateTimeKind",
+        "DateTimeFormat",
+        "BinaryGUID",
+        "Version",
     ];
 
     private static readonly Dictionary<string, string> KeywordMap = new(StringComparer.OrdinalIgnoreCase)
@@ -39,6 +43,14 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
         ["CommandTimeout"] = "Default Timeout",
         ["Pooling"] = "Pooling",
         ["Vfs"] = "Vfs",
+        ["DateTimeKind"] = "DateTimeKind",
+        ["Date Time Kind"] = "DateTimeKind",
+        ["DateTimeFormat"] = "DateTimeFormat",
+        ["Date Time Format"] = "DateTimeFormat",
+        ["BinaryGUID"] = "BinaryGUID",
+        ["BinaryGuid"] = "BinaryGUID",
+        ["Binary GUID"] = "BinaryGUID",
+        ["Version"] = "Version",
     };
 
     public SqliteConnectionStringBuilder()
@@ -106,6 +118,34 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
     {
         get => GetString("Vfs");
         set => SetString("Vfs", value);
+    }
+
+    public DateTimeKind DateTimeKind
+    {
+        get => GetEnum("DateTimeKind", System.DateTimeKind.Unspecified);
+        set => this["DateTimeKind"] = value;
+    }
+
+    public string DateTimeFormat
+    {
+        get => GetString("DateTimeFormat");
+        set => SetString("DateTimeFormat", value);
+    }
+
+    public bool BinaryGUID
+    {
+        get => GetBool("BinaryGUID", true);
+        set => this["BinaryGUID"] = value;
+    }
+
+    public int Version
+    {
+        get => GetInt("Version", 3);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            this["Version"] = value;
+        }
     }
 
     public override ICollection Keys => new ReadOnlyCollection<string>(CanonicalKeywords);
@@ -254,8 +294,9 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Mode" => ConvertOpenMode(value),
             "Cache" => ConvertCacheMode(value),
             "Foreign Keys" => ConvertToNullableBoolean(value),
-            "Recursive Triggers" or "Pooling" => Convert.ToBoolean(value, CultureInfo.InvariantCulture),
-            "Default Timeout" => Convert.ToInt32(value, CultureInfo.InvariantCulture),
+            "Recursive Triggers" or "Pooling" or "BinaryGUID" => Convert.ToBoolean(value, CultureInfo.InvariantCulture),
+            "Default Timeout" or "Version" => Convert.ToInt32(value, CultureInfo.InvariantCulture),
+            "DateTimeKind" => ConvertDateTimeKind(value),
             _ => Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty,
         };
     }
@@ -267,6 +308,7 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Mode" => ConvertOpenMode(value),
             "Cache" => ConvertCacheMode(value),
             "Foreign Keys" => ConvertToNullableBoolean(value)!,
+            "DateTimeKind" => ConvertDateTimeKind(value),
             _ => value,
         };
     }
@@ -284,6 +326,10 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             "Default Timeout" => 30,
             "Pooling" => true,
             "Vfs" => null!,
+            "DateTimeKind" => System.DateTimeKind.Unspecified,
+            "DateTimeFormat" => string.Empty,
+            "BinaryGUID" => true,
+            "Version" => 3,
             _ => throw new ArgumentException(Properties.Resources.KeywordNotSupported(keyword)),
         };
     }
@@ -328,5 +374,14 @@ public class SqliteConnectionStringBuilder : DbConnectionStringBuilder
             throw new ArgumentOutOfRangeException(nameof(value), value, Properties.Resources.InvalidEnumValue(typeof(SqliteCacheMode), mode));
 
         return mode;
+    }
+
+    private static DateTimeKind ConvertDateTimeKind(object value)
+    {
+        var kind = ConvertEnum<DateTimeKind>(value);
+        if (!Enum.IsDefined(kind))
+            throw new ArgumentOutOfRangeException(nameof(value), value, Properties.Resources.InvalidEnumValue(typeof(DateTimeKind), kind));
+
+        return kind;
     }
 }

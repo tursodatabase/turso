@@ -1584,6 +1584,48 @@ expect {
     10|7|7
 }
 
+# Composite child FK whose first component is an INTEGER PRIMARY KEY rowid alias.
+# The OLD child key probe must materialize each component, not assume adjacent registers.
+@cross-check-integrity
+test fk-deferred-child-update-rowid-alias-composite-old-probe {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INT, b INT, UNIQUE(a,b));
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        x INT,
+        FOREIGN KEY(id,x) REFERENCES parent(a,b) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES(1,2),(1,3);
+    INSERT INTO child VALUES(1,2);
+    BEGIN;
+    INSERT INTO child VALUES(9,9);
+    UPDATE child SET x=3 WHERE id=1;
+    COMMIT;
+}
+expect error {
+}
+
+# Composite child FK whose second component is an INTEGER PRIMARY KEY rowid alias.
+# This covers the non-leading alias case for OLD child key materialization.
+@cross-check-integrity
+test fk-deferred-child-update-rowid-alias-composite-old-probe-second-component {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INT, b INT, UNIQUE(a,b));
+    CREATE TABLE child(
+        x INT,
+        id INTEGER PRIMARY KEY,
+        FOREIGN KEY(x,id) REFERENCES parent(a,b) DEFERRABLE INITIALLY DEFERRED
+    );
+    INSERT INTO parent VALUES(2,1),(3,1);
+    INSERT INTO child(x,id) VALUES(2,1);
+    BEGIN;
+    INSERT INTO child(x,id) VALUES(9,9);
+    UPDATE child SET x=3 WHERE id=1;
+    COMMIT;
+}
+expect error {
+}
+
 # TX: NULL in child FK -> never a violation
 @cross-check-integrity
 test fk-deferred-null-fk-never-violates {
@@ -3045,6 +3087,157 @@ test fk-restrict-null-child-ok {
 }
 expect {
     0
+}
+
+# ON UPDATE RESTRICT should ignore parent keys containing NULL (SQLite `=` semantics).
+@cross-check-integrity
+test fk-update-restrict-null-parent-key-noop {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(k INT UNIQUE);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        pkey INT REFERENCES parent(k) ON UPDATE RESTRICT
+    );
+    CREATE INDEX child_pkey_idx ON child(pkey);
+    INSERT INTO parent VALUES(NULL), (1);
+    INSERT INTO child VALUES(10, NULL), (20, 1);
+    UPDATE parent SET k = k WHERE k IS NULL;
+    SELECT ifnull(pkey, 'NULL') FROM child ORDER BY id;
+}
+expect {
+    NULL
+    1
+}
+
+# ON UPDATE RESTRICT should also ignore NULL parent keys without a child index.
+@cross-check-integrity
+test fk-update-restrict-null-parent-key-noop-scan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(k INT UNIQUE);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        pkey INT REFERENCES parent(k) ON UPDATE RESTRICT
+    );
+    INSERT INTO parent VALUES(NULL), (1);
+    INSERT INTO child VALUES(10, NULL), (20, 1);
+    UPDATE parent SET k = k WHERE k IS NULL;
+    SELECT ifnull(pkey, 'NULL') FROM child ORDER BY id;
+}
+expect {
+    NULL
+    1
+}
+
+# ON UPDATE NO ACTION should also ignore parent keys containing NULL.
+@cross-check-integrity
+test fk-update-noaction-null-parent-key-noop {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(k INT UNIQUE);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        pkey INT REFERENCES parent(k) ON UPDATE NO ACTION
+    );
+    CREATE INDEX child_pkey_idx ON child(pkey);
+    INSERT INTO parent VALUES(NULL), (1);
+    INSERT INTO child VALUES(10, NULL), (20, 1);
+    UPDATE parent SET k = 2 WHERE k IS NULL;
+    SELECT ifnull(pkey, 'NULL') FROM child ORDER BY id;
+}
+expect {
+    NULL
+    1
+}
+
+# ON DELETE RESTRICT should ignore NULL parent keys without a child index.
+@cross-check-integrity
+test fk-delete-restrict-null-parent-key-noop-scan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(k INT UNIQUE);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        pkey INT REFERENCES parent(k) ON DELETE RESTRICT
+    );
+    INSERT INTO parent VALUES(NULL), (1);
+    INSERT INTO child VALUES(10, NULL), (20, 1);
+    DELETE FROM parent WHERE k IS NULL;
+    SELECT count(*) FROM parent WHERE k IS NULL;
+    SELECT k FROM parent;
+    SELECT ifnull(pkey, 'NULL') FROM child ORDER BY id;
+}
+expect {
+    0
+    1
+    NULL
+    1
+}
+
+# ON DELETE RESTRICT should ignore NULL parent keys when the child lookup uses an index.
+@cross-check-integrity
+test fk-delete-restrict-null-parent-key-noop-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(k INT UNIQUE);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        pkey INT REFERENCES parent(k) ON DELETE RESTRICT
+    );
+    CREATE INDEX child_pkey_idx ON child(pkey);
+    INSERT INTO parent VALUES(NULL), (1);
+    INSERT INTO child VALUES(10, NULL), (20, 1);
+    DELETE FROM parent WHERE k IS NULL;
+    SELECT count(*) FROM parent WHERE k IS NULL;
+    SELECT k FROM parent;
+    SELECT ifnull(pkey, 'NULL') FROM child ORDER BY id;
+}
+expect {
+    0
+    1
+    NULL
+    1
+}
+
+# Composite parent key: a partial-NULL key cannot be referenced, so ON UPDATE
+# RESTRICT must ignore it even when other components match a child row.
+@cross-check-integrity
+test fk-update-restrict-partial-null-composite-parent-key-noop {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INT, b INT, UNIQUE(a, b));
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        x INT,
+        y INT,
+        FOREIGN KEY(x, y) REFERENCES parent(a, b) ON UPDATE RESTRICT
+    );
+    INSERT INTO parent VALUES(1, NULL), (1, 2);
+    INSERT INTO child VALUES(10, 1, 2);
+    UPDATE parent SET b = b WHERE b IS NULL;
+    SELECT a, ifnull(b, 'NULL') FROM parent ORDER BY a, b;
+}
+expect {
+    1|NULL
+    1|2
+}
+
+# Composite parent key: deleting a partial-NULL parent row must not trip
+# ON DELETE RESTRICT for children matching the non-NULL components.
+@cross-check-integrity
+test fk-delete-restrict-partial-null-composite-parent-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INT, b INT, UNIQUE(a, b));
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        x INT,
+        y INT,
+        FOREIGN KEY(x, y) REFERENCES parent(a, b) ON DELETE RESTRICT
+    );
+    INSERT INTO parent VALUES(1, NULL), (1, 2);
+    INSERT INTO child VALUES(10, 1, 2);
+    DELETE FROM parent WHERE b IS NULL;
+    SELECT count(*) FROM parent;
+    SELECT a, b FROM parent;
+}
+expect {
+    1
+    1|2
 }
 
 # DROP parent table should fail when child rows reference it

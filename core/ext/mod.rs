@@ -220,6 +220,8 @@ impl Database {
 
         let io: Arc<dyn IO> = match vfs {
             "memory" => Arc::new(MemoryIO::new()),
+            #[cfg(feature = "io_memory_yield")]
+            "memory_yield" => Arc::new(crate::MemoryYieldIO::new()),
             "syscall" => Arc::new(SyscallIO::new()?),
             #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
             "io_uring" => Arc::new(UringIO::new()?),
