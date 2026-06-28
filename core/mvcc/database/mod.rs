@@ -2189,6 +2189,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     // Old version is valid UNTIL the committing
                     // transaction's end timestamp. See Hekaton page 299.
                     committed.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
+
+                    // Failed checkpoint can make a version durable in the B-tree
+                    // before checkpoint GC removes it from MVCC store. If a later
+                    // transaction deletes that version, recovery will skip the already
+                    // durable begin frame and only replay this delete. Preserve the
+                    // B-tree residency in the logical log so recovery checkpoints the
+                    // tombstone instead of dropping it as a delete of a missing row.
+                    if !committed.btree_resident {
+                        let durable_boundary = mvcc_store.durable_txid_max.load(Ordering::SeqCst);
+                        if matches!(
+                            row_version.begin(),
+                            Some(TxTimestampOrID::Timestamp(begin_ts))
+                                if begin_ts > 0 && begin_ts <= durable_boundary
+                        ) {
+                            committed.btree_resident = true;
+                        }
+                    }
                 }
                 Some(committed)
             };

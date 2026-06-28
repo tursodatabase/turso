@@ -3396,6 +3396,55 @@ fn test_checkpoint_stale_boundary_does_not_replay_checkpointed_create_table_afte
     assert_eq!(&rows[0][1].to_string(), "persisted");
 }
 
+/// What this test checks: a DELETE committed after a failed checkpoint remains durable after restart and checkpoint recovery.
+/// Why this matters: a failed checkpoint can advance the durable boundary before logical-log cleanup finishes; later deletes must not be lost or resurrected from the B-tree.
+#[test]
+fn test_failed_checkpoint_then_delete_does_not_resurrect_row_after_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    let failure_injector = FixedFailureInjector::new([(
+        CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+        LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+    )]);
+    conn.set_failure_injector(Some(failure_injector.clone()));
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect_err("explicit checkpoint should surface the injected durable-boundary failure");
+
+    assert!(failure_injector.is_empty());
+    conn.set_failure_injector(None);
+
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    let rows = get_rows(&conn, "SELECT count(*) FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 0);
+
+    conn.close().unwrap();
+
+    DATABASE_MANAGER.lock().clear();
+    db.restart();
+
+    let reopened = db.connect();
+    reopened.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&reopened, "SELECT count(*) FROM t");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        0,
+        "checkpoint after recovery must not resurrect a row deleted after a failed checkpoint"
+    );
+
+    let integrity = get_rows(&reopened, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(&integrity[0][0].to_string(), "ok");
+}
+
 /// What this test checks: Replay gate uses metadata boundary and never applies frames at or below it.
 /// Why this matters: This enforces exactly-once effects at the DB-file apply boundary.
 #[test]
