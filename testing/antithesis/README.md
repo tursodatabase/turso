@@ -1,21 +1,5 @@
 # Antithesis Test Suite
 
-## Diff-Targeted (Focused) Runs
-
-The `Antithesis experiment` workflow accepts a `diff_base` input (a branch or SHA). When set, the workflow:
-
-1. fetches the diff `diff_base...HEAD` from the GitHub compare API into `testing/stress/git.diff`,
-2. squashes it into `testing/stress/targeted_coverage.json` via
-   `scripts/antithesis/diff_to_targeted_coverage.py` (changed new-side line ranges, in the
-   `antithesis_targeted_coverage` schema Antithesis uses to focus the fuzzer),
-3. bakes that file into the workload image, and
-4. launches with `custom.use_targeted_fuzzing=true`.
-
-At runtime `docker-entrypoint.sh` copies the file to `$ANTITHESIS_OUTPUT_DIR/targeted_coverage.json`
-only when it is non-empty, so leaving `diff_base` blank reproduces the previous, non-targeted behavior
-exactly. Because the targeting is driven purely by line ranges, you can also "game" it to fuzz an
-arbitrary slice (e.g. a recovery path) by diffing against a base where only those lines differ.
-
 ## How to Dump Artifacts from a Test Run
 
 To dump the stress tool's log and the database from an Antithesis test run, follow these steps. Note that they require
