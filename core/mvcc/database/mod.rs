@@ -3446,6 +3446,21 @@ impl StateTransition for DeleteRowStateMachine {
                     .seek(seek_key, SeekOp::GE { eq_only: true })?
                 {
                     IOResult::Done(seek_res) => {
+                        // TEMP DIAGNOSTIC (mvcc+io_uring index corruption): the
+                        // seek outcome for every delete (table + index). A
+                        // collected+applied index delete that still leaves an
+                        // orphan would show here (e.g. seeking and deleting the
+                        // wrong cell). NotFound bails Corrupt below, so a silent
+                        // orphan means the delete was never applied, not that it
+                        // mis-seeked.
+                        tracing::trace!(
+                            target: "mvcc_ckpt_index",
+                            phase = "delete_seek",
+                            table_id = ?self.rowid.table_id,
+                            key = ?self.rowid.row_id,
+                            seek = ?seek_res,
+                            "delete-from-pager seek result"
+                        );
                         match seek_res {
                             SeekResult::Found => {
                                 self.state = DeleteRowState::Delete;
