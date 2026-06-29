@@ -4,4 +4,9 @@ echo '{"antithesis_setup": { "status": "complete", "details": null }}' > $ANTITH
 
 set -Eeuo pipefail
 
+if [ -f /opt/antithesis/targeted_coverage.json ] \
+  && grep -q '"begin_line"' /opt/antithesis/targeted_coverage.json; then
+  cp /opt/antithesis/targeted_coverage.json "$ANTITHESIS_OUTPUT_DIR/targeted_coverage.json"
+fi
+
 exec "$@"

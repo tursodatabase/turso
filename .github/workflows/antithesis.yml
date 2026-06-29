@@ -45,9 +45,6 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Publish workload
-      run: bash ./scripts/antithesis/publish-workload.sh
-
     - name: Generate diff for targeted testing
       if: ${{ inputs.diff_base != '' }}
       env:
@@ -62,6 +59,16 @@ jobs:
           -H "X-GitHub-Api-Version: 2022-11-28" \
           "https://api.github.com/repos/$REPO/compare/$DIFF_BASE...$HEAD_SHA" \
           -o testing/stress/git.diff
+        python3 scripts/antithesis/diff_to_targeted_coverage.py \
+          testing/stress/git.diff -o testing/stress/targeted_coverage.json
+
+    - name: Ensure targeted-coverage placeholder
+      run: |
+        [ -f testing/stress/targeted_coverage.json ] \
+          || : > testing/stress/targeted_coverage.json
+
+    - name: Publish workload
+      run: bash ./scripts/antithesis/publish-workload.sh
 
     - name: Publish config
       run: bash ./scripts/antithesis/publish-config.sh
@@ -85,3 +92,4 @@ jobs:
         additional_parameters: |-
           antithesis.duration=${{ inputs.duration }}
           antithesis.source=${{ github.ref_name }}
+          custom.use_targeted_fuzzing=${{ inputs.diff_base != '' }}
