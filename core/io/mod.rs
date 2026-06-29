@@ -1978,4 +1978,145 @@ mod shuttle_tests {
         concurrent_overlapping_writes,
         test_concurrent_overlapping_writes_impl
     );
+
+    /// Reproduces the io_uring "lost leader" deadlock in [`UringIO::step`].
+    ///
+    /// Unlike every other test in this module, this one awaits completions
+    /// through the **async** path ([`IOCompletions::wait_async`] ->
+    /// `IOCompletionAsync::poll`), which on `Poll::Pending` calls `step()`
+    /// exactly once and then parks on the completion's waker. The synchronous
+    /// path (`wait_for_completion`) loops `while !finished { step() }`, so a
+    /// follower that loses the `wait_lock` race simply retries and can never
+    /// get permanently stuck — which is why the existing tests don't catch
+    /// this bug.
+    ///
+    /// `UringIO::step` is a leader/follower pump. The leader holds `wait_lock`
+    /// and drains the ring; a follower that loses `try_lock(wait_lock)` returns
+    /// immediately and trusts the current leader to drain its completion and
+    /// fire its waker. The bug is a lost-wakeup race in the leader's `empty()`
+    /// exit:
+    ///
+    /// ```text
+    /// loop {
+    ///     let pending = {
+    ///         let mut state = self.state.lock();
+    ///         state.flush_overflow(&self.ring);
+    ///         if state.empty() { return Ok(()); }  // drops `state`, THEN `_wait_guard`
+    ///         state.pending_ops
+    ///     };
+    ///     ...
+    /// }
+    /// ```
+    ///
+    /// The `return` drops the `state` guard first and the `_wait_guard` second,
+    /// so there is a window where `state` is unlocked but `wait_lock` is still
+    /// held. A follower can slot into that window:
+    ///   1. Leader A holds both locks, sees `empty()` (B hasn't submitted yet),
+    ///      begins returning -> drops `state`.
+    ///   2. In the gap: B locks `state`, pushes its SQE (`pending_ops = 1`),
+    ///      unlocks; polls its completion -> `Pending`; calls `step()` ->
+    ///      `try_lock(wait_lock)` fails (A still holds `_wait_guard`) -> B
+    ///      returns and parks, trusting "the leader".
+    ///   3. A drops `_wait_guard` and leaves `step()`. A's own completion is
+    ///      already done, so A finishes. B's SQE is never submitted/drained and
+    ///      no leader remains. B's waker never fires.
+    ///
+    /// With both tasks parked / finished and a non-empty ring, shuttle's
+    /// deadlock detector panics with `deadlock! blocked tasks: [...]`. This is
+    /// sound: `UringIO` has no background thread reaping completions, so if
+    /// every task is blocked, nothing will ever pump the ring.
+    ///
+    /// This is gated behind `#[ignore]` because it reproduces an as-yet-unfixed
+    /// bug (it is expected to panic). Run it explicitly with:
+    ///
+    /// ```sh
+    /// RUSTFLAGS='--cfg tokio_unstable --cfg shuttle' \
+    ///   cargo test -p turso_core --features io_uring,fs \
+    ///   shuttle_io_uring_async_lost_leader_deadlock -- --ignored --nocapture
+    /// ```
+    ///
+    /// The schedule count can be overridden with `SHUTTLE_ITERS` (the run stops
+    /// at the first deadlocking schedule, so a real bug terminates early).
+    #[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
+    #[test]
+    #[ignore = "reproduces an unfixed io_uring lost-leader deadlock; expected to panic. Run with --ignored"]
+    fn shuttle_io_uring_async_lost_leader_deadlock() {
+        // Concurrent tasks, each issuing a short run of writes that they await
+        // through the async (parking) path. The permanent deadlock requires a
+        // *leader* to finish its work and leave `step()` while a *follower*
+        // slips a fresh SQE into the unlock window and parks; if the leader has
+        // a next op it instead becomes leader again and rescues the follower.
+        // So the most reliable shape is the minimal one: two tasks, one op each
+        // (every leader is on its "last" op). Both are env-tunable so the same
+        // harness can sweep the interleaving space.
+        let num_tasks: u64 = env_u64("SHUTTLE_TASKS", 2);
+        let ops_per_task: u64 = env_u64("SHUTTLE_OPS", 1);
+
+        let iters = std::env::var("SHUTTLE_ITERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(50_000);
+
+        let body = move || {
+            let factory = UringIOFactory::new();
+            let io = factory.create();
+            let path = factory.temp_dir().join("deadlock.db");
+            let file = io
+                .open_file(path.to_str().unwrap(), OpenFlags::Create, false)
+                .unwrap();
+
+            shuttle::future::block_on(async move {
+                let mut handles = Vec::with_capacity(num_tasks as usize);
+                for t in 0..num_tasks {
+                    let io = io.clone();
+                    let file = file.clone();
+                    handles.push(shuttle::future::spawn_local(async move {
+                        for i in 0..ops_per_task {
+                            // Distinct, non-overlapping offset per (task, op).
+                            let offset = (t * ops_per_task + i) * 512;
+                            let buf = Arc::new(Buffer::new(vec![0xAB; 512]));
+                            let c = Completion::new_write(|_| {});
+                            let c = file.pwrite(offset, buf, c).unwrap();
+                            // Await via the async path: on Pending this calls
+                            // step() once and then parks on the completion's
+                            // waker (the buggy path).
+                            crate::types::IOCompletions::Single(c)
+                                .wait_async(io.as_ref())
+                                .await
+                                .unwrap();
+                        }
+                    }));
+                }
+                for h in handles {
+                    h.await.unwrap();
+                }
+            });
+        };
+
+        // If a concrete failing schedule is provided, replay it
+        // deterministically (the panic message prints such a string).
+        if let Ok(schedule) = std::env::var("SHUTTLE_REPLAY") {
+            shuttle::replay(body, schedule.trim());
+            return;
+        }
+
+        // PCT (`check_pct`) systematically inserts a small number of
+        // preemptions; the lost-leader race needs exactly one (preempt the
+        // departing leader between its two unlocks), so PCT finds it far faster
+        // than uniform-random scheduling. `SHUTTLE_PCT=0` falls back to random.
+        let pct_depth: usize = env_u64("SHUTTLE_PCT", 3) as usize;
+        if pct_depth == 0 {
+            shuttle::check_random(body, iters);
+        } else {
+            shuttle::check_pct(body, iters, pct_depth);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
+    fn env_u64(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(default)
+    }
 }
