@@ -1088,6 +1088,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 for version in self.maybe_get_checkpointable_versions(&versions, index_id) {
                     let is_delete = version.end().is_some();
 
+                    // TEMP DIAGNOSTIC (mvcc+io_uring index corruption): record
+                    // every index version collected into the checkpoint write
+                    // set. A lost old-key delete shows up here as a *missing*
+                    // `is_delete=true` entry for the orphaned key (i.e. the
+                    // tombstone was filtered out by `maybe_get_checkpointable_versions`).
+                    tracing::trace!(
+                        target: "mvcc_ckpt_index",
+                        phase = "collect",
+                        index_id = ?index_id,
+                        is_delete,
+                        key = ?version.row.id.row_id,
+                        "collect index version"
+                    );
+
                     // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
                     // the database file.
                     with_mvcc_checkpoint_allocation_site!(CheckpointIndexWriteSet, {
@@ -2023,12 +2037,37 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .values()
                         .any(|(table_id, _)| *table_id == row_version.row.id.table_id)
                     {
+                        // TEMP DIAGNOSTIC (mvcc+io_uring index corruption): a
+                        // skipped delete leaves the old index entry in the
+                        // b-tree -> an orphan. If an orphaned key shows up here
+                        // it means the `created_btrees` no-op wrongly fired for
+                        // an index whose b-tree already existed.
+                        tracing::trace!(
+                            target: "mvcc_ckpt_index",
+                            phase = "write",
+                            decision = "SKIP_DELETE_btree_just_created",
+                            index = %index.name,
+                            index_id = ?index_id,
+                            root_page,
+                            key = ?row_version.row.id.row_id,
+                            "skip index delete"
+                        );
                         self.state = CheckpointState::WriteIndexRow {
                             index_write_set_index: index_write_set_index + 1,
                             requires_seek: true,
                         };
                         return Ok(TransitionResult::Continue);
                     }
+                    tracing::trace!(
+                        target: "mvcc_ckpt_index",
+                        phase = "write",
+                        decision = "APPLY_DELETE",
+                        index = %index.name,
+                        index_id = ?index_id,
+                        root_page,
+                        key = ?row_version.row.id.row_id,
+                        "apply index delete"
+                    );
                     let state_machine = self
                         .mvstore
                         .delete_row_from_pager(row_version.row.id.clone(), cursor)?;
@@ -2038,6 +2077,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     };
                 } else {
                     // This is an insert/update operation
+                    tracing::trace!(
+                        target: "mvcc_ckpt_index",
+                        phase = "write",
+                        decision = "APPLY_INSERT",
+                        index = %index.name,
+                        index_id = ?index_id,
+                        root_page,
+                        key = ?row_version.row.id.row_id,
+                        "apply index insert"
+                    );
                     let state_machine =
                         self.mvstore
                             .write_row_to_pager(&row_version.row, cursor, requires_seek)?;
