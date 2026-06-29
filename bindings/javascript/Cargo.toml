@@ -16,6 +16,9 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 turso_core = { workspace = true, features = ["fts"] }
 turso_parser = { workspace = true }
+# Statically linked into the wasm build (via the `browser` feature) so the
+# fuzzy string functions are available out of the box for the online demo.
+limbo_fuzzy = { workspace = true, features = ["static"], optional = true }
 napi = { version = "3.8.3", default-features = false, features = ["napi6"] }
 napi-derive = { version = "3.5.2", default-features = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
@@ -23,7 +26,7 @@ tracing.workspace = true
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 
 [features]
-browser = []
+browser = ["dep:limbo_fuzzy"]
 test_helper = ["turso_core/test_helper"]
 tracing_release = ["turso_core/tracing_release"]
 [build-dependencies]
