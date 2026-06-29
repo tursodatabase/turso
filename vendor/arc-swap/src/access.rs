@@ -90,6 +90,8 @@ use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::sync::Arc;
 
+#[cfg(nightly)]
+use super::ref_cnt::ArcSwapAllocator;
 use super::ref_cnt::RefCnt;
 use super::strategy::Strategy;
 use super::{ArcSwapAny, Guard};
@@ -156,6 +158,7 @@ impl<T: RefCnt, S: Strategy<T>> Access<T> for ArcSwapAny<T, S> {
 #[doc(hidden)]
 pub struct DirectDeref<T: RefCnt, S: Strategy<T>>(Guard<T, S>);
 
+#[cfg(not(nightly))]
 impl<T, S: Strategy<Arc<T>>> Deref for DirectDeref<Arc<T>, S> {
     type Target = T;
     fn deref(&self) -> &T {
@@ -163,8 +166,33 @@ impl<T, S: Strategy<Arc<T>>> Deref for DirectDeref<Arc<T>, S> {
     }
 }
 
+#[cfg(nightly)]
+impl<T, A, S> Deref for DirectDeref<Arc<T, A>, S>
+where
+    A: ArcSwapAllocator,
+    S: Strategy<Arc<T, A>>,
+{
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0.deref().deref()
+    }
+}
+
+#[cfg(not(nightly))]
 impl<T, S: Strategy<Arc<T>>> Access<T> for ArcSwapAny<Arc<T>, S> {
     type Guard = DirectDeref<Arc<T>, S>;
+    fn load(&self) -> Self::Guard {
+        DirectDeref(self.load())
+    }
+}
+
+#[cfg(nightly)]
+impl<T, A, S> Access<T> for ArcSwapAny<Arc<T, A>, S>
+where
+    A: ArcSwapAllocator,
+    S: Strategy<Arc<T, A>>,
+{
+    type Guard = DirectDeref<Arc<T, A>, S>;
     fn load(&self) -> Self::Guard {
         DirectDeref(self.load())
     }

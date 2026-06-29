@@ -132,8 +132,17 @@ pub(crate) mod sealed {
     pub trait InnerStrategy<T: RefCnt> {
         // Drop „unlocks“
         type Protected: Protected<T>;
-        unsafe fn load(&self, storage: &AtomicPtr<T::Base>) -> Self::Protected;
-        unsafe fn wait_for_readers(&self, old: *const T::Base, storage: &AtomicPtr<T::Base>);
+        unsafe fn load(
+            &self,
+            storage: &AtomicPtr<T::Base>,
+            allocator: &T::Allocator,
+        ) -> Self::Protected;
+        unsafe fn wait_for_readers(
+            &self,
+            old: *const T::Base,
+            storage: &AtomicPtr<T::Base>,
+            allocator: &T::Allocator,
+        );
     }
 
     pub trait CaS<T: RefCnt>: InnerStrategy<T> {
@@ -142,6 +151,7 @@ pub(crate) mod sealed {
             storage: &AtomicPtr<T::Base>,
             current: C,
             new: T,
+            allocator: &T::Allocator,
         ) -> Self::Protected;
     }
 }

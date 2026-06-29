@@ -78,13 +78,18 @@ impl Debt {
     }
 
     /// Pays all the debts on the given pointer and the storage.
-    pub(crate) fn pay_all<T, R>(ptr: *const T::Base, storage_addr: usize, replacement: R)
+    pub(crate) fn pay_all<T, R>(
+        ptr: *const T::Base,
+        storage_addr: usize,
+        replacement: R,
+        allocator: &T::Allocator,
+    )
     where
         T: RefCnt,
         R: Fn() -> T,
     {
         LocalNode::with(|local| {
-            let val = unsafe { T::from_ptr(ptr) };
+            let val = unsafe { T::from_ptr(ptr, allocator) };
             // Pre-pay one ref count that can be safely put into a debt slot to pay it.
             T::inc(&val);
 

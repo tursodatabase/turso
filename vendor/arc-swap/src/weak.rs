@@ -3,10 +3,17 @@ use core::ptr;
 use alloc::rc::Weak as RcWeak;
 use alloc::sync::Weak;
 
+#[cfg(nightly)]
+use crate::ArcSwapAllocator;
 use crate::RefCnt;
 
+#[cfg(not(nightly))]
 unsafe impl<T> RefCnt for Weak<T> {
     type Base = T;
+    type Allocator = ();
+
+    fn allocator(_me: &Self) -> Self::Allocator {}
+
     fn as_ptr(me: &Self) -> *mut T {
         if Weak::ptr_eq(&Weak::new(), me) {
             ptr::null_mut()
@@ -21,7 +28,7 @@ unsafe impl<T> RefCnt for Weak<T> {
             Weak::into_raw(me) as *mut T
         }
     }
-    unsafe fn from_ptr(ptr: *const T) -> Self {
+    unsafe fn from_ptr(ptr: *const T, _allocator: &Self::Allocator) -> Self {
         if ptr.is_null() {
             Weak::new()
         } else {
@@ -30,8 +37,51 @@ unsafe impl<T> RefCnt for Weak<T> {
     }
 }
 
+#[cfg(nightly)]
+unsafe impl<T, A> RefCnt for Weak<T, A>
+where
+    A: ArcSwapAllocator,
+{
+    type Base = T;
+    type Allocator = A;
+
+    fn allocator(me: &Self) -> Self::Allocator {
+        Weak::allocator(me).clone()
+    }
+
+    fn as_ptr(me: &Self) -> *mut T {
+        let empty = Weak::new_in(Weak::allocator(me).clone());
+        if Weak::ptr_eq(&empty, me) {
+            ptr::null_mut()
+        } else {
+            Weak::as_ptr(me) as *mut T
+        }
+    }
+
+    fn into_ptr(me: Self) -> *mut T {
+        let empty = Weak::new_in(Weak::allocator(&me).clone());
+        if Weak::ptr_eq(&empty, &me) {
+            ptr::null_mut()
+        } else {
+            Weak::into_raw_with_allocator(me).0 as *mut T
+        }
+    }
+
+    unsafe fn from_ptr(ptr: *const T, allocator: &Self::Allocator) -> Self {
+        if ptr.is_null() {
+            Weak::new_in(allocator.clone())
+        } else {
+            Weak::from_raw_in(ptr, allocator.clone())
+        }
+    }
+}
+
 unsafe impl<T> RefCnt for RcWeak<T> {
     type Base = T;
+    type Allocator = ();
+
+    fn allocator(_me: &Self) -> Self::Allocator {}
+
     fn as_ptr(me: &Self) -> *mut T {
         if RcWeak::ptr_eq(&RcWeak::new(), me) {
             ptr::null_mut()
@@ -46,7 +96,7 @@ unsafe impl<T> RefCnt for RcWeak<T> {
             RcWeak::into_raw(me) as *mut T
         }
     }
-    unsafe fn from_ptr(ptr: *const T) -> Self {
+    unsafe fn from_ptr(ptr: *const T, _allocator: &Self::Allocator) -> Self {
         if ptr.is_null() {
             RcWeak::new()
         } else {

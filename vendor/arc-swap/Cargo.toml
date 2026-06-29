@@ -34,6 +34,9 @@ features = [
     "weak",
 ]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)'] }
+
 [profile.bench]
 debug = 2
 

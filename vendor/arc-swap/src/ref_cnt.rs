@@ -1,8 +1,22 @@
+#[cfg(nightly)]
+use alloc::alloc::{Allocator, Global};
 use core::mem;
 use core::ptr;
 
 use alloc::rc::Rc;
 use alloc::sync::Arc;
+
+/// Allocator values that can be used by `arc-swap`.
+///
+/// `ArcSwapAny` stores one allocator context and uses it whenever it rebuilds
+/// an allocator-aware pointer from its raw pointee. The allocator type is part
+/// of the `ArcSwapAny` type, so values stored in the container use the same
+/// allocator generic.
+#[cfg(nightly)]
+pub unsafe trait ArcSwapAllocator: Allocator + Clone + Default {}
+
+#[cfg(nightly)]
+unsafe impl ArcSwapAllocator for Global {}
 
 /// A trait describing smart reference counted pointers.
 ///
@@ -39,6 +53,11 @@ use alloc::sync::Arc;
 pub unsafe trait RefCnt: Clone {
     /// The base type the pointer points to.
     type Base;
+    /// Context needed to reconstruct a smart pointer from its raw pointer.
+    type Allocator: Clone + Default;
+
+    /// Returns the allocator/context associated with this pointer.
+    fn allocator(me: &Self) -> Self::Allocator;
 
     /// Converts the smart pointer into a raw pointer, without affecting the reference count.
     ///
@@ -65,7 +84,7 @@ pub unsafe trait RefCnt: Clone {
     /// # Safety
     ///
     /// This must not be called by code outside of this crate.
-    unsafe fn from_ptr(ptr: *const Self::Base) -> Self;
+    unsafe fn from_ptr(ptr: *const Self::Base, allocator: &Self::Allocator) -> Self;
 
     /// Increments the reference count by one.
     ///
@@ -83,13 +102,18 @@ pub unsafe trait RefCnt: Clone {
     /// # Safety
     ///
     /// This must not be called by code outside of this crate.
-    unsafe fn dec(ptr: *const Self::Base) {
-        drop(Self::from_ptr(ptr));
+    unsafe fn dec(ptr: *const Self::Base, allocator: &Self::Allocator) {
+        drop(Self::from_ptr(ptr, allocator));
     }
 }
 
+#[cfg(not(nightly))]
 unsafe impl<T> RefCnt for Arc<T> {
     type Base = T;
+    type Allocator = ();
+
+    fn allocator(_me: &Self) -> Self::Allocator {}
+
     fn into_ptr(me: Arc<T>) -> *mut T {
         Arc::into_raw(me) as *mut T
     }
@@ -118,13 +142,42 @@ unsafe impl<T> RefCnt for Arc<T> {
 
         ptr
     }
-    unsafe fn from_ptr(ptr: *const T) -> Arc<T> {
+    unsafe fn from_ptr(ptr: *const T, _allocator: &Self::Allocator) -> Arc<T> {
         Arc::from_raw(ptr)
+    }
+}
+
+#[cfg(nightly)]
+unsafe impl<T, A> RefCnt for Arc<T, A>
+where
+    A: ArcSwapAllocator,
+{
+    type Base = T;
+    type Allocator = A;
+
+    fn allocator(me: &Self) -> Self::Allocator {
+        Arc::allocator(me).clone()
+    }
+
+    fn into_ptr(me: Arc<T, A>) -> *mut T {
+        Arc::into_raw_with_allocator(me).0 as *mut T
+    }
+
+    fn as_ptr(me: &Arc<T, A>) -> *mut T {
+        Arc::as_ptr(me) as *mut T
+    }
+
+    unsafe fn from_ptr(ptr: *const T, allocator: &Self::Allocator) -> Arc<T, A> {
+        Arc::from_raw_in(ptr, allocator.clone())
     }
 }
 
 unsafe impl<T> RefCnt for Rc<T> {
     type Base = T;
+    type Allocator = ();
+
+    fn allocator(_me: &Self) -> Self::Allocator {}
+
     fn into_ptr(me: Rc<T>) -> *mut T {
         Rc::into_raw(me) as *mut T
     }
@@ -153,24 +206,30 @@ unsafe impl<T> RefCnt for Rc<T> {
 
         ptr
     }
-    unsafe fn from_ptr(ptr: *const T) -> Rc<T> {
+    unsafe fn from_ptr(ptr: *const T, _allocator: &Self::Allocator) -> Rc<T> {
         Rc::from_raw(ptr)
     }
 }
 
 unsafe impl<T: RefCnt> RefCnt for Option<T> {
     type Base = T::Base;
+    type Allocator = T::Allocator;
+
+    fn allocator(me: &Self) -> Self::Allocator {
+        me.as_ref().map(T::allocator).unwrap_or_default()
+    }
+
     fn into_ptr(me: Option<T>) -> *mut T::Base {
         me.map(T::into_ptr).unwrap_or_else(ptr::null_mut)
     }
     fn as_ptr(me: &Option<T>) -> *mut T::Base {
         me.as_ref().map(T::as_ptr).unwrap_or_else(ptr::null_mut)
     }
-    unsafe fn from_ptr(ptr: *const T::Base) -> Option<T> {
+    unsafe fn from_ptr(ptr: *const T::Base, allocator: &Self::Allocator) -> Option<T> {
         if ptr.is_null() {
             None
         } else {
-            Some(T::from_ptr(ptr))
+            Some(T::from_ptr(ptr, allocator))
         }
     }
 }
