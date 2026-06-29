@@ -1281,7 +1281,6 @@ pub fn emit_upsert(
             };
             emit_cdc_insns(
                 program,
-                resolver,
                 OperationMode::DELETE,
                 cdc_id,
                 ctx.conflict_rowid_reg,
@@ -1301,7 +1300,6 @@ pub fn emit_upsert(
             };
             emit_cdc_insns(
                 program,
-                resolver,
                 OperationMode::INSERT,
                 cdc_id,
                 new_rowid,
@@ -1336,7 +1334,6 @@ pub fn emit_upsert(
             };
             emit_cdc_insns(
                 program,
-                resolver,
                 OperationMode::UPDATE(UpdateRowSource::Normal),
                 cdc_id,
                 ctx.conflict_rowid_reg,

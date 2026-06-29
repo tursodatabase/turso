@@ -1201,7 +1201,6 @@ pub fn emit_cdc_full_record(
 #[allow(clippy::too_many_arguments)]
 pub fn emit_cdc_insns(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     operation_mode: OperationMode,
     cdc_cursor_id: usize,
     rowid_reg: usize,
@@ -1214,7 +1213,6 @@ pub fn emit_cdc_insns(
     match cdc_info.map(|info| info.cdc_version()) {
         Some(crate::CdcVersion::V2) => emit_cdc_insns_v2(
             program,
-            resolver,
             operation_mode,
             cdc_cursor_id,
             rowid_reg,
@@ -1225,7 +1223,6 @@ pub fn emit_cdc_insns(
         ),
         Some(crate::CdcVersion::V1) => emit_cdc_insns_v1(
             program,
-            resolver,
             operation_mode,
             cdc_cursor_id,
             rowid_reg,
@@ -1243,7 +1240,6 @@ pub fn emit_cdc_insns(
 #[allow(clippy::too_many_arguments)]
 fn emit_cdc_insns_v1(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     operation_mode: OperationMode,
     cdc_cursor_id: usize,
     rowid_reg: usize,
@@ -1260,11 +1256,8 @@ fn emit_cdc_insns_v1(
     });
     program.mark_last_insn_constant();
 
-    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0)? else {
-        bail_parse_error!("no function {}", "unixepoch");
-    };
     let unixepoch_fn_ctx = crate::function::FuncCtx {
-        func: unixepoch_fn,
+        func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
     };
 
@@ -1356,7 +1349,6 @@ fn emit_cdc_insns_v1(
 #[allow(clippy::too_many_arguments)]
 fn emit_cdc_insns_v2(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     operation_mode: OperationMode,
     cdc_cursor_id: usize,
     rowid_reg: usize,
@@ -1374,11 +1366,8 @@ fn emit_cdc_insns_v2(
     program.mark_last_insn_constant();
 
     // change_time = unixepoch()
-    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0)? else {
-        bail_parse_error!("no function {}", "unixepoch");
-    };
     let unixepoch_fn_ctx = crate::function::FuncCtx {
-        func: unixepoch_fn,
+        func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
     };
     program.emit_insn(Insn::Function {

@@ -1310,7 +1310,6 @@ pub fn translate_drop_index(
         };
         emit_cdc_insns(
             program,
-            resolver,
             OperationMode::DELETE,
             cdc_cursor_id,
             row_id_reg,
