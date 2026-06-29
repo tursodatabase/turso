@@ -2563,10 +2563,9 @@ pub struct WalFile {
 
     io_ctx: RwLock<IOContext>,
 
-    /// Set when `write_frame_raw` appends frames without a commit marker
-    /// (`db_size == 0`), meaning the coordination backend's max_frame is
-    /// behind our connection-local max_frame. Cleared once
-    /// `finish_append_frames_commit` publishes the state.
+    /// Set when WAL frames are appended without a commit marker (`db_size == 0`),
+    /// meaning the coordination backend's max_frame is behind our connection-local
+    /// max_frame. Cleared once `finish_append_frames_commit` publishes the state.
     has_unpublished_frames: AtomicBool,
 }
 
@@ -4084,8 +4083,8 @@ impl Wal for WalFile {
                     )
                 } else if snapshot != local_state.snapshot {
                     if self.has_unpublished_frames.load(Ordering::Acquire) {
-                        // write_frame_raw appended frames without a commit
-                        // marker (db_size == 0), so the coordination backend's
+                        // Spill/raw frames have no commit marker yet
+                        // (db_size == 0), so the coordination backend's
                         // max_frame is behind our local max_frame. Chain from
                         // local state so we don't overwrite those frames.
                         (
@@ -4297,6 +4296,12 @@ impl Wal for WalFile {
         let c = file.pwritev(start_off, iovecs, c)?;
 
         self.io.drain_completions(std::slice::from_ref(&c))?;
+
+        if !page_frame_and_checksum.is_empty() {
+            // Spill frames are durable but unpublished until the commit marker
+            // advances the shared WAL snapshot.
+            self.has_unpublished_frames.store(true, Ordering::Release);
+        }
 
         for (page, fid, csum) in &page_frame_and_checksum {
             self.complete_append_frame(page.get().id as u64, *fid, *csum);
