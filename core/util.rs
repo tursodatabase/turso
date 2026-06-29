@@ -734,7 +734,22 @@ pub fn try_capture_parameters_column_agnostic(
 /// This function is used to determine whether two expressions are logically
 /// equivalent in the context of queries, even if their representations
 /// differ. e.g.: `SUM(x)` and `sum(x)`, `x + y` and `y + x`
+///
+/// Do NOT use this in cases where we require strict matching (onconflict,partial index .. where etc).
 pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
+    exprs_are_equivalent_impl(expr1, expr2, true)
+}
+
+/// Same as `exprs_are_equivalent`, but `a = b` and `b = a` are treated as different.
+pub fn exprs_are_syntactically_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
+    exprs_are_equivalent_impl(expr1, expr2, false)
+}
+
+fn exprs_are_equivalent_impl(
+    expr1: &Expr,
+    expr2: &Expr,
+    allow_commutative_binary_swap: bool,
+) -> bool {
     match (expr1, expr2) {
         (
             Expr::Between {
@@ -751,16 +766,18 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
             },
         ) => {
             not1 == not2
-                && exprs_are_equivalent(lhs1, lhs2)
-                && exprs_are_equivalent(start1, start2)
-                && exprs_are_equivalent(end1, end2)
+                && exprs_are_equivalent_impl(lhs1, lhs2, allow_commutative_binary_swap)
+                && exprs_are_equivalent_impl(start1, start2, allow_commutative_binary_swap)
+                && exprs_are_equivalent_impl(end1, end2, allow_commutative_binary_swap)
         }
         (Expr::Binary(lhs1, op1, rhs1), Expr::Binary(lhs2, op2, rhs2)) => {
             op1 == op2
-                && ((exprs_are_equivalent(lhs1, lhs2) && exprs_are_equivalent(rhs1, rhs2))
-                    || (op1.is_commutative()
-                        && exprs_are_equivalent(lhs1, rhs2)
-                        && exprs_are_equivalent(rhs1, lhs2)))
+                && ((exprs_are_equivalent_impl(lhs1, lhs2, allow_commutative_binary_swap)
+                    && exprs_are_equivalent_impl(rhs1, rhs2, allow_commutative_binary_swap))
+                    || (allow_commutative_binary_swap
+                        && op1.is_commutative()
+                        && exprs_are_equivalent_impl(lhs1, rhs2, allow_commutative_binary_swap)
+                        && exprs_are_equivalent_impl(rhs1, lhs2, allow_commutative_binary_swap)))
         }
         (
             Expr::Case {
@@ -777,7 +794,8 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
             base1 == base2
                 && pairs1.len() == pairs2.len()
                 && pairs1.iter().zip(pairs2).all(|((w1, t1), (w2, t2))| {
-                    exprs_are_equivalent(w1, w2) && exprs_are_equivalent(t1, t2)
+                    exprs_are_equivalent_impl(w1, w2, allow_commutative_binary_swap)
+                        && exprs_are_equivalent_impl(t1, t2, allow_commutative_binary_swap)
                 })
                 && else1 == else2
         }
@@ -791,7 +809,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 type_name: type2,
             },
         ) => {
-            exprs_are_equivalent(expr1, expr2)
+            exprs_are_equivalent_impl(expr1, expr2, allow_commutative_binary_swap)
                 && match (type1, type2) {
                     (Some(t1), Some(t2)) => t1.name.eq_ignore_ascii_case(&t2.name),
                     _ => false,
@@ -799,7 +817,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         }
         (Expr::Collate(expr1, collation1), Expr::Collate(expr2, collation2)) => {
             // TODO: check correctness of comparing colation as strings
-            exprs_are_equivalent(expr1, expr2)
+            exprs_are_equivalent_impl(expr1, expr2, allow_commutative_binary_swap)
                 && collation1
                     .as_str()
                     .eq_ignore_ascii_case(collation2.as_str())
@@ -841,29 +859,35 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         ) => {
             name1.as_str().eq_ignore_ascii_case(name2.as_str())
                 && match (&filter1.filter_clause, &filter2.filter_clause) {
-                    (Some(expr1), Some(expr2)) => exprs_are_equivalent(expr1, expr2),
+                    (Some(expr1), Some(expr2)) => {
+                        exprs_are_equivalent_impl(expr1, expr2, allow_commutative_binary_swap)
+                    }
                     (None, None) => true,
                     _ => false,
                 }
                 && filter1.over_clause == filter2.over_clause
         }
-        (Expr::NotNull(expr1), Expr::NotNull(expr2)) => exprs_are_equivalent(expr1, expr2),
-        (Expr::IsNull(expr1), Expr::IsNull(expr2)) => exprs_are_equivalent(expr1, expr2),
+        (Expr::NotNull(expr1), Expr::NotNull(expr2)) => {
+            exprs_are_equivalent_impl(expr1, expr2, allow_commutative_binary_swap)
+        }
+        (Expr::IsNull(expr1), Expr::IsNull(expr2)) => {
+            exprs_are_equivalent_impl(expr1, expr2, allow_commutative_binary_swap)
+        }
         (Expr::Literal(lit1), Expr::Literal(lit2)) => check_literal_equivalency(lit1, lit2),
         (Expr::Id(id1), Expr::Id(id2)) => check_ident_equivalency(id1.as_str(), id2.as_str()),
         (Expr::Unary(op1, expr1), Expr::Unary(op2, expr2)) => {
-            op1 == op2 && exprs_are_equivalent(expr1, expr2)
+            op1 == op2 && exprs_are_equivalent_impl(expr1, expr2, allow_commutative_binary_swap)
         }
         (Expr::Variable(val), Expr::Variable(val2)) => val == val2,
         (Expr::Parenthesized(exprs1), Expr::Parenthesized(exprs2)) => {
             exprs1.len() == exprs2.len()
-                && exprs1
-                    .iter()
-                    .zip(exprs2)
-                    .all(|(e1, e2)| exprs_are_equivalent(e1, e2))
+                && exprs1.iter().zip(exprs2).all(|(e1, e2)| {
+                    exprs_are_equivalent_impl(e1, e2, allow_commutative_binary_swap)
+                })
         }
         (Expr::Parenthesized(exprs1), exprs2) | (exprs2, Expr::Parenthesized(exprs1)) => {
-            exprs1.len() == 1 && exprs_are_equivalent(&exprs1[0], exprs2)
+            exprs1.len() == 1
+                && exprs_are_equivalent_impl(&exprs1[0], exprs2, allow_commutative_binary_swap)
         }
         (Expr::Qualified(tn1, cn1), Expr::Qualified(tn2, cn2)) => {
             check_ident_equivalency(tn1.as_str(), tn2.as_str())
@@ -887,12 +911,12 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
             },
         ) => {
             *not1 == *not2
-                && exprs_are_equivalent(lhs1, lhs2)
+                && exprs_are_equivalent_impl(lhs1, lhs2, allow_commutative_binary_swap)
                 && rhs1.len() == rhs2.len()
                 && rhs1
                     .iter()
                     .zip(rhs2.iter())
-                    .all(|(a, b)| exprs_are_equivalent(a, b))
+                    .all(|(a, b)| exprs_are_equivalent_impl(a, b, allow_commutative_binary_swap))
         }
         (
             Expr::Column {

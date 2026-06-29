@@ -36,7 +36,7 @@ use crate::{
         insert::Insertion,
         plan::{ResultSetColumn, TableReferences},
     },
-    util::{exprs_are_equivalent, normalize_ident},
+    util::{exprs_are_syntactically_equivalent, normalize_ident},
     vdbe::{
         affinity::Affinity,
         builder::{DmlColumnContext, ProgramBuilder},
@@ -324,7 +324,7 @@ fn partial_index_where_clauses_match(
     // TODO: ideally we would have a binding step where we wouldn't need to do these ad-hoc bindings just to compare exprs
     bind_partial_index_where_expr(&mut target_where, table);
     bind_partial_index_where_expr(&mut index_where, table);
-    exprs_are_equivalent(&target_where, &index_where)
+    exprs_are_syntactically_equivalent(&target_where, &index_where)
 }
 
 /// Match ON CONFLICT target to a UNIQUE index, *ignoring order* but requiring
@@ -378,15 +378,16 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
                 }
             }
         } else {
-            // Expression target (e.g. lower(val)): match against expression index
-            // columns using semantic equivalence.
+            // Expression target (e.g. lower(val)): match against expression
+            // index columns positionally, so `a + b` does not match an index
+            // on `b + a`.
             let (target_expr, target_collate) = extract_target_expr(&te.expr);
             for (i, ic) in index.columns.iter().enumerate() {
                 if matched.get(i) {
                     continue;
                 }
                 if let Some(idx_expr) = &ic.expr {
-                    if exprs_are_equivalent(target_expr, idx_expr) {
+                    if exprs_are_syntactically_equivalent(target_expr, idx_expr) {
                         // If target specifies a collation, it must match the index column's.
                         if let Some(ref tc) = target_collate {
                             let icoll = effective_collation_for_index_col(ic, table);
