@@ -24,7 +24,10 @@ HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 SOURCE_SUFFIX = ".rs"
 
 
-def squash(diff_text):
+# A single linear pass over the diff: the branchiness is inherent to the
+# unified-diff grammar (hunk headers, +/-/context lines, file markers), so
+# splitting it up would scatter the state machine rather than simplify it.
+def squash(diff_text):  # noqa: C901
     locations = []
     current_file = None
     skip = False
