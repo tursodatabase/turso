@@ -1396,11 +1396,8 @@ fn emit_cdc_insns_v2(
         rowid_reg: candidate_reg,
         prev_largest_reg: 0,
     });
-    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1)? else {
-        bail_parse_error!("no function {}", "conn_txn_id");
-    };
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
-        func: conn_txn_id_fn,
+        func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
     };
     program.emit_insn(Insn::Function {
@@ -1466,13 +1463,6 @@ fn emit_cdc_insns_v2(
         program.mark_last_insn_constant();
     }
 
-    let rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: cdc_cursor_id,
-        rowid_reg,
-        prev_largest_reg: 0,
-    });
-
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u16(turso_cdc_registers),
@@ -1484,7 +1474,7 @@ fn emit_cdc_insns_v2(
 
     program.emit_insn(Insn::Insert {
         cursor: cdc_cursor_id,
-        key_reg: rowid_reg,
+        key_reg: candidate_reg,
         record_reg,
         flag: InsertFlags::new()
             .skip_last_rowid()
