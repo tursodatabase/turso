@@ -28,7 +28,10 @@ use crate::fast_lock::SpinLock;
 use crate::io::clock::MonotonicInstant;
 use crate::io::CompletionGroup;
 use crate::io::{File, IO};
-use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum, PageCodecLocation};
+use crate::storage::database::{
+    page_codec_size_mismatch, validate_page_codec_output_len, DatabaseStorage,
+    EncryptionOrChecksum, PageCodecLocation,
+};
 #[cfg(host_shared_wal)]
 use crate::storage::shared_wal_coordination::SharedWalCoordinationOpenMode;
 #[cfg(host_shared_wal)]
@@ -3504,7 +3507,24 @@ impl Wal for WalFile {
                     EncryptionOrChecksum::PageCodec(ctx) => {
                         match ctx.decode_page(body_slice, expected_page_id, PageCodecLocation::Wal)
                         {
-                            Ok(decoded) => body_slice.copy_from_slice(&decoded),
+                            Ok(decoded) => {
+                                if decoded.len() != body_slice.len() {
+                                    let err = page_codec_size_mismatch(
+                                        expected_page_id,
+                                        body_slice.len(),
+                                        decoded.len(),
+                                    );
+                                    mark_unlikely();
+                                    tracing::error!(
+                                        "Page codec returned wrong-sized WAL batch frame for page_idx={expected_page_id}: expected {}, got {}",
+                                        body_slice.len(),
+                                        decoded.len()
+                                    );
+                                    clear_slots_on_err(&slots);
+                                    return Some(err);
+                                }
+                                body_slice.copy_from_slice(&decoded);
+                            }
                             Err(e) => {
                                 mark_unlikely();
                                 tracing::error!(
@@ -3615,15 +3635,21 @@ impl Wal for WalFile {
                     PageCodecLocation::Wal,
                 ) {
                     Ok(decoded_data) => {
-                        turso_assert!(
-                            (frame_len - WAL_FRAME_HEADER_SIZE) == decoded_data.len(),
-                            "frame_len minus header_size does not equal expected decoded data length",
-                            { "frame_len_minus_header": frame_len - WAL_FRAME_HEADER_SIZE, "decoded_data_len": decoded_data.len() }
-                        );
+                        let expected_len = frame_len - WAL_FRAME_HEADER_SIZE;
+                        if decoded_data.len() != expected_len {
+                            return Some(page_codec_size_mismatch(
+                                header.page_number as usize,
+                                expected_len,
+                                decoded_data.len(),
+                            ));
+                        }
                         frame_ref[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&decoded_data);
                     }
-                    Err(_) => {
-                        tracing::debug!("Failed to decode page data for frame_id={frame_id}");
+                    Err(e) => {
+                        tracing::debug!("Failed to decode page data for frame_id={frame_id}: {e}");
+                        return Some(CompletionError::DecryptionError {
+                            page_idx: header.page_number as usize,
+                        });
                     }
                 }
             }
@@ -4168,7 +4194,9 @@ impl Wal for WalFile {
                     Cow::Owned(ctx.encrypt_page(plain, page_id)?)
                 }
                 EncryptionOrChecksum::PageCodec(ctx) => {
-                    Cow::Owned(ctx.encode_page(plain, page_id, PageCodecLocation::Wal)?)
+                    let encoded = ctx.encode_page(plain, page_id, PageCodecLocation::Wal)?;
+                    validate_page_codec_output_len(page_id, plain.len(), encoded.len())?;
+                    Cow::Owned(encoded)
                 }
                 EncryptionOrChecksum::Checksum(ctx) => {
                     ctx.add_checksum_to_page(plain, page_id)?;
@@ -4286,7 +4314,9 @@ impl Wal for WalFile {
                     Cow::Owned(ctx.encrypt_page(plain, page_id)?)
                 }
                 EncryptionOrChecksum::PageCodec(ctx) => {
-                    Cow::Owned(ctx.encode_page(plain, page_id, PageCodecLocation::Wal)?)
+                    let encoded = ctx.encode_page(plain, page_id, PageCodecLocation::Wal)?;
+                    validate_page_codec_output_len(page_id, plain.len(), encoded.len())?;
+                    Cow::Owned(encoded)
                 }
                 EncryptionOrChecksum::Checksum(ctx) => {
                     ctx.add_checksum_to_page(plain, page_id)?;
@@ -5604,15 +5634,16 @@ pub mod test {
         io::FileSyncType,
         storage::{
             buffer_pool::BufferPool,
-            database::{DatabaseFile, DatabaseStorage},
+            database::{DatabaseFile, DatabaseStorage, IOContext, PageCodec, PageCodecLocation},
             pager::{allocate_new_page, PageRef},
-            sqlite3_ondisk::{self, PageSize, WAL_HEADER_SIZE},
+            sqlite3_ondisk::{self, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE},
             wal::READMARK_NOT_USED,
         },
         types::IOResult,
         util::IOExt,
         Buffer, CheckpointMode, CheckpointResult, Completion, CompletionError, Connection,
-        Database, File, LimboError, MemoryIO, OpenFlags, PlatformIO, SyncMode, WalFileShared, IO,
+        Database, File, LimboError, MemoryIO, OpenFlags, PlatformIO, Result, SyncMode,
+        WalFileShared, IO,
     };
     use std::num::NonZeroUsize;
     #[cfg(unix)]
@@ -5955,6 +5986,53 @@ pub mod test {
         page
     }
 
+    #[derive(Debug)]
+    enum TestPageCodec {
+        Xor(u8),
+        ShortEncode,
+        ShortDecode,
+        ErrorDecode,
+    }
+
+    impl PageCodec for TestPageCodec {
+        fn required_reserved_bytes(&self) -> u8 {
+            0
+        }
+
+        fn encode_page(
+            &self,
+            page: &[u8],
+            _page_idx: usize,
+            _location: PageCodecLocation,
+        ) -> Result<Vec<u8>> {
+            match self {
+                Self::Xor(mask) => Ok(page.iter().map(|byte| byte ^ mask).collect()),
+                Self::ShortEncode => Ok(page[..page.len() - 1].to_vec()),
+                Self::ShortDecode | Self::ErrorDecode => Ok(page.to_vec()),
+            }
+        }
+
+        fn decode_page(
+            &self,
+            page: &[u8],
+            _page_idx: usize,
+            _location: PageCodecLocation,
+        ) -> Result<Vec<u8>> {
+            match self {
+                Self::Xor(mask) => Ok(page.iter().map(|byte| byte ^ mask).collect()),
+                Self::ShortDecode => Ok(page[..page.len() - 1].to_vec()),
+                Self::ErrorDecode => Err(LimboError::InternalError("codec decode failed".into())),
+                Self::ShortEncode => Ok(page.to_vec()),
+            }
+        }
+    }
+
+    fn set_test_page_codec(wal: &WalFile, codec: Arc<dyn PageCodec>) {
+        let mut io_ctx = IOContext::default();
+        io_ctx.set_page_codec(codec);
+        wal.set_io_context(io_ctx);
+    }
+
     fn append_test_pages(
         io: &Arc<dyn IO>,
         wal: &WalFile,
@@ -6019,6 +6097,98 @@ pub mod test {
             assert_eq!(page.wal_tag_pair(), ((idx + 1) as u64, 0));
             assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
         }
+    }
+
+    #[test]
+    fn page_codec_round_trips_wal_batch_reads() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
+        let source_pages = vec![
+            page_with_pattern(32, 0x10, &buffer_pool),
+            page_with_pattern(33, 0x20, &buffer_pool),
+        ];
+        let expected = append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(32)),
+            Arc::new(crate::Page::new(33)),
+        ];
+        let c = wal
+            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        for (idx, page) in target_pages.iter().enumerate() {
+            assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
+        }
+    }
+
+    #[test]
+    fn page_codec_wal_write_rejects_wrong_sized_encoded_page() {
+        let page_size = 512;
+        let (_io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::ShortEncode));
+        let pages = vec![page_with_pattern(41, 0x41, &buffer_pool)];
+
+        let err = match wal.prepare_frames(&pages, PageSize::new(page_size).unwrap(), Some(1), None)
+        {
+            Ok(_) => panic!("wrong-sized encoded WAL frame must fail"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            LimboError::CompletionError(CompletionError::PageCodecSizeMismatch {
+                page_idx: 41,
+                expected: 512,
+                actual: 511,
+            })
+        ));
+    }
+
+    #[test]
+    fn page_codec_wal_batch_read_rejects_wrong_sized_decoded_page() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::ShortDecode));
+        let source_pages = vec![page_with_pattern(42, 0x42, &buffer_pool)];
+        append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![Arc::new(crate::Page::new(42))];
+        let c = wal
+            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .unwrap();
+        let err = wait_for_completion_error(&io, c);
+
+        assert!(matches!(
+            err,
+            CompletionError::PageCodecSizeMismatch {
+                page_idx: 42,
+                expected: 512,
+                actual: 511,
+            }
+        ));
+        assert!(!target_pages[0].is_locked());
+        assert!(!target_pages[0].is_loaded());
+    }
+
+    #[test]
+    fn page_codec_raw_wal_read_propagates_decode_error() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        set_test_page_codec(&wal, Arc::new(TestPageCodec::ErrorDecode));
+        let source_pages = vec![page_with_pattern(43, 0x43, &buffer_pool)];
+        append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let mut frame = vec![0; WAL_FRAME_HEADER_SIZE + page_size as usize];
+        let c = wal.read_frame_raw(1, &mut frame).unwrap();
+        let err = wait_for_completion_error(&io, c);
+
+        assert!(matches!(
+            err,
+            CompletionError::DecryptionError { page_idx: 43 }
+        ));
     }
 
     #[test]

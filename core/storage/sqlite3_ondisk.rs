@@ -62,7 +62,9 @@ use crate::io::{Buffer, Completion, FileSyncType, ReadComplete};
 use crate::numeric::Numeric;
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
-use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum, PageCodecLocation};
+use crate::storage::database::{
+    page_codec_size_mismatch, DatabaseStorage, EncryptionOrChecksum, PageCodecLocation,
+};
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
 use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -2000,8 +2002,8 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let page_codec = ctx.clone();
             let original_complete = complete;
 
-            let decode_complete =
-                Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+            let decode_complete = Box::new(
+                move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                     let Ok((encoded_buf, bytes_read)) = res else {
                         return original_complete(res);
                     };
@@ -2017,6 +2019,20 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
                         PageCodecLocation::Wal,
                     ) {
                         Ok(decoded_data) => {
+                            if decoded_data.len() != encoded_buf.len() {
+                                let err = page_codec_size_mismatch(
+                                    page_idx,
+                                    encoded_buf.len(),
+                                    decoded_data.len(),
+                                );
+                                tracing::error!(
+                                    "Page codec returned wrong-sized decoded WAL frame for page_idx={page_idx}: expected {}, got {}",
+                                    encoded_buf.len(),
+                                    decoded_data.len()
+                                );
+                                original_complete(Err(err));
+                                return Some(err);
+                            }
                             encoded_buf.as_mut_slice().copy_from_slice(&decoded_data);
                             original_complete(Ok((encoded_buf, bytes_read)))
                         }
@@ -2029,7 +2045,8 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
                             Some(err)
                         }
                     }
-                });
+                },
+            );
 
             let new_completion = Completion::new_read(buf, decode_complete);
             io.pread(offset, new_completion)

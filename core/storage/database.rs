@@ -22,6 +22,10 @@ pub enum PageCodecLocation {
 }
 
 /// Transforms page images between their on-disk and in-memory representation.
+///
+/// Implementations must preserve the input page length. SQLite page size is a
+/// file-format invariant; codecs that need per-page metadata must store it in
+/// the page's reserved bytes rather than changing the page image length.
 pub trait PageCodec: std::fmt::Debug + Send + Sync {
     fn probe_header(&self, _raw_page1_prefix: &[u8]) -> Result<Option<PageCodecHeaderInfo>> {
         Ok(None)
@@ -40,6 +44,32 @@ pub trait PageCodec: std::fmt::Debug + Send + Sync {
         page_idx: usize,
         location: PageCodecLocation,
     ) -> Result<Vec<u8>>;
+}
+
+#[inline]
+pub(crate) fn page_codec_size_mismatch(
+    page_idx: usize,
+    expected: usize,
+    actual: usize,
+) -> CompletionError {
+    CompletionError::PageCodecSizeMismatch {
+        page_idx,
+        expected,
+        actual,
+    }
+}
+
+#[inline]
+pub(crate) fn validate_page_codec_output_len(
+    page_idx: usize,
+    expected: usize,
+    actual: usize,
+) -> Result<()> {
+    if actual != expected {
+        Err(page_codec_size_mismatch(page_idx, expected, actual).into())
+    } else {
+        Ok(())
+    }
 }
 
 impl PageCodec for EncryptionContext {
@@ -238,8 +268,8 @@ impl DatabaseStorage for DatabaseFile {
                 let page_codec = ctx.clone();
                 let read_buffer = r.buf_arc();
                 let original_c = c.clone();
-                let decode_complete =
-                    Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                let decode_complete = Box::new(
+                    move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                         let (buf, bytes_read) = match res {
                             Ok((buf, bytes_read)) => (buf, bytes_read),
                             Err(err) => {
@@ -261,6 +291,20 @@ impl DatabaseStorage for DatabaseFile {
                         ) {
                             Ok(decoded_data) => {
                                 let original_buf = original_c.as_read().buf();
+                                if decoded_data.len() != original_buf.len() {
+                                    let err = page_codec_size_mismatch(
+                                        page_idx,
+                                        original_buf.len(),
+                                        decoded_data.len(),
+                                    );
+                                    tracing::error!(
+                                        "Page codec returned wrong-sized decoded page for page_id={page_idx}: expected {}, got {}",
+                                        original_buf.len(),
+                                        decoded_data.len()
+                                    );
+                                    original_c.error(err);
+                                    return original_c.get_error();
+                                }
                                 original_buf.as_mut_slice().copy_from_slice(&decoded_data);
                                 original_c.complete(bytes_read);
                                 original_c.get_error()
@@ -277,7 +321,8 @@ impl DatabaseStorage for DatabaseFile {
                                 original_c.get_error()
                             }
                         }
-                    });
+                    },
+                );
                 let wrapped_completion = Completion::new_read(read_buffer, decode_complete);
                 self.file.pread(pos, wrapped_completion)
             }
@@ -433,6 +478,7 @@ fn encode_buffer(
     location: PageCodecLocation,
 ) -> Result<Arc<Buffer>> {
     let encrypted_data = ctx.encode_page(buffer.as_slice(), page_idx, location)?;
+    validate_page_codec_output_len(page_idx, buffer.len(), encrypted_data.len())?;
     Ok(Arc::new(Buffer::new(encrypted_data.to_vec())))
 }
 
@@ -440,6 +486,134 @@ fn checksum_buffer(page_idx: usize, buffer: Arc<Buffer>, ctx: &ChecksumContext) 
     ctx.add_checksum_to_page(buffer.as_mut_slice(), page_idx)
         .unwrap();
     buffer
+}
+
+#[cfg(test)]
+mod page_codec_tests {
+    use super::*;
+    use crate::File;
+    use crate::{io::IO, MemoryIO};
+
+    #[derive(Debug)]
+    struct ShortPageCodec;
+
+    impl PageCodec for ShortPageCodec {
+        fn required_reserved_bytes(&self) -> u8 {
+            0
+        }
+
+        fn encode_page(
+            &self,
+            page: &[u8],
+            _page_idx: usize,
+            _location: PageCodecLocation,
+        ) -> Result<Vec<u8>> {
+            Ok(page[..page.len() - 1].to_vec())
+        }
+
+        fn decode_page(
+            &self,
+            page: &[u8],
+            _page_idx: usize,
+            _location: PageCodecLocation,
+        ) -> Result<Vec<u8>> {
+            Ok(page[..page.len() - 1].to_vec())
+        }
+    }
+
+    struct MockFile {
+        read_result: std::result::Result<i32, CompletionError>,
+    }
+
+    impl File for MockFile {
+        fn lock_file(&self, _exclusive: bool) -> Result<()> {
+            Ok(())
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn pread(&self, _pos: u64, c: Completion) -> Result<Completion> {
+            match self.read_result {
+                Ok(bytes_read) => c.complete(bytes_read),
+                Err(err) => c.error(err),
+            }
+            Ok(c)
+        }
+
+        fn pwrite(&self, _pos: u64, _buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            c.complete(0);
+            Ok(c)
+        }
+
+        fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
+            c.complete(0);
+            Ok(c)
+        }
+
+        fn size(&self) -> Result<u64> {
+            Ok(0)
+        }
+
+        fn truncate(&self, _len: u64, c: Completion) -> Result<Completion> {
+            c.complete(0);
+            Ok(c)
+        }
+    }
+
+    #[test]
+    fn page_codec_encode_rejects_wrong_sized_database_page() {
+        let buffer = Arc::new(Buffer::new(vec![1, 2, 3, 4]));
+        let err = encode_buffer(7, buffer, &ShortPageCodec, PageCodecLocation::Database)
+            .expect_err("wrong-sized encoded page must fail");
+
+        assert!(matches!(
+            err,
+            LimboError::CompletionError(CompletionError::PageCodecSizeMismatch {
+                page_idx: 7,
+                expected: 4,
+                actual: 3,
+            })
+        ));
+    }
+
+    #[test]
+    fn page_codec_read_rejects_wrong_sized_database_page() {
+        let db_file = DatabaseFile {
+            file: Arc::new(MockFile {
+                read_result: Ok(4096),
+            }),
+        };
+        let mut io_ctx = IOContext::default();
+        io_ctx.set_page_codec(Arc::new(ShortPageCodec));
+        let page_idx = 9usize;
+        let original = Completion::new_read(Arc::new(Buffer::new_temporary(4096)), |_res| None);
+
+        let wrapped = db_file
+            .read_page(page_idx, &io_ctx, original.clone())
+            .unwrap();
+        let err = MemoryIO::new()
+            .wait_for_completion(wrapped)
+            .expect_err("wrong-sized decoded page must fail");
+
+        assert!(matches!(
+            err,
+            LimboError::CompletionError(CompletionError::PageCodecSizeMismatch {
+                page_idx: 9,
+                expected: 4096,
+                actual: 4095,
+            })
+        ));
+        assert_eq!(
+            original.get_error(),
+            Some(CompletionError::PageCodecSizeMismatch {
+                page_idx: 9,
+                expected: 4096,
+                actual: 4095,
+            })
+        );
+    }
 }
 
 #[cfg(all(test, feature = "checksum"))]
