@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -14,28 +15,51 @@ use tracing::{debug, error, info};
 use turso_core::{Connection, Value as CoreValue};
 use turso_sync_engine::server_proto::{
     BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
-    ExecuteStreamReq, ExecuteStreamResp, PageData, PageSetRawEncodingProto, PageUpdatesEncodingReq,
-    PipelineReqBody, PipelineRespBody, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, Row,
-    StmtResult, StreamRequest, StreamResponse, StreamResult, Value,
+    ExecuteStreamReq, ExecuteStreamResp, MvccLogicalLogMetadataProto, MvccLogicalLogRangeProto,
+    PageData, PageSetRawEncodingProto, PageUpdatesEncodingReq, PipelineReqBody, PipelineRespBody,
+    PullUpdatesApplyMode, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, PullUpdatesStreamKind,
+    Row, StmtResult, StreamRequest, StreamResponse, StreamResult, Value,
 };
 
 const WAL_FRAME_HEADER_SIZE: usize = 24;
 const PAGE_SIZE: usize = 4096;
+const MVCC_LOG_MAGIC: u32 = 0x4C4D4C32;
+const MVCC_LOG_VERSION: u8 = 3;
+const MVCC_LOG_HEADER_SIZE: usize = 56;
+const MVCC_LOG_HEADER_SALT_START: usize = 8;
+const MVCC_LOG_HEADER_SALT_END: usize = 16;
+const MVCC_LOG_HEADER_RESERVED_START: usize = 16;
+const MVCC_LOG_HEADER_CRC_START: usize = 52;
+const MVCC_TX_FRAME_MAGIC: u32 = 0x5854564D;
+const MVCC_TX_EXT_FRAME_MAGIC: u32 = 0x5845564D;
+const MVCC_TX_END_MAGIC: u32 = 0x4554564D;
+const MVCC_TX_HEADER_SIZE: usize = 24;
+const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
+const MVCC_TX_TRAILER_SIZE: usize = 8;
+const MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
 
 pub struct TursoSyncServer {
     address: String,
+    db_path: String,
     conn: Arc<Mutex<Arc<Connection>>>,
     interrupt_count: Arc<AtomicUsize>,
 }
 
 impl TursoSyncServer {
-    pub fn new(address: String, conn: Arc<Connection>, interrupt_count: Arc<AtomicUsize>) -> Self {
+    pub fn new(
+        address: String,
+        db_path: String,
+        conn: Arc<Connection>,
+        interrupt_count: Arc<AtomicUsize>,
+    ) -> Result<Self> {
         conn.wal_auto_actions_disable();
-        Self {
+
+        Ok(Self {
             address,
+            db_path,
             conn: Arc::new(Mutex::new(conn)),
             interrupt_count,
-        }
+        })
     }
 
     pub fn run(&self) -> Result<()> {
@@ -466,6 +490,20 @@ impl TursoSyncServer {
             return Err(anyhow!("Zstd encoding is not supported"));
         }
 
+        if PullUpdatesStreamKind::try_from(req.stream_kind).unwrap_or(PullUpdatesStreamKind::Pages)
+            == PullUpdatesStreamKind::MvccLogicalLog
+        {
+            return self.handle_logical_pull_updates(&req);
+        }
+
+        self.handle_page_pull_updates(&req, PullUpdatesApplyMode::Incremental)
+    }
+
+    fn handle_page_pull_updates(
+        &self,
+        req: &PullUpdatesReqProtoBody,
+        apply_mode: PullUpdatesApplyMode,
+    ) -> Result<HttpResponse> {
         let conn = self.conn.lock().unwrap();
 
         let wal_state = conn.wal_state()?;
@@ -549,19 +587,16 @@ impl TursoSyncServer {
         );
         pages_to_send.reverse();
 
-        let db_size = if wal_state.max_frame > 0 {
-            let mut last_frame = vec![0u8; frame_size];
-            let last_info = conn.wal_get_frame(wal_state.max_frame, &mut last_frame)?;
-            last_info.db_size as u64
-        } else {
-            0
-        };
+        let db_size = current_db_size_pages(&conn, wal_state.max_frame)?;
 
         let header = PullUpdatesRespProtoBody {
             server_revision: server_revision.to_string(),
             db_size,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+            apply_mode: apply_mode as i32,
+            mvcc_log: None,
         };
 
         let mut response_body = Vec::new();
@@ -589,12 +624,499 @@ impl TursoSyncServer {
             body: response_body,
         })
     }
+
+    fn handle_logical_pull_updates(&self, req: &PullUpdatesReqProtoBody) -> Result<HttpResponse> {
+        let (db_size, fallback_revision, legacy_current_revision) = {
+            let conn = self.conn.lock().unwrap();
+            let wal_state = conn.wal_state()?;
+            (
+                current_db_size_pages(&conn, wal_state.max_frame)?,
+                format!("page:{}", wal_state.max_frame),
+                wal_state.max_frame.to_string(),
+            )
+        };
+        let log_path = match logical_log_path(&self.db_path) {
+            Ok(path) => path,
+            Err(_) if is_in_memory_db_path(&self.db_path) => {
+                info!(
+                    "logical pull requested for in-memory sync server database; returning incremental pages"
+                );
+                return self.handle_page_pull_updates(req, PullUpdatesApplyMode::Incremental);
+            }
+            Err(err) => return Err(err),
+        };
+        let log = match std::fs::read(&log_path) {
+            Ok(log) => log,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                info!(
+                    "logical pull requested but no MVCC log exists at {}; returning replace-base fallback",
+                    log_path.display()
+                );
+                return self.handle_logical_fallback(
+                    req,
+                    fallback_revision,
+                    &legacy_current_revision,
+                    db_size,
+                );
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let snapshot = match scan_mvcc_log(&log) {
+            Ok(snapshot) => snapshot,
+            Err(err) if is_nonportable_mvcc_log_error(&err) => {
+                info!(
+                    "logical pull requested but MVCC log is not portable; returning replace-base pages: {err}"
+                );
+                return self.handle_logical_fallback(
+                    req,
+                    fallback_revision,
+                    &legacy_current_revision,
+                    db_size,
+                );
+            }
+            Err(err) => return Err(err),
+        };
+        let start_offset = parse_mvcc_revision_offset(&req.client_revision, snapshot.end_offset)?;
+        if start_offset > snapshot.end_offset {
+            return Err(anyhow!(
+                "MVCC logical pull revision is from the future: client_offset={} server_offset={}",
+                start_offset,
+                snapshot.end_offset
+            ));
+        }
+        let start = usize::try_from(start_offset)
+            .map_err(|_| anyhow!("MVCC logical pull start offset overflows usize"))?;
+        let end = usize::try_from(snapshot.end_offset)
+            .map_err(|_| anyhow!("MVCC logical pull end offset overflows usize"))?;
+
+        let mut response_body = Vec::new();
+        let (mvcc_log, body) = if start == end {
+            (None, Vec::new())
+        } else {
+            let crc_seed = if start_offset == 0 {
+                None
+            } else {
+                let seed = snapshot.crc_seed_at(start_offset)?;
+                Some(seed.to_le_bytes().to_vec())
+            };
+            (
+                Some(MvccLogicalLogMetadataProto {
+                    format: "lml3".to_string(),
+                    checkpoint_transition: false,
+                    ranges: vec![MvccLogicalLogRangeProto {
+                        generation: 1,
+                        start_offset,
+                        end_offset: snapshot.end_offset,
+                        starts_with_header: start_offset == 0,
+                        crc_seed,
+                    }],
+                }),
+                log[start..end].to_vec(),
+            )
+        };
+
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g1:o{}", snapshot.end_offset),
+            db_size,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log,
+        };
+
+        let header_bytes = header.encode_to_vec();
+        encode_length_delimited(&mut response_body, &header_bytes);
+        response_body.extend_from_slice(&body);
+
+        debug!(
+            "pull-updates logical: path={} client_revision={} end_offset={} body_bytes={}",
+            log_path.display(),
+            req.client_revision,
+            snapshot.end_offset,
+            body.len()
+        );
+
+        Ok(HttpResponse {
+            status: 200,
+            content_type: "application/protobuf".to_string(),
+            body: response_body,
+        })
+    }
+
+    fn handle_logical_fallback(
+        &self,
+        req: &PullUpdatesReqProtoBody,
+        server_revision: String,
+        legacy_current_revision: &str,
+        db_size: u64,
+    ) -> Result<HttpResponse> {
+        if req.client_revision == server_revision {
+            return self.handle_empty_logical_pull(server_revision, db_size);
+        }
+        if req.client_revision == legacy_current_revision {
+            return self.handle_empty_logical_pull(req.client_revision.clone(), db_size);
+        }
+
+        self.handle_replace_base_pages(server_revision)
+    }
+
+    fn handle_empty_logical_pull(
+        &self,
+        server_revision: String,
+        db_size: u64,
+    ) -> Result<HttpResponse> {
+        let header = PullUpdatesRespProtoBody {
+            server_revision,
+            db_size,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: None,
+        };
+
+        let mut response_body = Vec::new();
+        let header_bytes = header.encode_to_vec();
+        encode_length_delimited(&mut response_body, &header_bytes);
+
+        Ok(HttpResponse {
+            status: 200,
+            content_type: "application/protobuf".to_string(),
+            body: response_body,
+        })
+    }
+
+    fn handle_replace_base_pages(&self, server_revision: String) -> Result<HttpResponse> {
+        let (db_size, pages) = self.read_replace_base_pages()?;
+
+        let header = PullUpdatesRespProtoBody {
+            server_revision,
+            db_size,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+            apply_mode: PullUpdatesApplyMode::ReplaceBase as i32,
+            mvcc_log: None,
+        };
+
+        let mut response_body = Vec::new();
+        let header_bytes = header.encode_to_vec();
+        encode_length_delimited(&mut response_body, &header_bytes);
+
+        for (page_id, page) in pages {
+            let page_msg = PageData {
+                page_id,
+                encoded_page: Bytes::from(page),
+            };
+            let page_bytes = page_msg.encode_to_vec();
+            encode_length_delimited(&mut response_body, &page_bytes);
+        }
+
+        Ok(HttpResponse {
+            status: 200,
+            content_type: "application/protobuf".to_string(),
+            body: response_body,
+        })
+    }
+
+    fn read_replace_base_pages(&self) -> Result<(u64, Vec<(u64, Vec<u8>)>)> {
+        let conn = self.conn.lock().unwrap();
+        let wal_state = conn.wal_state()?;
+        let frame_watermark = Some(wal_state.max_frame);
+        let db_size = current_snapshot_db_size_pages(&conn, wal_state.max_frame)?;
+        let pages_capacity = usize::try_from(db_size)
+            .map_err(|_| anyhow!("database page count does not fit usize: {db_size}"))?;
+        let mut pages = Vec::with_capacity(pages_capacity);
+
+        for page_no in 1..=db_size {
+            let page_no_u32 = u32::try_from(page_no)
+                .map_err(|_| anyhow!("database page number does not fit u32: {page_no}"))?;
+            let mut page = vec![0; PAGE_SIZE];
+            let found =
+                conn.try_wal_watermark_read_page(page_no_u32, &mut page, frame_watermark)?;
+            if !found {
+                return Err(anyhow!(
+                    "database page {} is missing from replace-base snapshot",
+                    page_no
+                ));
+            }
+            pages.push((page_no - 1, page));
+        }
+
+        Ok((db_size, pages))
+    }
 }
 
 struct HttpResponse {
     status: u16,
     content_type: String,
     body: Vec<u8>,
+}
+
+struct MvccLogSnapshot {
+    end_offset: u64,
+    crc_by_offset: Vec<(u64, u32)>,
+}
+
+impl MvccLogSnapshot {
+    fn crc_seed_at(&self, offset: u64) -> Result<u32> {
+        self.crc_by_offset
+            .iter()
+            .find_map(|(boundary, crc)| (*boundary == offset).then_some(*crc))
+            .ok_or_else(|| {
+                anyhow!("MVCC logical pull offset is not a transaction boundary: {offset}")
+            })
+    }
+}
+
+fn logical_log_path(db_path: &str) -> Result<PathBuf> {
+    Ok(db_file_path(db_path)?.with_extension("db-log"))
+}
+
+fn is_in_memory_db_path(db_path: &str) -> bool {
+    db_path == ":memory:"
+}
+
+fn db_file_path(db_path: &str) -> Result<PathBuf> {
+    if is_in_memory_db_path(db_path) {
+        return Err(anyhow!(
+            "MVCC logical pull is not supported for in-memory sync server databases"
+        ));
+    }
+    let path = if let Some(rest) = db_path.strip_prefix("file:") {
+        rest.split_once('?').map_or(rest, |(path, _)| path)
+    } else {
+        db_path
+    };
+    Ok(PathBuf::from(path))
+}
+
+fn parse_mvcc_revision_offset(revision: &str, legacy_default: u64) -> Result<u64> {
+    if revision.is_empty() {
+        return Ok(0);
+    }
+    if let Some((generation, offset)) = revision.split_once(":o") {
+        let generation = generation
+            .strip_prefix('g')
+            .ok_or_else(|| anyhow!("invalid MVCC pull revision generation: {revision}"))?
+            .parse::<u64>()
+            .map_err(|err| anyhow!("invalid MVCC pull revision generation: {revision}: {err}"))?;
+        if generation != 1 {
+            return Err(anyhow!(
+                "sync_server supports only single-generation MVCC logical pulls: {revision}"
+            ));
+        }
+        return offset
+            .parse::<u64>()
+            .map_err(|err| anyhow!("invalid MVCC pull revision offset: {revision}: {err}"));
+    }
+    // Older page bootstrap responses from this test server used WAL frame
+    // numbers. Treat them as "the page snapshot already includes the current
+    // logical log" so the required follow-up logical pull becomes a no-op.
+    Ok(legacy_default)
+}
+
+fn scan_mvcc_log(log: &[u8]) -> Result<MvccLogSnapshot> {
+    if log.is_empty() {
+        return Ok(MvccLogSnapshot {
+            end_offset: 0,
+            crc_by_offset: vec![(0, 0)],
+        });
+    }
+    if log.len() < MVCC_LOG_HEADER_SIZE {
+        return Err(anyhow!(
+            "truncated MVCC logical log header: len={} header_size={}",
+            log.len(),
+            MVCC_LOG_HEADER_SIZE
+        ));
+    }
+    validate_mvcc_log_header(log)?;
+    let mut running_crc = initial_mvcc_log_crc(log)?;
+    let mut offset = MVCC_LOG_HEADER_SIZE;
+    let mut crc_by_offset = vec![(MVCC_LOG_HEADER_SIZE as u64, running_crc)];
+
+    while offset < log.len() {
+        let Some((frame_end, frame_crc)) = read_mvcc_frame_boundary(log, offset, running_crc)?
+        else {
+            break;
+        };
+        running_crc = frame_crc;
+        offset = frame_end;
+        crc_by_offset.push((offset as u64, running_crc));
+    }
+
+    Ok(MvccLogSnapshot {
+        end_offset: offset as u64,
+        crc_by_offset,
+    })
+}
+
+fn is_nonportable_mvcc_log_error(err: &anyhow::Error) -> bool {
+    let message = err.to_string();
+    message.starts_with("unsupported MVCC logical log version ")
+}
+
+fn validate_mvcc_log_header(log: &[u8]) -> Result<()> {
+    if read_u32_le(log, 0)? != MVCC_LOG_MAGIC {
+        return Err(anyhow!("invalid MVCC logical log magic"));
+    }
+    if log[4] != MVCC_LOG_VERSION {
+        return Err(anyhow!("unsupported MVCC logical log version {}", log[4]));
+    }
+    if log[5] & 0b1111_1110 != 0 {
+        return Err(anyhow!("invalid MVCC logical log header flags"));
+    }
+    let header_len = u16::from_le_bytes([log[6], log[7]]) as usize;
+    if header_len != MVCC_LOG_HEADER_SIZE {
+        return Err(anyhow!(
+            "invalid MVCC logical log header length: {header_len}"
+        ));
+    }
+    if log[MVCC_LOG_HEADER_RESERVED_START..MVCC_LOG_HEADER_CRC_START]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(anyhow!(
+            "MVCC logical log header reserved bytes must be zero"
+        ));
+    }
+    let stored_crc = read_u32_le(log, MVCC_LOG_HEADER_CRC_START)?;
+    let mut crc_buf = [0u8; MVCC_LOG_HEADER_SIZE];
+    crc_buf.copy_from_slice(&log[..MVCC_LOG_HEADER_SIZE]);
+    crc_buf[MVCC_LOG_HEADER_CRC_START..MVCC_LOG_HEADER_SIZE].fill(0);
+    let expected_crc = crc32c::crc32c(&crc_buf);
+    if stored_crc != expected_crc {
+        return Err(anyhow!("MVCC logical log header checksum mismatch"));
+    }
+    Ok(())
+}
+
+fn initial_mvcc_log_crc(log: &[u8]) -> Result<u32> {
+    let salt = u64::from_le_bytes(
+        log[MVCC_LOG_HEADER_SALT_START..MVCC_LOG_HEADER_SALT_END]
+            .try_into()
+            .expect("fixed-size salt slice"),
+    );
+    Ok(crc32c::crc32c(&salt.to_le_bytes()))
+}
+
+fn read_mvcc_frame_boundary(
+    log: &[u8],
+    offset: usize,
+    running_crc: u32,
+) -> Result<Option<(usize, u32)>> {
+    if log.len() - offset < MVCC_TX_HEADER_SIZE + MVCC_TX_TRAILER_SIZE {
+        return Ok(None);
+    }
+    let frame_magic = read_u32_le(log, offset)?;
+    let has_extension_header = frame_magic == MVCC_TX_EXT_FRAME_MAGIC;
+    if frame_magic != MVCC_TX_FRAME_MAGIC && !has_extension_header {
+        return Err(anyhow!(
+            "invalid MVCC logical log frame magic at offset {offset}: {frame_magic:#x}"
+        ));
+    }
+    let header_size = if has_extension_header {
+        MVCC_TX_EXT_HEADER_SIZE
+    } else {
+        MVCC_TX_HEADER_SIZE
+    };
+    if log.len() - offset < header_size + MVCC_TX_TRAILER_SIZE {
+        return Ok(None);
+    }
+    let payload_size = usize::try_from(read_u64_le(log, offset + 4)?)
+        .map_err(|_| anyhow!("MVCC logical log payload size overflows usize"))?;
+    let extension_size = if has_extension_header {
+        let extension_size = usize::try_from(read_u64_le(log, offset + 24)?)
+            .map_err(|_| anyhow!("MVCC logical log extension size overflows usize"))?;
+        let extension_record_count = read_u32_le(log, offset + 32)?;
+        let frame_flags = read_u32_le(log, offset + 36)?;
+        if frame_flags & !MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK != 0 {
+            return Err(anyhow!(
+                "unsupported MVCC logical log frame flags at offset {offset}: {frame_flags:#x}"
+            ));
+        }
+        if extension_size == 0 && extension_record_count != 0 {
+            return Err(anyhow!(
+                "MVCC logical log extension record count without extension block at offset {offset}"
+            ));
+        }
+        if extension_size > 0 && frame_flags & MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK == 0 {
+            return Err(anyhow!(
+                "MVCC logical log extension block missing flag at offset {offset}"
+            ));
+        }
+        extension_size
+    } else {
+        0
+    };
+    let trailer_start = offset
+        .checked_add(header_size)
+        .and_then(|value| value.checked_add(payload_size))
+        .and_then(|value| value.checked_add(extension_size))
+        .ok_or_else(|| anyhow!("MVCC logical log frame offset overflow"))?;
+    let frame_end = trailer_start
+        .checked_add(MVCC_TX_TRAILER_SIZE)
+        .ok_or_else(|| anyhow!("MVCC logical log frame end overflow"))?;
+    if frame_end > log.len() {
+        return Ok(None);
+    }
+    let expected_crc = crc32c::crc32c_append(running_crc, &log[offset..trailer_start]);
+    let stored_crc = read_u32_le(log, trailer_start)?;
+    if stored_crc != expected_crc {
+        return Err(anyhow!(
+            "MVCC logical log frame checksum mismatch at offset {offset}"
+        ));
+    }
+    let end_magic = read_u32_le(log, trailer_start + 4)?;
+    if end_magic != MVCC_TX_END_MAGIC {
+        return Err(anyhow!(
+            "invalid MVCC logical log frame end magic at offset {offset}"
+        ));
+    }
+    Ok(Some((frame_end, stored_crc)))
+}
+
+fn read_u32_le(buf: &[u8], offset: usize) -> Result<u32> {
+    let bytes = buf
+        .get(offset..offset + 4)
+        .ok_or_else(|| anyhow!("buffer too short for u32 at offset {offset}"))?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn read_u64_le(buf: &[u8], offset: usize) -> Result<u64> {
+    let bytes = buf
+        .get(offset..offset + 8)
+        .ok_or_else(|| anyhow!("buffer too short for u64 at offset {offset}"))?;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn current_db_size_pages(conn: &Connection, max_frame: u64) -> Result<u64> {
+    if max_frame > 0 {
+        let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
+        let mut last_frame = vec![0u8; frame_size];
+        let last_info = conn.wal_get_frame(max_frame, &mut last_frame)?;
+        Ok(last_info.db_size as u64)
+    } else {
+        Ok(0)
+    }
+}
+
+fn current_snapshot_db_size_pages(conn: &Connection, max_frame: u64) -> Result<u64> {
+    if max_frame > 0 {
+        return current_db_size_pages(conn, max_frame);
+    }
+
+    let mut page = vec![0u8; PAGE_SIZE];
+    if conn.try_wal_watermark_read_page(1, &mut page, Some(max_frame))? {
+        Ok(db_size_from_page(&page) as u64)
+    } else {
+        Ok(0)
+    }
+}
+
+fn db_size_from_page(page: &[u8]) -> u32 {
+    u32::from_be_bytes(page[28..32].try_into().unwrap())
 }
 
 fn find_header_end(data: &[u8]) -> Option<usize> {
