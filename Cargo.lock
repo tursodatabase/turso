@@ -6866,6 +6866,7 @@ version = "0.7.0-pre.18"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "crc32c",
  "ctor 0.4.2",
  "futures",
  "genawaiter",

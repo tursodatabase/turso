@@ -163,6 +163,8 @@ pub struct SyncEngineOpts {
     /// `None` (default) bootstraps in a single round-trip. No-op when
     /// partial-sync uses the query bootstrap strategy.
     pub pull_bytes_threshold: Option<u32>,
+    /// Use MVCC logical-log stream for incremental V1 pulls.
+    pub logical_mvcc_pull: Option<bool>,
 }
 
 struct SyncEngineOptsFilled {
@@ -181,6 +183,7 @@ struct SyncEngineOptsFilled {
     pub partial_sync_opts: Option<PartialSyncOpts>,
     pub push_operations_threshold: Option<usize>,
     pub pull_bytes_threshold: Option<usize>,
+    pub logical_mvcc_pull: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -333,6 +336,7 @@ impl SyncEngine {
             remote_encryption_key: opts.remote_encryption_key.clone(),
             push_operations_threshold: opts.push_operations_threshold.map(|x| x as usize),
             pull_bytes_threshold: opts.pull_bytes_threshold.map(|x| x as usize),
+            logical_mvcc_pull: opts.logical_mvcc_pull.unwrap_or(false),
         };
         Ok(SyncEngine {
             opts: opts_filled,
@@ -366,6 +370,7 @@ impl SyncEngine {
             remote_encryption_key: self.opts.remote_encryption_key.clone(),
             push_operations_threshold: self.opts.push_operations_threshold,
             pull_bytes_threshold: self.opts.pull_bytes_threshold,
+            logical_mvcc_pull: self.opts.logical_mvcc_pull,
         };
 
         let io = self.io()?;
