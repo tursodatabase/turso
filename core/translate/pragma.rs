@@ -1789,11 +1789,19 @@ fn emit_columns_for_table_info(
             }
         }
 
-        // pk — 1-based position within the primary key, or 0 if not part of the key
-        let pk = primary_key_columns
-            .and_then(|pk_cols| column_pk_index(column, pk_cols))
-            .map(|index| (index + 1) as i64)
-            .unwrap_or(0);
+        // pk — 1-based position within the primary key, or 0 if not part of the key.
+        // B-tree tables use composite key order from schema; virtual tables fall back to
+        // the per-column primary key flag (always 0 or 1 for vtabs).
+        let pk = match primary_key_columns.and_then(|pk_cols| column_pk_index(column, pk_cols)) {
+            Some(index) => (index + 1) as i64,
+            None => {
+                if column.primary_key() {
+                    1
+                } else {
+                    0
+                }
+            }
+        };
         program.emit_int(pk, base_reg + 5);
 
         if extended {
