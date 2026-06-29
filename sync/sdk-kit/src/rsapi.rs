@@ -37,6 +37,10 @@ pub struct TursoDatabaseSyncConfig {
     /// `None` => single-request bootstrap. No-op when partial-sync uses the
     /// query bootstrap strategy.
     pub pull_bytes_threshold: Option<usize>,
+    /// Use the MVCC logical-log stream for incremental V1 pulls. This is
+    /// required when syncing against an MVCC-mode remote; legacy page/WAL sync
+    /// keeps the default `false` value.
+    pub logical_mvcc_pull: bool,
 }
 
 pub type PartialSyncOpts = turso_sync_engine::types::PartialSyncOpts;
@@ -118,6 +122,7 @@ impl TursoDatabaseSyncConfig {
             } else {
                 Some(config.pull_bytes_threshold)
             },
+            logical_mvcc_pull: config.logical_mvcc_pull,
         })
     }
 }
@@ -251,6 +256,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             remote_encryption_key: sync_config.remote_encryption_key.clone(),
             push_operations_threshold: sync_config.push_operations_threshold,
             pull_bytes_threshold: sync_config.pull_bytes_threshold,
+            logical_mvcc_pull: sync_config.logical_mvcc_pull,
         };
         let is_memory = db_config.path == ":memory:";
         let db_io: Option<Arc<dyn IO>> = if is_memory {

@@ -27,6 +27,15 @@ pub struct ReplayInfo {
 }
 
 const SQLITE_SCHEMA_TABLE: &str = "sqlite_schema";
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 impl DatabaseReplayGenerator {
     pub fn new(conn: Arc<turso_core::Connection>, opts: DatabaseReplaySessionOpts) -> Self {
         Self { conn, opts }
@@ -223,43 +232,9 @@ impl DatabaseReplayGenerator {
                             after.last()
                         )));
                     };
-                    let mut parser = Parser::new(sql.as_str().as_bytes());
-                    let mut ast = parser
-                        .next()
-                        .ok_or_else(|| {
-                            Error::DatabaseTapeError(format!(
-                                "unexpected DDL query: {}",
-                                sql.as_str()
-                            ))
-                        })?
-                        .map_err(|e| {
-                            Error::DatabaseTapeError(format!(
-                                "unexpected DDL query {}: {}",
-                                e,
-                                sql.as_str()
-                            ))
-                        })?;
-                    let turso_parser::ast::Cmd::Stmt(stmt) = &mut ast else {
-                        return Err(Error::DatabaseTapeError(format!(
-                            "unexpected DDL query: {}",
-                            sql.as_str()
-                        )));
-                    };
-                    match stmt {
-                        turso_parser::ast::Stmt::CreateTable { if_not_exists, .. }
-                        | turso_parser::ast::Stmt::CreateIndex { if_not_exists, .. }
-                        | turso_parser::ast::Stmt::CreateTrigger { if_not_exists, .. }
-                        | turso_parser::ast::Stmt::CreateMaterializedView {
-                            if_not_exists, ..
-                        }
-                        | turso_parser::ast::Stmt::CreateView { if_not_exists, .. } => {
-                            *if_not_exists = true
-                        }
-                        _ => {}
-                    }
                     let insert = ReplayInfo {
                         change_type: DatabaseChangeType::Insert,
-                        query: ast.to_string(),
+                        query: sql.as_str().to_string(),
                         pk_column_indices: None,
                         column_names: Vec::new(),
                         is_ddl_replay: true,
@@ -346,18 +321,19 @@ impl DatabaseReplayGenerator {
                     idx, record_columns.len(), table_name
                 )));
             }
-            pk_predicates.push(format!("{} = ?", record_columns[idx]));
+            pk_predicates.push(format!("{} = ?", quote_ident(&record_columns[idx])));
         }
         for (idx, name) in record_columns.iter().enumerate() {
             if columns[idx] {
-                column_updates.push(format!("{name} = ?"));
+                column_updates.push(format!("{} = ?", quote_ident(name)));
             }
         }
+        let quoted_table_name = quote_ident(table_name);
         let (query, pk_column_indices) =
             if self.opts.use_implicit_rowid || pk_column_indices.is_empty() {
                 (
                     format!(
-                        "UPDATE {table_name} SET {} WHERE rowid = ?",
+                        "UPDATE {quoted_table_name} SET {} WHERE rowid = ?",
                         column_updates.join(", ")
                     ),
                     None,
@@ -365,7 +341,7 @@ impl DatabaseReplayGenerator {
             } else {
                 (
                     format!(
-                        "UPDATE {table_name} SET {} WHERE {}",
+                        "UPDATE {quoted_table_name} SET {} WHERE {}",
                         column_updates.join(", "),
                         pk_predicates.join(" AND ")
                     ),
@@ -404,10 +380,11 @@ impl DatabaseReplayGenerator {
                         idx, record_columns.len(), table_name
                     )));
                 }
-                pk_column_names.push(record_columns[idx].clone());
+                pk_column_names.push(quote_ident(&record_columns[idx]));
             }
             let mut update_clauses = Vec::new();
             for name in record_columns {
+                let name = quote_ident(name);
                 update_clauses.push(format!("{name} = excluded.{name}"));
             }
             format!(
@@ -418,11 +395,16 @@ impl DatabaseReplayGenerator {
         } else {
             String::new()
         };
+        let quoted_table_name = quote_ident(table_name);
         if !self.opts.use_implicit_rowid {
-            let col_list = record_columns.join(", ");
+            let col_list = record_columns
+                .iter()
+                .map(|name| quote_ident(name))
+                .collect::<Vec<_>>()
+                .join(", ");
             let placeholders = ["?"].repeat(columns).join(",");
             let query = format!(
-                "INSERT INTO {table_name}({col_list}) VALUES ({placeholders}){conflict_clause}"
+                "INSERT INTO {quoted_table_name}({col_list}) VALUES ({placeholders}){conflict_clause}"
             );
             return Ok(ReplayInfo {
                 change_type: DatabaseChangeType::Insert,
@@ -437,8 +419,19 @@ impl DatabaseReplayGenerator {
         insert_columns.push("rowid".to_string());
 
         let placeholders = ["?"].repeat(columns + 1).join(",");
-        let col_list = insert_columns.join(", ");
-        let query = format!("INSERT INTO {table_name}({col_list}) VALUES ({placeholders})");
+        let col_list = insert_columns
+            .iter()
+            .map(|name| quote_ident(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert_kind = if conflict_clause.is_empty() {
+            "INSERT OR REPLACE"
+        } else {
+            "INSERT"
+        };
+        let query = format!(
+            "{insert_kind} INTO {quoted_table_name}({col_list}) VALUES ({placeholders}){conflict_clause}"
+        );
         Ok(ReplayInfo {
             change_type: DatabaseChangeType::Insert,
             query,
@@ -455,11 +448,12 @@ impl DatabaseReplayGenerator {
         let (column_names, pk_column_indices) = self.table_columns_info(coro, table_name).await?;
         let mut pk_predicates = Vec::with_capacity(1);
         for &idx in &pk_column_indices {
-            pk_predicates.push(format!("{} = ?", column_names[idx]));
+            pk_predicates.push(format!("{} = ?", quote_ident(&column_names[idx])));
         }
         let use_implicit_rowid = self.opts.use_implicit_rowid;
+        let quoted_table_name = quote_ident(table_name);
         if pk_column_indices.is_empty() || use_implicit_rowid {
-            let query = format!("DELETE FROM {table_name} WHERE rowid = ?");
+            let query = format!("DELETE FROM {quoted_table_name} WHERE rowid = ?");
             tracing::trace!("delete_query: table_name={table_name}, query={query}, use_implicit_rowid={use_implicit_rowid}");
             return Ok(ReplayInfo {
                 change_type: DatabaseChangeType::Delete,
@@ -470,7 +464,7 @@ impl DatabaseReplayGenerator {
             });
         }
         let pk_predicates = pk_predicates.join(" AND ");
-        let query = format!("DELETE FROM {table_name} WHERE {pk_predicates}");
+        let query = format!("DELETE FROM {quoted_table_name} WHERE {pk_predicates}");
 
         tracing::trace!("delete_query: table_name={table_name}, query={query}, use_implicit_rowid={use_implicit_rowid}");
         Ok(ReplayInfo {
@@ -482,17 +476,82 @@ impl DatabaseReplayGenerator {
         })
     }
 
-    /// Execute a DDL statement idempotently: for CREATE TABLE statements,
-    /// check which columns already exist and only ALTER TABLE ADD COLUMN
-    /// for missing ones. Falls back to direct execution for non-CREATE TABLE DDL.
+    /// Execute a DDL statement idempotently: CREATE TABLE is replayed with
+    /// `IF NOT EXISTS`, named schema objects are skipped when already present,
+    /// and `ALTER TABLE ADD COLUMN` only adds missing columns. Falls back to
+    /// direct execution for other DDL.
     pub async fn execute_ddl_idempotent<Ctx>(&self, coro: &Coro<Ctx>, ddl: &str) -> Result<()> {
         let mut parser = Parser::new(ddl.as_bytes());
-        let Some(Ok(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::AlterTable(
-            turso_parser::ast::AlterTable {
-                name: tbl_name,
-                body: turso_parser::ast::AlterTableBody::AddColumn(col_def),
-            },
-        )))) = parser.next()
+        let Some(Ok(turso_parser::ast::Cmd::Stmt(mut stmt))) = parser.next() else {
+            self.execute_ddl(ddl)?;
+            return Ok(());
+        };
+        match &mut stmt {
+            turso_parser::ast::Stmt::CreateTable {
+                if_not_exists,
+                tbl_name,
+                body,
+                ..
+            } => {
+                *if_not_exists = true;
+                let table_name = tbl_name.name.as_str();
+                let (current_columns, _) = self.table_columns_info(coro, table_name).await?;
+                if current_columns.is_empty() {
+                    self.execute_ddl(ddl)?;
+                    return Ok(());
+                }
+                if let turso_parser::ast::CreateTableBody::ColumnsAndConstraints {
+                    columns, ..
+                } = body
+                {
+                    for column in columns {
+                        let col_name = column.col_name.as_str();
+                        if current_columns.iter().any(|c| c == col_name) {
+                            continue;
+                        }
+                        let add_column = format!("ALTER TABLE {tbl_name} ADD COLUMN {column}");
+                        self.execute_ddl(&add_column)?;
+                    }
+                }
+                return Ok(());
+            }
+            turso_parser::ast::Stmt::CreateIndex { idx_name, .. } => {
+                if self
+                    .schema_object_exists(coro, "index", idx_name.name.as_str())
+                    .await?
+                {
+                    return Ok(());
+                }
+                self.execute_ddl(ddl)?;
+                return Ok(());
+            }
+            turso_parser::ast::Stmt::CreateTrigger { trigger_name, .. } => {
+                if self
+                    .schema_object_exists(coro, "trigger", trigger_name.name.as_str())
+                    .await?
+                {
+                    return Ok(());
+                }
+                self.execute_ddl(ddl)?;
+                return Ok(());
+            }
+            turso_parser::ast::Stmt::CreateMaterializedView { view_name, .. }
+            | turso_parser::ast::Stmt::CreateView { view_name, .. } => {
+                if self
+                    .schema_object_exists(coro, "view", view_name.name.as_str())
+                    .await?
+                {
+                    return Ok(());
+                }
+                self.execute_ddl(ddl)?;
+                return Ok(());
+            }
+            _ => {}
+        }
+        let turso_parser::ast::Stmt::AlterTable(turso_parser::ast::AlterTable {
+            name: tbl_name,
+            body: turso_parser::ast::AlterTableBody::AddColumn(col_def),
+        }) = stmt
         else {
             self.conn.execute(ddl)?;
             return Ok(());
@@ -506,8 +565,28 @@ impl DatabaseReplayGenerator {
             );
             return Ok(());
         }
-        self.conn.execute(ddl)?;
+        self.execute_ddl(ddl)?;
         Ok(())
+    }
+
+    fn execute_ddl(&self, ddl: &str) -> Result<()> {
+        self.conn.execute(ddl).map_err(|error| {
+            Error::DatabaseTapeError(format!("failed to execute DDL `{ddl}`: {error}"))
+        })
+    }
+
+    async fn schema_object_exists<Ctx>(
+        &self,
+        coro: &Coro<Ctx>,
+        object_type: &str,
+        name: &str,
+    ) -> Result<bool> {
+        let object_type = sql_string_literal(object_type);
+        let name = sql_string_literal(name);
+        let query =
+            format!("SELECT 1 FROM sqlite_schema WHERE type = {object_type} AND name = {name}");
+        let mut stmt = self.conn.prepare(query)?;
+        Ok(run_stmt_once(coro, &mut stmt).await?.is_some())
     }
 
     async fn table_columns_info<Ctx>(
@@ -515,8 +594,9 @@ impl DatabaseReplayGenerator {
         coro: &Coro<Ctx>,
         table_name: &str,
     ) -> Result<(Vec<String>, Vec<usize>)> {
+        let table_name_literal = sql_string_literal(table_name);
         let mut table_info_stmt = self.conn.prepare(format!(
-            "SELECT cid, name, pk FROM pragma_table_info('{table_name}')"
+            "SELECT cid, name, pk FROM pragma_table_info({table_name_literal})"
         ))?;
         let mut pk_column_indices = Vec::with_capacity(1);
         let mut column_names = Vec::new();
