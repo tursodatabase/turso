@@ -898,12 +898,27 @@ impl WalCoordination for InProcessWalCoordination {
         let range = frame_watermark
             .map(|x| 0..=x)
             .unwrap_or(min_frame..=max_frame);
-        frame_cache.get(&page_id).and_then(|frames| {
+        let result = frame_cache.get(&page_id).and_then(|frames| {
             frames
                 .iter()
                 .rfind(|&&frame| range.contains(&frame))
                 .copied()
-        })
+        });
+        if page_id == 12075 || result == Some(5161) {
+            let frames = frame_cache.get(&page_id).cloned().unwrap_or_default();
+            let checkpoint_seq = shared.metadata.wal_header.lock().checkpoint_seq;
+            let shared_snapshot = WalSnapshot {
+                max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
+                nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
+                last_checksum: shared.metadata.last_checksum,
+                checkpoint_seq,
+                transaction_count: shared.metadata.transaction_count.load(Ordering::Acquire),
+            };
+            eprintln!(
+                "[WHOPPER_FIND_FRAME_PROBE] page_id={page_id} result={result:?} min_frame={min_frame} max_frame={max_frame} frame_watermark={frame_watermark:?} shared_snapshot={shared_snapshot:?} frames={frames:?}"
+            );
+        }
+        result
     }
 
     fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
@@ -4082,7 +4097,15 @@ impl Wal for WalFile {
                         local_state.snapshot.max_frame + 1,
                     )
                 } else if snapshot != local_state.snapshot {
-                    if self.has_unpublished_frames.load(Ordering::Acquire) {
+                    let has_unpublished_frames =
+                        self.has_unpublished_frames.load(Ordering::Acquire);
+                    if local_state.snapshot.max_frame > snapshot.max_frame {
+                        eprintln!(
+                            "[WHOPPER_PREPARE_FRAMES_PROBE] snapshot_mismatch has_unpublished_frames={has_unpublished_frames} authority={snapshot:?} local={:?}",
+                            local_state.snapshot
+                        );
+                    }
+                    if has_unpublished_frames {
                         // Spill/raw frames have no commit marker yet
                         // (db_size == 0), so the coordination backend's
                         // max_frame is behind our local max_frame. Chain from
@@ -4259,6 +4282,14 @@ impl Wal for WalFile {
                 frame_db_size,
                 &data_to_write,
             );
+            if page_id == 12075 || page_id == 11505 || next_frame_id == 5161 {
+                let frame = frame_bytes.as_slice();
+                let page_prefix = &frame[WAL_FRAME_HEADER_SIZE
+                    ..WAL_FRAME_HEADER_SIZE + 8.min(shared_page_size as usize)];
+                eprintln!(
+                    "[WHOPPER_WAL_APPEND_PROBE] build frame_id={next_frame_id} page_id={page_id} page_prefix={page_prefix:02x?}"
+                );
+            }
             iovecs.push(frame_bytes);
 
             // (page, assigned_frame_id, cumulative_checksum_at_this_frame)
@@ -4305,6 +4336,14 @@ impl Wal for WalFile {
 
         for (page, fid, csum) in &page_frame_and_checksum {
             self.complete_append_frame(page.get().id as u64, *fid, *csum);
+            if page.get().id == 12075 || page.get().id == 11505 || *fid == 5161 {
+                eprintln!(
+                    "[WHOPPER_WAL_APPEND_PROBE] index frame_id={fid} current_page_id={} wal_tag={:?} has_unpublished_frames={}",
+                    page.get().id,
+                    page.wal_tag_pair(),
+                    self.has_unpublished_frames.load(Ordering::Acquire)
+                );
+            }
         }
 
         Ok(c)
