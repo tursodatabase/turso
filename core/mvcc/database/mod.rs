@@ -1616,6 +1616,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     self.tx_id,
                     self.connection.as_ref(),
                     self.db_id,
+                    self.did_commit_schema_change,
                 );
             }
             self.end_read_tx_for_db();
@@ -2106,9 +2107,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             // - look only at this one write-set entry (`row_versions`);
             // - copy the versions written or ended by the committing transaction;
             // - if this same entry appears twice with the same
-            //   `begin=Timestamp(...)`, keep the later one, because recovery should
-            //   not replay an intermediate value for the same table row,
-            //   sqlite_schema row, or index entry;
+            //   `begin=Timestamp(...)`, keep the later one, except when the earlier
+            //   one is a B-tree-resident delete marker that checkpoint still needs;
             // - append those versions to `log_record.row_versions` without sorting
             //   them against versions from other write-set entries.
 
@@ -2198,8 +2198,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     continue;
                 };
                 canonicalize_table_id(&mut committed_version);
+                let is_btree_resident_delete_marker =
+                    |version: &RowVersion| version.btree_resident && version.end().is_some();
                 let replaces_last = entry_versions.last().is_some_and(|last| {
                     last.row.id == committed_version.row.id
+                        && !is_btree_resident_delete_marker(last)
                         && matches!(
                             (&last.begin(), &committed_version.begin()),
                             (
@@ -2218,6 +2221,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 {
                     let same_row_and_begin = |existing: &RowVersion| {
                         existing.row.id == committed_version.row.id
+                            && !is_btree_resident_delete_marker(existing)
+                            && !is_btree_resident_delete_marker(&committed_version)
                             && matches!(
                                 (&existing.begin(), &committed_version.begin()),
                                 (
@@ -5986,15 +5991,45 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         crate::without_allocation_faults!(self.remove_tx(tx_id).expect(ALLOC_ERR_MSG));
     }
 
-    fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
+    fn cleanup_dropped_commit(
+        &self,
+        tx_id: TxID,
+        connection: &Connection,
+        db_id: usize,
+        did_commit_schema_change: bool,
+    ) {
         let tx_state = self.txs.get(&tx_id).map(|tx| tx.value().state.load());
         match tx_state {
             Some(TransactionState::Active | TransactionState::Preparing(_)) => {
                 self.rollback_tx_inner(tx_id, Some(connection), db_id);
             }
-            Some(TransactionState::Committed(_)) => {
-                if let Some(tx) = self.txs.get(&tx_id) {
-                    self.unlock_commit_lock_if_held(tx.value());
+            Some(TransactionState::Committed(commit_ts)) => {
+                if let Some(tx_entry) = self.txs.get(&tx_id) {
+                    let tx = tx_entry.value();
+                    self.rewrite_committed_tx_references(tx_id, commit_ts, tx);
+
+                    let dependents = std::mem::take(&mut *tx.commit_dep_set.lock());
+                    for dep_tx_id in dependents {
+                        if let Some(dep_tx_entry) = self.txs.get(&dep_tx_id) {
+                            dep_tx_entry
+                                .value()
+                                .commit_dep_counter
+                                .fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
+
+                    self.unlock_commit_lock_if_held(tx);
+                    let tx_header = *tx.header.read();
+                    let last_committed_ts = self
+                        .last_committed_tx_ts
+                        .fetch_max(commit_ts, Ordering::AcqRel);
+                    if last_committed_ts <= commit_ts {
+                        self.global_header.write().replace(tx_header);
+                    }
+                    if did_commit_schema_change {
+                        self.last_committed_schema_change_ts
+                            .fetch_max(commit_ts, Ordering::AcqRel);
+                    }
                 }
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
@@ -6009,6 +6044,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
+                }
+            }
+        }
+    }
+
+    fn rewrite_committed_tx_references(&self, tx_id: TxID, commit_ts: u64, tx: &Transaction<A>) {
+        let write_set_snapshot: Vec<(RowID, RowVersions<A>)> = tx.write_set.lock().to_vec();
+        for (_rowid, row_versions) in &write_set_snapshot {
+            for row_version in row_versions.write().iter_mut() {
+                if row_version.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
+                    row_version.set_begin(Some(TxTimestampOrID::Timestamp(commit_ts)));
+                }
+                if row_version.end() == Some(TxTimestampOrID::TxID(tx_id)) {
+                    row_version.set_end(Some(TxTimestampOrID::Timestamp(commit_ts)));
                 }
             }
         }
@@ -6810,8 +6859,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Rule 1: Aborted garbage (begin=None, end=None) — always remove.
     /// Rule 2: Superseded (end=Timestamp(e), e <= lwm) — remove unless it's a
     ///         tombstone (no committed current version) whose deletion hasn't
-    ///         been checkpointed (e > ckpt_max), or a B-tree-resident version
-    ///         whose physical delete/overwrite hasn't been checkpointed.
+    ///         been checkpointed (e > ckpt_max), or a version with a physical
+    ///         B-tree image whose delete/overwrite hasn't been checkpointed.
     /// Rule 3: Current checkpointed sole-survivor (end=None, b <= ckpt_max,
     ///         b < lwm, no other versions remain) — remove.
     ///
@@ -6826,10 +6875,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // removable — UNLESS it's a tombstone (sole version, no committed
         // current version) whose deletion hasn't been checkpointed to B-tree
         // yet. In that case removing it would let the dual cursor fall through
-        // to a stale B-tree row. A B-tree-resident version needs the same guard
-        // even with a committed current replacement: that replacement can be
-        // deleted before checkpoint, leaving this as the only evidence that
-        // checkpoint must remove or overwrite the physical row.
+        // to a stale B-tree row. A version with a physical B-tree image needs
+        // the same guard even with a committed current replacement: that
+        // replacement can be deleted before checkpoint, leaving this as the
+        // only evidence that checkpoint must remove or overwrite the physical
+        // row.
         //
         // has_current only counts committed current versions (begin=Timestamp).
         // Pending inserts (begin=TxID) don't count — they might roll back,
@@ -6839,8 +6889,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         });
         versions.retain(|rv| match &rv.end() {
             Some(TxTimestampOrID::Timestamp(e)) if *e <= lwm => {
-                // Also retain B-tree-resident versions until checkpoint makes the physical change durable.
-                *e > ckpt_max && (rv.btree_resident || !has_current)
+                let has_physical_btree_image = rv.btree_resident
+                    || matches!(
+                        rv.begin(),
+                        Some(TxTimestampOrID::Timestamp(b)) if b <= ckpt_max
+                    );
+                *e > ckpt_max && (has_physical_btree_image || !has_current)
             }
             _ => true,
         });
