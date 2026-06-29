@@ -428,3 +428,38 @@ expect {
     3600000000000
 }
 
+test time_constructor_types {
+    SELECT typeof(time_now());
+    SELECT typeof(time_date(2024, 1, 1));
+    SELECT typeof(time_unix(1700000000));
+    SELECT typeof(time_milli(1700000000000));
+    SELECT typeof(time_micro(1700000000000000));
+    SELECT typeof(time_nano(1700000000000000000));
+    SELECT typeof(make_date(2024, 1, 1));
+    SELECT typeof(make_timestamp(2024, 1, 1, 0, 0, 0));
+    SELECT typeof(to_timestamp(1700000000));
+    SELECT typeof(time_parse('2024-01-01'));
+}
+expect {
+    blob
+    blob
+    blob
+    blob
+    blob
+    blob
+    blob
+    blob
+    blob
+    blob
+}
+
+@requires strict "uses STRICT tables"
+test time_now_strict_blob_column {
+    CREATE TABLE t (t BLOB) STRICT;
+    INSERT INTO t VALUES (time_now());
+    SELECT typeof(t) FROM t;
+}
+expect {
+    blob
+}
+
