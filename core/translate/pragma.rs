@@ -10,7 +10,7 @@ use turso_parser::ast::PragmaName;
 use turso_parser::ast::{self, Expr, Literal};
 
 use super::integrity_check::{
-    MAX_INTEGRITY_CHECK_ERRORS, translate_integrity_check, translate_quick_check,
+    translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
 };
 use crate::function::Func;
 use crate::pragma::pragma_for;
@@ -22,10 +22,10 @@ use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::plan::BitSet;
-use crate::util::{IOExt as _, normalize_ident, parse_signed_number, parse_string};
+use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{CaptureDataChangesInfo, LimboError, Numeric, Value, bail_parse_error};
+use crate::{bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
