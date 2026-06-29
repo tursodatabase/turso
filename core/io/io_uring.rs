@@ -530,6 +530,23 @@ impl IO for UringIO {
                 // SAFETY: holding `state` Mutex.
                 unsafe { state.flush_overflow(&self.ring) };
                 if state.empty() {
+                    // Step down as leader *before* releasing `state`. A
+                    // submitter must hold `state` to push an SQE, so dropping
+                    // `_wait_guard` while we still hold `state` closes the
+                    // lost-leader race: any racing follower either (a) already
+                    // pushed its op and we observed it just above (so the ring
+                    // is not actually empty and we keep draining), or (b) is
+                    // still blocked on `state` and, once we release it, finds
+                    // `wait_lock` free and becomes the leader itself.
+                    //
+                    // Releasing `wait_lock` *after* `state` (i.e. just letting
+                    // both guards drop at the end of this scope) left a window:
+                    // a follower could push its SQE under `state` (now free),
+                    // then lose `try_lock(wait_lock)` against this departing
+                    // leader, defer, and park on its completion's waker — which
+                    // nobody would ever fire, because we then left with its op
+                    // still pending and no leader to drain the ring.
+                    drop(_wait_guard);
                     return Ok(());
                 }
                 state.pending_ops

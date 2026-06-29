@@ -737,3 +737,114 @@ async fn begin_publish_window_gc_scenario(num_readers: usize, rounds: i64) {
         "Observed a row, and then no row. This violates Snapshot Isolation"
     );
 }
+
+/// Regression test for the io_uring `step()` leader/follower lost-wakeup
+/// deadlock.
+///
+/// `UringIO::step()` is a leader/follower IO pump. One caller wins `wait_lock`
+/// and becomes the *leader*, draining the ring until it is empty; concurrent
+/// callers `try_lock`, lose the race, and *defer* — returning immediately and
+/// parking on their own completion's waker, trusting the leader to drain the op
+/// they just submitted.
+///
+/// The bug is a lost-leader race. On the buggy code the leader, after observing
+/// an empty ring, releases the `state` lock and *then* releases `wait_lock` —
+/// two separate unlocks. A follower can slip into that window: push its SQE
+/// under `state` (now free), then `try_lock(wait_lock)` while the departing
+/// leader still holds it → it fails, defers, and parks. The leader then leaves
+/// with the follower's op still pending and nobody left to pump the ring, so the
+/// follower waits forever.
+///
+/// This drives a couple of async tasks through `step()`'s handoff directly,
+/// using only the public `IO`/`File`/`Completion` API — no DB/MVCC/btree
+/// internals. The await primitive mirrors production's
+/// `core::types::IOCompletionAsync`: poll the completion, and if it is not
+/// finished, drive exactly one `step()` and park on its waker. It must *park*,
+/// not spin — `IO::wait_for_completion` spins `step()` and would silently
+/// rescue the follower, masking the bug. Under shuttle the `wait_lock`/`state`
+/// mutexes are shuttle-instrumented, so the scheduler explores the interleaving
+/// and the deadlock detector fires on the buggy code.
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+mod io_uring_step_deadlock {
+    use super::{shuttle_config, Arc};
+    use shuttle::scheduler::{PctScheduler, RandomScheduler};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use turso_core::{Buffer, Completion, File, OpenFlags, UringIO, IO};
+
+    /// Await a single completion the way the production async path does: poll
+    /// it, and if it is not yet finished, drive exactly one `step()` and park
+    /// on its waker (re-polled only when the leader drains it).
+    struct AwaitCompletion {
+        io: Arc<dyn IO>,
+        completion: Completion,
+    }
+
+    impl Future for AwaitCompletion {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            match Pin::new(&mut this.completion).poll(cx) {
+                Poll::Pending => {
+                    this.io.step().unwrap();
+                    Poll::Pending
+                }
+                Poll::Ready(_) => Poll::Ready(()),
+            }
+        }
+    }
+
+    async fn submit_one_write(io: Arc<dyn IO>, file: Arc<dyn File>, pos: u64, byte: u8) {
+        let buf = Arc::new(Buffer::new(vec![byte; 64]));
+        let completion = Completion::new_write(|_| {});
+        let completion = file.pwrite(pos, buf, completion).unwrap();
+        AwaitCompletion { io, completion }.await;
+    }
+
+    /// `num_tasks` async tasks each submit one write to a distinct offset and
+    /// await it via the parking path. With the buggy `step()` this wedges when
+    /// one task finishes its leader stint and leaves exactly as another submits
+    /// and defers.
+    async fn step_handoff_scenario(num_tasks: usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uring_deadlock.bin");
+        let io: Arc<dyn IO> = Arc::new(UringIO::new().unwrap());
+        let file = io
+            .open_file(path.to_str().unwrap(), OpenFlags::Create, false)
+            .unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0..num_tasks {
+            let io = io.clone();
+            let file = file.clone();
+            handles.push(turso_stress::future::spawn(async move {
+                submit_one_write(io, file, (i as u64) * 64, i as u8).await;
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn shuttle_test_io_uring_step_handoff_deadlock() {
+        // The bug is low-depth and reproduces within the first handful of
+        // iterations on the unfixed code; 2000 schedules is a comfortable
+        // margin while keeping the (passing) run quick — each iteration spins
+        // up a fresh io_uring ring, which is syscall-heavy.
+        let scheduler = RandomScheduler::new(2000);
+        let runner = shuttle::Runner::new(scheduler, shuttle_config());
+        runner.run(|| shuttle::future::block_on(step_handoff_scenario(2)));
+    }
+
+    #[test]
+    fn shuttle_test_io_uring_step_handoff_deadlock_pct() {
+        // PCT with a small depth bound targets exactly this kind of
+        // few-ordering-constraints liveness bug.
+        let scheduler = PctScheduler::new(2, 2000);
+        let runner = shuttle::Runner::new(scheduler, shuttle_config());
+        runner.run(|| shuttle::future::block_on(step_handoff_scenario(2)));
+    }
+}

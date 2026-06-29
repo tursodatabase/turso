@@ -117,7 +117,8 @@ jobs:
       env:
         RUST_BACKTRACE: "full"
         RUSTFLAGS: "--cfg=shuttle"
-      run: cargo test -p turso_stress --locked --test shuttle_mvcc
+      # io_uring enables the UringIO leader/follower deadlock regression test.
+      run: cargo test -p turso_stress --locked --features io_uring --test shuttle_mvcc
     - name: Run shuttle stress test
       env:
         RUST_BACKTRACE: 1

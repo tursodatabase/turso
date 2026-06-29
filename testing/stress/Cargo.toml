@@ -22,6 +22,10 @@ path = "main.rs"
 
 [features]
 default = []
+# Enables the real io_uring IO backend (Linux only) so the shuttle tests can
+# drive `turso_core::UringIO` directly. Used by the io_uring step()
+# leader/follower deadlock regression test in tests/shuttle_mvcc.rs.
+io_uring = ["turso_core/io_uring"]
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
