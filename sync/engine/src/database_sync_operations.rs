@@ -201,14 +201,8 @@ pub async fn db_bootstrap<IO: SyncEngineIo, Ctx>(
         ctx.coro.yield_(SyncEngineIoResult::IO).await?;
     }
 
-    // sync files in the end
-    let c = Completion::new_sync(move |_| {
-        // todo(sivukhin): we need to error out in case of failed sync
-    });
-    let c = db.sync(c, FileSyncType::Fsync)?;
-    while !c.succeeded() {
-        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    // sync file in the end
+    sync_file(ctx.coro, &db).await?;
 
     let elapsed = std::time::Instant::now().duration_since(start_time);
     tracing::info!("db_bootstrap: finished: bytes={pos}, elapsed={:?}", elapsed);
@@ -383,13 +377,7 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
         offset += WAL_FRAME_SIZE as u64;
     }
 
-    let c = Completion::new_sync(move |_| {
-        // todo(sivukhin): we need to error out in case of failed sync
-    });
-    let c = frames_file.sync(c, FileSyncType::Fsync)?;
-    while !c.succeeded() {
-        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    sync_file(ctx.coro, frames_file).await?;
 
     Ok(DatabasePullRevision::V1 {
         revision: header.server_revision,
@@ -602,13 +590,7 @@ pub async fn wal_pull_to_file_legacy<IO: SyncEngineIo, Ctx>(
         ctx.coro.yield_(SyncEngineIoResult::IO).await?;
     }
 
-    let c = Completion::new_sync(move |_| {
-        // todo(sivukhin): we need to error out in case of failed sync
-    });
-    let c = frames_file.sync(c, FileSyncType::Fsync)?;
-    while !c.succeeded() {
-        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    sync_file(ctx.coro, frames_file).await?;
 
     Ok(revision)
 }
@@ -1496,6 +1478,11 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
         }
     }
 
+    // Persist the bootstrapped DB file before the caller records this revision
+    // as durable in the metadata; otherwise a crash could leave the DB file
+    // with unflushed pages while the metadata claims a completed bootstrap.
+    sync_file(ctx.coro, &file).await?;
+
     Ok(DatabasePullRevision::V1 {
         revision: header.server_revision,
     })
@@ -1535,7 +1522,10 @@ pub async fn bootstrap_db_file_legacy<IO: SyncEngineIo, Ctx>(
         io.truncate(ctx.coro, file, 0).await?;
     }
     if let Some(file) = io.try_open(&format!("{main_db_path}-wal"))? {
-        io.truncate(ctx.coro, file, 0).await?;
+        io.truncate(ctx.coro, file.clone(), 0).await?;
+        // Make the WAL reset durable so a stale WAL can't reappear next to the
+        // freshly bootstrapped DB after a crash and get replayed onto it.
+        sync_file(ctx.coro, &file).await?;
     }
 
     let file = io.create(main_db_path)?;
@@ -1552,6 +1542,18 @@ pub async fn bootstrap_db_file_legacy<IO: SyncEngineIo, Ctx>(
         generation: db_info.current_generation,
         synced_frame_no: None,
     })
+}
+
+/// fsync the given file, yielding on the coro until the sync completion finishes.
+pub async fn sync_file<Ctx>(coro: &Coro<Ctx>, file: &Arc<dyn turso_core::File>) -> Result<()> {
+    let c = Completion::new_sync(|_| {
+        // todo(sivukhin): we need to error out in case of failed sync
+    });
+    let c = file.sync(c, FileSyncType::Fsync)?;
+    while !c.succeeded() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    Ok(())
 }
 
 pub async fn reset_wal_file<Ctx>(
@@ -1576,6 +1578,10 @@ pub async fn reset_wal_file<Ctx>(
     while !c.succeeded() {
         coro.yield_(SyncEngineIoResult::IO).await?;
     }
+    // Persist the truncation: without fsync a crash could leave stale revert
+    // frames on disk while the metadata already records the new revert
+    // watermark, which would corrupt the next rollback.
+    sync_file(coro, &wal).await?;
     Ok(())
 }
 
@@ -1953,5 +1959,111 @@ mod tests {
     fn test_remote_encryption_key_header_constant() {
         use super::ENCRYPTION_KEY_HEADER;
         assert_eq!(ENCRYPTION_KEY_HEADER, "x-turso-encryption-key");
+    }
+
+    /// `reset_wal_file` resets the revert WAL and then records the new revert
+    /// watermark durably in the metadata. If the truncation isn't fsynced, a
+    /// crash could leave stale revert frames on disk, so the function must issue
+    /// an fsync after truncating.
+    #[test]
+    fn test_reset_wal_file_fsyncs_truncation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        use tempfile::NamedTempFile;
+        use turso_core::{io::FileSyncType, Buffer, Completion, File, OpenFlags, IO};
+
+        use crate::database_sync_operations::reset_wal_file;
+
+        struct CountingFile {
+            inner: Arc<dyn File>,
+            syncs: Arc<AtomicUsize>,
+            truncates: Arc<AtomicUsize>,
+        }
+
+        impl File for CountingFile {
+            fn lock_file(&self, exclusive: bool) -> turso_core::Result<()> {
+                self.inner.lock_file(exclusive)
+            }
+            fn unlock_file(&self) -> turso_core::Result<()> {
+                self.inner.unlock_file()
+            }
+            fn pread(&self, pos: u64, c: Completion) -> turso_core::Result<Completion> {
+                self.inner.pread(pos, c)
+            }
+            fn pwrite(
+                &self,
+                pos: u64,
+                buffer: Arc<Buffer>,
+                c: Completion,
+            ) -> turso_core::Result<Completion> {
+                self.inner.pwrite(pos, buffer, c)
+            }
+            fn sync(
+                &self,
+                c: Completion,
+                sync_type: FileSyncType,
+            ) -> turso_core::Result<Completion> {
+                self.syncs.fetch_add(1, Ordering::SeqCst);
+                self.inner.sync(c, sync_type)
+            }
+            fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
+                self.truncates.fetch_add(1, Ordering::SeqCst);
+                self.inner.truncate(len, c)
+            }
+            fn size(&self) -> turso_core::Result<u64> {
+                self.inner.size()
+            }
+        }
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let inner = io.open_file(path, OpenFlags::Create, false).unwrap();
+
+        // make the WAL non-empty so the truncation actually has frames to drop
+        let buffer = Arc::new(Buffer::new_temporary(4096));
+        let c = inner
+            .pwrite(0, buffer.clone(), Completion::new_write(|_| {}))
+            .unwrap();
+        while !c.succeeded() {
+            io.step().unwrap();
+        }
+        assert!(inner.size().unwrap() > 0);
+
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let truncates = Arc::new(AtomicUsize::new(0));
+        let counting: Arc<dyn File> = Arc::new(CountingFile {
+            inner: inner.clone(),
+            syncs: syncs.clone(),
+            truncates: truncates.clone(),
+        });
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let counting = counting.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                reset_wal_file(&coro, counting, 0).await
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(truncates.load(Ordering::SeqCst), 1, "wal must be truncated");
+        assert!(
+            syncs.load(Ordering::SeqCst) >= 1,
+            "reset_wal_file must fsync the truncation"
+        );
+        assert_eq!(counting.size().unwrap(), 0, "wal must be truncated to zero");
     }
 }

@@ -15,7 +15,7 @@ use crate::{
     database_sync_operations::{
         acquire_slot, apply_transformation, bootstrap_db_file, connect_untracked,
         count_local_changes, has_table, push_logical_changes, read_last_change_id, read_wal_salt,
-        reset_wal_file, update_last_change_id, wait_all_results, wal_apply_from_file,
+        reset_wal_file, sync_file, update_last_change_id, wait_all_results, wal_apply_from_file,
         wal_pull_to_file, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER,
         WAL_FRAME_SIZE,
     },
@@ -768,6 +768,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
             revert_session.commit(db_size)?;
             revert_session.wal_session.end(false)?;
+        }
+        // The revert frames above are written through raw WAL inserts (pwrite
+        // without fsync) and the session is closed with force_commit=false,
+        // which doesn't sync either. Persist them durably before update_meta
+        // records the new revert watermark: otherwise a crash could lose revert
+        // frames the metadata claims exist, corrupting the next rollback.
+        if let Some(revert_wal_file) = self.io.try_open(&self.revert_db_wal_path)? {
+            sync_file(coro, &revert_wal_file).await?;
         }
         self.update_meta(coro, |meta| {
             meta.revert_since_wal_salt = main_wal_salt;
