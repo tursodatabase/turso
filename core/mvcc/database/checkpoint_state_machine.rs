@@ -1270,13 +1270,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // through WAL even if the later WAL checkpoint/log truncation is busy.
         let mut schema_ref = self.connection.db.schema.lock();
         let schema = Arc::make_mut(&mut *schema_ref);
-        for table in schema.tables.values_mut() {
+        for (name, table) in schema.tables.iter_mut() {
             let table = Arc::get_mut(table).expect("this should be the only reference");
             let Some(btree_table) = table.btree_mut() else {
                 continue;
             };
             let btree_table = Arc::make_mut(btree_table);
             if btree_table.root_page < 0 {
+                let old_root_page = btree_table.root_page;
                 let table_id = MVTableId::from(btree_table.root_page);
                 let entry = self
                     .mvstore
@@ -1287,6 +1288,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     .value()
                     .expect("table with id {table_id:?} should have a mapping");
                 btree_table.root_page = value as i64;
+                #[cfg(feature = "conn_raw_api")]
+                {
+                    schema.table_names_by_root_page.remove(&old_root_page);
+                    schema
+                        .table_names_by_root_page
+                        .insert(btree_table.root_page, name.clone());
+                }
             }
         }
         for table_index_list in schema.indexes.values_mut() {
