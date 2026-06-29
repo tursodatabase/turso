@@ -139,7 +139,7 @@ impl Node {
     }
 
     /// Mark this node that a writer is currently playing with it.
-    pub fn reserve_writer(&self) -> NodeReservation {
+    pub fn reserve_writer(&self) -> NodeReservation<'_> {
         self.active_writers.fetch_add(1, Acquire);
         NodeReservation(self)
     }
@@ -194,7 +194,7 @@ impl Node {
     }
 
     /// Iterate over the fast slots.
-    pub(crate) fn fast_slots(&self) -> Iter<Debt> {
+    pub(crate) fn fast_slots(&self) -> Iter<'_, Debt> {
         self.fast.into_iter()
     }
 

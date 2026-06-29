@@ -30,16 +30,24 @@ pub struct HybridProtection<T: RefCnt> {
 }
 
 impl<T: RefCnt> HybridProtection<T> {
-    pub(super) unsafe fn new(ptr: *const T::Base, debt: Option<&'static Debt>) -> Self {
+    pub(super) unsafe fn new(
+        ptr: *const T::Base,
+        debt: Option<&'static Debt>,
+        allocator: &T::Allocator,
+    ) -> Self {
         Self {
             debt,
-            ptr: ManuallyDrop::new(T::from_ptr(ptr)),
+            ptr: ManuallyDrop::new(T::from_ptr(ptr, allocator)),
         }
     }
 
     /// Try getting a dept into a fast slot.
     #[inline]
-    fn attempt(node: &LocalNode, storage: &AtomicPtr<T::Base>) -> Option<Self> {
+    fn attempt(
+        node: &LocalNode,
+        storage: &AtomicPtr<T::Base>,
+        allocator: &T::Allocator,
+    ) -> Option<Self> {
         // Relaxed is good enough here, see the Acquire below
         let ptr = storage.load(Relaxed);
         // Try to get a debt slot. If not possible, fail.
@@ -51,7 +59,7 @@ impl<T: RefCnt> HybridProtection<T> {
         let confirm = storage.load(SeqCst);
         if ptr == confirm {
             // Successfully got a debt
-            Some(unsafe { Self::new(ptr, Some(debt)) })
+            Some(unsafe { Self::new(ptr, Some(debt), allocator) })
         } else if debt.pay::<T>(ptr) {
             // It changed in the meantime, we return the debt (that is on the outdated pointer,
             // possibly destroyed) and fail.
@@ -59,12 +67,16 @@ impl<T: RefCnt> HybridProtection<T> {
         } else {
             // It changed in the meantime, but the debt for the previous pointer was already paid
             // for by someone else, so we are fine using it.
-            Some(unsafe { Self::new(ptr, None) })
+            Some(unsafe { Self::new(ptr, None, allocator) })
         }
     }
 
     /// Get a debt slot using the slower but always successful mechanism.
-    fn fallback(node: &LocalNode, storage: &AtomicPtr<T::Base>) -> Self {
+    fn fallback(
+        node: &LocalNode,
+        storage: &AtomicPtr<T::Base>,
+        allocator: &T::Allocator,
+    ) -> Self {
         // First, we claim a debt slot and store the address of the atomic pointer there, so the
         // writer can optionally help us out with loading and protecting something.
         let gen = node.new_helping(storage as *const _ as usize);
@@ -78,17 +90,17 @@ impl<T: RefCnt> HybridProtection<T> {
         match node.confirm_helping(gen, candidate as usize) {
             Ok(debt) => {
                 // The fast path -> we got the debt confirmed alright.
-                Self::from_inner(unsafe { Self::new(candidate, Some(debt)).into_inner() })
+                Self::from_inner(unsafe { Self::new(candidate, Some(debt), allocator).into_inner() })
             }
             Err((unused_debt, replacement)) => {
                 // The debt is on the candidate we provided and it is unused, we so we just pay it
                 // back right away.
                 if !unused_debt.pay::<T>(candidate) {
-                    unsafe { T::dec(candidate) };
+                    unsafe { T::dec(candidate, allocator) };
                 }
                 // We got a (possibly) different pointer out. But that one is already protected and
                 // the slot is paid back.
-                unsafe { Self::new(replacement as *mut _, None) }
+                unsafe { Self::new(replacement as *mut _, None, allocator) }
             }
         }
     }
@@ -140,7 +152,8 @@ impl<T: RefCnt> Protected<T> for HybridProtection<T> {
             Some(debt) => {
                 let ptr = T::inc(&self.ptr);
                 if !debt.pay::<T>(ptr) {
-                    unsafe { T::dec(ptr) };
+                    let allocator = T::allocator(&self.ptr);
+                    unsafe { T::dec(ptr, &allocator) };
                 }
             }
         }
@@ -183,23 +196,32 @@ where
     Cfg: Config,
 {
     type Protected = HybridProtection<T>;
-    unsafe fn load(&self, storage: &AtomicPtr<T::Base>) -> Self::Protected {
+    unsafe fn load(
+        &self,
+        storage: &AtomicPtr<T::Base>,
+        allocator: &T::Allocator,
+    ) -> Self::Protected {
         LocalNode::with(|node| {
             let fast = if Cfg::USE_FAST {
-                HybridProtection::attempt(node, storage)
+                HybridProtection::attempt(node, storage, allocator)
             } else {
                 None
             };
-            fast.unwrap_or_else(|| HybridProtection::fallback(node, storage))
+            fast.unwrap_or_else(|| HybridProtection::fallback(node, storage, allocator))
         })
     }
-    unsafe fn wait_for_readers(&self, old: *const T::Base, storage: &AtomicPtr<T::Base>) {
+    unsafe fn wait_for_readers(
+        &self,
+        old: *const T::Base,
+        storage: &AtomicPtr<T::Base>,
+        allocator: &T::Allocator,
+    ) {
         // The pay_all may need to provide fresh replacement values if someone else is loading from
         // this particular storage. We do so by the exact same way, by `load` ‒ it's OK, a writer
         // does not hold a slot and the reader doesn't recurse back into writer, so we won't run
         // out of slots.
-        let replacement = || self.load(storage).into_inner();
-        Debt::pay_all::<T, _>(old, storage as *const _ as usize, replacement);
+        let replacement = || self.load(storage, allocator).into_inner();
+        Debt::pay_all::<T, _>(old, storage as *const _ as usize, replacement, allocator);
     }
 }
 
@@ -209,9 +231,10 @@ impl<T: RefCnt, Cfg: Config> CaS<T> for HybridStrategy<Cfg> {
         storage: &AtomicPtr<T::Base>,
         current: C,
         new: T,
+        allocator: &T::Allocator,
     ) -> Self::Protected {
         loop {
-            let old = <Self as InnerStrategy<T>>::load(self, storage);
+            let old = <Self as InnerStrategy<T>>::load(self, storage, allocator);
             // Observation of their inequality is enough to make a verdict
             if old.as_ptr() != current.as_raw() {
                 return old;
@@ -224,10 +247,15 @@ impl<T: RefCnt, Cfg: Config> CaS<T> for HybridStrategy<Cfg> {
             {
                 // We successfully put the new value in. The ref count went in there too.
                 T::into_ptr(new);
-                <Self as InnerStrategy<T>>::wait_for_readers(self, old.as_ptr(), storage);
+                <Self as InnerStrategy<T>>::wait_for_readers(
+                    self,
+                    old.as_ptr(),
+                    storage,
+                    allocator,
+                );
                 // We just got one ref count out of the storage and we have one in old. We don't
                 // need two.
-                T::dec(old.as_ptr());
+                T::dec(old.as_ptr(), allocator);
                 return old;
             }
         }

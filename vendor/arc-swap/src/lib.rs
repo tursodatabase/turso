@@ -2,6 +2,7 @@
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(deprecated)]
+#![cfg_attr(nightly, feature(allocator_api))]
 #![cfg_attr(feature = "experimental-thread-local", no_std)]
 #![cfg_attr(feature = "experimental-thread-local", feature(thread_local))]
 
@@ -154,6 +155,8 @@ use alloc::sync::Arc;
 use crate::access::{Access, Map};
 pub use crate::as_raw::AsRaw;
 pub use crate::cache::Cache;
+#[cfg(nightly)]
+pub use crate::ref_cnt::ArcSwapAllocator;
 pub use crate::ref_cnt::RefCnt;
 use crate::strategy::hybrid::{DefaultConfig, HybridStrategy};
 use crate::strategy::sealed::Protected;
@@ -304,10 +307,16 @@ where
 /// [`Arc`]: https://doc.rust-lang.org/std/sync/struct.Arc.html
 /// [`from`]: https://doc.rust-lang.org/nightly/std/convert/trait.From.html#tymethod.from
 /// [`RefCnt`]: trait.RefCnt.html
-pub struct ArcSwapAny<T: RefCnt, S: Strategy<T> = DefaultStrategy> {
+pub struct ArcSwapAny<
+    T: RefCnt<Allocator = A>,
+    S: Strategy<T> = DefaultStrategy,
+    A: Clone + Default = <T as RefCnt>::Allocator,
+> {
     // Notes: AtomicPtr needs Sized
     /// The actual pointer, extracted from the Arc.
     ptr: AtomicPtr<T::Base>,
+    /// Allocator/context used to reconstruct pointers from raw storage.
+    allocator: A,
 
     /// We are basically an Arc in disguise. Inherit parameters from Arc by pretending to contain
     /// it.
@@ -317,27 +326,40 @@ pub struct ArcSwapAny<T: RefCnt, S: Strategy<T> = DefaultStrategy> {
     strategy: S,
 }
 
-impl<T: RefCnt, S: Default + Strategy<T>> From<T> for ArcSwapAny<T, S> {
+impl<T, S, A> From<T> for ArcSwapAny<T, S, A>
+where
+    T: RefCnt<Allocator = A>,
+    S: Default + Strategy<T>,
+    A: Clone + Default,
+{
     fn from(val: T) -> Self {
         Self::with_strategy(val, S::default())
     }
 }
 
-impl<T: RefCnt, S: Strategy<T>> Drop for ArcSwapAny<T, S> {
+impl<T, S, A> Drop for ArcSwapAny<T, S, A>
+where
+    T: RefCnt<Allocator = A>,
+    S: Strategy<T>,
+    A: Clone + Default,
+{
     fn drop(&mut self) {
         let ptr = *self.ptr.get_mut();
         unsafe {
             // To pay any possible debts
-            self.strategy.wait_for_readers(ptr, &self.ptr);
+            self.strategy
+                .wait_for_readers(ptr, &self.ptr, &self.allocator);
             // We are getting rid of the one stored ref count
-            T::dec(ptr);
+            T::dec(ptr, &self.allocator);
         }
     }
 }
 
-impl<T, S: Strategy<T>> Debug for ArcSwapAny<T, S>
+impl<T, S, A> Debug for ArcSwapAny<T, S, A>
 where
-    T: Debug + RefCnt,
+    T: Debug + RefCnt<Allocator = A>,
+    S: Strategy<T>,
+    A: Clone + Default,
 {
     fn fmt(&self, formatter: &mut Formatter) -> FmtResult {
         formatter
@@ -347,22 +369,34 @@ where
     }
 }
 
-impl<T, S: Strategy<T>> Display for ArcSwapAny<T, S>
+impl<T, S, A> Display for ArcSwapAny<T, S, A>
 where
-    T: Display + RefCnt,
+    T: Display + RefCnt<Allocator = A>,
+    S: Strategy<T>,
+    A: Clone + Default,
 {
     fn fmt(&self, formatter: &mut Formatter) -> FmtResult {
         self.load().fmt(formatter)
     }
 }
 
-impl<T: RefCnt + Default, S: Default + Strategy<T>> Default for ArcSwapAny<T, S> {
+impl<T, S, A> Default for ArcSwapAny<T, S, A>
+where
+    T: RefCnt<Allocator = A> + Default,
+    S: Default + Strategy<T>,
+    A: Clone + Default,
+{
     fn default() -> Self {
         Self::new(T::default())
     }
 }
 
-impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
+impl<T, S, A> ArcSwapAny<T, S, A>
+where
+    T: RefCnt<Allocator = A>,
+    S: Strategy<T>,
+    A: Clone + Default,
+{
     /// Constructs a new storage.
     pub fn new(val: T) -> Self
     where
@@ -371,14 +405,29 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
         Self::from(val)
     }
 
+    /// Constructs a new storage with an explicit allocator/context.
+    pub fn new_in(val: T, allocator: A) -> Self
+    where
+        S: Default,
+    {
+        Self::with_strategy_in(val, S::default(), allocator)
+    }
+
     /// Constructs a new storage while customizing the protection strategy.
     pub fn with_strategy(val: T, strategy: S) -> Self {
+        let allocator = T::allocator(&val);
+        Self::with_strategy_in(val, strategy, allocator)
+    }
+
+    /// Constructs a new storage with an explicit allocator/context.
+    pub fn with_strategy_in(val: T, strategy: S, allocator: A) -> Self {
         // The AtomicPtr requires *mut in its interface. We are more like *const, so we cast it.
         // However, we always go back to *const right away when we get the pointer on the other
         // side, so it should be fine.
         let ptr = T::into_ptr(val);
         Self {
             ptr: AtomicPtr::new(ptr),
+            allocator,
             _phantom_arc: PhantomData,
             strategy,
         }
@@ -388,9 +437,13 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
     pub fn into_inner(mut self) -> T {
         let ptr = *self.ptr.get_mut();
         // To pay all the debts
-        unsafe { self.strategy.wait_for_readers(ptr, &self.ptr) };
+        unsafe {
+            self.strategy
+                .wait_for_readers(ptr, &self.ptr, &self.allocator)
+        };
+        let allocator = self.allocator.clone();
         mem::forget(self);
-        unsafe { T::from_ptr(ptr) }
+        unsafe { T::from_ptr(ptr, &allocator) }
     }
 
     /// Loads the value.
@@ -451,7 +504,7 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
     /// ```
     #[inline]
     pub fn load(&self) -> Guard<T, S> {
-        let protected = unsafe { self.strategy.load(&self.ptr) };
+        let protected = unsafe { self.strategy.load(&self.ptr, &self.allocator) };
         Guard { inner: protected }
     }
 
@@ -471,8 +524,9 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
         // SeqCst to synchronize the time lines with the group counters.
         let old = self.ptr.swap(new, Ordering::SeqCst);
         unsafe {
-            self.strategy.wait_for_readers(old, &self.ptr);
-            T::from_ptr(old)
+            self.strategy
+                .wait_for_readers(old, &self.ptr, &self.allocator);
+            T::from_ptr(old, &self.allocator)
         }
     }
 
@@ -497,7 +551,8 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
         C: AsRaw<T::Base>,
         S: CaS<T>,
     {
-        let protected = unsafe { self.strategy.compare_and_swap(&self.ptr, current, new) };
+        let protected =
+            unsafe { self.strategy.compare_and_swap(&self.ptr, current, new, &self.allocator) };
         Guard { inner: protected }
     }
 
@@ -682,8 +737,17 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
 ///
 /// This is a type alias only. Most of its methods are described on
 /// [`ArcSwapAny`](struct.ArcSwapAny.html).
+#[cfg(not(nightly))]
 pub type ArcSwap<T> = ArcSwapAny<Arc<T>>;
 
+/// An atomic storage for `Arc`.
+///
+/// This is a type alias only. Most of its methods are described on
+/// [`ArcSwapAny`](struct.ArcSwapAny.html).
+#[cfg(nightly)]
+pub type ArcSwap<T, A = alloc::alloc::Global> = ArcSwapAny<Arc<T, A>, DefaultStrategy, A>;
+
+#[cfg(not(nightly))]
 impl<T, S: Strategy<Arc<T>>> ArcSwapAny<Arc<T>, S> {
     /// A convenience constructor directly from the pointed-to value.
     ///
@@ -693,6 +757,37 @@ impl<T, S: Strategy<Arc<T>>> ArcSwapAny<Arc<T>, S> {
         S: Default,
     {
         Self::from(Arc::new(val))
+    }
+}
+
+#[cfg(nightly)]
+impl<T, S> ArcSwapAny<Arc<T, alloc::alloc::Global>, S>
+where
+    S: Strategy<Arc<T, alloc::alloc::Global>>,
+{
+    /// A convenience constructor directly from the pointed-to value.
+    ///
+    /// Direct equivalent for `ArcSwap::new(Arc::new(val))`.
+    pub fn from_pointee(val: T) -> Self
+    where
+        S: Default,
+    {
+        Self::from_pointee_in(val, alloc::alloc::Global)
+    }
+}
+
+#[cfg(nightly)]
+impl<T, A, S> ArcSwapAny<Arc<T, A>, S>
+where
+    A: ArcSwapAllocator,
+    S: Strategy<Arc<T, A>>,
+{
+    /// A convenience constructor directly from the pointed-to value and allocator.
+    pub fn from_pointee_in(val: T, allocator: A) -> Self
+    where
+        S: Default,
+    {
+        Self::new_in(Arc::new_in(val, allocator.clone()), allocator)
     }
 }
 
@@ -716,8 +811,18 @@ impl<T, S: Strategy<Arc<T>>> ArcSwapAny<Arc<T>, S> {
 /// assert!(shared.swap(Some(Arc::new(42))).is_none());
 /// assert_eq!(42, **shared.load_full().as_ref().unwrap());
 /// ```
+#[cfg(not(nightly))]
 pub type ArcSwapOption<T> = ArcSwapAny<Option<Arc<T>>>;
 
+/// An atomic storage for `Option<Arc>`.
+///
+/// This is very similar to [`ArcSwap`](type.ArcSwap.html), but allows storing NULL values, which
+/// is useful in some situations.
+#[cfg(nightly)]
+pub type ArcSwapOption<T, A = alloc::alloc::Global> =
+    ArcSwapAny<Option<Arc<T, A>>, DefaultStrategy, A>;
+
+#[cfg(not(nightly))]
 impl<T, S: Strategy<Option<Arc<T>>>> ArcSwapAny<Option<Arc<T>>, S> {
     /// A convenience constructor directly from a pointed-to value.
     ///
@@ -751,6 +856,57 @@ impl<T, S: Strategy<Option<Arc<T>>>> ArcSwapAny<Option<Arc<T>>, S> {
     }
 }
 
+#[cfg(nightly)]
+impl<T, S> ArcSwapAny<Option<Arc<T, alloc::alloc::Global>>, S>
+where
+    S: Strategy<Option<Arc<T, alloc::alloc::Global>>>,
+{
+    /// A convenience constructor directly from a pointed-to value.
+    ///
+    /// This just allocates the `Arc` under the hood.
+    pub fn from_pointee<V: Into<Option<T>>>(val: V) -> Self
+    where
+        S: Default,
+    {
+        Self::from_pointee_in(val, alloc::alloc::Global)
+    }
+
+    /// A convenience constructor for an empty value.
+    ///
+    /// This is equivalent to `ArcSwapOption::new(None)`.
+    pub fn empty() -> Self
+    where
+        S: Default,
+    {
+        Self::empty_in(alloc::alloc::Global)
+    }
+}
+
+#[cfg(nightly)]
+impl<T, A, S> ArcSwapAny<Option<Arc<T, A>>, S>
+where
+    A: ArcSwapAllocator,
+    S: Strategy<Option<Arc<T, A>>>,
+{
+    /// A convenience constructor directly from a pointed-to value and allocator.
+    pub fn from_pointee_in<V: Into<Option<T>>>(val: V, allocator: A) -> Self
+    where
+        S: Default,
+    {
+        let val = val.into().map(|val| Arc::new_in(val, allocator.clone()));
+        Self::new_in(val, allocator)
+    }
+
+    /// A convenience constructor for an empty value with an explicit allocator.
+    pub fn empty_in(allocator: A) -> Self
+    where
+        S: Default,
+    {
+        Self::new_in(None, allocator)
+    }
+}
+
+#[cfg(not(nightly))]
 impl<T> ArcSwapOption<T> {
     /// A const-fn equivalent of [empty].
     ///
@@ -774,6 +930,28 @@ impl<T> ArcSwapOption<T> {
     pub const fn const_empty() -> Self {
         Self {
             ptr: AtomicPtr::new(ptr::null_mut()),
+            allocator: (),
+            _phantom_arc: PhantomData,
+            strategy: HybridStrategy {
+                _config: DefaultConfig,
+            },
+        }
+    }
+}
+
+#[cfg(nightly)]
+impl<T> ArcSwapOption<T> {
+    /// A const-fn equivalent of [empty].
+    ///
+    /// Just like [empty], this creates an `None`-holding `ArcSwapOption`. The [empty] is, however,
+    /// more general ‒ this is available only for the default strategy, while [empty] is for any
+    /// [Default]-constructible strategy (current or future one).
+    ///
+    /// [empty]: ArcSwapAny::empty
+    pub const fn const_empty() -> Self {
+        Self {
+            ptr: AtomicPtr::new(ptr::null_mut()),
+            allocator: alloc::alloc::Global,
             _phantom_arc: PhantomData,
             strategy: HybridStrategy {
                 _config: DefaultConfig,
@@ -790,7 +968,16 @@ impl<T> ArcSwapOption<T> {
 /// See the [`IndependentStrategy`] for further details.
 // Being phased out. Will deprecate once we verify in production that the new strategy works fine.
 #[doc(hidden)]
+#[cfg(not(nightly))]
 pub type IndependentArcSwap<T> = ArcSwapAny<Arc<T>, IndependentStrategy>;
+
+/// An atomic storage that doesn't share the internal generation locks with others.
+///
+/// See the [`IndependentStrategy`] for further details.
+#[doc(hidden)]
+#[cfg(nightly)]
+pub type IndependentArcSwap<T, A = alloc::alloc::Global> =
+    ArcSwapAny<Arc<T, A>, IndependentStrategy, A>;
 
 /// Arc swap for the [Weak] pointer.
 ///
@@ -803,8 +990,55 @@ pub type IndependentArcSwap<T> = ArcSwapAny<Arc<T>, IndependentStrategy>;
 /// Needs the `weak` feature turned on.
 ///
 /// [Weak]: std::sync::Weak
-#[cfg(feature = "weak")]
+#[cfg(all(feature = "weak", not(nightly)))]
 pub type ArcSwapWeak<T> = ArcSwapAny<alloc::sync::Weak<T>>;
+
+/// Arc swap for the [Weak] pointer.
+///
+/// Needs the `weak` feature turned on.
+#[cfg(all(feature = "weak", nightly))]
+pub type ArcSwapWeak<T, A = alloc::alloc::Global> =
+    ArcSwapAny<alloc::sync::Weak<T, A>, DefaultStrategy, A>;
+
+#[cfg(all(test, nightly))]
+mod allocator_tests {
+    use alloc::alloc::{AllocError, Allocator, Global, Layout};
+    use alloc::sync::Arc;
+    use core::ptr::NonNull;
+
+    use super::{ArcSwapAllocator, ArcSwapOption};
+
+    #[derive(Clone, Default)]
+    struct TestAllocator;
+
+    unsafe impl Allocator for TestAllocator {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            <Global as Allocator>::allocate(&Global, layout)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            unsafe {
+                <Global as Allocator>::deallocate(&Global, ptr, layout);
+            }
+        }
+    }
+
+    unsafe impl ArcSwapAllocator for TestAllocator {}
+
+    #[test]
+    fn option_empty_in_preserves_allocator_for_later_store() {
+        let allocator = TestAllocator;
+        let shared = ArcSwapOption::<usize, TestAllocator>::empty_in(allocator.clone());
+
+        shared.store(Some(Arc::new_in(42, allocator.clone())));
+
+        let loaded = shared.load_full();
+        assert_eq!(42, **loaded.as_ref().unwrap());
+        let previous = shared.swap(None);
+        assert_eq!(42, **previous.as_ref().unwrap());
+        assert!(shared.load_full().is_none());
+    }
+}
 
 macro_rules! t {
     ($name: ident, $strategy: ty) => {
