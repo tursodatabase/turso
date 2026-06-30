@@ -22,6 +22,7 @@ pub struct ReplayInfo {
     pub change_type: DatabaseChangeType,
     pub query: String,
     pub pk_column_indices: Option<Vec<usize>>,
+    pub rowid_alias_pk_column_index: Option<usize>,
     pub column_names: Vec<String>,
     pub is_ddl_replay: bool,
 }
@@ -130,20 +131,27 @@ impl DatabaseReplayGenerator {
         }
         match change {
             DatabaseChangeType::Delete => {
-                if self.opts.use_implicit_rowid || info.pk_column_indices.is_none() {
-                    crate::alloc::vec![turso_core::Value::from_i64(id)]
-                } else {
+                if let Some(pk_column_indices) = info.pk_column_indices.as_ref() {
                     let mut values = <crate::alloc::Vec<turso_core::Value> as TursoAllocExt>::new();
-                    let pk_column_indices = info.pk_column_indices.as_ref().unwrap();
                     for pk in pk_column_indices {
-                        let value = std::mem::replace(&mut record[*pk], turso_core::Value::Null);
+                        let value = if info.rowid_alias_pk_column_index == Some(*pk) {
+                            turso_core::Value::from_i64(id)
+                        } else {
+                            std::mem::replace(&mut record[*pk], turso_core::Value::Null)
+                        };
                         values.push(value);
                     }
                     values
+                } else {
+                    crate::alloc::vec![turso_core::Value::from_i64(id)]
                 }
             }
             DatabaseChangeType::Insert => {
-                if self.opts.use_implicit_rowid {
+                if let Some(pk) = info.rowid_alias_pk_column_index {
+                    record[pk] = turso_core::Value::from_i64(id);
+                    return record;
+                }
+                if self.opts.use_implicit_rowid && info.pk_column_indices.is_none() {
                     record.push(turso_core::Value::from_i64(id));
                 }
                 record
@@ -175,7 +183,11 @@ impl DatabaseReplayGenerator {
                 }
                 if let Some(pk_column_indices) = &info.pk_column_indices {
                     for pk in pk_column_indices {
-                        let value = std::mem::replace(&mut record[*pk], turso_core::Value::Null);
+                        let value = if info.rowid_alias_pk_column_index == Some(*pk) {
+                            turso_core::Value::from_i64(id)
+                        } else {
+                            std::mem::replace(&mut record[*pk], turso_core::Value::Null)
+                        };
                         values.push(value);
                     }
                 } else {
@@ -219,6 +231,7 @@ impl DatabaseReplayGenerator {
                         change_type: DatabaseChangeType::Delete,
                         query,
                         pk_column_indices: None,
+                        rowid_alias_pk_column_index: None,
                         column_names: Vec::new(),
                         is_ddl_replay: true,
                     };
@@ -236,6 +249,7 @@ impl DatabaseReplayGenerator {
                         change_type: DatabaseChangeType::Insert,
                         query: sql.as_str().to_string(),
                         pk_column_indices: None,
+                        rowid_alias_pk_column_index: None,
                         column_names: Vec::new(),
                         is_ddl_replay: true,
                     };
@@ -259,6 +273,7 @@ impl DatabaseReplayGenerator {
                         change_type: DatabaseChangeType::Update,
                         query: ddl_stmt.as_str().to_string(),
                         pk_column_indices: None,
+                        rowid_alias_pk_column_index: None,
                         column_names: Vec::new(),
                         is_ddl_replay: true,
                     };
@@ -302,7 +317,8 @@ impl DatabaseReplayGenerator {
         table_name: &str,
         columns: &[bool],
     ) -> Result<ReplayInfo> {
-        let (column_names, pk_column_indices) = self.table_columns_info(coro, table_name).await?;
+        let (column_names, pk_column_indices, rowid_alias_pk_column_index) =
+            self.table_columns_info(coro, table_name).await?;
         // The CDC record may have fewer columns than the current schema
         // (e.g. records captured before ALTER TABLE ADD COLUMN).
         // Only reference columns present in the record.
@@ -329,30 +345,30 @@ impl DatabaseReplayGenerator {
             }
         }
         let quoted_table_name = quote_ident(table_name);
-        let (query, pk_column_indices) =
-            if self.opts.use_implicit_rowid || pk_column_indices.is_empty() {
-                (
-                    format!(
-                        "UPDATE {quoted_table_name} SET {} WHERE rowid = ?",
-                        column_updates.join(", ")
-                    ),
-                    None,
-                )
-            } else {
-                (
-                    format!(
-                        "UPDATE {quoted_table_name} SET {} WHERE {}",
-                        column_updates.join(", "),
-                        pk_predicates.join(" AND ")
-                    ),
-                    Some(pk_column_indices),
-                )
-            };
+        let (query, pk_column_indices) = if pk_column_indices.is_empty() {
+            (
+                format!(
+                    "UPDATE {quoted_table_name} SET {} WHERE rowid = ?",
+                    column_updates.join(", ")
+                ),
+                None,
+            )
+        } else {
+            (
+                format!(
+                    "UPDATE {quoted_table_name} SET {} WHERE {}",
+                    column_updates.join(", "),
+                    pk_predicates.join(" AND ")
+                ),
+                Some(pk_column_indices),
+            )
+        };
         Ok(ReplayInfo {
             change_type: DatabaseChangeType::Update,
             query,
             column_names: record_columns.to_vec(),
             pk_column_indices,
+            rowid_alias_pk_column_index,
             is_ddl_replay: false,
         })
     }
@@ -362,7 +378,8 @@ impl DatabaseReplayGenerator {
         table_name: &str,
         columns: usize,
     ) -> Result<ReplayInfo> {
-        let (column_names, pk_column_indices) = self.table_columns_info(coro, table_name).await?;
+        let (column_names, pk_column_indices, rowid_alias_pk_column_index) =
+            self.table_columns_info(coro, table_name).await?;
         // The CDC record may have fewer columns than the current schema
         // (e.g. records captured before ALTER TABLE ADD COLUMN).
         // Only reference columns present in the record.
@@ -396,7 +413,7 @@ impl DatabaseReplayGenerator {
             String::new()
         };
         let quoted_table_name = quote_ident(table_name);
-        if !self.opts.use_implicit_rowid {
+        if !self.opts.use_implicit_rowid || !pk_column_indices.is_empty() {
             let col_list = record_columns
                 .iter()
                 .map(|name| quote_ident(name))
@@ -409,7 +426,8 @@ impl DatabaseReplayGenerator {
             return Ok(ReplayInfo {
                 change_type: DatabaseChangeType::Insert,
                 query,
-                pk_column_indices: None,
+                pk_column_indices: (!pk_column_indices.is_empty()).then_some(pk_column_indices),
+                rowid_alias_pk_column_index,
                 column_names: record_columns.to_vec(),
                 is_ddl_replay: false,
             });
@@ -437,6 +455,7 @@ impl DatabaseReplayGenerator {
             query,
             column_names: original_column_names,
             pk_column_indices: None,
+            rowid_alias_pk_column_index: None,
             is_ddl_replay: false,
         })
     }
@@ -445,14 +464,15 @@ impl DatabaseReplayGenerator {
         coro: &Coro<Ctx>,
         table_name: &str,
     ) -> Result<ReplayInfo> {
-        let (column_names, pk_column_indices) = self.table_columns_info(coro, table_name).await?;
+        let (column_names, pk_column_indices, rowid_alias_pk_column_index) =
+            self.table_columns_info(coro, table_name).await?;
         let mut pk_predicates = Vec::with_capacity(1);
         for &idx in &pk_column_indices {
             pk_predicates.push(format!("{} = ?", quote_ident(&column_names[idx])));
         }
         let use_implicit_rowid = self.opts.use_implicit_rowid;
         let quoted_table_name = quote_ident(table_name);
-        if pk_column_indices.is_empty() || use_implicit_rowid {
+        if pk_column_indices.is_empty() {
             let query = format!("DELETE FROM {quoted_table_name} WHERE rowid = ?");
             tracing::trace!("delete_query: table_name={table_name}, query={query}, use_implicit_rowid={use_implicit_rowid}");
             return Ok(ReplayInfo {
@@ -460,6 +480,7 @@ impl DatabaseReplayGenerator {
                 query,
                 column_names,
                 pk_column_indices: None,
+                rowid_alias_pk_column_index: None,
                 is_ddl_replay: false,
             });
         }
@@ -472,6 +493,7 @@ impl DatabaseReplayGenerator {
             query,
             column_names,
             pk_column_indices: Some(pk_column_indices),
+            rowid_alias_pk_column_index,
             is_ddl_replay: false,
         })
     }
@@ -495,7 +517,7 @@ impl DatabaseReplayGenerator {
             } => {
                 *if_not_exists = true;
                 let table_name = tbl_name.name.as_str();
-                let (current_columns, _) = self.table_columns_info(coro, table_name).await?;
+                let (current_columns, _, _) = self.table_columns_info(coro, table_name).await?;
                 if current_columns.is_empty() {
                     self.execute_ddl(ddl)?;
                     return Ok(());
@@ -557,7 +579,7 @@ impl DatabaseReplayGenerator {
             return Ok(());
         };
         let table_name = tbl_name.name.as_str();
-        let (current_columns, _) = self.table_columns_info(coro, table_name).await?;
+        let (current_columns, _, _) = self.table_columns_info(coro, table_name).await?;
         let col_name = col_def.col_name.as_str();
         if current_columns.iter().any(|c| c == col_name) {
             tracing::debug!(
@@ -593,13 +615,14 @@ impl DatabaseReplayGenerator {
         &self,
         coro: &Coro<Ctx>,
         table_name: &str,
-    ) -> Result<(Vec<String>, Vec<usize>)> {
+    ) -> Result<(Vec<String>, Vec<usize>, Option<usize>)> {
         let table_name_literal = sql_string_literal(table_name);
         let mut table_info_stmt = self.conn.prepare(format!(
-            "SELECT cid, name, pk FROM pragma_table_info({table_name_literal})"
+            "SELECT cid, name, type, pk FROM pragma_table_info({table_name_literal})"
         ))?;
         let mut pk_column_indices = Vec::with_capacity(1);
         let mut column_names = Vec::new();
+        let mut column_types = Vec::new();
         while let Some(column) = run_stmt_once(coro, &mut table_info_stmt).await? {
             let turso_core::Value::Numeric(turso_core::Numeric::Integer(column_id)) =
                 column.get_value(0)
@@ -613,7 +636,12 @@ impl DatabaseReplayGenerator {
                     "unexpected column type for pragma_table_info query".to_string(),
                 ));
             };
-            let turso_core::Value::Numeric(turso_core::Numeric::Integer(pk)) = column.get_value(2)
+            let turso_core::Value::Text(column_type) = column.get_value(2) else {
+                return Err(Error::DatabaseTapeError(
+                    "unexpected column type for pragma_table_info query".to_string(),
+                ));
+            };
+            let turso_core::Value::Numeric(turso_core::Numeric::Integer(pk)) = column.get_value(3)
             else {
                 return Err(Error::DatabaseTapeError(
                     "unexpected column type for pragma_table_info query".to_string(),
@@ -623,7 +651,17 @@ impl DatabaseReplayGenerator {
                 pk_column_indices.push(*column_id as usize);
             }
             column_names.push(name.as_str().to_string());
+            column_types.push(column_type.as_str().to_string());
         }
-        Ok((column_names, pk_column_indices))
+        let rowid_alias_pk_column_index = if pk_column_indices.len() == 1 {
+            let pk = pk_column_indices[0];
+            column_types
+                .get(pk)
+                .is_some_and(|column_type| column_type.eq_ignore_ascii_case("INTEGER"))
+                .then_some(pk)
+        } else {
+            None
+        };
+        Ok((column_names, pk_column_indices, rowid_alias_pk_column_index))
     }
 }

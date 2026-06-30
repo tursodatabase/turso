@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
     ops::Deref,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, Once, RwLock, Weak,
     },
     task::Waker,
@@ -32,6 +32,38 @@ use crate::{
 
 assert_send!(TursoDatabase, TursoConnection, TursoStatement);
 assert_sync!(TursoDatabase);
+
+#[derive(Default)]
+pub struct SyncBusyGate {
+    active: AtomicBool,
+}
+
+impl SyncBusyGate {
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Release);
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+pub struct SyncBusyGuard {
+    gate: Arc<SyncBusyGate>,
+}
+
+impl SyncBusyGuard {
+    pub fn new(gate: Arc<SyncBusyGate>) -> Self {
+        gate.set_active(true);
+        Self { gate }
+    }
+}
+
+impl Drop for SyncBusyGuard {
+    fn drop(&mut self) {
+        self.gate.set_active(false);
+    }
+}
 
 pub use turso_core::types::FromValue;
 pub use turso_ext::{
@@ -489,6 +521,32 @@ impl From<LimboError> for TursoError {
     }
 }
 
+fn sync_busy_error() -> TursoError {
+    TursoError::Busy("database is locked".to_string())
+}
+
+fn sync_operation_active(sync_busy: Option<&Arc<SyncBusyGate>>) -> bool {
+    sync_busy.is_some_and(|gate| gate.is_active())
+}
+
+fn map_sync_transient_error(
+    sync_busy: Option<&Arc<SyncBusyGate>>,
+    error: TursoError,
+) -> TursoError {
+    if sync_busy.is_none() {
+        return error;
+    }
+    match error {
+        TursoError::Error(message)
+            if message == "Database schema changed"
+                || message.starts_with("I/O error: short read on page") =>
+        {
+            sync_busy_error()
+        }
+        other => other,
+    }
+}
+
 static LOGGER: RwLock<Option<Box<Logger>>> = RwLock::new(None);
 static SETUP: Once = Once::new();
 
@@ -825,6 +883,7 @@ pub struct TursoConnection {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
     connection: Arc<Connection>,
+    sync_busy: Option<Arc<SyncBusyGate>>,
     cached_statements: Arc<Mutex<HashMap<String, Arc<CachedStatement>>>>,
     /// Weak refs to every statement handle created by this connection, keyed
     /// by a monotonic ID. Statements remove themselves on drop, so this map
@@ -836,14 +895,31 @@ pub struct TursoConnection {
 
 impl TursoConnection {
     pub fn new(config: &TursoDatabaseConfig, connection: Arc<Connection>) -> Arc<Self> {
+        Self::new_with_sync_busy(config, connection, None)
+    }
+
+    pub fn new_with_sync_busy(
+        config: &TursoDatabaseConfig,
+        connection: Arc<Connection>,
+        sync_busy: Option<Arc<SyncBusyGate>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             async_io: config.async_io,
             connection,
+            sync_busy,
             concurrent_guard: Arc::new(ConcurrentGuard::new()),
             cached_statements: Arc::new(Mutex::new(HashMap::new())),
             stmts: Arc::new(Mutex::new(HashMap::new())),
             next_stmt_id: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    fn sync_operation_active(&self) -> bool {
+        sync_operation_active(self.sync_busy.as_ref())
+    }
+
+    fn map_sync_transient_error(&self, error: TursoError) -> TursoError {
+        map_sync_transient_error(self.sync_busy.as_ref(), error)
     }
     /// Set busy timeout for the connection
     pub fn set_busy_timeout(&self, duration: Duration) {
@@ -981,12 +1057,20 @@ impl TursoConnection {
 
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
-        let statement = self.connection.prepare(sql)?;
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
+        let statement = self
+            .connection
+            .prepare(sql)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))?;
         let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
         let stmt_id = self.track_stmt(&handle);
         Ok(Box::new(TursoStatement {
             concurrent_guard: self.concurrent_guard.clone(),
             async_io: self.async_io,
+            sync_busy: self.sync_busy.clone(),
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
@@ -995,6 +1079,9 @@ impl TursoConnection {
 
     /// Prepare a statement from the provided SQL string and cache it for future use.
     pub fn prepare_cached(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
         let sql_str = sql.as_ref();
 
         // Check if we have a cached version
@@ -1011,6 +1098,7 @@ impl TursoConnection {
                 return Ok(Box::new(TursoStatement {
                     concurrent_guard: self.concurrent_guard.clone(),
                     async_io: self.async_io,
+                    sync_busy: self.sync_busy.clone(),
                     handle,
                     stmt_id,
                     stmts: self.stmts.clone(),
@@ -1019,7 +1107,11 @@ impl TursoConnection {
         }
 
         // Not cached, prepare it fresh
-        let statement = self.connection.prepare(sql_str)?;
+        let statement = self
+            .connection
+            .prepare(sql_str)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))?;
 
         // Cache it for future use
         let cached = Arc::new(CachedStatement {
@@ -1036,6 +1128,7 @@ impl TursoConnection {
         Ok(Box::new(TursoStatement {
             concurrent_guard: self.concurrent_guard.clone(),
             async_io: self.async_io,
+            sync_busy: self.sync_busy.clone(),
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
@@ -1048,7 +1141,15 @@ impl TursoConnection {
         &self,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Box<TursoStatement>, usize)>, TursoError> {
-        match self.connection.consume_stmt(sql)? {
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
+        match self
+            .connection
+            .consume_stmt(sql)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))?
+        {
             Some((statement, position)) => {
                 let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
                 let stmt_id = self.track_stmt(&handle);
@@ -1056,6 +1157,7 @@ impl TursoConnection {
                     Box::new(TursoStatement {
                         async_io: self.async_io,
                         concurrent_guard: Arc::new(ConcurrentGuard::new()),
+                        sync_busy: self.sync_busy.clone(),
                         handle,
                         stmt_id,
                         stmts: self.stmts.clone(),
@@ -1180,6 +1282,7 @@ fn step_inner(
 pub struct TursoStatement {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
+    sync_busy: Option<Arc<SyncBusyGate>>,
     pub(crate) handle: StatementHandle,
     stmt_id: usize,
     stmts: StmtRegistry,
@@ -1281,6 +1384,9 @@ impl TursoStatement {
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     #[inline]
     pub fn step(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
+        if sync_operation_active(self.sync_busy.as_ref()) {
+            return Err(sync_busy_error());
+        }
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
         let mut handle = self.handle.lock().unwrap();
@@ -1288,12 +1394,16 @@ impl TursoStatement {
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
         step_inner(stmt, self.async_io, waker)
+            .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))
     }
 
     /// execute statement to completion
     /// method returns [TursoStatusCode::Done] if execution completed
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     pub fn execute(&mut self, waker: Option<&Waker>) -> Result<TursoExecutionResult, TursoError> {
+        if sync_operation_active(self.sync_busy.as_ref()) {
+            return Err(sync_busy_error());
+        }
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
         let mut handle = self.handle.lock().unwrap();
@@ -1302,7 +1412,8 @@ impl TursoStatement {
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
 
         loop {
-            let status = step_inner(stmt, self.async_io, waker)?;
+            let status = step_inner(stmt, self.async_io, waker)
+                .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))?;
             if status == TursoStatusCode::Row {
                 continue;
             } else if status == TursoStatusCode::Io {
@@ -1333,6 +1444,9 @@ impl TursoStatement {
     /// get row value as an owned Value
     #[inline]
     pub fn row_value(&self, index: usize) -> Result<turso_core::Value, TursoError> {
+        if sync_operation_active(self.sync_busy.as_ref()) {
+            return Err(sync_busy_error());
+        }
         let handle = self.handle.lock().unwrap();
         let stmt = handle
             .as_ref()

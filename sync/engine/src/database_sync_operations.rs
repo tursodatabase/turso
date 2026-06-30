@@ -2487,8 +2487,10 @@ pub async fn update_last_change_id<Ctx>(
     tracing::info!(
         "update_last_change_id(client_id={client_id}): pull_gen={pull_gen}, change_id={change_id}"
     );
-    conn.execute(TURSO_SYNC_CREATE_TABLE)?;
-    tracing::info!("update_last_change_id(client_id={client_id}): initialized table");
+    if !has_table(coro, conn, TURSO_SYNC_TABLE_NAME).await? {
+        ensure_sync_last_change_id_table(coro, conn, client_id).await?;
+        tracing::info!("update_last_change_id(client_id={client_id}): initialized table");
+    }
     let mut select_stmt = conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID)?;
     select_stmt.bind_at(
         1.try_into().unwrap(),

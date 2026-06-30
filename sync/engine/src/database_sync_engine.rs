@@ -2022,6 +2022,25 @@ fn publish_schema_after_raw_wal_replay(
     Ok(())
 }
 
+fn publish_schema_after_sync_checkpoint(conn: &Arc<turso_core::Connection>) -> Result<()> {
+    conn.get_pager().clear_page_cache(true);
+    match force_reparse_schema_with_retry(conn) {
+        Ok(()) => {
+            conn.publish_schema_after_external_restore();
+            Ok(())
+        }
+        Err(Error::TursoError(LimboError::Busy)) => {
+            tracing::debug!(
+                "checkpoint: schema refresh after sync checkpoint skipped due to local busy connection"
+            );
+            Ok(())
+        }
+        Err(error) => Err(Error::DatabaseSyncEngineError(format!(
+            "failed to refresh schema after sync checkpoint: {error}",
+        ))),
+    }
+}
+
 /// Marks all current CDC rows as already observed by `client_id`.
 #[allow(dead_code)]
 async fn acknowledge_existing_cdc_for_client<Ctx>(
@@ -2050,8 +2069,7 @@ async fn acknowledge_existing_cdc_for_client<Ctx>(
 /// Recreates the local sync metadata table after page-level restore.
 ///
 /// Raw page replay can replace the table contents along with ordinary pages.
-/// This helper resets the table and writes the high-water mark that should
-/// survive the restore.
+/// This helper writes the high-water mark that should survive the restore.
 #[allow(dead_code)]
 async fn rebuild_local_sync_metadata_table<Ctx>(
     coro: &Coro<Ctx>,
@@ -2060,13 +2078,6 @@ async fn rebuild_local_sync_metadata_table<Ctx>(
     pull_gen: i64,
     change_id: i64,
 ) -> Result<()> {
-    execute_with_schema_retry(conn, "DROP TABLE IF EXISTS turso_sync_last_change_id").map_err(
-        |error| {
-            Error::DatabaseSyncEngineError(format!(
-                "failed to reset local sync high-water mark table after raw page replay: {error}",
-            ))
-        },
-    )?;
     conn.publish_schema_after_external_restore();
     update_last_change_id(coro, conn, client_id, pull_gen, change_id).await
 }
@@ -2816,6 +2827,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.main_db_path,
             result
         );
+        publish_schema_after_sync_checkpoint(&main_conn)?;
 
         Ok(())
     }

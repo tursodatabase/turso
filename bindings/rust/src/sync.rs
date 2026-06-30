@@ -26,6 +26,8 @@ pub use turso_sync_sdk_kit::rsapi::PartialSyncOpts;
 
 // Constants used across the sync module
 const DEFAULT_CLIENT_NAME: &str = "turso-sync-rust";
+const CHECKPOINT_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+const CHECKPOINT_BUSY_MAX_ATTEMPTS: usize = 100;
 
 /// Future returned by an auth token provider. Resolves to a bearer token string
 /// (without the `Bearer ` prefix — that prefix is added when building the header).
@@ -445,8 +447,19 @@ impl Database {
 
     // Force WAL checkpoint for the main database.
     pub async fn checkpoint(&self) -> Result<()> {
-        let op = self.sync.checkpoint();
-        drive_operation(op, self.io.clone()).await?;
+        for attempt in 0..CHECKPOINT_BUSY_MAX_ATTEMPTS {
+            let op = self.sync.checkpoint();
+            let result = drive_operation(op, self.io.clone()).await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if is_sync_busy_error(&error) && attempt + 1 < CHECKPOINT_BUSY_MAX_ATTEMPTS =>
+                {
+                    tokio::time::sleep(CHECKPOINT_BUSY_RETRY_DELAY).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(())
     }
 
@@ -506,6 +519,14 @@ async fn drive_operation_result(
 ) -> Result<Option<turso_sync_sdk_kit::turso_async_operation::TursoAsyncOperationResult>> {
     let fut = AsyncOpFuture::new(op, io);
     fut.await
+}
+
+fn is_sync_busy_error(error: &Error) -> bool {
+    match error {
+        Error::Busy(_) => true,
+        Error::Error(message) => message.contains("Database is busy"),
+        _ => false,
+    }
 }
 
 // Custom Future that integrates with TursoDatabaseAsyncOperation and our IO worker.
@@ -2043,7 +2064,16 @@ mod tests {
                         Err(crate::Error::Busy(_)) => continue,
                         Err(e) => panic!("reader query failed: {e:?}"),
                     };
-                    let all = all_rows(rows).await.unwrap();
+                    let all = match all_rows(rows).await {
+                        Ok(all) => all,
+                        Err(e)
+                            if e.downcast_ref::<crate::Error>()
+                                .is_some_and(|error| matches!(error, crate::Error::Busy(_))) =>
+                        {
+                            continue;
+                        }
+                        Err(e) => panic!("reader query failed: {e:?}"),
+                    };
                     let Value::Integer(n) = all[0][0] else {
                         panic!("unexpected reader value: {:?}", all[0][0]);
                     };
@@ -2071,7 +2101,15 @@ mod tests {
             total += cnt as i64;
 
             applied_total.store(total, Ordering::Release);
-            db.pull().await.unwrap();
+            loop {
+                match db.pull().await {
+                    Ok(_) => break,
+                    Err(e) if super::is_sync_busy_error(&e) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(e) => panic!("pull failed: {e:?}"),
+                }
+            }
 
             let _ = db.checkpoint().await;
 

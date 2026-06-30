@@ -2081,6 +2081,7 @@ impl Database {
                 self.open_flags,
                 self.durable_storage.clone(),
                 None,
+                self.mv_store_allocator.clone(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));
             let mvcc_bootstrap_conn = self._connect(true, None, None)?;
