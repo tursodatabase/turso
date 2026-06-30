@@ -3330,6 +3330,7 @@ dependencies = [
  "serde_json",
  "similar",
  "similar-asserts",
+ "sql_gen",
  "sql_generation",
  "strum",
  "tempfile",

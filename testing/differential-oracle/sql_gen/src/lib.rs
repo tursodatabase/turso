@@ -44,12 +44,13 @@ pub mod policy;
 pub mod schema;
 pub mod strategy;
 pub mod trace;
+pub mod visit;
 
 // Re-export main types
 pub use ast::{
-    BinOp, ConflictClause, CteDefinition, CteMaterialization, Expr, Literal, Stmt,
-    TriggerBodyStmtKind, TriggerEvent, TriggerEventKind, TriggerStmt, TriggerTiming, UnaryOp,
-    WithClause,
+    BinOp, ConflictClause, CreateIndexKind, CteDefinition, CteMaterialization, Expr, FtsMatchExpr,
+    FtsMatchSyntax, Literal, OptimizeIndexStmt, Stmt, TriggerBodyStmtKind, TriggerEvent,
+    TriggerEventKind, TriggerStmt, TriggerTiming, UnaryOp, WithClause,
 };
 pub use builder::SqlGenBuilder;
 pub use capabilities::{
@@ -60,14 +61,17 @@ pub use context::Context;
 pub use error::{GenError, GenErrorKind};
 pub use functions::{FunctionCategory, FunctionDef, SCALAR_FUNCTIONS};
 pub use policy::{
-    BinOpCategoryWeights, BinOpWeights, CompoundOpWeights, CompoundOperatorWeights, CteConfig,
-    CteMaterializationWeights, DeleteConfig, ExprConfig, ExprWeights, FunctionConfig,
-    IdentifierConfig, InsertConfig, LiteralConfig, LiteralTypeWeights, NullsOrderWeights,
-    OrderDirectionWeights, Policy, SelectConfig, StmtWeights, StringCharset,
-    TriggerBodyStmtWeights, TriggerConfig, TriggerEventWeights, TriggerTimingWeights,
-    UnaryOpWeights, UpdateConfig,
+    BinOpCategoryWeights, BinOpWeights, CompoundOpWeights, CompoundOperatorWeights,
+    CreateIndexConfig, CteConfig, CteMaterializationWeights, DeleteConfig, DropIndexConfig,
+    ExprConfig, ExprWeights, FtsConfig, FunctionConfig, IdentifierConfig, InsertConfig,
+    LiteralConfig, LiteralTypeWeights, NullsOrderWeights, OrderDirectionWeights, Policy,
+    SelectConfig, StmtWeights, StringCharset, TriggerBodyStmtWeights, TriggerConfig,
+    TriggerEventWeights, TriggerTimingWeights, UnaryOpWeights, UpdateConfig,
 };
-pub use schema::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table};
+pub use schema::{
+    ColumnDef, DataType, FtsColumnWeight, FtsIndexSpec, FtsTokenizer, Index, IndexKind, Schema,
+    SchemaBuilder, SchemaTransactionState, Table, split_qualified_name,
+};
 pub use strategy::{GeneratedSql, SqlStrategy};
 pub use trace::{Coverage, CoverageReport, ExprKind, Origin, OriginPath, StmtKind, TreeMode};
 

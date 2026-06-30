@@ -47,6 +47,12 @@ impl InteractionPlan {
         rng: &mut impl rand::Rng,
         env: &mut SimulatorEnv,
     ) -> Option<Interactions> {
+        #[cfg(feature = "fts")]
+        if env.opts.enable_fts {
+            let state = env.fts_state.as_mut()?;
+            return crate::runner::fts::next_fts_interactions(state);
+        }
+
         // First interaction
         if self.len_properties() == 0 {
             // First create at least one table
@@ -328,6 +334,25 @@ impl Interactions {
             InteractionsType::Fault(fault) => {
                 let mut builder =
                     InteractionBuilder::with_interaction(InteractionType::Fault(*fault));
+                builder.connection_index(self.connection_index).id(id);
+                let interaction = builder.build().unwrap();
+                vec![interaction]
+            }
+            #[cfg(feature = "fts")]
+            InteractionsType::FtsSql(sql) => {
+                let mut builder =
+                    InteractionBuilder::with_interaction(InteractionType::FtsSql(sql.clone()));
+                builder
+                    .connection_index(self.connection_index)
+                    .ignore_error(sql.ignore_error)
+                    .id(id);
+                let interaction = builder.build().unwrap();
+                vec![interaction]
+            }
+            #[cfg(feature = "fts")]
+            InteractionsType::FtsOracle(check) => {
+                let mut builder =
+                    InteractionBuilder::with_interaction(InteractionType::FtsOracle(check.clone()));
                 builder.connection_index(self.connection_index).id(id);
                 let interaction = builder.build().unwrap();
                 vec![interaction]

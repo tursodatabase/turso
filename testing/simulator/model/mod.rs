@@ -236,6 +236,8 @@ fn prepare_insert_rows(
     Ok(new_rows)
 }
 
+#[cfg(feature = "fts")]
+pub mod fts;
 pub mod interactions;
 pub mod metrics;
 pub mod property;

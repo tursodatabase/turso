@@ -3,18 +3,20 @@
 use crate::SqlGen;
 use crate::ast::{
     AlterTableAction, AlterTableActionKind, AlterTableStmt, BinOp, ColumnDefStmt, ConflictClause,
-    CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, DeleteStmt, DropIndexStmt, DropTableStmt,
-    DropTriggerStmt, Expr, InsertStmt, Literal, PragmaForeignKeyListStmt, Stmt, TemporaryKeyword,
-    TriggerBodyStmtKind, TriggerEvent, TriggerEventKind, TriggerStmt, TriggerTiming, UpdateStmt,
+    CreateIndexKind, CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, DeleteStmt,
+    DropIndexStmt, DropTableStmt, DropTriggerStmt, Expr, InsertStmt, Literal, OptimizeIndexStmt,
+    PragmaForeignKeyListStmt, Stmt, TemporaryKeyword, TriggerBodyStmtKind, TriggerEvent,
+    TriggerEventKind, TriggerStmt, TriggerTiming, UpdateStmt,
 };
 use crate::capabilities::Capabilities;
 use crate::context::Context;
 use crate::error::GenError;
 use crate::generate::expr::{generate_condition, generate_expr};
+use crate::generate::fts::generate_fts_document_text;
 use crate::generate::literal::generate_literal;
 use crate::generate::select::{generate_select, generate_with_clause};
 use crate::policy::AlterTableConfig;
-use crate::schema::DataType;
+use crate::schema::{ColumnDef, DataType, FtsIndexSpec, FtsTokenizer, Table};
 use crate::trace::{Origin, StmtKind};
 use sql_gen_macros::trace_gen;
 
@@ -92,6 +94,9 @@ fn collect_capability_allowed_stmts<C: Capabilities>() -> Vec<StmtKind> {
     if C::DROP_INDEX {
         candidates.push(StmtKind::DropIndex);
     }
+    if C::OPTIMIZE_INDEX {
+        candidates.push(StmtKind::OptimizeIndex);
+    }
     if C::PRAGMA {
         candidates.push(StmtKind::PragmaForeignKeyList);
     }
@@ -103,6 +108,12 @@ fn collect_capability_allowed_stmts<C: Capabilities>() -> Vec<StmtKind> {
     }
     if C::ROLLBACK {
         candidates.push(StmtKind::Rollback);
+    }
+    if C::SAVEPOINT {
+        candidates.push(StmtKind::Savepoint);
+    }
+    if C::RELEASE {
+        candidates.push(StmtKind::Release);
     }
     if C::CREATE_TRIGGER {
         candidates.push(StmtKind::CreateTrigger);
@@ -125,12 +136,6 @@ fn collect_capability_allowed_stmts<C: Capabilities>() -> Vec<StmtKind> {
     }
     if C::ANALYZE {
         candidates.push(StmtKind::Analyze);
-    }
-    if C::SAVEPOINT {
-        candidates.push(StmtKind::Savepoint);
-    }
-    if C::RELEASE {
-        candidates.push(StmtKind::Release);
     }
 
     candidates
@@ -180,7 +185,7 @@ fn is_stmt_valid_for_schema(
         | StmtKind::CreateIndex
         | StmtKind::CreateTrigger => has_tables,
         // DROP INDEX requires indexes to exist
-        StmtKind::DropIndex => has_indexes,
+        StmtKind::DropIndex | StmtKind::OptimizeIndex => has_indexes,
         // DROP TRIGGER requires triggers to exist
         StmtKind::DropTrigger => has_triggers,
         // These are always valid
@@ -189,9 +194,9 @@ fn is_stmt_valid_for_schema(
         | StmtKind::Commit
         | StmtKind::Rollback
         | StmtKind::PragmaForeignKeyList => true,
-        // Stubs — always valid (would require tables for views but weight is 0 anyway)
         StmtKind::CreateView => has_tables,
         StmtKind::DropView => true,
+        // Stubs
         StmtKind::Vacuum | StmtKind::Analyze => true,
         StmtKind::Reindex => has_tables || has_indexes,
         StmtKind::Savepoint | StmtKind::Release => true,
@@ -214,6 +219,7 @@ fn dispatch_stmt_generation<C: Capabilities>(
         StmtKind::AlterTable => generate_alter_table(generator, ctx),
         StmtKind::CreateIndex => generate_create_index(generator, ctx),
         StmtKind::DropIndex => generate_drop_index(generator, ctx),
+        StmtKind::OptimizeIndex => generate_optimize_index(generator, ctx),
         StmtKind::PragmaForeignKeyList => generate_pragma_foreign_key_list(generator, ctx),
         StmtKind::Begin => Ok(Stmt::Begin),
         StmtKind::Commit => Ok(Stmt::Commit),
@@ -334,6 +340,7 @@ fn generate_insert_values<C: Capabilities>(
     let insert_expr_gen = if expr_prob > 0.0 {
         let mut policy = generator.policy().clone();
         policy.expr_weights.column_ref = 0;
+        policy.expr_weights.fts_match = 0;
         policy.max_expr_depth = expr_max_depth;
         Some(SqlGen::<C>::new(generator.schema().clone(), policy))
     } else {
@@ -341,7 +348,8 @@ fn generate_insert_values<C: Capabilities>(
     };
 
     // Read table columns from scope
-    let table_columns = ctx.tables_in_scope()[0].table.columns.clone();
+    let table = ctx.tables_in_scope()[0].table.clone();
+    let table_columns = table.columns.clone();
 
     for _ in 0..num_rows {
         let mut row = Vec::with_capacity(columns.len());
@@ -355,13 +363,41 @@ fn generate_insert_values<C: Capabilities>(
                     }
                 }
             }
-            let lit = generate_literal(ctx, col.data_type, generator.policy());
+            let lit = generate_column_literal(generator, ctx, &table, col);
             row.push(Expr::literal(ctx, lit));
         }
         values.push(row);
     }
 
     values
+}
+
+fn generate_column_literal<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    column: &ColumnDef,
+) -> Literal {
+    if column.data_type == DataType::Text
+        && ctx.gen_bool_with_prob(generator.policy().fts_config.indexed_text_term_probability)
+        && is_fts_indexed_column(generator, table, &column.name)
+    {
+        Literal::Text(generate_fts_document_text(ctx))
+    } else {
+        generate_literal(ctx, column.data_type, generator.policy())
+    }
+}
+
+fn is_fts_indexed_column<C: Capabilities>(
+    generator: &SqlGen<C>,
+    table: &Table,
+    column_name: &str,
+) -> bool {
+    generator
+        .schema()
+        .indexes_for_table_in_database(&table.name, table.database.as_deref())
+        .iter()
+        .any(|index| index.is_fts() && index.columns.iter().any(|column| column == column_name))
 }
 
 /// Generate an UPDATE statement.
@@ -497,7 +533,8 @@ fn generate_update_sets<C: Capabilities>(
     let from_ref_prob = update_config.from_set_reference_probability;
 
     // Read table columns from scope
-    let table_columns = ctx.tables_in_scope()[0].table.columns.clone();
+    let table = ctx.tables_in_scope()[0].table.clone();
+    let table_columns = table.columns.clone();
 
     // Collect FROM-side tables for cross-table references
     let from_tables: Vec<_> = if ctx.tables_in_scope().len() > 1 {
@@ -594,7 +631,7 @@ fn generate_update_sets<C: Capabilities>(
                 }
             }
         }
-        let lit = generate_literal(ctx, col.data_type, generator.policy());
+        let lit = generate_column_literal(generator, ctx, &table, col);
         sets.push((col.name.clone(), Expr::literal(ctx, lit)));
     }
 
@@ -1028,12 +1065,27 @@ pub fn generate_create_index<C: Capabilities>(
         None => index_name,
     };
 
-    // Select columns for the index
-    let max_cols = table.columns.len().min(create_index_config.max_columns);
-    let num_cols = ctx.gen_range_inclusive(1, max_cols);
-    let columns: Vec<String> = (0..num_cols)
-        .filter_map(|_| ctx.choose(&table.columns).map(|c| c.name.clone()))
+    // Select columns for the index. Use a subsequence so the same column is not
+    // emitted more than once, which also keeps FTS weights unambiguous.
+    let fts_candidate_columns: Vec<_> = table
+        .columns
+        .iter()
+        .filter(|c| !c.data_type.is_array())
+        .cloned()
         .collect();
+    let use_fts = ctx.gen_bool_with_prob(create_index_config.fts_probability)
+        && !fts_candidate_columns.is_empty();
+
+    let selectable_columns = if use_fts {
+        &fts_candidate_columns
+    } else {
+        &table.columns
+    };
+    let max_cols = selectable_columns
+        .len()
+        .min(create_index_config.max_columns);
+    let picked_columns = ctx.subsequence(selectable_columns, 1..=max_cols);
+    let columns: Vec<String> = picked_columns.iter().map(|c| c.name.clone()).collect();
 
     if columns.is_empty() {
         return Err(GenError::exhausted("create_index", "no columns for index"));
@@ -1052,10 +1104,54 @@ pub fn generate_create_index<C: Capabilities>(
     Ok(Stmt::CreateIndex(CreateIndexStmt {
         name: qualified_index_name,
         table: table.unqualified_name().to_string(),
+        kind: if use_fts {
+            CreateIndexKind::Fts(generate_fts_index_spec(ctx, &columns, create_index_config))
+        } else {
+            CreateIndexKind::BTree {
+                unique: ctx.gen_bool_with_prob(create_index_config.unique_probability),
+            }
+        },
         columns,
-        unique: ctx.gen_bool_with_prob(create_index_config.unique_probability),
         if_not_exists: ctx.gen_bool_with_prob(create_index_config.if_not_exists_probability),
     }))
+}
+
+fn generate_fts_index_spec(
+    ctx: &mut Context,
+    columns: &[String],
+    create_index_config: &crate::policy::CreateIndexConfig,
+) -> FtsIndexSpec {
+    let mut spec = FtsIndexSpec::new();
+
+    if ctx.gen_bool_with_prob(create_index_config.fts_tokenizer_probability) {
+        spec = spec.with_tokenizer(generate_fts_tokenizer(ctx));
+    }
+
+    if ctx.gen_bool_with_prob(create_index_config.fts_weight_probability) {
+        for column in ctx.subsequence(columns, 1..=columns.len()) {
+            let weight = match ctx.gen_range(5) {
+                0 => 0.5,
+                1 => 1.0,
+                2 => 2.0,
+                3 => 4.0,
+                _ => 10.0,
+            };
+            spec = spec.with_weight(column, weight);
+        }
+    }
+
+    spec
+}
+
+fn generate_fts_tokenizer(ctx: &mut Context) -> FtsTokenizer {
+    let tokenizers = [
+        FtsTokenizer::Default,
+        FtsTokenizer::Raw,
+        FtsTokenizer::Simple,
+        FtsTokenizer::Whitespace,
+        FtsTokenizer::Ngram,
+    ];
+    *ctx.choose(&tokenizers).unwrap_or(&FtsTokenizer::Default)
 }
 
 /// Generate a DROP INDEX statement.
@@ -1077,6 +1173,32 @@ pub fn generate_drop_index<C: Capabilities>(
         name: index_name,
         if_exists: ctx.gen_bool_with_prob(drop_index_config.if_exists_probability),
     }))
+}
+
+/// Generate an OPTIMIZE INDEX statement.
+pub fn generate_optimize_index<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<Stmt, GenError> {
+    let fts_indexes: Vec<_> = generator
+        .schema()
+        .indexes
+        .iter()
+        .filter(|idx| idx.is_fts())
+        .collect();
+    let selected = if fts_indexes.is_empty() {
+        ctx.choose(&generator.schema().indexes)
+    } else {
+        ctx.choose(&fts_indexes).copied()
+    };
+
+    let name = if ctx.gen_bool_with_prob(0.75) {
+        selected.map(|idx| idx.qualified_name())
+    } else {
+        None
+    };
+
+    Ok(Stmt::OptimizeIndex(OptimizeIndexStmt { name }))
 }
 
 /// Generate a PRAGMA foreign_key_list statement.
@@ -1683,8 +1805,8 @@ fn generate_expression_index<C: Capabilities>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::Policy;
-    use crate::schema::{ColumnDef, SchemaBuilder, Table};
+    use crate::policy::{ExprWeights, Policy};
+    use crate::schema::{ColumnDef, FtsIndexSpec, Index, SchemaBuilder, Table};
     use crate::{DmlOnly, Full, SelectOnly};
 
     fn test_generator() -> SqlGen<Full> {
@@ -1721,6 +1843,39 @@ mod tests {
 
         let sql = stmt.unwrap().to_string();
         assert!(sql.starts_with("INSERT INTO"));
+    }
+
+    #[test]
+    fn test_generate_insert_values_excludes_fts_predicates() {
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "docs",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("body", DataType::Text),
+                ],
+            ))
+            .index(
+                Index::new("docs_fts", "docs", vec!["body".to_string()]).fts(FtsIndexSpec::new()),
+            )
+            .build();
+        let mut policy = Policy::fts();
+        policy.insert_config.cte_probability = 0.0;
+        policy.insert_config.expression_value_probability = 1.0;
+        policy.insert_config.min_rows = 1;
+        policy.insert_config.max_rows = 1;
+        policy.expr_weights = ExprWeights {
+            fts_match: 100,
+            ..ExprWeights::all_zero()
+        };
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut ctx = Context::new_with_seed(7);
+
+        let stmt = generate_insert(&generator, &mut ctx).unwrap();
+        let sql = stmt.to_string();
+
+        assert!(!sql.contains("fts_match("), "{sql}");
+        assert!(!sql.contains(" MATCH "), "{sql}");
     }
 
     #[test]
@@ -1789,6 +1944,53 @@ mod tests {
                 Stmt::Select(_) | Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
             ));
         }
+    }
+
+    #[test]
+    fn test_generate_create_index_defaults_to_btree() {
+        let generator = test_generator();
+        let mut ctx = Context::new_with_seed(42);
+
+        let stmt = generate_create_index(&generator, &mut ctx).unwrap();
+        let sql = stmt.to_string();
+
+        assert!(sql.starts_with("CREATE"));
+        assert!(sql.contains(" INDEX "));
+        assert!(!sql.contains("USING fts"));
+    }
+
+    #[test]
+    fn test_generate_create_index_can_emit_fts_profile() {
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "docs",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("title", DataType::Text),
+                    ColumnDef::new("body", DataType::Text),
+                    ColumnDef::new("code", DataType::Integer),
+                    ColumnDef::new("tags", DataType::TextArray),
+                ],
+            ))
+            .build();
+        let mut policy = Policy::fts();
+        policy.create_index_config.max_columns = 4;
+        policy.create_index_config.fts_tokenizer_probability = 1.0;
+        policy.create_index_config.fts_weight_probability = 1.0;
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut ctx = Context::new_with_seed(7);
+
+        let stmt = generate_create_index(&generator, &mut ctx).unwrap();
+        let Stmt::CreateIndex(create_index) = stmt else {
+            panic!("expected CREATE INDEX");
+        };
+
+        assert!(matches!(create_index.kind, CreateIndexKind::Fts(_)));
+        assert!(!create_index.columns.contains(&"tags".to_string()));
+        let sql = create_index.to_string();
+        assert!(sql.contains("USING fts"));
+        assert!(sql.contains("WITH ("));
+        assert!(sql.contains("weights = '"));
     }
 
     #[test]

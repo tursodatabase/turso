@@ -20,6 +20,7 @@ pub struct ScopedTable {
 ///
 /// The context holds the RNG, coverage tracker, and current
 /// scope information. It is passed to all generation functions.
+#[derive(Clone)]
 pub struct Context {
     rng: StdRng,
     coverage: Coverage,

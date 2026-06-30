@@ -7,6 +7,8 @@ pub mod env;
 pub mod execution;
 #[expect(dead_code)]
 pub mod file;
+#[cfg(feature = "fts")]
+pub mod fts;
 pub mod io;
 pub mod memory;
 

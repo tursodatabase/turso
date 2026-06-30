@@ -1,5 +1,6 @@
 //! Schema types for defining database structure.
 
+use crate::ast::{self, AlterTableAction, CreateIndexKind, Stmt};
 use std::collections::HashSet;
 use std::fmt;
 
@@ -198,6 +199,97 @@ impl Table {
     }
 }
 
+/// The storage/index method represented by a schema index.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum IndexKind {
+    BTree,
+    Fts(FtsIndexSpec),
+}
+
+impl IndexKind {
+    pub fn is_btree(&self) -> bool {
+        matches!(self, IndexKind::BTree)
+    }
+}
+
+/// Configuration for a Turso `CREATE INDEX ... USING fts` index.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct FtsIndexSpec {
+    pub tokenizer: FtsTokenizer,
+    pub weights: Vec<FtsColumnWeight>,
+}
+
+impl Default for FtsIndexSpec {
+    fn default() -> Self {
+        Self {
+            tokenizer: FtsTokenizer::Default,
+            weights: Vec::new(),
+        }
+    }
+}
+
+impl FtsIndexSpec {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_tokenizer(mut self, tokenizer: FtsTokenizer) -> Self {
+        self.tokenizer = tokenizer;
+        self
+    }
+
+    pub fn with_weight(mut self, column: impl Into<String>, weight: f32) -> Self {
+        self.weights.push(FtsColumnWeight {
+            column: column.into(),
+            weight,
+        });
+        self
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.tokenizer == FtsTokenizer::Default && self.weights.is_empty()
+    }
+}
+
+/// Supported tokenizer names accepted by Turso's FTS index method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum FtsTokenizer {
+    Default,
+    Raw,
+    Simple,
+    Whitespace,
+    Ngram,
+}
+
+impl FtsTokenizer {
+    pub fn name(&self) -> &'static str {
+        match self {
+            FtsTokenizer::Default => "default",
+            FtsTokenizer::Raw => "raw",
+            FtsTokenizer::Simple => "simple",
+            FtsTokenizer::Whitespace => "whitespace",
+            FtsTokenizer::Ngram => "ngram",
+        }
+    }
+}
+
+impl fmt::Display for FtsTokenizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+/// Per-column FTS scoring weight.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct FtsColumnWeight {
+    pub column: String,
+    pub weight: f32,
+}
+
 /// An index definition in a schema.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -208,6 +300,8 @@ pub struct Index {
     pub unique: bool,
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub database: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "IndexKind::is_btree"))]
+    pub kind: IndexKind,
 }
 
 impl Index {
@@ -222,12 +316,23 @@ impl Index {
             columns,
             unique: false,
             database: None,
+            kind: IndexKind::BTree,
         }
     }
 
     pub fn unique(mut self) -> Self {
         self.unique = true;
         self
+    }
+
+    pub fn fts(mut self, spec: FtsIndexSpec) -> Self {
+        self.unique = false;
+        self.kind = IndexKind::Fts(spec);
+        self
+    }
+
+    pub fn is_fts(&self) -> bool {
+        matches!(self.kind, IndexKind::Fts(_))
     }
 
     pub fn in_database(mut self, db: impl Into<String>) -> Self {
@@ -243,12 +348,33 @@ impl Index {
     }
 }
 
+/// Split `schema.name` into `(schema, name)`, leaving unqualified names in
+/// the main schema.
+pub fn split_qualified_name(name: &str) -> (Option<&str>, &str) {
+    if let Some((database, name)) = name.split_once('.') {
+        (Some(database), name)
+    } else {
+        (None, name)
+    }
+}
+
+fn normalize_database(database: Option<&str>) -> Option<&str> {
+    match database {
+        Some("main") => None,
+        other => other,
+    }
+}
+
 /// A trigger definition in a schema.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Trigger {
     pub name: String,
     pub table_name: String,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub database: Option<String>,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub target_database: Option<String>,
 }
 
 impl Trigger {
@@ -256,7 +382,19 @@ impl Trigger {
         Self {
             name: name.into(),
             table_name: table_name.into(),
+            database: None,
+            target_database: None,
         }
+    }
+
+    pub fn in_database(mut self, db: impl Into<String>) -> Self {
+        self.database = Some(db.into());
+        self
+    }
+
+    pub fn on_table_in_database(mut self, db: impl Into<String>) -> Self {
+        self.target_database = Some(db.into());
+        self
     }
 }
 
@@ -328,9 +466,10 @@ impl Schema {
 
     /// Returns all table names in a specific database scope.
     pub fn table_names_in_database(&self, database: Option<&str>) -> HashSet<String> {
+        let database = normalize_database(database);
         self.tables
             .iter()
-            .filter(|t| t.database.as_deref() == database)
+            .filter(|t| normalize_database(t.database.as_deref()) == database)
             .map(|t| t.name.clone())
             .collect()
     }
@@ -342,9 +481,10 @@ impl Schema {
 
     /// Returns all index names in a specific database scope.
     pub fn index_names_in_database(&self, database: Option<&str>) -> HashSet<String> {
+        let database = normalize_database(database);
         self.indexes
             .iter()
-            .filter(|i| i.database.as_deref() == database)
+            .filter(|i| normalize_database(i.database.as_deref()) == database)
             .map(|i| i.name.clone())
             .collect()
     }
@@ -357,6 +497,12 @@ impl Schema {
     /// Returns a table by name.
     pub fn get_table(&self, name: &str) -> Option<&Table> {
         self.tables.iter().find(|t| t.name == name)
+    }
+
+    /// Returns a table by a possibly schema-qualified name.
+    pub fn get_table_by_qualified_name(&self, name: &str) -> Option<&Table> {
+        let (database, table_name) = split_qualified_name(name);
+        self.table_in_database(table_name, normalize_database(database))
     }
 
     /// Returns indexes for a specific table.
@@ -373,9 +519,12 @@ impl Schema {
         table_name: &str,
         database: Option<&str>,
     ) -> Vec<&Index> {
+        let database = normalize_database(database);
         self.indexes
             .iter()
-            .filter(|i| i.table_name == table_name && i.database.as_deref() == database)
+            .filter(|i| {
+                i.table_name == table_name && normalize_database(i.database.as_deref()) == database
+            })
             .collect()
     }
 
@@ -383,11 +532,551 @@ impl Schema {
     pub fn has_tables(&self) -> bool {
         !self.tables.is_empty()
     }
+
+    /// Apply a statement that completed successfully to the schema model.
+    ///
+    /// Non-schema statements are intentionally no-ops. Schema statements that
+    /// are represented in the AST must be modeled here; if a new schema-changing
+    /// statement becomes executable, leaving it unmodeled would let generator
+    /// state drift from the database.
+    pub fn apply_successful_statement(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::CreateTable(create_table) => self.apply_create_table(create_table),
+            Stmt::DropTable(drop_table) => self.apply_drop_table(drop_table),
+            Stmt::AlterTable(alter_table) => self.apply_alter_table(alter_table),
+            Stmt::CreateIndex(create_index) => self.apply_create_index(create_index),
+            Stmt::DropIndex(drop_index) => self.apply_drop_index(drop_index),
+            Stmt::CreateTrigger(create_trigger) => self.apply_create_trigger(create_trigger),
+            Stmt::DropTrigger(drop_trigger) => self.apply_drop_trigger(drop_trigger),
+            Stmt::Select(_)
+            | Stmt::Insert(_)
+            | Stmt::Update(_)
+            | Stmt::Delete(_)
+            | Stmt::OptimizeIndex(_)
+            | Stmt::PragmaForeignKeyList(_)
+            | Stmt::Begin
+            | Stmt::Commit
+            | Stmt::Rollback
+            | Stmt::Vacuum
+            | Stmt::Reindex
+            | Stmt::Analyze => {}
+            Stmt::CreateView | Stmt::DropView | Stmt::Savepoint(_) | Stmt::Release(_) => {
+                panic!("successful schema statement is not modeled: {stmt:?}")
+            }
+        }
+    }
+
+    fn apply_create_table(&mut self, create_table: &ast::CreateTableStmt) {
+        let (database_from_name, table_name) = split_qualified_name(&create_table.table);
+        let database_from_name = normalize_database(database_from_name);
+        let database = if create_table.temporary.is_some() {
+            assert!(
+                database_from_name.is_none() || database_from_name == Some("temp"),
+                "successful CREATE TEMP TABLE used non-temp schema qualifier"
+            );
+            Some(String::from("temp"))
+        } else {
+            database_from_name.map(str::to_string)
+        };
+
+        if self.tables.iter().any(|table| {
+            table.name == table_name
+                && normalize_database(table.database.as_deref()) == database.as_deref()
+        }) {
+            assert!(
+                create_table.if_not_exists,
+                "successful CREATE TABLE duplicated an existing table without IF NOT EXISTS"
+            );
+            return;
+        }
+
+        let mut table = Table::new(
+            table_name,
+            create_table
+                .columns
+                .iter()
+                .map(column_from_create)
+                .collect(),
+        );
+        table.database = database;
+        table.strict = create_table.strict;
+        self.tables.push(table);
+    }
+
+    fn apply_drop_table(&mut self, drop_table: &ast::DropTableStmt) {
+        let (database, table_name) = split_qualified_name(&drop_table.table);
+        let Some(table_idx) = self.resolve_table_index_for_name(table_name, database, true) else {
+            assert!(
+                drop_table.if_exists,
+                "successful DROP TABLE referenced an untracked table"
+            );
+            return;
+        };
+
+        let table = self.tables.remove(table_idx);
+        self.indexes
+            .retain(|index| !index_targets_table(index, &table.name, table.database.as_deref()));
+        self.triggers.retain(|trigger| {
+            !trigger_targets_table(trigger, &table.name, table.database.as_deref())
+        });
+    }
+
+    fn apply_create_index(&mut self, create_index: &ast::CreateIndexStmt) {
+        let (raw_index_database_from_name, index_name) = split_qualified_name(&create_index.name);
+        let index_database_from_name = normalize_database(raw_index_database_from_name);
+
+        if self.indexes.iter().any(|index| {
+            index.name == index_name
+                && normalize_database(index.database.as_deref()) == index_database_from_name
+        }) {
+            assert!(
+                create_index.if_not_exists,
+                "successful CREATE INDEX duplicated an existing index without IF NOT EXISTS"
+            );
+            return;
+        }
+
+        let (raw_table_database_from_name, table_name) = split_qualified_name(&create_index.table);
+        let raw_table_database = raw_table_database_from_name.or(raw_index_database_from_name);
+        let Some(table_idx) = self.resolve_table_index_for_name(
+            table_name,
+            raw_table_database,
+            raw_table_database.is_some(),
+        ) else {
+            panic!("successful CREATE INDEX referenced an untracked table");
+        };
+        let table = &self.tables[table_idx];
+        assert!(
+            index_database_from_name.is_none()
+                || index_database_from_name == normalize_database(table.database.as_deref()),
+            "successful CREATE INDEX used a different schema than its table"
+        );
+
+        let mut index = Index::new(index_name, table.name.clone(), create_index.columns.clone());
+        if let Some(database) = index_database_from_name.or(table.database.as_deref()) {
+            index = index.in_database(database);
+        }
+        match &create_index.kind {
+            CreateIndexKind::BTree { unique } => {
+                if *unique {
+                    index = index.unique();
+                }
+            }
+            CreateIndexKind::Fts(spec) => {
+                index = index.fts(spec.clone());
+            }
+        }
+        self.indexes.push(index);
+    }
+
+    fn apply_drop_index(&mut self, drop_index: &ast::DropIndexStmt) {
+        let (database, index_name) = split_qualified_name(&drop_index.name);
+        let Some(index_idx) = self.resolve_index_index_for_name(index_name, database) else {
+            assert!(
+                drop_index.if_exists,
+                "successful DROP INDEX referenced an untracked index"
+            );
+            return;
+        };
+        self.indexes.remove(index_idx);
+    }
+
+    fn apply_alter_table(&mut self, alter_table: &ast::AlterTableStmt) {
+        let (database, table_name) = split_qualified_name(&alter_table.table);
+        let Some(table_idx) = self.resolve_table_index_for_name(table_name, database, true) else {
+            panic!("successful ALTER TABLE referenced an untracked table");
+        };
+        let database = normalize_database(database);
+
+        match &alter_table.action {
+            AlterTableAction::RenameTo(new_name) => {
+                let table_database = self.tables[table_idx].database.clone();
+                let old_name = self.tables[table_idx].name.clone();
+                let (new_database, new_table_name) = split_qualified_name(new_name);
+                let new_database = normalize_database(new_database);
+                assert!(
+                    new_database.is_none() || new_database == table_database.as_deref(),
+                    "successful ALTER TABLE RENAME crossed schema boundaries"
+                );
+
+                for index in self.indexes.iter_mut().filter(|index| {
+                    index_targets_table(index, &old_name, table_database.as_deref())
+                }) {
+                    index.table_name = new_table_name.to_string();
+                }
+                for trigger in self.triggers.iter_mut().filter(|trigger| {
+                    trigger_targets_table(trigger, &old_name, table_database.as_deref())
+                }) {
+                    trigger.table_name = new_table_name.to_string();
+                }
+                self.tables[table_idx].name = new_table_name.to_string();
+            }
+            AlterTableAction::AddColumn(column) => {
+                let table = &mut self.tables[table_idx];
+                assert!(
+                    !table
+                        .columns
+                        .iter()
+                        .any(|existing| existing.name == column.name),
+                    "successful ALTER TABLE ADD COLUMN duplicated an existing column"
+                );
+                table.columns.push(column_from_create(column));
+            }
+            AlterTableAction::DropColumn(column_name) => {
+                let table = &mut self.tables[table_idx];
+                let original_len = table.columns.len();
+                table.columns.retain(|column| column.name != *column_name);
+                assert!(
+                    table.columns.len() < original_len,
+                    "successful ALTER TABLE DROP COLUMN referenced an untracked column"
+                );
+
+                for index in self
+                    .indexes
+                    .iter_mut()
+                    .filter(|index| index_targets_table(index, table_name, database))
+                {
+                    index.columns.retain(|column| column != column_name);
+                    if let IndexKind::Fts(spec) = &mut index.kind {
+                        spec.weights.retain(|weight| weight.column != *column_name);
+                    }
+                }
+            }
+            AlterTableAction::RenameColumn { old_name, new_name } => {
+                let table = &mut self.tables[table_idx];
+                let Some(column) = table
+                    .columns
+                    .iter_mut()
+                    .find(|column| column.name == *old_name)
+                else {
+                    panic!("successful ALTER TABLE RENAME COLUMN referenced an untracked column");
+                };
+                column.name.clone_from(new_name);
+
+                for index in self
+                    .indexes
+                    .iter_mut()
+                    .filter(|index| index_targets_table(index, table_name, database))
+                {
+                    for column in &mut index.columns {
+                        if column == old_name {
+                            column.clone_from(new_name);
+                        }
+                    }
+                    if let IndexKind::Fts(spec) = &mut index.kind {
+                        for weight in &mut spec.weights {
+                            if weight.column == *old_name {
+                                weight.column.clone_from(new_name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_create_trigger(&mut self, create_trigger: &ast::CreateTriggerStmt) {
+        let (raw_trigger_database, trigger_name) = split_qualified_name(&create_trigger.name);
+        let trigger_database = normalize_database(raw_trigger_database);
+        assert!(
+            !create_trigger.temporary || raw_trigger_database.is_none(),
+            "successful CREATE TEMP TRIGGER used a qualified trigger name"
+        );
+        let trigger_schema_was_specified = raw_trigger_database.is_some();
+        let trigger_schema = if create_trigger.temporary {
+            Some("temp")
+        } else {
+            trigger_database
+        };
+        let (target_database, target_table) = split_qualified_name(&create_trigger.table);
+        let Some(table) = self.resolve_trigger_target_table(
+            target_table,
+            target_database,
+            trigger_schema,
+            trigger_schema_was_specified,
+        ) else {
+            panic!("successful CREATE TRIGGER referenced an untracked table");
+        };
+
+        let mut trigger = Trigger::new(trigger_name, table.name.clone());
+        let trigger_database = trigger_schema.or(table.database.as_deref());
+        if self.triggers.iter().any(|trigger| {
+            trigger.name == trigger_name
+                && normalize_database(trigger.database.as_deref()) == trigger_database
+        }) {
+            assert!(
+                create_trigger.if_not_exists,
+                "successful CREATE TRIGGER duplicated an existing trigger without IF NOT EXISTS"
+            );
+            return;
+        }
+        if let Some(database) = trigger_database {
+            trigger = trigger.in_database(database);
+        }
+        if let Some(database) = table.database.as_deref() {
+            trigger = trigger.on_table_in_database(database);
+        }
+        self.triggers.push(trigger);
+    }
+
+    fn apply_drop_trigger(&mut self, drop_trigger: &ast::DropTriggerStmt) {
+        let (database, trigger_name) = split_qualified_name(&drop_trigger.name);
+        let Some(trigger_idx) = self.resolve_trigger_index_for_name(trigger_name, database) else {
+            assert!(
+                drop_trigger.if_exists,
+                "successful DROP TRIGGER referenced an untracked trigger"
+            );
+            return;
+        };
+        self.triggers.remove(trigger_idx);
+    }
+
+    fn table_in_database(&self, table_name: &str, database: Option<&str>) -> Option<&Table> {
+        let database = normalize_database(database);
+        self.tables.iter().find(|table| {
+            table.name == table_name && normalize_database(table.database.as_deref()) == database
+        })
+    }
+
+    fn table_index_in_database(&self, table_name: &str, database: Option<&str>) -> Option<usize> {
+        let database = normalize_database(database);
+        self.tables.iter().position(|table| {
+            table.name == table_name && normalize_database(table.database.as_deref()) == database
+        })
+    }
+
+    fn index_index_in_database(&self, index_name: &str, database: Option<&str>) -> Option<usize> {
+        let database = normalize_database(database);
+        self.indexes.iter().position(|index| {
+            index.name == index_name && normalize_database(index.database.as_deref()) == database
+        })
+    }
+
+    fn resolve_trigger_target_table(
+        &self,
+        table_name: &str,
+        database: Option<&str>,
+        trigger_schema: Option<&str>,
+        trigger_schema_was_specified: bool,
+    ) -> Option<&Table> {
+        if database.is_some() {
+            return self.table_in_database(table_name, database);
+        }
+
+        if trigger_schema_was_specified && trigger_schema != Some("temp") {
+            return self.table_in_database(table_name, trigger_schema);
+        }
+
+        let include_attached = trigger_schema == Some("temp");
+        let table_idx = self.resolve_table_index_for_name(table_name, None, include_attached)?;
+        Some(&self.tables[table_idx])
+    }
+
+    fn resolve_table_index_for_name(
+        &self,
+        table_name: &str,
+        database: Option<&str>,
+        include_attached: bool,
+    ) -> Option<usize> {
+        if database.is_some() {
+            return self.table_index_in_database(table_name, database);
+        }
+
+        if let Some(table_idx) = self.table_index_in_database(table_name, Some("temp")) {
+            return Some(table_idx);
+        }
+        if let Some(table_idx) = self.table_index_in_database(table_name, None) {
+            return Some(table_idx);
+        }
+        if !include_attached {
+            return None;
+        }
+        self.attached_databases
+            .iter()
+            .find_map(|database| self.table_index_in_database(table_name, Some(database)))
+    }
+
+    fn resolve_index_index_for_name(
+        &self,
+        index_name: &str,
+        database: Option<&str>,
+    ) -> Option<usize> {
+        if database.is_some() {
+            return self.index_index_in_database(index_name, database);
+        }
+
+        if let Some(index_idx) = self.index_index_in_database(index_name, Some("temp")) {
+            return Some(index_idx);
+        }
+        if let Some(index_idx) = self.index_index_in_database(index_name, None) {
+            return Some(index_idx);
+        }
+        self.attached_databases
+            .iter()
+            .find_map(|database| self.index_index_in_database(index_name, Some(database)))
+    }
+
+    fn resolve_trigger_index_for_name(
+        &self,
+        trigger_name: &str,
+        database: Option<&str>,
+    ) -> Option<usize> {
+        if database.is_some() {
+            let database = normalize_database(database);
+            return self.triggers.iter().position(|trigger| {
+                trigger.name == trigger_name
+                    && normalize_database(trigger.database.as_deref()) == database
+            });
+        }
+
+        self.triggers
+            .iter()
+            .position(|trigger| {
+                trigger.name == trigger_name && trigger.database.as_deref() == Some("temp")
+            })
+            .or_else(|| {
+                self.triggers.iter().position(|trigger| {
+                    trigger.name == trigger_name
+                        && normalize_database(trigger.database.as_deref()).is_none()
+                })
+            })
+            .or_else(|| {
+                self.attached_databases.iter().find_map(|database| {
+                    self.triggers.iter().position(|trigger| {
+                        trigger.name == trigger_name
+                            && normalize_database(trigger.database.as_deref())
+                                == Some(database.as_str())
+                    })
+                })
+            })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SchemaTransactionState {
+    begin_snapshot: Option<Schema>,
+}
+
+impl SchemaTransactionState {
+    pub fn in_transaction(&self) -> bool {
+        self.begin_snapshot.is_some()
+    }
+
+    pub fn can_run_external_snapshot_oracles(&self) -> bool {
+        self.begin_snapshot.is_none()
+    }
+
+    pub fn apply_successful_statement(&mut self, schema: &mut Schema, stmt: &Stmt) {
+        match stmt {
+            Stmt::Begin => {
+                assert!(
+                    self.begin_snapshot.is_none(),
+                    "successful BEGIN entered an already tracked transaction"
+                );
+                self.begin_snapshot = Some(schema.clone());
+            }
+            Stmt::Commit => {
+                assert!(
+                    self.begin_snapshot.is_some(),
+                    "successful COMMIT left no tracked transaction to close"
+                );
+                self.begin_snapshot = None;
+            }
+            Stmt::Rollback => {
+                let Some(snapshot) = self.begin_snapshot.take() else {
+                    panic!("successful ROLLBACK left no tracked transaction to restore");
+                };
+                *schema = snapshot;
+            }
+            Stmt::Savepoint(_) | Stmt::Release(_) => {
+                panic!("successful savepoint statement is not modeled: {stmt:?}")
+            }
+            _ => schema.apply_successful_statement(stmt),
+        }
+    }
+}
+
+fn column_from_create(column: &ast::ColumnDefStmt) -> ColumnDef {
+    let mut col = ColumnDef::new(column.name.clone(), column.data_type);
+    if column.primary_key {
+        col = col.primary_key();
+    } else if column.not_null {
+        col = col.not_null();
+    }
+    if column.unique {
+        col = col.unique();
+    }
+    col
+}
+
+fn index_targets_table(index: &Index, table_name: &str, database: Option<&str>) -> bool {
+    let (index_table_database, index_table_name) = split_qualified_name(&index.table_name);
+    let index_table_database = normalize_database(index_table_database);
+    let index_database = normalize_database(index.database.as_deref());
+    index_table_name == table_name
+        && index_table_database.or(index_database) == normalize_database(database)
+}
+
+fn trigger_targets_table(trigger: &Trigger, table_name: &str, database: Option<&str>) -> bool {
+    trigger.table_name == table_name
+        && normalize_database(trigger.target_database.as_deref()) == normalize_database(database)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{
+        AlterTableAction, AlterTableStmt, ColumnDefStmt, CreateIndexKind, CreateIndexStmt,
+        CreateTableStmt, CreateTriggerStmt, DropIndexStmt, DropTableStmt, DropTriggerStmt, Stmt,
+        TriggerEvent, TriggerTiming,
+    };
+
+    fn create_table_stmt(table: &str) -> Stmt {
+        Stmt::CreateTable(CreateTableStmt {
+            table: table.to_string(),
+            columns: vec![
+                ColumnDefStmt {
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    primary_key: true,
+                    not_null: true,
+                    unique: false,
+                    default: None,
+                    check: None,
+                },
+                ColumnDefStmt {
+                    name: "body".to_string(),
+                    data_type: DataType::Text,
+                    primary_key: false,
+                    not_null: false,
+                    unique: false,
+                    default: None,
+                    check: None,
+                },
+            ],
+            if_not_exists: false,
+            strict: false,
+            temporary: None,
+        })
+    }
+
+    fn body_table(name: &str) -> Table {
+        Table::new(name, vec![ColumnDef::new("body", DataType::Text)])
+    }
+
+    fn create_trigger_stmt(name: &str, table: &str, temporary: bool) -> Stmt {
+        Stmt::CreateTrigger(CreateTriggerStmt {
+            name: name.to_string(),
+            table: table.to_string(),
+            timing: TriggerTiming::After,
+            event: TriggerEvent::Insert,
+            for_each_row: true,
+            when_clause: None,
+            body: Vec::new(),
+            if_not_exists: false,
+            temporary,
+        })
+    }
 
     #[test]
     fn test_column_def_builder() {
@@ -438,6 +1127,31 @@ mod tests {
     }
 
     #[test]
+    fn test_fts_index_builder() {
+        let index = Index::new(
+            "docs_fts",
+            "docs",
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unique()
+        .fts(
+            FtsIndexSpec::new()
+                .with_tokenizer(FtsTokenizer::Raw)
+                .with_weight("title", 4.0),
+        );
+
+        assert!(index.is_fts());
+        assert!(!index.unique);
+        assert!(matches!(
+            index.kind,
+            IndexKind::Fts(FtsIndexSpec {
+                tokenizer: FtsTokenizer::Raw,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn test_scoped_names_keep_main_and_temp_separate() {
         let schema = SchemaBuilder::new()
             .database("temp")
@@ -475,5 +1189,341 @@ mod tests {
             schema.index_names_in_database(Some("temp")),
             HashSet::from([String::from("shadowed_idx")])
         );
+    }
+
+    #[test]
+    fn qualified_main_table_name_targets_main_not_temp_shadow() {
+        let mut schema = SchemaBuilder::new()
+            .database("temp")
+            .table(body_table("docs"))
+            .table(body_table("docs").in_database("temp"))
+            .index(Index::new("docs_idx", "docs", vec!["body".to_string()]))
+            .index(Index::new("docs_idx", "docs", vec!["body".to_string()]).in_database("temp"))
+            .trigger(Trigger::new("docs_trg", "docs"))
+            .trigger(
+                Trigger::new("docs_trg", "docs")
+                    .in_database("temp")
+                    .on_table_in_database("temp"),
+            )
+            .build();
+
+        schema.apply_successful_statement(&Stmt::AlterTable(AlterTableStmt {
+            table: "main.docs".to_string(),
+            action: AlterTableAction::RenameTo("renamed_docs".to_string()),
+        }));
+
+        assert!(
+            schema
+                .get_table_by_qualified_name("main.renamed_docs")
+                .is_some()
+        );
+        assert!(schema.get_table_by_qualified_name("temp.docs").is_some());
+        assert_eq!(
+            schema
+                .indexes
+                .iter()
+                .find(|index| index.database.is_none())
+                .expect("main index remains")
+                .table_name,
+            "renamed_docs"
+        );
+        assert_eq!(
+            schema
+                .triggers
+                .iter()
+                .find(|trigger| trigger.database.is_none())
+                .expect("main trigger remains")
+                .table_name,
+            "renamed_docs"
+        );
+
+        schema.apply_successful_statement(&Stmt::DropTable(DropTableStmt {
+            table: "main.renamed_docs".to_string(),
+            if_exists: false,
+        }));
+
+        assert!(
+            schema
+                .get_table_by_qualified_name("main.renamed_docs")
+                .is_none()
+        );
+        assert!(schema.get_table_by_qualified_name("temp.docs").is_some());
+        assert_eq!(schema.indexes.len(), 1);
+        assert_eq!(schema.indexes[0].database.as_deref(), Some("temp"));
+        assert_eq!(schema.triggers.len(), 1);
+        assert_eq!(schema.triggers[0].database.as_deref(), Some("temp"));
+    }
+
+    #[test]
+    fn unqualified_table_name_resolves_temp_then_main_then_attached() {
+        let mut schema = SchemaBuilder::new()
+            .database("temp")
+            .database("aux")
+            .table(body_table("docs"))
+            .table(body_table("docs").in_database("temp"))
+            .table(body_table("docs").in_database("aux"))
+            .build();
+
+        schema.apply_successful_statement(&Stmt::DropTable(DropTableStmt {
+            table: "docs".to_string(),
+            if_exists: false,
+        }));
+        assert!(schema.get_table_by_qualified_name("temp.docs").is_none());
+        assert!(schema.get_table_by_qualified_name("main.docs").is_some());
+        assert!(schema.get_table_by_qualified_name("aux.docs").is_some());
+
+        schema.apply_successful_statement(&Stmt::AlterTable(AlterTableStmt {
+            table: "docs".to_string(),
+            action: AlterTableAction::RenameTo("renamed_docs".to_string()),
+        }));
+        assert!(
+            schema
+                .get_table_by_qualified_name("main.renamed_docs")
+                .is_some()
+        );
+        assert!(schema.get_table_by_qualified_name("aux.docs").is_some());
+
+        schema.apply_successful_statement(&Stmt::DropTable(DropTableStmt {
+            table: "docs".to_string(),
+            if_exists: false,
+        }));
+        assert!(schema.get_table_by_qualified_name("aux.docs").is_none());
+    }
+
+    #[test]
+    fn drop_index_resolves_temp_before_main_and_qualified_main_exactly() {
+        let mut schema = SchemaBuilder::new()
+            .database("temp")
+            .table(body_table("docs"))
+            .table(body_table("docs").in_database("temp"))
+            .index(Index::new("docs_idx", "docs", vec!["body".to_string()]))
+            .index(Index::new("docs_idx", "docs", vec!["body".to_string()]).in_database("temp"))
+            .build();
+
+        schema.apply_successful_statement(&Stmt::DropIndex(DropIndexStmt {
+            name: "docs_idx".to_string(),
+            if_exists: false,
+        }));
+        assert_eq!(schema.indexes.len(), 1);
+        assert_eq!(schema.indexes[0].database, None);
+
+        schema.apply_successful_statement(&Stmt::DropIndex(DropIndexStmt {
+            name: "main.docs_idx".to_string(),
+            if_exists: false,
+        }));
+        assert!(schema.indexes.is_empty());
+    }
+
+    #[test]
+    fn trigger_schema_and_target_schema_are_tracked_separately() {
+        let mut schema = SchemaBuilder::new()
+            .database("temp")
+            .table(body_table("docs"))
+            .table(body_table("docs").in_database("temp"))
+            .build();
+
+        schema.apply_successful_statement(&create_trigger_stmt("docs_trg", "docs", false));
+
+        assert_eq!(schema.triggers.len(), 1);
+        assert_eq!(schema.triggers[0].database.as_deref(), Some("temp"));
+        assert_eq!(schema.triggers[0].target_database.as_deref(), Some("temp"));
+
+        schema.apply_successful_statement(&Stmt::DropTable(DropTableStmt {
+            table: "main.docs".to_string(),
+            if_exists: false,
+        }));
+        assert_eq!(schema.triggers.len(), 1);
+
+        schema.apply_successful_statement(&Stmt::DropTable(DropTableStmt {
+            table: "temp.docs".to_string(),
+            if_exists: false,
+        }));
+        assert!(schema.triggers.is_empty());
+    }
+
+    #[test]
+    fn drop_trigger_resolves_temp_before_main_and_qualified_main_exactly() {
+        let mut schema = SchemaBuilder::new()
+            .database("temp")
+            .trigger(Trigger::new("docs_trg", "docs"))
+            .trigger(
+                Trigger::new("docs_trg", "docs")
+                    .in_database("temp")
+                    .on_table_in_database("temp"),
+            )
+            .build();
+
+        schema.apply_successful_statement(&Stmt::DropTrigger(DropTriggerStmt {
+            name: "docs_trg".to_string(),
+            if_exists: false,
+        }));
+        assert_eq!(schema.triggers.len(), 1);
+        assert_eq!(schema.triggers[0].database, None);
+
+        schema.apply_successful_statement(&Stmt::DropTrigger(DropTriggerStmt {
+            name: "main.docs_trg".to_string(),
+            if_exists: false,
+        }));
+        assert!(schema.triggers.is_empty());
+    }
+
+    #[test]
+    fn successful_schema_statements_update_tables_and_indexes() {
+        let mut schema = Schema::default();
+        schema.apply_successful_statement(&create_table_stmt("docs"));
+        schema.apply_successful_statement(&Stmt::CreateIndex(CreateIndexStmt {
+            name: "idx_docs_body".to_string(),
+            table: "docs".to_string(),
+            columns: vec!["body".to_string()],
+            kind: CreateIndexKind::BTree { unique: false },
+            if_not_exists: false,
+        }));
+
+        schema.apply_successful_statement(&Stmt::AlterTable(AlterTableStmt {
+            table: "docs".to_string(),
+            action: AlterTableAction::RenameColumn {
+                old_name: "body".to_string(),
+                new_name: "title".to_string(),
+            },
+        }));
+        assert_eq!(schema.indexes[0].columns, vec!["title"]);
+
+        schema.apply_successful_statement(&Stmt::AlterTable(AlterTableStmt {
+            table: "docs".to_string(),
+            action: AlterTableAction::RenameTo("articles".to_string()),
+        }));
+
+        assert!(schema.get_table_by_qualified_name("articles").is_some());
+        assert_eq!(schema.indexes[0].table_name, "articles");
+    }
+
+    #[test]
+    fn fts_column_weights_follow_column_renames() {
+        let mut schema = Schema::default();
+        schema.apply_successful_statement(&create_table_stmt("docs"));
+        schema.apply_successful_statement(&Stmt::CreateIndex(CreateIndexStmt {
+            name: "idx_docs_body".to_string(),
+            table: "docs".to_string(),
+            columns: vec!["body".to_string()],
+            kind: CreateIndexKind::Fts(FtsIndexSpec::new().with_weight("body", 2.0)),
+            if_not_exists: false,
+        }));
+
+        schema.apply_successful_statement(&Stmt::AlterTable(AlterTableStmt {
+            table: "docs".to_string(),
+            action: AlterTableAction::RenameColumn {
+                old_name: "body".to_string(),
+                new_name: "title".to_string(),
+            },
+        }));
+
+        assert_eq!(schema.indexes[0].columns, vec!["title"]);
+        let IndexKind::Fts(spec) = &schema.indexes[0].kind else {
+            panic!("expected FTS index");
+        };
+        assert_eq!(spec.weights[0].column, "title");
+    }
+
+    #[test]
+    fn schema_transaction_rollback_restores_schema_snapshot() {
+        let mut schema = Schema::default();
+        let mut tx_state = SchemaTransactionState::default();
+        schema.apply_successful_statement(&create_table_stmt("docs"));
+
+        tx_state.apply_successful_statement(&mut schema, &Stmt::Begin);
+        tx_state.apply_successful_statement(&mut schema, &create_table_stmt("scratch"));
+        assert!(schema.get_table_by_qualified_name("scratch").is_some());
+
+        tx_state.apply_successful_statement(&mut schema, &Stmt::Rollback);
+
+        assert!(!tx_state.in_transaction());
+        assert!(schema.get_table_by_qualified_name("docs").is_some());
+        assert!(schema.get_table_by_qualified_name("scratch").is_none());
+    }
+
+    #[test]
+    fn table_rename_and_drop_update_only_matching_database_triggers() {
+        let mut schema = SchemaBuilder::new()
+            .database("temp")
+            .table(Table::new(
+                "docs",
+                vec![ColumnDef::new("body", DataType::Text)],
+            ))
+            .table(
+                Table::new("docs", vec![ColumnDef::new("body", DataType::Text)])
+                    .in_database("temp"),
+            )
+            .trigger(Trigger::new("main_docs_trg", "docs"))
+            .trigger(
+                Trigger::new("temp_docs_trg", "docs")
+                    .in_database("temp")
+                    .on_table_in_database("temp"),
+            )
+            .build();
+
+        schema.apply_successful_statement(&Stmt::AlterTable(AlterTableStmt {
+            table: "temp.docs".to_string(),
+            action: AlterTableAction::RenameTo("renamed_docs".to_string()),
+        }));
+
+        let main_trigger = schema
+            .triggers
+            .iter()
+            .find(|trigger| trigger.name == "main_docs_trg")
+            .expect("main trigger remains");
+        let temp_trigger = schema
+            .triggers
+            .iter()
+            .find(|trigger| trigger.name == "temp_docs_trg")
+            .expect("temp trigger remains");
+        assert_eq!(main_trigger.table_name, "docs");
+        assert_eq!(main_trigger.database, None);
+        assert_eq!(main_trigger.target_database, None);
+        assert_eq!(temp_trigger.table_name, "renamed_docs");
+        assert_eq!(temp_trigger.database.as_deref(), Some("temp"));
+        assert_eq!(temp_trigger.target_database.as_deref(), Some("temp"));
+
+        schema.apply_successful_statement(&Stmt::DropTable(DropTableStmt {
+            table: "docs".to_string(),
+            if_exists: false,
+        }));
+
+        assert_eq!(schema.triggers.len(), 1);
+        assert_eq!(schema.triggers[0].name, "temp_docs_trg");
+        assert_eq!(schema.triggers[0].database.as_deref(), Some("temp"));
+        assert_eq!(schema.triggers[0].target_database.as_deref(), Some("temp"));
+    }
+
+    #[test]
+    fn drop_table_removes_dependent_indexes_and_triggers() {
+        let mut schema = Schema::default();
+        schema.apply_successful_statement(&create_table_stmt("docs"));
+        schema.apply_successful_statement(&Stmt::CreateIndex(CreateIndexStmt {
+            name: "idx_docs_body".to_string(),
+            table: "docs".to_string(),
+            columns: vec!["body".to_string()],
+            kind: CreateIndexKind::BTree { unique: false },
+            if_not_exists: false,
+        }));
+        schema.apply_successful_statement(&Stmt::CreateTrigger(CreateTriggerStmt {
+            name: "trg_docs".to_string(),
+            table: "docs".to_string(),
+            timing: TriggerTiming::After,
+            event: TriggerEvent::Insert,
+            for_each_row: true,
+            when_clause: None,
+            body: Vec::new(),
+            if_not_exists: false,
+            temporary: false,
+        }));
+
+        schema.apply_successful_statement(&Stmt::DropTable(DropTableStmt {
+            table: "docs".to_string(),
+            if_exists: false,
+        }));
+
+        assert!(schema.tables.is_empty());
+        assert!(schema.indexes.is_empty());
+        assert!(schema.triggers.is_empty());
     }
 }

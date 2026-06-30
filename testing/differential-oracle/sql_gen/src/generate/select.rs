@@ -12,6 +12,9 @@ use crate::error::GenError;
 use crate::functions::{AGGREGATE_FUNCTIONS, FunctionCategory};
 use crate::generate::expr::generate_condition;
 use crate::generate::expr::generate_expr;
+use crate::generate::fts::{
+    generate_fts_match_expr, generate_fts_score_expr, has_fts_index_in_scope,
+};
 use crate::generate::literal::generate_literal;
 use crate::policy::SelectConfig;
 use crate::schema::{ColumnDef, DataType, Table};
@@ -229,6 +232,17 @@ fn generate_select_impl_inner<C: Capabilities>(
             }
         }
     };
+
+    if mode == SelectMode::Full
+        && group_by.is_none()
+        && has_fts_index_in_scope(generator, ctx)
+        && ctx.gen_bool_with_prob(generator.policy().fts_config.score_projection_probability)
+    {
+        columns.push(SelectColumn {
+            expr: generate_fts_score_expr(generator, ctx)?,
+            alias: Some("score".to_string()),
+        });
+    }
 
     // When there is no GROUP BY and `restrict_mixed_aggregates` is enabled,
     // the result column list must not mix aggregate and non-aggregate
@@ -725,7 +739,20 @@ fn generate_order_by<C: Capabilities>(
     let num_items = ctx.gen_range_inclusive(1, max_items.min(total_cols.max(1)));
     let mut items = Vec::with_capacity(num_items);
 
+    if has_fts_index_in_scope(generator, ctx)
+        && ctx.gen_bool_with_prob(generator.policy().fts_config.score_order_by_probability)
+    {
+        items.push(OrderByItem {
+            expr: generate_fts_score_expr(generator, ctx)?,
+            direction: select_order_direction(ctx, &select_config.order_direction_weights),
+            nulls: select_nulls_order(ctx, &select_config.nulls_order_weights),
+        });
+    }
+
     for _ in 0..num_items {
+        if items.len() >= max_items {
+            break;
+        }
         let col_w = select_config.order_by_column_weight;
         let expr_w = select_config.order_by_expr_weight;
 
@@ -957,6 +984,12 @@ pub(crate) fn generate_join_on_condition<C: Capabilities>(
     let right_scope = ctx.tables_in_scope().last().unwrap();
     let right_qualifier = right_scope.qualifier.clone();
     let right_table = right_scope.table.clone();
+
+    if has_fts_index_in_scope(generator, ctx)
+        && ctx.gen_bool_with_prob(generator.policy().fts_config.join_on_fts_match_probability)
+    {
+        return generate_fts_match_expr(generator, ctx);
+    }
 
     if ctx.gen_bool_with_prob(join_config.equi_join_probability) {
         // Try to find compatible columns (same data type) between the two tables

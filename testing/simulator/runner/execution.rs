@@ -55,6 +55,8 @@ use crate::{
 };
 
 use super::env::{SimConnection, SimulatorEnv};
+#[cfg(feature = "fts")]
+use super::fts::oracle::{execute_fts_oracle, execute_fts_sql};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Execution {
@@ -306,6 +308,33 @@ pub fn execute_interaction_turso(
             interaction.execute_assertion(stack, env)?;
             stack.clear();
         }
+        #[cfg(feature = "fts")]
+        InteractionType::FtsSql(sql) => {
+            let results = {
+                let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index]
+                else {
+                    unreachable!()
+                };
+                execute_fts_sql(conn, &sql.sql).inspect_err(|err| tracing::error!(?err))
+            };
+
+            if let Some(fts_state) = env.fts_state.as_mut() {
+                fts_state.finish_sql_result(results.is_ok());
+            }
+
+            if let Err(err) = &results
+                && !interaction.ignore_error
+            {
+                return Err(err.clone());
+            }
+
+            stack.push(results);
+        }
+        #[cfg(feature = "fts")]
+        InteractionType::FtsOracle(check) => {
+            execute_fts_oracle(env, connection_index, check)?;
+            stack.clear();
+        }
         InteractionType::Assumption(_) => {
             let assumption_result = interaction.execute_assumption(stack, env);
             stack.clear();
@@ -438,6 +467,10 @@ fn execute_interaction_rusqlite(
         }
         InteractionType::FsyncQuery(..) => {
             unimplemented!("cannot implement fsync query in rusqlite, as we do not control IO");
+        }
+        #[cfg(feature = "fts")]
+        InteractionType::FtsSql(_) | InteractionType::FtsOracle(_) => {
+            unimplemented!("FTS simulator interactions are Limbo-only");
         }
         InteractionType::Assertion(_) => {
             interaction.execute_assertion(stack, env)?;

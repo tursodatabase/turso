@@ -15,7 +15,7 @@ use sql_generation::generation::generated_expr::rename_column_refs_in_expr;
 use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::{SimValue, Table};
 use tracing::trace;
-use turso_core::Database;
+use turso_core::{Database, DatabaseOpts};
 use turso_parser::ast::ColumnConstraint;
 
 use crate::generation::Shadow;
@@ -23,10 +23,29 @@ use crate::model::Query;
 use crate::profiles::Profile;
 use crate::runner::SimIO;
 use crate::runner::cli::IoBackend;
+#[cfg(feature = "fts")]
+use crate::runner::fts::FtsPlanState;
 use crate::runner::io::SimulatorIO;
 use crate::runner::memory::io::MemorySimIO;
 const DEFAULT_CACHE_SIZE: usize = 2000;
 use super::cli::SimulatorCLI;
+
+pub(crate) fn simulator_database_opts(enable_fts: bool) -> DatabaseOpts {
+    let opts = DatabaseOpts::new()
+        .with_autovacuum(true)
+        .with_attach(true)
+        .with_generated_columns(true);
+
+    #[cfg(feature = "fts")]
+    {
+        if enable_fts {
+            return opts.with_index_method(true);
+        }
+    }
+
+    let _ = enable_fts;
+    opts
+}
 
 /// Pre-create attached DB files with MVCC journal mode so that journal modes
 /// are compatible when ATTACH happens later during simulation.
@@ -1071,6 +1090,8 @@ pub(crate) struct SimulatorEnv {
     pub(crate) attached_dbs: Vec<String>,
     /// Sequences are global objects, not affected by transactions/savepoints
     pub sequences: Vec<ShadowSequence>,
+    #[cfg(feature = "fts")]
+    pub(crate) fts_state: Option<FtsPlanState>,
 }
 
 impl UnwindSafe for SimulatorEnv {}
@@ -1097,6 +1118,8 @@ impl SimulatorEnv {
             committed_tables: self.committed_tables.clone(),
             attached_dbs: self.attached_dbs.clone(),
             sequences: self.sequences.clone(),
+            #[cfg(feature = "fts")]
+            fts_state: self.fts_state.clone(),
         }
     }
 
@@ -1167,10 +1190,7 @@ impl SimulatorEnv {
             io.clone(),
             db_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new()
-                .with_autovacuum(true)
-                .with_attach(true)
-                .with_generated_columns(true),
+            simulator_database_opts(self.opts.enable_fts),
             None,
         ) {
             Ok(db) => db,
@@ -1288,6 +1308,7 @@ impl SimulatorEnv {
             disable_reopen_database: cli_opts.disable_reopen_database,
             disable_integrity_check: cli_opts.disable_integrity_check,
             cache_size: profile.cache_size_pages.unwrap_or(DEFAULT_CACHE_SIZE),
+            enable_fts: false,
         };
 
         // Remove existing database file if it exists
@@ -1388,10 +1409,7 @@ impl SimulatorEnv {
             io.clone(),
             db_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new()
-                .with_autovacuum(true)
-                .with_attach(true)
-                .with_generated_columns(true),
+            simulator_database_opts(opts.enable_fts),
             None,
         ) {
             Ok(db) => db,
@@ -1437,6 +1455,8 @@ impl SimulatorEnv {
             connection_last_query: Bitmap::new(),
             attached_dbs,
             sequences: Vec::new(),
+            #[cfg(feature = "fts")]
+            fts_state: None,
         }
     }
 
@@ -1636,6 +1656,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_faulty_query: bool,
     pub(crate) disable_reopen_database: bool,
     pub(crate) disable_integrity_check: bool,
+    pub(crate) enable_fts: bool,
 
     pub(crate) max_interactions: u32,
     pub(crate) page_size: usize,

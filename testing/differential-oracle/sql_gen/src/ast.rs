@@ -5,7 +5,7 @@
 
 use crate::context::Context;
 use crate::functions::AGGREGATE_FUNCTIONS;
-use crate::schema::{DataType, Schema};
+use crate::schema::{DataType, FtsIndexSpec, FtsTokenizer, Schema};
 use std::fmt;
 
 // =============================================================================
@@ -26,6 +26,7 @@ pub enum Stmt {
     AlterTable(AlterTableStmt),
     CreateIndex(CreateIndexStmt),
     DropIndex(DropIndexStmt),
+    OptimizeIndex(OptimizeIndexStmt),
     PragmaForeignKeyList(PragmaForeignKeyListStmt),
     CreateTrigger(CreateTriggerStmt),
     DropTrigger(DropTriggerStmt),
@@ -54,6 +55,7 @@ impl fmt::Display for Stmt {
             Stmt::AlterTable(s) => write!(f, "{s}"),
             Stmt::CreateIndex(s) => write!(f, "{s}"),
             Stmt::DropIndex(s) => write!(f, "{s}"),
+            Stmt::OptimizeIndex(s) => write!(f, "{s}"),
             Stmt::PragmaForeignKeyList(s) => write!(f, "{s}"),
             Stmt::CreateTrigger(s) => write!(f, "{s}"),
             Stmt::DropTrigger(s) => write!(f, "{s}"),
@@ -92,6 +94,7 @@ impl Stmt {
             | Stmt::AlterTable(_)
             | Stmt::CreateIndex(_)
             | Stmt::DropIndex(_)
+            | Stmt::OptimizeIndex(_)
             | Stmt::PragmaForeignKeyList(_)
             | Stmt::CreateTrigger(_)
             | Stmt::DropTrigger(_)
@@ -334,6 +337,7 @@ impl Expr {
                 .or_else(|| b.right.unordered_limit_reason()),
             Expr::UnaryOp(u) => u.operand.unordered_limit_reason(),
             Expr::FunctionCall(fc) => fc.args.iter().find_map(|a| a.unordered_limit_reason()),
+            Expr::FtsMatch(fts) => fts.query.unordered_limit_reason(),
             Expr::Case(c) => c
                 .operand
                 .as_ref()
@@ -391,6 +395,7 @@ impl Expr {
                 .args
                 .iter()
                 .find_map(|a| a.non_unique_order_by_reason(schema)),
+            Expr::FtsMatch(fts) => fts.query.non_unique_order_by_reason(schema),
             Expr::Case(c) => c
                 .operand
                 .as_ref()
@@ -449,6 +454,7 @@ impl Expr {
                 }
                 fc.args.iter().any(|a| a.contains_aggregate())
             }
+            Expr::FtsMatch(fts) => fts.query.contains_aggregate(),
             Expr::BinaryOp(b) => b.left.contains_aggregate() || b.right.contains_aggregate(),
             Expr::UnaryOp(u) => u.operand.contains_aggregate(),
             Expr::Cast(c) => c.expr.contains_aggregate(),
@@ -488,6 +494,7 @@ impl Expr {
         match self {
             Expr::ColumnRef(_) => true,
             Expr::FunctionCall(fc) => fc.args.iter().any(|a| a.contains_column_ref()),
+            Expr::FtsMatch(fts) => !fts.columns.is_empty() || fts.query.contains_column_ref(),
             Expr::BinaryOp(b) => b.left.contains_column_ref() || b.right.contains_column_ref(),
             Expr::UnaryOp(u) => u.operand.contains_column_ref(),
             Expr::Cast(c) => c.expr.contains_column_ref(),
@@ -528,6 +535,7 @@ impl Expr {
         match self {
             Expr::Subquery(_) => true,
             Expr::FunctionCall(fc) => fc.args.iter().any(|a| a.contains_scalar_subquery()),
+            Expr::FtsMatch(fts) => fts.query.contains_scalar_subquery(),
             Expr::BinaryOp(b) => {
                 b.left.contains_scalar_subquery() || b.right.contains_scalar_subquery()
             }
@@ -1254,21 +1262,34 @@ pub struct CreateIndexStmt {
     pub name: String,
     pub table: String,
     pub columns: Vec<String>,
-    pub unique: bool,
+    pub kind: CreateIndexKind,
     pub if_not_exists: bool,
+}
+
+/// Index method and method-specific options for `CREATE INDEX`.
+#[derive(Debug, Clone)]
+pub enum CreateIndexKind {
+    BTree { unique: bool },
+    Fts(FtsIndexSpec),
 }
 
 impl fmt::Display for CreateIndexStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "CREATE ")?;
-        if self.unique {
+        if matches!(&self.kind, CreateIndexKind::BTree { unique: true }) {
             write!(f, "UNIQUE ")?;
         }
         write!(f, "INDEX ")?;
         if self.if_not_exists {
             write!(f, "IF NOT EXISTS ")?;
         }
-        write!(f, "{} ON {} (", self.name, self.table)?;
+        write!(f, "{} ON {}", self.name, self.table)?;
+
+        if matches!(self.kind, CreateIndexKind::Fts(_)) {
+            write!(f, " USING fts")?;
+        }
+
+        write!(f, " (")?;
 
         for (i, col) in self.columns.iter().enumerate() {
             if i > 0 {
@@ -1277,8 +1298,43 @@ impl fmt::Display for CreateIndexStmt {
             write!(f, "{col}")?;
         }
 
-        write!(f, ")")
+        write!(f, ")")?;
+
+        if let CreateIndexKind::Fts(spec) = &self.kind {
+            write_fts_index_options(f, spec)?;
+        }
+
+        Ok(())
     }
+}
+
+fn write_fts_index_options(f: &mut fmt::Formatter<'_>, spec: &FtsIndexSpec) -> fmt::Result {
+    if spec.is_default() {
+        return Ok(());
+    }
+
+    write!(f, " WITH (")?;
+
+    let mut needs_comma = false;
+    if spec.tokenizer != FtsTokenizer::Default {
+        write!(f, "tokenizer = '{}'", spec.tokenizer)?;
+        needs_comma = true;
+    }
+    if !spec.weights.is_empty() {
+        if needs_comma {
+            write!(f, ", ")?;
+        }
+        write!(f, "weights = '")?;
+        for (i, field_weight) in spec.weights.iter().enumerate() {
+            if i > 0 {
+                write!(f, ",")?;
+            }
+            write!(f, "{}={:.1}", field_weight.column, field_weight.weight)?;
+        }
+        write!(f, "'")?;
+    }
+
+    write!(f, ")")
 }
 
 /// A DROP INDEX statement.
@@ -1295,6 +1351,22 @@ impl fmt::Display for DropIndexStmt {
             write!(f, "IF EXISTS ")?;
         }
         write!(f, "{}", self.name)
+    }
+}
+
+/// An OPTIMIZE INDEX statement.
+#[derive(Debug, Clone)]
+pub struct OptimizeIndexStmt {
+    pub name: Option<String>,
+}
+
+impl fmt::Display for OptimizeIndexStmt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "OPTIMIZE INDEX")?;
+        if let Some(name) = &self.name {
+            write!(f, " {name}")?;
+        }
+        Ok(())
     }
 }
 
@@ -1470,6 +1542,7 @@ pub enum Expr {
     BinaryOp(Box<BinaryOpExpr>),
     UnaryOp(Box<UnaryOpExpr>),
     FunctionCall(FunctionCallExpr),
+    FtsMatch(FtsMatchExpr),
     Subquery(Box<SelectStmt>),
     Case(Box<CaseExpr>),
     Cast(Box<CastExpr>),
@@ -1500,6 +1573,7 @@ impl fmt::Display for Expr {
             Expr::BinaryOp(b) => write!(f, "{b}"),
             Expr::UnaryOp(u) => write!(f, "{u}"),
             Expr::FunctionCall(fc) => write!(f, "{fc}"),
+            Expr::FtsMatch(fts) => write!(f, "{fts}"),
             Expr::Subquery(s) => write!(f, "({s})"),
             Expr::Case(c) => write!(f, "{c}"),
             Expr::Cast(c) => write!(f, "{c}"),
@@ -1567,6 +1641,21 @@ impl Expr {
             name,
             args,
             filter: Some(Box::new(filter)),
+        })
+    }
+
+    /// Create an FTS match predicate (records to context).
+    pub fn fts_match(
+        ctx: &mut Context,
+        columns: Vec<ColumnRef>,
+        query: Expr,
+        syntax: FtsMatchSyntax,
+    ) -> Self {
+        ctx.record(ExprKind::FtsMatch);
+        Expr::FtsMatch(FtsMatchExpr {
+            columns,
+            query: Box::new(query),
+            syntax,
         })
     }
 
@@ -1931,6 +2020,55 @@ impl fmt::Display for FunctionCallExpr {
     }
 }
 
+/// Syntax form for an FTS match predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtsMatchSyntax {
+    Function,
+    Match,
+}
+
+/// A Turso FTS predicate: either `fts_match(...)` or `(col, ...) MATCH query`.
+#[derive(Debug, Clone)]
+pub struct FtsMatchExpr {
+    pub columns: Vec<ColumnRef>,
+    pub query: Box<Expr>,
+    pub syntax: FtsMatchSyntax,
+}
+
+impl fmt::Display for FtsMatchExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.syntax {
+            FtsMatchSyntax::Function => {
+                write!(f, "fts_match(")?;
+                for (i, col) in self.columns.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{col}")?;
+                }
+                if !self.columns.is_empty() {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{})", self.query)
+            }
+            FtsMatchSyntax::Match => {
+                if self.columns.len() == 1 {
+                    write!(f, "{} MATCH {}", self.columns[0], self.query)
+                } else {
+                    write!(f, "(")?;
+                    for (i, col) in self.columns.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{col}")?;
+                    }
+                    write!(f, ") MATCH {}", self.query)
+                }
+            }
+        }
+    }
+}
+
 /// A CASE expression.
 #[derive(Debug, Clone)]
 pub struct CaseExpr {
@@ -2152,6 +2290,42 @@ mod tests {
         };
 
         assert_eq!(select.to_string(), "SELECT name FROM users LIMIT 10");
+    }
+
+    #[test]
+    fn test_create_fts_index_display() {
+        let create_index = CreateIndexStmt {
+            name: "docs_fts".to_string(),
+            table: "docs".to_string(),
+            columns: vec!["title".to_string(), "body".to_string()],
+            kind: CreateIndexKind::Fts(
+                FtsIndexSpec::new()
+                    .with_tokenizer(FtsTokenizer::Raw)
+                    .with_weight("title", 4.0)
+                    .with_weight("body", 1.0),
+            ),
+            if_not_exists: true,
+        };
+
+        assert_eq!(
+            create_index.to_string(),
+            "CREATE INDEX IF NOT EXISTS docs_fts ON docs USING fts (title, body) WITH (tokenizer = 'raw', weights = 'title=4.0,body=1.0')"
+        );
+    }
+
+    #[test]
+    fn test_optimize_index_display() {
+        assert_eq!(
+            OptimizeIndexStmt {
+                name: Some("docs_fts".to_string())
+            }
+            .to_string(),
+            "OPTIMIZE INDEX docs_fts"
+        );
+        assert_eq!(
+            OptimizeIndexStmt { name: None }.to_string(),
+            "OPTIMIZE INDEX"
+        );
     }
 
     #[test]
