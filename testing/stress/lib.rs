@@ -130,11 +130,12 @@ pub mod thread {
 
 #[cfg(shuttle)]
 pub mod future {
-    pub use shuttle::future::{spawn_local as spawn, JoinHandle};
+    pub use shuttle::future::{spawn_local as spawn, yield_now, JoinHandle};
 }
 
 #[cfg(not(shuttle))]
 pub mod future {
+    pub use tokio::task::yield_now;
     pub use tokio::{spawn, task::JoinHandle};
 }
 

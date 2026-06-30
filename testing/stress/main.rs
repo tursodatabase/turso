@@ -529,7 +529,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 #[cfg(shuttle)]
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use shuttle::scheduler::{RandomScheduler, UncontrolledNondeterminismCheckScheduler};
+    use shuttle::scheduler::{
+        PctScheduler, RandomScheduler, UncontrolledNondeterminismCheckScheduler,
+    };
 
     let config = turso_stress::shuttle_config();
 
@@ -544,8 +546,18 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Box::new(UncontrolledNondeterminismCheckScheduler::new(
             RandomScheduler::new(1),
         ))
+    } else if opts.pct {
+        eprintln!(
+            "Using PctScheduler (depth={}, schedules={})",
+            opts.pct_depth, opts.schedules
+        );
+        Box::new(PctScheduler::new_from_seed(
+            seed,
+            opts.pct_depth,
+            opts.schedules,
+        ))
     } else {
-        Box::new(RandomScheduler::new_from_seed(seed, 1))
+        Box::new(RandomScheduler::new_from_seed(seed, opts.schedules))
     };
 
     let runner = shuttle::Runner::new(scheduler, config);
@@ -667,6 +679,10 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         }
         TxMode::Concurrent => {
             conn.pragma_update("journal_mode", "mvcc").await?;
+            if let Some(threshold) = opts.mvcc_checkpoint_threshold {
+                conn.pragma_update("mvcc_checkpoint_threshold", threshold)
+                    .await?;
+            }
         }
     };
 
@@ -825,9 +841,55 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
             handles.push(handle);
         }
 
+        let mut reader_handles = Vec::with_capacity(opts.long_readers);
+        for reader_idx in 0..opts.long_readers {
+            let db = db.clone();
+            let schema_for_reader = schema.clone();
+            let reopen_requested = reopen_requested.clone();
+            let reader_thread = ThreadId::new(usize::MAX - 1 - reader_idx);
+
+            let handle = turso_stress::future::spawn(async move {
+                let conn = StressDb::connect(&db, reader_thread.clone(), opts.busy_timeout).await?;
+
+                let table_name = schema_for_reader.tables
+                    [reader_idx % schema_for_reader.tables.len()]
+                .name
+                .clone();
+                let select = format!("SELECT COUNT(*) FROM {table_name}");
+
+                let begin = match opts.tx_mode {
+                    TxMode::SQLite => "BEGIN",
+                    TxMode::Concurrent => "BEGIN CONCURRENT",
+                };
+                let _ = conn.execute(begin, ()).await;
+
+                if let Ok(mut rows) = conn.query(&select, ()).await {
+                    let _ = rows.next().await;
+                }
+
+                for _ in 0..opts.nr_iterations {
+                    if reopen_requested.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if let Ok(mut rows) = conn.query(&select, ()).await {
+                        let _ = rows.next().await;
+                    }
+                    turso_stress::future::yield_now().await;
+                }
+
+                let _ = conn.execute("COMMIT", ()).await;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            });
+            reader_handles.push(handle);
+        }
+
         for handle in handles {
             let (thread_idx, completed_iteration_count) = handle.await??;
             stress_counter.register_iterations(thread_idx, completed_iteration_count);
+        }
+
+        for handle in reader_handles {
+            handle.await??;
         }
 
         // This is what triggers MVCC recovery

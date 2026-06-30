@@ -75,6 +75,40 @@ pub struct Opts {
 
     #[clap(
         long,
+        help = "Number of long-lived reader tasks that hold a read snapshot open while writers run",
+        default_value_t = 0
+    )]
+    pub long_readers: usize,
+
+    #[clap(
+        long,
+        help = "Use shuttle's PctScheduler (probabilistic concurrency testing) instead of RandomScheduler",
+        default_value_t = false
+    )]
+    pub pct: bool,
+
+    #[clap(
+        long,
+        help = "Maximum number of priority changes for PctScheduler (PCT bug depth)",
+        default_value_t = 5
+    )]
+    pub pct_depth: usize,
+
+    #[clap(
+        long,
+        help = "Number of schedules the shuttle scheduler explores before giving up",
+        default_value_t = 1
+    )]
+    pub schedules: usize,
+
+    #[clap(
+        long,
+        help = "Set PRAGMA mvcc_checkpoint_threshold in concurrent mode to force frequent checkpoints"
+    )]
+    pub mvcc_checkpoint_threshold: Option<i64>,
+
+    #[clap(
+        long,
         help = "If true, this will run a modified minimal version of turso_stress that ensure the DB is deterministic (no sources of randomness that are not controlled by the seed)"
     )]
     pub check_uncontrolled_nondeterminism: bool,
