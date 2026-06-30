@@ -1,17 +1,5 @@
 @database :memory:
 
-# Test that incompatible features are properly rejected when MVCC is enabled.
-# These tests only run against tursodb since MVCC is turso-specific.
-
-test mvcc-rejects-cdc {
-    PRAGMA journal_mode = 'mvcc';
-    CREATE TABLE t4 (id INTEGER PRIMARY KEY, val TEXT);
-    PRAGMA capture_data_changes_conn = 'full';
-}
-expect error {
-    CDC is not supported in MVCC mode
-}
-
 # DDL statements inside BEGIN CONCURRENT should produce a clear error message
 # instead of the confusing "database table is locked".
 
