@@ -97,7 +97,7 @@ impl PageCodec for EncryptionContext {
 }
 
 #[derive(Debug, Clone)]
-pub enum EncryptionOrChecksum {
+pub enum PageTransform {
     Encryption(EncryptionContext),
     PageCodec(Arc<dyn PageCodec>),
     Checksum(ChecksumContext),
@@ -106,59 +106,57 @@ pub enum EncryptionOrChecksum {
 
 #[derive(Debug, Clone)]
 pub struct IOContext {
-    encryption_or_checksum: EncryptionOrChecksum,
+    page_transform: PageTransform,
 }
 
 impl IOContext {
     pub fn encryption_context(&self) -> Option<&EncryptionContext> {
-        match &self.encryption_or_checksum {
-            EncryptionOrChecksum::Encryption(ctx) => Some(ctx),
+        match &self.page_transform {
+            PageTransform::Encryption(ctx) => Some(ctx),
             _ => None,
         }
     }
 
     pub fn get_reserved_space_bytes(&self) -> u8 {
-        match &self.encryption_or_checksum {
-            EncryptionOrChecksum::Encryption(ctx) => ctx.required_reserved_bytes(),
-            EncryptionOrChecksum::PageCodec(ctx) => ctx.required_reserved_bytes(),
-            EncryptionOrChecksum::Checksum(ctx) => ctx.required_reserved_bytes(),
-            EncryptionOrChecksum::None => Default::default(),
+        match &self.page_transform {
+            PageTransform::Encryption(ctx) => ctx.required_reserved_bytes(),
+            PageTransform::PageCodec(ctx) => ctx.required_reserved_bytes(),
+            PageTransform::Checksum(ctx) => ctx.required_reserved_bytes(),
+            PageTransform::None => Default::default(),
         }
     }
 
     pub fn set_encryption(&mut self, encryption_ctx: EncryptionContext) {
-        self.encryption_or_checksum = EncryptionOrChecksum::Encryption(encryption_ctx);
+        self.page_transform = PageTransform::Encryption(encryption_ctx);
     }
 
     pub fn set_page_codec(&mut self, codec: Arc<dyn PageCodec>) {
-        self.encryption_or_checksum = EncryptionOrChecksum::PageCodec(codec);
+        self.page_transform = PageTransform::PageCodec(codec);
     }
 
-    pub fn has_page_codec(&self) -> bool {
+    pub fn has_content_transform(&self) -> bool {
         matches!(
-            self.encryption_or_checksum,
-            EncryptionOrChecksum::Encryption(_) | EncryptionOrChecksum::PageCodec(_)
+            self.page_transform,
+            PageTransform::Encryption(_) | PageTransform::PageCodec(_)
         )
     }
 
-    pub fn encryption_or_checksum(&self) -> &EncryptionOrChecksum {
-        &self.encryption_or_checksum
+    pub fn page_transform(&self) -> &PageTransform {
+        &self.page_transform
     }
 
     pub fn reset_checksum(&mut self) {
-        self.encryption_or_checksum = EncryptionOrChecksum::None;
+        self.page_transform = PageTransform::None;
     }
 }
 
 impl Default for IOContext {
     fn default() -> Self {
         #[cfg(feature = "checksum")]
-        let encryption_or_checksum = EncryptionOrChecksum::Checksum(ChecksumContext::default());
+        let page_transform = PageTransform::Checksum(ChecksumContext::default());
         #[cfg(not(feature = "checksum"))]
-        let encryption_or_checksum = EncryptionOrChecksum::None;
-        Self {
-            encryption_or_checksum,
-        }
+        let page_transform = PageTransform::None;
+        Self { page_transform }
     }
 }
 
@@ -217,8 +215,8 @@ impl DatabaseStorage for DatabaseFile {
             return Err(LimboError::IntegerOverflow);
         };
 
-        match &io_ctx.encryption_or_checksum {
-            EncryptionOrChecksum::Encryption(ctx) => {
+        match &io_ctx.page_transform {
+            PageTransform::Encryption(ctx) => {
                 let encryption_ctx = ctx.clone();
                 let read_buffer = r.buf_arc();
                 let original_c = c.clone();
@@ -264,7 +262,7 @@ impl DatabaseStorage for DatabaseFile {
                 let wrapped_completion = Completion::new_read(read_buffer, decrypt_complete);
                 self.file.pread(pos, wrapped_completion)
             }
-            EncryptionOrChecksum::PageCodec(ctx) => {
+            PageTransform::PageCodec(ctx) => {
                 let page_codec = ctx.clone();
                 let read_buffer = r.buf_arc();
                 let original_c = c.clone();
@@ -326,7 +324,7 @@ impl DatabaseStorage for DatabaseFile {
                 let wrapped_completion = Completion::new_read(read_buffer, decode_complete);
                 self.file.pread(pos, wrapped_completion)
             }
-            EncryptionOrChecksum::Checksum(ctx) => {
+            PageTransform::Checksum(ctx) => {
                 let checksum_ctx = ctx.clone();
                 let read_buffer = r.buf_arc();
                 let original_c = c.clone();
@@ -367,7 +365,7 @@ impl DatabaseStorage for DatabaseFile {
                 let wrapped_completion = Completion::new_read(read_buffer, verify_complete);
                 self.file.pread(pos, wrapped_completion)
             }
-            EncryptionOrChecksum::None => self.file.pread(pos, c),
+            PageTransform::None => self.file.pread(pos, c),
         }
     }
 
@@ -387,15 +385,15 @@ impl DatabaseStorage for DatabaseFile {
         let Some(pos) = (page_idx as u64 - 1).checked_mul(buffer_size as u64) else {
             return Err(LimboError::IntegerOverflow);
         };
-        let buffer = match &io_ctx.encryption_or_checksum {
-            EncryptionOrChecksum::Encryption(ctx) => {
+        let buffer = match &io_ctx.page_transform {
+            PageTransform::Encryption(ctx) => {
                 encode_buffer(page_idx, buffer, ctx, PageCodecLocation::Database)?
             }
-            EncryptionOrChecksum::PageCodec(ctx) => {
+            PageTransform::PageCodec(ctx) => {
                 encode_buffer(page_idx, buffer, ctx.as_ref(), PageCodecLocation::Database)?
             }
-            EncryptionOrChecksum::Checksum(ctx) => checksum_buffer(page_idx, buffer, ctx),
-            EncryptionOrChecksum::None => buffer,
+            PageTransform::Checksum(ctx) => checksum_buffer(page_idx, buffer, ctx),
+            PageTransform::None => buffer,
         };
         self.file.pwrite(pos, buffer, c)
     }
@@ -416,15 +414,15 @@ impl DatabaseStorage for DatabaseFile {
         let Some(pos) = (first_page_idx as u64 - 1).checked_mul(page_size as u64) else {
             return Err(LimboError::IntegerOverflow);
         };
-        let buffers = match &io_ctx.encryption_or_checksum() {
-            EncryptionOrChecksum::Encryption(ctx) => buffers
+        let buffers = match &io_ctx.page_transform() {
+            PageTransform::Encryption(ctx) => buffers
                 .into_iter()
                 .enumerate()
                 .map(|(i, buffer)| {
                     encode_buffer(first_page_idx + i, buffer, ctx, PageCodecLocation::Database)
                 })
                 .collect::<Result<Vec<_>>>()?,
-            EncryptionOrChecksum::PageCodec(ctx) => buffers
+            PageTransform::PageCodec(ctx) => buffers
                 .into_iter()
                 .enumerate()
                 .map(|(i, buffer)| {
@@ -436,12 +434,12 @@ impl DatabaseStorage for DatabaseFile {
                     )
                 })
                 .collect::<Result<Vec<_>>>()?,
-            EncryptionOrChecksum::Checksum(ctx) => buffers
+            PageTransform::Checksum(ctx) => buffers
                 .into_iter()
                 .enumerate()
                 .map(|(i, buffer)| checksum_buffer(first_page_idx + i, buffer, ctx))
                 .collect::<Vec<_>>(),
-            EncryptionOrChecksum::None => buffers,
+            PageTransform::None => buffers,
         };
         let c = self.file.pwritev(pos, buffers, c)?;
         Ok(c)

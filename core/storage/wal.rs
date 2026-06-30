@@ -29,8 +29,8 @@ use crate::io::clock::MonotonicInstant;
 use crate::io::CompletionGroup;
 use crate::io::{File, IO};
 use crate::storage::database::{
-    page_codec_size_mismatch, validate_page_codec_output_len, DatabaseStorage,
-    EncryptionOrChecksum, PageCodecLocation,
+    page_codec_size_mismatch, validate_page_codec_output_len, DatabaseStorage, PageCodecLocation,
+    PageTransform,
 };
 #[cfg(host_shared_wal)]
 use crate::storage::shared_wal_coordination::SharedWalCoordinationOpenMode;
@@ -3431,7 +3431,7 @@ impl Wal for WalFile {
         }
 
         let epoch = self.coordination.checkpoint_epoch();
-        let enc_or_csum = self.io_ctx.read().encryption_or_checksum().clone();
+        let page_transform = self.io_ctx.read().page_transform().clone();
         let raw_buf = scratch_buf.unwrap_or_else(|| Arc::new(Buffer::new_temporary(total)));
 
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
@@ -3488,8 +3488,8 @@ impl Wal for WalFile {
                 );
                 body_slice.copy_from_slice(page_body);
 
-                match &enc_or_csum {
-                    EncryptionOrChecksum::Encryption(ctx) => {
+                match &page_transform {
+                    PageTransform::Encryption(ctx) => {
                         match ctx.decrypt_page(body_slice, expected_page_id) {
                             Ok(decrypted) => body_slice.copy_from_slice(&decrypted),
                             Err(e) => {
@@ -3504,7 +3504,7 @@ impl Wal for WalFile {
                             }
                         }
                     }
-                    EncryptionOrChecksum::PageCodec(ctx) => {
+                    PageTransform::PageCodec(ctx) => {
                         match ctx.decode_page(body_slice, expected_page_id, PageCodecLocation::Wal)
                         {
                             Ok(decoded) => {
@@ -3537,7 +3537,7 @@ impl Wal for WalFile {
                             }
                         }
                     }
-                    EncryptionOrChecksum::Checksum(ctx) => {
+                    PageTransform::Checksum(ctx) => {
                         if let Err(e) = ctx.verify_checksum(body_slice, expected_page_id) {
                             mark_unlikely();
                             tracing::error!(
@@ -3547,7 +3547,7 @@ impl Wal for WalFile {
                             return Some(e);
                         }
                     }
-                    EncryptionOrChecksum::None => {}
+                    PageTransform::None => {}
                 }
             }
 
@@ -3581,8 +3581,8 @@ impl Wal for WalFile {
         };
         let page_codec = {
             let io_ctx = self.io_ctx.read();
-            match io_ctx.encryption_or_checksum() {
-                EncryptionOrChecksum::PageCodec(ctx) => Some(ctx.clone()),
+            match io_ctx.page_transform() {
+                PageTransform::PageCodec(ctx) => Some(ctx.clone()),
                 _ => None,
             }
         };
@@ -4183,26 +4183,24 @@ impl Wal for WalFile {
 
         let mut bufs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
         let mut metadata = Vec::with_capacity(pages.len());
-        let enc_or_csum = self.io_ctx.read().encryption_or_checksum().clone();
+        let page_transform = self.io_ctx.read().page_transform().clone();
 
         for (idx, page) in pages.iter().enumerate() {
             let page_id = page.get().id;
             let plain = page.get_contents().as_ptr();
 
-            let data: Cow<[u8]> = match &enc_or_csum {
-                EncryptionOrChecksum::Encryption(ctx) => {
-                    Cow::Owned(ctx.encrypt_page(plain, page_id)?)
-                }
-                EncryptionOrChecksum::PageCodec(ctx) => {
+            let data: Cow<[u8]> = match &page_transform {
+                PageTransform::Encryption(ctx) => Cow::Owned(ctx.encrypt_page(plain, page_id)?),
+                PageTransform::PageCodec(ctx) => {
                     let encoded = ctx.encode_page(plain, page_id, PageCodecLocation::Wal)?;
                     validate_page_codec_output_len(page_id, plain.len(), encoded.len())?;
                     Cow::Owned(encoded)
                 }
-                EncryptionOrChecksum::Checksum(ctx) => {
+                PageTransform::Checksum(ctx) => {
                     ctx.add_checksum_to_page(plain, page_id)?;
                     Cow::Borrowed(plain)
                 }
-                EncryptionOrChecksum::None => Cow::Borrowed(plain),
+                PageTransform::None => Cow::Borrowed(plain),
             };
 
             // if DB size is included for commit frame, it will need to be included only in the last frame of the batch.
@@ -4297,7 +4295,7 @@ impl Wal for WalFile {
         let mut iovecs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
         let mut page_frame_and_checksum: Vec<(PageRef, u64, (u32, u32))> =
             Vec::with_capacity(pages.len());
-        let enc_or_csum = self.io_ctx.read().encryption_or_checksum().clone();
+        let page_transform = self.io_ctx.read().page_transform().clone();
 
         // Rolling checksum input to each frame build
         let mut rolling_checksum: (u32, u32) = *self.last_checksum.read();
@@ -4309,20 +4307,18 @@ impl Wal for WalFile {
             let page_id = page.get().id;
             let plain = page.get_contents().as_ptr();
 
-            let data_to_write: std::borrow::Cow<[u8]> = match &enc_or_csum {
-                EncryptionOrChecksum::Encryption(ctx) => {
-                    Cow::Owned(ctx.encrypt_page(plain, page_id)?)
-                }
-                EncryptionOrChecksum::PageCodec(ctx) => {
+            let data_to_write: std::borrow::Cow<[u8]> = match &page_transform {
+                PageTransform::Encryption(ctx) => Cow::Owned(ctx.encrypt_page(plain, page_id)?),
+                PageTransform::PageCodec(ctx) => {
                     let encoded = ctx.encode_page(plain, page_id, PageCodecLocation::Wal)?;
                     validate_page_codec_output_len(page_id, plain.len(), encoded.len())?;
                     Cow::Owned(encoded)
                 }
-                EncryptionOrChecksum::Checksum(ctx) => {
+                PageTransform::Checksum(ctx) => {
                     ctx.add_checksum_to_page(plain, page_id)?;
                     Cow::Borrowed(plain)
                 }
-                EncryptionOrChecksum::None => Cow::Borrowed(plain),
+                PageTransform::None => Cow::Borrowed(plain),
             };
 
             let frame_db_size = 0; // this method is not used for the commit path

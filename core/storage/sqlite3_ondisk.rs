@@ -63,7 +63,7 @@ use crate::numeric::Numeric;
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::{
-    page_codec_size_mismatch, DatabaseStorage, EncryptionOrChecksum, PageCodecLocation,
+    page_codec_size_mismatch, DatabaseStorage, PageCodecLocation, PageTransform,
 };
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
@@ -1962,8 +1962,8 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
     let buf = buffer_pool.get_page();
     let buf = Arc::new(buf);
 
-    match io_ctx.encryption_or_checksum() {
-        EncryptionOrChecksum::Encryption(ctx) => {
+    match io_ctx.page_transform() {
+        PageTransform::Encryption(ctx) => {
             let encryption_ctx = ctx.clone();
             let original_complete = complete;
 
@@ -1998,7 +1998,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let new_completion = Completion::new_read(buf, decrypt_complete);
             io.pread(offset, new_completion)
         }
-        EncryptionOrChecksum::PageCodec(ctx) => {
+        PageTransform::PageCodec(ctx) => {
             let page_codec = ctx.clone();
             let original_complete = complete;
 
@@ -2051,7 +2051,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let new_completion = Completion::new_read(buf, decode_complete);
             io.pread(offset, new_completion)
         }
-        EncryptionOrChecksum::Checksum(ctx) => {
+        PageTransform::Checksum(ctx) => {
             let checksum_ctx = ctx.clone();
             let original_c = complete;
             let verify_complete =
@@ -2079,7 +2079,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let c = Completion::new_read(buf, verify_complete);
             io.pread(offset, c)
         }
-        EncryptionOrChecksum::None => {
+        PageTransform::None => {
             let c = Completion::new_read(buf, complete);
             io.pread(offset, c)
         }

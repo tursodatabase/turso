@@ -5471,8 +5471,8 @@ impl Pager {
         Ok(IOResult::Done(result))
     }
 
-    pub fn is_encryption_ctx_set(&self) -> bool {
-        self.io_ctx.read().has_page_codec()
+    pub fn has_content_transform(&self) -> bool {
+        self.io_ctx.read().has_content_transform()
     }
 
     pub fn is_encryption_enabled(&self) -> bool {
