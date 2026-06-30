@@ -10553,6 +10553,31 @@ mod tests {
         assert_eq!(final_count, n as usize);
     }
 
+    /// An oversized on-disk cell count must not panic the rowid binary search:
+    /// indexing the cell-pointer array off the page should surface `Corrupt`.
+    /// Regression test for https://github.com/tursodatabase/turso/issues/7473.
+    #[test]
+    fn table_leaf_oversized_cell_count_reads_corrupt_not_panic() {
+        let (pager, root_page, _db, _conn) = empty_btree();
+
+        let (root, _c) = pager.io.block(|| pager.read_page(root_page)).unwrap();
+        while root.is_locked() {
+            pager.io.step().unwrap();
+        }
+
+        // Forge an oversized cell count, as a corrupt file would.
+        let contents = root.get_contents();
+        contents.write_cell_count(0xFFFF);
+
+        // In range per the forged count, but its array entry lies off the page.
+        let oob_idx = pager.usable_space() / CELL_PTR_SIZE_BYTES;
+        let result = contents.cell_table_leaf_read_rowid(oob_idx);
+        assert!(
+            matches!(result, Err(LimboError::Corrupt(_))),
+            "expected Corrupt error, got {result:?}"
+        );
+    }
+
     #[test]
     pub fn test_clear_overflow_pages_no_overflow() -> Result<()> {
         let pager = setup_test_env(5);
