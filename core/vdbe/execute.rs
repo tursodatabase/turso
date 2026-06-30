@@ -5890,7 +5890,7 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
 /// - **JsonGroup***: `[raw_jsonb: Blob]` - accumulated raw JSONB bytes
 fn update_agg_payload(
     func: &AggFunc,
-    arg: Value,                // most agg functions take one argument
+    arg: &Value,               // read-only; only Min/Max keep an owned copy (they clone)
     maybe_arg2: Option<Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut [Value],
     collation: CollationSeq,
@@ -5948,10 +5948,10 @@ fn update_agg_payload(
             };
             match arg {
                 Value::Numeric(Numeric::Integer(i)) => {
-                    apply_kbn_step_int(sum_val, i, &mut sum_state);
+                    apply_kbn_step_int(sum_val, *i, &mut sum_state);
                 }
                 Value::Numeric(Numeric::Float(f)) => {
-                    apply_kbn_step(sum_val, f64::from(f), &mut sum_state);
+                    apply_kbn_step(sum_val, f64::from(*f), &mut sum_state);
                 }
                 Value::Text(t) => {
                     let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
@@ -5967,7 +5967,7 @@ fn update_agg_payload(
                         ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
                     }
                 }
-                Value::Blob(b) => match try_for_float(&b).1 {
+                Value::Blob(b) => match try_for_float(b).1 {
                     ParsedNumber::Integer(i) => apply_kbn_step(sum_val, i as f64, &mut sum_state),
                     ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
                     ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
@@ -6010,9 +6010,9 @@ fn update_agg_payload(
                 Value::Null => {}
                 Value::Numeric(Numeric::Integer(i)) => match acc {
                     Value::Null => {
-                        *acc = Value::from_i64(i);
+                        *acc = Value::from_i64(*i);
                     }
-                    Value::Numeric(Numeric::Integer(acc_i)) => match acc_i.checked_add(i) {
+                    Value::Numeric(Numeric::Integer(acc_i)) => match acc_i.checked_add(*i) {
                         Some(sum) => *acc_i = sum,
                         None => {
                             if matches!(func, AggFunc::Total) {
@@ -6020,7 +6020,7 @@ fn update_agg_payload(
                                 *acc = Value::from_f64(acc_f);
                                 sum_state.approx = true;
                                 sum_state.ovrfl = true;
-                                apply_kbn_step_int(acc, i, &mut sum_state);
+                                apply_kbn_step_int(acc, *i, &mut sum_state);
                             } else {
                                 mark_unlikely();
                                 return Err(LimboError::IntegerOverflow);
@@ -6028,23 +6028,23 @@ fn update_agg_payload(
                         }
                     },
                     Value::Numeric(Numeric::Float(_)) => {
-                        apply_kbn_step_int(acc, i, &mut sum_state);
+                        apply_kbn_step_int(acc, *i, &mut sum_state);
                     }
                     _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
                 },
                 Value::Numeric(Numeric::Float(f)) => match acc {
                     Value::Null => {
-                        *acc = Value::Numeric(Numeric::Float(f));
+                        *acc = Value::Numeric(Numeric::Float(*f));
                         sum_state.approx = true;
                     }
                     Value::Numeric(Numeric::Integer(i)) => {
                         *acc = Value::from_f64(*i as f64);
                         sum_state.approx = true;
-                        apply_kbn_step(acc, f64::from(f), &mut sum_state);
+                        apply_kbn_step(acc, f64::from(*f), &mut sum_state);
                     }
                     Value::Numeric(Numeric::Float(_)) => {
                         sum_state.approx = true;
-                        apply_kbn_step(acc, f64::from(f), &mut sum_state);
+                        apply_kbn_step(acc, f64::from(*f), &mut sum_state);
                     }
                     _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
                 },
@@ -6053,7 +6053,7 @@ fn update_agg_payload(
                     handle_text_sum(acc, &mut sum_state, parsed_number, parse_result, false);
                 }
                 Value::Blob(b) => {
-                    let (parse_result, parsed_number) = try_for_float(&b);
+                    let (parse_result, parsed_number) = try_for_float(b);
                     handle_text_sum(acc, &mut sum_state, parsed_number, parse_result, true);
                 }
             }
@@ -6066,7 +6066,7 @@ fn update_agg_payload(
                 return Ok(());
             }
             if matches!(payload[0], Value::Null) {
-                payload[0] = arg;
+                payload[0] = arg.clone();
                 return Ok(());
             }
             use std::cmp::Ordering;
@@ -6076,7 +6076,7 @@ fn update_agg_payload(
                 let payload_ref = payload[0].as_ref();
                 cmp_fn(&arg_ref, &payload_ref)?
             } else {
-                compare_with_collation(&arg, &payload[0], Some(collation), comparator)?
+                compare_with_collation(arg, &payload[0], Some(collation), comparator)?
             };
             let should_update = match func {
                 AggFunc::Max => cmp == Ordering::Greater,
@@ -6084,7 +6084,7 @@ fn update_agg_payload(
                 _ => false,
             };
             if should_update {
-                payload[0] = arg;
+                payload[0] = arg.clone();
             }
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
@@ -6098,7 +6098,7 @@ fn update_agg_payload(
                 *acc = Value::build_text(arg.to_string());
             } else {
                 acc.exec_group_concat(&delimiter);
-                acc.exec_group_concat(&arg);
+                acc.exec_group_concat(arg);
             }
         }
         AggFunc::External(_) => {
@@ -6116,7 +6116,7 @@ fn update_agg_payload(
                     "JsonGroupObject/JsonbGroupObject: no value provided".to_string(),
                 ));
             };
-            let mut key_vec = convert_dbtype_to_raw_jsonb(&arg)?;
+            let mut key_vec = convert_dbtype_to_raw_jsonb(arg)?;
             let mut val_vec = convert_dbtype_to_raw_jsonb(&value)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 mark_unlikely();
@@ -6148,7 +6148,7 @@ fn update_agg_payload(
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             // arg = value
-            let mut data = convert_dbtype_to_raw_jsonb(&arg)?;
+            let mut data = convert_dbtype_to_raw_jsonb(arg)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
@@ -6508,14 +6508,20 @@ pub fn op_agg_step(
     }
 
     let current_collation = state.current_collation.unwrap_or(CollationSeq::Binary);
-    let comparator = match comparator.as_ref() {
-        Some(comparator) => Some(make_sort_comparator(comparator)?),
-        None if current_collation.is_custom() => Some(
-            program
-                .connection
-                .make_collation_comparator(current_collation)?,
-        ),
-        None => None,
+    // The comparator is only consumed by Min/Max; building it for every aggregate step would
+    // be wasted work, so only construct it for those.
+    let comparator = if matches!(func, AggFunc::Min | AggFunc::Max) {
+        match comparator.as_ref() {
+            Some(comparator) => Some(make_sort_comparator(comparator)?),
+            None if current_collation.is_custom() => Some(
+                program
+                    .connection
+                    .make_collation_comparator(current_collation)?,
+            ),
+            None => None,
+        }
+    } else {
+        None
     };
 
     // Step the aggregate
@@ -6569,10 +6575,8 @@ pub fn op_agg_step(
             }
         }
         _ => {
-            let arg = state.registers[*col].get_value().clone();
-
-            // Read the optional second-argument register before borrowing the
-            // accumulator mutably (delimiter for group_concat/json, fraction for percentiles).
+            // Second argument (delimiter for group_concat/json, fraction for percentiles),
+            // read before we take the accumulator borrow.
             let maybe_arg2 = match func {
                 AggFunc::GroupConcat | AggFunc::StringAgg => {
                     Some(state.registers[*delimiter].get_value().clone())
@@ -6587,17 +6591,18 @@ pub fn op_agg_step(
                 _ => None,
             };
 
-            let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
-                panic!(
-                    "Unexpected value {:?} in AggStep at register {}",
-                    state.registers[*acc_reg], *acc_reg
-                );
-            };
-
             match func {
-                // ArrayAgg and the ordered-set aggregates buffer values by growing the
-                // payload Vec directly (O(1) per row); they cannot use the fixed-size slice.
+                // ArrayAgg and the ordered-set aggregates buffer values by growing the payload
+                // Vec directly (O(1) per row); they cannot use the fixed-size slice, and they
+                // need an owned copy of the argument to push.
                 AggFunc::ArrayAgg => {
+                    let arg = state.registers[*col].get_value().clone();
+                    let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+                        return Err(LimboError::InternalError(format!(
+                            "AggStep: register {} does not hold an aggregate accumulator",
+                            *acc_reg
+                        )));
+                    };
                     let payload = agg.payload_vec_mut();
                     let count = payload[0]
                         .as_int()
@@ -6607,6 +6612,13 @@ pub fn op_agg_step(
                     payload.push(arg);
                 }
                 AggFunc::Mode => {
+                    let arg = state.registers[*col].get_value().clone();
+                    let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+                        return Err(LimboError::InternalError(format!(
+                            "AggStep: register {} does not hold an aggregate accumulator",
+                            *acc_reg
+                        )));
+                    };
                     let payload = agg.payload_vec_mut();
                     // Record the value's collation (constant per group) for finalize-time sorting.
                     payload[0] = Value::from_i64(current_collation.to_bits() as i64);
@@ -6618,6 +6630,13 @@ pub fn op_agg_step(
                     }
                 }
                 AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+                    let arg = state.registers[*col].get_value().clone();
+                    let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+                        return Err(LimboError::InternalError(format!(
+                            "AggStep: register {} does not hold an aggregate accumulator",
+                            *acc_reg
+                        )));
+                    };
                     let payload = agg.payload_vec_mut();
                     payload[0] = Value::from_i64(current_collation.to_bits() as i64);
                     // The fraction is a per-group constant; record it on every step.
@@ -6630,7 +6649,21 @@ pub fn op_agg_step(
                         payload.push(arg);
                     }
                 }
+                // Count/Sum/Avg/Total/Min/Max/GroupConcat/Json read the argument by reference;
+                // update_agg_payload clones only where it must (Min/Max keep the extreme). The
+                // input and accumulator are always distinct registers, so borrow them disjointly.
                 _ => {
+                    let [arg_reg, acc_slot] = state
+                        .registers
+                        .get_disjoint_mut([*col, *acc_reg])
+                        .expect("aggregate input and accumulator are distinct registers");
+                    let arg = arg_reg.get_value();
+                    let Register::Aggregate(agg) = acc_slot else {
+                        return Err(LimboError::InternalError(format!(
+                            "AggStep: register {} does not hold an aggregate accumulator",
+                            *acc_reg
+                        )));
+                    };
                     let payload = agg.payload_mut();
                     update_agg_payload(
                         func,
@@ -17235,7 +17268,7 @@ mod tests {
         let mut payload = vec![Value::from_i64(5)];
         update_agg_payload(
             &AggFunc::Count,
-            Value::Null,
+            &Value::Null,
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -17250,7 +17283,7 @@ mod tests {
         let mut payload = vec![Value::from_i64(5)];
         update_agg_payload(
             &AggFunc::Count,
-            Value::from_i64(42),
+            &Value::from_i64(42),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -17270,7 +17303,7 @@ mod tests {
         ];
         update_agg_payload(
             &AggFunc::Sum,
-            Value::from_i64(10),
+            &Value::from_i64(10),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -17281,7 +17314,7 @@ mod tests {
 
         update_agg_payload(
             &AggFunc::Sum,
-            Value::from_i64(5),
+            &Value::from_i64(5),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -17301,7 +17334,7 @@ mod tests {
         ];
         update_agg_payload(
             &AggFunc::Sum,
-            Value::Null,
+            &Value::Null,
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -17317,7 +17350,7 @@ mod tests {
         // First value sets the min/max
         update_agg_payload(
             &AggFunc::Min,
-            Value::from_i64(5),
+            &Value::from_i64(5),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -17329,7 +17362,7 @@ mod tests {
         // Smaller value updates min
         update_agg_payload(
             &AggFunc::Min,
-            Value::from_i64(3),
+            &Value::from_i64(3),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -17341,7 +17374,7 @@ mod tests {
         // Larger value doesn't update min
         update_agg_payload(
             &AggFunc::Min,
-            Value::from_i64(10),
+            &Value::from_i64(10),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -17361,7 +17394,7 @@ mod tests {
         ];
         update_agg_payload(
             &AggFunc::Avg,
-            Value::from_i64(10),
+            &Value::from_i64(10),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -17373,7 +17406,7 @@ mod tests {
 
         update_agg_payload(
             &AggFunc::Avg,
-            Value::from_i64(20),
+            &Value::from_i64(20),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -17425,7 +17458,7 @@ mod tests {
 
         update_agg_payload(
             &AggFunc::Avg,
-            Value::from_i64(9007199254740994),
+            &Value::from_i64(9007199254740994),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -17434,7 +17467,7 @@ mod tests {
         .unwrap();
         update_agg_payload(
             &AggFunc::Avg,
-            Value::from_i64(-9007199254740993),
+            &Value::from_i64(-9007199254740993),
             None,
             &mut payload,
             CollationSeq::Binary,

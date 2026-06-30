@@ -182,6 +182,10 @@ name = "benchmark"
 harness = false
 
 [[bench]]
+name = "count_benchmark"
+harness = false
+
+[[bench]]
 name = "mvcc_benchmark"
 harness = false
 
