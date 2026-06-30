@@ -2329,11 +2329,20 @@ pub fn translate_drop_table(
         program.preassign_label_to_next_insn(end_loop_label);
     }
 
-    // Clean up turso_cdc_version entry for the dropped table (if version table exists)
+    // Clean up turso_cdc_version entry for the dropped table (if version table exists).
+    //
+    // Skip this when the table being dropped IS turso_cdc_version itself: its
+    // b-tree was just destroyed by the `Destroy` above, so opening a cursor on
+    // its now-freed root page would be a use-after-free. There is also nothing to
+    // clean up — turso_cdc_version's rows are keyed by the CDC data table name, so
+    // it never holds a row named "turso_cdc_version".
+    let dropping_version_table = normalize_ident(tbl_name.name.as_str())
+        .eq_ignore_ascii_case(crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME);
     if let Some(version_table) = resolver
         .schema()
         .get_table(crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME)
         .and_then(|t| t.btree())
+        .filter(|_| !dropping_version_table)
     {
         let ver_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(version_table.clone()));
         let ver_table_name_reg = program.alloc_register();
