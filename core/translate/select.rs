@@ -6,6 +6,7 @@ use super::plan::{
 use crate::schema::Table;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
     bind_and_rewrite_expr, expr_vector_size, walk_expr, BindingBehavior, WalkControl,
@@ -233,8 +234,14 @@ pub fn prepare_select_plan(
             } else {
                 let mut key = Vec::with_capacity(select.order_by.len());
                 for (i, o) in select.order_by.iter().enumerate() {
-                    let col_idx = resolve_compound_order_by_expr(&o.expr, &all_plans, i + 1)?;
-                    key.push((col_idx, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
+                    let (col_idx, collation) =
+                        resolve_compound_order_by_expr(&o.expr, &all_plans, i + 1)?;
+                    key.push((
+                        col_idx,
+                        o.order.unwrap_or(ast::SortOrder::Asc),
+                        o.nulls,
+                        collation,
+                    ));
                 }
                 Some(key)
             };
@@ -1143,9 +1150,16 @@ fn resolve_compound_order_by_expr(
     expr: &ast::Expr,
     all_plans: &[&SelectPlan],
     term_number: usize,
-) -> Result<usize> {
+) -> Result<(usize, Option<CollationSeq>)> {
     let num_result_columns = all_plans[0].result_columns.len();
     match expr {
+        // An explicit COLLATE wraps the column reference. Resolve the inner
+        // reference and carry the collation so it overrides the referenced
+        // column's own collation when the compound result is sorted.
+        ast::Expr::Collate(inner, collation_name) => {
+            let (col_idx, _) = resolve_compound_order_by_expr(inner, all_plans, term_number)?;
+            Ok((col_idx, Some(CollationSeq::new(collation_name.as_str())?)))
+        }
         // Case 1: Numeric column reference (e.g., ORDER BY 1)
         ast::Expr::Literal(ast::Literal::Numeric(num)) => {
             if let Ok(column_number) = num.parse::<usize>() {
@@ -1156,7 +1170,7 @@ fn resolve_compound_order_by_expr(
                         num_result_columns
                     );
                 }
-                Ok(column_number - 1)
+                Ok((column_number - 1, None))
             } else {
                 crate::bail_parse_error!(
                     "{} ORDER BY term does not match any column in the result set",
@@ -1175,7 +1189,7 @@ fn resolve_compound_order_by_expr(
                 for (i, rc) in result_columns.iter().enumerate() {
                     if let Some(alias) = &rc.alias {
                         if normalize_ident(alias) == name_normalized {
-                            return Ok(i);
+                            return Ok((i, None));
                         }
                     }
                 }
@@ -1183,7 +1197,7 @@ fn resolve_compound_order_by_expr(
                 for (i, rc) in result_columns.iter().enumerate() {
                     if let Some(col_name) = rc.name(table_references) {
                         if normalize_ident(col_name) == name_normalized {
-                            return Ok(i);
+                            return Ok((i, None));
                         }
                     }
                 }
