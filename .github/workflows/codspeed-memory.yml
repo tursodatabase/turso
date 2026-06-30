@@ -8,15 +8,7 @@
 name: CodSpeed Memory
 
 on:
-  push:
-    branches:
-      - "main"
-  pull_request:
-  workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: true
+  workflow_call:
 
 permissions:
   contents: read
@@ -75,6 +67,7 @@ jobs:
           - mixed
           - scan-heavy
           - series-blob
+          - update-churn
     steps:
       - uses: actions/checkout@v4
 

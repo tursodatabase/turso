@@ -21,6 +21,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  memory:
+    name: Memory benchmarks
+    uses: ./.github/workflows/codspeed-memory.yml
+    permissions:
+      contents: read
+      id-token: write
+
   discover:
     name: Discover benchmark shards
     runs-on: blacksmith-4vcpu-ubuntu-2404
