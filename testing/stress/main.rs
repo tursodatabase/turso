@@ -15,7 +15,7 @@ use rand::{Rng, SeedableRng};
 use shuttle::scheduler::Scheduler;
 use std::collections::HashSet;
 use std::path::Path;
-use turso_stress::sync::atomic::{AtomicBool, Ordering};
+use turso_stress::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use turso_stress::sync::Arc;
 use turso_stress::sync::AsyncBarrier as Barrier;
 use turso_stress::sync::AsyncMutex as Mutex;
@@ -690,6 +690,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         let mut handles = Vec::with_capacity(opts.nr_threads);
         let reopen_requested = Arc::new(AtomicBool::new(false));
         let all_threads_ready = Arc::new(Barrier::new(stress_counter.incomplete_threads()));
+        let active_writers = Arc::new(AtomicUsize::new(stress_counter.incomplete_threads()));
 
         for (iteration_idx, ((thread_idx, thread), mut progress_bar)) in threads
             .iter()
@@ -709,6 +710,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
             let sql_logger = sql_logger.clone();
             let all_threads_ready = all_threads_ready.clone();
             let stress_counter = stress_counter.clone();
+            let active_writers = active_writers.clone();
 
             let handle = turso_stress::future::spawn(async move {
                 let mut conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
@@ -833,6 +835,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
                 // In case this thread is running an exclusive transaction, commit it so that it doesn't block other threads.
                 let _ = conn.execute("COMMIT", ()).await;
+                active_writers.fetch_sub(1, Ordering::Release);
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
                     thread_idx,
                     iteration_count_this_batch,
@@ -845,7 +848,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         for reader_idx in 0..opts.long_readers {
             let db = db.clone();
             let schema_for_reader = schema.clone();
-            let reopen_requested = reopen_requested.clone();
+            let active_writers = active_writers.clone();
             let reader_thread = ThreadId::new(usize::MAX - 1 - reader_idx);
 
             let handle = turso_stress::future::spawn(async move {
@@ -867,14 +870,17 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     let _ = rows.next().await;
                 }
 
-                for _ in 0..opts.nr_iterations {
-                    if reopen_requested.load(Ordering::Acquire) {
-                        break;
-                    }
+                let cap = opts
+                    .nr_iterations
+                    .saturating_mul(opts.nr_threads + 2)
+                    .max(1000);
+                let mut iters = 0;
+                while active_writers.load(Ordering::Acquire) > 0 && iters < cap {
                     if let Ok(mut rows) = conn.query(&select, ()).await {
                         let _ = rows.next().await;
                     }
                     turso_stress::future::yield_now().await;
+                    iters += 1;
                 }
 
                 let _ = conn.execute("COMMIT", ()).await;
