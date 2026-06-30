@@ -778,7 +778,6 @@ fn emit_delete_row_common(
             };
             emit_cdc_insns(
                 program,
-                &t_ctx.resolver,
                 OperationMode::DELETE,
                 cdc_cursor_id,
                 rowid_reg,
