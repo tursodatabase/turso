@@ -4,6 +4,7 @@ mod common;
 mod conflict_resolution;
 mod custom_types;
 mod database;
+mod database_leak;
 mod external_apis;
 mod functions;
 mod fuzz_transaction;
