@@ -1,7 +1,7 @@
 use branches::unlikely;
 
 use super::{slot_bitmap::AtomicSlotBitmap, sqlite3_ondisk::WAL_FRAME_HEADER_SIZE};
-use crate::alloc::ApiAllocator;
+use crate::alloc::{ApiAllocator, DynAllocator};
 use crate::io::TEMP_BUFFER_CACHE;
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::Arc;
@@ -109,6 +109,8 @@ struct PoolInner {
     wal_frame_arena: Option<Arc<Arena>>,
     /// The size of each `Arena`, in bytes.
     arena_size: usize,
+    /// Allocator used for arena backing memory.
+    allocator: DynAllocator,
     /// The `[Database::page_size]`, which the `page_arena` will use to
     /// return buffers from `Self::get_page`.
     db_page_size: OnceLock<usize>,
@@ -120,7 +122,7 @@ crate::assert::assert_send_sync!(PoolInner);
 
 impl Default for BufferPool {
     fn default() -> Self {
-        Self::new(Self::DEFAULT_ARENA_SIZE)
+        Self::new(Self::DEFAULT_ARENA_SIZE, DynAllocator::default())
     }
 }
 
@@ -137,7 +139,7 @@ impl BufferPool {
     const MAX_ARENA_SIZE: usize = 32 * 1024 * 1024;
     /// 64kb Minimum arena size
     const MIN_ARENA_SIZE: usize = 1024 * 64;
-    fn new(arena_size: usize) -> Self {
+    fn new(arena_size: usize, allocator: DynAllocator) -> Self {
         turso_assert!(
             (Self::MIN_ARENA_SIZE..Self::MAX_ARENA_SIZE).contains(&arena_size),
             "Arena size out of valid range",
@@ -148,6 +150,7 @@ impl BufferPool {
                 page_arena: None,
                 wal_frame_arena: None,
                 arena_size,
+                allocator,
                 db_page_size: OnceLock::new(),
                 io: None,
             }),
@@ -190,8 +193,8 @@ impl BufferPool {
     /// populating the Arenas. Arenas will not be created until `[BufferPool::finalize_page_size]`,
     /// and the pool will temporarily return temporary buffers to prevent reallocation of the
     /// arena if the page size is set to something other than the default value.
-    pub fn begin_init(io: &Arc<dyn IO>, arena_size: usize) -> Arc<Self> {
-        let pool = Arc::new(BufferPool::new(arena_size));
+    pub fn begin_init(io: &Arc<dyn IO>, arena_size: usize, allocator: DynAllocator) -> Arc<Self> {
+        let pool = Arc::new(BufferPool::new(arena_size, allocator));
         let inner = pool.inner_mut();
         // Just store the IO handle, don't create arena yet
         if inner.io.is_none() {
@@ -282,11 +285,12 @@ impl PoolInner {
     fn init_arenas(&mut self) -> crate::Result<()> {
         let db_page_size = self.get_db_page_size();
         let arena_size = self.arena_size;
+        let allocator = self.allocator.clone();
 
         let io = self.io.as_ref().expect("Pool not initialized").clone();
 
         // Create regular page arena
-        match Arena::new(db_page_size, arena_size, &io) {
+        match Arena::new(db_page_size, arena_size, &io, allocator.clone()) {
             Ok(arena) => {
                 tracing::trace!(
                     "added arena {} with size {} MB and slot size {}",
@@ -306,7 +310,7 @@ impl PoolInner {
 
         // Create WAL frame arena
         let wal_frame_size = db_page_size + WAL_FRAME_HEADER_SIZE;
-        match Arena::new(wal_frame_size, arena_size, &io) {
+        match Arena::new(wal_frame_size, arena_size, &io, allocator) {
             Ok(arena) => {
                 tracing::trace!(
                     "added WAL frame arena {} with size {} MB and slot size {}",
@@ -345,6 +349,8 @@ struct Arena {
     slot_size: usize,
     /// Layout used to allocate the arena backing memory.
     layout: arena::ArenaLayout,
+    /// Allocator that owns `base`.
+    allocator: DynAllocator,
 }
 
 // SAFETY: Arena's base pointer is uniquely owned by the arena. All mutable state
@@ -354,7 +360,7 @@ unsafe impl Sync for Arena {}
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        unsafe { arena::DEFAULT_ARENA_ALLOCATOR.deallocate(self.base, self.layout) };
+        unsafe { self.allocator.deallocate(self.base, self.layout) };
     }
 }
 
@@ -372,7 +378,12 @@ static NEXT_ID: std::sync::atomic::AtomicU32 =
 impl Arena {
     /// Create a new arena with the given size and page size.
     /// NOTE: Minimum arena size is slot_size * 64
-    fn new(slot_size: usize, arena_size: usize, io: &Arc<dyn IO>) -> Result<Self, String> {
+    fn new(
+        slot_size: usize,
+        arena_size: usize,
+        io: &Arc<dyn IO>,
+        allocator: DynAllocator,
+    ) -> Result<Self, String> {
         let min_slots = arena_size.div_ceil(slot_size);
         let rounded_slots = (min_slots.max(64) + 63) & !63;
         let rounded_bytes = rounded_slots * slot_size;
@@ -386,7 +397,7 @@ impl Arena {
         }
         let layout = arena::ArenaLayout::from_size_align(rounded_bytes, arena::ARENA_ALIGNMENT)
             .map_err(|err| format!("invalid arena layout: {err}"))?;
-        let allocation = arena::DEFAULT_ARENA_ALLOCATOR
+        let allocation = allocator
             .allocate(layout)
             .map_err(|_| "arena allocation failed".to_string())?;
         let base = allocation.cast();
@@ -406,6 +417,7 @@ impl Arena {
             allocated_slots: AtomicUsize::new(0),
             slot_size,
             layout,
+            allocator,
         })
     }
 
@@ -445,14 +457,11 @@ impl Arena {
 }
 
 mod arena {
-    use crate::alloc::{Layout, TursoAllocator};
+    use crate::alloc::Layout;
 
     pub type ArenaLayout = Layout;
 
     pub const ARENA_ALIGNMENT: usize = std::mem::size_of::<u8>();
-
-    pub type DefaultArenaAllocator = TursoAllocator;
-    pub const DEFAULT_ARENA_ALLOCATOR: DefaultArenaAllocator = TursoAllocator;
 }
 
 /// Shuttle tests for concurrent buffer pool operations.
@@ -472,7 +481,8 @@ mod shuttle_tests {
 
     fn create_test_pool() -> Arc<BufferPool> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let pool =
+            BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE, DynAllocator::default());
         pool.finalize_with_page_size(4096).unwrap();
         pool
     }
@@ -664,7 +674,8 @@ mod shuttle_tests {
     fn shuttle_concurrent_finalize() {
         let test = || {
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-            let pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+            let pool =
+                BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE, DynAllocator::default());
             let pool2 = Arc::clone(&pool);
             let pool3 = Arc::clone(&pool);
 

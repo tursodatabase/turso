@@ -10291,7 +10291,8 @@ mod tests {
         let page_size = 512;
 
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let buffer_pool = BufferPool::begin_init(&io, page_size * 128);
+        let buffer_pool =
+            BufferPool::begin_init(&io, page_size * 128, crate::alloc::DynAllocator::default());
 
         let db_file = Arc::new(DatabaseFile::new(
             io.open_file(":memory:", OpenFlags::Create, false).unwrap(),
