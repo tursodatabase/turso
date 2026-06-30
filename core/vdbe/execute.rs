@@ -6787,11 +6787,11 @@ pub fn op_sorter_open(
         (cache_size as usize) * page_size
     };
     let mut order = Vec::try_with_capacity_ext(order_collations_nulls.len())
-        .expect("TODO: fallible allocations");
+        .expect(crate::alloc::ALLOC_ERR_MSG);
     let mut collations = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
-        .expect("TODO: fallible allocations");
+        .expect(crate::alloc::ALLOC_ERR_MSG);
     let mut nulls_orders = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
-        .expect("TODO: fallible allocations");
+        .expect(crate::alloc::ALLOC_ERR_MSG);
     for (ord, coll, nulls) in order_collations_nulls.iter() {
         order.push(*ord);
         collations.push(coll.unwrap_or_default());
@@ -6799,7 +6799,7 @@ pub fn op_sorter_open(
     }
     let mut sort_comparators =
         crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
-            .expect("TODO: fallible allocations");
+            .expect(crate::alloc::ALLOC_ERR_MSG);
     for (idx, (_, coll, _)) in order_collations_nulls.iter().enumerate() {
         let comparator = match comparators.get(idx).and_then(|c| c.as_ref()) {
             Some(comparator) => Some(make_sort_comparator(comparator)?),
@@ -12448,7 +12448,7 @@ pub fn op_parse_schema(
         stmt,
         schema_arc,
         from_sql_indexes: crate::alloc::Vec::try_with_capacity_ext(10)
-            .expect("TODO: fallible allocations"),
+            .expect(crate::alloc::ALLOC_ERR_MSG),
         automatic_indices: Default::default(),
         dbsp_state_roots: Default::default(),
         dbsp_state_index_roots: Default::default(),
@@ -14363,11 +14363,11 @@ pub fn op_add_column(
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints = check_constraints
             .try_to_vec()
-            .expect("TODO: fallible allocations");
+            .expect(crate::alloc::ALLOC_ERR_MSG);
         // Update foreign keys to include any FK constraints from the new column
         btree.foreign_keys = foreign_keys
             .try_to_vec()
-            .expect("TODO: fallible allocations");
+            .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // Resolve generated column expressions and update virtual column metadata
         btree.prepare_generated_columns()?;
@@ -14876,10 +14876,10 @@ pub fn op_hash_build(
         })
         .unwrap_or_else(|| OpHashBuildState {
             key_values: crate::alloc::Vec::try_with_capacity_ext(data.num_keys)
-                .expect("TODO: fallible allocations"),
+                .expect(crate::alloc::ALLOC_ERR_MSG),
             key_idx: 0,
             payload_values: crate::alloc::Vec::try_with_capacity_ext(data.num_payload)
-                .expect("TODO: fallible allocations"),
+                .expect(crate::alloc::ALLOC_ERR_MSG),
             payload_idx: 0,
             rowid: None,
             cursor_id: data.cursor_id,
@@ -14907,7 +14907,7 @@ pub fn op_hash_build(
             collations: data
                 .collations
                 .try_to_vec()
-                .expect("TODO: fallible allocations"),
+                .expect(crate::alloc::ALLOC_ERR_MSG),
             temp_store,
             track_matched: data.track_matched,
             partition_count: None,
@@ -15014,7 +15014,7 @@ pub fn op_hash_distinct(
             collations: data
                 .collations
                 .try_to_vec()
-                .expect("TODO: fallible allocations"),
+                .expect(crate::alloc::ALLOC_ERR_MSG),
             temp_store,
             track_matched: false,
             partition_count: None,
@@ -15120,7 +15120,7 @@ pub fn op_hash_probe(
             } else {
                 // Different hash table, read fresh keys
                 let mut keys = crate::alloc::Vec::try_with_capacity_ext(num_keys)
-                    .expect("TODO: fallible allocations");
+                    .expect(crate::alloc::ALLOC_ERR_MSG);
                 for i in 0..num_keys {
                     let reg = &state.registers[key_start_reg + i];
                     keys.push(reg.get_value().clone());
@@ -15130,7 +15130,7 @@ pub fn op_hash_probe(
         } else {
             // First entry, read probe keys from registers
             let mut keys = crate::alloc::Vec::try_with_capacity_ext(num_keys)
-                .expect("TODO: fallible allocations");
+                .expect(crate::alloc::ALLOC_ERR_MSG);
             for i in 0..num_keys {
                 let reg = &state.registers[key_start_reg + i];
                 keys.push(reg.get_value().clone());

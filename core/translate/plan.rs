@@ -2289,7 +2289,7 @@ impl JoinedTable {
                 )
             })
             .try_collect::<alloc::Vec<_>>()
-            .expect("TODO: fallible allocations");
+            .expect(crate::alloc::ALLOC_ERR_MSG);
 
         for (i, column) in columns.iter_mut().enumerate() {
             if super::expr::expr_is_array(
@@ -2403,7 +2403,7 @@ impl JoinedTable {
                 )
             })
             .try_collect::<alloc::Vec<_>>()
-            .expect("TODO: fallible allocations");
+            .expect(crate::alloc::ALLOC_ERR_MSG);
 
         for (i, column) in columns.iter_mut().enumerate() {
             if super::expr::expr_is_array(&result_columns[i].expr, Some(table_references)) {

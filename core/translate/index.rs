@@ -445,7 +445,7 @@ fn emit_refill_index(
             .iter()
             .map(|c| (c.order, c.collation, None))
             .try_collect()
-            .expect("TODO: fallible allocations");
+            .expect(crate::alloc::ALLOC_ERR_MSG);
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sorter_cursor_id,
             columns: columns.len(),
@@ -892,7 +892,7 @@ fn resolve_sorted_columns_with_resolver(
         <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
             cols.len(),
         )
-        .expect("TODO: fallible allocations");
+        .expect(crate::alloc::ALLOC_ERR_MSG);
     for sc in cols {
         let order = sc.order.unwrap_or(SortOrder::Asc);
         let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref(), resolver)?;

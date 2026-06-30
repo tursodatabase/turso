@@ -582,7 +582,7 @@ impl EmitWindow {
         let src_columns = src_table
             .columns()
             .try_to_vec()
-            .expect("TODO: fallible allocations");
+            .expect(crate::alloc::ALLOC_ERR_MSG);
         let src_column_count = src_columns.len();
         let window_name = window.name.clone().expect("window name is missing");
         let partition_by_len = window

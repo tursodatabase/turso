@@ -1247,7 +1247,7 @@ mod tests {
             1,
             name.to_string(),
             crate::alloc::vec![],
-            columns.try_to_vec().expect("TODO: fallible allocations"),
+            columns.try_to_vec().expect(crate::alloc::ALLOC_ERR_MSG),
             BTreeCharacteristics::HAS_ROWID,
             crate::alloc::vec![],
             crate::alloc::vec![],

@@ -882,7 +882,7 @@ impl BTreeCursor {
         });
         cursor.index_info = Some(Arc::new(
             IndexInfo::new(key_info, false, table.primary_key_columns.len(), true)
-                .expect("TODO: fallible allocations"),
+                .expect(crate::alloc::ALLOC_ERR_MSG),
         ));
         cursor
     }

@@ -741,7 +741,7 @@ fn build_materialized_input_columns(
     let mut columns = crate::alloc::vec![];
     columns
         .try_reserve(num_keys + payload_columns.len())
-        .expect("TODO: fallible allocations");
+        .expect(crate::alloc::ALLOC_ERR_MSG);
     for i in 0..num_keys {
         columns.push(Column::new_default_text(
             Some(format!("key_{i}")),

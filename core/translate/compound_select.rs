@@ -564,7 +564,7 @@ fn create_dedupe_index(
             expr: None,
         })
         .try_collect::<crate::alloc::Vec<_>>()
-        .expect("TODO: fallible allocations");
+        .expect(crate::alloc::ALLOC_ERR_MSG);
     for (i, column) in dedupe_columns.iter_mut().enumerate() {
         let left_collation = get_collseq_from_expr(
             &left_select.result_columns[i].expr,
@@ -786,7 +786,7 @@ fn create_collection_index(
             expr: None,
         })
         .try_collect::<crate::alloc::Vec<_>>()
-        .expect("TODO: fallible allocations");
+        .expect(crate::alloc::ALLOC_ERR_MSG);
     for (i, column) in columns.iter_mut().enumerate() {
         let left_collation = get_collseq_from_expr(
             &left_select.result_columns[i].expr,
@@ -861,7 +861,7 @@ fn emit_compound_order_by(
             (*order, collation, *nulls)
         })
         .try_collect()
-        .expect("TODO: fallible allocations");
+        .expect(crate::alloc::ALLOC_ERR_MSG);
     // Sequence tie-breaker: preserves insertion order for rows with equal ORDER BY keys
     order_collations_nulls.push((SortOrder::Asc, None, None));
 
@@ -902,7 +902,7 @@ fn emit_compound_order_by(
                 })
             })
             .try_collect()
-            .expect("TODO: fallible allocations");
+            .expect(crate::alloc::ALLOC_ERR_MSG);
     // No comparator needed for the sequence tie-breaker column
     comparators.push(None);
     program.emit_insn(Insn::SorterOpen {

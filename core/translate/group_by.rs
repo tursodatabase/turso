@@ -178,7 +178,7 @@ impl EmitGroupBy {
                     Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
                 .try_collect::<Result<crate::alloc::Vec<_>>>()
-                .expect("TODO: fallible allocations")?;
+                .expect(crate::alloc::ALLOC_ERR_MSG)?;
 
             // Resolve custom type comparators for GROUP BY columns (e.g. array_lt).
             let comparators = group_by
@@ -188,7 +188,7 @@ impl EmitGroupBy {
                     custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
                 })
                 .try_collect()
-                .expect("TODO: fallible allocations");
+                .expect(crate::alloc::ALLOC_ERR_MSG);
 
             program.emit_insn(Insn::SorterOpen {
                 cursor_id: sort_cursor,
