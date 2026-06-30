@@ -891,8 +891,7 @@ fn resolve_sorted_columns_with_resolver(
     let mut resolved =
         <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
             cols.len(),
-        )
-        .expect(crate::alloc::ALLOC_ERR_MSG);
+        )?;
     for sc in cols {
         let order = sc.order.unwrap_or(SortOrder::Asc);
         let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref(), resolver)?;
