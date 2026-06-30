@@ -456,7 +456,7 @@ pub(crate) fn emit_materialized_build_inputs(
             MaterializedBuildInputMode::KeyPayload {
                 num_keys,
                 payload_columns,
-            } => build_materialized_input_columns(*num_keys, payload_columns),
+            } => build_materialized_input_columns(*num_keys, payload_columns)?,
         };
         let ephemeral_table = Arc::new(BTreeTable::new(
             0,
@@ -737,11 +737,9 @@ fn collect_materialized_payload_columns(
 fn build_materialized_input_columns(
     num_keys: usize,
     payload_columns: &[MaterializedColumnRef],
-) -> crate::alloc::Vec<Column> {
+) -> Result<crate::alloc::Vec<Column>> {
     let mut columns = crate::alloc::vec![];
-    columns
-        .try_reserve(num_keys + payload_columns.len())
-        .expect("TODO: fallible allocations");
+    columns.try_reserve(num_keys + payload_columns.len())?;
     for i in 0..num_keys {
         columns.push(Column::new_default_text(
             Some(format!("key_{i}")),
@@ -761,7 +759,7 @@ fn build_materialized_input_columns(
         };
         columns.push(column);
     }
-    columns
+    Ok(columns)
 }
 
 /// Construct a SELECT plan that materializes build-side inputs into an ephemeral table.

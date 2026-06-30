@@ -1993,7 +1993,7 @@ impl Schema {
                 Some((name.clone(), seq_name.to_string()))
             })
             .try_collect()
-            .expect("TODO: fallible allocations")
+            .expect(crate::alloc::ALLOC_ERR_MSG)
     }
 
     fn sequence_backing_tables(&self) -> Vec<SequenceBackingTableSource> {
@@ -2009,7 +2009,7 @@ impl Schema {
                 })
             })
             .try_collect()
-            .expect("TODO: fallible allocations")
+            .expect(crate::alloc::ALLOC_ERR_MSG)
     }
 
     fn read_sequence_metadata(record: &ImmutableRecord) -> Option<SequenceMetadata> {

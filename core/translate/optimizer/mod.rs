@@ -1139,7 +1139,7 @@ fn update_from_scratch_columns(set_clause_count: usize) -> crate::alloc::Vec<Col
             )
         })
         .try_collect()
-        .expect("TODO: fallible allocations")
+        .expect(crate::alloc::ALLOC_ERR_MSG)
 }
 
 /// Build the SELECT that gathers the stable write set for an UPDATE before the
@@ -3236,7 +3236,7 @@ fn ephemeral_index_build(
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))
         .try_collect()
-        .expect("TODO: fallible allocations");
+        .expect(crate::alloc::ALLOC_ERR_MSG);
     // sort so that constraints first, then rest in whatever order they were in in the table
     ephemeral_columns.sort_by(|a, b| {
         let a_constraint = constraint_refs

@@ -8298,7 +8298,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
         let mut from_sql_indexes =
-            crate::alloc::Vec::try_with_capacity_ext(10).expect("TODO: fallible allocations");
+            crate::alloc::Vec::try_with_capacity_ext(10).expect(crate::alloc::ALLOC_ERR_MSG);
         let mut automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>> =
             HashMap::default();
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
