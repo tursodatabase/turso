@@ -1,6 +1,7 @@
 use branches::unlikely;
 
 use super::{slot_bitmap::AtomicSlotBitmap, sqlite3_ondisk::WAL_FRAME_HEADER_SIZE};
+use crate::alloc::ApiAllocator;
 use crate::io::TEMP_BUFFER_CACHE;
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::Arc;
@@ -334,26 +335,26 @@ struct Arena {
     /// with `io_uring`, then the ID represents the index of the arena into the ring's
     /// sparse registered buffer array created on the ring's initialization.
     id: u32,
-    /// Base pointer to the arena returned by `mmap`
+    /// Base pointer to the arena allocated through Turso's allocator API.
     base: NonNull<u8>,
     /// Total number of slots currently allocated/in use.
     allocated_slots: AtomicUsize,
     /// Currently free slots (lock-free atomic bitmap).
     free_slots: AtomicSlotBitmap,
-    /// Total size of the arena in bytes
-    arena_size: usize,
     /// Slot size the total arena is divided into.
     slot_size: usize,
+    /// Layout used to allocate the arena backing memory.
+    layout: arena::ArenaLayout,
 }
 
-// SAFETY: Arena's base pointer comes from mmap and is never aliased. All mutable
-// state is behind atomics (AtomicUsize, AtomicSlotBitmap), so concurrent access is safe.
+// SAFETY: Arena's base pointer is uniquely owned by the arena. All mutable state
+// is behind atomics (AtomicUsize, AtomicSlotBitmap), so concurrent access is safe.
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        unsafe { arena::dealloc(self.base.as_ptr(), self.arena_size) };
+        unsafe { arena::DEFAULT_ARENA_ALLOCATOR.deallocate(self.base, self.layout) };
     }
 }
 
@@ -383,8 +384,12 @@ impl Arena {
                 BufferPool::MAX_ARENA_SIZE
             ));
         }
-        let ptr = unsafe { arena::alloc(rounded_bytes) };
-        let base = NonNull::new(ptr).ok_or("Failed to allocate arena")?;
+        let layout = arena::ArenaLayout::from_size_align(rounded_bytes, arena::ARENA_ALIGNMENT)
+            .map_err(|err| format!("invalid arena layout: {err}"))?;
+        let allocation = arena::DEFAULT_ARENA_ALLOCATOR
+            .allocate(layout)
+            .map_err(|_| "arena allocation failed".to_string())?;
+        let base = allocation.cast();
         let id = io
             .register_fixed_buffer(base, rounded_bytes)
             .unwrap_or_else(|_| {
@@ -400,7 +405,7 @@ impl Arena {
             free_slots: map,
             allocated_slots: AtomicUsize::new(0),
             slot_size,
-            arena_size: rounded_bytes,
+            layout,
         })
     }
 
@@ -439,49 +444,15 @@ impl Arena {
     }
 }
 
-#[cfg(all(unix, not(miri)))]
 mod arena {
-    use libc::MAP_ANONYMOUS;
-    use libc::{mmap, munmap, MAP_PRIVATE, PROT_READ, PROT_WRITE};
-    use std::ffi::c_void;
+    use crate::alloc::{Layout, TursoAllocator};
 
-    pub unsafe fn alloc(len: usize) -> *mut u8 {
-        let ptr = mmap(
-            std::ptr::null_mut(),
-            len,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            -1,
-            0,
-        );
-        if ptr == libc::MAP_FAILED {
-            panic!("mmap failed: {}", std::io::Error::last_os_error());
-        }
-        #[cfg(target_os = "linux")]
-        {
-            libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
-        }
-        ptr as *mut u8
-    }
+    pub type ArenaLayout = Layout;
 
-    pub unsafe fn dealloc(ptr: *mut u8, len: usize) {
-        let result = munmap(ptr as *mut c_void, len);
-        if result != 0 {
-            panic!("munmap failed: {}", std::io::Error::last_os_error());
-        }
-    }
-}
+    pub const ARENA_ALIGNMENT: usize = std::mem::size_of::<u8>();
 
-#[cfg(any(not(unix), miri))]
-mod arena {
-    pub unsafe fn alloc(len: usize) -> *mut u8 {
-        let layout = std::alloc::Layout::from_size_align(len, std::mem::size_of::<u8>()).unwrap();
-        unsafe { std::alloc::alloc_zeroed(layout) }
-    }
-    pub unsafe fn dealloc(ptr: *mut u8, len: usize) {
-        let layout = std::alloc::Layout::from_size_align(len, std::mem::size_of::<u8>()).unwrap();
-        unsafe { std::alloc::dealloc(ptr, layout) };
-    }
+    pub type DefaultArenaAllocator = TursoAllocator;
+    pub const DEFAULT_ARENA_ALLOCATOR: DefaultArenaAllocator = TursoAllocator;
 }
 
 /// Shuttle tests for concurrent buffer pool operations.
