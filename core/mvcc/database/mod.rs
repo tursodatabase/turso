@@ -8292,6 +8292,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut fresh = Schema::new();
         fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
+        // Carry the on-disk schema format so legacy (format < 4) databases keep
+        // ignoring DESC on index columns, matching SQLite (see
+        // `Schema::populate_indices`).
+        fresh.schema_format = self
+            .global_header
+            .read()
+            .as_ref()
+            .map(|header| header.schema_format.get())
+            .unwrap_or_else(|| connection.schema.read().schema_format);
         let mut from_sql_indexes =
             crate::alloc::Vec::try_with_capacity_ext(10).expect("TODO: fallible allocations");
         let mut automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>> =

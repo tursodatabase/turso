@@ -1234,6 +1234,10 @@ impl Connection {
         let mut fresh = Schema::with_options(self.experimental_custom_types_enabled())?;
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
+        // Preserve the on-disk schema format so a reparse keeps the same DESC
+        // index handling as the initial load (descending indexes are only
+        // honored for format >= 4).
+        fresh.schema_format = self.schema.read().schema_format;
 
         // Capture built-in table-valued functions (e.g. generate_series, json_each)
         // before dropping the old schema. These are registered programmatically and

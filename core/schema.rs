@@ -15,7 +15,7 @@ use crate::translate::expr::{
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
 use crate::types::{IOResult, ImmutableRecord};
-use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::util::{exprs_are_equivalent, normalize_ident, IOExt};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
 use crate::{turso_assert, turso_debug_assert};
@@ -781,6 +781,13 @@ pub struct Schema {
     pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
     pub has_indexes: HashSet<String>,
     pub schema_version: u32,
+    /// The database file's schema format number (header byte offset 44-47).
+    /// Descending indexes were introduced in format 4; for any lower format
+    /// SQLite ignores the `DESC` qualifier on index columns and treats them as
+    /// ascending. We mirror that when loading the schema. Defaults to 4 (the
+    /// format new databases use), i.e. `DESC` is honored unless we learn the
+    /// on-disk header says otherwise.
+    pub schema_format: u32,
     /// Statistics collected via ANALYZE for regular B-tree tables and indexes.
     pub analyze_stats: AnalyzeStats,
 
@@ -933,6 +940,9 @@ impl Schema {
             indexes,
             has_indexes,
             schema_version: 0,
+            // 4 = honor DESC indexes (the format new databases use). Overwritten
+            // from the file header when an existing database is loaded.
+            schema_format: 4,
             analyze_stats: AnalyzeStats::default(),
             table_to_materialized_views,
             incompatible_views,
@@ -1557,6 +1567,15 @@ impl Schema {
                     pager.begin_read_tx()?;
                     state.read_tx_active = true;
 
+                    // Capture the on-disk schema format. Descending indexes are
+                    // only honored for format >= 4; for legacy formats the DESC
+                    // qualifier is ignored (see `populate_indices`). Page 1 is
+                    // already cached at this point, so this header read does not
+                    // actually block.
+                    self.schema_format = pager
+                        .io
+                        .block(|| pager.with_header(|h| h.schema_format.get()))?;
+
                     state.accumulators = Some(MakeFromBtreeAccumulators {
                         from_sql_indexes: Vec::try_with_capacity_ext(10)?,
                         automatic_indices: HashMap::with_capacity_and_hasher(10, FxBuildHasher),
@@ -1760,6 +1779,13 @@ impl Schema {
         automatic_indices: HashMap<String, Vec<(String, i64)>>,
         mvcc_enabled: bool,
     ) -> Result<()> {
+        // Descending indexes were introduced with schema format 4. A database
+        // written with an older format has the DESC qualifier in its CREATE
+        // INDEX text ignored by SQLite, which stores and scans those indexes
+        // ascending. Mirror that here so the query planner picks the same scan
+        // direction SQLite would for a legacy file.
+        let honor_desc = self.schema_format >= 4;
+
         for unparsed_sql_from_index in from_sql_indexes {
             let table = self
                 .get_btree_table(&unparsed_sql_from_index.table_name)
@@ -1771,7 +1797,7 @@ impl Schema {
                         unparsed_sql_from_index.sql
                     ))
                 })?;
-            let index = Index::from_sql(
+            let mut index = Index::from_sql(
                 syms,
                 &unparsed_sql_from_index.sql,
                 unparsed_sql_from_index.root_page,
@@ -1779,6 +1805,9 @@ impl Schema {
             )?;
             if mvcc_enabled && index.index_method.is_some() {
                 crate::bail_parse_error!("Custom index modules are not supported with MVCC");
+            }
+            if !honor_desc {
+                index.force_ascending();
             }
             self.add_index(Arc::new(index))?;
         }
@@ -1831,13 +1860,17 @@ impl Schema {
                     }
 
                     if let Some(index_entry) = automatic_indexes.pop() {
-                        self.add_index(Arc::new(Index::automatic_from_primary_key(
+                        let mut index = Index::automatic_from_primary_key(
                             table.as_ref(),
                             index_entry,
                             unique_set.columns.len(),
                             unique_set.conflict_clause,
                             &unique_set.collations,
-                        )?))?;
+                        )?;
+                        if !honor_desc {
+                            index.force_ascending();
+                        }
+                        self.add_index(Arc::new(index))?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
                         // Skip creating this index - it will be added later when its schema row is processed
@@ -1863,13 +1896,17 @@ impl Schema {
                         column_indices_and_sort_orders.push((pos_in_table, *sort_order));
                     }
                     if let Some(index_entry) = automatic_indexes.pop() {
-                        self.add_index(Arc::new(Index::automatic_from_unique(
+                        let mut index = Index::automatic_from_unique(
                             table.as_ref(),
                             index_entry,
                             column_indices_and_sort_orders,
                             unique_set.conflict_clause,
                             &unique_set.collations,
-                        )?))?;
+                        )?;
+                        if !honor_desc {
+                            index.force_ascending();
+                        }
+                        self.add_index(Arc::new(index))?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
                         // Skip creating this index - it will be added later when its schema row is processed
@@ -2677,6 +2714,7 @@ impl Clone for Schema {
             indexes,
             has_indexes: self.has_indexes.clone(),
             schema_version: self.schema_version,
+            schema_format: self.schema_format,
             analyze_stats: self.analyze_stats.clone(),
             table_to_materialized_views: self.table_to_materialized_views.clone(),
             incompatible_views,
@@ -5522,6 +5560,16 @@ impl Index {
     /// Check if this is an expression index.
     pub fn is_expression_index(&self) -> bool {
         self.columns.iter().any(|c| c.expr.is_some())
+    }
+
+    /// Force every index column to ascending order. Used when loading a
+    /// database whose schema format predates descending-index support (format
+    /// < 4): SQLite ignores the `DESC` qualifier on such files, so the on-disk
+    /// b-tree is ordered ascending and we must scan it the same way.
+    pub fn force_ascending(&mut self) {
+        for column in &mut self.columns {
+            column.order = SortOrder::Asc;
+        }
     }
 
     /// check if this is special backing_btree index created and managed by custom index_method
