@@ -1024,13 +1024,16 @@ pub fn translate_alter_table(
 
             // Handle CHECK constraints:
             // - Column-level CHECK constraints for the dropped column are silently removed
-            // - Table-level CHECK constraints referencing the dropped column cause an error
+            // - Any other CHECK constraint referencing the dropped column causes an error
             for check in &btree.check_constraints {
-                if check.column.is_some() {
-                    // Column-level constraint: will be removed below
+                if check
+                    .column
+                    .as_ref()
+                    .is_some_and(|col| normalize_ident(col) == col_normalized)
+                {
+                    // Column-level constraint on the dropped column: removed below
                     continue;
                 }
-                // Table-level constraint: check if it references the dropped column
                 if check_expr_references_column(&check.expr, &col_normalized) {
                     return Err(LimboError::ParseError(format!(
                         "error in table {table_name} after drop column: no such column: {column_name}"

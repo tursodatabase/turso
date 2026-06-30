@@ -699,6 +699,7 @@ expect {
     1
 }
 
+# Column-level CHECK on the dropped column only → removed with the column
 @cross-check-integrity
 test drop-column-removes-check-constraint {
     CREATE TABLE t_check (a INTEGER PRIMARY KEY, b REAL CHECK (b BETWEEN 0.0 AND 1000.0), c INTEGER NOT NULL);
@@ -712,6 +713,7 @@ expect {
     2|99
 }
 
+# Table-level CHECK referencing dropped column → fail
 @cross-check-integrity
 test fail-drop-column-table-level-check-constraint {
     CREATE TABLE t_check2 (a INTEGER PRIMARY KEY, b INTEGER, c TEXT, CHECK (b > 0));
@@ -719,6 +721,84 @@ test fail-drop-column-table-level-check-constraint {
 }
 expect error {
     error in table t_check2 after drop column: no such column: b
+}
+
+# Column-level CHECK on another column referencing dropped column → fail
+@cross-check-integrity
+test fail-drop-column-column-level-check-references-other-column {
+    CREATE TABLE t_check3 (a INTEGER, b INTEGER CHECK (b > a));
+    ALTER TABLE t_check3 DROP COLUMN a;
+}
+expect error {
+    error in table t_check3 after drop column: no such column: a
+}
+
+# Same as above; referenced column appears first in the CHECK expression → fail
+@cross-check-integrity
+test fail-drop-column-column-level-check-reverse-expr-order {
+    CREATE TABLE t_check_rev (a INTEGER, b INTEGER CHECK (a <= b));
+    ALTER TABLE t_check_rev DROP COLUMN a;
+}
+expect error {
+    error in table t_check_rev after drop column: no such column: a
+}
+
+# Drop the column that owns the CHECK even when the expr references other columns → succeed
+@cross-check-integrity
+test drop-column-removes-column-level-check-referencing-other-column {
+    CREATE TABLE t_check_own (a INTEGER, b INTEGER CHECK (b > a));
+    INSERT INTO t_check_own VALUES (1, 5);
+    ALTER TABLE t_check_own DROP COLUMN b;
+    INSERT INTO t_check_own (a) VALUES (2);
+    SELECT * FROM t_check_own;
+}
+expect {
+    1
+    2
+}
+
+# Drop a column not referenced by any CHECK → succeed
+@cross-check-integrity
+test drop-column-unrelated-column-with-check-on-other-columns {
+    CREATE TABLE t_check_unrel (a INTEGER, b INTEGER CHECK (b > a), c TEXT);
+    INSERT INTO t_check_unrel VALUES (1, 5, 'x');
+    ALTER TABLE t_check_unrel DROP COLUMN c;
+    INSERT INTO t_check_unrel (a, b) VALUES (2, 10);
+    SELECT * FROM t_check_unrel;
+}
+expect {
+    1|5
+    2|10
+}
+
+# Column-level CHECK with table-qualified reference to dropped column → fail
+@cross-check-integrity
+test fail-drop-column-column-level-check-qualified-ref {
+    CREATE TABLE t_check_qual (a INTEGER, b INTEGER CHECK (t_check_qual.a < b));
+    ALTER TABLE t_check_qual DROP COLUMN a;
+}
+expect error {
+    error in table t_check_qual after drop column: no such column: a
+}
+
+# Table-level CHECK referencing multiple columns including dropped column → fail
+@cross-check-integrity
+test fail-drop-column-table-level-multi-column-check {
+    CREATE TABLE t_check_multi (a INTEGER, b INTEGER, c INTEGER, CHECK (a + b > c));
+    ALTER TABLE t_check_multi DROP COLUMN a;
+}
+expect error {
+    error in table t_check_multi after drop column: no such column: a
+}
+
+# Named column-level CHECK referencing another column → fail
+@cross-check-integrity
+test fail-drop-column-named-column-level-check-references-other-column {
+    CREATE TABLE t_check_named (a INTEGER, b INTEGER CONSTRAINT b_gt_a CHECK (b > a));
+    ALTER TABLE t_check_named DROP COLUMN a;
+}
+expect error {
+    error in table t_check_named after drop column: no such column: a
 }
 
 @cross-check-integrity
