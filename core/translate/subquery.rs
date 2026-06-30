@@ -872,8 +872,7 @@ fn get_subquery_parser<'a>(
                             expr: None,
                         })
                     })
-                    .try_collect::<Result<crate::alloc::Vec<_>>>()
-                    .expect(crate::alloc::ALLOC_ERR_MSG)?;
+                    .try_collect::<Result<crate::alloc::Vec<_>>>()??;
 
                 let ephemeral_index = Arc::new(Index {
                     columns,

@@ -444,8 +444,7 @@ fn emit_refill_index(
             .columns
             .iter()
             .map(|c| (c.order, c.collation, None))
-            .try_collect()
-            .expect(crate::alloc::ALLOC_ERR_MSG);
+            .try_collect()?;
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sorter_cursor_id,
             columns: columns.len(),
