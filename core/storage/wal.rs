@@ -5937,6 +5937,36 @@ pub mod test {
         expected
     }
 
+    #[test]
+    fn append_frames_vectored_spill_frames_are_not_reused_by_next_prepare() {
+        let page_size = 512;
+        let (_io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let spill_page = page_with_pattern(7, 0x70, &buffer_pool);
+
+        let completion = wal
+            .append_frames_vectored(vec![spill_page], PageSize::new(page_size).unwrap())
+            .unwrap();
+        assert!(completion.succeeded());
+        assert_eq!(wal.get_max_frame(), 1);
+        assert_eq!(wal.get_max_frame_in_wal(), 0);
+
+        let commit_page = page_with_pattern(9, 0x90, &buffer_pool);
+        let prepared = wal
+            .prepare_frames(
+                &[commit_page],
+                PageSize::new(page_size).unwrap(),
+                Some(99),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            prepared.metadata[0].1, 2,
+            "prepare_frames must chain after unpublished spill frames"
+        );
+        assert_eq!(prepared.final_max_frame, 2);
+    }
+
     fn wait_for_completion_error(io: &Arc<dyn IO>, completion: Completion) -> CompletionError {
         match io.wait_for_completion(completion) {
             Err(LimboError::CompletionError(err)) => err,
