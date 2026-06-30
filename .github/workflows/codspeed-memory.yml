@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -47,21 +47,18 @@ jobs:
         with:
           tool: cargo-codspeed
 
+      - name: Mount benchmark binary sticky disk
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: codspeed-memory-binary-${{ github.run_id }}
+          path: target/codspeed
+
       - name: Build memory benchmarks
         run: cargo codspeed build -m memory -p memory-benchmark-codspeed --features codspeed
 
-      - name: Upload benchmark binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: codspeed-memory-binary
-          compression-level: 1
-          path: target/codspeed
-          if-no-files-found: "error"
-          retention-days: 1
-
   run:
     name: "memory benchmarks (${{ matrix.workload }})"
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: build
     timeout-minutes: 30
     # Allow this job to fail without failing the entire CI run
@@ -89,14 +86,16 @@ jobs:
         with:
           tool: cargo-codspeed
 
-      - name: Download benchmark binary
-        uses: actions/download-artifact@v4
+      - name: Mount benchmark binary sticky disk
+        uses: useblacksmith/stickydisk@v1
         with:
-          name: codspeed-memory-binary
+          key: codspeed-memory-binary-${{ github.run_id }}
           path: target/codspeed
+          commit: false
 
       - name: Restore binary permissions
-        # artifacts do not preserve the executable bit
+        # Sticky disks preserve file contents but the CodSpeed runner expects
+        # every benchmark binary to be executable.
         run: find target/codspeed -type f -exec chmod +x {} +
 
       - name: Run memory benchmarks
@@ -104,3 +103,16 @@ jobs:
         with:
           mode: memory
           run: cargo codspeed run -m memory -p memory-benchmark-codspeed --bench memory_profiles "${{ matrix.workload }}"
+
+  cleanup:
+    name: Delete temporary benchmark sticky disk
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs:
+      - build
+      - run
+    if: ${{ always() }}
+    steps:
+      - name: Delete benchmark binary sticky disk
+        uses: useblacksmith/stickydisk-delete@v1
+        with:
+          delete-key: codspeed-memory-binary-${{ github.run_id }}
