@@ -7238,6 +7238,11 @@ impl PageStack {
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG, name = "pagestack::push"))]
     fn _push(&mut self, page: PageRef, starting_cell_idx: i32) {
         tracing::trace!(current = self.current_page, new_page_id = page.get().id,);
+        turso_assert!(
+            !page.is_freelist(),
+            "b-tree traversed into a page that is on the freelist",
+            { "page_id": page.get().id }
+        );
         'validate: {
             let current = self.current_page;
             if current == -1 {

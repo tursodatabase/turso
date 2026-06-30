@@ -739,6 +739,17 @@ const PAGE_DIRTY: usize = 0b1000;
 const PAGE_LOADED: usize = 0b10000;
 /// Page has been spilled to WAL (can be evicted even though dirty).
 const PAGE_SPILLED: usize = 0b100000;
+/// In-memory marker that the page is on the freelist: set in [Pager::free_page],
+/// cleared in [Pager::allocate_page] and when a savepoint rollback undoes a free.
+/// Lets us catch a double-free at the offending free instead of later at reuse.
+///
+/// It is never set unless the page really is on the freelist, so asserting
+/// `!is_freelist()` never false-positives. The converse does not hold: the
+/// marker lives on the cached `Page`, not on disk, so when the page cache evicts
+/// that `Page` the marker is lost and a later re-read rebuilds it cleared even
+/// though the page is still on the freelist. That only costs a missed check —
+/// the reuse-time assertion in [Pager::allocate_page] still backstops it.
+const PAGE_FREELIST: usize = 0b1000000;
 
 impl Page {
     pub fn new(id: i64) -> Self {
@@ -851,6 +862,24 @@ impl Page {
     pub fn clear_loaded(&self) {
         tracing::debug!("clear loaded {}", self.get().id);
         self.get().flags.fetch_and(!PAGE_LOADED, Ordering::Release);
+    }
+
+    /// Whether this page is currently recorded on the freelist. See [PAGE_FREELIST].
+    #[inline]
+    pub fn is_freelist(&self) -> bool {
+        self.get().flags.load(Ordering::Acquire) & PAGE_FREELIST != 0
+    }
+
+    #[inline]
+    pub fn set_freelist(&self) {
+        self.get().flags.fetch_or(PAGE_FREELIST, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn clear_freelist(&self) {
+        self.get()
+            .flags
+            .fetch_and(!PAGE_FREELIST, Ordering::Release);
     }
 
     #[inline]
@@ -1228,6 +1257,8 @@ struct SavepointSnapshot {
     wal_max_frame: u64,
     wal_checksum: (u32, u32),
     deferred_fk_violations: isize,
+    /// Length of `freed_pages_this_txn` when this savepoint was opened.
+    freed_pages_mark: usize,
 }
 
 struct Savepoint {
@@ -1249,6 +1280,9 @@ struct Savepoint {
     wal_checksum: RwLock<(u32, u32)>,
     /// Deferred FK counter value at the start of this savepoint.
     deferred_fk_violations: AtomicIsize,
+    /// Length of `freed_pages_this_txn` when this savepoint was opened; a rollback to
+    /// this savepoint truncates the log back to here. See [PAGE_FREELIST].
+    freed_pages_mark: AtomicUsize,
 }
 
 impl Savepoint {
@@ -1259,6 +1293,7 @@ impl Savepoint {
         wal_max_frame: u64,
         wal_checksum: (u32, u32),
         deferred_fk_violations: isize,
+        freed_pages_mark: usize,
     ) -> Self {
         Self {
             kind,
@@ -1269,6 +1304,7 @@ impl Savepoint {
             wal_max_frame: AtomicU64::new(wal_max_frame),
             wal_checksum: RwLock::new(wal_checksum),
             deferred_fk_violations: AtomicIsize::new(deferred_fk_violations),
+            freed_pages_mark: AtomicUsize::new(freed_pages_mark),
         }
     }
 
@@ -1300,6 +1336,7 @@ impl Savepoint {
             wal_max_frame: self.wal_max_frame.load(Ordering::Acquire),
             wal_checksum: *self.wal_checksum.read(),
             deferred_fk_violations: self.deferred_fk_violations.load(Ordering::Acquire),
+            freed_pages_mark: self.freed_pages_mark.load(Ordering::Acquire),
         }
     }
 
@@ -1313,6 +1350,7 @@ impl Savepoint {
             wal_max_frame: AtomicU64::new(snapshot.wal_max_frame),
             wal_checksum: RwLock::new(snapshot.wal_checksum),
             deferred_fk_violations: AtomicIsize::new(snapshot.deferred_fk_violations),
+            freed_pages_mark: AtomicUsize::new(snapshot.freed_pages_mark),
         }
     }
 }
@@ -1344,6 +1382,11 @@ pub struct Pager {
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
+    /// Append-only log of pages freed in the current transaction. Each savepoint
+    /// records this log's length when opened (`Savepoint::freed_pages_mark`); a
+    /// rollback truncates the log back to that length and clears the
+    /// `PAGE_FREELIST` hint for the truncated entries.
+    freed_pages_this_txn: RwLock<Vec<u32>>,
     commit_info: RwLock<CommitInfo>,
     checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
@@ -1631,6 +1674,7 @@ impl Pager {
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
+            freed_pages_this_txn: RwLock::new(Vec::new()),
             commit_info: RwLock::new(CommitInfo {
                 completions: Vec::new(),
                 completion_group: None,
@@ -1981,6 +2025,7 @@ impl Pager {
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(savepoint.write_offset());
         } else {
+            self.freed_pages_this_txn.write().clear();
             let subjournal = self.subjournal.read();
             let Some(subjournal) = subjournal.as_ref() else {
                 return Ok(());
@@ -2054,6 +2099,7 @@ impl Pager {
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(journal_end_offset);
         } else {
+            self.freed_pages_this_txn.write().clear();
             let subjournal = self.subjournal.read();
             let Some(subjournal) = subjournal.as_ref() else {
                 return Ok(result);
@@ -2067,6 +2113,7 @@ impl Pager {
 
     pub fn clear_savepoints(&self) -> Result<()> {
         *self.savepoints.write() = Vec::new();
+        self.freed_pages_this_txn.write().clear();
         let subjournal = self.subjournal.read();
         let Some(subjournal) = subjournal.as_ref() else {
             return Ok(());
@@ -2164,6 +2211,7 @@ impl Pager {
             wal_max_frame,
             wal_checksum,
             deferred_fk_violations,
+            self.freed_pages_this_txn.read().len(),
         );
         self.savepoints.write().push(savepoint);
         Ok(())
@@ -2243,6 +2291,19 @@ impl Pager {
             }
             dirty_pages.remove_range((db_size + 1)..);
             cache.truncate(db_size as usize)?;
+            // Every page freed after this savepoint opened is now back in the
+            // tree, so clear its PAGE_FREELIST hint. Those frees are exactly the
+            // log entries past the savepoint's mark; drain them off. Frees before
+            // the mark are untouched — their hint is still valid.
+            for page_id in self
+                .freed_pages_this_txn
+                .write()
+                .drain(savepoint.freed_pages_mark..)
+            {
+                if let Ok(Some(page)) = cache.get(&PageCacheKey::new(page_id as usize)) {
+                    page.clear_freelist();
+                }
+            }
         }
 
         if let Some(wal) = &self.wal {
@@ -4128,6 +4189,11 @@ impl Pager {
                                 page.get().id
                             )));
                         }
+                        turso_assert!(
+                            page.get_contents().overflow_cells.is_empty(),
+                            "dirty page still has overflow cells at commit time",
+                            { "page_id": page.get().id }
+                        );
                         commit_info.page_source_cursor += 1;
                         commit_info.collected_pages.push(page);
 
@@ -4888,6 +4954,16 @@ impl Pager {
             .map(|header_ref| header_ref.borrow().freelist_pages.get())
             .unwrap_or(0)
     }
+    /// Mark `page` as on the freelist: set its `PAGE_FREELIST` hint and, while a
+    /// savepoint is open, append it to `freed_pages_this_txn` so a rollback can
+    /// clear the hint precisely. See [PAGE_FREELIST] and `rollback_to_snapshot`.
+    fn mark_page_on_freelist(&self, page: &Page) {
+        page.set_freelist();
+        if self.savepoints.read().last().is_some() {
+            self.freed_pages_this_txn.write().push(page.get().id as u32);
+        }
+    }
+
     // Providing a page is optional, if provided it will be used to avoid reading the page from disk.
     // This is implemented in accordance with sqlite freepage2() function.
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -4940,6 +5016,11 @@ impl Pager {
                         }
                         None => return_if_io!(self.read_page(page_id as i64)),
                     };
+                    turso_assert!(
+                        !page.is_freelist(),
+                        "freeing a page that is already on the freelist (double-free)",
+                        { "page_id": page_id }
+                    );
                     header.freelist_pages = (header.freelist_pages.get() + 1).into();
 
                     let trunk_page_id = header.freelist_trunk_page.get();
@@ -4999,6 +5080,7 @@ impl Pager {
                         );
 
                         // Unpin page before finishing - it's added to freelist
+                        self.mark_page_on_freelist(page);
                         page.unpin();
                         break;
                     }
@@ -5022,6 +5104,7 @@ impl Pager {
                     // Update page 1 to point to new trunk
                     header.freelist_trunk_page = (page_id as u32).into();
                     // Unpin page before finishing - it's now a trunk page
+                    self.mark_page_on_freelist(page);
                     page.unpin();
                     break;
                 }
@@ -5261,6 +5344,8 @@ impl Pager {
                         );
                     }
                     // Unpin trunk_page before returning - caller takes ownership
+                    // and the page is no longer on the freelist.
+                    trunk_page.clear_freelist();
                     trunk_page.unpin();
                     let trunk_page = trunk_page.clone();
                     *state = AllocatePageState::Start;
@@ -5319,7 +5404,9 @@ impl Pager {
                     );
 
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
-                    // Unpin both pages before returning - caller takes ownership of leaf_page
+                    // Unpin both pages before returning - caller takes ownership of leaf_page,
+                    // which is no longer on the freelist.
+                    leaf_page.clear_freelist();
                     trunk_page.unpin();
                     leaf_page.unpin();
                     let leaf_page = leaf_page.clone();
@@ -5860,8 +5947,18 @@ mod ptrmap_tests {
             }
         }
     }
-    // Helper to create a Pager for testing
+    // Helper to create a Pager for testing.
     fn test_pager_setup(page_size: u32, initial_db_pages: u32) -> Pager {
+        _test_pager_setup(page_size, initial_db_pages, true)
+    }
+
+    // Same as `test_pager_setup` but with autovacuum disabled, so there are no
+    // ptrmap pages to perturb freelist mechanics.
+    fn test_pager_setup_no_autovacuum(page_size: u32, initial_db_pages: u32) -> Pager {
+        _test_pager_setup(page_size, initial_db_pages, false)
+    }
+
+    fn _test_pager_setup(page_size: u32, initial_db_pages: u32, auto_vacuum: bool) -> Pager {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(
             io.open_file("test.db", OpenFlags::Create, true).unwrap(),
@@ -5906,12 +6003,16 @@ mod ptrmap_tests {
                 page_cache.capacity()
             );
         }
-        pager
-            .persist_auto_vacuum_mode(AutoVacuumMode::Full)
-            .unwrap();
+        if auto_vacuum {
+            pager
+                .persist_auto_vacuum_mode(AutoVacuumMode::Full)
+                .unwrap();
+        }
 
-        //  Allocate all the pages as btree root pages
-        const EXPECTED_FIRST_ROOT_PAGE_ID: u32 = 3; // page1 = 1,  first ptrmap page = 2, root page = 3
+        //  Allocate all the pages as btree root pages.
+        //  With autovacuum: page1 = 1, first ptrmap page = 2, first root = 3.
+        //  Without autovacuum: page1 = 1, first root = 2 (no ptrmap page).
+        let expected_first_root_page_id: u32 = if auto_vacuum { 3 } else { 2 };
         for i in 0..initial_db_pages {
             let res = run_until_done(
                 || pager.btree_create(&CreateBTreeFlags::new_table()),
@@ -5928,7 +6029,7 @@ mod ptrmap_tests {
             }
             match res {
                 Ok(root_page_id) => {
-                    assert_eq!(root_page_id, EXPECTED_FIRST_ROOT_PAGE_ID + i);
+                    assert_eq!(root_page_id, expected_first_root_page_id + i);
                 }
                 Err(e) => {
                     panic!("test_pager_setup: btree_create failed: {e:?}");
@@ -6229,6 +6330,54 @@ mod ptrmap_tests {
             }
             IOResult::IO(_) => panic!("loaded cache hit must not yield"),
         }
+    }
+
+    /// `free_page` rejects a double-free at the offending free, instead of
+    /// leaving it for `allocate_page` to detect later at reuse.
+    #[test]
+    #[should_panic(expected = "double-free")]
+    fn double_free_detected_at_source() {
+        // initial_db_pages only sizes the buffer-pool arena (needs >= 16 pages).
+        let pager = test_pager_setup_no_autovacuum(4096, 8);
+        let id = run_until_done(|| pager.allocate_page(), &pager)
+            .unwrap()
+            .get()
+            .id;
+        run_until_done(|| pager.free_page(None, id), &pager).unwrap();
+        // Freeing it again must trip the assert.
+        let _ = run_until_done(|| pager.free_page(None, id), &pager);
+    }
+
+    /// Rolling back an inner savepoint must not clear freelist hints for pages
+    /// freed before that inner savepoint started, or this real double-free is no
+    /// longer caught at the offending free.
+    #[test]
+    #[should_panic(expected = "double-free")]
+    fn nested_savepoint_rollback_preserves_prior_free_for_double_free_detection() {
+        let pager = test_pager_setup_no_autovacuum(4096, 8);
+        let page_a = run_until_done(|| pager.allocate_page(), &pager).unwrap();
+        let page_b = run_until_done(|| pager.allocate_page(), &pager).unwrap();
+        let db_size = pager
+            .io
+            .block(|| pager.with_header(|header| header.database_size.get()))
+            .unwrap();
+
+        pager.open_subjournal().unwrap();
+        pager.open_savepoint(db_size).unwrap();
+
+        let page_a_id = page_a.get().id;
+        let page_b_id = page_b.get().id;
+        run_until_done(|| pager.free_page(Some(page_a.clone()), page_a_id), &pager).unwrap();
+        run_until_done(|| pager.free_page(Some(page_b.clone()), page_b_id), &pager).unwrap();
+
+        // The inner savepoint starts at the same subjournal offset recorded for
+        // the frees above when the freelist trunk was already dirty.
+        pager.open_savepoint(db_size).unwrap();
+        pager.rollback_to_newest_savepoint().unwrap();
+
+        // page_a was freed before the inner savepoint, so this is still a
+        // double-free and must trip the PAGE_FREELIST assertion.
+        let _ = run_until_done(|| pager.free_page(Some(page_a.clone()), page_a_id), &pager);
     }
 }
 
