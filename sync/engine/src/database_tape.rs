@@ -982,11 +982,8 @@ mod tests {
                 }
             }
         });
-        loop {
-            match gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
-                genawaiter::GeneratorState::Complete(()) => break,
-            }
+        while let genawaiter::GeneratorState::Yielded(..) = gen.resume_with(Ok(())) {
+            io.step().unwrap()
         }
     }
 

@@ -493,6 +493,7 @@ mod tests {
 
     struct CapturingSyncEngineIo {
         response: Mutex<Option<Vec<u8>>>,
+        #[allow(clippy::type_complexity)]
         request: Mutex<Option<(String, String, Option<Vec<u8>>)>>,
     }
 
@@ -2125,6 +2126,7 @@ fn should_replay_raw_pages_on_sql_conn(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_local_replay_floor_change_id(
     use_pushed_change_hint: bool,
     use_pushed_replay_floor_hint: bool,
