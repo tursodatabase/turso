@@ -99,6 +99,10 @@ impl ThreadRng {
     fn get_random(&mut self) -> u64 {
         self.rng.random()
     }
+
+    fn choose<'a, T>(&mut self, ts: &'a [T]) -> &'a T {
+        &ts[self.rng.random_range(0..ts.len())]
+    }
 }
 
 #[cfg(antithesis)]
@@ -114,31 +118,36 @@ impl ThreadRng {
     fn get_random(&mut self) -> u64 {
         antithesis_sdk::random::get_random()
     }
+
+    fn choose<'a, T>(&mut self, ts: &'a [T]) -> &'a T {
+        // Routing the selection through Antithesis' own RNG gives it visibility
+        // into the choice, which it uses to explore the decision space.
+        antithesis_sdk::random::random_choice(ts).expect("choose called on empty slice")
+    }
 }
 
 // Helper functions for generating random data
 fn generate_random_identifier(rng: &mut ThreadRng) -> String {
-    let adj = ADJECTIVES[rng.get_random() as usize % ADJECTIVES.len()];
-    let noun = NOUNS[rng.get_random() as usize % NOUNS.len()];
+    let adj = rng.choose(ADJECTIVES);
+    let noun = rng.choose(NOUNS);
     let num = rng.get_random() % 1000;
     format!("{adj}_{noun}_{num}")
 }
 
 fn generate_random_data_type(rng: &mut ThreadRng) -> DataType {
-    match rng.get_random() % 5 {
-        0 => DataType::Integer,
-        1 => DataType::Real,
-        2 => DataType::Text,
-        3 => DataType::Blob,
-        _ => DataType::Numeric,
-    }
+    rng.choose(&[
+        DataType::Integer,
+        DataType::Real,
+        DataType::Text,
+        DataType::Blob,
+        DataType::Numeric,
+    ])
+    .clone()
 }
 
 fn generate_random_constraint(rng: &mut ThreadRng) -> Constraint {
-    match rng.get_random() % 2 {
-        0 => Constraint::NotNull,
-        _ => Constraint::Unique,
-    }
+    rng.choose(&[Constraint::NotNull, Constraint::Unique])
+        .clone()
 }
 
 fn generate_random_column(rng: &mut ThreadRng) -> Column {
@@ -295,7 +304,7 @@ fn generate_insert(rng: &mut ThreadRng, table: &Table) -> String {
                 && col.constraints.contains(&Constraint::PrimaryKey)
                 && rng.get_random() % 100 < 50
             {
-                table.pk_values[rng.get_random() as usize % table.pk_values.len()].clone()
+                rng.choose(&table.pk_values).clone()
             } else {
                 generate_random_value(rng, &col.data_type)
             }
@@ -347,11 +356,7 @@ fn generate_update(rng: &mut ThreadRng, table: &Table) -> String {
     };
 
     let where_clause = if !table.pk_values.is_empty() && rng.get_random() % 100 < 50 {
-        format!(
-            "{} = {}",
-            pk_column.name,
-            table.pk_values[rng.get_random() as usize % table.pk_values.len()]
-        )
+        format!("{} = {}", pk_column.name, rng.choose(&table.pk_values))
     } else {
         format!(
             "{} = {}",
@@ -376,11 +381,7 @@ fn generate_delete(rng: &mut ThreadRng, table: &Table) -> String {
         .expect("Table should have a primary key");
 
     let where_clause = if !table.pk_values.is_empty() && rng.get_random() % 100 < 50 {
-        format!(
-            "{} = {}",
-            pk_column.name,
-            table.pk_values[rng.get_random() as usize % table.pk_values.len()]
-        )
+        format!("{} = {}", pk_column.name, rng.choose(&table.pk_values))
     } else {
         format!(
             "{} = {}",
@@ -394,8 +395,8 @@ fn generate_delete(rng: &mut ThreadRng, table: &Table) -> String {
 
 /// Generate a random SQL statement for a schema
 fn generate_random_statement(rng: &mut ThreadRng, schema: &ArbitrarySchema) -> String {
-    let table = &schema.tables[rng.get_random() as usize % schema.tables.len()];
-    match rng.get_random() % 3 {
+    let table = rng.choose(&schema.tables);
+    match *rng.choose(&[0, 1, 2]) {
         0 => generate_insert(rng, table),
         1 => generate_update(rng, table),
         _ => generate_delete(rng, table),
@@ -747,7 +748,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         }
 
                         // 50% ROLLBACK TO (partial undo), 50% RELEASE (keep changes).
-                        if rng.get_random() % 2 == 0 {
+                        if *rng.choose(&[true, false]) {
                             let rollback_sql = format!("ROLLBACK TO {sp_name};");
                             let _ = conn.execute(&rollback_sql, ()).await;
                         }
@@ -756,11 +757,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     }
 
                     if tx.is_some() {
-                        let end_tx = if rng.get_random() % 2 == 0 {
-                            "COMMIT;"
-                        } else {
-                            "ROLLBACK;"
-                        };
+                        let end_tx = *rng.choose(&["COMMIT;", "ROLLBACK;"]);
                         let _ = conn.execute(end_tx, ()).await;
                     }
 
