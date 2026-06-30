@@ -772,13 +772,16 @@ expect {
 }
 
 # Column-level CHECK with table-qualified reference to dropped column → fail
+# Behaviour matches SQLite (DROP rejected). Error text differs for qualified refs:
+# SQLite reports the reference as written (t_check_qual.a); Turso the bare name (a).
+# Regex below accepts both; aligning Turso's message with SQLite is a separate issue.
 @cross-check-integrity
 test fail-drop-column-column-level-check-qualified-ref {
     CREATE TABLE t_check_qual (a INTEGER, b INTEGER CHECK (t_check_qual.a < b));
     ALTER TABLE t_check_qual DROP COLUMN a;
 }
 expect error {
-    error in table t_check_qual after drop column: no such column: a
+    error in table t_check_qual after drop column: no such column: (t_check_qual\.)?a
 }
 
 # Table-level CHECK referencing multiple columns including dropped column → fail
