@@ -1023,7 +1023,7 @@ mod tests {
                                 id: 1,
                                 change: DatabaseTapeRowChangeType::Insert {
                                     after: crate::alloc::vec![
-                                        turso_core::Value::from_i64(1),
+                                        turso_core::Value::Null,
                                         turso_core::Value::build_text("new"),
                                     ],
                                 },
@@ -1036,18 +1036,108 @@ mod tests {
                         .await
                         .unwrap();
                 }
-                let mut stmt = conn.prepare("SELECT value FROM t WHERE id = 1").unwrap();
-                let row = run_stmt_once(&coro, &mut stmt).await.unwrap().unwrap();
-                row.get_values().cloned().collect::<Vec<_>>()
+                let mut stmt = conn.prepare("SELECT id, value FROM t ORDER BY id").unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                rows
             }
         });
-        let row = loop {
+        let rows = loop {
             match gen.resume_with(Ok(())) {
                 genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
                 genawaiter::GeneratorState::Complete(result) => break result,
             }
         };
-        assert_eq!(row, vec![turso_core::Value::build_text("new")]);
+        assert_eq!(
+            rows,
+            vec![vec![
+                turso_core::Value::from_i64(1),
+                turso_core::Value::build_text("new")
+            ]]
+        );
+    }
+
+    #[test]
+    pub fn test_implicit_rowid_replay_prefers_explicit_primary_key() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(io.clone(), db_path).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE t(x TEXT PRIMARY KEY, value TEXT)")
+                    .unwrap();
+                conn.execute("INSERT INTO t(rowid, x, value) VALUES (4, 'remote', 'kept')")
+                    .unwrap();
+                conn.execute("INSERT INTO t(rowid, x, value) VALUES (5, 'local', 'old')")
+                    .unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: true,
+                    };
+                    let mut session = db.start_replay_session(&coro, opts).await.unwrap();
+                    session
+                        .replay(
+                            &coro,
+                            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                                change_id: 1,
+                                change_time: 1,
+                                table_name: "t".to_string(),
+                                id: 4,
+                                change: DatabaseTapeRowChangeType::Insert {
+                                    after: crate::alloc::vec![
+                                        turso_core::Value::build_text("local"),
+                                        turso_core::Value::build_text("new"),
+                                    ],
+                                },
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    session
+                        .replay(&coro, DatabaseTapeOperation::Commit)
+                        .await
+                        .unwrap();
+                }
+                let mut stmt = conn
+                    .prepare("SELECT rowid, x, value FROM t ORDER BY x")
+                    .unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                rows
+            }
+        });
+        let rows = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    turso_core::Value::from_i64(5),
+                    turso_core::Value::build_text("local"),
+                    turso_core::Value::build_text("new")
+                ],
+                vec![
+                    turso_core::Value::from_i64(4),
+                    turso_core::Value::build_text("remote"),
+                    turso_core::Value::build_text("kept")
+                ],
+            ]
+        );
     }
 
     #[test]
