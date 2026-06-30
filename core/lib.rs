@@ -3634,11 +3634,11 @@ mod database_tests {
             .unwrap();
         drop(conn);
 
-        match Database::open_file_with_flags(io, path, OpenFlags::Create, DatabaseOpts::new(), None)
-        {
-            Ok(_) => panic!("opening without the codec must not reuse a codec-required database"),
-            Err(_) => {}
-        }
+        assert!(
+            Database::open_file_with_flags(io, path, OpenFlags::Create, DatabaseOpts::new(), None)
+                .is_err(),
+            "opening without the codec must not reuse a codec-required database"
+        );
     }
 
     #[cfg(feature = "fs")]
