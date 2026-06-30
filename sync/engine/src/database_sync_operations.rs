@@ -4073,11 +4073,8 @@ mod tests {
                 assert!(max_change_id.is_some_and(|change_id| change_id > 0));
             }
         });
-        loop {
-            match gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
-                genawaiter::GeneratorState::Complete(()) => break,
-            }
+        while let genawaiter::GeneratorState::Yielded(..) = gen.resume_with(Ok(())) {
+            io.step().unwrap()
         }
     }
 
@@ -5146,7 +5143,7 @@ mod tests {
             table_name: "sqlite_schema".to_string(),
             id: 1,
             change: DatabaseTapeRowChangeType::Insert {
-                after: parse_bin_record(&record(&[
+                after: parse_bin_record(record(&[
                     turso_core::Value::build_text("table"),
                     turso_core::Value::build_text("__turso_internal_mvcc_meta"),
                     turso_core::Value::build_text("__turso_internal_mvcc_meta"),
@@ -5164,7 +5161,7 @@ mod tests {
             table_name: "sqlite_schema".to_string(),
             id: 2,
             change: DatabaseTapeRowChangeType::Insert {
-                after: parse_bin_record(&record(&[
+                after: parse_bin_record(record(&[
                     turso_core::Value::build_text("table"),
                     turso_core::Value::build_text("items"),
                     turso_core::Value::build_text("items"),
@@ -5187,7 +5184,7 @@ mod tests {
             id: 2,
             change: DatabaseTapeRowChangeType::Update {
                 before: Vec::new(),
-                after: parse_bin_record(&record(&[
+                after: parse_bin_record(record(&[
                     turso_core::Value::build_text("table"),
                     turso_core::Value::build_text("items"),
                     turso_core::Value::build_text("items"),
@@ -5196,7 +5193,7 @@ mod tests {
                 ]))
                 .unwrap(),
                 updates: Some(
-                    parse_bin_record(&record(&[
+                    parse_bin_record(record(&[
                         turso_core::Value::from_i64(0),
                         turso_core::Value::from_i64(0),
                         turso_core::Value::from_i64(0),

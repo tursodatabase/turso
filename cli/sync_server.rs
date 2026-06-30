@@ -820,6 +820,7 @@ impl TursoSyncServer {
         })
     }
 
+    #[allow(clippy::type_complexity)]
     fn read_replace_base_pages(&self) -> Result<(u64, Vec<(u64, Vec<u8>)>)> {
         let conn = self.conn.lock().unwrap();
         let wal_state = conn.wal_state()?;
