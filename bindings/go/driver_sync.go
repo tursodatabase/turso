@@ -74,6 +74,18 @@ type TursoSyncDbConfig struct {
 	// Can also be specified via Path DSN: "mydb.db?_busy_timeout=10000"
 	// If both are set, this field takes precedence.
 	BusyTimeout int
+
+	// optional cap on the number of CDC operations packed into a single push HTTP batch.
+	// when > 0, push splits on transaction boundaries once the current batch has accumulated
+	// at least this many operations. a single user transaction is never split across batches.
+	// 0 (default) sends the entire change set in one batch.
+	PushOperationsThreshold int
+
+	// optional hint, in bytes, that splits the bootstrap download into multiple
+	// /pull-updates HTTP requests of >= this many bytes each. when > 0, the bootstrap is fetched
+	// in chunks. 0 (default) bootstraps in a single round-trip. no-op when partial sync uses the
+	// query bootstrap strategy.
+	PullBytesThreshold int
 }
 
 // statistics for the synced database.
@@ -158,6 +170,8 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 		PartialBootstrapStrategyQuery:  config.PartialSyncExperimental.BootstrapStrategyQuery,
 		PartialBootstrapSegmentSize:    config.PartialSyncExperimental.SegmentSize,
 		PartialBootstrapPrefetch:       config.PartialSyncExperimental.Prefetch,
+		PushOperationsThreshold:        config.PushOperationsThreshold,
+		PullBytesThreshold:             config.PullBytesThreshold,
 	}
 	sdb, err := turso_sync_database_new(dbCfg, syncCfg)
 	if err != nil {

@@ -420,6 +420,8 @@ def connect_sync(
     isolation_level: Optional[str] = "DEFERRED",
     remote_encryption_key: Optional[str] = None,
     remote_encryption_cipher: Optional[RemoteEncryptionCipher] = None,
+    push_operations_threshold: Optional[int] = None,
+    pull_bytes_threshold: Optional[int] = None,
 ) -> ConnectionSync:
     """
     Create and open a synchronized database connection.
@@ -434,6 +436,13 @@ def connect_sync(
     - experimental_features, isolation_level: passed to underlying connection
     - remote_encryption_key: base64-encoded encryption key for encrypted Turso Cloud databases
     - remote_encryption_cipher: encryption cipher for the remote database (used to calculate reserved_bytes)
+    - push_operations_threshold: optional cap on the number of CDC operations packed into a single
+      push HTTP batch; push splits on transaction boundaries once the current batch accumulated at
+      least this many operations (a single transaction is never split). None (default) sends the
+      entire change set in one batch
+    - pull_bytes_threshold: optional hint, in bytes, that splits the bootstrap download into multiple
+      pull-updates HTTP requests of >= this many bytes each. None (default) bootstraps in a single
+      round-trip; no-op when partial sync uses the query bootstrap strategy
     """
     # Resolve client name
     cname = client_name or "turso-sync-py"
@@ -476,6 +485,8 @@ def connect_sync(
         else None,
         remote_encryption_key=remote_encryption_key,
         remote_encryption_cipher=remote_encryption_cipher,
+        push_operations_threshold=push_operations_threshold,
+        pull_bytes_threshold=pull_bytes_threshold,
     )
 
     # Create sync database holder
