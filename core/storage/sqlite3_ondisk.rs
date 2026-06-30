@@ -1482,6 +1482,7 @@ impl BuildSharedWal {
             },
             runtime: WalSharedRuntime {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file.clone()),
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
@@ -1869,19 +1870,23 @@ impl StreamingWalReader {
             return;
         }
         let wfs = self.wal_shared.read();
-        {
-            let mut frame_cache = wfs.runtime.frame_cache.lock();
-            for (page, mut frames) in state.pending_frames.drain() {
-                // Only include frames up to last valid commit
-                frames.retain(|&f| f <= state.last_valid_frame);
-                if !frames.is_empty() {
-                    frame_cache.entry(page).or_default().extend(frames);
-                }
+        let mut frame_cache = wfs.runtime.frame_cache.lock();
+        for (page, mut frames) in state.pending_frames.drain() {
+            // Only include frames up to last valid commit
+            frames.retain(|&f| f <= state.last_valid_frame);
+            if !frames.is_empty() {
+                frame_cache.entry(page).or_default().extend(frames);
             }
         }
         wfs.metadata
             .max_frame
             .store(state.last_valid_frame, Ordering::Release);
+        // Recovery populates `frame_cache` directly (not via `cache_frame`), so
+        // seed the high-water with the recovered frames; otherwise the first
+        // post-recovery rewind/slot-reuse could go undetected.
+        wfs.runtime
+            .frame_cache_high_water
+            .fetch_max(state.last_valid_frame, Ordering::AcqRel);
     }
 
     /// Finalizes the loading process
