@@ -594,3 +594,14 @@ test select-param-zero-invalid {
 expect error {
     .*variable number must be between.*
 }
+
+# Regression: `main.sqlite_temp_schema` must not silently alias to
+# `main.sqlite_schema` via name normalization. The qualified-name resolver
+# is shared by the SELECT planner, so a SELECT here locks down the same
+# path that protects DELETE/UPDATE/INSERT.
+test select-main-sqlite-temp-schema-alias-is-missing {
+    SELECT * FROM main.sqlite_temp_schema;
+}
+expect error {
+    no such table: main\.sqlite_temp_schema
+}

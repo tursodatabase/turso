@@ -2221,3 +2221,44 @@ test insert-two-partial-unique-indexes-expr-key-no-hang {
 expect {
     1|B|
 }
+
+# Regression: sqlite_temp_* aliases must not bypass sqlite_schema DML protection.
+@cross-check-integrity
+test insert-main-sqlite-temp-schema-alias-is-missing {
+    CREATE TABLE t1(x INTEGER);
+    INSERT INTO main.sqlite_temp_schema(type,name,tbl_name,rootpage,sql)
+    VALUES('table','x','x',1,'CREATE TABLE x(y)');
+}
+expect error {
+    no such table: main\.sqlite_temp_schema
+}
+
+@cross-check-integrity
+test insert-main-sqlite-temp-master-alias-is-missing {
+    CREATE TABLE t1(x INTEGER);
+    INSERT INTO main.sqlite_temp_master(type,name,tbl_name,rootpage,sql)
+    VALUES('table','x','x',1,'CREATE TABLE x(y)');
+}
+expect error {
+    no such table: main\.sqlite_temp_master
+}
+
+@cross-check-integrity
+test insert-unqualified-sqlite-temp-schema-alias-is-protected {
+    CREATE TABLE t1(x INTEGER);
+    INSERT INTO sqlite_temp_schema(type,name,tbl_name,rootpage,sql)
+    VALUES('table','x','x',1,'CREATE TABLE x(y)');
+}
+expect error {
+    table .* may not be modified
+}
+
+@cross-check-integrity
+test insert-temp-qualified-sqlite-temp-schema-alias-is-protected {
+    CREATE TABLE t1(x INTEGER);
+    INSERT INTO temp.sqlite_temp_schema(type,name,tbl_name,rootpage,sql)
+    VALUES('table','x','x',1,'CREATE TABLE x(y)');
+}
+expect error {
+    table .* may not be modified
+}

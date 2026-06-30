@@ -101,11 +101,11 @@ pub fn translate_create_trigger(
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
     let database_id =
         resolve_create_trigger_database_id(resolver, &trigger_name, &tbl_name, temporary)?;
-    let target_table_database_id = if temporary {
-        // A temp trigger's target table can be in any schema.
+    let target_table_database_id = if temporary || tbl_name.db_name.is_some() {
+        // Temp triggers can target any schema; explicitly qualified target
+        // names need the qualified resolver so e.g. `main.sqlite_temp_schema`
+        // is rejected with "no such table" before any later checks see it.
         resolver.resolve_existing_table_database_id_qualified(&tbl_name)?
-    } else if tbl_name.db_name.is_some() {
-        resolver.resolve_database_id(&tbl_name)?
     } else {
         database_id
     };
