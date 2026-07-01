@@ -186,7 +186,7 @@ fn generate_random_table(rng: &mut ThreadRng) -> Table {
     }
 
     // Then, randomly select one column to be the primary key
-    let pk_index = (rng.get_random() % column_count as u64) as usize;
+    let pk_index = *rng.choose(&(0..column_count).collect::<Vec<_>>());
     columns[pk_index].constraints.push(Constraint::PrimaryKey);
     Table {
         name,
@@ -711,10 +711,11 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     }
 
                     let tx = match opts.tx_mode {
-                        TxMode::SQLite => gen_bool(&mut rng, 0.5).then_some("BEGIN;"),
-                        TxMode::Concurrent => {
-                            gen_bool(&mut rng, 0.9).then_some("BEGIN CONCURRENT;")
-                        }
+                        TxMode::SQLite => (*rng.choose(&[true, false])).then_some("BEGIN;"),
+                        TxMode::Concurrent => (*rng.choose(&[
+                            true, true, true, true, true, true, true, true, true, false,
+                        ]))
+                        .then_some("BEGIN CONCURRENT;"),
                     };
 
                     if let Some(tx_stmt) = tx {
