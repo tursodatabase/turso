@@ -62,11 +62,6 @@ jobs:
         python3 scripts/antithesis/diff_to_targeted_coverage.py \
           testing/stress/git.diff -o testing/stress/targeted_coverage.json
 
-    - name: Ensure targeted-coverage placeholder
-      run: |
-        [ -f testing/stress/targeted_coverage.json ] \
-          || : > testing/stress/targeted_coverage.json
-
     - name: Publish workload
       run: bash ./scripts/antithesis/publish-workload.sh
 
