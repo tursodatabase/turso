@@ -8,7 +8,6 @@ mod sql_logging;
 
 use clap::Parser;
 use opts::{Opts, TxMode};
-use rand::distr::uniform::{SampleRange, SampleUniform};
 #[cfg(not(antithesis))]
 use rand::rngs::StdRng;
 #[cfg(not(antithesis))]
@@ -16,6 +15,7 @@ use rand::SeedableRng;
 #[cfg(shuttle)]
 use shuttle::scheduler::Scheduler;
 use std::collections::HashSet;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use turso_stress::sync::atomic::{AtomicBool, Ordering};
 use turso_stress::sync::Arc;
@@ -84,30 +84,30 @@ const NOUNS: &[&str] = &[
     "leaf", "root", "seed", "fruit", "flower", "grass", "stone", "sand", "wave", "wind", "rain",
 ];
 
+#[cfg(not(antithesis))]
+type StressRng = StdRng;
+#[cfg(antithesis)]
+type StressRng = antithesis_sdk::random::AntithesisRng;
+
 struct ThreadRng {
-    #[cfg(not(antithesis))]
-    rng: StdRng,
-    #[cfg(antithesis)]
-    rng: antithesis_sdk::random::AntithesisRng,
+    rng: StressRng,
+}
+
+impl Deref for ThreadRng {
+    type Target = StressRng;
+
+    fn deref(&self) -> &Self::Target {
+        &self.rng
+    }
+}
+
+impl DerefMut for ThreadRng {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.rng
+    }
 }
 
 impl ThreadRng {
-    fn get_random(&mut self) -> u64 {
-        self.rng.random()
-    }
-
-    fn random_range<T, R>(&mut self, range: R) -> T
-    where
-        T: SampleUniform,
-        R: SampleRange<T>,
-    {
-        self.rng.random_range::<T, R>(range)
-    }
-
-    fn true_with_probability(&mut self, numerator: u32, denominator: u32) -> bool {
-        self.rng.random_ratio(numerator, denominator)
-    }
-
     fn choose<'a, T>(&mut self, ts: &'a [T]) -> &'a T {
         #[cfg(not(antithesis))]
         return &ts[self.rng.random_range(0..ts.len())];
@@ -205,10 +205,6 @@ fn generate_random_table(rng: &mut ThreadRng) -> Table {
     }
 }
 
-fn gen_bool(rng: &mut ThreadRng, probability_true: f64) -> bool {
-    (rng.get_random() as f64 / u64::MAX as f64) < probability_true
-}
-
 fn gen_schema(rng: &mut ThreadRng, table_count: Option<usize>) -> ArbitrarySchema {
     let table_count = table_count.unwrap_or_else(|| rng.random_range(1..11) as usize);
     let mut tables = Vec::with_capacity(table_count);
@@ -284,7 +280,7 @@ fn generate_random_value(rng: &mut ThreadRng, data_type: &DataType) -> String {
             // 20% chance of generating a large blob via zeroblob() to trigger
             // page allocation (the pattern that exposed the savepoint rollback
             // bug in tursodatabase/turso#6176).
-            if rng.true_with_probability(1, 5) {
+            if rng.random_ratio(1, 5) {
                 let size = rng.random_range(1000..9000);
                 format!("zeroblob({size})")
             } else {
@@ -310,7 +306,7 @@ fn generate_insert(rng: &mut ThreadRng, table: &Table) -> String {
         .map(|col| {
             if !table.pk_values.is_empty()
                 && col.constraints.contains(&Constraint::PrimaryKey)
-                && rng.true_with_probability(1, 2)
+                && rng.random_ratio(1, 2)
             {
                 rng.choose(&table.pk_values).clone()
             } else {
@@ -363,7 +359,7 @@ fn generate_update(rng: &mut ThreadRng, table: &Table) -> String {
             .join(", ")
     };
 
-    let where_clause = if !table.pk_values.is_empty() && rng.true_with_probability(1, 2) {
+    let where_clause = if !table.pk_values.is_empty() && rng.random_ratio(1, 2) {
         format!("{} = {}", pk_column.name, rng.choose(&table.pk_values))
     } else {
         format!(
@@ -388,7 +384,7 @@ fn generate_delete(rng: &mut ThreadRng, table: &Table) -> String {
         .find(|col| col.constraints.contains(&Constraint::PrimaryKey))
         .expect("Table should have a primary key");
 
-    let where_clause = if !table.pk_values.is_empty() && rng.true_with_probability(1, 2) {
+    let where_clause = if !table.pk_values.is_empty() && rng.random_ratio(1, 2) {
         format!("{} = {}", pk_column.name, rng.choose(&table.pk_values))
     } else {
         format!(
@@ -715,16 +711,16 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                 all_threads_ready.wait().await;
                 for interaction_idx in stress_counter.iteration_idx(thread_idx)..opts.nr_iterations
                 {
-                    if gen_bool(&mut rng, 0.02) {
+                    if rng.random_ratio(1, 50) {
                         // Reconnect to the database
                         conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
                     }
 
                     let tx = match opts.tx_mode {
-                        TxMode::SQLite => (rng.true_with_probability(1, 2)).then_some("BEGIN;"),
-                        TxMode::Concurrent => rng
-                            .true_with_probability(9, 10)
-                            .then_some("BEGIN CONCURRENT;"),
+                        TxMode::SQLite => (rng.random_ratio(1, 2)).then_some("BEGIN;"),
+                        TxMode::Concurrent => {
+                            rng.random_ratio(9, 10).then_some("BEGIN CONCURRENT;")
+                        }
                     };
 
                     if let Some(tx_stmt) = tx {
@@ -741,7 +737,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     // This generates the pattern that exposed the pager rollback bug
                     // in tursodatabase/turso#6176: SAVEPOINT → DML (possibly with
                     // large blobs that allocate new pages) → ROLLBACK TO / RELEASE.
-                    if tx.is_some() && rng.true_with_probability(3, 10) {
+                    if tx.is_some() && rng.random_ratio(3, 10) {
                         let sp_name = format!("sp_{}", rng.random_range(0..100));
                         let savepoint_sql = format!("SAVEPOINT {sp_name};");
                         let _ = conn.execute(&savepoint_sql, ()).await;
@@ -756,7 +752,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         }
 
                         // 50% ROLLBACK TO (partial undo), 50% RELEASE (keep changes).
-                        if rng.true_with_probability(1, 2) {
+                        if rng.random_ratio(1, 2) {
                             let rollback_sql = format!("ROLLBACK TO {sp_name};");
                             let _ = conn.execute(&rollback_sql, ()).await;
                         }
@@ -809,7 +805,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         }
                     }
 
-                    if gen_bool(&mut rng, 0.01 / stress_counter.incomplete_threads() as f64) {
+                    if rng.random_ratio(1, 100 * stress_counter.incomplete_threads() as u32) {
                         reopen_requested.store(true, Ordering::Release);
                     }
                     if reopen_requested.load(Ordering::Acquire) {
