@@ -224,7 +224,45 @@ The CI checks for formatting, Clippy warnings, and test failures so remember to 
 * **Keep commits as small as possible**. The smaller the commit, the easier it is to review, but also easier `git revert` when things go bad.
 * **Don't mix logic and cleanups in same commit**. If you need to refactor the code, do it in a commit of its own. Mixing refactoring with logic changes makes it very hard to review a commit.
 * **Don't mix logic and formatting changes in same commit**. Resist the urge to fix random formatting issues in the same commit as your logic changes, because it only makes it harder to review the commit.
-* **Write a good commit message**. You know your commit is atomic when it's easy to write a short commit message that describes the intent of the change.
+* **Write a good commit message**. You know your commit is atomic when it's easy to write a short commit message that describes the intent of the change. Follow the commit message style below.
+
+### Commit message style
+
+Use an optional component scope followed by a lowercase imperative summary.
+Do not add a trailing period. Conventional Commit prefixes such as
+`feat(scope):` are not required.
+
+```text
+[scope: ]<imperative summary>
+
+<why the change is needed and what invariant or bug it addresses>
+
+<non-obvious implementation details or tradeoffs, if needed>
+
+Tests: <relevant validation, if useful>
+
+Fixes #1234
+```
+
+For example:
+
+```text
+core/mvcc: preserve B-tree cleanup markers in commit logs
+
+Commit-log canonicalization could collapse a cleanup marker into the
+replacement row, leaving stale physical B-tree state after checkpoint.
+
+Keep B-tree-resident delete markers when collapsing adjacent versions.
+
+Tests: added an update/reopen/delete/checkpoint regression test
+
+Fixes #1234
+```
+
+The body should explain the intent and why the change is needed, rather than
+narrating the diff. Include non-obvious implementation details and tradeoffs
+that will matter to reviewers or future maintainers. The body, test summary,
+and issue reference are optional when they do not add useful information.
 
 To produce pull requests like this, you should learn how to use Git's interactive rebase (`git rebase -i`).
 
