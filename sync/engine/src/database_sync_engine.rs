@@ -259,31 +259,43 @@ mod tests {
             DatabaseSyncEngineProtocolVersion::Legacy,
             false,
             DbChangesStreamKind::LegacyPages,
+            true,
         ));
         assert!(!should_replay_raw_pages_on_sql_conn(
             DatabaseSyncEngineProtocolVersion::Legacy,
             false,
             DbChangesStreamKind::ReplaceBasePages,
+            true,
+        ));
+        assert!(!should_replay_raw_pages_on_sql_conn(
+            DatabaseSyncEngineProtocolVersion::V1,
+            false,
+            DbChangesStreamKind::Pages,
+            false,
         ));
         assert!(should_replay_raw_pages_on_sql_conn(
             DatabaseSyncEngineProtocolVersion::V1,
             false,
             DbChangesStreamKind::Pages,
+            true,
         ));
         assert!(should_replay_raw_pages_on_sql_conn(
             DatabaseSyncEngineProtocolVersion::V1,
             false,
             DbChangesStreamKind::ReplaceBasePages,
+            true,
         ));
         assert!(!should_replay_raw_pages_on_sql_conn(
             DatabaseSyncEngineProtocolVersion::V1,
             true,
             DbChangesStreamKind::ReplaceBasePages,
+            true,
         ));
         assert!(!should_replay_raw_pages_on_sql_conn(
             DatabaseSyncEngineProtocolVersion::V1,
             false,
             DbChangesStreamKind::Logical,
+            true,
         ));
     }
 
@@ -2117,8 +2129,10 @@ fn should_replay_raw_pages_on_sql_conn(
     protocol_version_hint: DatabaseSyncEngineProtocolVersion,
     logical_replay_conn_active: bool,
     stream_kind: DbChangesStreamKind,
+    mvcc_active: bool,
 ) -> bool {
     protocol_version_hint != DatabaseSyncEngineProtocolVersion::Legacy
+        && mvcc_active
         && !logical_replay_conn_active
         && matches!(
             stream_kind,
@@ -3361,6 +3375,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 self.opts.protocol_version_hint,
                 false,
                 stream_kind,
+                main_conn.mv_store().as_ref().is_some(),
             );
         let replace_base_precollection_floor = if replace_base_pages {
             if no_checkpoint_replace_base {
@@ -3478,6 +3493,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             let mut logical_replay_conn = None;
             let mut remote_logical_touched_rows = BTreeSet::new();
             let applied_raw_db_size: u32;
+            let mut revert_since_wal_watermark = None;
             let mut followup_revision = None;
             match stream_kind {
                 stream_kind if stream_kind_applies_remote_pages(stream_kind) => {
@@ -3696,6 +3712,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 self.opts.protocol_version_hint,
                 logical_replay_conn.is_some(),
                 stream_kind,
+                main_conn.mv_store().as_ref().is_some(),
             );
             if raw_page_replay_on_sql_conn {
                 let mut finished_main_session = main_session
@@ -3728,11 +3745,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 main_session
                     .as_mut()
                     .expect("main WAL session must be active")
-                    .commit(applied_raw_db_size)?;
-                if stream_kind_applies_remote_pages(stream_kind)
-                    && !replace_base_pages
-                    && raw_page_replay_on_sql_conn
-                {
+                    .commit(0)?;
+                revert_since_wal_watermark = Some(
+                    main_session
+                        .as_ref()
+                        .expect("main WAL session must be active")
+                        .frames_count()?,
+                );
+                if stream_kind_applies_remote_pages(stream_kind) && !replace_base_pages {
                     let current_schema_version = main_conn.read_schema_version()?;
                     let final_schema_version =
                         current_schema_version.max(main_conn_schema_version) + 1;
@@ -4178,8 +4198,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
             let logical_table_names_by_stable_id =
                 read_logical_replay_table_map(coro, &main_conn).await?;
+            let revert_since_wal_watermark =
+                revert_since_wal_watermark.unwrap_or(main_conn.wal_state()?.max_frame);
             Ok((
-                main_conn.wal_state()?.max_frame,
+                revert_since_wal_watermark,
                 logical_table_names_by_stable_id,
                 followup_revision,
             ))
