@@ -26,7 +26,7 @@ use crate::logging::Tracer;
 use crate::progress::ProgressBars;
 use crate::sql_logging::SqlLogger;
 use turso::core::clear_database_registry;
-use turso::Builder;
+use turso::{Builder, Value};
 use turso_stress::ThreadId;
 
 /// Represents a column in a SQLite table
@@ -768,17 +768,22 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     if interaction_idx % INTEGRITY_CHECK_INTERVAL == 0 {
                         let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
                         match res.next().await {
-                            Ok(Some(row)) => {
-                                let value = row.get_value(0).unwrap();
-                                if value != "ok".into() {
-                                    sql_logger.log(
-                                        &thread,
-                                        "PRAGMA integrity_check",
-                                        &format!("ERROR: {value:?}"),
-                                    );
-                                    turso_macros::turso_assert_unreachable!("integrity check failed", { "thread": thread, "value": value });
-                                }
+                            Ok(Some(row))
+                                if Value::Text("ok".into()) == row.get_value(0).unwrap() =>
+                            {
                                 sql_logger.log(&thread, "PRAGMA integrity_check", "OK");
+                            }
+                            Ok(Some(row)) => {
+                                let mut rows = vec![row.get_value(0).unwrap()];
+                                while let Some(r) = res.next().await? {
+                                    rows.push(r.get_value(0).unwrap());
+                                }
+                                sql_logger.log(
+                                    &thread,
+                                    "PRAGMA integrity_check",
+                                    &format!("ERROR: {rows:?}"),
+                                );
+                                turso_macros::turso_assert_unreachable!("integrity check failed", { "thread": thread, "rows": rows });
                             }
                             Ok(None) => {
                                 sql_logger.log(&thread, "PRAGMA integrity_check", "ERROR: no rows");
@@ -790,17 +795,8 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                                     "PRAGMA integrity_check",
                                     &format!("ERROR: {e}"),
                                 );
-                                println!("thread#{thread} Error performing integrity check: {e}");
+                                turso_macros::turso_assert_unreachable!("Error performing integrity check", { "thread": thread, "error": e });
                             }
-                        }
-                        match res.next().await {
-                            Ok(Some(_)) => {
-                                turso_macros::turso_assert_unreachable!("integrity check returned more than 1 row", { "thread": thread });
-                            }
-                            Err(e) => {
-                                println!("thread#{thread} Error performing integrity check: {e}")
-                            }
-                            _ => {}
                         }
                     }
 
