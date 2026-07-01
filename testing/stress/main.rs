@@ -1,3 +1,4 @@
+use rand::Rng;
 mod conn;
 mod counter;
 mod logging;
@@ -7,10 +8,11 @@ mod sql_logging;
 
 use clap::Parser;
 use opts::{Opts, TxMode};
+use rand::distr::uniform::{SampleRange, SampleUniform};
 #[cfg(not(antithesis))]
 use rand::rngs::StdRng;
 #[cfg(not(antithesis))]
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 #[cfg(shuttle)]
 use shuttle::scheduler::Scheduler;
 use std::collections::HashSet;
@@ -100,8 +102,16 @@ impl ThreadRng {
         self.rng.random()
     }
 
-    fn random_range(&mut self, range: std::ops::Range<u64>) -> u64 {
+    fn random_range<T, R>(&mut self, range: R) -> T
+    where
+        T: SampleUniform,
+        R: SampleRange<T>,
+    {
         self.rng.random_range(range)
+    }
+
+    fn true_with_probability(&mut self, numerator: u32, denominator: u32) -> bool {
+        self.rng.random_ratio(numerator, denominator)
     }
 
     fn choose<'a, T>(&mut self, ts: &'a [T]) -> &'a T {
@@ -123,9 +133,16 @@ impl ThreadRng {
         antithesis_sdk::random::get_random()
     }
 
-    fn random_range(&mut self, range: std::ops::Range<u64>) -> u64 {
-        use rand::Rng;
-        antithesis_sdk::random::AntithesisRng.random_range(range)
+    fn random_range<T, R>(&mut self, range: R) -> T
+    where
+        T: SampleUniform,
+        R: SampleRange<T>,
+    {
+        antithesis_sdk::random::AntithesisRng.random_range::<T, R>(range)
+    }
+
+    fn true_with_probability(&mut self, numerator: u32, denominator: u32) -> bool {
+        antithesis_sdk::random::AntithesisRng.random_ratio(numerator, denominator)
     }
 
     fn choose<'a, T>(&mut self, ts: &'a [T]) -> &'a T {
@@ -195,7 +212,7 @@ fn generate_random_table(rng: &mut ThreadRng) -> Table {
     }
 
     // Then, randomly select one column to be the primary key
-    let pk_index = *rng.choose(&(0..column_count).collect::<Vec<_>>());
+    let pk_index = rng.random_range(0..column_count);
     columns[pk_index].constraints.push(Constraint::PrimaryKey);
     Table {
         name,
@@ -277,13 +294,13 @@ fn constraint_to_sql(constraint: &Constraint) -> String {
 fn generate_random_value(rng: &mut ThreadRng, data_type: &DataType) -> String {
     match data_type {
         DataType::Integer => rng.random_range(0..1000).to_string(),
-        DataType::Real => format!("{:.2}", rng.random_range(0..1000) as f64 / 100.0),
+        DataType::Real => format!("{:.2}", rng.random_range(0f32..100f32)),
         DataType::Text => format!("'{}'", generate_random_identifier(rng)),
         DataType::Blob => {
             // 20% chance of generating a large blob via zeroblob() to trigger
             // page allocation (the pattern that exposed the savepoint rollback
             // bug in tursodatabase/turso#6176).
-            if *rng.choose(&[true, false, false, false, false]) {
+            if rng.true_with_probability(1, 5) {
                 let size = rng.random_range(1000..9000);
                 format!("zeroblob({size})")
             } else {
@@ -309,7 +326,7 @@ fn generate_insert(rng: &mut ThreadRng, table: &Table) -> String {
         .map(|col| {
             if !table.pk_values.is_empty()
                 && col.constraints.contains(&Constraint::PrimaryKey)
-                && *rng.choose(&[true, false])
+                && rng.true_with_probability(1, 2)
             {
                 rng.choose(&table.pk_values).clone()
             } else {
@@ -362,7 +379,7 @@ fn generate_update(rng: &mut ThreadRng, table: &Table) -> String {
             .join(", ")
     };
 
-    let where_clause = if !table.pk_values.is_empty() && *rng.choose(&[true, false]) {
+    let where_clause = if !table.pk_values.is_empty() && rng.true_with_probability(1, 2) {
         format!("{} = {}", pk_column.name, rng.choose(&table.pk_values))
     } else {
         format!(
@@ -387,7 +404,7 @@ fn generate_delete(rng: &mut ThreadRng, table: &Table) -> String {
         .find(|col| col.constraints.contains(&Constraint::PrimaryKey))
         .expect("Table should have a primary key");
 
-    let where_clause = if !table.pk_values.is_empty() && *rng.choose(&[true, false]) {
+    let where_clause = if !table.pk_values.is_empty() && rng.true_with_probability(1, 2) {
         format!("{} = {}", pk_column.name, rng.choose(&table.pk_values))
     } else {
         format!(
@@ -403,7 +420,7 @@ fn generate_delete(rng: &mut ThreadRng, table: &Table) -> String {
 /// Generate a random SQL statement for a schema
 fn generate_random_statement(rng: &mut ThreadRng, schema: &ArbitrarySchema) -> String {
     let table = rng.choose(&schema.tables);
-    match *rng.choose(&[0, 1, 2]) {
+    match rng.random_range(0..=2) {
         0 => generate_insert(rng, table),
         1 => generate_update(rng, table),
         _ => generate_delete(rng, table),
@@ -720,11 +737,10 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     }
 
                     let tx = match opts.tx_mode {
-                        TxMode::SQLite => (*rng.choose(&[true, false])).then_some("BEGIN;"),
-                        TxMode::Concurrent => (*rng.choose(&[
-                            true, true, true, true, true, true, true, true, true, false,
-                        ]))
-                        .then_some("BEGIN CONCURRENT;"),
+                        TxMode::SQLite => (rng.true_with_probability(1, 2)).then_some("BEGIN;"),
+                        TxMode::Concurrent => rng
+                            .true_with_probability(9, 10)
+                            .then_some("BEGIN CONCURRENT;"),
                     };
 
                     if let Some(tx_stmt) = tx {
@@ -741,11 +757,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     // This generates the pattern that exposed the pager rollback bug
                     // in tursodatabase/turso#6176: SAVEPOINT → DML (possibly with
                     // large blobs that allocate new pages) → ROLLBACK TO / RELEASE.
-                    if tx.is_some()
-                        && *rng.choose(&[
-                            true, true, true, false, false, false, false, false, false, false,
-                        ])
-                    {
+                    if tx.is_some() && rng.true_with_probability(3, 10) {
                         let sp_name = format!("sp_{}", rng.random_range(0..100));
                         let savepoint_sql = format!("SAVEPOINT {sp_name};");
                         let _ = conn.execute(&savepoint_sql, ()).await;
@@ -760,7 +772,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         }
 
                         // 50% ROLLBACK TO (partial undo), 50% RELEASE (keep changes).
-                        if *rng.choose(&[true, false]) {
+                        if rng.true_with_probability(1, 2) {
                             let rollback_sql = format!("ROLLBACK TO {sp_name};");
                             let _ = conn.execute(&rollback_sql, ()).await;
                         }
