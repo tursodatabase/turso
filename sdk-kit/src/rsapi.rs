@@ -849,6 +849,22 @@ impl TursoConnection {
     pub fn set_busy_timeout(&self, duration: Duration) {
         self.connection.set_busy_timeout(duration);
     }
+    /// Request interruption of the statement currently running on this connection.
+    /// Mirrors `sqlite3_interrupt`: the in-flight `step`/`execute` aborts with an
+    /// `Interrupt` error. Safe to call from another thread. If no statement is
+    /// active the request is ignored.
+    pub fn interrupt(&self) {
+        self.connection.interrupt();
+    }
+    /// Set the maximum wall-clock duration a single statement is allowed to run
+    /// before it is interrupted. `Duration::ZERO` disables the timeout.
+    pub fn set_query_timeout(&self, duration: Duration) {
+        self.connection.set_query_timeout(duration);
+    }
+    /// Get the current per-statement query timeout (`Duration::ZERO` when disabled).
+    pub fn get_query_timeout(&self) -> Duration {
+        self.connection.get_query_timeout()
+    }
     pub fn get_auto_commit(&self) -> bool {
         self.connection.get_auto_commit()
     }
