@@ -797,11 +797,7 @@ impl Value {
             return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
-        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
-            .expect("formatted float should always parse successfully")
-            .into();
-
-        Value::from_f64(f)
+        Value::from_f64(round_half_away_from_zero(f, precision))
     }
 
     fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value {
@@ -1617,6 +1613,37 @@ fn compare_chars(p: char, t: char, no_case: bool) -> bool {
         p.eq_ignore_ascii_case(&t)
     } else {
         p == t
+    }
+}
+
+/// Rounds `f` to `precision` fractional digits, rounding halves away from zero
+/// to match SQLite's `ROUND()`. Uses `mul_add` to recover the error of the scaling multiply.
+///
+/// Values past ~15 significant digits may still differ from SQLite, but those are beyond f64's
+/// reliable precision regardless.
+fn round_half_away_from_zero(f: f64, precision: usize) -> f64 {
+    debug_assert!((1..=30).contains(&precision));
+
+    let sign_negative = f.is_sign_negative();
+    let abs_f = f.abs();
+    let scale = 10f64.powi(precision as i32);
+
+    // True product is `scaled + err`; `err` is the bits the multiply dropped.
+    let scaled = abs_f * scale;
+    let err = abs_f.mul_add(scale, -scaled);
+
+    let floor = scaled.floor();
+    let decision = (scaled - floor - 0.5) + err;
+
+    // `>= 0.0` rounds up both above the halfway point and at an exact tie,
+    // which goes away from zero (up, since `abs_f` is non-negative).
+    let rounded_scaled = if decision >= 0.0 { floor + 1.0 } else { floor };
+
+    let abs_result = rounded_scaled / scale;
+    if sign_negative {
+        -abs_result
+    } else {
+        abs_result
     }
 }
 
@@ -2734,6 +2761,91 @@ mod tests {
         let input_val = Value::from_f64(100.123);
         let expected_val = Value::Null;
         assert_eq!(input_val.exec_round(Some(&Value::Null)), expected_val);
+
+        let input_val = Value::from_f64(2.25);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(2.3);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(2.225);
+        let precision_val = Value::from_i64(2);
+        let expected_val = Value::from_f64(2.23);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(2.675);
+        let precision_val = Value::from_i64(2);
+        let expected_val = Value::from_f64(2.67);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(1.15);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(1.1);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(-2.675);
+        let precision_val = Value::from_i64(2);
+        let expected_val = Value::from_f64(-2.67);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(0.5);
+        let precision_val = Value::from_i64(0);
+        let expected_val = Value::from_f64(1.0);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(2.5);
+        let precision_val = Value::from_i64(0);
+        let expected_val = Value::from_f64(3.0);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(-2.5);
+        let precision_val = Value::from_i64(0);
+        let expected_val = Value::from_f64(-3.0);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(1.25);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(1.3);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(-2.25);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(-2.3);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(0.999);
+        let precision_val = Value::from_i64(2);
+        let expected_val = Value::from_f64(1.0);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(9.99);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(10.0);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(0.125);
+        let precision_val = Value::from_i64(2);
+        let expected_val = Value::from_f64(0.13);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(1.005);
+        let precision_val = Value::from_i64(2);
+        let expected_val = Value::from_f64(1.0);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(-0.5);
+        let precision_val = Value::from_i64(0);
+        let expected_val = Value::from_f64(-1.0);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(2.675);
+        let precision_val = Value::build_text("2");
+        let expected_val = Value::from_f64(2.67);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(0.5);
+        let precision_val = Value::build_text("0");
+        let expected_val = Value::from_f64(1.0);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
     }
 
     #[test]
