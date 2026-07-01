@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/cli-darwin-arm64",
-  "version": "0.7.0-pre.14",
+  "version": "0.7.0-pre.15",
   "description": "Turso CLI binary for macOS ARM64",
   "os": [
     "darwin"
