@@ -5894,7 +5894,7 @@ fn update_agg_payload(
     maybe_arg2: Option<Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut [Value],
     collation: CollationSeq,
-    comparator: &Option<crate::vdbe::sorter::SortComparator>,
+    comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
 ) -> Result<()> {
     match func {
         AggFunc::Count => {
@@ -6070,13 +6070,14 @@ fn update_agg_payload(
                 return Ok(());
             }
             use std::cmp::Ordering;
+            let comparator = comparator()?;
             // Use custom type comparator if available, otherwise fall back to collation
             let cmp = if let Some(ref cmp_fn) = comparator {
                 let arg_ref = arg.as_ref();
                 let payload_ref = payload[0].as_ref();
                 cmp_fn(&arg_ref, &payload_ref)?
             } else {
-                compare_with_collation(arg, &payload[0], Some(collation), comparator)?
+                compare_with_collation(arg, &payload[0], Some(collation), &comparator)?
             };
             let should_update = match func {
                 AggFunc::Max => cmp == Ordering::Greater,
@@ -6508,10 +6509,8 @@ pub fn op_agg_step(
     }
 
     let current_collation = state.current_collation.unwrap_or(CollationSeq::Binary);
-    // The comparator is only consumed by Min/Max; building it for every aggregate step would
-    // be wasted work, so only construct it for those.
-    let comparator = if matches!(func, AggFunc::Min | AggFunc::Max) {
-        match comparator.as_ref() {
+    let comparator_factory = move || -> Result<Option<crate::vdbe::sorter::SortComparator>> {
+        Ok(match comparator.as_ref() {
             Some(comparator) => Some(make_sort_comparator(comparator)?),
             None if current_collation.is_custom() => Some(
                 program
@@ -6519,9 +6518,7 @@ pub fn op_agg_step(
                     .make_collation_comparator(current_collation)?,
             ),
             None => None,
-        }
-    } else {
-        None
+        })
     };
 
     // Step the aggregate
@@ -6671,7 +6668,7 @@ pub fn op_agg_step(
                         maybe_arg2,
                         payload,
                         current_collation,
-                        &comparator,
+                        comparator_factory,
                     )?;
                 }
             }
@@ -17272,7 +17269,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            &None,
+            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5)); // unchanged
@@ -17287,7 +17284,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            &None,
+            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(6));
@@ -17307,7 +17304,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            &None,
+            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10));
@@ -17318,7 +17315,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            &None,
+            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(15));
@@ -17338,7 +17335,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            &None,
+            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10)); // unchanged
@@ -17354,7 +17351,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            &None,
+            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5));
@@ -17366,7 +17363,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            &None,
+            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -17378,7 +17375,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            &None,
+            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -17398,7 +17395,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            &None,
+            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(10.0));
@@ -17410,7 +17407,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            &None,
+            || Ok(None),
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(30.0));
@@ -17462,7 +17459,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            &None,
+            || Ok(None),
         )
         .unwrap();
         update_agg_payload(
@@ -17471,7 +17468,7 @@ mod tests {
             None,
             &mut payload,
             CollationSeq::Binary,
-            &None,
+            || Ok(None),
         )
         .unwrap();
 
