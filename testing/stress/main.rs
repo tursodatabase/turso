@@ -274,7 +274,7 @@ fn generate_random_value(rng: &mut ThreadRng, data_type: &DataType) -> String {
             // 20% chance of generating a large blob via zeroblob() to trigger
             // page allocation (the pattern that exposed the savepoint rollback
             // bug in tursodatabase/turso#6176).
-            if rng.get_random() % 5 == 0 {
+            if *rng.choose(&[true, false, false, false, false]) {
                 let size = 1000 + (rng.get_random() % 8000);
                 format!("zeroblob({size})")
             } else {
@@ -300,7 +300,7 @@ fn generate_insert(rng: &mut ThreadRng, table: &Table) -> String {
         .map(|col| {
             if !table.pk_values.is_empty()
                 && col.constraints.contains(&Constraint::PrimaryKey)
-                && rng.get_random() % 100 < 50
+                && *rng.choose(&[true, false])
             {
                 rng.choose(&table.pk_values).clone()
             } else {
@@ -353,7 +353,7 @@ fn generate_update(rng: &mut ThreadRng, table: &Table) -> String {
             .join(", ")
     };
 
-    let where_clause = if !table.pk_values.is_empty() && rng.get_random() % 100 < 50 {
+    let where_clause = if !table.pk_values.is_empty() && *rng.choose(&[true, false]) {
         format!("{} = {}", pk_column.name, rng.choose(&table.pk_values))
     } else {
         format!(
@@ -378,7 +378,7 @@ fn generate_delete(rng: &mut ThreadRng, table: &Table) -> String {
         .find(|col| col.constraints.contains(&Constraint::PrimaryKey))
         .expect("Table should have a primary key");
 
-    let where_clause = if !table.pk_values.is_empty() && rng.get_random() % 100 < 50 {
+    let where_clause = if !table.pk_values.is_empty() && *rng.choose(&[true, false]) {
         format!("{} = {}", pk_column.name, rng.choose(&table.pk_values))
     } else {
         format!(
@@ -731,7 +731,11 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     // This generates the pattern that exposed the pager rollback bug
                     // in tursodatabase/turso#6176: SAVEPOINT → DML (possibly with
                     // large blobs that allocate new pages) → ROLLBACK TO / RELEASE.
-                    if tx.is_some() && rng.get_random() % 100 < 30 {
+                    if tx.is_some()
+                        && *rng.choose(&[
+                            true, true, true, false, false, false, false, false, false, false,
+                        ])
+                    {
                         let sp_name = format!("sp_{}", rng.get_random() % 100);
                         let savepoint_sql = format!("SAVEPOINT {sp_name};");
                         let _ = conn.execute(&savepoint_sql, ()).await;
