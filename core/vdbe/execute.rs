@@ -10230,6 +10230,20 @@ pub fn op_idx_delete(
         return Ok(InsnFunctionStepResult::Step);
     }
 
+    // Detect whether another write statement is suspended mid-execution on this
+    // same connection (turso allows a statement to yield on IO while the caller
+    // steps a different statement). Such an overlapping writer can transiently
+    // leave the index and table row out of sync — e.g. an UPDATE that has already
+    // deleted a row's old index entry but not yet rewritten the row will make a
+    // reentrant DELETE read the still-present old row and then fail to find the
+    // now-missing index entry. That is expected partial state from the concurrent
+    // statement, not on-disk corruption, so it must not raise SQLITE_CORRUPT here.
+    // A standalone DELETE/UPDATE still surfaces a genuinely missing entry as an
+    // error. See issue #7694.
+    let self_active_write = if state.is_active_write { 1 } else { 0 };
+    let overlapping_write_in_flight =
+        program.connection.n_active_writes.load(Ordering::SeqCst) - self_active_write > 0;
+
     loop {
         #[cfg(debug_assertions)]
         tracing::debug!(
@@ -10263,7 +10277,10 @@ pub fn op_idx_delete(
                 if !found {
                     // If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry is found
                     // Also, do not raise this (self-correcting and non-critical) error if in writable_schema mode.
-                    if *raise_error_if_no_matching_entry {
+                    // A concurrent, mid-execution writer on the same connection can legitimately
+                    // account for the missing entry (see #7694), so only treat it as corruption
+                    // when this statement is the sole write in flight.
+                    if *raise_error_if_no_matching_entry && !overlapping_write_in_flight {
                         let reg_values = (*start_reg..*start_reg + *num_regs)
                             .map(|i| &state.registers[i])
                             .collect::<Vec<_>>();
@@ -10284,13 +10301,21 @@ pub fn op_idx_delete(
                     return_if_io!(cursor.rowid())
                 };
 
-                if rowid.is_none() && *raise_error_if_no_matching_entry {
-                    let reg_values = (*start_reg..*start_reg + *num_regs)
-                        .map(|i| &state.registers[i])
-                        .collect::<Vec<_>>();
-                    return Err(LimboError::Corrupt(format!(
-                        "IdxDelete: no matching index entry found for key while verifying: {reg_values:?}"
-                    )));
+                if rowid.is_none() {
+                    // As above, tolerate a missing entry when another write statement on this
+                    // connection is suspended mid-execution (#7694); otherwise it is corruption.
+                    if *raise_error_if_no_matching_entry && !overlapping_write_in_flight {
+                        let reg_values = (*start_reg..*start_reg + *num_regs)
+                            .map(|i| &state.registers[i])
+                            .collect::<Vec<_>>();
+                        return Err(LimboError::Corrupt(format!(
+                            "IdxDelete: no matching index entry found for key while verifying: {reg_values:?}"
+                        )));
+                    }
+                    // Cursor is not positioned on a matching entry; skip the delete.
+                    state.pc += 1;
+                    state.active_op_state.clear();
+                    return Ok(InsnFunctionStepResult::Step);
                 }
                 *state.active_op_state.idx_delete() = OpIdxDeleteState::Deleting;
             }

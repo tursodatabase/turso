@@ -7,6 +7,8 @@ mod database;
 mod external_apis;
 mod functions;
 mod fuzz_transaction;
+#[cfg(feature = "io_memory_yield")]
+mod idxdelete_reentrant_update;
 mod index_method;
 mod integrity_check;
 mod mvcc;
