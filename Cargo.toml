@@ -138,7 +138,7 @@ divan = { package = "codspeed-divan-compat", version = "4.2.1" }
 
 chrono = { version = "0.4.42", default-features = false }
 hex = "0.4"
-antithesis_sdk = { version = "0.2", default-features = false }
+antithesis_sdk = { version = "0.2.9", default-features = false }
 cfg-if = "1.0.0"
 tracing-appender = "0.2.3"
 env_logger = { version = "0.11.6", default-features = false }

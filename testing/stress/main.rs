@@ -100,6 +100,10 @@ impl ThreadRng {
         self.rng.random()
     }
 
+    fn random_range(&mut self, range: std::ops::Range<u64>) -> u64 {
+        self.rng.random_range(range)
+    }
+
     fn choose<'a, T>(&mut self, ts: &'a [T]) -> &'a T {
         &ts[self.rng.random_range(0..ts.len())]
     }
@@ -119,6 +123,13 @@ impl ThreadRng {
         antithesis_sdk::random::get_random()
     }
 
+    fn random_range(&mut self, range: std::ops::Range<u64>) -> u64 {
+        // AntithesisRng draws from Antithesis' RNG; going through random_range
+        // (instead of get_random() % n) gives an unbiased value in the range.
+        use rand::Rng;
+        antithesis_sdk::random::AntithesisRng.random_range(range)
+    }
+
     fn choose<'a, T>(&mut self, ts: &'a [T]) -> &'a T {
         antithesis_sdk::random::random_choice(ts).expect("choose called on empty slice")
     }
@@ -128,7 +139,7 @@ impl ThreadRng {
 fn generate_random_identifier(rng: &mut ThreadRng) -> String {
     let adj = rng.choose(ADJECTIVES);
     let noun = rng.choose(NOUNS);
-    let num = rng.get_random() % 1000;
+    let num = rng.random_range(0..1000);
     format!("{adj}_{noun}_{num}")
 }
 
@@ -152,7 +163,7 @@ fn generate_random_column(rng: &mut ThreadRng) -> Column {
     let name = generate_random_identifier(rng);
     let data_type = generate_random_data_type(rng);
 
-    let constraint_count = (rng.get_random() % 2) as usize;
+    let constraint_count = rng.random_range(0..2) as usize;
     let mut constraints = Vec::with_capacity(constraint_count);
 
     for _ in 0..constraint_count {
@@ -168,7 +179,7 @@ fn generate_random_column(rng: &mut ThreadRng) -> Column {
 
 fn generate_random_table(rng: &mut ThreadRng) -> Table {
     let name = generate_random_identifier(rng);
-    let column_count = (rng.get_random() % 10 + 1) as usize;
+    let column_count = rng.random_range(1..11) as usize;
     let mut columns = Vec::with_capacity(column_count);
     let mut column_names = HashSet::new();
 
@@ -200,7 +211,7 @@ fn gen_bool(rng: &mut ThreadRng, probability_true: f64) -> bool {
 }
 
 fn gen_schema(rng: &mut ThreadRng, table_count: Option<usize>) -> ArbitrarySchema {
-    let table_count = table_count.unwrap_or_else(|| (rng.get_random() % 10 + 1) as usize);
+    let table_count = table_count.unwrap_or_else(|| rng.random_range(1..11) as usize);
     let mut tables = Vec::with_capacity(table_count);
     let mut table_names = HashSet::new();
 
@@ -267,21 +278,21 @@ fn constraint_to_sql(constraint: &Constraint) -> String {
 /// Generate a random value for a given data type
 fn generate_random_value(rng: &mut ThreadRng, data_type: &DataType) -> String {
     match data_type {
-        DataType::Integer => (rng.get_random() % 1000).to_string(),
-        DataType::Real => format!("{:.2}", (rng.get_random() % 1000) as f64 / 100.0),
+        DataType::Integer => rng.random_range(0..1000).to_string(),
+        DataType::Real => format!("{:.2}", rng.random_range(0..1000) as f64 / 100.0),
         DataType::Text => format!("'{}'", generate_random_identifier(rng)),
         DataType::Blob => {
             // 20% chance of generating a large blob via zeroblob() to trigger
             // page allocation (the pattern that exposed the savepoint rollback
             // bug in tursodatabase/turso#6176).
             if *rng.choose(&[true, false, false, false, false]) {
-                let size = 1000 + (rng.get_random() % 8000);
+                let size = rng.random_range(1000..9000);
                 format!("zeroblob({size})")
             } else {
                 format!("x'{}'", hex::encode(generate_random_identifier(rng)))
             }
         }
-        DataType::Numeric => (rng.get_random() % 1000).to_string(),
+        DataType::Numeric => rng.random_range(0..1000).to_string(),
     }
 }
 
@@ -737,12 +748,12 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                             true, true, true, false, false, false, false, false, false, false,
                         ])
                     {
-                        let sp_name = format!("sp_{}", rng.get_random() % 100);
+                        let sp_name = format!("sp_{}", rng.random_range(0..100));
                         let savepoint_sql = format!("SAVEPOINT {sp_name};");
                         let _ = conn.execute(&savepoint_sql, ()).await;
 
                         // Execute 1-3 DML statements inside the savepoint.
-                        let sp_stmts = 1 + (rng.get_random() % 3) as usize;
+                        let sp_stmts = rng.random_range(1..4) as usize;
                         for _ in 0..sp_stmts {
                             let sp_sql = generate_random_statement(&mut rng, &schema_for_task);
                             if let Err(turso::Error::Corrupt(e)) = conn.execute(&sp_sql, ()).await {
