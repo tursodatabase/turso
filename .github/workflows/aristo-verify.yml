@@ -1,0 +1,33 @@
+# Heavy Aristo canon verification (`aristo verify`).
+#
+# Unlike the cheap stamp/lint checks in aristo.yml (which run on every PR with
+# no token), `verify` validates intent annotations against the canon and needs
+# the ARETTA_TOKEN secret.
+#
+# For now this is a manual-only workflow (workflow_dispatch) so we can opt in to
+# runs while we evaluate cost and signal. Note this means it must be merged to
+# the default branch before it can be triggered. Enable the nightly cron once
+# verify is proven out in CI.
+name: Aristo verify
+
+on:
+  workflow_dispatch:
+  # Nightly run — enable once verify is proven out in CI.
+  # schedule:
+  #   - cron: '0 7 * * *' # nightly at 07:00 UTC
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify intent annotations
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aretta-ai/aristo-action@v1
+        with:
+          checks: verify
+          aretta-token: ${{ secrets.ARETTA_TOKEN }}

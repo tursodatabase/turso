@@ -1,0 +1,34 @@
+# Lints Aristo intent annotations on every PR.
+#
+# Runs the cheap, local annotation checks via the shared aristo-action — no
+# token needed, everything runs on the runner:
+#   - stamp: the index is fresh relative to source (new/changed intents indexed)
+#   - lint:  annotation prose is clean (no placeholders, weasel words, etc.)
+#
+# Heavy canon verification (`aristo verify`) is intentionally not run here; it
+# needs an ARETTA_TOKEN secret and belongs in a separate nightly workflow.
+name: Aristo intents
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint intent annotations
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aretta-ai/aristo-action@v1
+        with:
+          checks: stamp, lint

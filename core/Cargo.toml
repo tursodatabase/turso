@@ -125,6 +125,7 @@ bigdecimal = "0.4"
 num-bigint = "0.4"
 num-traits = "0.2"
 stacker = { version = "0.1", optional = true }
+aristo = "0.2.8"
 
 [target.'cfg(not(any(target_family = "wasm", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
 simsimd = "6.5.3"
