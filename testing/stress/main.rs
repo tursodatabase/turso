@@ -124,8 +124,6 @@ impl ThreadRng {
     }
 
     fn random_range(&mut self, range: std::ops::Range<u64>) -> u64 {
-        // AntithesisRng draws from Antithesis' RNG; going through random_range
-        // (instead of get_random() % n) gives an unbiased value in the range.
         use rand::Rng;
         antithesis_sdk::random::AntithesisRng.random_range(range)
     }

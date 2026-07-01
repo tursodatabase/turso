@@ -38,8 +38,6 @@ turso_macros = { workspace = true }
 rusqlite = { workspace = true }
 
 [target.'cfg(antithesis)'.dependencies]
-# rand_v0_9 enables AntithesisRng's rand 0.9 RngCore impl so we can use
-# random_range() through Antithesis' RNG (matches the workspace rand = 0.9).
 antithesis_sdk = { workspace = true, features = ["full", "rand_v0_9"] }
 serde_json = { workspace = true }
 
