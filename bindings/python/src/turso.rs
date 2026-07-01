@@ -1,3 +1,13 @@
+//! Note to implementers: any non-trivial function that is directly exposed from Python should call
+//! Rust code from inside [Python::detach]. This releases the Global Interpreter Lock (GIL) and lets
+//! other threads make progress while the Rust code is running.
+//!
+//! TODO crossing the FFI boundary back to Python to release the GIL might have a noticeable
+//!  performance impact, especially when called on methods like [PyTursoStatement::run_io] and
+//!  [PyTursoStatement::step], which are meant to be called in a Python loop. We should consider
+//!  providing monolithic helpers like `next_row()` that would run a SM to its next row in
+//!  Rust-land. This pattern of extracting loops to native code is not uncommon in Python libraries
+//!  (e.g. the itertools library), since Python tends to be slow.
 use pyo3::{
     prelude::*,
     types::{PyBytes, PyTuple},
@@ -250,19 +260,11 @@ impl PyTursoConnection {
         Ok(self.connection.get_auto_commit())
     }
     /// Request interruption of the statement currently executing on this connection.
-    ///
-    /// Mirrors `sqlite3_interrupt`/`sqlite3.Connection.interrupt`: a `step`/`execute`
-    /// running on another thread aborts and raises [`Interrupt`]. Because the
-    /// execution methods release the GIL, this can be called from a watchdog thread
-    /// while a query is in flight. If no statement is active the call is a no-op.
     pub fn interrupt(&self) {
         self.connection.interrupt();
     }
     /// Set the maximum time (in milliseconds) a single statement may run before it
     /// is interrupted and raises [`Interrupt`]. A value of `0` disables the timeout.
-    ///
-    /// Unlike a watchdog + [`Self::interrupt`], this needs no extra thread: the
-    /// deadline is enforced inside the engine's step loop.
     pub fn set_query_timeout(&self, milliseconds: u64) {
         self.connection
             .set_query_timeout(std::time::Duration::from_millis(milliseconds));
@@ -393,9 +395,8 @@ impl PyTursoStatement {
     }
     /// Reset the statement by clearing bindings and reclaiming memory of the program from previous run
     /// This will also abort last operation if any was unfinished (but if transaction was opened before this statement - its state will be untouched, reset will only affect operation within current statement)
-    pub fn reset(&mut self) -> PyResult<()> {
-        self.statement.reset().map_err(turso_error_to_py_err)?;
-        Ok(())
+    pub fn reset(&mut self, py: Python) -> PyResult<()> {
+        py.detach(|| self.statement.reset().map_err(turso_error_to_py_err))
     }
 }
 
