@@ -1,5 +1,6 @@
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
+use std::process::Command;
 use std::sync::Arc;
 use turso_core::{Database, DatabaseOpts, IO, OpenFlags, Statement};
 use turso_whopper::{IOFaultConfig, SimulatorIO};
@@ -12,6 +13,56 @@ fn run_to_done(stmt: &mut Statement, io: &SimulatorIO) {
             _ => {}
         }
     }
+}
+
+#[test]
+fn test_mvcc_integrity_check_schema_churn_seed() {
+    let output = Command::new(env!("CARGO_BIN_EXE_turso_whopper"))
+        .env("SEED", "1")
+        .args([
+            "--enable-mvcc",
+            "--max-steps",
+            "100000",
+            "--max-connections",
+            "4",
+            "--allocation-fault-probability",
+            "0",
+        ])
+        .output()
+        .expect("run turso_whopper");
+
+    assert!(
+        output.status.success(),
+        "turso_whopper failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_mvcc_integrity_check_schema_publish_dependency_seed() {
+    let output = Command::new(env!("CARGO_BIN_EXE_turso_whopper"))
+        .env("SEED", "10246767071894117048")
+        .args([
+            "--mode",
+            "fast",
+            "--max-steps",
+            "10000",
+            "--reopen-probability",
+            "0.01",
+            "--enable-mvcc",
+            "--allocation-fault-probability",
+            "0.01",
+        ])
+        .output()
+        .expect("run turso_whopper");
+
+    assert!(
+        output.status.success(),
+        "turso_whopper failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Regression test for MVCC concurrent commit yield-spin deadlock.

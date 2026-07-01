@@ -11,6 +11,7 @@ use turso_whopper::{
     StepResult, Whopper, WhopperOpts,
     chaotic_btree::BtreeRebalanceProfile,
     chaotic_elle::{ChaoticElleProfile, ChaoticWorkloadProfile, ElleModelKind},
+    chaotic_mvcc::MvccCheckpointSchemaChurnProfile,
     properties::*,
     workloads::*,
 };
@@ -434,7 +435,18 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             Box::new(AutoincWatermarkMonotonicity::new()),
         ];
 
-        (w, p, vec![], vec![])
+        let chaotic: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)> =
+            if args.enable_mvcc && args.mode != "recovery-heavy" {
+                vec![(
+                    0.35,
+                    "mvcc-checkpoint-schema-churn",
+                    Box::new(MvccCheckpointSchemaChurnProfile::new()),
+                )]
+            } else {
+                vec![]
+            };
+
+        (w, p, vec![], chaotic)
     }
 }
 

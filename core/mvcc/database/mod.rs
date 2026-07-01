@@ -1490,6 +1490,7 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     #[cfg(any(test, injected_yields))]
     yield_instance_id: u64,
     did_commit_schema_change: bool,
+    schema_publish_lock_held: bool,
     tx_id: TxID,
     mvcc_store: Arc<MvStore<Clock, A>>,
     connection: Arc<Connection>,
@@ -1590,6 +1591,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             #[cfg(any(test, injected_yields))]
             yield_instance_id: connection.next_yield_instance_id(),
             did_commit_schema_change: schema_did_change_from_tx,
+            schema_publish_lock_held: false,
             tx_id,
             mvcc_store,
             connection,
@@ -1624,6 +1626,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     .set_tx_state(crate::connection::TransactionState::None);
             }
         }
+        self.release_schema_publish_lock();
 
         let tx_id = self.tx_id;
         let db_id = self.db_id;
@@ -1642,6 +1645,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             "Connection should not still reference an MVCC tx after a successful commit",
             { "tx_id": tx_id, "db_id": db_id }
         );
+    }
+
+    fn acquire_schema_publish_lock(&mut self) -> bool {
+        if self.schema_publish_lock_held {
+            return true;
+        }
+        if self.mvcc_store.schema_publish_lock.write() {
+            self.schema_publish_lock_held = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release_schema_publish_lock(&mut self) {
+        if self.schema_publish_lock_held {
+            self.mvcc_store.schema_publish_lock.unlock();
+            self.schema_publish_lock_held = false;
+        }
     }
 
     fn end_read_tx_for_db(&self) {
@@ -3077,6 +3099,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 }
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
+                let end_ts = *end_ts;
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
@@ -3091,6 +3114,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         .map(|header| header.schema_cookie.get())
                         != Some(tx_header.schema_cookie.get());
                 self.did_commit_schema_change = schema_did_change;
+                if schema_did_change && !self.acquire_schema_publish_lock() {
+                    return Ok(TransitionResult::Io(IOCompletions::Single(
+                        Completion::new_yield(),
+                    )));
+                }
                 if schema_did_change {
                     let schema = self.connection.schema.read().clone();
                     self.connection.db.update_schema_if_newer(schema);
@@ -3105,15 +3133,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // applies in FinalizeCommit below.
                 let prev_hdr_ts = mvcc_store
                     .last_global_header_ts
-                    .fetch_max(*end_ts, Ordering::AcqRel);
-                if prev_hdr_ts <= *end_ts {
+                    .fetch_max(end_ts, Ordering::AcqRel);
+                if prev_hdr_ts <= end_ts {
                     self.header.write().replace(tx_header);
                 }
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
-                self.state = CommitState::CommitEnd { end_ts: *end_ts };
+                self.state = CommitState::CommitEnd { end_ts };
                 return Ok(TransitionResult::Continue);
             }
             CommitState::CommitEnd { end_ts } => {
+                let end_ts = *end_ts;
+                if self.did_commit_schema_change && !self.acquire_schema_publish_lock() {
+                    return Ok(TransitionResult::Io(IOCompletions::Single(
+                        Completion::new_yield(),
+                    )));
+                }
                 // Order of operations matters here:
                 // 1. Advance logical log writer offset (makes the written bytes "owned")
                 // 2. Mark transaction Committed
@@ -3150,23 +3184,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         .storage
                         .advance_logical_log_offset_after_success(append_bytes)?;
                 }
-                tx_unlocked
-                    .state
-                    .store(TransactionState::Committed(*end_ts));
+                tx_unlocked.state.store(TransactionState::Committed(end_ts));
 
                 // Hand off to the chunked rewriter. Between chunks readers
                 // resolve any unwritten TxID refs via `txs[tx_id]` which now
                 // reports Committed(end_ts).
-                self.state = CommitState::RewriteLiveVersions(RewriteLiveVersionsCtx {
-                    end_ts: *end_ts,
-                    cursor: 0,
-                });
+                self.state =
+                    CommitState::RewriteLiveVersions(RewriteLiveVersionsCtx { end_ts, cursor: 0 });
                 Ok(TransitionResult::Continue)
             }
             // Chunked: yields every MVCC_COMMIT_BATCH_SIZE rowids. Same
             // helper-dispatch reason as BuildLogRecord above.
             CommitState::RewriteLiveVersions(_) => self.step_rewrite_live_versions(mvcc_store),
             CommitState::FinalizeCommit { end_ts } => {
+                let end_ts = *end_ts;
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
@@ -3203,15 +3234,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     // lower value can cause data loss / corruption.
                     let last_committed_ts = mvcc_store
                         .last_committed_tx_ts
-                        .fetch_max(*end_ts, Ordering::AcqRel);
-                    if last_committed_ts <= *end_ts {
+                        .fetch_max(end_ts, Ordering::AcqRel);
+                    if last_committed_ts <= end_ts {
                         global_header.replace(tx_header);
                     }
                 }
                 if self.did_commit_schema_change {
                     mvcc_store
                         .last_committed_schema_change_ts
-                        .fetch_max(*end_ts, Ordering::AcqRel);
+                        .fetch_max(end_ts, Ordering::AcqRel);
                 }
 
                 // We have now updated all the versions with a reference to the
@@ -3229,6 +3260,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 }
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
+                self.release_schema_publish_lock();
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 if mvcc_store.storage.should_checkpoint() {
                     let state_machine = StateMachine::new(CheckpointStateMachine::new(
@@ -3253,7 +3285,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 if mvcc_store.should_gc() {
                     mvcc_store.gc_incremental(MvStore::<Clock>::MAX_CHAINS_PER_GC);
                 }
-                tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, *end_ts);
+                tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, end_ts);
                 self.finalize(mvcc_store)?;
                 Ok(TransitionResult::Done(()))
             }
@@ -3560,6 +3592,25 @@ pub struct RowidAllocator {
     initialized: AtomicBool,
 }
 
+/// Held while an MVCC `PRAGMA integrity_check` is running.
+///
+/// The statement was compiled with the table and index roots from one schema,
+/// but MVCC does not keep a matching `Schema` snapshot for the transaction.
+/// While this guard is alive, DDL commits cannot publish a different root map
+/// under that statement. Ordinary row writes can still commit through normal
+/// MVCC visibility rules.
+pub(crate) struct MvccIntegrityCheckGuard {
+    schema_publish_lock: Arc<TursoRwLock>,
+}
+
+impl Drop for MvccIntegrityCheckGuard {
+    fn drop(&mut self) {
+        // ProgramState owns the guard, so finishing, resetting, or aborting the
+        // statement all release waiting DDL here.
+        self.schema_publish_lock.unlock();
+    }
+}
+
 /// Sub state machine for [`MvStore::bootstrap_nonblock`]. Carried by the
 /// open state machine (`OpenDbAsyncPhase::BootstrapMvStore`) across the
 /// metadata-bootstrap IO chain so opening an MVCC database does not block on
@@ -3829,6 +3880,17 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// - Immediately TRUNCATE checkpoint the WAL into the database file.
     /// - Release the blocking_checkpoint_lock.
     blocking_checkpoint_lock: Arc<TursoRwLock>,
+    /// Serializes MVCC schema/root publication against `PRAGMA integrity_check`.
+    ///
+    /// MVCC gives a transaction-scoped row snapshot and header/schema cookie,
+    /// but not a transaction-scoped `Schema` object. `PRAGMA integrity_check`
+    /// compiles from the connection's schema view and bakes table/index roots
+    /// into ordinary VDBE ops that scan tables, probe indexes, and count index
+    /// entries. A fully versioned schema catalog would be the broader fix; this
+    /// narrower lock instead prevents schema-changing commits from publishing a
+    /// different root view while integrity_check is mid-statement, without
+    /// serializing ordinary DML commits.
+    schema_publish_lock: Arc<TursoRwLock>,
     /// The highest transaction ID that has been made durable in the WAL.
     /// Used to skip checkpointing transactions from mv store to WAL that have already been processed.
     durable_txid_max: AtomicU64,
@@ -3997,6 +4059,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             commit_coordinator: Arc::new(CommitCoordinator::new()),
             global_header: Arc::new(RwLock::new(None)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
+            schema_publish_lock: Arc::new(TursoRwLock::new()),
             durable_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
@@ -5616,6 +5679,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
 
         Ok(tx_id)
+    }
+
+    /// `PRAGMA integrity_check` mixes a compiled schema/root view with generated
+    /// table/index bytecode, so in MVCC mode schema-changing commits must not
+    /// publish a new view while it runs.
+    pub(crate) fn begin_integrity_check_guard(&self) -> Result<MvccIntegrityCheckGuard> {
+        if !self.schema_publish_lock.read() {
+            return Err(LimboError::Busy);
+        }
+        Ok(MvccIntegrityCheckGuard {
+            schema_publish_lock: self.schema_publish_lock.clone(),
+        })
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TxInsert)]
