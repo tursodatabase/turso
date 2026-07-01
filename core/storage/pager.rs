@@ -2174,6 +2174,8 @@ impl Pager {
         savepoint: &SavepointSnapshot,
         journal_end_offset: u64,
     ) -> Result<()> {
+        self.reset_internal_states();
+
         let subjournal = self.subjournal.read();
         let Some(subjournal) = subjournal.as_ref() else {
             return Ok(());
@@ -5453,6 +5455,7 @@ impl Pager {
     }
 
     fn reset_internal_states(&self) {
+        self.pending_reads.write().clear();
         *self.checkpoint_state.write() = CheckpointState::default();
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().reset();
