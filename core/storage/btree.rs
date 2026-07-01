@@ -7239,7 +7239,7 @@ impl PageStack {
     fn _push(&mut self, page: PageRef, starting_cell_idx: i32) {
         tracing::trace!(current = self.current_page, new_page_id = page.get().id,);
         turso_assert!(
-            !page.is_freelist(),
+            !page.is_definitely_on_freelist(),
             "b-tree traversed into a page that is on the freelist",
             { "page_id": page.get().id }
         );

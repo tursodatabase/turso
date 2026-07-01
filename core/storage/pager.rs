@@ -744,7 +744,7 @@ const PAGE_SPILLED: usize = 0b100000;
 /// Lets us catch a double-free at the offending free instead of later at reuse.
 ///
 /// It is never set unless the page really is on the freelist, so asserting
-/// `!is_freelist()` never false-positives. The converse does not hold: the
+/// `!is_definitely_on_freelist()` never false-positives. The converse does not hold: the
 /// marker lives on the cached `Page`, not on disk, so when the page cache evicts
 /// that `Page` the marker is lost and a later re-read rebuilds it cleared even
 /// though the page is still on the freelist. That only costs a missed check —
@@ -864,9 +864,12 @@ impl Page {
         self.get().flags.fetch_and(!PAGE_LOADED, Ordering::Release);
     }
 
-    /// Whether this page is currently recorded on the freelist. See [PAGE_FREELIST].
+    /// Whether this page is *known* to be on the freelist. `true` is authoritative
+    /// (the marker is never set spuriously); `false` only means "not known" — the
+    /// marker is lost when the page cache evicts the `Page`, so it can be a false
+    /// negative. See [PAGE_FREELIST].
     #[inline]
-    pub fn is_freelist(&self) -> bool {
+    pub fn is_definitely_on_freelist(&self) -> bool {
         self.get().flags.load(Ordering::Acquire) & PAGE_FREELIST != 0
     }
 
@@ -4959,7 +4962,12 @@ impl Pager {
     /// clear the hint precisely. See [PAGE_FREELIST] and `rollback_to_snapshot`.
     fn mark_page_on_freelist(&self, page: &Page) {
         page.set_freelist();
-        if self.savepoints.read().last().is_some() {
+        // Hold the savepoints lock across the push so a concurrent savepoint
+        // open/rollback cannot interleave between the check and the append —
+        // otherwise a new savepoint could record a `freed_pages_mark` that
+        // races this entry, desyncing the log length from the mark.
+        let savepoints = self.savepoints.read();
+        if savepoints.last().is_some() {
             self.freed_pages_this_txn.write().push(page.get().id as u32);
         }
     }
@@ -5017,7 +5025,7 @@ impl Pager {
                         None => return_if_io!(self.read_page(page_id as i64)),
                     };
                     turso_assert!(
-                        !page.is_freelist(),
+                        !page.is_definitely_on_freelist(),
                         "freeing a page that is already on the freelist (double-free)",
                         { "page_id": page_id }
                     );
