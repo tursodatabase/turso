@@ -84,20 +84,14 @@ const NOUNS: &[&str] = &[
     "leaf", "root", "seed", "fruit", "flower", "grass", "stone", "sand", "wave", "wind", "rain",
 ];
 
-/// RNG wrapper that works with both Shuttle and Antithesis
-#[cfg(not(antithesis))]
 struct ThreadRng {
+    #[cfg(not(antithesis))]
     rng: StdRng,
+    #[cfg(antithesis)]
+    rng: antithesis_sdk::random::AntithesisRng,
 }
 
-#[cfg(not(antithesis))]
 impl ThreadRng {
-    fn new(seed: u64) -> Self {
-        Self {
-            rng: StdRng::seed_from_u64(seed),
-        }
-    }
-
     fn get_random(&mut self) -> u64 {
         self.rng.random()
     }
@@ -107,7 +101,7 @@ impl ThreadRng {
         T: SampleUniform,
         R: SampleRange<T>,
     {
-        self.rng.random_range(range)
+        self.rng.random_range::<T, R>(range)
     }
 
     fn true_with_probability(&mut self, numerator: u32, denominator: u32) -> bool {
@@ -115,38 +109,28 @@ impl ThreadRng {
     }
 
     fn choose<'a, T>(&mut self, ts: &'a [T]) -> &'a T {
-        &ts[self.rng.random_range(0..ts.len())]
+        #[cfg(not(antithesis))]
+        return &ts[self.rng.random_range(0..ts.len())];
+        #[cfg(antithesis)]
+        antithesis_sdk::random::random_choice(ts).expect("choose called on empty slice")
+    }
+}
+
+#[cfg(not(antithesis))]
+impl ThreadRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            rng: StdRng::seed_from_u64(seed),
+        }
     }
 }
 
 #[cfg(antithesis)]
-struct ThreadRng;
-
-#[cfg(antithesis)]
 impl ThreadRng {
     fn new(_seed: u64) -> Self {
-        // Antithesis uses its own RNG, seed is ignored
-        Self
-    }
-
-    fn get_random(&mut self) -> u64 {
-        antithesis_sdk::random::get_random()
-    }
-
-    fn random_range<T, R>(&mut self, range: R) -> T
-    where
-        T: SampleUniform,
-        R: SampleRange<T>,
-    {
-        antithesis_sdk::random::AntithesisRng.random_range::<T, R>(range)
-    }
-
-    fn true_with_probability(&mut self, numerator: u32, denominator: u32) -> bool {
-        antithesis_sdk::random::AntithesisRng.random_ratio(numerator, denominator)
-    }
-
-    fn choose<'a, T>(&mut self, ts: &'a [T]) -> &'a T {
-        antithesis_sdk::random::random_choice(ts).expect("choose called on empty slice")
+        Self {
+            rng: antithesis_sdk::random::AntithesisRng,
+        }
     }
 }
 
