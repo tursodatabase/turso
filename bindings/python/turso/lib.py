@@ -418,6 +418,43 @@ class Connection:
         except Exception as exc:  # noqa: BLE001
             raise _map_turso_exception(exc)
 
+    def interrupt(self) -> None:
+        """
+        Abort any query currently executing on this connection.
+
+        Mirrors ``sqlite3.Connection.interrupt``: call it from another thread to
+        cancel a long-running ``execute``/``fetch*`` in flight; that call raises
+        ``OperationalError`` ("interrupted"). The underlying execution methods
+        release the GIL, so a watchdog thread can actually run while a query is
+        busy. If no statement is running the call is a no-op.
+        """
+        try:
+            self._conn.interrupt()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def set_query_timeout(self, milliseconds: int) -> None:
+        """
+        Set the maximum time (in milliseconds) a single statement may run before
+        it is interrupted (raising ``OperationalError``). ``0`` disables the
+        timeout. Unlike ``interrupt()`` this needs no watchdog thread: the
+        deadline is enforced inside the engine. Turso extension (not in stdlib
+        ``sqlite3``).
+        """
+        if milliseconds < 0:
+            raise ProgrammingError("query timeout must be non-negative")
+        try:
+            self._conn.set_query_timeout(milliseconds)
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def get_query_timeout(self) -> int:
+        """Return the current per-statement query timeout in milliseconds (``0`` = disabled)."""
+        try:
+            return self._conn.get_query_timeout()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
     def _maybe_implicit_begin(self, sql: str) -> None:
         """
         Implement sqlite3 legacy implicit transaction behavior:
