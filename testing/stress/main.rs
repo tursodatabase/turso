@@ -120,8 +120,6 @@ impl ThreadRng {
     }
 
     fn choose<'a, T>(&mut self, ts: &'a [T]) -> &'a T {
-        // Routing the selection through Antithesis' own RNG gives it visibility
-        // into the choice, which it uses to explore the decision space.
         antithesis_sdk::random::random_choice(ts).expect("choose called on empty slice")
     }
 }
