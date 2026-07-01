@@ -79,6 +79,12 @@ jobs:
         with:
           tool: cargo-codspeed
 
+      - name: Wait for sticky disk snapshot propagation
+        # The build job commits the sticky disk from the action's post step.
+        # Give Blacksmith time to expose that snapshot to dependent jobs before
+        # these shards mount the read-only copy.
+        run: sleep 90
+
       - name: Mount benchmark binary sticky disk
         uses: useblacksmith/stickydisk@v1
         with:
