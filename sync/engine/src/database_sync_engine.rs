@@ -4146,7 +4146,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             if replace_base_pages || raw_page_replay_on_sql_conn {
                 publish_schema_after_raw_wal_replay(&main_conn, "raw WAL replay")?;
             }
-            if replace_base_pages || had_cdc_table && raw_page_replay_on_sql_conn {
+            if replace_base_pages || had_cdc_table && stream_kind_applies_remote_pages(stream_kind)
+            {
                 tracing::info!(
                     "apply_changes(path={}): reinitialize CDC pragma after WAL replay commit",
                     self.main_db_path,
