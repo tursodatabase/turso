@@ -1,4 +1,5 @@
 #![allow(unused_variables, dead_code)]
+use crate::storage::sqlite3_ondisk::PageSize;
 use crate::turso_assert;
 use crate::{LimboError, Result};
 use aegis::aegis128l::Aegis128L;
@@ -550,6 +551,13 @@ impl EncryptionContext {
 
     pub fn cipher_mode(&self) -> CipherMode {
         self.cipher_mode
+    }
+
+    /// Set the database page size used when encrypting and decrypting pages.
+    ///
+    /// This does not change the selected cipher or key material.
+    pub(crate) fn set_page_size(&mut self, page_size: PageSize) {
+        self.page_size = page_size.get() as usize;
     }
 
     /// Returns the number of reserved bytes required at the end of each page for encryption metadata.
