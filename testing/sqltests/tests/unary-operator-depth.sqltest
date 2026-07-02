@@ -1,0 +1,32 @@
+@database :memory:
+
+# Regression test for issue #4197: very long sequences of unary operators
+# should not cause a stack overflow. The translator handles these iteratively.
+
+test long-unary-plus-sequence {
+    SELECT +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++123;
+}
+expect {
+    123
+}
+
+test long-unary-minus-sequence {
+    SELECT - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -123;
+}
+expect {
+    123
+}
+
+test long-unary-minus-sequence-odd {
+    SELECT - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -123;
+}
+expect {
+    -123
+}
+
+test long-addition-chain {
+    SELECT 1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1;
+}
+expect {
+    100
+}
