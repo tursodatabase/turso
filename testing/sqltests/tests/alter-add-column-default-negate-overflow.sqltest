@@ -1,0 +1,70 @@
+# Regression test for https://github.com/tursodatabase/turso/issues/4621
+# Negating a hex literal that parses to i64::MIN in an ALTER TABLE ADD COLUMN
+# DEFAULT expression must not panic with "attempt to negate with overflow".
+#
+# SQLite accepts the ALTER: its valueFromExpr promotes -(i64::MIN) to the
+# REAL value 2^63, so pre-existing rows read 9.22337203685478e+18. Statements
+# that code-generate the default (e.g. a subsequent INSERT) are rejected at
+# prepare time with "hex literal too big". We match that behavior.
+
+@database :memory:
+
+test alter-add-column-default-negate-min-int {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b DEFAULT -0x8000000000000000;
+    SELECT a, b, typeof(b) FROM t;
+}
+expect {
+    1|9.22337203685478e+18|real
+}
+
+test alter-add-column-default-negate-min-int-parenthesized {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b DEFAULT (-0x8000000000000000);
+    SELECT a, b, typeof(b) FROM t;
+}
+expect {
+    1|9.22337203685478e+18|real
+}
+
+# Code-generating the overflowing default (new row insertion) fails at
+# prepare time, like SQLite.
+test alter-add-column-default-negate-min-int-insert {
+    CREATE TABLE t (a INTEGER);
+    ALTER TABLE t ADD COLUMN b DEFAULT -0x8000000000000000;
+    INSERT INTO t (a) VALUES (1);
+}
+expect error {
+    hex literal too big: -0x8000000000000000
+}
+
+# Negating the literal directly is also a prepare-time error, like SQLite.
+test select-negate-min-int-hex-literal {
+    SELECT -0x8000000000000000;
+}
+expect error {
+    hex literal too big: -0x8000000000000000
+}
+
+test alter-add-column-default-negate-ok {
+    CREATE TABLE t2 (a INTEGER);
+    ALTER TABLE t2 ADD COLUMN b DEFAULT -0x1;
+    INSERT INTO t2 (a) VALUES (1);
+    SELECT b FROM t2;
+}
+expect {
+    -1
+}
+
+# Boundary: negating i64::MAX is fine, only i64::MIN overflows.
+test alter-add-column-default-negate-max-int {
+    CREATE TABLE t3 (a INTEGER);
+    ALTER TABLE t3 ADD COLUMN b DEFAULT -0x7fffffffffffffff;
+    INSERT INTO t3 (a) VALUES (1);
+    SELECT b FROM t3;
+}
+expect {
+    -9223372036854775807
+}
