@@ -258,30 +258,42 @@ mod tests {
     fn sql_replay_page_routing_keeps_legacy_on_wal_session() {
         assert!(!should_replay_raw_pages_on_sql_conn(
             DatabaseSyncEngineProtocolVersion::Legacy,
+            true,
             false,
             DbChangesStreamKind::LegacyPages,
             true,
         ));
         assert!(!should_replay_raw_pages_on_sql_conn(
             DatabaseSyncEngineProtocolVersion::Legacy,
+            true,
             false,
             DbChangesStreamKind::ReplaceBasePages,
             true,
         ));
         assert!(!should_replay_raw_pages_on_sql_conn(
             DatabaseSyncEngineProtocolVersion::V1,
+            false,
+            false,
+            DbChangesStreamKind::Pages,
+            true,
+        ));
+        assert!(!should_replay_raw_pages_on_sql_conn(
+            DatabaseSyncEngineProtocolVersion::V1,
+            true,
             false,
             DbChangesStreamKind::Pages,
             false,
         ));
         assert!(should_replay_raw_pages_on_sql_conn(
             DatabaseSyncEngineProtocolVersion::V1,
+            true,
             false,
             DbChangesStreamKind::Pages,
             true,
         ));
         assert!(should_replay_raw_pages_on_sql_conn(
             DatabaseSyncEngineProtocolVersion::V1,
+            true,
             false,
             DbChangesStreamKind::ReplaceBasePages,
             true,
@@ -289,11 +301,13 @@ mod tests {
         assert!(!should_replay_raw_pages_on_sql_conn(
             DatabaseSyncEngineProtocolVersion::V1,
             true,
+            true,
             DbChangesStreamKind::ReplaceBasePages,
             true,
         ));
         assert!(!should_replay_raw_pages_on_sql_conn(
             DatabaseSyncEngineProtocolVersion::V1,
+            true,
             false,
             DbChangesStreamKind::Logical,
             true,
@@ -2142,11 +2156,13 @@ fn stream_kind_applies_remote_pages(stream_kind: DbChangesStreamKind) -> bool {
 #[allow(dead_code)]
 fn should_replay_raw_pages_on_sql_conn(
     protocol_version_hint: DatabaseSyncEngineProtocolVersion,
+    logical_mvcc_pull_active: bool,
     logical_replay_conn_active: bool,
     stream_kind: DbChangesStreamKind,
     mvcc_active: bool,
 ) -> bool {
     protocol_version_hint != DatabaseSyncEngineProtocolVersion::Legacy
+        && logical_mvcc_pull_active
         && mvcc_active
         && !logical_replay_conn_active
         && matches!(
@@ -3391,6 +3407,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             || matches!(stream_kind, DbChangesStreamKind::Logical)
             || should_replay_raw_pages_on_sql_conn(
                 self.opts.protocol_version_hint,
+                self.meta().logical_mvcc_pull_active,
                 false,
                 stream_kind,
                 main_conn.mv_store().as_ref().is_some(),
@@ -3728,6 +3745,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
             let raw_page_replay_on_sql_conn = should_replay_raw_pages_on_sql_conn(
                 self.opts.protocol_version_hint,
+                self.meta().logical_mvcc_pull_active,
                 logical_replay_conn.is_some(),
                 stream_kind,
                 main_conn.mv_store().as_ref().is_some(),
