@@ -1,6 +1,6 @@
 use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
@@ -186,7 +186,7 @@ pub fn emit_program_for_update(
             internal_id: target_table.internal_id,
             table: target_table.table.clone(),
             using_dedup_hidden_cols: ColumnMask::default(),
-            col_used_mask: target_table.col_used_mask.clone(),
+            col_used_mask: target_table.col_used_mask.try_clone()?,
             cte_select: None,
             cte_explicit_columns: vec![],
             cte_id: None,

@@ -1660,6 +1660,17 @@ impl IntoIterator for ColumnMask {
     }
 }
 
+impl alloc::TryClone for ColumnMask {
+    type Error = alloc::TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            bitset: self.bitset.try_clone()?,
+            has_rowid_sentinel: self.has_rowid_sentinel,
+        })
+    }
+}
+
 /// Dense bitset optimized for the common case where all elements ≤64, with heap-allocated overflow.
 ///
 /// *WARNING*: This bitset occupies `O(max_num)` space when `max_num > 64`,
@@ -1679,6 +1690,18 @@ impl<T> Default for BitSet<T> {
             overflow: None,
             _phantom: PhantomData,
         }
+    }
+}
+
+impl<T> alloc::TryClone for BitSet<T> {
+    type Error = alloc::TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            inline: self.inline,
+            overflow: self.overflow.try_clone()?,
+            _phantom: PhantomData,
+        })
     }
 }
 
@@ -1988,8 +2011,6 @@ impl<T> TryFrom<u128> for BitSet<T> {
     type Error = alloc::TryReserveError;
 
     fn try_from(from: u128) -> Result<Self, Self::Error> {
-        use crate::alloc::*;
-
         let high = (from >> 64) as u64;
         let overflow = match high != 0 {
             true => Some(alloc::try_vec![high]?),
@@ -2288,8 +2309,7 @@ impl JoinedTable {
                     ColDef::default(),
                 )
             })
-            .try_collect::<alloc::Vec<_>>()
-            .expect(crate::alloc::ALLOC_ERR_MSG);
+            .try_collect::<alloc::Vec<_>>()?;
 
         for (i, column) in columns.iter_mut().enumerate() {
             if super::expr::expr_is_array(
@@ -2402,8 +2422,7 @@ impl JoinedTable {
                     ColDef::default(),
                 )
             })
-            .try_collect::<alloc::Vec<_>>()
-            .expect(crate::alloc::ALLOC_ERR_MSG);
+            .try_collect::<alloc::Vec<_>>()?;
 
         for (i, column) in columns.iter_mut().enumerate() {
             if super::expr::expr_is_array(&result_columns[i].expr, Some(table_references)) {

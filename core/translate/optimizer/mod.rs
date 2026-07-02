@@ -1123,8 +1123,8 @@ fn update_from_scratch_col_name(idx: usize) -> String {
     format!("__update_from_{idx}")
 }
 
-fn update_from_scratch_columns(set_clause_count: usize) -> crate::alloc::Vec<Column> {
-    (0..set_clause_count)
+fn update_from_scratch_columns(set_clause_count: usize) -> Result<crate::alloc::Vec<Column>> {
+    Ok((0..set_clause_count)
         .map(|idx| {
             // Keep scratch-table columns at BLOB affinity so materializing SET payloads
             // does not coerce values before the real target-column affinity is applied.
@@ -1138,8 +1138,7 @@ fn update_from_scratch_columns(set_clause_count: usize) -> crate::alloc::Vec<Col
                 ColDef::default(),
             )
         })
-        .try_collect()
-        .expect(crate::alloc::ALLOC_ERR_MSG)
+        .try_collect()?)
 }
 
 /// Build the SELECT that gathers the stable write set for an UPDATE before the
@@ -1156,9 +1155,9 @@ fn build_update_write_set_plan(
     let scratch_table_id = program.table_reference_counter.next();
     let is_update_from = !plan.from_tables.joined_tables().is_empty();
     let columns = if is_update_from {
-        update_from_scratch_columns(plan.set_clauses.len())
+        update_from_scratch_columns(plan.set_clauses.len())?
     } else {
-        crate::alloc::vec![(*ROWID_COLUMN).clone()]
+        std::iter::once((*ROWID_COLUMN).clone()).try_collect()?
     };
     let ephemeral_table = Arc::new(BTreeTable::new(
         0, // root_page, not relevant for ephemeral table definition
@@ -2337,7 +2336,7 @@ fn optimize_table_access(
                     let ephemeral_index = ephemeral_index_build(
                         &table_references.joined_tables_mut()[table_idx],
                         &usable_constraint_refs,
-                    );
+                    )?;
 
                     mark_seek_constraints_consumed(
                         &table_constraints.constraints,
@@ -3214,7 +3213,7 @@ impl Optimizable for ast::Expr {
 fn ephemeral_index_build(
     table_reference: &JoinedTable,
     constraint_refs: &[RangeConstraintRef],
-) -> Index {
+) -> Result<Index> {
     let mut ephemeral_columns: crate::alloc::Vec<IndexColumn> = table_reference
         .columns()
         .iter()
@@ -3235,8 +3234,7 @@ fn ephemeral_index_build(
         })
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))
-        .try_collect()
-        .expect(crate::alloc::ALLOC_ERR_MSG);
+        .try_collect()?;
     // sort so that constraints first, then rest in whatever order they were in in the table
     ephemeral_columns.sort_by(|a, b| {
         let a_constraint = constraint_refs
@@ -3274,7 +3272,7 @@ fn ephemeral_index_build(
         on_conflict: None,
     };
 
-    ephemeral_index
+    Ok(ephemeral_index)
 }
 
 /// Build a [SeekDef] for a given list of [Constraint]s
