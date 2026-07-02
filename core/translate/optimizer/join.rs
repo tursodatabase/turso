@@ -3545,7 +3545,8 @@ mod tests {
                     default: None,
                     expr: None,
                 })
-                .collect(),
+                .try_collect()
+                .unwrap(),
             unique,
             ephemeral: false,
             root_page: 1,
