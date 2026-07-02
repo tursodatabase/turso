@@ -318,7 +318,7 @@ pub fn translate_insert(
         ensure_sequence_initialized(program, resolver, &btree_table, database_id)?;
     }
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), table.get_name())?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(table.get_name()))?;
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;

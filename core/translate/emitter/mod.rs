@@ -1065,17 +1065,22 @@ fn build_rowid_column() -> Column {
 pub fn prepare_cdc_if_necessary(
     program: &mut ProgramBuilder,
     schema: &Schema,
-    changed_table_name: &str,
+    changed_table_name: Option<&str>,
 ) -> Result<Option<(usize, Arc<BTreeTable>)>> {
     let mode = program.capture_data_changes_info();
     let cdc_table = mode.table();
     let Some(cdc_table) = cdc_table else {
         return Ok(None);
     };
-    if changed_table_name == cdc_table
-        || changed_table_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
-    {
-        return Ok(None);
+    // Self-exclusion: never capture changes to CDC's own bookkeeping tables. `None` means the
+    // caller has no associated table (e.g. a transaction-boundary COMMIT record) and always
+    // gets the cursor.
+    if let Some(changed_table_name) = changed_table_name {
+        if changed_table_name == cdc_table
+            || changed_table_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
+        {
+            return Ok(None);
+        }
     }
     let Some(turso_cdc_table) = schema.get_table(cdc_table) else {
         crate::bail_parse_error!("no such table: {}", cdc_table);
@@ -1500,7 +1505,6 @@ pub fn emit_cdc_commit_insns(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     cdc_cursor_id: usize,
-    txn_id_reg: Option<usize>,
 ) -> Result<()> {
     // v2 COMMIT record: (NULL, unixepoch(), conn_txn_id(-1), 2, NULL, NULL, NULL, NULL, NULL)
     let regs = program.alloc_registers(9);
@@ -1528,32 +1532,21 @@ pub fn emit_cdc_commit_insns(
 
     // reg+2: change_txn_id = conn_txn_id(-1)
     // Pass -1 as candidate: if a txn_id exists, return it; if not, -1 is stored (and will be reset).
-    // Callers that already computed conn_txn_id (e.g. to gate the record on whether the
-    // transaction captured a change) pass that register in to avoid recomputing it.
-    match txn_id_reg {
-        Some(src_reg) => program.emit_insn(Insn::Copy {
-            src_reg,
-            dst_reg: regs + 2,
-            extra_amount: 0,
-        }),
-        None => {
-            let minus_one_reg = program.alloc_register();
-            program.emit_int(-1, minus_one_reg);
-            let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1)? else {
-                bail_parse_error!("no function {}", "conn_txn_id");
-            };
-            let conn_txn_id_fn_ctx = crate::function::FuncCtx {
-                func: conn_txn_id_fn,
-                arg_count: 1,
-            };
-            program.emit_insn(Insn::Function {
-                constant_mask: 0,
-                start_reg: minus_one_reg,
-                dest: regs + 2,
-                func: conn_txn_id_fn_ctx,
-            });
-        }
-    }
+    let minus_one_reg = program.alloc_register();
+    program.emit_int(-1, minus_one_reg);
+    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1)? else {
+        bail_parse_error!("no function {}", "conn_txn_id");
+    };
+    let conn_txn_id_fn_ctx = crate::function::FuncCtx {
+        func: conn_txn_id_fn,
+        arg_count: 1,
+    };
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: minus_one_reg,
+        dest: regs + 2,
+        func: conn_txn_id_fn_ctx,
+    });
 
     // reg+3: change_type = 2 (COMMIT)
     program.emit_int(2, regs + 3);
@@ -1627,7 +1620,7 @@ pub fn emit_cdc_autocommit_commit(
             jump_if_null: true,
         });
 
-        emit_cdc_commit_insns(program, resolver, cdc_cursor_id, None)?;
+        emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
 
         program.preassign_label_to_next_insn(skip_label);
     }
@@ -1673,6 +1666,8 @@ pub fn emit_cdc_explicit_commit_insns(
     });
 
     // Skip the whole record (including the CDC OpenWrite) when no change was captured.
+    // `emit_cdc_commit_insns` recomputes `conn_txn_id(-1)` for the record itself; because the
+    // opcode is an idempotent get-or-set, the second call returns the same value we gated on.
     let skip_label = program.allocate_label();
     program.emit_insn(Insn::Eq {
         lhs: txn_id_reg,
@@ -1682,10 +1677,9 @@ pub fn emit_cdc_explicit_commit_insns(
         collation: None,
     });
 
-    // Use a dummy table name for prepare_cdc_if_necessary — any name that isn't the
-    // CDC table itself will work.
-    if let Some((cdc_cursor_id, _)) = prepare_cdc_if_necessary(program, schema, "__tx_commit__")? {
-        emit_cdc_commit_insns(program, resolver, cdc_cursor_id, Some(txn_id_reg))?;
+    // A COMMIT record has no associated table, so pass `None` (no self-exclusion check).
+    if let Some((cdc_cursor_id, _)) = prepare_cdc_if_necessary(program, schema, None)? {
+        emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
     }
 
     program.preassign_label_to_next_insn(skip_label);
