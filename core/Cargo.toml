@@ -122,6 +122,7 @@ rustc-hash = "2.0"
 either = { workspace = true }
 tracing-subscriber.workspace = true
 rapidhash = "4.1.1"
+simdutf8 = "0.1.5"
 branches = { version = "0.4.3", default-features = false }
 bumpalo = { version = "3", features = ["collections"] }
 smallvec = "1.15.1"
@@ -248,4 +249,8 @@ harness = false
 
 [[bench]]
 name = "prepare_params_benchmark"
+harness = false
+
+[[bench]]
+name = "record_benchmark"
 harness = false

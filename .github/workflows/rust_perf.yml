@@ -38,6 +38,8 @@ jobs:
             features: ""
           - bench: graph_queries_benchmark
             features: "--features bench"
+          - bench: record_benchmark
+            features: "--features bench"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
