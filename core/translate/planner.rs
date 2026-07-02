@@ -968,126 +968,130 @@ fn parse_table(
     let database_id = resolver.resolve_existing_table_database_id_qualified(qualified_name)?;
     let table_name = &qualified_name.name;
 
-    // Check if the FROM clause table is referring to a CTE in the current scope.
-    // Each reference gets a freshly planned CTE to ensure unique internal_ids and cursor IDs.
-    if let Some(cte_idx) = cte_definitions
-        .iter()
-        .position(|cte| cte.name == normalized_qualified_name)
-    {
-        let planning_outer_query_refs =
-            base_outer_refs_for_cte_planning(table_references.outer_query_refs(), cte_definitions);
-        // This is an actual CTE reference in the FROM/JOIN clause - count it
-        let mut cte_table = plan_cte(
-            cte_idx,
-            cte_definitions,
-            &planning_outer_query_refs,
-            resolver,
-            program,
-            connection,
-            true, // Actual FROM/JOIN reference - count it
-        )?;
-
-        // If there's an alias provided, update the identifier to use that alias
-        if let Some(a) = maybe_alias {
-            cte_table.identifier = normalize_ident(a.name().as_str());
-        }
-
-        // Mark the pre-planned outer_query_ref as "CTE definition only" so it is
-        // still available for CTE lookup in subquery FROM clauses (e.g.
-        // EXISTS (SELECT 1 FROM <cte_name> ...)), but no longer participates in
-        // column resolution. Column resolution now goes through the joined_table
-        // which has the alias (if any) or the original name.
-        table_references.mark_outer_query_ref_cte_definition_only(&normalized_qualified_name);
-
-        table_references.add_joined_table(cte_table);
-        return Ok(());
-    }
-
-    // A non-recursive CTE's body cannot reference its own name. The CTE name
-    // shadows any same-named schema object, but without RECURSIVE it's circular.
-    if program.is_cte_being_defined(&normalized_qualified_name) {
-        crate::bail_parse_error!("circular reference: {}", table_name.as_str());
-    }
-
-    // Check if the table is a CTE from an outer scope (e.g., a CTE referencing another CTE).
-    // This handles cases like: WITH a AS (...), b AS (SELECT ... FROM a) SELECT * FROM b;
-    // When planning b's body, 'a' is in outer_query_refs.
-    if let Some(outer_ref) =
-        table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
-    {
-        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
-        // Clone fields we need before dropping the borrow on table_references.
-        let cte_select = outer_ref.cte_select.clone();
-        let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
-        let cte_id = outer_ref.cte_id;
-        let outer_table = outer_ref.table.clone();
-        let materialize_hint = match &outer_table {
-            Table::FromClauseSubquery(subquery) => subquery.materialize_hint(),
-            _ => false,
-        };
-
-        if let Some(cte_ast) = cte_select {
-            // Re-plan the CTE from its original AST to get fresh internal_ids.
-            // This prevents cursor key collisions when the same CTE is
-            // referenced multiple times in the same scope.
-            let cte_plan = prepare_select_plan(
-                cte_ast,
+    if qualified_name.db_name.is_none() {
+        // Check if the FROM clause table is referring to a CTE in the current scope.
+        // Each reference gets a freshly planned CTE to ensure unique internal_ids and cursor IDs.
+        if let Some(cte_idx) = cte_definitions
+            .iter()
+            .position(|cte| cte.name == normalized_qualified_name)
+        {
+            let planning_outer_query_refs = base_outer_refs_for_cte_planning(
+                table_references.outer_query_refs(),
+                cte_definitions,
+            );
+            // This is an actual CTE reference in the FROM/JOIN clause - count it
+            let mut cte_table = plan_cte(
+                cte_idx,
+                cte_definitions,
+                &planning_outer_query_refs,
                 resolver,
                 program,
-                table_references.outer_query_refs(),
-                QueryDestination::placeholder_for_subquery(),
                 connection,
+                true, // Actual FROM/JOIN reference - count it
             )?;
-            let explicit_cols = if cte_explicit_columns.is_empty() {
-                None
-            } else {
-                Some(cte_explicit_columns.as_slice())
-            };
-            // Validate explicit column count on actual CTE reference (matching SQLite
-            // behavior, which defers this check until the CTE is used).
-            if let Some(cols) = explicit_cols {
-                let result_col_count = cte_plan.select_result_columns().len();
-                if cols.len() != result_col_count {
-                    crate::bail_parse_error!(
-                        "table {} has {} columns but {} column names were provided",
-                        normalized_qualified_name,
-                        result_col_count,
-                        cols.len()
-                    );
-                }
+
+            // If there's an alias provided, update the identifier to use that alias
+            if let Some(a) = maybe_alias {
+                cte_table.identifier = normalize_ident(a.name().as_str());
             }
-            // Use the CTE name for the subquery name so query plans show
-            // "SCAN cte_name AS alias" instead of just "SCAN alias".
-            let mut jt = JoinedTable::new_subquery_from_plan(
-                normalized_qualified_name.clone(),
-                cte_plan,
-                None,
-                program.table_reference_counter.next(),
-                explicit_cols,
-                cte_id,
-                materialize_hint,
-            )?;
-            if let Some(alias) = alias {
-                jt.identifier = alias;
-            }
-            jt.database_id = database_id;
-            table_references.add_joined_table(jt);
-        } else {
-            let internal_id = program.table_reference_counter.next();
-            table_references.add_joined_table(JoinedTable {
-                op: Operation::default_scan_for(&outer_table),
-                table: outer_table,
-                identifier: alias.unwrap_or(normalized_qualified_name),
-                internal_id,
-                join_info: None,
-                col_used_mask: ColumnUsedMask::default(),
-                column_use_counts: Vec::new(),
-                expression_index_usages: Vec::new(),
-                database_id,
-                indexed: None,
-            });
+
+            // Mark the pre-planned outer_query_ref as "CTE definition only" so it is
+            // still available for CTE lookup in subquery FROM clauses (e.g.
+            // EXISTS (SELECT 1 FROM <cte_name> ...)), but no longer participates in
+            // column resolution. Column resolution now goes through the joined_table
+            // which has the alias (if any) or the original name.
+            table_references.mark_outer_query_ref_cte_definition_only(&normalized_qualified_name);
+
+            table_references.add_joined_table(cte_table);
+            return Ok(());
         }
-        return Ok(());
+
+        // A non-recursive CTE's body cannot reference its own name. The CTE name
+        // shadows any same-named schema object, but without RECURSIVE it's circular.
+        if program.is_cte_being_defined(&normalized_qualified_name) {
+            crate::bail_parse_error!("circular reference: {}", table_name.as_str());
+        }
+
+        // Check if the table is a CTE from an outer scope (e.g., a CTE referencing another CTE).
+        // This handles cases like: WITH a AS (...), b AS (SELECT ... FROM a) SELECT * FROM b;
+        // When planning b's body, 'a' is in outer_query_refs.
+        if let Some(outer_ref) =
+            table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
+        {
+            let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
+            // Clone fields we need before dropping the borrow on table_references.
+            let cte_select = outer_ref.cte_select.clone();
+            let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
+            let cte_id = outer_ref.cte_id;
+            let outer_table = outer_ref.table.clone();
+            let materialize_hint = match &outer_table {
+                Table::FromClauseSubquery(subquery) => subquery.materialize_hint(),
+                _ => false,
+            };
+
+            if let Some(cte_ast) = cte_select {
+                // Re-plan the CTE from its original AST to get fresh internal_ids.
+                // This prevents cursor key collisions when the same CTE is
+                // referenced multiple times in the same scope.
+                let cte_plan = prepare_select_plan(
+                    cte_ast,
+                    resolver,
+                    program,
+                    table_references.outer_query_refs(),
+                    QueryDestination::placeholder_for_subquery(),
+                    connection,
+                )?;
+                let explicit_cols = if cte_explicit_columns.is_empty() {
+                    None
+                } else {
+                    Some(cte_explicit_columns.as_slice())
+                };
+                // Validate explicit column count on actual CTE reference (matching SQLite
+                // behavior, which defers this check until the CTE is used).
+                if let Some(cols) = explicit_cols {
+                    let result_col_count = cte_plan.select_result_columns().len();
+                    if cols.len() != result_col_count {
+                        crate::bail_parse_error!(
+                            "table {} has {} columns but {} column names were provided",
+                            normalized_qualified_name,
+                            result_col_count,
+                            cols.len()
+                        );
+                    }
+                }
+                // Use the CTE name for the subquery name so query plans show
+                // "SCAN cte_name AS alias" instead of just "SCAN alias".
+                let mut jt = JoinedTable::new_subquery_from_plan(
+                    normalized_qualified_name.clone(),
+                    cte_plan,
+                    None,
+                    program.table_reference_counter.next(),
+                    explicit_cols,
+                    cte_id,
+                    materialize_hint,
+                )?;
+                if let Some(alias) = alias {
+                    jt.identifier = alias;
+                }
+                jt.database_id = database_id;
+                table_references.add_joined_table(jt);
+            } else {
+                let internal_id = program.table_reference_counter.next();
+                table_references.add_joined_table(JoinedTable {
+                    op: Operation::default_scan_for(&outer_table),
+                    table: outer_table,
+                    identifier: alias.unwrap_or(normalized_qualified_name),
+                    internal_id,
+                    join_info: None,
+                    col_used_mask: ColumnUsedMask::default(),
+                    column_use_counts: Vec::new(),
+                    expression_index_usages: Vec::new(),
+                    database_id,
+                    indexed: None,
+                });
+            }
+            return Ok(());
+        }
     }
 
     // Resolve table using connection's with_schema method
@@ -1238,23 +1242,25 @@ fn parse_table(
     // For other types of tables in the outer query references, we do not add them as joined tables,
     // because the query can simply _reference_ them in e.g. the SELECT columns or the WHERE clause,
     // but it's not part of the join order.
-    if let Some(outer_ref) =
-        table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
-    {
-        if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
-            table_references.add_joined_table(JoinedTable {
-                op: Operation::default_scan_for(&outer_ref.table),
-                table: outer_ref.table.clone(),
-                identifier: outer_ref.identifier.clone(),
-                internal_id: program.table_reference_counter.next(),
-                join_info: None,
-                col_used_mask: ColumnUsedMask::default(),
-                column_use_counts: Vec::new(),
-                expression_index_usages: Vec::new(),
-                database_id,
-                indexed: None,
-            });
-            return Ok(());
+    if qualified_name.db_name.is_none() {
+        if let Some(outer_ref) =
+            table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
+        {
+            if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
+                table_references.add_joined_table(JoinedTable {
+                    op: Operation::default_scan_for(&outer_ref.table),
+                    table: outer_ref.table.clone(),
+                    identifier: outer_ref.identifier.clone(),
+                    internal_id: program.table_reference_counter.next(),
+                    join_info: None,
+                    col_used_mask: ColumnUsedMask::default(),
+                    column_use_counts: Vec::new(),
+                    expression_index_usages: Vec::new(),
+                    database_id,
+                    indexed: None,
+                });
+                return Ok(());
+            }
         }
     }
 
