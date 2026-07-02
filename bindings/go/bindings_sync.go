@@ -72,6 +72,16 @@ type TursoSyncDatabaseConfig struct {
 	RemoteEncryptionKey string
 	// optional encryption cipher name (e.g. "aes256gcm", "chacha20poly1305")
 	RemoteEncryptionCipher string
+	// optional cap on the number of CDC operations packed into a single push HTTP batch.
+	// when > 0, push splits on transaction boundaries once the current batch has accumulated
+	// at least this many operations. a single user transaction is never split across batches.
+	// 0 (default) sends the entire change set in one batch.
+	PushOperationsThreshold int
+	// optional hint, in bytes, that splits the bootstrap download into multiple
+	// /pull-updates HTTP requests of >= this many bytes each. when > 0, the bootstrap is fetched
+	// in chunks. 0 (default) bootstraps in a single round-trip. no-op when partial-sync uses the
+	// query bootstrap strategy.
+	PullBytesThreshold int
 }
 
 // TursoSyncStats holds sync engine stats.
@@ -127,6 +137,8 @@ type turso_sync_database_config_t struct {
 	partial_bootstrap_prefetch        bool
 	remote_encryption_key             uintptr // const char*
 	remote_encryption_cipher          uintptr // const char*
+	push_operations_threshold         uintptr // size_t
+	pull_bytes_threshold              uintptr // size_t
 }
 
 type turso_sync_io_http_request_t struct {
@@ -414,6 +426,8 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 	if syncConfig.RemoteEncryptionCipher != "" {
 		encryptionCipherBytes, csync.remote_encryption_cipher = makeCStringBytes(syncConfig.RemoteEncryptionCipher)
 	}
+	csync.push_operations_threshold = uintptr(syncConfig.PushOperationsThreshold)
+	csync.pull_bytes_threshold = uintptr(syncConfig.PullBytesThreshold)
 
 	var db *turso_sync_database_t
 	var errPtr *byte

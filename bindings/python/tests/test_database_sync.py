@@ -7,7 +7,7 @@ import time
 import turso
 import turso.sync
 
-from .utils import TursoServer
+from .utils import CountingProxy, TursoServer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
 
@@ -239,3 +239,29 @@ def test_configuration_persistence():
             conn2.pull()
             assert conn2.execute("SELECT * FROM t").fetchall() == [(42,), (43,)]
             conn2.close()
+
+
+def test_pull_bytes_threshold():
+    # Verify that pull_bytes_threshold is propagated to the sync engine: when set,
+    # the bootstrap download is split into multiple /pull-updates HTTP requests
+    # instead of a single round-trip.
+    with TursoServer() as server:
+        server.db_sql("CREATE TABLE big(x INTEGER PRIMARY KEY, y BLOB)")
+        server.db_sql("INSERT INTO big SELECT value, randomblob(1024) FROM generate_series(1, 50)")
+
+        # bootstrap fetches the seeded db into a fresh in-memory client through a
+        # counting proxy and returns how many /pull-updates requests it issued.
+        def bootstrap(threshold):
+            with CountingProxy(server.db_url(), "/pull-updates") as proxy:
+                conn = turso.sync.connect(":memory:", proxy.url(), pull_bytes_threshold=threshold)
+                assert conn.execute("SELECT COUNT(*) FROM big").fetchall() == [(50,)]
+                conn.close()
+                return proxy.count
+
+        # Default bootstrap is a single round-trip; an 8KB threshold (2 pages per
+        # chunk) over a multi-page db must split into strictly more requests. If
+        # the setting were not propagated both runs would issue the same count.
+        without_threshold = bootstrap(None)
+        with_threshold = bootstrap(8192)
+        assert with_threshold > without_threshold
+        assert with_threshold > 1

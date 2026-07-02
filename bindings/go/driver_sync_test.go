@@ -9,10 +9,14 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -755,4 +759,80 @@ func TestSyncLargeSchema(t *testing.T) {
 	require.Nil(t, rows.Scan(&count))
 	require.Equal(t, count, numTables)
 	rows.Close()
+}
+
+// newCountingProxy starts a transparent reverse proxy in front of upstream that
+// counts every POST request whose path ends with pathSuffix. It is used to
+// observe how the sync engine splits its HTTP traffic into batches.
+func newCountingProxy(t *testing.T, upstream, pathSuffix string, counter *atomic.Int64) *httptest.Server {
+	t.Helper()
+	target, err := url.Parse(upstream)
+	require.Nil(t, err)
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	director := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		director(req)
+		// preserve the host the upstream expects (matters for cloud subdomains,
+		// harmless for the local sync server)
+		req.Host = target.Host
+	}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, pathSuffix) {
+			counter.Add(1)
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+}
+
+// TestSyncPullBytesThreshold verifies that the PullBytesThreshold setting is
+// propagated to the sync engine: when set, the bootstrap download is split into
+// multiple /pull-updates HTTP requests instead of a single round-trip.
+func TestSyncPullBytesThreshold(t *testing.T) {
+	server, err := NewTursoServer()
+	require.Nil(t, err)
+	t.Cleanup(func() { server.Close() })
+
+	// Seed a remote with enough data to span many 4KB pages.
+	_, err = server.DbSql("CREATE TABLE big(x INTEGER PRIMARY KEY, y BLOB)")
+	require.Nil(t, err)
+	_, err = server.DbSql("INSERT INTO big SELECT value, randomblob(1024) FROM generate_series(1, 50)")
+	require.Nil(t, err)
+
+	// bootstrap fetches the seeded db into a fresh in-memory client through a
+	// counting proxy and returns how many /pull-updates requests it issued.
+	bootstrap := func(threshold int) int64 {
+		var pullUpdates atomic.Int64
+		proxy := newCountingProxy(t, server.DbUrl, "/pull-updates", &pullUpdates)
+		defer proxy.Close()
+
+		db, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
+			Path:               ":memory:",
+			ClientName:         "turso-sync-go",
+			RemoteUrl:          proxy.URL,
+			PullBytesThreshold: threshold,
+		})
+		require.Nil(t, err)
+
+		// bootstrapped data must be intact regardless of chunking
+		conn, err := db.Connect(context.Background())
+		require.Nil(t, err)
+		rows, err := conn.QueryContext(context.Background(), "SELECT COUNT(*) FROM big")
+		require.Nil(t, err)
+		var count int
+		require.True(t, rows.Next())
+		require.Nil(t, rows.Scan(&count))
+		require.Equal(t, 50, count)
+		rows.Close()
+		conn.Close()
+
+		return pullUpdates.Load()
+	}
+
+	// Default bootstrap is a single round-trip; an 8KB threshold (2 pages per
+	// chunk) over a multi-page db must split into strictly more requests. If the
+	// setting were not propagated both runs would issue the same count.
+	withoutThreshold := bootstrap(0)
+	withThreshold := bootstrap(8192)
+	require.Greater(t, withThreshold, withoutThreshold)
+	require.Greater(t, withThreshold, int64(1))
 }
