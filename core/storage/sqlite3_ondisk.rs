@@ -62,7 +62,9 @@ use crate::io::{Buffer, Completion, FileSyncType, ReadComplete};
 use crate::numeric::Numeric;
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
-use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
+use crate::storage::database::{
+    page_codec_size_mismatch, DatabaseStorage, PageCodecLocation, PageTransform,
+};
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
 use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -640,7 +642,7 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
         })
     };
     let c = Completion::new_write(write_complete);
-    let io_ctx = pager.io_ctx.read();
+    let io_ctx = pager.io_ctx.read().clone();
     page_source.write_page(page_id, buffer, &io_ctx, c)
 }
 
@@ -729,7 +731,7 @@ pub fn write_pages_vectored(
                 done_cl.store(true, Ordering::Release);
             }
         });
-        let io_ctx = pager.io_ctx.read();
+        let io_ctx = pager.io_ctx.read().clone();
         let bufs = std::mem::replace(&mut run_bufs, Vec::with_capacity(EST_BUFF_CAPACITY));
         match pager
             .db_file
@@ -1965,8 +1967,8 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
     let buf = buffer_pool.get_page();
     let buf = Arc::new(buf);
 
-    match io_ctx.encryption_or_checksum() {
-        EncryptionOrChecksum::Encryption(ctx) => {
+    match io_ctx.page_transform() {
+        PageTransform::Encryption(ctx) => {
             let encryption_ctx = ctx.clone();
             let original_complete = complete;
 
@@ -2001,7 +2003,60 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let new_completion = Completion::new_read(buf, decrypt_complete);
             io.pread(offset, new_completion)
         }
-        EncryptionOrChecksum::Checksum(ctx) => {
+        PageTransform::PageCodec(ctx) => {
+            let page_codec = ctx.clone();
+            let original_complete = complete;
+
+            let decode_complete = Box::new(
+                move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                    let Ok((encoded_buf, bytes_read)) = res else {
+                        return original_complete(res);
+                    };
+                    turso_assert_greater_than!(
+                        bytes_read,
+                        0,
+                        "expected to read data for encoded page",
+                        { "page_idx": page_idx }
+                    );
+                    match page_codec.decode_page(
+                        encoded_buf.as_slice(),
+                        page_idx,
+                        PageCodecLocation::Wal,
+                    ) {
+                        Ok(decoded_data) => {
+                            if decoded_data.len() != encoded_buf.len() {
+                                let err = page_codec_size_mismatch(
+                                    page_idx,
+                                    encoded_buf.len(),
+                                    decoded_data.len(),
+                                );
+                                tracing::error!(
+                                    "Page codec returned wrong-sized decoded WAL frame for page_idx={page_idx}: expected {}, got {}",
+                                    encoded_buf.len(),
+                                    decoded_data.len()
+                                );
+                                original_complete(Err(err));
+                                return Some(err);
+                            }
+                            encoded_buf.as_mut_slice().copy_from_slice(&decoded_data);
+                            original_complete(Ok((encoded_buf, bytes_read)))
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to decode WAL frame data for page_idx={page_idx}: {e}"
+                            );
+                            let err = CompletionError::DecryptionError { page_idx };
+                            original_complete(Err(err));
+                            Some(err)
+                        }
+                    }
+                },
+            );
+
+            let new_completion = Completion::new_read(buf, decode_complete);
+            io.pread(offset, new_completion)
+        }
+        PageTransform::Checksum(ctx) => {
             let checksum_ctx = ctx.clone();
             let original_c = complete;
             let verify_complete =
@@ -2029,7 +2084,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let c = Completion::new_read(buf, verify_complete);
             io.pread(offset, c)
         }
-        EncryptionOrChecksum::None => {
+        PageTransform::None => {
             let c = Completion::new_read(buf, complete);
             io.pread(offset, c)
         }

@@ -610,7 +610,7 @@ impl Connection {
                 db_opts,
                 None,
             )?;
-            let pager = Arc::new(db._init(None)?);
+            let pager = Arc::new(db._init(None, None)?);
             pager.set_initial_page_size(page_size)?;
             return Ok(TempDatabase {
                 db,
@@ -640,7 +640,7 @@ impl Connection {
                 db_opts,
                 None,
             )?;
-            let pager = Arc::new(db._init(None)?);
+            let pager = Arc::new(db._init(None, None)?);
             pager.set_initial_page_size(page_size)?;
             Ok(TempDatabase {
                 db,
@@ -659,7 +659,7 @@ impl Connection {
                 db_opts,
                 None,
             )?;
-            let pager = Arc::new(db._init(None)?);
+            let pager = Arc::new(db._init(None, None)?);
             pager.set_initial_page_size(page_size)?;
             Ok(TempDatabase { db, pager })
         }
@@ -675,7 +675,7 @@ impl Connection {
             self.make_temp_database_opts(),
             None,
         )?;
-        let pager = Arc::new(db._init(None)?);
+        let pager = Arc::new(db._init(None, None)?);
         pager.set_initial_page_size(self.get_page_size())?;
         Ok(TempDatabase {
             db,
@@ -3084,9 +3084,11 @@ impl Connection {
                     }));
                 }
                 AttachDatabaseState::Init(init) => {
-                    let mut pager = Arc::new(crate::return_if_io!(init
-                        .db
-                        ._init_nonblock(&mut init.init_st, init.encryption_key.as_ref(),)));
+                    let mut pager = Arc::new(crate::return_if_io!(init.db._init_nonblock(
+                        &mut init.init_st,
+                        init.encryption_key.as_ref(),
+                        None,
+                    )));
 
                     if !init.attached_is_fresh {
                         self.reject_initialized_attach_mismatches(&init.alias, &init.db, &pager)?;
@@ -4183,9 +4185,10 @@ impl Connection {
 
     fn ensure_can_change_encryption_settings(&self) -> Result<()> {
         let pager = self.pager.load();
-        if pager.is_encryption_ctx_set() {
+        if pager.has_content_transform() {
             return Err(LimboError::InvalidArgument(
-                "cannot reset encryption attributes if already set in the session".to_string(),
+                "cannot reset encryption attributes after a page transform is set in the session"
+                    .to_string(),
             ));
         }
         if self.db.get_mv_store().is_some() {
