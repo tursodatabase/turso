@@ -1462,13 +1462,14 @@ impl SimulatorEnv {
                     conn.execute(format!("PRAGMA cache_size = {}", self.opts.cache_size))
                         .expect("set pragma cache_size");
                 }
+                register_simulator_turso_udfs(&conn);
                 self.connections[connection_index] = SimConnection::LimboConnection(conn);
             }
             SimulationType::Differential => {
-                self.connections[connection_index] = SimConnection::SQLiteConnection(
-                    rusqlite::Connection::open(self.get_db_path())
-                        .expect("Failed to open SQLite connection"),
-                );
+                let conn = rusqlite::Connection::open(self.get_db_path())
+                    .expect("Failed to open SQLite connection");
+                register_simulator_rusqlite_udfs(&conn);
+                self.connections[connection_index] = SimConnection::SQLiteConnection(conn);
             }
         };
 
@@ -1599,6 +1600,66 @@ impl SimConnection {
             }
             SimConnection::Disconnected => {}
         }
+    }
+}
+
+pub(crate) fn register_simulator_turso_udfs(conn: &turso_core::Connection) {
+    for &name in sql_generation::model::query::predicate::SIM_UDF_NAMES {
+        let eval_name = name.to_string();
+        conn.register_scalar_function(name, 1, true, move |args| {
+            let argument = args.first().cloned().unwrap_or(turso_core::Value::Null);
+            Ok(
+                sql_generation::model::query::predicate::eval_sim_udf(&eval_name, &argument)
+                    .unwrap_or(turso_core::Value::Null),
+            )
+        })
+        .expect("register simulator scalar UDF on turso connection");
+    }
+}
+
+pub(crate) fn register_simulator_rusqlite_udfs(conn: &rusqlite::Connection) {
+    use rusqlite::functions::FunctionFlags;
+    for &name in sql_generation::model::query::predicate::SIM_UDF_NAMES {
+        let eval_name = name.to_string();
+        conn.create_scalar_function(
+            name,
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            move |ctx| {
+                let argument = rusqlite_value_to_core(ctx.get_raw(0));
+                let result =
+                    sql_generation::model::query::predicate::eval_sim_udf(&eval_name, &argument)
+                        .unwrap_or(turso_core::Value::Null);
+                Ok(core_value_to_rusqlite(result))
+            },
+        )
+        .expect("register simulator scalar UDF on sqlite connection");
+    }
+}
+
+fn rusqlite_value_to_core(value: rusqlite::types::ValueRef<'_>) -> turso_core::Value {
+    match value {
+        rusqlite::types::ValueRef::Null => turso_core::Value::Null,
+        rusqlite::types::ValueRef::Integer(n) => turso_core::Value::from_i64(n),
+        rusqlite::types::ValueRef::Real(f) => turso_core::Value::from_f64(f),
+        rusqlite::types::ValueRef::Text(bytes) => {
+            turso_core::Value::build_text(String::from_utf8_lossy(bytes).into_owned())
+        }
+        rusqlite::types::ValueRef::Blob(bytes) => turso_core::Value::Blob(bytes.to_vec()),
+    }
+}
+
+fn core_value_to_rusqlite(value: turso_core::Value) -> rusqlite::types::Value {
+    match value {
+        turso_core::Value::Null => rusqlite::types::Value::Null,
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(n)) => {
+            rusqlite::types::Value::Integer(n)
+        }
+        turso_core::Value::Numeric(turso_core::Numeric::Float(f)) => {
+            rusqlite::types::Value::Real(f64::from(f))
+        }
+        turso_core::Value::Text(text) => rusqlite::types::Value::Text(text.as_str().to_string()),
+        turso_core::Value::Blob(blob) => rusqlite::types::Value::Blob(blob),
     }
 }
 

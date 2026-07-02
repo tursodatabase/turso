@@ -182,6 +182,14 @@ pub static SCALAR_FUNCTIONS: &[FunctionDef] = &[
         .args(&[ANY])
         .returns(DataType::Integer)
         .category(FunctionCategory::Math),
+    FunctionDef::new("sim_double")
+        .args(&[INT])
+        .returns(DataType::Integer)
+        .category(FunctionCategory::Math),
+    FunctionDef::new("sim_is_even")
+        .args(&[INT])
+        .returns(DataType::Integer)
+        .category(FunctionCategory::Math),
     FunctionDef::new("RANDOM")
         .arity(0, 0)
         .returns(DataType::Integer)

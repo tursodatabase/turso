@@ -10,7 +10,7 @@ use std::{
         Arc,
     },
 };
-use turso_core::{Connection, LimboError, StepResult};
+use turso_core::{Connection, LimboError, StepResult, Value};
 use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarDerive,
     ScalarFunc, ScalarFunction, StepFunction, Value as ExtValue, ValueDestructor,
@@ -811,6 +811,176 @@ fn managed_aggregate_errors_leave_connection_usable(tmp_db: TempDatabase) -> any
         counters.aggregate_inits.load(AtomicOrdering::SeqCst),
         counters.aggregate_drops.load(AtomicOrdering::SeqCst)
     );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn closure_scalar_round_trips_every_value_type(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_scalar_function("closure_echo", 1, true, |args| Ok(args[0].clone()))?;
+
+    let integers: Vec<(i64,)> = conn.exec_rows("SELECT closure_echo(42)");
+    assert_eq!(integers, vec![(42,)]);
+    let floats: Vec<(f64,)> = conn.exec_rows("SELECT closure_echo(3.5)");
+    assert_eq!(floats, vec![(3.5,)]);
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT closure_echo('hi')"),
+        vec![vec![SqliteValue::Text("hi".to_string())]]
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT closure_echo(x'01ff')"),
+        vec![vec![SqliteValue::Blob(vec![0x01, 0xff])]]
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT closure_echo(NULL)"),
+        vec![vec![SqliteValue::Null]]
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn closure_scalar_enforces_fixed_arity(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_scalar_function("udf_pair", 2, true, |args| {
+        Ok(Value::from_i64(args.len() as i64))
+    })?;
+
+    let matched: Vec<(i64,)> = conn.exec_rows("SELECT udf_pair(10, 20)");
+    assert_eq!(matched, vec![(2,)]);
+    assert!(conn.prepare("SELECT udf_pair(10)").is_err());
+    assert!(conn.prepare("SELECT udf_pair(10, 20, 30)").is_err());
+    Ok(())
+}
+
+#[turso_macros::test]
+fn closure_scalar_variadic_receives_every_argument(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_scalar_function("udf_argcount", -1, true, |args| {
+        Ok(Value::from_i64(args.len() as i64))
+    })?;
+
+    let none: Vec<(i64,)> = conn.exec_rows("SELECT udf_argcount()");
+    assert_eq!(none, vec![(0,)]);
+    let several: Vec<(i64,)> = conn.exec_rows("SELECT udf_argcount(1, 'a', x'00')");
+    assert_eq!(several, vec![(3,)]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn closure_scalar_propagates_errors(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_scalar_function("udf_boom", 1, false, |_args| {
+        Err(LimboError::InvalidArgument("kaboom".to_string()))
+    })?;
+
+    let err = conn.execute("SELECT udf_boom(1)").unwrap_err();
+    assert!(matches!(err, LimboError::ExtensionError(_)));
+    assert!(err.to_string().contains("kaboom"));
+
+    let usable: Vec<(i64,)> = conn.exec_rows("SELECT 1");
+    assert_eq!(usable, vec![(1,)]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn closure_scalar_reports_arity_and_determinism(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_scalar_function("udf_pure", 1, true, |args| Ok(args[0].clone()))?;
+    conn.register_scalar_function("udf_impure", 2, false, |_args| Ok(Value::Null))?;
+
+    let function_list: Vec<(String, i64, String, String, i64, i64)> =
+        conn.exec_rows("PRAGMA function_list");
+    let pure = function_list
+        .iter()
+        .find(|(name, ..)| name == "udf_pure")
+        .expect("udf_pure should be listed");
+    assert_eq!(pure.2, "s");
+    assert_eq!(pure.4, 1);
+    assert_ne!(pure.5 & 0x800, 0);
+
+    let impure = function_list
+        .iter()
+        .find(|(name, ..)| name == "udf_impure")
+        .expect("udf_impure should be listed");
+    assert_eq!(impure.4, 2);
+    assert_eq!(impure.5 & 0x800, 0);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn closure_scalar_registration_is_per_connection(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn_a = tmp_db.connect_limbo();
+    let conn_b = tmp_db.connect_limbo();
+    conn_a.register_scalar_function("udf_only_a", 0, true, |_args| Ok(Value::from_i64(7)))?;
+
+    let visible: Vec<(i64,)> = conn_a.exec_rows("SELECT udf_only_a()");
+    assert_eq!(visible, vec![(7,)]);
+    let err = conn_b.prepare("SELECT udf_only_a()").unwrap_err();
+    assert!(err.to_string().contains("no such function"));
+    Ok(())
+}
+
+#[turso_macros::test]
+fn closure_scalar_reregistration_replaces_and_unregister_removes(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_scalar_function("udf_v", 0, true, |_args| Ok(Value::from_i64(1)))?;
+    let first: Vec<(i64,)> = conn.exec_rows("SELECT udf_v()");
+    assert_eq!(first, vec![(1,)]);
+
+    conn.register_scalar_function("udf_v", 0, true, |_args| Ok(Value::from_i64(2)))?;
+    let second: Vec<(i64,)> = conn.exec_rows("SELECT udf_v()");
+    assert_eq!(second, vec![(2,)]);
+
+    conn.unregister_scalar_function("udf_v")?;
+    let err = conn.prepare("SELECT udf_v()").unwrap_err();
+    assert!(err.to_string().contains("no such function"));
+    assert!(conn.unregister_scalar_function("udf_v").is_err());
+    Ok(())
+}
+
+#[turso_macros::test]
+fn closure_scalar_supports_multiple_arities(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_scalar_function("udf_n", 1, true, |_args| Ok(Value::from_i64(1)))?;
+    conn.register_scalar_function("udf_n", 2, true, |_args| Ok(Value::from_i64(2)))?;
+    conn.register_scalar_function("udf_n", -1, true, |args| {
+        Ok(Value::from_i64(100 + args.len() as i64))
+    })?;
+
+    let one: Vec<(i64,)> = conn.exec_rows("SELECT udf_n(10)");
+    assert_eq!(one, vec![(1,)]);
+    let two: Vec<(i64,)> = conn.exec_rows("SELECT udf_n(10, 20)");
+    assert_eq!(two, vec![(2,)]);
+    let variadic: Vec<(i64,)> = conn.exec_rows("SELECT udf_n(10, 20, 30)");
+    assert_eq!(variadic, vec![(103,)]);
+
+    conn.register_scalar_function("udf_n", 1, true, |_args| Ok(Value::from_i64(11)))?;
+    let replaced: Vec<(i64,)> = conn.exec_rows("SELECT udf_n(10)");
+    assert_eq!(replaced, vec![(11,)]);
+    let unchanged: Vec<(i64,)> = conn.exec_rows("SELECT udf_n(10, 20)");
+    assert_eq!(unchanged, vec![(2,)]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn closure_scalar_shadows_builtin_functions(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let builtin: Vec<(i64,)> = conn.exec_rows("SELECT abs(-5)");
+    assert_eq!(builtin, vec![(5,)]);
+
+    conn.register_scalar_function("abs", 1, true, |_args| Ok(Value::from_i64(42)))?;
+    let shadowed: Vec<(i64,)> = conn.exec_rows("SELECT abs(-5)");
+    assert_eq!(shadowed, vec![(42,)]);
+
+    let other = tmp_db.connect_limbo();
+    let other_builtin: Vec<(i64,)> = other.exec_rows("SELECT abs(-5)");
+    assert_eq!(other_builtin, vec![(5,)]);
+
+    conn.unregister_scalar_function("abs")?;
+    let restored: Vec<(i64,)> = conn.exec_rows("SELECT abs(-5)");
+    assert_eq!(restored, vec![(5,)]);
     Ok(())
 }
 

@@ -242,6 +242,30 @@ impl Connection {
         conn.set_busy_timeout(duration);
         Ok(())
     }
+
+    pub fn register_scalar_function<F>(
+        &self,
+        name: &str,
+        arity: i32,
+        deterministic: bool,
+        function: F,
+    ) -> Result<()>
+    where
+        F: Fn(&[turso_core::Value]) -> turso_core::Result<turso_core::Value>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let conn = self.get_inner_connection()?;
+        conn.register_scalar_function(name, arity, deterministic, function)?;
+        Ok(())
+    }
+
+    pub fn unregister_scalar_function(&self, name: &str) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.unregister_scalar_function(name)?;
+        Ok(())
+    }
 }
 
 impl Debug for Connection {

@@ -905,6 +905,30 @@ impl TursoConnection {
         result_code_to_result(result, "register external scalar function")
     }
 
+    pub fn register_scalar_function<F>(
+        &self,
+        name: &str,
+        arity: i32,
+        deterministic: bool,
+        function: F,
+    ) -> Result<(), TursoError>
+    where
+        F: Fn(&[turso_core::Value]) -> turso_core::Result<turso_core::Value>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.connection
+            .register_scalar_function(name, arity, deterministic, function)
+            .map_err(TursoError::from)
+    }
+
+    pub fn unregister_scalar_function(&self, name: &str) -> Result<(), TursoError> {
+        self.connection
+            .unregister_scalar_function(name)
+            .map_err(TursoError::from)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn register_external_aggregate_function(
         &self,

@@ -35,6 +35,65 @@ fn apply_turso_experimental_features(mut builder: Builder) -> Builder {
     builder
 }
 
+fn register_test_udf(conn: &Connection) -> Result<(), BackendError> {
+    use turso::core::{LimboError, Numeric, Value as CoreValue};
+
+    conn.register_scalar_function("test_udf", -1, true, |args| {
+        let Some(CoreValue::Text(behavior)) = args.first() else {
+            return Err(LimboError::InvalidArgument(
+                "test_udf: first argument must be a behavior name".to_string(),
+            ));
+        };
+        let rest = &args[1..];
+        match behavior.as_str() {
+            "echo" => Ok(rest.first().cloned().unwrap_or(CoreValue::Null)),
+            "const" => Ok(CoreValue::from_i64(42)),
+            "null" => Ok(CoreValue::Null),
+            "argc" => Ok(CoreValue::from_i64(rest.len() as i64)),
+            "add" => {
+                let sum = rest
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        CoreValue::Numeric(Numeric::Integer(value)) => Some(*value),
+                        _ => None,
+                    })
+                    .sum::<i64>();
+                Ok(CoreValue::from_i64(sum))
+            }
+            "concat" => {
+                let combined: String = rest
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        CoreValue::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                Ok(CoreValue::build_text(combined))
+            }
+            "upper" => {
+                let text = match rest.first() {
+                    Some(CoreValue::Text(text)) => text.as_str().to_uppercase(),
+                    _ => String::new(),
+                };
+                Ok(CoreValue::build_text(text))
+            }
+            "len" => {
+                let length = match rest.first() {
+                    Some(CoreValue::Text(text)) => text.as_str().chars().count() as i64,
+                    Some(CoreValue::Blob(blob)) => blob.len() as i64,
+                    _ => 0,
+                };
+                Ok(CoreValue::from_i64(length))
+            }
+            "boom" => Err(LimboError::InvalidArgument("test_udf: boom".to_string())),
+            other => Err(LimboError::InvalidArgument(format!(
+                "test_udf: unknown behavior '{other}'"
+            ))),
+        }
+    })
+    .map_err(|e| BackendError::CreateDatabase(e.to_string()))
+}
+
 /// Native Rust backend using Turso bindings directly
 pub struct RustBackend {
     /// Resolver for default database paths
@@ -130,6 +189,8 @@ impl SqlBackend for RustBackend {
         let conn = db
             .connect()
             .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;
+
+        register_test_udf(&conn)?;
 
         // Prepend MVCC pragma if enabled (skip for readonly databases; the generated readonly DBs are already in MVCC mode).
         if self.mvcc && !config.readonly {

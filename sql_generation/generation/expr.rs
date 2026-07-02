@@ -7,7 +7,7 @@ use crate::{
         frequency, gen_random_text, one_of, pick, pick_index, Arbitrary, ArbitraryFrom,
         ArbitrarySized, ArbitrarySizedFrom, GenerationContext,
     },
-    model::table::SimValue,
+    model::{query::predicate::SIM_UDF_NAMES, table::SimValue},
 };
 
 impl<T> Arbitrary for Box<T>
@@ -169,6 +169,21 @@ impl ArbitrarySized for Expr {
                                         UnaryOperator::arbitrary(rng, context),
                                         Box::arbitrary_sized(rng, context, size - 1),
                                     )
+                                }),
+                                Box::new(|rng: &mut R| {
+                                    let name =
+                                        SIM_UDF_NAMES[rng.random_range(0..SIM_UDF_NAMES.len())];
+                                    Expr::FunctionCall {
+                                        name: Name::exact(name.to_string()),
+                                        distinctness: None,
+                                        args: vec![Box::arbitrary_sized(rng, context, size - 1)],
+                                        order_by: Vec::new(),
+                                        within_group: Vec::new(),
+                                        filter_over: ast::FunctionTail {
+                                            filter_clause: None,
+                                            over_clause: None,
+                                        },
+                                    }
                                 }),
                                 // TODO: skip Exists for now
                                 // TODO: skip Function Call for now

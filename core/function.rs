@@ -111,6 +111,12 @@ impl ExtFunc {
         }
     }
 
+    pub fn argc(&self) -> i32 {
+        match self {
+            Self::Scalar { argc, .. } | Self::Aggregate { argc, .. } => *argc,
+        }
+    }
+
     pub fn is_aggregate(&self) -> bool {
         matches!(self, Self::Aggregate { .. })
     }
