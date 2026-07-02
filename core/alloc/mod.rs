@@ -188,7 +188,7 @@ macro_rules! __turso_alloc_try_vec {
                 <$crate::alloc::Vec<_> as $crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
                     $crate::__turso_alloc_vec_count!($($element),+),
                 )?;
-            $(values.try_push($element)?;)+
+            $(values.push($element)?;)+
             Ok::<_, $crate::alloc::TryReserveError>(values)
         })()
     }};

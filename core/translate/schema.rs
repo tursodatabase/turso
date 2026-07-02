@@ -2115,7 +2115,7 @@ pub fn translate_drop_table(
         // cursor id 1
         let sqlite_schema_cursor_id_1 =
             program.alloc_cursor_id(CursorType::BTreeTable(schema_table.clone()));
-        let columns = crate::alloc::vec![Column::new(
+        let columns = crate::alloc::try_vec![Column::new(
             Some("rowid".to_string()),
             "INTEGER".to_string(),
             None,
@@ -2123,7 +2123,7 @@ pub fn translate_drop_table(
             Type::Integer,
             None,
             ColDef::default(),
-        )];
+        )]?;
         let simple_table_rc = Arc::new(BTreeTable::new(
             0, // root_page, not relevant for ephemeral table definition
             "ephemeral_scratch".to_string(),

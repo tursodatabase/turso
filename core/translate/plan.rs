@@ -2288,8 +2288,7 @@ impl JoinedTable {
                     ColDef::default(),
                 )
             })
-            .try_collect::<alloc::Vec<_>>()
-            .expect(crate::alloc::ALLOC_ERR_MSG);
+            .try_collect::<alloc::Vec<_>>()?;
 
         for (i, column) in columns.iter_mut().enumerate() {
             if super::expr::expr_is_array(
@@ -2402,8 +2401,7 @@ impl JoinedTable {
                     ColDef::default(),
                 )
             })
-            .try_collect::<alloc::Vec<_>>()
-            .expect(crate::alloc::ALLOC_ERR_MSG);
+            .try_collect::<alloc::Vec<_>>()?;
 
         for (i, column) in columns.iter_mut().enumerate() {
             if super::expr::expr_is_array(&result_columns[i].expr, Some(table_references)) {

@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt};
 use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
 use crate::translate::collate::CollationSeq;
@@ -1573,7 +1573,7 @@ fn find_best_access_method_for_subquery(
     }
 
     let ephemeral_index =
-        materialized_subquery_ephemeral_index(rhs_table, subquery, &key_col_positions);
+        materialized_subquery_ephemeral_index(rhs_table, subquery, &key_col_positions)?;
     let (iter_dir, _is_index_ordered, order_satisfiability_bonus) =
         materialized_subquery_order_properties(
             rhs_table,
@@ -1655,8 +1655,9 @@ fn materialized_subquery_ephemeral_index(
     rhs_table: &JoinedTable,
     subquery: &FromClauseSubquery,
     key_col_positions: &[usize],
-) -> Arc<Index> {
-    let mut index_columns: crate::alloc::Vec<IndexColumn> = crate::alloc::vec![];
+) -> Result<Arc<Index>> {
+    let mut index_columns: crate::alloc::Vec<IndexColumn> =
+        crate::alloc::Vec::try_with_capacity_ext(subquery.columns.len())?;
     let mut seen_col_positions = std::collections::HashSet::new();
 
     for &col_pos in key_col_positions {
@@ -1667,6 +1668,7 @@ fn materialized_subquery_ephemeral_index(
         if !seen_col_positions.insert(col_pos) {
             continue;
         }
+        // Capacity is preallocated to subquery.columns.len(); key columns are deduplicated.
         index_columns.push(IndexColumn {
             name: column.name.clone().unwrap_or_default(),
             order: SortOrder::Asc,
@@ -1681,6 +1683,7 @@ fn materialized_subquery_ephemeral_index(
         if seen_col_positions.contains(&col_pos) {
             continue;
         }
+        // Capacity is preallocated to subquery.columns.len(); non-key columns fill the remainder.
         index_columns.push(IndexColumn {
             name: column.name.clone().unwrap_or_default(),
             order: SortOrder::Asc,
@@ -1691,7 +1694,7 @@ fn materialized_subquery_ephemeral_index(
         });
     }
 
-    Arc::new(Index {
+    Ok(Arc::new(Index {
         // Match the runtime autoindex naming so EQP and bytecode make it clear
         // that this is a synthetic probe/index-on-temp-table path.
         name: format!("ephemeral_subquery_{}", rhs_table.internal_id),
@@ -1704,7 +1707,7 @@ fn materialized_subquery_ephemeral_index(
         has_rowid: true,
         index_method: None,
         on_conflict: None,
-    })
+    }))
 }
 
 /// Decide whether the synthetic materialized-subquery index would also satisfy
