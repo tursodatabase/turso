@@ -5893,7 +5893,7 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
 ///   ordered-set aggregates, the collation / percentile fraction to use at finalize time.
 fn update_agg_payload(
     func: &AggFunc,
-    arg: &Value, // first argument
+    arg: &Value,               // first argument
     maybe_arg2: Option<Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut crate::alloc::Vec<Value>,
     collation: CollationSeq,
@@ -6593,7 +6593,6 @@ pub fn op_agg_step(
         }
         _ => {
             // Second argument (delimiter for group_concat/json, fraction for percentiles),
-            // read before we take the accumulator borrow.
             let maybe_arg2 = match func {
                 AggFunc::GroupConcat | AggFunc::StringAgg => {
                     Some(state.registers[*delimiter].get_value().clone())
