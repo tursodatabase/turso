@@ -105,8 +105,9 @@ mod tests {
         resolve_local_replay_floor_change_id, should_replay_raw_pages_on_sql_conn,
         should_request_logical_pull, should_use_logical_mvcc_pull,
         stream_kind_applies_remote_pages, stream_kind_for_pull_updates_v1_result,
-        synced_change_id_after_remote_apply, DatabaseSyncEngine, DatabaseSyncEngineOpts,
-        ReplaceBaseApplyGuard, REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER,
+        synced_change_id_after_remote_apply, use_pushed_change_hint_for_local_replay,
+        DatabaseSyncEngine, DatabaseSyncEngineOpts, ReplaceBaseApplyGuard,
+        REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER,
     };
     use crate::{
         client_proto::{
@@ -312,7 +313,21 @@ mod tests {
     }
 
     #[test]
-    fn page_replay_uses_last_pushed_hint_when_requested_and_sync_row_is_stale() {
+    fn v1_page_replay_uses_remote_snapshot_sync_row_not_later_push_hint() {
+        assert!(!use_pushed_change_hint_for_local_replay(
+            DbChangesStreamKind::Pages,
+            false
+        ));
+        let floor = resolve_local_replay_floor_change_id(false, false, 7, 7, Some(12), 7, 34, 12);
+        assert_eq!(floor, Some(12));
+    }
+
+    #[test]
+    fn legacy_page_replay_can_use_last_pushed_hint_when_sync_row_is_stale() {
+        assert!(use_pushed_change_hint_for_local_replay(
+            DbChangesStreamKind::LegacyPages,
+            false
+        ));
         let floor = resolve_local_replay_floor_change_id(true, false, 7, 7, Some(12), 7, 34, 12);
         assert_eq!(floor, Some(34));
     }
@@ -2189,8 +2204,11 @@ fn synced_change_id_after_remote_apply(
     }
 }
 
-fn use_pushed_change_hint_for_local_replay(stream_kind: DbChangesStreamKind) -> bool {
-    !matches!(stream_kind, DbChangesStreamKind::Logical)
+fn use_pushed_change_hint_for_local_replay(
+    stream_kind: DbChangesStreamKind,
+    raw_page_replay_on_sql_conn: bool,
+) -> bool {
+    !raw_page_replay_on_sql_conn && matches!(stream_kind, DbChangesStreamKind::LegacyPages)
 }
 
 fn use_pushed_replay_floor_hint_for_local_replay(stream_kind: DbChangesStreamKind) -> bool {
@@ -3764,7 +3782,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     );
                 }
             }
-            let use_pushed_change_hint = use_pushed_change_hint_for_local_replay(stream_kind);
+            let use_pushed_change_hint =
+                use_pushed_change_hint_for_local_replay(stream_kind, raw_page_replay_on_sql_conn);
             let use_pushed_replay_floor_hint =
                 use_pushed_replay_floor_hint_for_local_replay(stream_kind);
 
