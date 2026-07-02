@@ -6776,9 +6776,9 @@ pub fn op_sorter_open(
 
     // Set the buffer size threshold to be roughly the same as the limit configured for the page-cache.
     let max_buffer_size_bytes = if cache_size < 0 {
-        (cache_size.abs() * 1024) as usize
+        (cache_size.unsigned_abs() as usize).saturating_mul(1024)
     } else {
-        (cache_size as usize) * page_size
+        (cache_size as usize).saturating_mul(page_size)
     };
     let mut order = Vec::try_with_capacity_ext(order_collations_nulls.len())
         .expect("TODO: fallible allocations");
