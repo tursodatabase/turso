@@ -104,6 +104,26 @@ await transaction([
 ]);
 ```
 
+### Fuzzy string matching
+
+The wasm build statically links the fuzzy string extension, so its SQL
+functions are available out of the box (no `.load` step required):
+
+```javascript
+import { connect } from '@tursodatabase/database-wasm';
+
+const db = await connect(':memory:');
+
+// Levenshtein edit distance
+const { dist } = await db.prepare('SELECT fuzzy_leven(?, ?) AS dist').get('kitten', 'sitting');
+console.log(dist); // 3
+```
+
+Available functions include `fuzzy_leven`, `fuzzy_damlev`, `fuzzy_editdist`,
+`fuzzy_hamming`, `fuzzy_jarowin`, `fuzzy_osadist`, `fuzzy_soundex`,
+`fuzzy_phonetic`, `fuzzy_caver`, `fuzzy_rsoundex`, `fuzzy_translit`, and
+`fuzzy_script`.
+
 ## API Reference
 
 For complete API documentation, see [JavaScript API Reference](https://github.com/tursodatabase/turso/blob/main/docs/javascript-api-reference.md).

@@ -99,8 +99,15 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
 
                 #(#static_vtabs)*
 
+                // The vfs registrations are wrapped in a block so the `cfg`
+                // gates the block itself. Without the braces, when an extension
+                // has no vfs entries `#(#static_vfs)*` expands to nothing and the
+                // attribute would instead apply to the trailing `ResultCode::OK`,
+                // stripping the return value on wasm targets (E0317).
                 #[cfg(not(target_family = "wasm"))]
-                #(#static_vfs)*
+                {
+                    #(#static_vfs)*
+                }
 
                 ::turso_ext::ResultCode::OK
               }
