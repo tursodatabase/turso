@@ -906,14 +906,26 @@ fn query_pragma(
         PragmaName::WalCheckpoint => {
             // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
             // Allocate two more here as one was allocated at the top.
+            let passive_allowed = connection.mv_store_for_db(database_id).is_none()
+                || connection.experimental_mvcc_passive_checkpoint_enabled();
             let mode = match value {
                 Some(ast::Expr::Name(name)) => {
                     let mode_name = normalize_ident(name.as_str());
-                    CheckpointMode::from_str(&mode_name).map_err(|e| {
+                    let mode = CheckpointMode::from_str(&mode_name).map_err(|e| {
                         LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}"))
-                    })?
+                    })?;
+                    if matches!(mode, CheckpointMode::Passive { .. }) && !passive_allowed {
+                        return Err(LimboError::InvalidArgument(
+                            "PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint"
+                                .into(),
+                        ));
+                    }
+                    mode
                 }
-                _ => CheckpointMode::Passive {
+                _ if passive_allowed => CheckpointMode::Passive {
+                    upper_bound_inclusive: None,
+                },
+                _ => CheckpointMode::Truncate {
                     upper_bound_inclusive: None,
                 },
             };
@@ -1404,12 +1416,37 @@ fn query_pragma(
         }
         PragmaName::IntegrityCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_integrity_check(schema, program, resolver, database_id, max_errors)?;
+            // integrity_check verifies the physical file, so for the main MVCC database use the
+            // latest shared schema (which reflects every committed+materialized object) rather
+            // than this connection's possibly-stale tx-snapshot — otherwise a table another
+            // connection just created and checkpointed is missing and its live page is
+            // mis-reported as orphaned.
+            let main_schema = (database_id == 0 && connection.mvcc_enabled())
+                .then(|| connection.db.schema.lock().clone());
+            let schema = main_schema.as_deref().unwrap_or(schema);
+            translate_integrity_check(
+                schema,
+                program,
+                resolver,
+                database_id,
+                max_errors,
+                &connection,
+            )?;
             Ok(TransactionMode::Read)
         }
         PragmaName::QuickCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_quick_check(schema, program, resolver, database_id, max_errors)?;
+            let main_schema = (database_id == 0 && connection.mvcc_enabled())
+                .then(|| connection.db.schema.lock().clone());
+            let schema = main_schema.as_deref().unwrap_or(schema);
+            translate_quick_check(
+                schema,
+                program,
+                resolver,
+                database_id,
+                max_errors,
+                &connection,
+            )?;
             Ok(TransactionMode::Read)
         }
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
