@@ -2926,7 +2926,7 @@ pub fn halt(
 ) -> Result<InsnFunctionStepResult> {
     let mv_store = program.connection.mv_store();
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
-    let owns_auto_txn = state.owns_auto_txn();
+    let can_autocommit_now = state.can_autocommit_now(&program.connection);
 
     // Check if we're resuming from a FAIL commit I/O wait.
     // If pending_fail_error is set, we were in the middle of committing partial changes
@@ -3003,7 +3003,7 @@ pub fn halt(
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
         // Note: ON CONFLICT FAIL does NOT apply to FK violations, so we check for those first.
-        if program.resolve_type == ResolveType::Fail && owns_auto_txn {
+        if program.resolve_type == ResolveType::Fail && can_autocommit_now {
             // Check for immediate FK violations - FK errors don't respect ON CONFLICT
             if program.connection.foreign_keys_enabled()
                 && state.get_fk_immediate_violations_during_stmt() > 0
@@ -3035,9 +3035,9 @@ pub fn halt(
     }
 
     tracing::trace!(
-        "halt(auto_commit={}, owns_auto_txn={})",
+        "halt(auto_commit={}, can_autocommit_now={})",
         auto_commit,
-        owns_auto_txn
+        can_autocommit_now
     );
 
     // Check for immediate foreign key violations.
@@ -3057,7 +3057,7 @@ pub fn halt(
     if auto_commit {
         // In autocommit mode, a statement that leaves deferred violations must fail here,
         // and it also ends the transaction.
-        if owns_auto_txn && program.connection.foreign_keys_enabled() {
+        if can_autocommit_now && program.connection.foreign_keys_enabled() {
             let deferred_violations = program
                 .connection
                 .fk_deferred_violations
@@ -3079,7 +3079,7 @@ pub fn halt(
             }
         }
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
-        if owns_auto_txn {
+        if can_autocommit_now {
             vtab_commit_all(&program.connection)?;
             index_method_pre_commit_all(state, pager)?;
             // Sequence backing-table compaction and sqlite_sequence sync
@@ -3106,6 +3106,25 @@ pub fn halt(
             // Another root statement may own the implicit autocommit
             // transaction. This statement can finish, but must not commit or
             // roll back connection-level state it did not start.
+            //
+            // FIXME: when this statement is a writer in MVCC mode, deferring
+            // its commit to the last sibling statement means the writer's
+            // caller observes success before the changes are durable. If the
+            // shared transaction then ends in a rollback — the last sibling
+            // reader is reset or dropped mid-scan, or a later joining writer
+            // errors or is abandoned after changing rows — the finished
+            // writer's changes are silently discarded
+            // (see test_mvcc_completed_writer_changes_lost_when_last_reader_abandoned).
+            // SQLite never has this window: it commits at the writer's own
+            // halt and downgrades the transaction to read-only for the
+            // remaining statements (btreeEndTransaction). The MVCC equivalent
+            // is to commit here, allocating a successor read-only
+            // transaction's begin timestamp inside the same
+            // `get_commit_timestamp` critical section as this commit's end
+            // timestamp, swapping `mv_tx` to that successor so remaining
+            // readers keep an identical snapshot. That also attributes commit
+            // errors (e.g. WriteWriteConflict) to the writer's own step
+            // instead of whichever sibling happens to finish last.
             if let Some(cdc_info) = state.pending_cdc_info.take() {
                 program.connection.set_capture_data_changes_info(cdc_info);
             }
@@ -3472,22 +3491,50 @@ pub fn op_transaction_inner(
     let pager = program.get_pager_from_database_index(db)?;
     // Get the MvStore for the specific database (main or attached).
     let mv_store = program.connection.mv_store_for_db(*db);
+    let is_main_db = *db == crate::MAIN_DB_ID;
+    let is_secondary_db = !is_main_db;
+    let write = matches!(
+        tx_mode,
+        TransactionMode::Write | TransactionMode::Concurrent
+    );
+    // BEGIN IMMEDIATE / EXCLUSIVE / CONCURRENT need write-capable transaction
+    // access, but they are not themselves write statements. Only statements in
+    // `write_databases` count for same-connection writer blocking and
+    // active-writer cleanup.
+    let statement_writes_db = program.write_databases.get(*db);
     loop {
         match *state.active_op_state.transaction() {
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
-                let write = matches!(
-                    tx_mode,
-                    TransactionMode::Write | TransactionMode::Concurrent
-                );
                 let mut started_secondary_tx = false;
                 if write && conn.is_readonly(*db) {
                     return Err(LimboError::ReadOnly);
                 }
+                let active_writers = conn.n_active_writes.load(Ordering::SeqCst);
+                turso_assert!(
+                    active_writers <= 1,
+                    "n_active_writes must be 0 or 1, got {active_writers}"
+                );
+                // One connection may have many active readers, but only one
+                // top-level writer. A second writer on the same connection is
+                // rejected before it opens transaction or savepoint state.
+                //
+                // This is stricter than SQLite. SQLite can run overlapping
+                // write statements on one connection because sqlite3_step()
+                // does not return to the caller in the middle of built-in
+                // write opcodes. Turso can suspend there for async I/O, so a
+                // second writer would make reset/drop cleanup hard to get right.
+                if statement_writes_db
+                    && !conn.is_nested_stmt()
+                    && !state.is_active_write
+                    && active_writers > 0
+                {
+                    return Err(LimboError::Busy);
+                }
 
                 // Fast path: if checkpoint root publication already replaced the
                 // shared schema, force reprepare before opening any transaction state.
-                if *db == crate::MAIN_DB_ID
+                if is_main_db
                     && mv_store.is_some()
                     && conn.mvcc_schema_requires_reprepare_before_tx()
                 {
@@ -3512,7 +3559,6 @@ pub fn op_transaction_inner(
 
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
-                let is_secondary_db = *db != crate::MAIN_DB_ID;
                 let (new_transaction_state, updated) = if conn.is_nested_stmt() {
                     (current_state, false)
                 } else if is_secondary_db {
@@ -3847,7 +3893,7 @@ pub fn op_transaction_inner(
             OpTransactionState::BeginNamedSavepoints => {
                 match open_connection_named_savepoints_for_db(&program.connection, *db, &pager)? {
                     IOResult::Done(()) => {
-                        if *db != crate::MAIN_DB_ID
+                        if is_secondary_db
                             && mv_store.is_none()
                             && matches!(tx_mode, TransactionMode::Write)
                             && !pager.holds_write_lock()
@@ -3891,64 +3937,86 @@ pub fn op_transaction_inner(
             }
             OpTransactionState::BeginStatement => {
                 let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
-                let in_explicit_txn = !program.connection.auto_commit.load(Ordering::SeqCst);
-                if *db == crate::MAIN_DB_ID && needs_stmt_journal {
-                    let write = matches!(tx_mode, TransactionMode::Write);
-                    let res = state.begin_statement(&program.connection, &pager, write)?;
-                    if let IOResult::IO(io) = res {
-                        return Ok(InsnFunctionStepResult::IO(io));
-                    }
-                } else if *db != crate::MAIN_DB_ID
-                    && matches!(tx_mode, TransactionMode::Write)
-                    && needs_stmt_journal
-                {
-                    if in_explicit_txn && !state.has_stmt_transaction {
-                        state.has_stmt_transaction = true;
-                        state.fk_deferred_violations_when_stmt_started.store(
-                            program
-                                .connection
-                                .fk_deferred_violations
-                                .load(Ordering::Acquire),
-                            Ordering::SeqCst,
-                        );
-                        state
-                            .fk_immediate_violations_during_stmt
-                            .store(0, Ordering::Release);
-                    }
-                    if !in_explicit_txn {
-                        // Autocommit statements rollback the whole transaction on error, so
-                        // non-main pagers do not need statement savepoints here.
-                    } else if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
-                        // Attached MVCC DB: open an MvStore savepoint.
-                        if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
-                            mv_store.begin_savepoint(tx_id);
+                let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
+                let in_explicit_txn = !auto_commit;
+                if needs_stmt_journal {
+                    if is_main_db {
+                        let res = state.begin_statement(
+                            &program.connection,
+                            &pager,
+                            statement_writes_db,
+                        )?;
+                        if let IOResult::IO(io) = res {
+                            return Ok(InsnFunctionStepResult::IO(io));
                         }
-                    } else {
-                        // Attached WAL DB: open a pager savepoint for statement rollback.
-                        let db_size =
-                            return_if_io!(pager.with_header(|header| header.database_size.get()));
-                        pager.open_subjournal()?;
-                        pager.try_use_subjournal()?;
-                        let result = pager.open_savepoint(db_size);
-                        if result.is_err() {
-                            pager.stop_use_subjournal();
+                    } else if statement_writes_db && in_explicit_txn {
+                        if !state.has_stmt_transaction {
+                            state.has_stmt_transaction = true;
+                            state.fk_deferred_violations_when_stmt_started.store(
+                                program
+                                    .connection
+                                    .fk_deferred_violations
+                                    .load(Ordering::Acquire),
+                                Ordering::SeqCst,
+                            );
+                            state
+                                .fk_immediate_violations_during_stmt
+                                .store(0, Ordering::Release);
                         }
-                        result?;
-                        state.attached_savepoint_pagers.push(pager.clone());
+                        if let Some(mv_store) = mv_store.as_ref() {
+                            // Attached MVCC DB: open an MvStore savepoint.
+                            if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
+                                mv_store.begin_savepoint(tx_id);
+                            }
+                        } else {
+                            // Attached WAL DB: open a pager savepoint for statement rollback.
+                            let db_size = return_if_io!(
+                                pager.with_header(|header| header.database_size.get())
+                            );
+                            pager.open_subjournal()?;
+                            pager.try_use_subjournal()?;
+                            let result = pager.open_savepoint(db_size);
+                            if result.is_err() {
+                                pager.stop_use_subjournal();
+                            }
+                            result?;
+                            state.attached_savepoint_pagers.push(pager.clone());
+                        }
                     }
                 }
 
-                if *db == MAIN_DB_ID
-                    && matches!(tx_mode, TransactionMode::Write)
-                    && !program.connection.auto_commit.load(Ordering::SeqCst)
-                {
-                    program
-                        .connection
-                        .n_active_writes
-                        .fetch_add(1, Ordering::SeqCst);
-                    state.is_active_write = true;
-                    if state.has_stmt_transaction {
+                let is_top_level_statement = !program.connection.is_nested_stmt();
+                if statement_writes_db && is_top_level_statement {
+                    if !state.is_active_write {
+                        let previous = program
+                            .connection
+                            .n_active_writes
+                            .fetch_add(1, Ordering::SeqCst);
+                        turso_assert!(
+                            previous == 0,
+                            "starting a writer while {previous} writer(s) are already active"
+                        );
+                        state.is_active_write = true;
+                    }
+                    if is_main_db && in_explicit_txn && state.has_stmt_transaction {
                         state.auto_txn_cleanup = TxnCleanup::RollbackSavepoint;
+                    }
+                }
+                if is_top_level_statement
+                    && is_main_db
+                    && auto_commit
+                    && state.auto_txn_cleanup == TxnCleanup::None
+                {
+                    let active_root_statements = program
+                        .connection
+                        .n_active_root_statements
+                        .load(Ordering::SeqCst);
+                    if active_root_statements > 1 {
+                        // A sibling statement opened the implicit transaction
+                        // before this statement joined it. Mark this statement
+                        // so the last remaining sibling can close the
+                        // transaction.
+                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                     }
                 }
                 state.pc += 1;
@@ -4003,6 +4071,7 @@ pub fn op_auto_commit(
             res,
             Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
         ) {
+            conn.clear_tx_poison();
             conn.clear_named_savepoints();
         }
         return res;
@@ -4063,11 +4132,26 @@ pub fn op_auto_commit(
                 conn.set_cdc_transaction_id(-1);
             }
             TxOp::Commit => {
+                if conn.tx_is_poisoned() {
+                    // A write statement inside BEGIN was reset/dropped before
+                    // it reached Done, and there was no statement savepoint to
+                    // undo only that statement. Letting COMMIT proceed would
+                    // persist a partial statement, so COMMIT rolls back the
+                    // whole transaction and reports the abandoned write.
+                    conn.rollback_manual_txn_cleanup(pager, true);
+                    return Err(LimboError::TxError(
+                        "cannot commit - an unfinished write statement was abandoned".to_string(),
+                    ));
+                }
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
                 conn.auto_commit.store(true, Ordering::SeqCst);
             }
             TxOp::Begin => {
+                turso_assert!(
+                    !conn.tx_is_poisoned(),
+                    "rollback-only marker leaked outside an explicit transaction"
+                );
                 conn.auto_commit.store(false, Ordering::SeqCst);
                 return Ok(InsnFunctionStepResult::Done);
             }
@@ -4130,6 +4214,7 @@ pub fn op_auto_commit(
 
     // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
     conn.set_cdc_transaction_id(-1);
+    conn.clear_tx_poison();
     conn.clear_named_savepoints();
 
     Ok(res)
@@ -4226,6 +4311,10 @@ pub fn op_savepoint(
                     }
                     conn.push_named_savepoint(frame);
                     if starts_transaction {
+                        turso_assert!(
+                            !conn.tx_is_poisoned(),
+                            "rollback-only marker leaked outside an explicit transaction"
+                        );
                         conn.auto_commit.store(false, Ordering::SeqCst);
                     }
 

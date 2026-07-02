@@ -2090,6 +2090,7 @@ impl Database {
             database_schemas: RwLock::new(HashMap::default()),
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
+            poisoned_tx: AtomicBool::new(false),
             last_insert_rowid: AtomicI64::new(0),
             changes: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
