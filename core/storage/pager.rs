@@ -4131,6 +4131,11 @@ impl Pager {
                                 page.get().id
                             )));
                         }
+                        turso_assert!(
+                            page.get().overflow_cells.is_empty(),
+                            "dirty page still has overflow cells at commit time",
+                            { "page_id": page.get().id }
+                        );
                         commit_info.page_source_cursor += 1;
                         commit_info.collected_pages.push(page);
 
@@ -4936,14 +4941,11 @@ impl Pager {
                                 "free_page page id mismatch",
                                 { "expected": page_id, "actual": page.get().id }
                             );
-                            if page.is_loaded() {
-                                let page_contents = page.get_contents();
-                                page_contents.overflow_cells.clear();
-                            }
                             (page, None)
                         }
                         None => return_if_io!(self.read_page(page_id as i64)),
                     };
+                    page.get().overflow_cells.clear();
                     header.freelist_pages = (header.freelist_pages.get() + 1).into();
 
                     let trunk_page_id = header.freelist_trunk_page.get();

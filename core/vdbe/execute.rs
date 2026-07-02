@@ -100,6 +100,24 @@ use crate::pseudo::PseudoCursor;
 
 use crate::storage::btree::{BTreeCursor, BTreeKey};
 
+#[inline]
+fn btree_cursor_with_yield_context(
+    cursor: Box<BTreeCursor>,
+    connection: &Arc<Connection>,
+) -> Box<BTreeCursor> {
+    #[cfg(any(test, injected_yields))]
+    {
+        let mut cursor = cursor;
+        cursor.install_yield_context(connection);
+        cursor
+    }
+    #[cfg(not(any(test, injected_yields)))]
+    {
+        let _ = connection;
+        cursor
+    }
+}
+
 use super::{
     array::{
         array_values_from_blob, compare_arrays, compute_array_length, compute_array_length_at_dim,
@@ -11077,12 +11095,15 @@ pub fn op_open_write(
         };
         if let Some(index) = maybe_index {
             let num_columns = index.columns.len();
-            let btree_cursor = Box::new(BTreeCursor::new_index(
-                pager,
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                index.as_ref(),
-                num_columns,
-            )?);
+            let btree_cursor = btree_cursor_with_yield_context(
+                Box::new(BTreeCursor::new_index(
+                    pager,
+                    maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                    index.as_ref(),
+                    num_columns,
+                )?),
+                &program.connection,
+            );
             let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
                 IndexInfo::new_from_index_in(index, mv_store.allocator())?
             } else {
@@ -11112,18 +11133,24 @@ pub fn op_open_write(
 
             let btree_cursor: Box<dyn CursorTrait> = match cursor_type {
                 CursorType::BTreeTable(table_rc) if !table_rc.has_rowid => {
-                    Box::new(BTreeCursor::new_without_rowid_table(
+                    btree_cursor_with_yield_context(
+                        Box::new(BTreeCursor::new_without_rowid_table(
+                            pager,
+                            maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                            table_rc.as_ref(),
+                            num_columns,
+                        )),
+                        &program.connection,
+                    )
+                }
+                _ => btree_cursor_with_yield_context(
+                    Box::new(BTreeCursor::new_table(
                         pager,
                         maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                        table_rc.as_ref(),
                         num_columns,
-                    ))
-                }
-                _ => Box::new(BTreeCursor::new_table(
-                    pager,
-                    maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                    num_columns,
-                )),
+                    )),
+                    &program.connection,
+                ),
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors

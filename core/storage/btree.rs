@@ -13,6 +13,9 @@ use super::{
 };
 #[cfg(test)]
 use crate::alloc::TursoIteratorExt;
+#[cfg(any(test, injected_yields))]
+use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
+use crate::mvcc::yield_points::inject_io_yield;
 use crate::{
     io::CompletionGroup,
     io_yield_one,
@@ -340,6 +343,25 @@ enum WriteState {
     },
     Balancing,
     Finish,
+}
+
+#[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+pub(crate) enum BTreeWriteYieldPoint {
+    AfterInsertOverflowCellBeforeBalance,
+}
+
+#[cfg(any(test, injected_yields))]
+const BTREE_WRITE_YIELD_FAMILY: u64 = 0x4254_5245_5752_4954;
+
+#[cfg(any(test, injected_yields))]
+impl YieldPointMarker for BTreeWriteYieldPoint {
+    const POINT_COUNT: u8 = 1;
+
+    fn ordinal(self) -> u8 {
+        self as u8
+    }
 }
 
 struct ReadPayloadOverflow {
@@ -777,6 +799,10 @@ pub struct BTreeCursor {
     /// itself into the registry). Direct BTreeCursor::new callers (tests,
     /// internal utilities) bypass that path; their Drop skips unregister.
     did_register: crate::sync::atomic::AtomicBool,
+    #[cfg(any(test, injected_yields))]
+    yield_injector: Option<Arc<dyn crate::mvcc::yield_points::YieldInjector>>,
+    #[cfg(any(test, injected_yields))]
+    yield_instance_id: u64,
 }
 
 /// Records the in-flight descent for `iteration_pending_descent`. The direction
@@ -856,7 +882,17 @@ impl BTreeCursor {
             pending_peer_save: None,
             has_peers: crate::sync::atomic::AtomicBool::new(false),
             did_register: crate::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, injected_yields))]
+            yield_injector: None,
+            #[cfg(any(test, injected_yields))]
+            yield_instance_id: 0,
         }
+    }
+
+    #[cfg(any(test, injected_yields))]
+    pub(crate) fn install_yield_context(&mut self, connection: &crate::Connection) {
+        self.yield_injector = connection.yield_injector();
+        self.yield_instance_id = connection.next_yield_instance_id();
     }
 
     pub fn new_table(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
@@ -2668,6 +2704,10 @@ impl BTreeCursor {
                         turso_assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "no balancing operation should be in progress during insert", { "state": self.state, "sub_state": self.balance_state.sub_state });
                         // If we balance, we must save the cursor position and seek to it later.
                         self.save_context(CursorContext::seek_eq_only(bkey));
+                        inject_io_yield!(
+                            self,
+                            BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance
+                        );
                     } else {
                         *write_state = WriteState::Finish;
                     }
@@ -5443,8 +5483,89 @@ impl BTreeCursor {
     }
 }
 
+#[cfg(any(test, injected_yields))]
+impl ProvidesYieldContext for BTreeCursor {
+    fn yield_context(&self) -> YieldContext {
+        YieldContext::new(
+            self.yield_injector.clone(),
+            None,
+            self.yield_instance_id,
+            BTREE_WRITE_YIELD_FAMILY ^ self.root_page as u64,
+        )
+    }
+}
+
+impl BTreeCursor {
+    fn clear_transient_overflow_cells(&mut self) {
+        // Overflow cells are page-local scratch for the cursor's in-flight balance.
+        // If the cursor is abandoned after queueing them, cached pages may outlive
+        // the cursor and must not carry that scratch into later writes.
+        if matches!(self.state, CursorState::None)
+            && matches!(self.balance_state.sub_state, BalanceSubState::Start)
+        {
+            turso_assert!(
+                self.balance_state.balance_info.is_none(),
+                "idle cursor has balance info"
+            );
+            // No write or balance operation is in progress, so this cursor has no
+            // transient overflow cells to clean up.
+            return;
+        }
+
+        for page in self.stack.stack.iter().flatten() {
+            page.get().overflow_cells.clear();
+        }
+
+        // Insert/overwrite can stage overflow cells before balance_info is populated.
+        // If the cursor is dropped in that window, this page handle is the only owner
+        // of that transient state.
+        match &self.state {
+            CursorState::Write(WriteState::Insert { page, .. })
+            | CursorState::Write(WriteState::Overwrite { page, .. }) => {
+                page.get().overflow_cells.clear();
+            }
+            CursorState::Write(WriteState::Start)
+            | CursorState::Write(WriteState::Balancing)
+            | CursorState::Write(WriteState::Finish)
+            | CursorState::Destroy(_)
+            | CursorState::Delete(_)
+            | CursorState::None => {}
+        }
+
+        if let Some(balance_info) = &self.balance_state.balance_info {
+            for page in balance_info.pages_to_balance.iter().flatten() {
+                page.get().overflow_cells.clear();
+            }
+        }
+
+        // Newly allocated/reused sibling pages are tracked only by BalanceContext until
+        // non-root balancing finishes. If the cursor is dropped before then, clear any
+        // overflow scratch from those pages explicitly.
+        match &self.balance_state.sub_state {
+            BalanceSubState::NonRootDoBalancingAllocate {
+                context: Some(context),
+                ..
+            }
+            | BalanceSubState::NonRootDoBalancingFinish { context } => {
+                for page in context.pages_to_balance_new.iter().flatten() {
+                    page.get().overflow_cells.clear();
+                }
+            }
+            BalanceSubState::Start
+            | BalanceSubState::BalanceRoot
+            | BalanceSubState::Decide
+            | BalanceSubState::Quick
+            | BalanceSubState::NonRootPickSiblings
+            | BalanceSubState::NonRootDoBalancing
+            | BalanceSubState::NonRootDoBalancingAllocate { context: None, .. }
+            | BalanceSubState::FreePages { .. } => {}
+        }
+    }
+}
+
 impl Drop for BTreeCursor {
     fn drop(&mut self) {
+        self.clear_transient_overflow_cells();
         if !self
             .did_register
             .load(crate::sync::atomic::Ordering::Relaxed)
@@ -7568,6 +7689,7 @@ fn find_free_slot(
 pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usable_space: usize) {
     // setup btree page
     let contents = page.get_contents();
+    contents.overflow_cells.clear();
     tracing::debug!(
         "btree_init_page(id={}, offset={}, usable_space={})",
         page.get().id,
@@ -8493,7 +8615,7 @@ fn _insert_into_cell(
         #[cfg(debug_assertions)]
         {
             if let Some(overflow_cell) = page.overflow_cells.last() {
-                turso_assert!(overflow_cell.index + 1 == cell_idx, "multiple overflow cells can only occur when a parent overflows during balancing as divider cells are inserted into it. those cells should always be in-order and sequential");
+                turso_assert!(overflow_cell.index + 1 == cell_idx, "multiple overflow cells can only occur when a parent overflows during balancing as divider cells are inserted into it. those cells should always be in-order and sequential", { "page_id": page.id, "last_overflow_index": overflow_cell.index, "cell_idx": cell_idx, "cell_count": page.cell_count(), "overflow_count": page.overflow_cells.len() });
             }
         }
         page.overflow_cells.push(OverflowCell {
@@ -8966,6 +9088,10 @@ mod tests {
     use super::*;
     use crate::{
         io::{Buffer, MemoryIO, OpenFlags, IO},
+        mvcc::{
+            yield_hooks::YieldPointMarker,
+            yield_points::{YieldInjector, YieldPoint},
+        },
         schema::IndexColumn,
         storage::{
             database::DatabaseFile, page_cache::PageCache, pager::default_page1,
@@ -8977,7 +9103,14 @@ mod tests {
         WalFileShared,
     };
     use arc_swap::ArcSwapOption;
-    use std::{mem::transmute, ops::Deref, sync::Arc};
+    use std::{
+        mem::transmute,
+        ops::Deref,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
 
     use tempfile::TempDir;
 
@@ -8991,6 +9124,55 @@ mod tests {
     };
 
     use super::{btree_init_page, defragment_page, drop_cell, insert_into_cell};
+
+    #[derive(Debug)]
+    struct TargetedYieldInjector {
+        point: YieldPoint,
+        selection_key: u64,
+        fired: AtomicBool,
+    }
+
+    impl TargetedYieldInjector {
+        fn new(point: YieldPoint, selection_key: u64) -> Arc<Self> {
+            Arc::new(Self {
+                point,
+                selection_key,
+                fired: AtomicBool::new(false),
+            })
+        }
+
+        fn fired(&self) -> bool {
+            self.fired.load(Ordering::Acquire)
+        }
+    }
+
+    impl YieldInjector for TargetedYieldInjector {
+        fn should_yield(&self, _instance_id: u64, selection_key: u64, point: YieldPoint) -> bool {
+            point == self.point
+                && selection_key == self.selection_key
+                && !self.fired.swap(true, Ordering::AcqRel)
+        }
+    }
+
+    fn btree_write_selection_key(root_page: i64) -> u64 {
+        BTREE_WRITE_YIELD_FAMILY ^ root_page as u64
+    }
+
+    fn query_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
+        let mut stmt = conn.prepare(sql).unwrap();
+        match stmt.step().unwrap() {
+            StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
+            other => panic!("expected a row, got {other:?}"),
+        }
+    }
+
+    fn query_single_text(conn: &Arc<Connection>, sql: &str) -> String {
+        let mut stmt = conn.prepare(sql).unwrap();
+        match stmt.step().unwrap() {
+            StepResult::Row => stmt.row().unwrap().get::<String>(0).unwrap(),
+            other => panic!("expected a row, got {other:?}"),
+        }
+    }
 
     #[allow(clippy::arc_with_non_send_sync)]
     fn get_page(id: usize) -> PageRef {
@@ -9020,6 +9202,201 @@ mod tests {
         let db = Database::open_file(io.clone(), path.to_str().unwrap()).unwrap();
 
         db
+    }
+
+    #[test]
+    fn wal_reuses_freelist_leaf_after_abandoned_overflowing_insert() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, "freelist-stale-overflow.db").unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("PRAGMA journal_mode = WAL").unwrap();
+        conn.execute(
+            "CREATE TABLE red_rain_308 (
+                slow_desk_238 INTEGER NOT NULL,
+                quiet_tree_398 TEXT NOT NULL,
+                smart_dog_422 REAL UNIQUE,
+                new_hill_140 TEXT,
+                light_door_957 REAL,
+                wild_dog_803 TEXT NOT NULL,
+                new_flower_28 BLOB,
+                old_fish_931 TEXT PRIMARY KEY
+            )",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE full_fish_194 (
+                brave_star_722 TEXT PRIMARY KEY,
+                hot_star_957 NUMERIC,
+                empty_chair_834 REAL
+            )",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO red_rain_308 (
+                slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
+                light_door_957, wild_dog_803, new_flower_28, old_fish_931
+            ) VALUES (
+                1, 'seed', 0.24, 'seed', 1.0, 'seed', zeroblob(3600), 'existing_unique'
+            )",
+        )
+        .unwrap();
+        for id in 2..260 {
+            conn.execute(format!(
+                "INSERT INTO red_rain_308 (
+                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
+                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
+                ) VALUES (
+                    {id}, 'quiet_tree_{id}', {id}.0, 'new_hill_{id}',
+                    1.5, 'wild_dog_{id}', zeroblob(3600), 'seed_{id}'
+                )"
+            ))
+            .unwrap();
+        }
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("DELETE FROM red_rain_308 WHERE old_fish_931 = 'seed_2'")
+            .unwrap();
+        conn.execute("SAVEPOINT sp_91").unwrap();
+        conn.execute(
+            "INSERT INTO full_fish_194 (brave_star_722, hot_star_957, empty_chair_834)
+             VALUES ('sweet_fish_597', 328, 7.71)",
+        )
+        .unwrap();
+
+        let red_rain_root_page = query_single_i64(
+            &conn,
+            "SELECT rootpage FROM sqlite_schema
+             WHERE type = 'table' AND name = 'red_rain_308'",
+        );
+        let injector = TargetedYieldInjector::new(
+            BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance.point(),
+            btree_write_selection_key(red_rain_root_page),
+        );
+        conn.set_yield_injector(Some(injector.clone()));
+        let mut abandoned = conn
+            .prepare(
+                "INSERT INTO red_rain_308 (
+                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
+                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
+                ) VALUES (
+                    926, 'dry_hill_411', 9.24, 'blue_hill_65',
+                    7.50, 'happy_moon_474', zeroblob(7200), 'smart_rock_113'
+                )",
+            )
+            .unwrap();
+        assert!(matches!(abandoned.step().unwrap(), StepResult::Yield));
+        assert!(injector.fired());
+        abandoned.reset().unwrap();
+        drop(abandoned);
+        conn.set_yield_injector(None);
+
+        conn.execute("DELETE FROM red_rain_308 WHERE slow_desk_238 BETWEEN 2 AND 240")
+            .unwrap();
+        conn.execute("RELEASE sp_91").unwrap();
+
+        assert!(conn
+            .execute(
+                "INSERT INTO red_rain_308 (
+                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
+                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
+                ) VALUES (
+                    927, 'dry_hill_412', 0.24, 'blue_hill_66',
+                    7.50, 'happy_moon_475', x'736f66745f73746f6e655f313732', 'smart_rock_114'
+                )"
+            )
+            .is_err());
+
+        for id in 300..420 {
+            conn.execute(format!(
+                "INSERT INTO red_rain_308 (
+                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
+                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
+                ) VALUES (
+                    {id}, 'quiet_tree_{id}', {id}.0, 'new_hill_{id}',
+                    1.5, 'wild_dog_{id}', zeroblob(3600), 'reuse_{id}'
+                )"
+            ))
+            .unwrap();
+        }
+
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(query_single_text(&conn, "PRAGMA integrity_check"), "ok");
+    }
+
+    #[test]
+    fn wal_overflowing_insert_resumes_after_yield_before_balance() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, "resume-overflow-yield.db").unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("PRAGMA journal_mode = WAL").unwrap();
+        conn.execute(
+            "CREATE TABLE red_rain_308 (
+                slow_desk_238 INTEGER NOT NULL,
+                quiet_tree_398 TEXT NOT NULL,
+                smart_dog_422 REAL UNIQUE,
+                new_hill_140 TEXT,
+                light_door_957 REAL,
+                wild_dog_803 TEXT NOT NULL,
+                new_flower_28 BLOB,
+                old_fish_931 TEXT PRIMARY KEY
+            )",
+        )
+        .unwrap();
+
+        for id in 1..260 {
+            conn.execute(format!(
+                "INSERT INTO red_rain_308 (
+                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
+                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
+                ) VALUES (
+                    {id}, 'quiet_tree_{id}', {id}.0, 'new_hill_{id}',
+                    1.5, 'wild_dog_{id}', zeroblob(3600), 'seed_{id}'
+                )"
+            ))
+            .unwrap();
+        }
+
+        let red_rain_root_page = query_single_i64(
+            &conn,
+            "SELECT rootpage FROM sqlite_schema
+             WHERE type = 'table' AND name = 'red_rain_308'",
+        );
+        let injector = TargetedYieldInjector::new(
+            BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance.point(),
+            btree_write_selection_key(red_rain_root_page),
+        );
+        conn.set_yield_injector(Some(injector.clone()));
+        let mut stmt = conn
+            .prepare(
+                "INSERT INTO red_rain_308 (
+                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
+                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
+                ) VALUES (
+                    926, 'dry_hill_411', 9.24, 'blue_hill_65',
+                    7.50, 'happy_moon_474', zeroblob(7200), 'smart_rock_113'
+                )",
+            )
+            .unwrap();
+
+        assert!(matches!(stmt.step().unwrap(), StepResult::Yield));
+        assert!(injector.fired());
+        assert!(matches!(stmt.step().unwrap(), StepResult::Done));
+        drop(stmt);
+        conn.set_yield_injector(None);
+
+        assert_eq!(
+            query_single_i64(
+                &conn,
+                "SELECT COUNT(*) FROM red_rain_308 WHERE old_fish_931 = 'smart_rock_113'",
+            ),
+            1
+        );
+        assert_eq!(query_single_text(&conn, "PRAGMA integrity_check"), "ok");
     }
 
     fn ensure_cell(page: &mut PageContent, cell_idx: usize, payload: &Vec<u8>) {
