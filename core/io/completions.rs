@@ -1,4 +1,7 @@
-use futures::task::AtomicWaker;
+mod futures_utils {
+    pub use futures_core::task::__internal::AtomicWaker;
+}
+use futures_utils::AtomicWaker;
 
 use crate::turso_assert_eq;
 use core::fmt::{self, Debug};
