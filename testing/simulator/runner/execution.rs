@@ -17,6 +17,13 @@ use turso_core::{Connection, LimboError, Result, Value};
 ///   retries. The simulator's outer loop treats them as transient and
 ///   moves on (no progress to undo because the engine never acquired
 ///   the resource).
+/// - SchemaUpdated: another connection committed DDL while this connection
+///   holds an open transaction whose (data and schema) snapshot predates that
+///   DDL. The engine reprepares internally, but cannot reconcile a statement
+///   against a snapshot older than the committed schema, so it surfaces this
+///   the same way it surfaces a stale read snapshot — the schema-level analog
+///   of BusySnapshot. The caller is expected to roll back and retry; nothing
+///   was applied, so we treat it as transient.
 /// - ParseError("sequence \"...\" does not exist"): cross-connection
 ///   schema-lag artifact. Connection A's `CREATE SEQUENCE` commits;
 ///   connection B picks the seq from the model and runs `nextval`
@@ -24,13 +31,14 @@ use turso_core::{Connection, LimboError, Result, Value};
 ///   The model is consistent and the engine is consistent; only B's
 ///   per-connection schema cache is one beat behind. Treat it like
 ///   any other transient retry trigger.
-fn is_recoverable_tx_error(err: &LimboError) -> bool {
+pub(crate) fn is_recoverable_tx_error(err: &LimboError) -> bool {
     matches!(
         err,
         LimboError::WriteWriteConflict
             | LimboError::TxError(_)
             | LimboError::Busy
             | LimboError::BusySnapshot
+            | LimboError::SchemaUpdated
     ) || matches!(
         err,
         LimboError::ParseError(msg)
@@ -38,9 +46,50 @@ fn is_recoverable_tx_error(err: &LimboError) -> bool {
     )
 }
 
-/// Returns true if the error indicates the transaction was rolled back by the database.
-fn error_causes_rollback(err: &LimboError) -> bool {
+/// Returns true if the error indicates the engine already rolled the
+/// transaction back on its own (so the model just needs to follow suit).
+pub(crate) fn error_causes_rollback(err: &LimboError) -> bool {
     matches!(err, LimboError::WriteWriteConflict)
+}
+
+/// Returns true if the error leaves the engine's transaction open but doomed:
+/// the connection's snapshot (data and/or schema) is stale, so no further
+/// statement can make progress and the engine's prescribed recovery is to
+/// "rollback and retry the whole transaction" (the exact wording of the
+/// BusySnapshot error). The simulator must issue that rollback itself —
+/// otherwise the connection stays wedged in the dead transaction and every
+/// subsequent statement fails with a fresh stale-snapshot error.
+pub(crate) fn error_requires_client_rollback(err: &LimboError) -> bool {
+    matches!(err, LimboError::BusySnapshot | LimboError::SchemaUpdated)
+}
+
+/// Reconcile the simulator's model with the engine after a recoverable
+/// transaction error, keeping the two consistent:
+/// - the engine auto-rolled-back (e.g. WriteWriteConflict): drop the model's
+///   transaction to match;
+/// - the engine left the transaction open but doomed (stale snapshot/schema):
+///   issue a real `ROLLBACK` so both engine and model return to autocommit;
+/// - otherwise transient (Busy, cross-connection schema lag): the transaction
+///   is intact on both sides, so leave it alone.
+pub(crate) fn reconcile_recoverable_tx_error(
+    env: &mut SimulatorEnv,
+    connection_index: usize,
+    err: &LimboError,
+) {
+    if !env.conn_in_transaction(connection_index) {
+        return;
+    }
+    if error_causes_rollback(err) {
+        env.rollback_conn(connection_index);
+    } else if error_requires_client_rollback(err) {
+        if let SimConnection::LimboConnection(conn) = &env.connections[connection_index] {
+            // Best-effort: the transaction is open but doomed, so ROLLBACK
+            // succeeds; if the engine already closed it we simply ignore the
+            // resulting "no active transaction" error.
+            let _ = conn.execute("ROLLBACK");
+        }
+        env.rollback_conn(connection_index);
+    }
 }
 
 use crate::{
@@ -244,9 +293,7 @@ pub fn execute_interaction_turso(
             {
                 let continuation = match err {
                     err if is_recoverable_tx_error(err) => {
-                        if error_causes_rollback(err) && env.conn_in_transaction(connection_index) {
-                            env.rollback_conn(connection_index);
-                        }
+                        reconcile_recoverable_tx_error(env, connection_index, err);
                         ExecutionContinuation::NextInteractionOutsideThisProperty
                     }
                     LimboError::Constraint(_) => {
@@ -348,17 +395,34 @@ pub fn execute_interaction_turso(
 }
 
 fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
-    let mut rows = conn.query("PRAGMA integrity_check;")?.unwrap();
+    // The integrity check is an opportunistic diagnostic, not part of the
+    // workload. When it is run on a connection that holds a transaction whose
+    // snapshot has gone stale (another connection committed DDL or advanced the
+    // WAL past it), reading the schema/pages surfaces a recoverable transaction
+    // error (e.g. SchemaUpdated, BusySnapshot). That is an expected concurrent
+    // condition, not corruption, so skip the check rather than failing the run.
+    // The post-simulation integrity check runs on a fresh connection and still
+    // validates the database.
+    let mut rows = match conn.query("PRAGMA integrity_check;") {
+        Ok(rows) => rows.unwrap(),
+        Err(err) if is_recoverable_tx_error(&err) => return Ok(()),
+        Err(err) => return Err(err),
+    };
     let mut result = Vec::new();
 
-    rows.run_with_row_callback(|row| {
+    if let Err(err) = rows.run_with_row_callback(|row| {
         let val = match row.get_value(0) {
             turso_core::Value::Text(text) => text.as_str().to_string(),
             _ => unreachable!(),
         };
         result.push(val);
         Ok(())
-    })?;
+    }) {
+        if is_recoverable_tx_error(&err) {
+            return Ok(());
+        }
+        return Err(err);
+    }
 
     if result.is_empty() {
         return Err(LimboError::InternalError(
