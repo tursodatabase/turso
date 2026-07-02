@@ -110,7 +110,15 @@ pub(crate) fn portable_schema_row_from_record(record_bytes: &[u8]) -> Result<Por
 }
 
 pub(crate) fn is_portable_table_schema_row(row: &PortableSchemaRow) -> bool {
-    row.rootpage != 0 && row.row_type.eq_ignore_ascii_case("table")
+    row.rootpage != 0 && row.row_type.eq_ignore_ascii_case("table") && is_portable_schema_row(row)
+}
+
+pub(crate) fn is_portable_schema_row(row: &PortableSchemaRow) -> bool {
+    is_portable_logical_name(&row.name)
+        && (row.row_type.eq_ignore_ascii_case("table")
+            || row.row_type.eq_ignore_ascii_case("index")
+            || row.row_type.eq_ignore_ascii_case("trigger")
+            || row.row_type.eq_ignore_ascii_case("view"))
 }
 
 #[derive(Default)]

@@ -591,9 +591,6 @@ fn update_pragma(
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
             let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
-            if opts.is_some() && connection.mvcc_enabled() {
-                bail_parse_error!("CDC is not supported in MVCC mode");
-            }
             // InitCdcVersion handles everything at execution time:
             // - For enable: creates CDC table + version table, records version,
             //   reads back actual version, defers CDC state to Halt

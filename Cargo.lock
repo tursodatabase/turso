@@ -6623,6 +6623,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "comfy-table",
+ "crc32c",
  "csv",
  "ctrlc",
  "dirs 5.0.1",
@@ -6866,6 +6867,7 @@ version = "0.7.0-pre.14"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "crc32c",
  "ctor 0.4.2",
  "futures",
  "genawaiter",

@@ -13384,6 +13384,56 @@ fn test_mvcc_portable_changes_resolve_rows_through_object_map_in_same_txn() {
     assert!(object.mv_table_id < 0);
 }
 
+#[test]
+fn test_mvcc_mode_supports_cdc_for_client_push() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:").unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full,turso_cdc')")
+        .unwrap();
+
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+    conn.execute("UPDATE items SET payload = 'beta' WHERE id = 1")
+        .unwrap();
+    conn.execute("DELETE FROM items WHERE id = 1").unwrap();
+
+    let item_rows = get_rows(
+        &conn,
+        "SELECT change_id, change_txn_id, change_type
+         FROM turso_cdc
+         WHERE table_name = 'items'
+         ORDER BY change_id",
+    );
+    let item_change_types = item_rows
+        .iter()
+        .map(|row| row[2].as_int().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(item_change_types, vec![1, 0, -1]);
+    assert!(item_rows.iter().all(|row| row[1].as_int().unwrap() > 0));
+
+    let all_rows = get_rows(
+        &conn,
+        "SELECT change_id, change_type
+         FROM turso_cdc
+         ORDER BY change_id",
+    );
+    let change_ids = all_rows
+        .iter()
+        .map(|row| row[0].as_int().unwrap())
+        .collect::<Vec<_>>();
+    let commit_count = all_rows
+        .iter()
+        .filter(|row| row[1].as_int() == Some(2))
+        .count();
+
+    assert_eq!(change_ids, (1..=all_rows.len() as i64).collect::<Vec<_>>());
+    assert_eq!(commit_count, 4);
+}
+
 #[cfg(feature = "conn_raw_api")]
 #[test]
 fn test_mvcc_portable_changes_emit_index_drop_for_drop_table() {
@@ -13522,6 +13572,105 @@ fn test_mvcc_portable_changes_use_checkpointed_schema_after_restart() {
         assert!(objects.iter().any(|object| object.name == "items"));
         conn.close().unwrap();
     }
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoint() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:").unwrap();
+    let creator = db.connect().unwrap();
+    creator.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    creator.set_portable_logical_changes_enabled(true);
+    creator
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    let rows = get_rows(
+        &creator,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 'items'",
+    );
+    let initial_rootpage = rows[0][0].as_int().unwrap();
+    assert!(initial_rootpage < 0);
+
+    let checkpoint = db.connect().unwrap();
+    checkpoint
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let rows = get_rows(
+        &checkpoint,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 'items'",
+    );
+    let rootpage = rows[0][0].as_int().unwrap();
+    assert!(rootpage > 0);
+    {
+        let schema = checkpoint.db.schema.lock();
+        assert_eq!(schema.table_name_for_root_page(rootpage), Some("items"));
+        assert_eq!(schema.table_name_for_root_page(initial_rootpage), None);
+    }
+    {
+        let schema = checkpoint.schema.read();
+        assert_eq!(schema.table_name_for_root_page(rootpage), Some("items"));
+        assert_eq!(schema.table_name_for_root_page(initial_rootpage), None);
+    }
+
+    let writer = db.connect().unwrap();
+    writer.set_portable_logical_changes_enabled(true);
+    writer
+        .execute("INSERT INTO items(id, payload) VALUES (1, 'after-checkpoint')")
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&writer);
+    let txns = decode_portable_change_txns(&portable_changes);
+    let objects = decoded_object_maps(&txns);
+
+    assert!(
+        objects.iter().any(|object| object.name == "items"),
+        "DML-only portable frame should resolve user table after cross-connection checkpoint"
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn test_mvcc_portable_changes_resolve_table_after_alter_backfill() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute(
+            "CREATE TABLE items(
+                id INTEGER PRIMARY KEY,
+                owner TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                rev INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .unwrap();
+    db.conn
+        .execute("CREATE INDEX items_owner_rev_idx ON items(owner, rev)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items (id, owner, payload, rev) VALUES (1, 'seed-a', 'alpha', 1)")
+        .unwrap();
+
+    db.conn
+        .execute("ALTER TABLE items ADD COLUMN note TEXT")
+        .unwrap();
+    db.conn
+        .execute("UPDATE items SET note = 'schema-note'")
+        .unwrap();
+
+    db.conn
+        .execute(
+            "INSERT INTO items (id, owner, payload, rev, note)
+             VALUES (1000000, 'remote-owner', 'remote-bootstrap-5', 1, 'remote-owner-note-1000000')",
+        )
+        .unwrap();
+
+    let portable_changes = collect_mvcc_portable_change_bytes(&db.conn);
+    let txns = decode_portable_change_txns(&portable_changes);
+    assert!(
+        txns.len() >= 6,
+        "expected every portable-enabled commit to be encoded, got {} txns",
+        txns.len()
+    );
 }
 
 #[cfg(feature = "conn_raw_api")]
