@@ -260,8 +260,17 @@ fn test_clique_join() {
     let (mut rng, seed) = rng_from_time_or_env();
     println!("seed: {seed}");
 
-    // Clique has O(n^2) join conditions, test multiple sizes up to 62
+    // A clique has O(n^2) join predicates that are AND-ed into a single WHERE
+    // clause, so skip clique sizes whose predicate would exceed the parser's
+    // expression depth limit (`MAX_EXPR_DEPTH`).
     for clique_size in [2, 4, 8, 12, 16, 32, 62] {
+        let num_conditions = clique_size * (clique_size - 1) / 2;
+        // Height of the left-deep AND chain over `num_conditions` comparisons.
+        let where_depth = num_conditions + 1;
+        if where_depth > turso_parser::MAX_EXPR_DEPTH {
+            continue;
+        }
+
         let tmp_db = TempDatabase::new_empty();
         let conn = tmp_db.connect_limbo();
 

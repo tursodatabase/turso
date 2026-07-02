@@ -23,6 +23,68 @@ pub fn parse(input: &str) -> Result<TestFile, ParseError> {
     parser.parse()
 }
 
+fn eval_block_macro_count(expr: &str) -> Result<usize, String> {
+    let expr = expr
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+
+    if expr == "expr_depth_limit" {
+        return Ok(turso_parser::MAX_EXPR_DEPTH);
+    }
+
+    if let Some(rest) = expr.strip_prefix("expr_depth_limit+") {
+        let delta = rest
+            .parse::<usize>()
+            .map_err(|_| format!("invalid repeat count expression: {expr}"))?;
+        return Ok(turso_parser::MAX_EXPR_DEPTH + delta);
+    }
+
+    if let Some(rest) = expr.strip_prefix("expr_depth_limit-") {
+        let delta = rest
+            .parse::<usize>()
+            .map_err(|_| format!("invalid repeat count expression: {expr}"))?;
+        return turso_parser::MAX_EXPR_DEPTH
+            .checked_sub(delta)
+            .ok_or_else(|| format!("repeat count underflow in expression: {expr}"));
+    }
+
+    expr.parse::<usize>()
+        .map_err(|_| format!("invalid repeat count expression: {expr}"))
+}
+
+fn expand_block_macros(content: &str) -> Result<String, String> {
+    let mut expanded = String::with_capacity(content.len());
+    let mut rest = content;
+
+    while let Some(start) = rest.find("{{") {
+        expanded.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("}}") else {
+            return Err("unterminated block macro".to_string());
+        };
+
+        let macro_body = after_start[..end].trim();
+        if let Some(args) = macro_body.strip_prefix("repeat:") {
+            let mut parts = args.splitn(2, ':');
+            let count_expr = parts
+                .next()
+                .ok_or_else(|| "repeat macro is missing a count".to_string())?;
+            let text = parts
+                .next()
+                .ok_or_else(|| "repeat macro is missing text to repeat".to_string())?;
+            expanded.push_str(&text.repeat(eval_block_macro_count(count_expr)?));
+        } else {
+            expanded.push_str(&eval_block_macro_count(macro_body)?.to_string());
+        }
+
+        rest = &after_start[end + 2..];
+    }
+
+    expanded.push_str(rest);
+    Ok(expanded)
+}
+
 struct Parser {
     tokens: Vec<SpannedToken>,
     pos: usize,
@@ -465,7 +527,7 @@ impl Parser {
             Some(Token::BlockContent(content)) => {
                 let content = content.clone();
                 self.advance();
-                Ok(content)
+                expand_block_macros(&content).map_err(|message| self.error(message))
             }
             Some(token) => Err(self.error(format!("expected block {{...}}, got {token}"))),
             None => Err(self.error("expected block, got EOF".to_string())),
@@ -802,6 +864,35 @@ expect {
         assert!(file.setups.contains_key("users"));
         assert_eq!(file.tests[0].modifiers.setups.len(), 1);
         assert_eq!(file.tests[0].modifiers.setups[0].name, "users");
+    }
+
+    #[test]
+    fn test_expand_expr_depth_macros() {
+        let input = r#"
+@database :memory:
+
+test expr-depth {
+    SELECT 1{{repeat:expr_depth_limit-1: OR 1}};
+}
+expect error {
+    Parse error: Expression tree is too large \(maximum depth {{expr_depth_limit}}\)
+}
+"#;
+
+        let file = parse(input).unwrap();
+        let test = &file.tests[0];
+        assert!(test.sql.starts_with("SELECT 1 OR 1"));
+        assert_eq!(
+            test.sql.matches(" OR 1").count(),
+            turso_parser::MAX_EXPR_DEPTH - 1
+        );
+        assert_eq!(
+            test.expectations.default,
+            Expectation::Error(Some(format!(
+                "Parse error: Expression tree is too large \\(maximum depth {}\\)",
+                turso_parser::MAX_EXPR_DEPTH
+            )))
+        );
     }
 
     #[test]
