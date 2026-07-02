@@ -1,4 +1,6 @@
-use crate::alloc::{DynAllocator, TursoSliceExt, TursoTryWithCapacityExt};
+use crate::alloc::{
+    DynAllocator, TursoIteratorExt, TursoSliceExt, TursoTryWithCapacityExt, TursoVecExt,
+};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
@@ -6441,9 +6443,10 @@ fn op_window_step(
     match func {
         WindowFunc::RowNumber => {
             if let Register::Value(Value::Null) = state.registers[acc_reg] {
-                state.registers[acc_reg] = Register::Aggregate(AggContext::Builtin(
-                    crate::alloc::vec![Value::from_i64(0)],
-                ));
+                state.registers[acc_reg] =
+                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
+                        Value::from_i64(0)
+                    ]?));
             }
             let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
             else {
@@ -6795,20 +6798,17 @@ pub fn op_sorter_open(
     } else {
         (cache_size as usize).saturating_mul(page_size)
     };
-    let mut order = Vec::try_with_capacity_ext(order_collations_nulls.len())
-        .expect(crate::alloc::ALLOC_ERR_MSG);
-    let mut collations = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
-        .expect(crate::alloc::ALLOC_ERR_MSG);
-    let mut nulls_orders = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
-        .expect(crate::alloc::ALLOC_ERR_MSG);
+    let mut order = Vec::try_with_capacity_ext(order_collations_nulls.len())?;
+    let mut collations = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())?;
+    let mut nulls_orders = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())?;
     for (ord, coll, nulls) in order_collations_nulls.iter() {
+        // Preallocated for every ORDER BY term above, so these pushes cannot grow the vectors.
         order.push(*ord);
         collations.push(coll.unwrap_or_default());
         nulls_orders.push(*nulls);
     }
     let mut sort_comparators =
-        crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
-            .expect(crate::alloc::ALLOC_ERR_MSG);
+        crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())?;
     for (idx, (_, coll, _)) in order_collations_nulls.iter().enumerate() {
         let comparator = match comparators.get(idx).and_then(|c| c.as_ref()) {
             Some(comparator) => Some(make_sort_comparator(comparator)?),
@@ -6819,6 +6819,7 @@ pub fn op_sorter_open(
                 _ => None,
             },
         };
+        // Preallocated for every ORDER BY term above, so this push cannot grow the vector.
         sort_comparators.push(comparator);
     }
     let temp_store = program.connection.get_temp_store();
@@ -12471,8 +12472,7 @@ pub fn op_parse_schema(
     *state.active_op_state.parse_schema() = Some(Box::new(OpParseSchemaInner {
         stmt,
         schema_arc,
-        from_sql_indexes: crate::alloc::Vec::try_with_capacity_ext(10)
-            .expect(crate::alloc::ALLOC_ERR_MSG),
+        from_sql_indexes: crate::alloc::Vec::try_with_capacity_ext(10)?,
         automatic_indices: Default::default(),
         dbsp_state_roots: Default::default(),
         dbsp_state_index_roots: Default::default(),
@@ -14369,6 +14369,8 @@ pub fn op_add_column(
 
     let conn = program.connection.clone();
     let normalized_table_name = normalize_ident(table.as_str());
+    let new_check_constraints = check_constraints.try_to_vec()?;
+    let new_foreign_keys = foreign_keys.try_to_vec()?;
 
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table_ref = schema
@@ -14383,15 +14385,11 @@ pub fn op_add_column(
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns_mut().push((**column).clone());
+        btree.columns_mut().try_push((**column).clone())?;
         // Update CHECK constraints to include any constraints from the new column
-        btree.check_constraints = check_constraints
-            .try_to_vec()
-            .expect(crate::alloc::ALLOC_ERR_MSG);
+        btree.check_constraints = new_check_constraints;
         // Update foreign keys to include any FK constraints from the new column
-        btree.foreign_keys = foreign_keys
-            .try_to_vec()
-            .expect(crate::alloc::ALLOC_ERR_MSG);
+        btree.foreign_keys = new_foreign_keys;
 
         // Resolve generated column expressions and update virtual column metadata
         btree.prepare_generated_columns()?;
@@ -14888,29 +14886,25 @@ pub fn op_hash_build(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(HashBuild { data }, insn);
 
-    let mut op_state = state
-        .active_op_state
-        .hash_build()
-        .take()
-        .filter(|s| {
-            s.hash_table_id == data.hash_table_id
-                && s.cursor_id == data.cursor_id
-                && s.key_start_reg == data.key_start_reg
-                && s.num_keys == data.num_keys
-        })
-        .unwrap_or_else(|| OpHashBuildState {
-            key_values: crate::alloc::Vec::try_with_capacity_ext(data.num_keys)
-                .expect(crate::alloc::ALLOC_ERR_MSG),
+    let mut op_state = match state.active_op_state.hash_build().take().filter(|s| {
+        s.hash_table_id == data.hash_table_id
+            && s.cursor_id == data.cursor_id
+            && s.key_start_reg == data.key_start_reg
+            && s.num_keys == data.num_keys
+    }) {
+        Some(op_state) => op_state,
+        None => OpHashBuildState {
+            key_values: crate::alloc::Vec::try_with_capacity_ext(data.num_keys)?,
             key_idx: 0,
-            payload_values: crate::alloc::Vec::try_with_capacity_ext(data.num_payload)
-                .expect(crate::alloc::ALLOC_ERR_MSG),
+            payload_values: crate::alloc::Vec::try_with_capacity_ext(data.num_payload)?,
             payload_idx: 0,
             rowid: None,
             cursor_id: data.cursor_id,
             hash_table_id: data.hash_table_id,
             key_start_reg: data.key_start_reg,
             num_keys: data.num_keys,
-        });
+        },
+    };
 
     // Create hash table if it doesn't exist yet
     let temp_store = program.connection.get_temp_store();
@@ -14928,10 +14922,7 @@ pub fn op_hash_build(
             initial_buckets: 1024,
             mem_budget,
             num_keys: data.num_keys,
-            collations: data
-                .collations
-                .try_to_vec()
-                .expect(crate::alloc::ALLOC_ERR_MSG),
+            collations: data.collations.try_to_vec()?,
             temp_store,
             track_matched: data.track_matched,
             partition_count: None,
@@ -14944,6 +14935,7 @@ pub fn op_hash_build(
         let i = op_state.key_idx;
         let reg = &state.registers[data.key_start_reg + i];
         let value = reg.get_value().clone();
+        // The resume state preallocates space for every key register before the loop starts.
         op_state.key_values.push(value);
         op_state.key_idx += 1;
     }
@@ -14954,6 +14946,7 @@ pub fn op_hash_build(
             let i = op_state.payload_idx;
             let reg = &state.registers[payload_reg + i];
             let value = reg.get_value().clone();
+            // The resume state preallocates space for every payload register before the loop starts.
             op_state.payload_values.push(value);
             op_state.payload_idx += 1;
         }
@@ -15035,10 +15028,7 @@ pub fn op_hash_distinct(
             initial_buckets: 1024,
             mem_budget,
             num_keys: data.num_keys,
-            collations: data
-                .collations
-                .try_to_vec()
-                .expect(crate::alloc::ALLOC_ERR_MSG),
+            collations: data.collations.try_to_vec()?,
             temp_store,
             track_matched: false,
             partition_count: None,
@@ -15143,22 +15133,22 @@ pub fn op_hash_probe(
                 )
             } else {
                 // Different hash table, read fresh keys
-                let mut keys = crate::alloc::Vec::try_with_capacity_ext(num_keys)
-                    .expect(crate::alloc::ALLOC_ERR_MSG);
-                for i in 0..num_keys {
-                    let reg = &state.registers[key_start_reg + i];
-                    keys.push(reg.get_value().clone());
-                }
+                let keys = (0..num_keys)
+                    .map(|i| {
+                        let reg = &state.registers[key_start_reg + i];
+                        reg.get_value().clone()
+                    })
+                    .try_collect()?;
                 (keys, None, false)
             }
         } else {
             // First entry, read probe keys from registers
-            let mut keys = crate::alloc::Vec::try_with_capacity_ext(num_keys)
-                .expect(crate::alloc::ALLOC_ERR_MSG);
-            for i in 0..num_keys {
-                let reg = &state.registers[key_start_reg + i];
-                keys.push(reg.get_value().clone());
-            }
+            let keys = (0..num_keys)
+                .map(|i| {
+                    let reg = &state.registers[key_start_reg + i];
+                    reg.get_value().clone()
+                })
+                .try_collect()?;
             (keys, None, false)
         };
 
