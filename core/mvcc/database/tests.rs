@@ -33,6 +33,7 @@ use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use std::sync::Arc;
 
 const TX_BASE_HEADER_SIZE: usize = 24;
 const TX_EXT_HEADER_SIZE: usize = 40;
@@ -7751,6 +7752,157 @@ fn test_rollback_with_index() {
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
+
+fn try_idxdelete_during_preparing_corruption() -> Option<String> {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup.execute("PRAGMA page_size = 512").unwrap();
+    setup
+        .execute(
+            "CREATE TABLE t(
+                a NUMERIC NOT NULL,
+                b REAL UNIQUE,
+                blob BLOB NOT NULL,
+                id INTEGER PRIMARY KEY,
+                c NUMERIC,
+                u TEXT UNIQUE,
+                d REAL
+            )",
+        )
+        .unwrap();
+    setup
+        .execute(
+            "INSERT INTO t VALUES(784, 9.99, zeroblob(8192), 322, 627, 'small_leaf_292', 2.24)",
+        )
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES(440, 8.25, zeroblob(8192), 502, 962, 'fast_sun_915', 3.31)")
+        .unwrap();
+    for filler in 1..=64i64 {
+        let rowid = 10_000 + filler;
+        setup
+            .execute(format!(
+                "INSERT INTO t VALUES({}, {}, zeroblob(512), {}, {}, 'seed_{filler}', {})",
+                10_000 + filler,
+                100_000.0 + filler as f64,
+                rowid,
+                20_000 + filler,
+                (filler % 97) as f64 + 0.01
+            ))
+            .unwrap();
+    }
+    setup.execute("PRAGMA data_sync_retry = 1").unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    setup.close().unwrap();
+
+    let old = db.connect();
+    let deleter = db.connect();
+    let victim = db.connect();
+
+    old.execute("BEGIN CONCURRENT").unwrap();
+    let _ = get_rows(&old, "SELECT COUNT(*) FROM t WHERE id = 322");
+
+    deleter.execute("DELETE FROM t WHERE id = 322").unwrap();
+
+    for filler in 1..=64i64 {
+        let rowid = 10_000 + filler;
+        old.execute(format!(
+            "UPDATE t SET a = {}, b = {}, blob = zeroblob(512), c = {}, u = 'old_{rowid}', d = {} WHERE id = {rowid}",
+            30_000 + filler,
+            300_000.0 + filler as f64,
+            40_000 + filler,
+            (filler % 101) as f64 + 0.02,
+        ))
+        .unwrap();
+    }
+    old.execute(
+        "UPDATE t SET a = 179, b = 7.75, blob = zeroblob(4194304), c = 453, u = 'hot_hill_935', d = 5.05 WHERE id = 322",
+    )
+    .unwrap();
+
+    let mv_store = db.get_mvcc_store();
+    let old_tx_id = old.get_mv_tx_id().expect("old txn should be active");
+    old.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::CommitValidation.point(),
+    ])));
+
+    let (at_preparing_tx, at_preparing_rx) = std::sync::mpsc::channel();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+
+    let commit_handle = std::thread::spawn(move || {
+        let mut commit = old.prepare("COMMIT").unwrap();
+        match commit.step().unwrap() {
+            crate::StepResult::Yield => {}
+            other => panic!("old COMMIT should yield at CommitValidation, got {other:?}"),
+        }
+        at_preparing_tx.send(()).unwrap();
+        proceed_rx.recv().unwrap();
+        commit.run_ignore_rows()
+    });
+
+    at_preparing_rx.recv().unwrap();
+
+    let saw_preparing = mv_store
+        .txs
+        .get(&old_tx_id)
+        .is_some_and(|entry| matches!(entry.value().state.load(), TransactionState::Preparing(_)));
+
+    victim.execute("BEGIN CONCURRENT").unwrap();
+    let victim_delete = victim.execute("DELETE FROM t WHERE id = 322");
+    proceed_tx.send(()).unwrap();
+    let old_commit = commit_handle.join().unwrap();
+    let _ = victim.execute("ROLLBACK");
+
+    if let Err(LimboError::Corrupt(msg)) = victim_delete {
+        return Some(msg);
+    }
+
+    match victim_delete {
+        Ok(_)
+        | Err(LimboError::WriteWriteConflict)
+        | Err(LimboError::Busy)
+        | Err(LimboError::BusySnapshot)
+        | Err(LimboError::CommitDependencyAborted) => {}
+        other => panic!("unexpected victim DELETE result: {other:?}"),
+    }
+
+    assert!(
+        saw_preparing,
+        "old txn should reach Preparing during COMMIT"
+    );
+    assert!(
+        matches!(old_commit, Err(LimboError::WriteWriteConflict)),
+        "stale updater should lose to concurrent delete, got {old_commit:?}"
+    );
+
+    assert_integrity_ok(&db.connect());
+    None
+}
+
+/// Concurrent DELETE while another txn is committing an UPDATE on a row that a
+/// third txn already deleted must not corrupt unique indexes.
+///
+/// Sequence (from idxdelete_speculative_abort_repro):
+/// 1. `old` begins and pins a snapshot containing row 322.
+/// 2. `deleter` autocommits DELETE of row 322 (MVCC delete; btree unchanged with
+///    checkpoint disabled).
+/// 3. `old` updates row 322 anyway (stale snapshot), rewriting unique columns.
+/// 4. `old` enters `Preparing` during COMMIT.
+/// 5. `victim` DELETEs row 322: table cursor reads `old`'s new unique values, but
+///    IdxDelete cannot find those keys in the btree/MVCC index → corruption.
+#[test]
+fn test_delete_during_preparing_update_of_stale_deleted_row_no_idxdelete_corruption() {
+    const ATTEMPTS: usize = 20;
+    for attempt in 0..ATTEMPTS {
+        if let Some(msg) = try_idxdelete_during_preparing_corruption() {
+            panic!("DELETE corrupted indexes on attempt {attempt}: {msg}");
+        }
+    }
+}
+
 /// 1. BEGIN CONCURRENT (start interactive transaction)
 /// 2. UPDATE modifies col_a's index, then fails constraint check on col_b
 /// 3. The partial index changes are NOT rolled back (this is the bug!)

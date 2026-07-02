@@ -4621,6 +4621,13 @@ impl Connection {
             None => Err(LimboError::InternalError("MVCC not enabled".into())),
         }
     }
+
+    pub(crate) fn mvcc_tx_should_abort(&self) -> bool {
+        match (self.db.get_mv_store().clone(), self.get_mv_tx_id()) {
+            (Some(mv_store), Some(tx_id)) => mv_store.tx_should_abort(tx_id),
+            _ => false,
+        }
+    }
 }
 
 pub type Row = vdbe::Row;
