@@ -2256,22 +2256,14 @@ pub fn op_array_element(
 
     let result = match arr_val {
         Value::Blob(blob) => match ValueIterator::new(blob) {
+            // Note: text fields with invalid UTF-8 are already demoted to
+            // blobs by the record decoder (`read_value_serial_type` in
+            // storage/sqlite3_ondisk.rs validates with simdutf8), so no
+            // re-validation is needed here.
             Ok(mut iter) => iter
                 .nth(idx)
                 .and_then(|r| r.ok())
-                .map(|vref| {
-                    // The blob may not be a real record — text fields could
-                    // contain invalid UTF-8 (from_utf8_unchecked in the
-                    // record decoder). Validate and demote to blob if needed.
-                    if let ValueRef::Text(t) = &vref {
-                        if t.value.as_bytes().iter().any(|&b| b > 0x7F)
-                            && std::str::from_utf8(t.value.as_bytes()).is_err()
-                        {
-                            return Value::Blob(t.value.as_bytes().to_vec());
-                        }
-                    }
-                    vref.to_owned()
-                })
+                .map(|vref| vref.to_owned())
                 .unwrap_or(Value::Null),
             Err(_) => Value::Null,
         },
@@ -17487,8 +17479,9 @@ mod tests {
     #[test]
     fn test_negate_blob_subscript_invalid_utf8_no_panic() {
         // Negating a blob subscript that extracts a "text" value containing
-        // invalid UTF-8 bytes must not panic. The record decoder uses
-        // from_utf8_unchecked, so ArrayElement must validate extracted text.
+        // invalid UTF-8 bytes must not panic. The record decoder validates
+        // text payloads and demotes invalid UTF-8 to a blob, so ArrayElement
+        // never sees a text value with invalid bytes.
         //
         // Reproduces fuzzer bug at seed 27035.
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

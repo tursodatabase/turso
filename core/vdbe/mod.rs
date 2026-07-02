@@ -2989,18 +2989,18 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 }
                 self.set_data_section(&data[content_size..]);
                 let text_data = &data[..content_size];
-                // SAFETY: TEXT serial type contains valid UTF-8
-                let text_str = if cfg!(debug_assertions) {
-                    match std::str::from_utf8(text_data) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Some(Err(LimboError::InternalError(format!(
-                                "Invalid UTF-8 in TEXT serial type: {e}"
-                            ))));
-                        }
+                // SQLite does not require TEXT values to be valid UTF-8 (e.g.
+                // `CAST(X'FF' AS TEXT)` stores the raw byte with a text serial
+                // type). Constructing a `&str` from such bytes is undefined
+                // behavior, so demote invalid UTF-8 to a blob, preserving the
+                // raw bytes. See `read_value` in storage/sqlite3_ondisk.rs
+                // for why demotion is preferred over returning an error.
+                let Ok(text_str) = simdutf8::basic::from_utf8(text_data) else {
+                    mark_unlikely();
+                    if let Err(err) = dest.set_blob(text_data.to_vec()) {
+                        return Some(Err(err));
                     }
-                } else {
-                    unsafe { std::str::from_utf8_unchecked(text_data) }
+                    return Some(Ok(()));
                 };
                 match dest {
                     Register::Value(Value::Text(existing_text)) => {

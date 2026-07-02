@@ -1088,12 +1088,31 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     content_size
                 ))
             })?;
-            // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-            let val = unsafe { std::str::from_utf8_unchecked(data) };
-            Ok((
-                ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
-                content_size,
-            ))
+            // SQLite does not require TEXT values to be valid UTF-8 (e.g.
+            // `CAST(X'FF' AS TEXT)` stores the raw byte with a text serial
+            // type). Constructing a `&str` from such bytes is undefined
+            // behavior, so demote invalid UTF-8 to a blob, preserving the
+            // raw bytes.
+            //
+            // Demotion can diverge from SQLite for such values (typeof()
+            // reports 'blob', and collation/type-ordering treat blobs
+            // differently from text), but SQLite itself documents behavior
+            // on ill-formed UTF-8 as unspecified. We prefer demotion over
+            // returning an error because an error would make every query
+            // touching the value fail, leaving no way to even read a
+            // database SQLite happily created. This mirrors the
+            // validate-and-demote handling of ArrayElement text extraction
+            // in vdbe/execute.rs.
+            match simdutf8::basic::from_utf8(data) {
+                Ok(val) => Ok((
+                    ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
+                    content_size,
+                )),
+                Err(_) => {
+                    mark_unlikely();
+                    Ok((ValueRef::Blob(data), content_size))
+                }
+            }
         }
     }
 }
@@ -1216,12 +1235,22 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-                let val = unsafe { std::str::from_utf8_unchecked(data) };
-                Ok((
-                    ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
-                    content_size,
-                ))
+                // SQLite does not require TEXT values to be valid UTF-8 (e.g.
+                // `CAST(X'FF' AS TEXT)` stores the raw byte with a text serial
+                // type). Constructing a `&str` from such bytes is undefined
+                // behavior, so demote invalid UTF-8 to a blob, preserving the
+                // raw bytes. See `read_value` above for why demotion is
+                // preferred over returning an error.
+                match simdutf8::basic::from_utf8(data) {
+                    Ok(val) => Ok((
+                        ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
+                        content_size,
+                    )),
+                    Err(_) => {
+                        mark_unlikely();
+                        Ok((ValueRef::Blob(data), content_size))
+                    }
+                }
             }
             _ => unreachable!(),
         },
