@@ -6608,10 +6608,6 @@ pub fn op_agg_step(
                 _ => None,
             };
 
-            // Every builtin aggregate steps through update_agg_payload: it reads the argument by
-            // reference and clones only where it must (Min/Max keep the extreme; array_agg/mode/
-            // percentile buffer a copy into the growable payload Vec). The input and accumulator
-            // are always distinct registers, so borrow them disjointly.
             let [arg_reg, acc_slot] =
                 state
                     .registers
