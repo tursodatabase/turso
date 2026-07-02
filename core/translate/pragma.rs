@@ -14,7 +14,7 @@ use super::integrity_check::{
 };
 use crate::function::Func;
 use crate::pragma::pragma_for;
-use crate::schema::Schema;
+use crate::schema::{Schema, Table};
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
@@ -1294,13 +1294,38 @@ fn query_pragma(
                 let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
                 resolver.with_schema(table_database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
-                        emit_columns_for_table_info(program, table.columns(), base_reg, false);
+                        let primary_key_columns = match table.as_ref() {
+                            Table::BTree(bt) => Some(bt.primary_key_columns.as_slice()),
+                            _ => None,
+                        };
+                        emit_columns_for_table_info(
+                            program,
+                            table.columns(),
+                            primary_key_columns,
+                            base_reg,
+                            false,
+                        );
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
                         let view = view_mutex.lock();
                         let flat_columns = view.column_schema.flat_columns();
-                        emit_columns_for_table_info(program, &flat_columns, base_reg, false);
+                        emit_columns_for_table_info(
+                            program,
+                            &flat_columns,
+                            // Materialized views have btree storage (implicit rowid) but no
+                            // declared PRIMARY KEY on their output columns; pk is always 0.
+                            None,
+                            base_reg,
+                            false,
+                        );
                     } else if let Some(view) = db_schema.get_view(&lookup_name) {
-                        emit_columns_for_table_info(program, &view.columns, base_reg, false);
+                        emit_columns_for_table_info(
+                            program,
+                            &view.columns,
+                            // Views are query definitions, not tables; pk is always 0.
+                            None,
+                            base_reg,
+                            false,
+                        );
                     }
                 });
             }
@@ -1329,13 +1354,38 @@ fn query_pragma(
                 let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
                 resolver.with_schema(table_database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
-                        emit_columns_for_table_info(program, table.columns(), base_reg, true);
+                        let primary_key_columns = match table.as_ref() {
+                            Table::BTree(bt) => Some(bt.primary_key_columns.as_slice()),
+                            _ => None,
+                        };
+                        emit_columns_for_table_info(
+                            program,
+                            table.columns(),
+                            primary_key_columns,
+                            base_reg,
+                            true,
+                        );
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
                         let view = view_mutex.lock();
                         let flat_columns = view.column_schema.flat_columns();
-                        emit_columns_for_table_info(program, &flat_columns, base_reg, true);
+                        emit_columns_for_table_info(
+                            program,
+                            &flat_columns,
+                            // Materialized views have btree storage (implicit rowid) but no
+                            // declared PRIMARY KEY on their output columns; pk is always 0.
+                            None,
+                            base_reg,
+                            true,
+                        );
                     } else if let Some(view) = db_schema.get_view(&lookup_name) {
-                        emit_columns_for_table_info(program, &view.columns, base_reg, true);
+                        emit_columns_for_table_info(
+                            program,
+                            &view.columns,
+                            // Views are query definitions, not tables; pk is always 0.
+                            None,
+                            base_reg,
+                            true,
+                        );
                     }
                 });
             }
@@ -1668,11 +1718,23 @@ fn query_pragma(
     }
 }
 
+/// 0-based index of `column` within `primary_key_columns`, if present.
+fn column_pk_index(
+    column: &crate::schema::Column,
+    primary_key_columns: &[(String, turso_parser::ast::SortOrder)],
+) -> Option<usize> {
+    let name = column.name.as_deref()?;
+    primary_key_columns
+        .iter()
+        .position(|(pk_name, _)| name.eq_ignore_ascii_case(pk_name))
+}
+
 /// Helper function to emit column information for PRAGMA table_info
 /// Used by both tables and views since they now have the same column emission logic
 fn emit_columns_for_table_info(
     program: &mut ProgramBuilder,
     columns: &[crate::schema::Column],
+    primary_key_columns: Option<&[(String, turso_parser::ast::SortOrder)]>,
     base_reg: usize,
     extended: bool,
 ) {
@@ -1727,8 +1789,20 @@ fn emit_columns_for_table_info(
             }
         }
 
-        // pk
-        program.emit_bool(column.primary_key(), base_reg + 5);
+        // pk — 1-based position within the primary key, or 0 if not part of the key.
+        // B-tree tables use composite key order from schema; virtual tables fall back to
+        // the per-column primary key flag (always 0 or 1 for vtabs).
+        let pk = match primary_key_columns.and_then(|pk_cols| column_pk_index(column, pk_cols)) {
+            Some(index) => (index + 1) as i64,
+            None => {
+                if column.primary_key() {
+                    1
+                } else {
+                    0
+                }
+            }
+        };
+        program.emit_int(pk, base_reg + 5);
 
         if extended {
             program.emit_int(column_type, base_reg + 6);
@@ -1808,9 +1882,9 @@ fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool>
     }
     if let Some(table_arc) = schema.tables.values().next() {
         let table_name = match table_arc.as_ref() {
-            crate::schema::Table::BTree(tbl) => &tbl.name,
-            crate::schema::Table::Virtual(tbl) => &tbl.name,
-            crate::schema::Table::FromClauseSubquery(tbl) => &tbl.name,
+            Table::BTree(tbl) => &tbl.name,
+            Table::Virtual(tbl) => &tbl.name,
+            Table::FromClauseSubquery(tbl) => &tbl.name,
         };
 
         if table_name != "sqlite_schema" {
