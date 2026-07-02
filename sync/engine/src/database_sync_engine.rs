@@ -427,6 +427,11 @@ mod tests {
             "with local replay, preserve the replay floor so local rows remain pushable"
         );
         assert_eq!(
+            synced_change_id_after_remote_apply(true, Some(11), 8),
+            8,
+            "the persisted sync floor must never advance beyond the local CDC high-water"
+        );
+        assert_eq!(
             synced_change_id_after_remote_apply(true, None, 40),
             0,
             "a database with no pre-existing CDC still starts from zero"
@@ -1988,7 +1993,7 @@ fn execute_with_schema_retry(conn: &Arc<turso_core::Connection>, sql: &str) -> R
             Ok(()) => return Ok(()),
             Err(LimboError::SchemaUpdated) if attempt < 4 => {
                 force_reparse_schema_with_retry(conn)?;
-                conn.publish_schema_after_external_restore();
+                publish_schema_after_external_restore(conn, "schema retry")?;
             }
             Err(error) => return Err(error.into()),
         }
@@ -2018,6 +2023,7 @@ fn reload_connection_after_external_restore(
     conn: &Arc<turso_core::Connection>,
     context: &str,
 ) -> Result<()> {
+    conn.discard_main_mvcc_tx_after_external_restore();
     match conn.reload_wal_after_external_restore() {
         Ok(()) => {}
         Err(LimboError::SchemaUpdated) => {
@@ -2044,7 +2050,7 @@ fn reload_connection_after_external_restore(
             format!("failed to refresh schema after {context}: {error}",),
         )
     })?;
-    conn.publish_schema_after_external_restore();
+    publish_schema_after_external_restore(conn, context)?;
     Ok(())
 }
 
@@ -2060,17 +2066,25 @@ fn publish_schema_after_raw_wal_replay(
             format!("failed to refresh schema after {context}: {error}",),
         )
     })?;
-    conn.publish_schema_after_external_restore();
+    publish_schema_after_external_restore(conn, context)?;
     Ok(())
 }
 
 fn publish_schema_after_sync_checkpoint(conn: &Arc<turso_core::Connection>) -> Result<()> {
     conn.get_pager().clear_page_cache(true);
     match force_reparse_schema_with_retry(conn) {
-        Ok(()) => {
-            conn.publish_schema_after_external_restore();
-            Ok(())
-        }
+        Ok(()) => match conn.publish_schema_after_external_restore() {
+            Ok(()) => Ok(()),
+            Err(LimboError::Busy) => {
+                tracing::debug!(
+                        "checkpoint: schema publish after sync checkpoint skipped due to local busy connection"
+                    );
+                Ok(())
+            }
+            Err(error) => Err(Error::DatabaseSyncEngineError(format!(
+                "failed to publish schema after sync checkpoint: {error}",
+            ))),
+        },
         Err(Error::TursoError(LimboError::Busy)) => {
             tracing::debug!(
                 "checkpoint: schema refresh after sync checkpoint skipped due to local busy connection"
@@ -2081,6 +2095,18 @@ fn publish_schema_after_sync_checkpoint(conn: &Arc<turso_core::Connection>) -> R
             "failed to refresh schema after sync checkpoint: {error}",
         ))),
     }
+}
+
+fn publish_schema_after_external_restore(
+    conn: &Arc<turso_core::Connection>,
+    context: &str,
+) -> Result<()> {
+    conn.publish_schema_after_external_restore()
+        .map_err(|error| {
+            Error::DatabaseSyncEngineError(format!(
+                "failed to publish schema after {context}: {error}",
+            ))
+        })
 }
 
 /// Marks all current CDC rows as already observed by `client_id`.
@@ -2120,7 +2146,7 @@ async fn rebuild_local_sync_metadata_table<Ctx>(
     pull_gen: i64,
     change_id: i64,
 ) -> Result<()> {
-    conn.publish_schema_after_external_restore();
+    publish_schema_after_external_restore(conn, "local sync metadata rebuild")?;
     update_last_change_id(coro, conn, client_id, pull_gen, change_id).await
 }
 
@@ -2213,11 +2239,12 @@ fn synced_change_id_after_remote_apply(
     local_replay_floor_change_id: Option<i64>,
     post_apply_change_id: i64,
 ) -> i64 {
-    if replayed_local_changes {
+    let change_id = if replayed_local_changes {
         local_replay_floor_change_id.unwrap_or(0)
     } else {
         post_apply_change_id
-    }
+    };
+    change_id.min(post_apply_change_id)
 }
 
 fn use_pushed_change_hint_for_local_replay(
@@ -3634,7 +3661,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                 "failed to initialize sync high-water mark table after replace-base snapshot: {error}"
                             ))
                         })?;
-                        conn.publish_schema_after_external_restore();
+                        publish_schema_after_external_restore(
+                            &conn,
+                            "replace-base sync table initialization",
+                        )?;
                         conn = match connect_untracked(&self.main_tape) {
                             Ok(conn) => conn,
                             Err(Error::TursoError(LimboError::SchemaUpdated)) => {
@@ -3656,7 +3686,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                 "failed to refresh replay connection schema after replace-base sync table initialization: {error}",
                             ))
                         })?;
-                        conn.publish_schema_after_external_restore();
+                        publish_schema_after_external_restore(
+                            &conn,
+                            "replace-base sync table reconnect",
+                        )?;
                         execute_with_schema_retry(&conn, "BEGIN IMMEDIATE").map_err(|error| {
                             Error::DatabaseSyncEngineError(format!(
                                 "failed to begin replace-base replay transaction: {error}",
@@ -3977,9 +4010,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                 "failed to reinitialize CDC pragma before local replay: {error}",
                             ))
                         })?;
-                    if replace_base_pages || raw_page_replay_on_sql_conn {
-                        phase_conn.publish_schema_after_external_restore();
-                    }
                     cdc_enabled_for_local_replay = true;
                 }
 
@@ -4130,6 +4160,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     };
                     let synced_change_id = preserve_local_replay_floor
                         .map_or(synced_change_id, |floor| synced_change_id.min(floor));
+                    let synced_change_id = synced_change_id.min(change_id);
                     if raw_page_replay_on_sql_conn {
                         rebuild_local_sync_metadata_table(
                             coro,
@@ -4198,7 +4229,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         "failed to reinitialize CDC pragma after remote apply: {error}",
                     ))
                 })?;
-                main_conn.publish_schema_after_external_restore();
+                publish_schema_after_external_restore(&main_conn, "post-WAL-replay CDC refresh")?;
                 let change_id = max_local_change_id(coro, &main_conn).await?.unwrap_or(0);
                 tracing::info!(
                     "apply_changes(path={}): post-WAL-replay CDC high-water mark: {}",
@@ -4216,9 +4247,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         post_remote_apply_change_id
                     } else {
                         synced_change_id
-                    };
+                };
                 let synced_change_id = preserve_local_replay_floor
                     .map_or(synced_change_id, |floor| synced_change_id.min(floor));
+                let synced_change_id = synced_change_id.min(change_id);
                 update_last_change_id(
                     coro,
                     &main_conn,

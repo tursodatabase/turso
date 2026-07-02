@@ -193,7 +193,7 @@ fn logical_op_to_tape_operations(
                     change_id: 0,
                     change_time: commit_ts,
                     change: DatabaseTapeRowChangeType::Delete {
-                        before: Default::default(),
+                        before: turso_core::alloc::vec![],
                     },
                     table_name: op.table_name,
                     id: op.rowid,
@@ -2558,7 +2558,10 @@ pub async fn ensure_sync_last_change_id_table<Ctx>(
                     "update_last_change_id(client_id={client_id}): schema updated while initializing sync table; refreshing schema"
                 );
                 force_reparse_schema_with_retry(conn)?;
-                conn.publish_schema_after_external_restore();
+                publish_schema_after_external_restore(
+                    conn,
+                    "sync high-water mark table initialization",
+                )?;
                 if attempt == 2 {
                     return Ok(());
                 }
@@ -2586,6 +2589,18 @@ fn force_reparse_schema_with_retry(conn: &Arc<turso_core::Connection>) -> Result
         }
     }
     Ok(())
+}
+
+fn publish_schema_after_external_restore(
+    conn: &Arc<turso_core::Connection>,
+    context: &str,
+) -> Result<()> {
+    conn.publish_schema_after_external_restore()
+        .map_err(|error| {
+            Error::DatabaseSyncEngineError(format!(
+                "failed to publish schema after {context}: {error}",
+            ))
+        })
 }
 
 pub async fn read_last_change_id<Ctx>(

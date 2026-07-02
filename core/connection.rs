@@ -1083,6 +1083,7 @@ impl Connection {
         if self.get_tx_state() != TransactionState::None {
             return Ok(());
         }
+        let had_main_mv_tx = self.get_mv_tx().is_some();
 
         if self.db.shared_wal_coordination()?.is_some() {
             // Cross-process schema changes can leave page 1 and sqlite_schema
@@ -1151,6 +1152,9 @@ impl Connection {
         if previous == TransactionState::Read {
             pager.end_read_tx();
         }
+        if !had_main_mv_tx {
+            self.clear_internal_main_mvcc_tx(&pager);
+        }
 
         reparse_result?;
 
@@ -1167,10 +1171,10 @@ impl Connection {
     #[cfg(feature = "conn_raw_api")]
     pub fn force_reparse_schema(self: &Arc<Connection>) -> Result<()> {
         if self.get_tx_state() != TransactionState::None {
-            return Ok(());
+            return Err(LimboError::Busy);
         }
         if self.get_mv_tx().is_some() || self.next_attached_mv_tx().is_some() {
-            return Ok(());
+            return Err(LimboError::Busy);
         }
 
         let pager = self.pager.load().clone();
@@ -1189,12 +1193,29 @@ impl Connection {
         if previous == TransactionState::Read {
             pager.end_read_tx();
         }
+        self.clear_internal_main_mvcc_tx(&pager);
 
         reparse_result?;
 
         let schema = self.schema.read().clone();
         self.db.update_schema_if_newer(schema);
         Ok(())
+    }
+
+    fn clear_internal_main_mvcc_tx(&self, pager: &Arc<Pager>) {
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return;
+        };
+        if let Some(mv_store) = self.mv_store().as_ref() {
+            if mv_store.is_tx_rollbackable(tx_id) {
+                mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+            } else {
+                self.set_mv_tx(None);
+            }
+        } else {
+            self.set_mv_tx(None);
+        }
+        pager.cleanup_read_tx();
     }
 
     /// Blocking shim: drives [`Self::reparse_schema_nonblock`] to completion.
@@ -2239,7 +2260,14 @@ impl Connection {
     /// case the shared schema cache must be replaced rather than updated
     /// monotonically, otherwise new connections can re-adopt stale metadata.
     #[cfg(feature = "conn_raw_api")]
-    pub fn publish_schema_after_external_restore(&self) {
+    pub fn publish_schema_after_external_restore(&self) -> Result<()> {
+        if self.get_tx_state() != TransactionState::None {
+            return Err(LimboError::Busy);
+        }
+        if self.get_mv_tx().is_some() || self.next_attached_mv_tx().is_some() {
+            return Err(LimboError::Busy);
+        }
+
         let schema = self.schema.read().clone();
         self.db
             .with_schema_mut(|current| {
@@ -2247,6 +2275,7 @@ impl Connection {
                 Ok(())
             })
             .expect("external restore schema replacement should be infallible");
+        Ok(())
     }
 
     /// Roll back the main-database MVCC transaction while keeping the
@@ -2262,6 +2291,14 @@ impl Connection {
         };
         let pager = self.pager.load();
         mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+    }
+
+    /// Discard the main-db MVCC transaction left by a sync raw-WAL session
+    /// before reparsing state after external file replacement.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn discard_main_mvcc_tx_after_external_restore(&self) {
+        let pager = self.pager.load();
+        self.clear_internal_main_mvcc_tx(&pager);
     }
 
     /// Returns whether the main database currently has a live MVCC transaction.
