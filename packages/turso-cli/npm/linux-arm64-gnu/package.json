@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/cli-linux-arm64-gnu",
-  "version": "0.7.0-pre.10",
+  "version": "0.7.0-pre.14",
   "description": "Turso CLI binary for Linux ARM64 (glibc)",
   "os": [
     "linux"

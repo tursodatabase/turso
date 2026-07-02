@@ -11,6 +11,7 @@ use super::{
         write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
     },
 };
+#[cfg(test)]
 use crate::alloc::TursoIteratorExt;
 use crate::{
     io::CompletionGroup,
@@ -869,27 +870,20 @@ impl BTreeCursor {
         num_columns: usize,
     ) -> Self {
         let mut cursor = Self::new(pager, root_page, num_columns);
-        let key_info = table
-            .primary_key_columns
-            .iter()
-            .map(|(col_name, order)| {
-                let (_, column) = table
-                    .get_column(col_name)
-                    .expect("WITHOUT ROWID primary key column should exist");
-                crate::types::KeyInfo {
-                    sort_order: *order,
-                    collation: column.collation_opt().unwrap_or_default(),
-                    nulls_order: None,
-                }
-            })
-            .try_collect::<crate::alloc::Vec<_>>()
-            .expect("TODO: fallible allocations");
-        cursor.index_info = Some(Arc::new(IndexInfo {
-            key_info,
-            has_rowid: false,
-            num_cols: table.primary_key_columns.len(),
-            is_unique: true,
-        }));
+        let key_info = table.primary_key_columns.iter().map(|(col_name, order)| {
+            let (_, column) = table
+                .get_column(col_name)
+                .expect("WITHOUT ROWID primary key column should exist");
+            crate::types::KeyInfo {
+                sort_order: *order,
+                collation: column.collation_opt().unwrap_or_default(),
+                nulls_order: None,
+            }
+        });
+        cursor.index_info = Some(Arc::new(
+            IndexInfo::new(key_info, false, table.primary_key_columns.len(), true)
+                .expect(crate::alloc::ALLOC_ERR_MSG),
+        ));
         cursor
     }
 

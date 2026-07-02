@@ -17,5 +17,5 @@ pub use traits::TursoFromIteratorIn;
 pub use traits::{
     TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt, TursoFromIterator, TursoHashMapExt,
     TursoHashSetExt, TursoIteratorExt, TursoNewExt, TursoSliceExt, TursoTryNewExt,
-    TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt,
+    TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt, TursoVecInExt,
 };

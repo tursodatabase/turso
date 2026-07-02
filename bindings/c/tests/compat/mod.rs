@@ -240,7 +240,7 @@ mod tests {
         unsafe {
             let mut db = ptr::null_mut();
             assert_eq!(
-                sqlite3_open(c"../testing/system/testing_clone.db".as_ptr(), &mut db),
+                sqlite3_open(c"../../testing/system/testing_clone.db".as_ptr(), &mut db),
                 SQLITE_OK
             );
             assert_eq!(sqlite3_close(db), SQLITE_OK);
@@ -651,7 +651,7 @@ mod tests {
         unsafe {
             let mut db = std::ptr::null_mut();
             assert_eq!(
-                sqlite3_open(c"../testing/system/testing.db".as_ptr(), &mut db),
+                sqlite3_open(c"../../testing/system/testing.db".as_ptr(), &mut db),
                 SQLITE_OK
             );
             let mut stmt = std::ptr::null_mut();

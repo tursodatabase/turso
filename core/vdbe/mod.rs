@@ -37,6 +37,7 @@ pub mod value;
 // for benchmarks
 pub use crate::translate::collate::CollationSeq;
 use crate::{
+    alloc::DynAllocator,
     error::LimboError,
     function::FuncCtx,
     mvcc::{database::CommitStateMachine, MvccClock},
@@ -98,6 +99,8 @@ use std::{
     task::Waker,
 };
 use tracing::{instrument, Level};
+
+type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
 
 /// State machine for committing view deltas with I/O handling
 #[derive(Debug, Clone)]
@@ -188,11 +191,11 @@ enum CommitState {
     /// Committing attached database pagers after main pager commit is done.
     CommittingAttached,
     CommittingMvcc {
-        state_machine: StateMachine<Box<CommitStateMachine<MvccClock>>>,
+        state_machine: StateMachine<Box<MvccCommitStateMachine>>,
     },
     /// Committing MVCC transactions on attached databases after main MVCC commit is done.
     CommittingAttachedMvcc {
-        state_machine: StateMachine<Box<CommitStateMachine<MvccClock>>>,
+        state_machine: StateMachine<Box<MvccCommitStateMachine>>,
         db_id: usize,
         mv_store: Arc<MvStore>,
     },
@@ -694,7 +697,7 @@ pub struct ProgramState {
     /// entry and drives it one step per opcode call, yielding
     /// `InsnFunctionStepResult::IO` between steps. Cleared on terminal
     /// outcome (Done / Conflict / Err) and on statement reset.
-    pub sequence_inner_commit: Option<StateMachine<Box<CommitStateMachine<MvccClock>>>>,
+    pub sequence_inner_commit: Option<StateMachine<Box<MvccCommitStateMachine>>>,
     /// State for a pending sequence inner-tx wrap, set by
     /// `Insn::SequenceBeginInnerTx` (Wrapped path only) and cleared
     /// by `Insn::SequenceCommitInnerTx` on any terminal outcome.
@@ -2350,7 +2353,7 @@ impl Program {
     #[instrument(skip(self, commit_state, mv_store), level = Level::DEBUG)]
     fn step_end_mvcc_txn(
         &self,
-        commit_state: &mut StateMachine<Box<CommitStateMachine<MvccClock>>>,
+        commit_state: &mut StateMachine<Box<MvccCommitStateMachine>>,
         mv_store: &Arc<MvStore>,
     ) -> Result<IOResult<()>> {
         commit_state.step(mv_store)

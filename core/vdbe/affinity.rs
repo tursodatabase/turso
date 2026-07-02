@@ -126,7 +126,7 @@ impl Affinity {
     }
 
     /// Convert affinity to the corresponding Type enum
-    pub fn to_type(&self) -> crate::schema::Type {
+    pub fn to_type(self) -> crate::schema::Type {
         use crate::schema::Type;
         match self {
             Affinity::Blob => Type::Blob,

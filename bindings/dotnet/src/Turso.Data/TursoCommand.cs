@@ -109,8 +109,24 @@ public class TursoCommand : DbCommand
 
     public override int ExecuteNonQuery()
     {
+        if (_connection?.IsRemote == true)
+            return ExecuteRemoteNonQueryAsync(CancellationToken.None).GetAwaiter().GetResult();
+
         using var reader = Execute();
         while (reader.Read())
+        {
+        }
+
+        return reader.RecordsAffected;
+    }
+
+    public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
+    {
+        if (_connection?.IsRemote == true)
+            return await ExecuteRemoteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var reader = await ExecuteDbDataReaderAsync(CommandBehavior.Default, cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
         }
 
@@ -125,14 +141,23 @@ public class TursoCommand : DbCommand
             : null;
     }
 
+    public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
+    {
+        await using var reader = await ExecuteDbDataReaderAsync(CommandBehavior.Default, cancellationToken).ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+            ? reader.GetValue(0)
+            : null;
+    }
+
     public override void Prepare()
     {
         if (_connection is null)
             throw new InvalidOperationException("Connection must be set before preparing a command.");
         if (string.IsNullOrWhiteSpace(CommandText))
             throw new InvalidOperationException("CommandText must be set before preparing a command.");
-        if (_transaction is { IsCompleted: true })
-            throw new InvalidOperationException("The transaction associated with this command has completed.");
+        ValidateTransaction();
+        if (_connection.IsRemote)
+            return;
 
         TursoStatementHandle? preparedStatement = null;
         try
@@ -200,6 +225,17 @@ public class TursoCommand : DbCommand
         return Execute(behavior);
     }
 
+    protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled<DbDataReader>(cancellationToken);
+
+        if (_connection?.IsRemote == true)
+            return ExecuteRemoteAsync(behavior, cancellationToken);
+
+        return Task.FromResult(Execute(behavior));
+    }
+
     private static string RewriteFacadePragmas(string sql, TursoConnection connection)
     {
         var normalized = sql.Trim().TrimEnd(';').Trim();
@@ -234,11 +270,58 @@ public class TursoCommand : DbCommand
         if (_connection is null)
             throw new InvalidOperationException("Connection must be set before executing a command.");
 
+        if (_connection.IsRemote)
+            return ExecuteRemoteAsync(behavior, CancellationToken.None).GetAwaiter().GetResult();
+
         Prepare();
 
         var statement = _statement ?? throw new InvalidOperationException("Command was not prepared.");
         _statement = null;
         var reader = new TursoDataReader(this, statement, behavior);
         return reader;
+    }
+
+    private async Task<DbDataReader> ExecuteRemoteAsync(CommandBehavior behavior, CancellationToken cancellationToken)
+    {
+        if (_connection is null)
+            throw new InvalidOperationException("Connection must be set before executing a command.");
+        if (string.IsNullOrWhiteSpace(CommandText))
+            throw new InvalidOperationException("CommandText must be set before executing a command.");
+        ValidateTransaction();
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var sql = RewriteFacadePragmas(CommandText, _connection);
+        var result = await _connection
+            .ExecuteRemoteAsync(sql, _parameterCollection, wantRows: true, CommandTimeout, cancellationToken)
+            .ConfigureAwait(false);
+        return new TursoRemoteDataReader(this, result, behavior);
+    }
+
+    private async Task<int> ExecuteRemoteNonQueryAsync(CancellationToken cancellationToken)
+    {
+        if (_connection is null)
+            throw new InvalidOperationException("Connection must be set before executing a command.");
+        if (string.IsNullOrWhiteSpace(CommandText))
+            throw new InvalidOperationException("CommandText must be set before executing a command.");
+        ValidateTransaction();
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var sql = RewriteFacadePragmas(CommandText, _connection);
+        var result = await _connection
+            .ExecuteRemoteAsync(sql, _parameterCollection, wantRows: false, CommandTimeout, cancellationToken)
+            .ConfigureAwait(false);
+        return checked((int)result.AffectedRowCount);
+    }
+
+    private void ValidateTransaction()
+    {
+        if (_transaction is null)
+            return;
+        if (_transaction.IsCompleted)
+            throw new InvalidOperationException("The transaction associated with this command has completed.");
+        if (!ReferenceEquals(_transaction.Connection, _connection))
+            throw new InvalidOperationException("The transaction is not associated with the command's connection.");
     }
 }

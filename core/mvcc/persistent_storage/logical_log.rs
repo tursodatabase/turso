@@ -236,6 +236,7 @@ use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::turso_assert;
 use crate::{
+    alloc::{ConcurrentAllocator, TursoAllocator},
     io::{CompletionGroup, ReadComplete},
     io_yield_one,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
@@ -3471,6 +3472,15 @@ impl StreamingLogicalLogReader {
         parsed_op: ParsedOp,
         get_index_info: &mut impl FnMut(MVTableId, IndexOpKind) -> Result<Arc<IndexInfo>>,
     ) -> Result<StreamingResult> {
+        self.parsed_op_to_streaming_in(parsed_op, get_index_info, TursoAllocator)
+    }
+
+    pub(crate) fn parsed_op_to_streaming_in<A: ConcurrentAllocator>(
+        &self,
+        parsed_op: ParsedOp,
+        get_index_info: &mut impl FnMut(MVTableId, IndexOpKind) -> Result<Arc<IndexInfo>>,
+        alloc: A,
+    ) -> Result<StreamingResult> {
         match parsed_op {
             ParsedOp::UpsertTable {
                 table_id,
@@ -3481,12 +3491,17 @@ impl StreamingLogicalLogReader {
             } => {
                 // Compute column_count from the serialized record so recovered rows keep
                 // the same shape metadata as non-recovered rows.
+                // Decode shape metadata by reference; ownership is only needed for the row payload.
                 let column_count =
                     crate::types::ImmutableRecordRef::from_bin_record(&record_bytes).column_count();
-                let row = Row::new_table_row(
-                    RowID::new(table_id, rowid.row_id.clone()),
-                    record_bytes,
-                    column_count,
+                let row = crate::with_mv_store_allocation_site!(
+                    RowPayload,
+                    Row::new_table_row_in(
+                        RowID::new(table_id, rowid.row_id.clone()),
+                        &record_bytes,
+                        column_count,
+                        alloc,
+                    )?
                 );
                 Ok(StreamingResult::UpsertTableRow {
                     row,
@@ -4417,9 +4432,10 @@ mod tests {
                     tx_id,
                     Row::new_table_row(
                         RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob().to_vec(),
+                        data.as_blob(),
                         5,
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             // now insert a row into table -2
@@ -4489,9 +4505,10 @@ mod tests {
                     tx_id,
                     Row::new_table_row(
                         RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob().to_vec(),
+                        data.as_blob(),
                         5,
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -4603,9 +4620,10 @@ mod tests {
                     tx_id,
                     Row::new_table_row(
                         RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob().to_vec(),
+                        data.as_blob(),
                         5,
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -5665,9 +5683,10 @@ mod tests {
                         )),
                         row: Row::new_table_row(
                             RowID::new((-2).into(), RowKey::Int(rowid)),
-                            Vec::new(),
+                            &[],
                             0,
-                        ),
+                        )
+                        .unwrap(),
                         btree_resident,
                     });
                     expected.push(ExpectedTableOp::Delete {
@@ -6239,15 +6258,7 @@ mod tests {
             2,
         )
         .unwrap();
-        let sortable_key = SortableIndexKey::new_from_record(
-            key_record,
-            Arc::new(IndexInfo {
-                has_rowid: true,
-                num_cols: 2,
-                is_unique: false,
-                ..Default::default()
-            }),
-        );
+        let sortable_key = SortableIndexKey::new_from_record(key_record, test_index_info());
         let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
         let row = Row::new_index_row(row_id, 2);
         crate::mvcc::database::RowVersion {
@@ -6262,12 +6273,26 @@ mod tests {
     }
 
     fn test_index_info() -> Arc<IndexInfo> {
-        Arc::new(IndexInfo {
-            has_rowid: true,
-            num_cols: 2,
-            is_unique: false,
-            ..Default::default()
-        })
+        Arc::new(
+            IndexInfo::new(
+                [
+                    crate::types::KeyInfo {
+                        sort_order: turso_parser::ast::SortOrder::Asc,
+                        collation: crate::translate::collate::CollationSeq::Binary,
+                        nulls_order: None,
+                    },
+                    crate::types::KeyInfo {
+                        sort_order: turso_parser::ast::SortOrder::Asc,
+                        collation: crate::translate::collate::CollationSeq::Binary,
+                        nulls_order: None,
+                    },
+                ],
+                true,
+                2,
+                false,
+            )
+            .unwrap(),
+        )
     }
 
     fn make_test_raw_table_row_version(
@@ -6277,7 +6302,8 @@ mod tests {
         commit_ts: u64,
         is_delete: bool,
     ) -> crate::mvcc::database::RowVersion {
-        let row = Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), record_bytes, 1);
+        let row =
+            Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), &record_bytes, 1).unwrap();
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
             begin: crate::mvcc::database::PackedTs::pack(if is_delete {

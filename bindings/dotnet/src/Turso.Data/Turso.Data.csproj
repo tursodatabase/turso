@@ -8,7 +8,7 @@
     <RootNamespace>Turso</RootNamespace>
     
     <Title>Turso ADO.NET Provider</Title>
-    <Description>ADO.NET provider for Turso, exposing SQLite-compatible local database access through System.Data.Common.</Description>
+    <Description>ADO.NET provider for Turso, exposing local and remote database access through System.Data.Common.</Description>
     <Authors>Turso authors</Authors>
     <PackageTags>turso;sqlite;database;ado.net;system.data</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

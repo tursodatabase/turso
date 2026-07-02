@@ -1668,11 +1668,48 @@ mod tests {
             Value::build_text("2024-07-21T12:00:00+Z"),        // Invalid timezone format
             Value::build_text("2024-07-21T12:00:00+00:00Z"),   // Mixing offset and Z
             Value::build_text("2024-07-21T12:00:00UTC"),       // Named timezone (not supported)
+            // Unsupported date format tests
+            Value::build_text("2024/07/21"),
+            Value::build_text("2024.07.21"),
+            Value::build_text("07/21/2024"),
+            Value::build_text("21/07/2024"),
         ];
 
         for case in invalid_cases {
             let result = exec_time(&[case.clone()]);
             assert_eq!(result, Value::Null);
+        }
+    }
+
+    #[test]
+    fn test_parse_modifier_overflow() {
+        let modifiers = [
+            "1e308 days",
+            "1e308 hours",
+            "1e308 minutes",
+            "1e308 seconds",
+            "1e308 months",
+            "1e308 years",
+            "-1e308 days",
+            "-1e308 hours",
+            "-1e308 minutes",
+            "-1e308 seconds",
+            "-1e308 months",
+            "-1e308 years",
+            "1e309 days",
+            "1e309 hours",
+            "1e309 minutes",
+            "1e309 seconds",
+            "1e309 months",
+            "1e309 years",
+        ];
+
+        for modifier in modifiers {
+            assert_eq!(
+                exec_datetime_full(&[Value::build_text("now"), Value::build_text(modifier),]),
+                Value::Null,
+                "modifier: {modifier}"
+            );
         }
     }
 
@@ -1821,6 +1858,28 @@ mod tests {
         assert_eq!(run("+2023-05-15 14:30"), "4023-06-16 14:30:00");
         assert_eq!(run("-0001-05-15 14:30"), "1998-07-16 09:30:00");
     }
+    #[test]
+    fn test_time_offset_boundaries() {
+        let valid = ["+24:59", "-24:59"];
+
+        for modifier in valid {
+            assert_ne!(
+                exec_datetime_full(&[Value::build_text("now"), Value::build_text(modifier),]),
+                Value::Null,
+                "modifier: {modifier}"
+            );
+        }
+
+        let invalid = ["+25:00", "+25:01", "-25:00", "-25:01"];
+
+        for modifier in invalid {
+            assert_eq!(
+                exec_datetime_full(&[Value::build_text("now"), Value::build_text(modifier),]),
+                Value::Null,
+                "modifier: {modifier}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_start_of() {
@@ -1840,6 +1899,25 @@ mod tests {
         assert_eq!(run(base, "START OF YEAR"), "2023-01-01 00:00:00");
         assert_eq!(run(base, "start of day"), "2023-06-15 00:00:00");
         assert_eq!(run(base, "START OF DAY"), "2023-06-15 00:00:00");
+    }
+
+    #[test]
+    fn test_invalid_end_of_modifiers() {
+        let modifiers = [
+            "end of month",
+            "END OF MONTH",
+            "end of year",
+            "END OF YEAR",
+            "end of day",
+            "END OF DAY",
+        ];
+
+        for modifier in modifiers {
+            let result =
+                exec_datetime_full(&[Value::build_text("2023-06-15"), Value::build_text(modifier)]);
+
+            assert_eq!(result, Value::Null, "modifier: {modifier}");
+        }
     }
 
     #[test]
@@ -1963,6 +2041,72 @@ mod tests {
 
         assert_eq!(run("30 seconds"), "2023-06-15 12:31:15");
         assert_eq!(run("-20 seconds"), "2023-06-15 12:30:25");
+    }
+    #[test]
+    fn test_datetime_boundary_arithmetic() {
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("9999-12-31 23:59:59"),
+                Value::build_text("+1 second"),
+            ]),
+            Value::Null
+        );
+
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("9999-12-31 23:59:59"),
+                Value::build_text("+1 day"),
+            ]),
+            Value::Null
+        );
+
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("9999-12-31 23:59:59"),
+                Value::build_text("+1 month"),
+            ]),
+            Value::Null
+        );
+
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("9999-12-31 23:59:59"),
+                Value::build_text("+1 year"),
+            ]),
+            Value::Null
+        );
+
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("0000-01-01 00:00:00"),
+                Value::build_text("-1 second"),
+            ]),
+            Value::build_text("-0001-12-31 23:59:59")
+        );
+
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("0000-01-01 00:00:00"),
+                Value::build_text("-1 day"),
+            ]),
+            Value::build_text("-0001-12-31 00:00:00")
+        );
+
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("0000-01-01 00:00:00"),
+                Value::build_text("-1 month"),
+            ]),
+            Value::build_text("-0001-12-01 00:00:00")
+        );
+
+        assert_eq!(
+            exec_datetime_full(&[
+                Value::build_text("0000-01-01 00:00:00"),
+                Value::build_text("-1 year"),
+            ]),
+            Value::build_text("-0001-01-01 00:00:00")
+        );
     }
 
     #[test]

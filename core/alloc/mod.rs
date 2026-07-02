@@ -4,10 +4,11 @@
 //! available. Builds compiled with `--cfg nightly` use Rust's unstable
 //! `allocator_api` collection parameters.
 
-use std::fmt;
+use std::{fmt, ptr::NonNull};
 
 mod allocation_site;
 mod api;
+mod arc;
 mod backend;
 mod collections;
 
@@ -19,13 +20,14 @@ pub use allocation_site::{
 /// stable, `std::alloc::Allocator` on `--cfg nightly` builds.
 pub use api::ApiAllocator;
 pub use api::{AllocError, Global, Layout};
+pub use arc::{try_arc_slice_from_slice, try_arc_slice_from_slice_in, ArcSlice};
 pub use backend::{set_allocator, SetAllocatorError, TursoAllocBackend};
 #[cfg(nightly)]
 pub use collections::TursoFromIteratorIn;
 pub use collections::{
     TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt, TursoFromIterator, TursoHashMapExt,
     TursoHashSetExt, TursoIteratorExt, TursoNewExt, TursoSliceExt, TursoTryNewExt,
-    TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt,
+    TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt, TursoVecInExt,
 };
 
 pub const ALLOC_ERR_MSG: &str = "TODO: fallible allocations";
@@ -66,6 +68,46 @@ impl<A: ApiAllocator + Clone + Send + Sync + 'static> ConcurrentAllocator for A 
 pub struct TursoAllocator;
 
 pub type Allocator = TursoAllocator;
+
+#[derive(Clone)]
+pub struct DynAllocator {
+    inner: Arc<dyn ApiAllocator + Send + Sync>,
+}
+
+impl DynAllocator {
+    pub fn new<A>(alloc: A) -> Self
+    where
+        A: ApiAllocator + Send + Sync + 'static,
+    {
+        Self {
+            inner: Arc::new(alloc),
+        }
+    }
+}
+
+impl Default for DynAllocator {
+    fn default() -> Self {
+        Self::new(TursoAllocator)
+    }
+}
+
+impl fmt::Debug for DynAllocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DynAllocator").finish_non_exhaustive()
+    }
+}
+
+unsafe impl ApiAllocator for DynAllocator {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        self.inner.allocate(layout)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        unsafe {
+            self.inner.deallocate(ptr, layout);
+        }
+    }
+}
 
 pub type Box<T> = std::boxed::Box<T>;
 

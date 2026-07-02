@@ -3890,6 +3890,15 @@ expect error {
     non-deterministic functions prohibited in generated columns
 }
 
+test gencol_deterministic_date_function {
+    CREATE TABLE t_issue_7061(a, b AS (date('2020-01-02')));
+    INSERT INTO t_issue_7061(a) VALUES(1);
+    SELECT b FROM t_issue_7061;
+}
+expect {
+    2020-01-02
+}
+
 # SQLite defers the error to the INSERT for these functions.
 test gencol_error_nondeterministic_datetime {
     CREATE TABLE t5(a INT, b TEXT GENERATED ALWAYS AS (datetime('now')));

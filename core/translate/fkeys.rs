@@ -221,24 +221,7 @@ fn emit_parent_key_change_probes(
             None
         };
 
-    for i in 0..n_cols {
-        let next = if i + 1 == n_cols {
-            skip
-        } else {
-            program.allocate_label()
-        };
-        program.emit_insn(Insn::Eq {
-            lhs: old_key_start + i,
-            rhs: new_key_start + i,
-            target_pc: next,
-            flags: CmpInsFlags::default(),
-            collation: None,
-        });
-        program.emit_insn(Insn::Goto { target_pc: changed });
-        if i + 1 != n_cols {
-            program.preassign_label_to_next_insn(next);
-        }
-    }
+    emit_key_change_check(program, old_key_start, new_key_start, n_cols, skip, changed);
 
     program.preassign_label_to_next_insn(changed);
     if let Some(ref plan) = deferred_new_key_probe {
@@ -446,8 +429,22 @@ where
     Ok(())
 }
 
-/// Iterate a table and call `on_match` when all child columns equal the key at
-/// `parent_key_start`.
+fn emit_skip_if_any_null(
+    program: &mut ProgramBuilder,
+    reg_start: usize,
+    nregs: usize,
+    target_pc: BranchOffset,
+) {
+    for i in 0..nregs {
+        program.emit_insn(Insn::IsNull {
+            reg: reg_start + i,
+            target_pc,
+        });
+    }
+}
+
+/// Iterate a table and call `on_match` when all child columns equal the
+/// non-NULL key at `parent_key_start`.
 ///
 /// Rows with any NULL FK column do not reference a parent and are ignored. For
 /// self-referential UPDATEs, `self_exclude_rowid` skips the current row when
@@ -497,7 +494,7 @@ where
             lhs: tmp,
             rhs: parent_key_start + i,
             target_pc: cont,
-            flags: CmpInsFlags::default().jump_if_null(),
+            flags: CmpInsFlags::default(),
             collation: Some(CollationSeq::Binary),
         });
         program.emit_insn(Insn::Goto {
@@ -886,6 +883,8 @@ fn emit_fk_parent_key_probe(
     let child_cols = &fk_ref.fk.child_columns;
     let is_deferred = fk_ref.fk.deferred;
     let is_restrict = matches!(fk_ref.fk.on_update, RefAct::Restrict);
+    let skip_probe = program.allocate_label();
+    emit_skip_if_any_null(program, parent_key_start, n_cols, skip_probe);
 
     let on_match = |p: &mut ProgramBuilder| -> Result<()> {
         match (is_deferred, pass) {
@@ -954,6 +953,7 @@ fn emit_fk_parent_key_probe(
         )?;
     }
 
+    program.preassign_label_to_next_insn(skip_probe);
     Ok(())
 }
 
@@ -1380,6 +1380,9 @@ fn emit_fk_delete_parent_existence_check_single(
         resolver,
     )?;
 
+    let skip_check = program.allocate_label();
+    emit_skip_if_any_null(program, parent_key_start, ncols, skip_check);
+
     let child_cols = &fk_ref.fk.child_columns;
     let child_idx = if !is_self_ref {
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -1439,6 +1442,7 @@ fn emit_fk_delete_parent_existence_check_single(
             },
         )?;
     }
+    program.preassign_label_to_next_insn(skip_check);
     Ok(())
 }
 
@@ -1653,6 +1657,7 @@ fn copy_key_from_values(
 }
 
 /// Emit instructions to detect if key values have changed between old and new registers.
+/// NULL values compare equal here, matching SQLite's FK action WHEN guard.
 /// Jumps to `skip_label` if all values are equal, falls through to `changed_label` if any differ.
 fn emit_key_change_check(
     program: &mut ProgramBuilder,
@@ -1672,7 +1677,7 @@ fn emit_key_change_check(
             lhs: old_key_start + i,
             rhs: new_key_start + i,
             target_pc: next.unwrap_or(skip_label),
-            flags: CmpInsFlags::default(),
+            flags: CmpInsFlags::default().null_eq(),
             collation: None,
         });
         program.emit_insn(Insn::Goto {
@@ -2626,4 +2631,32 @@ pub fn emit_fk_drop_table_check(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_change_check_treats_nulls_as_equal() {
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 4, 2));
+        let skip = program.allocate_label();
+        let changed = program.allocate_label();
+
+        emit_key_change_check(&mut program, 1, 2, 1, skip, changed);
+
+        assert!(
+            program.insns.iter().any(|(insn, _)| matches!(
+                insn,
+                Insn::Eq {
+                    lhs: 1,
+                    rhs: 2,
+                    flags,
+                    ..
+                } if flags.has_nulleq()
+            )),
+            "FK UPDATE action guard must use IS semantics for OLD/NEW key comparison"
+        );
+    }
 }

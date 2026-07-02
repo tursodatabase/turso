@@ -1,4 +1,4 @@
-use crate::alloc::{TursoSliceExt, TursoTryWithCapacityExt};
+use crate::alloc::{DynAllocator, TursoSliceExt, TursoTryWithCapacityExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
@@ -138,6 +138,8 @@ use super::{make_record, Program, ProgramState, Register};
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
 use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
+
+type MvccCheckpointStateMachine = CheckpointStateMachine<MvccClock, DynAllocator>;
 
 /// Macro to destructure an Insn enum variant, only to be used when it
 /// is *impossible* to be another variant.
@@ -1265,7 +1267,11 @@ pub fn op_open_read(
                 index.as_ref(),
                 num_columns,
             )?);
-            let index_info = Arc::new(IndexInfo::new_from_index(index)?);
+            let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
+                IndexInfo::new_from_index_in(index, mv_store.allocator())?
+            } else {
+                IndexInfo::new_from_index(index)?
+            });
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
@@ -6776,16 +6782,16 @@ pub fn op_sorter_open(
 
     // Set the buffer size threshold to be roughly the same as the limit configured for the page-cache.
     let max_buffer_size_bytes = if cache_size < 0 {
-        (cache_size.abs() * 1024) as usize
+        (cache_size.unsigned_abs() as usize).saturating_mul(1024)
     } else {
-        (cache_size as usize) * page_size
+        (cache_size as usize).saturating_mul(page_size)
     };
     let mut order = Vec::try_with_capacity_ext(order_collations_nulls.len())
-        .expect("TODO: fallible allocations");
+        .expect(crate::alloc::ALLOC_ERR_MSG);
     let mut collations = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
-        .expect("TODO: fallible allocations");
+        .expect(crate::alloc::ALLOC_ERR_MSG);
     let mut nulls_orders = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
-        .expect("TODO: fallible allocations");
+        .expect(crate::alloc::ALLOC_ERR_MSG);
     for (ord, coll, nulls) in order_collations_nulls.iter() {
         order.push(*ord);
         collations.push(coll.unwrap_or_default());
@@ -6793,7 +6799,7 @@ pub fn op_sorter_open(
     }
     let mut sort_comparators =
         crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())
-            .expect("TODO: fallible allocations");
+            .expect(crate::alloc::ALLOC_ERR_MSG);
     for (idx, (_, coll, _)) in order_collations_nulls.iter().enumerate() {
         let comparator = match comparators.get(idx).and_then(|c| c.as_ref()) {
             Some(comparator) => Some(make_sort_comparator(comparator)?),
@@ -11077,7 +11083,11 @@ pub fn op_open_write(
                 index.as_ref(),
                 num_columns,
             )?);
-            let index_info = Arc::new(IndexInfo::new_from_index(index)?);
+            let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
+                IndexInfo::new_from_index_in(index, mv_store.allocator())?
+            } else {
+                IndexInfo::new_from_index(index)?
+            });
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
@@ -12438,7 +12448,7 @@ pub fn op_parse_schema(
         stmt,
         schema_arc,
         from_sql_indexes: crate::alloc::Vec::try_with_capacity_ext(10)
-            .expect("TODO: fallible allocations"),
+            .expect(crate::alloc::ALLOC_ERR_MSG),
         automatic_indices: Default::default(),
         dbsp_state_roots: Default::default(),
         dbsp_state_index_roots: Default::default(),
@@ -14353,11 +14363,11 @@ pub fn op_add_column(
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints = check_constraints
             .try_to_vec()
-            .expect("TODO: fallible allocations");
+            .expect(crate::alloc::ALLOC_ERR_MSG);
         // Update foreign keys to include any FK constraints from the new column
         btree.foreign_keys = foreign_keys
             .try_to_vec()
-            .expect("TODO: fallible allocations");
+            .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // Resolve generated column expressions and update virtual column metadata
         btree.prepare_generated_columns()?;
@@ -14866,10 +14876,10 @@ pub fn op_hash_build(
         })
         .unwrap_or_else(|| OpHashBuildState {
             key_values: crate::alloc::Vec::try_with_capacity_ext(data.num_keys)
-                .expect("TODO: fallible allocations"),
+                .expect(crate::alloc::ALLOC_ERR_MSG),
             key_idx: 0,
             payload_values: crate::alloc::Vec::try_with_capacity_ext(data.num_payload)
-                .expect("TODO: fallible allocations"),
+                .expect(crate::alloc::ALLOC_ERR_MSG),
             payload_idx: 0,
             rowid: None,
             cursor_id: data.cursor_id,
@@ -14897,7 +14907,7 @@ pub fn op_hash_build(
             collations: data
                 .collations
                 .try_to_vec()
-                .expect("TODO: fallible allocations"),
+                .expect(crate::alloc::ALLOC_ERR_MSG),
             temp_store,
             track_matched: data.track_matched,
             partition_count: None,
@@ -15004,7 +15014,7 @@ pub fn op_hash_distinct(
             collations: data
                 .collations
                 .try_to_vec()
-                .expect("TODO: fallible allocations"),
+                .expect(crate::alloc::ALLOC_ERR_MSG),
             temp_store,
             track_matched: false,
             partition_count: None,
@@ -15110,7 +15120,7 @@ pub fn op_hash_probe(
             } else {
                 // Different hash table, read fresh keys
                 let mut keys = crate::alloc::Vec::try_with_capacity_ext(num_keys)
-                    .expect("TODO: fallible allocations");
+                    .expect(crate::alloc::ALLOC_ERR_MSG);
                 for i in 0..num_keys {
                     let reg = &state.registers[key_start_reg + i];
                     keys.push(reg.get_value().clone());
@@ -15120,7 +15130,7 @@ pub fn op_hash_probe(
         } else {
             // First entry, read probe keys from registers
             let mut keys = crate::alloc::Vec::try_with_capacity_ext(num_keys)
-                .expect("TODO: fallible allocations");
+                .expect(crate::alloc::ALLOC_ERR_MSG);
             for i in 0..num_keys {
                 let reg = &state.registers[key_start_reg + i];
                 keys.push(reg.get_value().clone());
@@ -15840,7 +15850,7 @@ pub struct OpJournalModeState {
     /// The new journal mode we're changing to
     pub new_mode: Option<journal_mode::JournalMode>,
     /// Checkpoint state machine for MVCC mode
-    pub checkpoint_sm: Option<StateMachine<Box<CheckpointStateMachine<MvccClock>>>>,
+    pub checkpoint_sm: Option<StateMachine<Box<MvccCheckpointStateMachine>>>,
     /// Bootstrap state machine when switching into MVCC mode
     pub bootstrap_state: BootstrapState,
     /// Page reference for writing header
@@ -16099,6 +16109,7 @@ fn op_journal_mode_inner(
                         program.connection.db.open_flags,
                         program.connection.db.durable_storage.clone(),
                         enc_ctx,
+                        program.connection.db.mv_store_allocator.clone(),
                     )?;
                     // Arm the abandonment guard *before* the irreversible
                     // store install + demote so a reset/drop at any subsequent

@@ -19,6 +19,28 @@ CI=1 make -C testing/sqltests run-rust  # use only if snapshot tests are require
 scripts/diff.sh "SQL" [label]  # compare sqlite3 vs tursodb output
 ```
 
+## Testing
+
+### Running Tests
+
+- `cargo test` - Rust unit and integration tests
+- `make test` - broad compatibility suite (TCL, sqlite3, extensions, MVCC)
+- `make test-single TEST=foo.test` - single legacy TCL test
+- `make -C testing/sqltests run-rust ARGS='--snapshot-filter __never__'` - preferred `.sqltest` runner for new coverage
+- `CI=1 make -C testing/sqltests run-rust` - only when snapshot tests are required
+
+### Test Organization
+
+Default: add coverage to the narrowest existing test harness that can express the bug. Prefer extending an existing test file or directory over creating a new one.
+
+- `testing/sqltests/tests/` - preferred for SQL conformance coverage. These tests run the same scenario against both Turso and SQLite, so use them first for parser, planner, executor, and SQL semantics work that fits the `.sqltest` DSL.
+- `tests/integration/` - primary fallback when the behavior cannot be expressed cleanly in `.sqltest`. Put API-level regressions, multi-connection orchestration, storage assertions, injected failures, timeout behavior, and other Rust-driven scenarios here.
+- `testing/conformance/sqlite3/` - imported upstream SQLite golden tests. Do not modify these for Turso behavior changes; use them as fixed compatibility coverage, and only touch them for intentional upstream sync or harness maintenance.
+- `testing/cli_tests/` - CLI-focused Python coverage for shell behavior and end-to-end command workflows.
+- `tests/fuzz/` - minimized fuzz regressions and targeted edge cases that are easier to keep as Rust tests.
+- `testing/simulator/` and `testing/concurrent-simulator/` - deterministic concurrency, scheduling, and failure-injection coverage for state-machine and I/O correctness.
+- `testing/differential-oracle/` and `testing/stress/` - differential and long-running stress tooling. Use these for deeper investigation or specialized validation, not as the first stop for a focused regression test.
+
 ## Structure
 
 ```
@@ -61,6 +83,29 @@ limbo/
 - **[Storage Format](docs/agent-guides/storage-format.md)** - file format, B-trees, pages
 - **[Async I/O Model](docs/agent-guides/async-io-model.md)** - IOResult, state machines, re-entrancy
 - **[MVCC](docs/agent-guides/mvcc.md)** - experimental multi-version concurrency (WIP)
+
+## Commit Messages
+
+Use an optional component scope followed by a lowercase imperative summary with
+no trailing period:
+
+```text
+[scope: ]<imperative summary>
+
+<why the change is needed and what invariant or bug it addresses>
+
+<non-obvious implementation details or tradeoffs, if needed>
+
+Tests: <relevant validation, if useful>
+
+Fixes #1234
+```
+
+For example: `core/mvcc: preserve B-tree cleanup markers in commit logs`.
+Explain intent rather than narrating the diff. Omit the body only when the
+subject fully explains a trivial change. Conventional Commit prefixes such as
+`feat(scope):` are not required. See [CONTRIBUTING.md](CONTRIBUTING.md) for a
+complete example.
 
 ## Benchmark Naming
 

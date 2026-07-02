@@ -2174,6 +2174,8 @@ impl Pager {
         savepoint: &SavepointSnapshot,
         journal_end_offset: u64,
     ) -> Result<()> {
+        self.reset_internal_states();
+
         let subjournal = self.subjournal.read();
         let Some(subjournal) = subjournal.as_ref() else {
             return Ok(());
@@ -3158,6 +3160,7 @@ impl Pager {
             return Ok((page, c));
         }
 
+        page.set_locked();
         let c =
             self.begin_read_disk_page(page_idx as usize, page.clone(), allow_empty_read, &io_ctx)?;
         Ok((page, c))
@@ -3203,11 +3206,26 @@ impl Pager {
                         "attempted to read page but got different page",
                         { "expected_page": page_idx, "actual_page": page.get().id }
                     );
+                    if !page.is_loaded() {
+                        // The page is cache-resident but its read is still in
+                        // flight: `read_page` publishes a page into the shared
+                        // cache (via `cache_insert` below) *before* its disk
+                        // read completes, and `PageCache::get` deliberately
+                        // hands out locked-but-unloaded in-flight pages. We have
+                        // no completion to surface on this path (the disk-read
+                        // completion was consumed by the original caller and the
+                        // `pending_reads` entry has already been removed), so
+                        // returning `Done((page, None))` would hand the caller a
+                        // locked, unloaded page with nothing to wait on: a torn
+                        // / uninitialized read, or a concurrent writer filling
+                        // the buffer underneath the reader.
+                        io_yield_one!(crate::Completion::new_yield());
+                    }
                     return Ok(IOResult::Done((page, None)));
                 }
             }
 
-            tracing::debug!("read_page_nonblock(page_idx = {page_idx}) = reading page from disk");
+            tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
             let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
             self.pending_reads.write().insert(
                 page_idx,
@@ -3343,8 +3361,12 @@ impl Pager {
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id as u32);
         // Notify cache before marking dirty (page was evictable, now it won't be)
-        // Only notify if page wasn't already dirty
-        if !page.is_dirty() {
+        // Only notify if page wasn't already dirty, or if it was spilled
+        // State before set_dirty():
+        // - clean page: evictable -> set_dirty() makes it dirty and unevictable
+        // - dirty + spilled page: evictable -> set_dirty() clears spilled and makes it unevictable
+        // - dirty + not spilled page: already unevictable -> no cache accounting change
+        if !page.is_dirty() || page.is_spilled() {
             let key = PageCacheKey::new(page.get().id);
             self.page_cache.write().notify_page_dirty(key);
         }
@@ -3958,6 +3980,7 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    #[aristo::intent("A commit frame must reach stable storage via fsync before the transaction is reported as durable\n", id = "aristos:wal_commit_requires_fsync", verify = "full", parent = "wal_protocol_correctness")]
     fn commit_dirty_pages_inner(
         &self,
         allowed_auto_actions: WalAutoActions,
@@ -4446,6 +4469,7 @@ impl Pager {
         )
     }
 
+    #[aristo::intent("The nbackfills counter advances after frames are durable, so recovery never replays already-checkpointed frames\n", id = "aristos:wal_nbackfills_orders_with_recovery", verify = "full", parent = "wal_protocol_correctness")]
     fn checkpoint_inner(
         &self,
         mode: CheckpointMode,
@@ -5433,6 +5457,7 @@ impl Pager {
     }
 
     fn reset_internal_states(&self) {
+        self.pending_reads.write().clear();
         *self.checkpoint_state.write() = CheckpointState::default();
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().reset();
@@ -6154,6 +6179,61 @@ mod ptrmap_tests {
             pager.pending_reads.read().get(&target_idx).is_none(),
             "pending_reads entry must be cleared once read_page_nonblock returns Done"
         );
+    }
+
+    /// Concurrency contract: a page can be cache-resident while its disk read
+    /// is still in flight (locked, not loaded) — `read_page` inserts into the
+    /// shared cache before the read completes, and `PageCache::get` hands out
+    /// such in-flight pages. A second reader hitting the cache-hit fast path
+    /// must NOT receive that unloaded page with `None` (no completion to wait
+    /// on); it must yield and re-enter until the read completes. Otherwise the
+    /// caller reads a torn / uninitialized buffer, or races a writer filling
+    /// the buffer underneath it.
+    #[test]
+    fn read_page_nonblock_inflight_cache_hit_yields_not_done() {
+        let pager = test_pager_setup(4096, 10);
+
+        let target_idx: i64 = 9999;
+        assert!(
+            pager.cache_get(target_idx as usize).unwrap().is_none(),
+            "test precondition: target page must not be in cache"
+        );
+
+        // Synthesize an in-flight read that has already been published to the
+        // shared cache: locked (a read is outstanding) but not loaded (the
+        // buffer hasn't been filled yet). This is exactly the state a page is
+        // in between `cache_insert` and the disk-read completion firing.
+        let inflight: PageRef = Arc::new(Page::new(target_idx));
+        inflight.set_locked();
+        assert!(!inflight.is_loaded());
+        pager
+            .page_cache
+            .write()
+            .insert(PageCacheKey::new(target_idx as usize), inflight.clone())
+            .unwrap();
+
+        // The fast path finds the page in cache but must refuse to return it
+        // without a completion, because it is not yet loaded.
+        match pager.read_page(target_idx).unwrap() {
+            IOResult::IO(_) => {}
+            IOResult::Done((page, c)) => panic!(
+                "read_page handed out an in-flight (locked, unloaded) page on the \
+                 cache-hit fast path: loaded={}, completion={}",
+                page.is_loaded(),
+                c.is_some()
+            ),
+        }
+
+        // Once the read completes (page becomes loaded), the same cache-hit
+        // fast path returns Done with no completion, as before.
+        inflight.set_loaded();
+        match pager.read_page(target_idx).unwrap() {
+            IOResult::Done((page, c)) => {
+                assert!(Arc::ptr_eq(&page, &inflight));
+                assert!(c.is_none(), "loaded cache hit must not return a completion");
+            }
+            IOResult::IO(_) => panic!("loaded cache hit must not yield"),
+        }
     }
 }
 

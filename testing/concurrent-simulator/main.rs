@@ -9,6 +9,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::{
     StepResult, Whopper, WhopperOpts,
+    chaotic_btree::BtreeRebalanceProfile,
     chaotic_elle::{ChaoticElleProfile, ChaoticWorkloadProfile, ElleModelKind},
     properties::*,
     workloads::*,
@@ -30,7 +31,7 @@ struct Args {
     #[command(subcommand)]
     subcommand: Option<SubCmd>,
 
-    /// Simulation mode (fast, chaos, ragnarök/ragnarok)
+    /// Simulation mode (fast, chaos, btree-rebalance/btree-rekey, recovery-heavy, ragnarök/ragnarok)
     #[arg(long, default_value = "fast")]
     mode: String,
     /// Max connections
@@ -162,6 +163,7 @@ fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     let base_max_steps = match args.mode.as_str() {
         "fast" => 100_000,
         "chaos" => 10_000_000,
+        "btree-rebalance" | "btree-rekey" => 500_000,
         "ragnarök" | "ragnarok" => 1_000_000,
         mode => return Err(anyhow::anyhow!("Unknown mode: {}", mode)),
     };
@@ -386,6 +388,19 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
         let et = vec![(table_name.to_string(), create_sql.to_string())];
 
         (w, p, et, chaotic)
+    } else if is_btree_rebalance_mode(&args.mode) {
+        let w: Vec<(u32, Box<dyn Workload>)> = vec![
+            (20, Box::new(IntegrityCheckWorkload)),
+            (5, Box::new(WalCheckpointWorkload)),
+        ];
+        let p: Vec<Box<dyn Property>> = vec![Box::new(IntegrityCheckProperty)];
+        let chaotic: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)> = vec![(
+            1.0,
+            "btree-rebalance",
+            Box::new(BtreeRebalanceProfile::default()),
+        )];
+
+        (w, p, vec![], chaotic)
     } else {
         let w: Vec<(u32, Box<dyn Workload>)> = vec![
             (10, Box::new(IntegrityCheckWorkload)),
@@ -433,6 +448,7 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
     let mut base_opts = match args.mode.as_str() {
         "fast" => WhopperOpts::fast(),
         "chaos" => WhopperOpts::chaos(),
+        "btree-rebalance" | "btree-rekey" => WhopperOpts::btree_rebalance(),
         "ragnarök" | "ragnarok" => WhopperOpts::ragnarok(),
         "recovery-heavy" => WhopperOpts::recovery_heavy(),
         mode => return Err(anyhow::anyhow!("Unknown mode: {}", mode)),
@@ -461,6 +477,10 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_allocation_fault_probability(args.allocation_fault_probability);
 
     Ok(opts)
+}
+
+fn is_btree_rebalance_mode(mode: &str) -> bool {
+    matches!(mode, "btree-rebalance" | "btree-rekey")
 }
 
 fn format_stats(stats: &turso_whopper::Stats, elle_mode: bool) -> String {

@@ -2,12 +2,16 @@ use std::{alloc::Allocator, iter::TrustedLen, ptr, slice};
 
 use super::super::{
     TryClone, TursoAllocExt, TursoFromIterator, TursoFromIteratorIn, TursoSliceExt,
-    TursoTryWithCapacityExt, TursoVecExt,
+    TursoTryWithCapacityExt, TursoVecExt, TursoVecInExt,
 };
 use crate::alloc::{TryReserveError, TursoAllocator, Vec};
 
 pub(super) const fn vec<T>() -> Vec<T> {
     Vec::new_in(TursoAllocator)
+}
+
+fn vec_in<T, A: std::alloc::Allocator>(alloc: A) -> Vec<T, A> {
+    Vec::new_in(alloc)
 }
 
 impl<T> TursoAllocExt for Vec<T> {
@@ -35,6 +39,26 @@ impl<T> TursoVecExt<T> for Vec<T> {
                 }
             }
         }
+    }
+}
+
+impl<T, A> TursoVecInExt<T, A> for Vec<T, A>
+where
+    A: std::alloc::Allocator,
+{
+    #[inline(always)]
+    fn new_in(alloc: A) -> Self {
+        vec_in(alloc)
+    }
+
+    #[inline(always)]
+    fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+        Vec::with_capacity_in(capacity, alloc)
+    }
+
+    #[inline(always)]
+    fn try_with_capacity_in(capacity: usize, alloc: A) -> Result<Self, TryReserveError> {
+        Vec::try_with_capacity_in(capacity, alloc).map_err(TryReserveError::from)
     }
 }
 

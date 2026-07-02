@@ -198,7 +198,7 @@ rows, _ = stmt.Query()
 for rows.Next() {
     var id int
     var username string
-    _ := rows.Scan(&id, &username)
+    rows.Scan(&id, &username)
     fmt.Printf("User: ID: %d, Username: %s\n", id, username)
 }
 ```
@@ -366,7 +366,7 @@ For Claude Desktop, add the configuration to your `claude_desktop_config.json` f
   "mcpServers": {
     "turso": {
       "command": "/path/to/.turso/tursodb",
-      "args": ["./path/to/your/database.db.db", "--mcp"]
+      "args": ["./path/to/your/database.db", "--mcp"]
     }
   }
 }
@@ -384,7 +384,7 @@ For Cursor, configure MCP in your settings:
 3. Add a new server with:
    - **Name**: `turso`
    - **Command**: `/path/to/.turso/tursodb`
-   - **Args**: `["./path/to/your/database.db.db", "--mcp"]`
+   - **Args**: `["./path/to/your/database.db", "--mcp"]`
 
 Alternatively, you can add it to your Cursor configuration file directly.
 

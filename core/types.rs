@@ -4,7 +4,6 @@ use either::Either;
 use turso_ext::{AggCtx, ContextDestructor, FinalizeFunction, StepFunction, ValueDestructor};
 use turso_parser::ast::SortOrder;
 
-use crate::alloc::vec;
 use crate::alloc::*;
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
@@ -1368,6 +1367,15 @@ mod immutable_record {
             two_values(self.payload, idx1, idx2)
         }
 
+        pub fn get_three_values(
+            &self,
+            idx1: usize,
+            idx2: usize,
+            idx3: usize,
+        ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
+            three_values(self.get_payload(), idx1, idx2, idx3)
+        }
+
         pub fn get_values_owned(&self) -> Result<Vec<Value>> {
             values_owned(self.payload)
         }
@@ -1992,6 +2000,11 @@ pub struct KeyInfo {
     pub nulls_order: Option<turso_parser::ast::NullsOrder>,
 }
 
+#[cfg(not(nightly))]
+pub type IndexKeyInfo = Vec<KeyInfo>;
+#[cfg(nightly)]
+pub type IndexKeyInfo = Vec<KeyInfo, DynAllocator>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Metadata about an index, used for handling and comparing index keys.
 ///
@@ -2000,7 +2013,7 @@ pub struct KeyInfo {
 /// in the index.
 pub struct IndexInfo {
     /// Specifies the sorting order (ascending or descending) for each column in the index.
-    pub key_info: Vec<KeyInfo>,
+    pub key_info: IndexKeyInfo,
     /// Indicates whether the index includes a row ID column.
     pub has_rowid: bool,
     /// The total number of columns in the index, including the row ID column if present.
@@ -2012,7 +2025,7 @@ pub struct IndexInfo {
 impl Default for IndexInfo {
     fn default() -> Self {
         Self {
-            key_info: vec![],
+            key_info: Self::key_info_in(TursoAllocator),
             has_rowid: true,
             num_cols: 1,
             is_unique: false,
@@ -2021,8 +2034,76 @@ impl Default for IndexInfo {
 }
 
 impl IndexInfo {
-    pub fn new_from_index(index: &Index) -> Result<Self> {
-        let mut key_info: Vec<KeyInfo> = index
+    pub fn key_info_in<A: ConcurrentAllocator>(alloc: A) -> IndexKeyInfo {
+        <IndexKeyInfo as TursoVecInExt<KeyInfo, DynAllocator>>::new_in(DynAllocator::new(alloc))
+    }
+
+    #[cfg(not(nightly))]
+    pub fn key_info_from_iter_in<A, I>(
+        key_info: I,
+        _alloc: A,
+    ) -> Result<IndexKeyInfo, TryReserveError>
+    where
+        A: ConcurrentAllocator,
+        I: IntoIterator<Item = KeyInfo>,
+    {
+        key_info.into_iter().try_collect()
+    }
+
+    #[cfg(nightly)]
+    pub fn key_info_from_iter_in<A, I>(
+        key_info: I,
+        alloc: A,
+    ) -> Result<IndexKeyInfo, TryReserveError>
+    where
+        A: ConcurrentAllocator,
+        I: IntoIterator<Item = KeyInfo>,
+    {
+        key_info
+            .into_iter()
+            .try_collect_in(DynAllocator::new(alloc))
+    }
+
+    pub fn new<I>(
+        key_info: I,
+        has_rowid: bool,
+        num_cols: usize,
+        is_unique: bool,
+    ) -> Result<Self, TryReserveError>
+    where
+        I: IntoIterator<Item = KeyInfo>,
+    {
+        Self::new_in(key_info, has_rowid, num_cols, is_unique, TursoAllocator)
+    }
+
+    pub fn new_in<A, I>(
+        key_info: I,
+        has_rowid: bool,
+        num_cols: usize,
+        is_unique: bool,
+        alloc: A,
+    ) -> Result<Self, TryReserveError>
+    where
+        A: ConcurrentAllocator,
+        I: IntoIterator<Item = KeyInfo>,
+    {
+        Ok(Self {
+            key_info: Self::key_info_from_iter_in(key_info, alloc)?,
+            has_rowid,
+            num_cols,
+            is_unique,
+        })
+    }
+
+    pub fn new_from_index(index: &Index) -> Result<Self, TryReserveError> {
+        Self::new_from_index_in(index, TursoAllocator)
+    }
+
+    pub fn new_from_index_in<A: ConcurrentAllocator>(
+        index: &Index,
+        alloc: A,
+    ) -> Result<Self, TryReserveError> {
+        let key_info = index
             .columns
             .iter()
             .map(|c| KeyInfo {
@@ -2030,21 +2111,18 @@ impl IndexInfo {
                 collation: c.collation.unwrap_or_default(),
                 nulls_order: None,
             })
-            .try_collect()?;
-        if index.has_rowid {
-            key_info.try_push(KeyInfo {
+            .chain(index.has_rowid.then_some(KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::Binary,
                 nulls_order: None,
-            })?;
-        }
-        let this = Self {
+            }));
+        Self::new_in(
             key_info,
-            has_rowid: index.has_rowid,
-            num_cols: index.columns.len() + (index.has_rowid as usize),
-            is_unique: index.unique,
-        };
-        Ok(this)
+            index.has_rowid,
+            index.columns.len() + (index.has_rowid as usize),
+            index.unique,
+            alloc,
+        )
     }
 }
 
@@ -3381,21 +3459,20 @@ mod tests {
         sort_orders: Vec<SortOrder>,
         collations: Vec<CollationSeq>,
     ) -> IndexInfo {
-        IndexInfo {
-            key_info: sort_orders
+        IndexInfo::new(
+            sort_orders
                 .into_iter()
                 .zip(collations)
                 .map(|(sort_order, collation)| KeyInfo {
                     sort_order,
                     collation,
                     nulls_order: None,
-                })
-                .try_collect()
-                .unwrap(),
-            has_rowid: false,
+                }),
+            false,
             num_cols,
-            is_unique: false,
-        }
+            false,
+        )
+        .unwrap()
     }
 
     fn assert_compare_matches_full_comparison(

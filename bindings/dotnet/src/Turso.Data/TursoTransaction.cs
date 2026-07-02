@@ -17,14 +17,20 @@ public class TursoTransaction : DbTransaction
         if (_isolationLevel == IsolationLevel.ReadUncommitted)
             connection.ReadUncommitted = true;
 
-        connection.ExecuteNonQuery("BEGIN");
+        if (connection.IsRemote)
+            connection.BeginRemoteTransaction(_isolationLevel);
+        else
+            connection.ExecuteNonQuery("BEGIN");
     }
 
     protected override void Dispose(bool disposing)
     {
         if (!_completed)
         {
-            Rollback();
+            if (_connection.State == System.Data.ConnectionState.Closed)
+                CompleteTransaction();
+            else
+                Rollback();
         }
 
         base.Dispose(disposing);
@@ -39,13 +45,51 @@ public class TursoTransaction : DbTransaction
     public override void Commit()
     {
         ThrowIfCompleted();
-        _connection.ExecuteNonQuery("COMMIT;");
-        CompleteTransaction();
+        if (_connection.IsRemote)
+        {
+            try
+            {
+                _connection.CommitRemoteTransaction();
+            }
+            catch (TursoRemoteSqlException)
+            {
+                throw;
+            }
+            catch
+            {
+                CompleteTransaction();
+                throw;
+            }
+
+            CompleteTransaction();
+            _connection.CloseRemoteSessionIfStateless();
+            return;
+        }
+        else
+        {
+            _connection.ExecuteNonQuery("COMMIT;");
+            CompleteTransaction();
+        }
     }
 
     public override void Rollback()
     {
         ThrowIfCompleted();
+        if (_connection.IsRemote)
+        {
+            try
+            {
+                _connection.RollbackRemoteTransaction();
+            }
+            finally
+            {
+                CompleteTransaction();
+            }
+
+            _connection.CloseRemoteSessionIfStateless();
+            return;
+        }
+
         try
         {
             _connection.ExecuteNonQuery("ROLLBACK;");

@@ -1,0 +1,135 @@
+[__meta__]
+schema_version = 1
+canon_version = "v0.1.0"
+last_fetched = "2026-05-30T06:00:12.353Z"
+
+[aret_4mbjdhds]
+last_match_text_hash = "sha256:9d400437abc7d933b5a5f93bdc8bef54c9f0dbc03d029683fd41dbfe40b5bc16"
+canon_fetched_at = "2026-05-26T06:22:36.7271Z"
+
+["aristos:wal_checkpoint_error_no_db_leak"]
+last_match_text_hash = "sha256:99cf0a4664b81492fcaf3eaace7c7ab17a51261a6c340c7cad8faae4be7d45cc"
+canon_fetched_at = "2026-05-30T06:00:12Z"
+
+[["aristos:wal_checkpoint_error_no_db_leak".accepted_matches]]
+canon_id = "wal_checkpoint_error_no_db_leak"
+version = "v0.1.0"
+canonical_text = """
+A checkpoint failure must not leak frames into the main database file
+"""
+canon_version = "v0.1.0"
+confidence = 0.982379848137498
+prefix_tier = "aristos:"
+backed_by = "golden model + proofs + differential testing"
+linked = "arta_5cc2507abbafa1dcca819c702e32c824"
+accepted_at = "2026-05-30T06:00:12Z"
+bound_at = "2026-05-30T06:00:12Z"
+
+["aristos:wal_commit_requires_fsync"]
+last_match_text_hash = "sha256:eabb4e41b7add936f2f8679a208a15b4c545042d2644a7d920de7c6f767ff7c6"
+canon_fetched_at = "2026-05-30T06:00:12Z"
+
+[["aristos:wal_commit_requires_fsync".accepted_matches]]
+canon_id = "wal_commit_requires_fsync"
+version = "v0.1.0"
+canonical_text = """
+A commit frame must reach stable storage via fsync before the transaction is reported as durable
+"""
+canon_version = "v0.1.0"
+confidence = 0.9738098997622728
+prefix_tier = "aristos:"
+backed_by = "golden model + proofs + differential testing"
+linked = "arta_e376126754850310276ec5c621c3c717"
+accepted_at = "2026-05-30T06:00:12Z"
+bound_at = "2026-05-30T06:00:12Z"
+
+["aristos:wal_find_frame_range_invariant"]
+last_match_text_hash = "sha256:a6a6aabf707adfe418c11bc5ea417c1364c926f72ee5f05bd27b8b6aac7b34f5"
+canon_fetched_at = "2026-05-30T05:43:56Z"
+
+[["aristos:wal_find_frame_range_invariant".accepted_matches]]
+canon_id = "wal_find_frame_range_invariant"
+version = "v0.1.0"
+canonical_text = """
+find_frame never reads outside the live frame range [nbackfills, max_frame]
+"""
+canon_version = "v0.1.0"
+confidence = 0.9851749204099178
+prefix_tier = "aristos:"
+backed_by = "golden model + proofs + differential testing"
+linked = "arta_961fe492d27d1abdb6f6af1e6a38ac79"
+accepted_at = "2026-05-30T05:43:56Z"
+bound_at = "2026-05-30T05:43:56Z"
+
+["aristos:wal_initialized_reflects_sync_outcome"]
+last_match_text_hash = "sha256:9d400437abc7d933b5a5f93bdc8bef54c9f0dbc03d029683fd41dbfe40b5bc16"
+canon_fetched_at = "2026-05-26T06:23:53Z"
+
+[["aristos:wal_initialized_reflects_sync_outcome".accepted_matches]]
+canon_id = "wal_initialized_reflects_sync_outcome"
+version = "v0.1.0"
+canonical_text = """
+The WAL initialized flag is set true only after a successful sync of the wal-header
+"""
+canon_version = "v0.1.0"
+confidence = 1.0000000000000002
+prefix_tier = "aristos:"
+backed_by = "golden model + proofs + differential testing"
+accepted_at = "2026-05-26T06:23:53Z"
+bound_at = "2026-05-26T06:23:53Z"
+
+["aristos:wal_nbackfills_orders_with_recovery"]
+last_match_text_hash = "sha256:7e7d1fd2ae298d6be58888acc49a0b7464f686bb0aa5725cf62e7459d3c59f42"
+canon_fetched_at = "2026-05-30T06:00:12Z"
+
+[["aristos:wal_nbackfills_orders_with_recovery".accepted_matches]]
+canon_id = "wal_nbackfills_orders_with_recovery"
+version = "v0.1.0"
+canonical_text = """
+The nbackfills counter advances after frames are durable, so recovery never replays already-checkpointed frames
+"""
+canon_version = "v0.1.0"
+confidence = 0.9736252743750812
+prefix_tier = "aristos:"
+backed_by = "golden model + proofs + differential testing"
+linked = "arta_40ceca467c64335d30ced059369d412f"
+accepted_at = "2026-05-30T06:00:12Z"
+bound_at = "2026-05-30T06:00:12Z"
+
+["aristos:wal_truncate_atomic_under_concurrent_writers"]
+last_match_text_hash = "sha256:3d260cf86a59e54d02ee3224cc3951b4c17aa0488e8be1109cf70e0912eef1ae"
+canon_fetched_at = "2026-05-30T05:43:56Z"
+
+[["aristos:wal_truncate_atomic_under_concurrent_writers".accepted_matches]]
+canon_id = "wal_truncate_atomic_under_concurrent_writers"
+version = "v0.1.0"
+canonical_text = """
+WAL truncate is atomic: no committed frame can be observed lost across the truncate operation
+"""
+canon_version = "v0.1.0"
+confidence = 0.9876048462465404
+prefix_tier = "aristos:"
+backed_by = "golden model + proofs + differential testing"
+linked = "arta_013316bc46e9af51cf52612fe2533e90"
+accepted_at = "2026-05-30T05:43:56Z"
+bound_at = "2026-05-30T05:43:56Z"
+
+[wal_checkpoint_error_no_db_leak]
+last_match_text_hash = "sha256:99cf0a4664b81492fcaf3eaace7c7ab17a51261a6c340c7cad8faae4be7d45cc"
+canon_fetched_at = "2026-05-30T06:00:12.360964Z"
+
+[wal_commit_requires_fsync]
+last_match_text_hash = "sha256:eabb4e41b7add936f2f8679a208a15b4c545042d2644a7d920de7c6f767ff7c6"
+canon_fetched_at = "2026-05-30T06:00:12.360964Z"
+
+[wal_find_frame_range_invariant]
+last_match_text_hash = "sha256:a6a6aabf707adfe418c11bc5ea417c1364c926f72ee5f05bd27b8b6aac7b34f5"
+canon_fetched_at = "2026-05-30T05:43:33.980749Z"
+
+[wal_nbackfills_orders_with_recovery]
+last_match_text_hash = "sha256:7e7d1fd2ae298d6be58888acc49a0b7464f686bb0aa5725cf62e7459d3c59f42"
+canon_fetched_at = "2026-05-30T06:00:12.360964Z"
+
+[wal_truncate_atomic_under_concurrent_writers]
+last_match_text_hash = "sha256:3d260cf86a59e54d02ee3224cc3951b4c17aa0488e8be1109cf70e0912eef1ae"
+canon_fetched_at = "2026-05-30T05:43:33.980749Z"

@@ -183,7 +183,7 @@ impl ParseSchemaRowsState {
         Self {
             inner: Some(ParseSchemaRowsInner {
                 rows,
-                from_sql_indexes: <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(10).expect("TODO: fallible allocations"),
+                from_sql_indexes: <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(10).expect(crate::alloc::ALLOC_ERR_MSG),
                 automatic_indices: HashMap::with_capacity_and_hasher(10, Default::default()),
                 dbsp_state_roots: HashMap::default(),
                 dbsp_state_index_roots: HashMap::default(),
@@ -1521,7 +1521,7 @@ impl ViewColumnSchema {
             .iter()
             .map(|vc| vc.column.clone())
             .try_collect()
-            .expect("TODO: fallible allocations")
+            .expect(crate::alloc::ALLOC_ERR_MSG)
     }
 
     /// Get columns that belong to a specific table
@@ -2348,7 +2348,7 @@ mod rename_column_view {
             .into_iter()
             .map(|vc| vc.column)
             .try_collect()
-            .expect("TODO: fallible allocations")
+            .expect(crate::alloc::ALLOC_ERR_MSG)
     }
 
     fn view_columns_from_select(

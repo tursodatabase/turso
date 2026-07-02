@@ -55,7 +55,7 @@ public class SqliteParameter : DbParameter
                 DbType.Binary => SqliteType.Blob,
                 DbType.Byte or DbType.Boolean or DbType.Int16 or DbType.Int32 or DbType.Int64 or DbType.SByte
                     or DbType.UInt16 or DbType.UInt32 or DbType.UInt64 => SqliteType.Integer,
-                DbType.Decimal or DbType.Double or DbType.Single => SqliteType.Real,
+                DbType.Double or DbType.Single => SqliteType.Real,
                 _ => SqliteType.Text,
             };
         }

@@ -872,8 +872,7 @@ fn get_subquery_parser<'a>(
                             expr: None,
                         })
                     })
-                    .try_collect::<Result<crate::alloc::Vec<_>>>()
-                    .expect("TODO: fallible allocations")?;
+                    .try_collect::<Result<crate::alloc::Vec<_>>>()??;
 
                 let ephemeral_index = Arc::new(Index {
                     columns,
@@ -1690,7 +1689,7 @@ fn emit_materialized_subquery_table(
         0,
         String::new(),
         crate::alloc::vec![],
-        columns.try_to_vec().expect("TODO: fallible allocations"),
+        columns.try_to_vec().expect(crate::alloc::ALLOC_ERR_MSG),
         BTreeCharacteristics::HAS_ROWID,
         crate::alloc::vec![],
         crate::alloc::vec![],

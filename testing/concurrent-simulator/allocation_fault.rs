@@ -208,6 +208,8 @@ fn allocation_site_id(site: AllocationSite) -> u64 {
             MvStoreAllocationSite::IndexRowsEntry => 5,
             MvStoreAllocationSite::IndexKeyEntry => 6,
             MvStoreAllocationSite::RowVersionReserve => 7,
+            MvStoreAllocationSite::RowPayload => 12,
+            MvStoreAllocationSite::SchemaRowPayload => 13,
         },
         AllocationSite::MvccCheckpoint(site) => match site {
             MvccCheckpointAllocationSite::CheckpointWriteSet => 8,

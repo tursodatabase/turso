@@ -23,7 +23,6 @@ COPY perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY perf/throughput/turso ./perf/throughput/turso
 COPY perf/memory ./perf/memory/
 COPY cli ./cli/
-COPY sqlite3 ./sqlite3/
 COPY tests ./tests/
 COPY testing ./testing/
 COPY sql_generation ./sql_generation/

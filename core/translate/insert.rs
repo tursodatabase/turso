@@ -1089,7 +1089,6 @@ pub fn translate_insert(
         };
         emit_cdc_insns(
             program,
-            resolver,
             OperationMode::INSERT,
             *cdc_cursor_id,
             insertion.key_register(),
@@ -3873,7 +3872,6 @@ fn emit_replace_delete_conflicting_row(
         };
         emit_cdc_insns(
             program,
-            resolver,
             OperationMode::DELETE,
             cdc_cursor_id,
             ctx.conflict_rowid_reg,

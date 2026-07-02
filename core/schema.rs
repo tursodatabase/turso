@@ -1,7 +1,7 @@
 use crate::alloc::vec;
 use crate::alloc::TursoFromIterator;
 use crate::alloc::*;
-use crate::function::{Deterministic, Func};
+use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::incremental::view::IncrementalView;
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, operator::create_dbsp_state_index};
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
@@ -1993,7 +1993,7 @@ impl Schema {
                 Some((name.clone(), seq_name.to_string()))
             })
             .try_collect()
-            .expect("TODO: fallible allocations")
+            .expect(crate::alloc::ALLOC_ERR_MSG)
     }
 
     fn sequence_backing_tables(&self) -> Vec<SequenceBackingTableSource> {
@@ -2009,7 +2009,7 @@ impl Schema {
                 })
             })
             .try_collect()
-            .expect("TODO: fallible allocations")
+            .expect(crate::alloc::ALLOC_ERR_MSG)
     }
 
     fn read_sequence_metadata(record: &ImmutableRecord) -> Option<SequenceMetadata> {
@@ -3956,6 +3956,75 @@ pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) ->
     Ok(clone.to_string())
 }
 
+pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
+    match func {
+        Func::Scalar(
+            ScalarFunc::Date
+            | ScalarFunc::Time
+            | ScalarFunc::DateTime
+            | ScalarFunc::UnixEpoch
+            | ScalarFunc::JulianDay
+            | ScalarFunc::StrfTime
+            | ScalarFunc::TimeDiff,
+        ) => is_deterministic_datetime_call(func, args),
+        _ => func.is_deterministic(),
+    }
+}
+
+// SQLite allows date/time functions in schema-persistent expressions only when
+// they do not depend on the current clock or local timezone. This applies to
+// expression indexes, partial index WHERE clauses, and generated columns.
+fn is_deterministic_datetime_call(func: &Func, args: &[Box<Expr>]) -> bool {
+    match func {
+        Func::Scalar(ScalarFunc::Date)
+        | Func::Scalar(ScalarFunc::Time)
+        | Func::Scalar(ScalarFunc::DateTime)
+        | Func::Scalar(ScalarFunc::UnixEpoch)
+        | Func::Scalar(ScalarFunc::JulianDay) => {
+            !args.is_empty()
+                && !is_current_time_expr(args[0].as_ref())
+                && !args[1..]
+                    .iter()
+                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
+        }
+        Func::Scalar(ScalarFunc::StrfTime) => {
+            args.len() >= 2
+                && !is_current_time_expr(args[1].as_ref())
+                && !args[2..]
+                    .iter()
+                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
+        }
+        Func::Scalar(ScalarFunc::TimeDiff) => {
+            !args.iter().any(|arg| is_current_time_expr(arg.as_ref()))
+        }
+        _ => unreachable!("non-datetime function passed to datetime index validator"),
+    }
+}
+
+fn is_current_time_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(ast::Literal::String(value)) if string_literal_eq(value, "now")
+    ) || matches!(
+        expr,
+        Expr::Literal(
+            ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp
+        )
+    )
+}
+
+fn is_unsafe_datetime_modifier(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(ast::Literal::String(value))
+            if string_literal_eq(value, "localtime") || string_literal_eq(value, "utc")
+    ) || is_current_time_expr(expr)
+}
+
+fn string_literal_eq(value: &str, expected: &str) -> bool {
+    value.trim_matches('\'').eq_ignore_ascii_case(expected)
+}
+
 pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
     use ast::Expr;
     match expr {
@@ -3993,7 +4062,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
             if matches!(func, Func::Agg(_)) {
                 bail_parse_error!("aggregate functions prohibited in generated columns");
             }
-            if !func.is_deterministic() {
+            if !is_deterministic_schema_function_call(&func, args) {
                 bail_parse_error!("non-deterministic functions prohibited in generated columns");
             }
             for arg in args {

@@ -1,3 +1,4 @@
+mod abandoned_create_index;
 mod assert_details;
 mod attach;
 mod common;

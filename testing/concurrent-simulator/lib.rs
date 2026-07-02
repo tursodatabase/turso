@@ -1,3 +1,5 @@
+#![cfg_attr(nightly, feature(allocator_api))]
+
 /// Whopper is a deterministic simulator for testing the Turso database.
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -23,6 +25,7 @@ use turso_core::{
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
 mod allocation_fault;
+pub mod chaotic_btree;
 pub mod chaotic_elle;
 pub mod elle;
 pub mod error_handling;
@@ -387,6 +390,20 @@ impl WhopperOpts {
             close_connections_gracefully: false,
             reopen_probability: 0.1,
             ..Self::fast()
+        }
+    }
+
+    pub fn btree_rebalance() -> Self {
+        Self {
+            max_steps: 500_000,
+            schema_bias: SchemaBias {
+                non_rowid_pk_prob: 0.0,
+                unique_col_prob: 0.0,
+                num_tables_range: 0..=0,
+                num_columns_range: 2..=2,
+                initial_rows_per_table: 0,
+            },
+            ..Default::default()
         }
     }
 
