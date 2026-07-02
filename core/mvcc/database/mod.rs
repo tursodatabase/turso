@@ -8421,6 +8421,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let maybe_root_page = self.table_id_to_rootpage.get(table_id);
         maybe_root_page.is_some_and(|entry| entry.value().is_some())
     }
+
+    pub fn tx_should_abort(&self, tx_id: u64) -> bool {
+        if let Some(tx) = self.txs.get(&tx_id) {
+            tx.value().abort_now.load(Ordering::Acquire)
+        } else {
+            false
+        }
+    }
 }
 
 fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) {

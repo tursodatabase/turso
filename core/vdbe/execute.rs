@@ -10267,8 +10267,14 @@ pub fn op_idx_delete(
                 };
 
                 if !found {
+                    // If we didn't find it because a txn we depended on was aborted, then it means it isn't really corrupt, we simply
+                    // might have found some garbage data because other tx trashed all row versions we depended on (basically it sets begin: None, end: None).
+                    if program.connection.mvcc_tx_should_abort() {
+                        return Err(LimboError::CommitDependencyAborted);
+                    }
                     // If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry is found
                     // Also, do not raise this (self-correcting and non-critical) error if in writable_schema mode.
+
                     if *raise_error_if_no_matching_entry {
                         let reg_values = (*start_reg..*start_reg + *num_regs)
                             .map(|i| &state.registers[i])
