@@ -50,6 +50,7 @@ Source = "https://github.com/tursodatabase/turso"
 "sqlite.turso" = "turso.sqlalchemy:TursoDialect"
 "sqlite.aioturso" = "turso.sqlalchemy:AioTursoDialect"
 "sqlite.turso_sync" = "turso.sqlalchemy:TursoSyncDialect"
+"sqlite.aioturso_sync" = "turso.sqlalchemy:AioTursoSyncDialect"
 
 [tool.maturin]
 bindings = 'pyo3'
