@@ -5484,7 +5484,7 @@ impl Index {
                     let configuration = IndexMethodConfiguration {
                         table_name: table.name.clone(),
                         index_name: index_name.clone(),
-                        columns: index_columns.clone(),
+                        columns: index_columns.try_clone()?,
                         parameters,
                     };
                     let descriptor = module.attach(&configuration)?;

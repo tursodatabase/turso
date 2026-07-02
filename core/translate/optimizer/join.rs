@@ -12,7 +12,7 @@ use super::{
     order::OrderTarget,
     AvailableIndexes, IndexMethodCandidate,
 };
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::{
     schema::Schema,
     stats::AnalyzeStats,
@@ -348,7 +348,7 @@ pub fn join_lhs_and_rhs<'a>(
             let probe_cardinality = *rhs_base_rows;
 
             let prior_mask = {
-                let mut mask = lhs_mask.clone();
+                let mut mask = lhs_mask.try_clone()?;
                 mask.clear(build_table_idx);
                 mask
             };
@@ -1177,7 +1177,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
 
                 // If there are no other tables except RHS, skip.
                 let lhs_mask = {
-                    let mut copy = mask.clone();
+                    let mut copy = mask.try_clone()?;
                     copy.clear(rhs_idx);
                     copy
                 };

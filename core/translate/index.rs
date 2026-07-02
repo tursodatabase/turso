@@ -1,4 +1,4 @@
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
@@ -199,7 +199,7 @@ pub fn translate_create_index(
             index_method = Some(index_module.attach(&IndexMethodConfiguration {
                 table_name: tbl.name.clone(),
                 index_name: idx_name.clone(),
-                columns: columns.clone(),
+                columns: columns.try_clone()?,
                 parameters,
             })?);
         }

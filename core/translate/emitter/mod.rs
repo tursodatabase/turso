@@ -22,7 +22,7 @@ use super::{
     trigger_exec::{get_triggers_including_temp, has_triggers_including_temp},
     window::WindowMetadata,
 };
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::instrument;
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
@@ -1809,7 +1809,7 @@ pub(crate) fn emit_columns_and_dependencies(
         program.alloc_registers(non_rowid_targets.len())
     };
     let extra_base = {
-        let mut dependencies_not_in_targets: ColumnMask = dependencies.clone();
+        let mut dependencies_not_in_targets: ColumnMask = dependencies.try_clone()?;
         dependencies_not_in_targets -= &target_mask;
 
         let extra_count = table
