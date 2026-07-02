@@ -6,6 +6,7 @@ use rand::Rng;
 use super::helpers;
 use core_tester::common::{limbo_exec_rows, rng_from_time_or_env, TempDatabase};
 use rusqlite::types::Value;
+use std::sync::Arc;
 
 /// Generate a star schema with N dimensions.
 /// Star schema = a fact table with N dimensions, each dimension table references the fact table.
@@ -89,6 +90,36 @@ fn has_index_search_on_table(eqp_rows: &[Vec<rusqlite::types::Value>], table_nam
     false
 }
 
+fn setup_chain_join(conn: &Arc<turso_core::Connection>, chain_length: usize) -> Vec<String> {
+    for i in 1..=chain_length {
+        let table_name = format!("t{i}");
+        if i == chain_length {
+            limbo_exec_rows(conn, &format!("CREATE TABLE {table_name}(c{i}, data)"));
+        } else {
+            limbo_exec_rows(
+                conn,
+                &format!("CREATE TABLE {table_name}(c{i}, c{})", i + 1),
+            );
+        }
+    }
+
+    for i in 1..=chain_length {
+        limbo_exec_rows(conn, &format!("CREATE INDEX idx_t{i} ON t{i}(c{i})"));
+    }
+
+    for i in 1..=chain_length {
+        if i == chain_length {
+            limbo_exec_rows(conn, &format!("INSERT INTO t{i} VALUES (1, 'end')"));
+        } else {
+            limbo_exec_rows(conn, &format!("INSERT INTO t{i} VALUES (1, 1)"));
+        }
+    }
+
+    (1..chain_length)
+        .map(|i| format!("t{i}.c{} = t{}.c{}", i + 1, i + 1, i + 1))
+        .collect()
+}
+
 /// Fuzz test: star schema with randomized FROM clause order.
 /// Verifies the optimizer always SCANs the fact table regardless of table ordering,
 /// and index scans the dimension tables. Both the DP and greedy algos should be able
@@ -159,40 +190,9 @@ fn test_chain_join_fuzz() {
         let tmp_db = TempDatabase::new_empty();
         let conn = tmp_db.connect_limbo();
 
-        // Create chain: each table has (join_col, next_join_col) using numeric column names
-        let mut tables = Vec::new();
-        for i in 1..=chain_length {
-            let table_name = format!("t{i}");
-            if i == chain_length {
-                limbo_exec_rows(&conn, &format!("CREATE TABLE {table_name}(c{i}, data)"));
-            } else {
-                limbo_exec_rows(
-                    &conn,
-                    &format!("CREATE TABLE {table_name}(c{i}, c{})", i + 1),
-                );
-            }
-            tables.push(table_name);
-        }
+        let join_conditions = setup_chain_join(&conn, chain_length);
 
-        // Create indexes on the chain
-        for i in 1..=chain_length {
-            limbo_exec_rows(&conn, &format!("CREATE INDEX idx_t{i} ON t{i}(c{i})"));
-        }
-
-        // Insert data forming a chain
-        for i in 1..=chain_length {
-            if i == chain_length {
-                limbo_exec_rows(&conn, &format!("INSERT INTO t{i} VALUES (1, 'end')"));
-            } else {
-                limbo_exec_rows(&conn, &format!("INSERT INTO t{i} VALUES (1, 1)"));
-            }
-        }
-
-        // Join conditions: t1.c2 = t2.c2 AND t2.c3 = t3.c3 AND ...
-        let join_conditions: Vec<String> = (1..chain_length)
-            .map(|i| format!("t{i}.c{} = t{}.c{}", i + 1, i + 1, i + 1))
-            .collect();
-
+        let tables: Vec<String> = (1..=chain_length).map(|i| format!("t{i}")).collect();
         let mut table_refs: Vec<&str> = tables.iter().map(|s| s.as_str()).collect();
         table_refs.shuffle(&mut rng);
 
@@ -251,6 +251,39 @@ fn test_chain_join_fuzz() {
             "Expected 1 row from {chain_length}-way chain join"
         );
     }
+}
+
+#[test]
+fn test_chain_join_bad_greedy_start_regression() {
+    let chain_length = 62;
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+    let join_conditions = setup_chain_join(&conn, chain_length);
+    let table_refs = [
+        "t61", "t5", "t47", "t4", "t3", "t39", "t35", "t7", "t8", "t9", "t50", "t56", "t48", "t21",
+        "t44", "t25", "t40", "t33", "t42", "t41", "t46", "t38", "t51", "t27", "t19", "t45", "t16",
+        "t12", "t2", "t17", "t30", "t13", "t34", "t32", "t22", "t62", "t6", "t55", "t58", "t18",
+        "t11", "t57", "t53", "t36", "t54", "t20", "t59", "t14", "t15", "t24", "t43", "t60", "t23",
+        "t28", "t31", "t1", "t49", "t10", "t29", "t26", "t37", "t52",
+    ];
+    let query = format!(
+        "SELECT t{chain_length}.data FROM {} WHERE {}",
+        table_refs.join(", "),
+        join_conditions.join(" AND ")
+    );
+
+    let eqp_rows = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
+    assert!(
+        has_scan_on_table(&eqp_rows, "t1"),
+        "Expected deterministic chain regression to start from indexed-unlock root t1"
+    );
+
+    let result = limbo_exec_rows(&conn, &query);
+    assert_eq!(
+        result.len(),
+        1,
+        "Expected 1 row from deterministic {chain_length}-way chain join"
+    );
 }
 
 /// Test: clique join where every table joins to every other.
