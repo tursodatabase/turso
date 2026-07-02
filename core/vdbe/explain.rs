@@ -2554,7 +2554,7 @@ pub fn insn_to_row(
                 format!("hash_table_id={hash_table_id}"),
             )
         },
-        Insn::VacuumInto { schema_name, dest_path } => (
+        Insn::VacuumInto { schema_name, dest_path, .. } => (
             "VacuumInto",
             0,
             0,

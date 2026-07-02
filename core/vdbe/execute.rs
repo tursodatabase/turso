@@ -64,9 +64,9 @@ use crate::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
-    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, Database,
-    DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState,
-    ValueRef, WalAutoActions, MAIN_DB_ID, TEMP_DB_ID,
+    CaptureDataChangesInfo, CdcVersion, CheckpointMode, CipherMode, Completion, Connection,
+    Database, DatabaseStorage, EncryptionOpts, IOExt, MvCursor, NonNan, OpenFlags, QueryMode,
+    Statement, TransactionState, ValueRef, WalAutoActions, MAIN_DB_ID, TEMP_DB_ID,
 };
 use crate::{
     error::{
@@ -137,7 +137,7 @@ use super::{make_record, Program, ProgramState, Register};
 
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
-use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
+use crate::{bail_constraint_error, must_be_btree_cursor, EncryptionKey, MvStore, Pager, Result};
 
 type MvccCheckpointStateMachine = CheckpointStateMachine<MvccClock, DynAllocator>;
 
@@ -16396,7 +16396,8 @@ fn op_vacuum_into_inner(
     load_insn!(
         VacuumInto {
             schema_name,
-            dest_path
+            dest_path,
+            encryption_opts
         },
         insn
     );
@@ -16462,6 +16463,7 @@ fn op_vacuum_into_inner(
                 // BEGIN and pragma helpers here are blocking convenience wrappers;
                 // async work starts with the schema scan in vacuum_target_build_step.
                 let source_db = program.connection.get_source_database(source_db_id);
+
                 program.connection.execute("BEGIN")?;
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                 let page_size: u32 = extract_pragma_int(
@@ -16510,6 +16512,8 @@ fn op_vacuum_into_inner(
                 // Mirror source feature flags to the output so schema replay
                 // can resolve custom types, generated columns, vtab modules, etc.
                 let output_opts = vacuum_target_opts_from_source(&source_db);
+                let output_opts = output_opts
+                    .with_encryption(output_opts.enable_encryption || encryption_opts.is_some());
 
                 // Always use PlatformIO for the output file, even if source
                 // is in-memory. This ensures VACUUM INTO writes to disk.
@@ -16519,14 +16523,24 @@ fn op_vacuum_into_inner(
                     dest_path,
                     OpenFlags::Create,
                     output_opts,
-                    None,
+                    encryption_opts.clone(),
                 )?;
-                let output_conn = output_db.connect()?;
+                // set reserved_space on destination to match source or use encryption parameters,
+                // if specified. This is important for databases using encryption or checksums.
+                // Must be set before page 1 is allocated (before any schema operations)
+                let (encryption_key, reserved_bytes) =
+                    if let Some(EncryptionOpts { cipher, hexkey }) = encryption_opts {
+                        let cipher_mode = CipherMode::try_from(cipher.as_str())?;
+                        (
+                            Some(EncryptionKey::from_hex_string(hexkey)?),
+                            cipher_mode.metadata_size() as u8,
+                        )
+                    } else {
+                        (None, reserved_space)
+                    };
+                let output_conn = output_db.connect_with_encryption(encryption_key)?;
                 output_conn.reset_page_size(page_size)?;
-                // set reserved_space on output to match source
-                // this is important for databases using encryption or checksums
-                // must be set before page 1 is allocated (before any schema operations)
-                output_conn.set_reserved_bytes(reserved_space)?;
+                output_conn.set_reserved_bytes(reserved_bytes)?;
 
                 mirror_symbols(&program.connection, &output_conn);
                 let source_custom_types = capture_custom_types(&program.connection, source_db_id);
