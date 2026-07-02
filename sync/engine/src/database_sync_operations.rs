@@ -192,7 +192,9 @@ fn logical_op_to_tape_operations(
                 DatabaseTapeRowChange {
                     change_id: 0,
                     change_time: commit_ts,
-                    change: DatabaseTapeRowChangeType::Delete { before: Vec::new() },
+                    change: DatabaseTapeRowChangeType::Delete {
+                        before: crate::alloc::Vec::new(),
+                    },
                     table_name: op.table_name,
                     id: op.rowid,
                 },
