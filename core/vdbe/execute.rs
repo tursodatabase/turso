@@ -5893,7 +5893,7 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
 ///   ordered-set aggregates, the collation / percentile fraction to use at finalize time.
 fn update_agg_payload(
     func: &AggFunc,
-    arg: &Value, // read-only; the buffering aggregates and Min/Max keep an owned copy (they clone)
+    arg: &Value, // first argument
     maybe_arg2: Option<Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut crate::alloc::Vec<Value>,
     collation: CollationSeq,
