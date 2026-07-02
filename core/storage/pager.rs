@@ -3168,8 +3168,6 @@ impl Pager {
             // Clear dirty pages and page cache before releasing the write lock
             self.clear_page_cache(true);
             self.dirty_pages.write().clear();
-            // saveAllCursors at sqlite3BtreeRollback (btree.c:4485).
-            self.invalidate_all_cursors();
             self.reset_internal_states();
             self.set_schema_cookie(None);
             wal.rollback(None);
@@ -4855,6 +4853,7 @@ impl Pager {
 
                     // Clear page cache only if requested (explicit checkpoints do this, auto-checkpoint does not)
                     if clear_page_cache {
+                        self.invalidate_all_cursors();
                         self.page_cache.write().clear(false).map_err(|e| {
                             res.release_guard();
                             LimboError::InternalError(format!("Failed to clear page cache: {e:?}"))
@@ -4903,6 +4902,7 @@ impl Pager {
     /// of a rollback or in case we want to invalidate page cache after starting a read transaction
     /// right after new writes happened which would invalidate current page cache.
     pub fn clear_page_cache(&self, clear_dirty: bool) {
+        self.invalidate_all_cursors();
         let dirty_pages = self.dirty_pages.write();
         let mut cache = self.page_cache.write();
         for page_id in dirty_pages.iter() {
@@ -5527,8 +5527,6 @@ impl Pager {
             // since we only need to clear the dirty pages that were modified by the write transaction.
             self.clear_page_cache(clear_dirty);
             self.dirty_pages.write().clear();
-            // saveAllCursors at sqlite3BtreeRollback (btree.c:4485).
-            self.invalidate_all_cursors();
         } else {
             turso_assert!(
                 self.dirty_pages.read().is_empty(),
