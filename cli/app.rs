@@ -780,22 +780,20 @@ impl Limbo {
 
     pub fn handle_dot_command(&mut self, line: &str) {
         let first = line.split_whitespace().next();
+        let args = shlex::split(line).unwrap_or_else(|| {
+            line.split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
+
         let parse = match first {
             Some("parameter") | Some("param") => {
-                let args = shlex::split(line).unwrap_or_else(|| {
-                    line.split_whitespace()
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                });
                 if args.is_empty() {
                     return;
                 }
                 CommandParser::try_parse_from(args)
             }
-            _ => {
-                let args = line.split_whitespace();
-                CommandParser::try_parse_from(args)
-            }
+            _ => CommandParser::try_parse_from(args),
         };
         match parse {
             Err(err) => {
