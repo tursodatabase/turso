@@ -902,6 +902,7 @@ fn resolve_sorted_columns_with_resolver(
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
                 GeneratedType::NotGenerated => None,
             };
+            // Capacity is preallocated to cols.len(); this loop pushes at most one column per input.
             resolved.push(IndexColumn {
                 name: column_name,
                 order,
@@ -915,6 +916,7 @@ fn resolve_sorted_columns_with_resolver(
         if !validate_index_expression(unwrapped_expr, table) {
             crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
         }
+        // Capacity is preallocated to cols.len(); this loop pushes at most one column per input.
         resolved.push(IndexColumn {
             name: sc.expr.to_string(),
             order,

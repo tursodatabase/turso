@@ -1689,7 +1689,7 @@ fn emit_materialized_subquery_table(
         0,
         String::new(),
         crate::alloc::vec![],
-        columns.try_to_vec().expect(crate::alloc::ALLOC_ERR_MSG),
+        columns.try_to_vec()?,
         BTreeCharacteristics::HAS_ROWID,
         crate::alloc::vec![],
         crate::alloc::vec![],
