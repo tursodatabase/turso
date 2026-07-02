@@ -5888,11 +5888,19 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
 /// - **Min/Max**: `[current_extreme: Value]` - tracks min/max seen so far
 /// - **GroupConcat/StringAgg**: `[accumulated: Null|Text]` - Null until first value, then Text
 /// - **JsonGroup***: `[raw_jsonb: Blob]` - accumulated raw JSONB bytes
+/// - **ArrayAgg/Mode/PercentileCont/PercentileDisc**: buffer every input value by growing the
+///   payload `Vec` (one push per row); the leading slots hold a running count and, for the
+///   ordered-set aggregates, the collation / percentile fraction to use at finalize time.
+///
+/// The payload is passed as the growable `crate::alloc::Vec<Value>` (the same type
+/// `payload_vec_mut()` returns) rather than a slice, so the buffering aggregates above can push;
+/// the fixed-size aggregates only index the leading slots and never grow it. Using the crate's
+/// `alloc::Vec` alias keeps the signature correct under the nightly `TursoAllocator` cfg.
 fn update_agg_payload(
     func: &AggFunc,
-    arg: &Value,               // read-only; only Min/Max keep an owned copy (they clone)
+    arg: &Value, // read-only; the buffering aggregates and Min/Max keep an owned copy (they clone)
     maybe_arg2: Option<Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
-    payload: &mut [Value],
+    payload: &mut crate::alloc::Vec<Value>,
     collation: CollationSeq,
     comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
 ) -> Result<()> {
@@ -5926,7 +5934,7 @@ fn update_agg_payload(
                 return Ok(());
             }
             // invariant as per init_agg_payload: payload[0] is Float (sum), payload[1] is Float (r_err), payload[2] is Integer (count)
-            let [sum_val, r_err_val, count_val, ..] = payload else {
+            let [sum_val, r_err_val, count_val, ..] = payload.as_mut_slice() else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
                     "Avg: payload too short".to_string(),
@@ -5980,7 +5988,7 @@ fn update_agg_payload(
         AggFunc::Sum | AggFunc::Total => {
             // invariant as per init_agg_payload: payload[0] is acc (Null/Integer/Float),
             // payload[1] is Float (r_err), payload[2] is Integer (approx), payload[3] is Integer (ovrfl)
-            let [acc, r_err_val, approx_val, ovrfl_val, ..] = payload else {
+            let [acc, r_err_val, approx_val, ovrfl_val, ..] = payload.as_mut_slice() else {
                 return Err(LimboError::InternalError(
                     "Sum/Total: payload too short".to_string(),
                 ));
@@ -6133,18 +6141,35 @@ fn update_agg_payload(
             vec.append(&mut val_vec);
         }
         AggFunc::ArrayAgg => {
-            // ArrayAgg accumulation is handled directly in the AggStep caller
-            // via payload_vec_mut() to grow the Vec (O(1) per row).
-            return Err(LimboError::InternalError(
-                "ArrayAgg should be handled directly in op_agg_step, not update_agg_payload".into(),
-            ));
+            // Buffer every value (including NULLs) by growing the payload Vec; payload[0] is a
+            // running count. O(1) per row.
+            let count = payload[0].as_int().ok_or_else(|| {
+                LimboError::InternalError("array_agg count slot must be an integer".into())
+            })? as usize;
+            payload[0] = Value::from_i64((count + 1) as i64);
+            payload.push(arg.clone());
         }
-        AggFunc::Mode | AggFunc::PercentileCont | AggFunc::PercentileDisc => {
-            // Ordered-set aggregates buffer values into a growable Vec, handled directly
-            // in op_agg_step (the slice here cannot grow).
-            return Err(LimboError::InternalError(
-                "ordered-set aggregate should be handled directly in op_agg_step".into(),
-            ));
+        AggFunc::Mode => {
+            // Record the value's collation (constant per group) for finalize-time sorting, then
+            // buffer the value. Ordered-set aggregates ignore NULL inputs.
+            payload[0] = Value::from_i64(collation.to_bits() as i64);
+            if !matches!(arg, Value::Null) {
+                let count = payload[1].as_int().unwrap_or(0) as usize;
+                payload[1] = Value::from_i64((count + 1) as i64);
+                payload.push(arg.clone());
+            }
+        }
+        AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+            payload[0] = Value::from_i64(collation.to_bits() as i64);
+            // The fraction is a per-group constant; record it on every step.
+            if let Some(fraction) = maybe_arg2 {
+                payload[2] = fraction;
+            }
+            if !matches!(arg, Value::Null) {
+                let count = payload[1].as_int().unwrap_or(0) as usize;
+                payload[1] = Value::from_i64((count + 1) as i64);
+                payload.push(arg.clone());
+            }
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
@@ -6588,90 +6613,36 @@ pub fn op_agg_step(
                 _ => None,
             };
 
-            match func {
-                // ArrayAgg and the ordered-set aggregates buffer values by growing the payload
-                // Vec directly (O(1) per row); they cannot use the fixed-size slice, and they
-                // need an owned copy of the argument to push.
-                AggFunc::ArrayAgg => {
-                    let arg = state.registers[*col].get_value().clone();
-                    let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
-                        return Err(LimboError::InternalError(format!(
-                            "AggStep: register {} does not hold an aggregate accumulator",
-                            *acc_reg
-                        )));
-                    };
-                    let payload = agg.payload_vec_mut();
-                    let count = payload[0]
-                        .as_int()
-                        .expect("array_agg count must be an integer")
-                        as usize;
-                    payload[0] = Value::from_i64((count + 1) as i64);
-                    payload.push(arg);
-                }
-                AggFunc::Mode => {
-                    let arg = state.registers[*col].get_value().clone();
-                    let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
-                        return Err(LimboError::InternalError(format!(
-                            "AggStep: register {} does not hold an aggregate accumulator",
-                            *acc_reg
-                        )));
-                    };
-                    let payload = agg.payload_vec_mut();
-                    // Record the value's collation (constant per group) for finalize-time sorting.
-                    payload[0] = Value::from_i64(current_collation.to_bits() as i64);
-                    // Ordered-set aggregates ignore NULL inputs.
-                    if !matches!(arg, Value::Null) {
-                        let count = payload[1].as_int().unwrap_or(0) as usize;
-                        payload[1] = Value::from_i64((count + 1) as i64);
-                        payload.push(arg);
-                    }
-                }
-                AggFunc::PercentileCont | AggFunc::PercentileDisc => {
-                    let arg = state.registers[*col].get_value().clone();
-                    let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
-                        return Err(LimboError::InternalError(format!(
-                            "AggStep: register {} does not hold an aggregate accumulator",
-                            *acc_reg
-                        )));
-                    };
-                    let payload = agg.payload_vec_mut();
-                    payload[0] = Value::from_i64(current_collation.to_bits() as i64);
-                    // The fraction is a per-group constant; record it on every step.
-                    if let Some(fraction) = maybe_arg2 {
-                        payload[2] = fraction;
-                    }
-                    if !matches!(arg, Value::Null) {
-                        let count = payload[1].as_int().unwrap_or(0) as usize;
-                        payload[1] = Value::from_i64((count + 1) as i64);
-                        payload.push(arg);
-                    }
-                }
-                // Count/Sum/Avg/Total/Min/Max/GroupConcat/Json read the argument by reference;
-                // update_agg_payload clones only where it must (Min/Max keep the extreme). The
-                // input and accumulator are always distinct registers, so borrow them disjointly.
-                _ => {
-                    let [arg_reg, acc_slot] = state
-                        .registers
-                        .get_disjoint_mut([*col, *acc_reg])
-                        .expect("aggregate input and accumulator are distinct registers");
-                    let arg = arg_reg.get_value();
-                    let Register::Aggregate(agg) = acc_slot else {
-                        return Err(LimboError::InternalError(format!(
-                            "AggStep: register {} does not hold an aggregate accumulator",
-                            *acc_reg
-                        )));
-                    };
-                    let payload = agg.payload_mut();
-                    update_agg_payload(
-                        func,
-                        arg,
-                        maybe_arg2,
-                        payload,
-                        current_collation,
-                        comparator_factory,
-                    )?;
-                }
-            }
+            // Every builtin aggregate steps through update_agg_payload: it reads the argument by
+            // reference and clones only where it must (Min/Max keep the extreme; array_agg/mode/
+            // percentile buffer a copy into the growable payload Vec). The input and accumulator
+            // are always distinct registers, so borrow them disjointly.
+            let [arg_reg, acc_slot] =
+                state
+                    .registers
+                    .get_disjoint_mut([*col, *acc_reg])
+                    .map_err(|_| {
+                        LimboError::InternalError(format!(
+                        "AggStep: input register {} and accumulator register {} must be distinct",
+                        *col, *acc_reg
+                    ))
+                    })?;
+            let arg = arg_reg.get_value();
+            let Register::Aggregate(agg) = acc_slot else {
+                return Err(LimboError::InternalError(format!(
+                    "AggStep: register {} does not hold an aggregate accumulator",
+                    *acc_reg
+                )));
+            };
+            let payload = agg.payload_vec_mut();
+            update_agg_payload(
+                func,
+                arg,
+                maybe_arg2,
+                payload,
+                current_collation,
+                comparator_factory,
+            )?;
         }
     };
 
@@ -17262,7 +17233,7 @@ mod tests {
 
     #[test]
     fn test_update_count_skips_null() {
-        let mut payload = vec![Value::from_i64(5)];
+        let mut payload = crate::alloc::vec![Value::from_i64(5)];
         update_agg_payload(
             &AggFunc::Count,
             &Value::Null,
@@ -17277,7 +17248,7 @@ mod tests {
 
     #[test]
     fn test_update_count_increments() {
-        let mut payload = vec![Value::from_i64(5)];
+        let mut payload = crate::alloc::vec![Value::from_i64(5)];
         update_agg_payload(
             &AggFunc::Count,
             &Value::from_i64(42),
@@ -17292,7 +17263,7 @@ mod tests {
 
     #[test]
     fn test_update_sum_integers() {
-        let mut payload = vec![
+        let mut payload = crate::alloc::vec![
             Value::Null,
             Value::from_f64(0.0),
             Value::from_i64(0),
@@ -17323,7 +17294,7 @@ mod tests {
 
     #[test]
     fn test_update_sum_null_is_skipped() {
-        let mut payload = vec![
+        let mut payload = crate::alloc::vec![
             Value::from_i64(10),
             Value::from_f64(0.0),
             Value::from_i64(0),
@@ -17343,7 +17314,7 @@ mod tests {
 
     #[test]
     fn test_update_min_max() {
-        let mut payload = vec![Value::Null];
+        let mut payload = crate::alloc::vec![Value::Null];
         // First value sets the min/max
         update_agg_payload(
             &AggFunc::Min,
@@ -17384,7 +17355,7 @@ mod tests {
     #[test]
     fn test_update_avg() {
         // Payload: [sum, r_err, count]
-        let mut payload = vec![
+        let mut payload = crate::alloc::vec![
             Value::from_f64(0.0),
             Value::from_f64(0.0),
             Value::from_i64(0),
@@ -17447,7 +17418,7 @@ mod tests {
 
     #[test]
     fn test_finalize_avg_large_integers() {
-        let mut payload = vec![
+        let mut payload = crate::alloc::vec![
             Value::from_f64(0.0),
             Value::from_f64(0.0),
             Value::from_i64(0),
