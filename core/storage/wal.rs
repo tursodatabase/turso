@@ -595,6 +595,7 @@ trait WalCoordination: Debug + Send + Sync {
 }
 
 /// Write-ahead log (WAL).
+#[aristo::intent("The WAL subsystem maintains LSN monotonicity, frame commitment ordering, recovery idempotency, checkpoint safety, and group commit atomicity.", id = "wal_protocol_correctness", verify = "neural")]
 pub trait Wal: Debug + Send + Sync {
     /// Begin a read transaction.
     /// Returns whether the database state has changed since the last read transaction.
@@ -3319,6 +3320,12 @@ impl Wal for WalFile {
 
     /// Find the latest frame containing a page.
     #[instrument(skip_all, level = Level::DEBUG)]
+    #[aristo::intent(
+        "find_frame never reads outside the live frame range [nbackfills, max_frame]\n",
+        id = "aristos:wal_find_frame_range_invariant",
+        verify = "full",
+        parent = "wal_protocol_correctness"
+    )]
     fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<u64>> {
         #[cfg(not(feature = "conn_raw_api"))]
         turso_assert!(
@@ -4071,6 +4078,12 @@ impl Wal for WalFile {
         }
     }
 
+    #[aristo::intent(
+        "The WAL initialized flag is set true only after a successful sync of the wal-header\n",
+        id = "aristos:wal_initialized_reflects_sync_outcome",
+        verify = "full",
+        parent = "wal_protocol_correctness"
+    )]
     fn prepare_wal_finish(&self, sync_type: FileSyncType) -> Result<Completion> {
         let file = self.coordination.wal_file()?;
         let coordination = self.coordination.clone();
@@ -4563,6 +4576,12 @@ impl WalFile {
         Ok(())
     }
 
+    #[aristo::intent(
+        "A checkpoint failure must not leak frames into the main database file\n",
+        id = "aristos:wal_checkpoint_error_no_db_leak",
+        verify = "full",
+        parent = "wal_protocol_correctness"
+    )]
     fn checkpoint_inner(
         &self,
         pager: &Pager,
@@ -4941,6 +4960,7 @@ impl WalFile {
     }
 
     /// Truncate WAL file to zero and sync it. Called by pager AFTER DB file is synced.
+    #[aristo::intent("WAL truncate is atomic: no committed frame can be observed lost across the truncate operation\n", id = "aristos:wal_truncate_atomic_under_concurrent_writers", verify = "full", parent = "wal_protocol_correctness")]
     fn truncate_log(
         &self,
         result: &mut CheckpointResult,
