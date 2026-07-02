@@ -5495,8 +5495,77 @@ impl ProvidesYieldContext for BTreeCursor {
     }
 }
 
+impl BTreeCursor {
+    fn clear_transient_overflow_cells(&mut self) {
+        // Overflow cells are page-local scratch for the cursor's in-flight balance.
+        // If the cursor is abandoned after queueing them, cached pages may outlive
+        // the cursor and must not carry that scratch into later writes.
+        if matches!(self.state, CursorState::None)
+            && matches!(self.balance_state.sub_state, BalanceSubState::Start)
+        {
+            turso_assert!(
+                self.balance_state.balance_info.is_none(),
+                "idle cursor has balance info"
+            );
+            // No write or balance operation is in progress, so this cursor has no
+            // transient overflow cells to clean up.
+            return;
+        }
+
+        for page in self.stack.stack.iter().flatten() {
+            page.get().overflow_cells.clear();
+        }
+
+        // Insert/overwrite can stage overflow cells before balance_info is populated.
+        // If the cursor is dropped in that window, this page handle is the only owner
+        // of that transient state.
+        match &self.state {
+            CursorState::Write(WriteState::Insert { page, .. })
+            | CursorState::Write(WriteState::Overwrite { page, .. }) => {
+                page.get().overflow_cells.clear();
+            }
+            CursorState::Write(WriteState::Start)
+            | CursorState::Write(WriteState::Balancing)
+            | CursorState::Write(WriteState::Finish)
+            | CursorState::Destroy(_)
+            | CursorState::Delete(_)
+            | CursorState::None => {}
+        }
+
+        if let Some(balance_info) = &self.balance_state.balance_info {
+            for page in balance_info.pages_to_balance.iter().flatten() {
+                page.get().overflow_cells.clear();
+            }
+        }
+
+        // Newly allocated/reused sibling pages are tracked only by BalanceContext until
+        // non-root balancing finishes. If the cursor is dropped before then, clear any
+        // overflow scratch from those pages explicitly.
+        match &self.balance_state.sub_state {
+            BalanceSubState::NonRootDoBalancingAllocate {
+                context: Some(context),
+                ..
+            }
+            | BalanceSubState::NonRootDoBalancingFinish { context } => {
+                for page in context.pages_to_balance_new.iter().flatten() {
+                    page.get().overflow_cells.clear();
+                }
+            }
+            BalanceSubState::Start
+            | BalanceSubState::BalanceRoot
+            | BalanceSubState::Decide
+            | BalanceSubState::Quick
+            | BalanceSubState::NonRootPickSiblings
+            | BalanceSubState::NonRootDoBalancing
+            | BalanceSubState::NonRootDoBalancingAllocate { context: None, .. }
+            | BalanceSubState::FreePages { .. } => {}
+        }
+    }
+}
+
 impl Drop for BTreeCursor {
     fn drop(&mut self) {
+        self.clear_transient_overflow_cells();
         if !self
             .did_register
             .load(crate::sync::atomic::Ordering::Relaxed)
@@ -7620,6 +7689,7 @@ fn find_free_slot(
 pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usable_space: usize) {
     // setup btree page
     let contents = page.get_contents();
+    contents.overflow_cells.clear();
     tracing::debug!(
         "btree_init_page(id={}, offset={}, usable_space={})",
         page.get().id,

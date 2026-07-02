@@ -101,11 +101,21 @@ use crate::pseudo::PseudoCursor;
 use crate::storage::btree::{BTreeCursor, BTreeKey};
 
 #[inline]
-fn install_btree_cursor_yield_context(cursor: &mut BTreeCursor, connection: &Arc<Connection>) {
+fn btree_cursor_with_yield_context(
+    cursor: Box<BTreeCursor>,
+    connection: &Arc<Connection>,
+) -> Box<BTreeCursor> {
     #[cfg(any(test, injected_yields))]
-    cursor.install_yield_context(connection);
+    {
+        let mut cursor = cursor;
+        cursor.install_yield_context(connection);
+        cursor
+    }
     #[cfg(not(any(test, injected_yields)))]
-    let _ = (cursor, connection);
+    {
+        let _ = connection;
+        cursor
+    }
 }
 
 use super::{
@@ -1214,13 +1224,11 @@ pub fn op_open_read(
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
 
-            let mut btree_cursor = BTreeCursor::new_table(
+            let btree_cursor = Box::new(BTreeCursor::new_table(
                 pager.clone(),
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 num_columns,
-            );
-            install_btree_cursor_yield_context(&mut btree_cursor, &program.connection);
-            let btree_cursor = Box::new(btree_cursor);
+            ));
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
 
             // Get the view name and look up or create its transaction state
@@ -1251,22 +1259,18 @@ pub fn op_open_read(
                 ));
             }
             let btree_cursor: Box<dyn CursorTrait> = if table.has_rowid {
-                let mut cursor = BTreeCursor::new_table(
+                Box::new(BTreeCursor::new_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     num_columns,
-                );
-                install_btree_cursor_yield_context(&mut cursor, &program.connection);
-                Box::new(cursor)
+                ))
             } else {
-                let mut cursor = BTreeCursor::new_without_rowid_table(
+                Box::new(BTreeCursor::new_without_rowid_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     table.as_ref(),
                     num_columns,
-                );
-                install_btree_cursor_yield_context(&mut cursor, &program.connection);
-                Box::new(cursor)
+                ))
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
@@ -1275,14 +1279,12 @@ pub fn op_open_read(
                 .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(index) => {
-            let mut btree_cursor = BTreeCursor::new_index(
+            let btree_cursor = Box::new(BTreeCursor::new_index(
                 pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 index.as_ref(),
                 num_columns,
-            )?;
-            install_btree_cursor_yield_context(&mut btree_cursor, &program.connection);
-            let btree_cursor = Box::new(btree_cursor);
+            )?);
             let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
                 IndexInfo::new_from_index_in(index, mv_store.allocator())?
             } else {
@@ -11093,14 +11095,15 @@ pub fn op_open_write(
         };
         if let Some(index) = maybe_index {
             let num_columns = index.columns.len();
-            let mut btree_cursor = BTreeCursor::new_index(
-                pager,
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                index.as_ref(),
-                num_columns,
-            )?;
-            install_btree_cursor_yield_context(&mut btree_cursor, &program.connection);
-            let btree_cursor = Box::new(btree_cursor);
+            let btree_cursor = btree_cursor_with_yield_context(
+                Box::new(BTreeCursor::new_index(
+                    pager,
+                    maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                    index.as_ref(),
+                    num_columns,
+                )?),
+                &program.connection,
+            );
             let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
                 IndexInfo::new_from_index_in(index, mv_store.allocator())?
             } else {
@@ -11130,24 +11133,24 @@ pub fn op_open_write(
 
             let btree_cursor: Box<dyn CursorTrait> = match cursor_type {
                 CursorType::BTreeTable(table_rc) if !table_rc.has_rowid => {
-                    let mut cursor = BTreeCursor::new_without_rowid_table(
+                    btree_cursor_with_yield_context(
+                        Box::new(BTreeCursor::new_without_rowid_table(
+                            pager,
+                            maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                            table_rc.as_ref(),
+                            num_columns,
+                        )),
+                        &program.connection,
+                    )
+                }
+                _ => btree_cursor_with_yield_context(
+                    Box::new(BTreeCursor::new_table(
                         pager,
                         maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                        table_rc.as_ref(),
                         num_columns,
-                    );
-                    install_btree_cursor_yield_context(&mut cursor, &program.connection);
-                    Box::new(cursor)
-                }
-                _ => {
-                    let mut cursor = BTreeCursor::new_table(
-                        pager,
-                        maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                        num_columns,
-                    );
-                    install_btree_cursor_yield_context(&mut cursor, &program.connection);
-                    Box::new(cursor)
-                }
+                    )),
+                    &program.connection,
+                ),
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
@@ -13423,7 +13426,7 @@ pub fn op_open_ephemeral(
                 _ => unreachable!("This should not have happened"),
             };
 
-            let mut cursor = if let CursorType::BTreeIndex(index) = cursor_type {
+            let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
                 BTreeCursor::new_index(pager.clone(), root_page, index, num_columns)
             } else {
                 Ok(BTreeCursor::new_table(
@@ -13432,7 +13435,6 @@ pub fn op_open_ephemeral(
                     num_columns,
                 ))
             }?;
-            install_btree_cursor_yield_context(&mut cursor, &program.connection);
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::Rewind {
                 cursor: Box::new(cursor),
                 temp_file: temp_file.take(),
@@ -13540,22 +13542,18 @@ pub fn op_open_dup(
                 ));
             }
             let cursor: Box<dyn CursorTrait> = if table.has_rowid {
-                let mut cursor = BTreeCursor::new_table(
+                Box::new(BTreeCursor::new_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     table.columns().len(),
-                );
-                install_btree_cursor_yield_context(&mut cursor, &program.connection);
-                Box::new(cursor)
+                ))
             } else {
-                let mut cursor = BTreeCursor::new_without_rowid_table(
+                Box::new(BTreeCursor::new_without_rowid_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     table.as_ref(),
                     table.columns().len(),
-                );
-                install_btree_cursor_yield_context(&mut cursor, &program.connection);
-                Box::new(cursor)
+                ))
             };
             let cursor: Box<dyn CursorTrait> = if !is_ephemeral {
                 if let Some(tx_id) = program.connection.get_mv_tx_id() {
