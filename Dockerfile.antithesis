@@ -75,6 +75,7 @@ COPY --from=builder /app/target/wheels/* /tmp
 RUN pip install --break-system-packages /tmp/*.whl
 
 WORKDIR /app
+COPY ./testing/antithesis/random.sh /opt/antithesis/test/v1/
 COPY ./testing/antithesis/bank-test/*.py /opt/antithesis/test/v1/bank-test/
 COPY ./testing/antithesis/stress-composer/*.py /opt/antithesis/test/v1/stress-composer/
 COPY ./testing/antithesis/stress /opt/antithesis/test/v1/stress
