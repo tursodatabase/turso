@@ -1,3 +1,4 @@
+use rand::Rng;
 mod conn;
 mod counter;
 mod logging;
@@ -10,10 +11,11 @@ use opts::{Opts, TxMode};
 #[cfg(not(antithesis))]
 use rand::rngs::StdRng;
 #[cfg(not(antithesis))]
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 #[cfg(shuttle)]
 use shuttle::scheduler::Scheduler;
 use std::collections::HashSet;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use turso_stress::sync::atomic::{AtomicBool, Ordering};
 use turso_stress::sync::Arc;
@@ -82,10 +84,36 @@ const NOUNS: &[&str] = &[
     "leaf", "root", "seed", "fruit", "flower", "grass", "stone", "sand", "wave", "wind", "rain",
 ];
 
-/// RNG wrapper that works with both Shuttle and Antithesis
 #[cfg(not(antithesis))]
+type StressRng = StdRng;
+#[cfg(antithesis)]
+type StressRng = antithesis_sdk::random::AntithesisRng;
+
 struct ThreadRng {
-    rng: StdRng,
+    rng: StressRng,
+}
+
+impl Deref for ThreadRng {
+    type Target = StressRng;
+
+    fn deref(&self) -> &Self::Target {
+        &self.rng
+    }
+}
+
+impl DerefMut for ThreadRng {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.rng
+    }
+}
+
+impl ThreadRng {
+    fn choose<'a, T>(&mut self, ts: &'a [T]) -> &'a T {
+        #[cfg(not(antithesis))]
+        return &ts[self.rng.random_range(0..ts.len())];
+        #[cfg(antithesis)]
+        antithesis_sdk::random::random_choice(ts).expect("choose called on empty slice")
+    }
 }
 
 #[cfg(not(antithesis))]
@@ -95,57 +123,46 @@ impl ThreadRng {
             rng: StdRng::seed_from_u64(seed),
         }
     }
-
-    fn get_random(&mut self) -> u64 {
-        self.rng.random()
-    }
 }
-
-#[cfg(antithesis)]
-struct ThreadRng;
 
 #[cfg(antithesis)]
 impl ThreadRng {
     fn new(_seed: u64) -> Self {
-        // Antithesis uses its own RNG, seed is ignored
-        Self
-    }
-
-    fn get_random(&mut self) -> u64 {
-        antithesis_sdk::random::get_random()
+        Self {
+            rng: antithesis_sdk::random::AntithesisRng,
+        }
     }
 }
 
 // Helper functions for generating random data
 fn generate_random_identifier(rng: &mut ThreadRng) -> String {
-    let adj = ADJECTIVES[rng.get_random() as usize % ADJECTIVES.len()];
-    let noun = NOUNS[rng.get_random() as usize % NOUNS.len()];
-    let num = rng.get_random() % 1000;
+    let adj = rng.choose(ADJECTIVES);
+    let noun = rng.choose(NOUNS);
+    let num = rng.random_range(0..1000);
     format!("{adj}_{noun}_{num}")
 }
 
 fn generate_random_data_type(rng: &mut ThreadRng) -> DataType {
-    match rng.get_random() % 5 {
-        0 => DataType::Integer,
-        1 => DataType::Real,
-        2 => DataType::Text,
-        3 => DataType::Blob,
-        _ => DataType::Numeric,
-    }
+    rng.choose(&[
+        DataType::Integer,
+        DataType::Real,
+        DataType::Text,
+        DataType::Blob,
+        DataType::Numeric,
+    ])
+    .clone()
 }
 
 fn generate_random_constraint(rng: &mut ThreadRng) -> Constraint {
-    match rng.get_random() % 2 {
-        0 => Constraint::NotNull,
-        _ => Constraint::Unique,
-    }
+    rng.choose(&[Constraint::NotNull, Constraint::Unique])
+        .clone()
 }
 
 fn generate_random_column(rng: &mut ThreadRng) -> Column {
     let name = generate_random_identifier(rng);
     let data_type = generate_random_data_type(rng);
 
-    let constraint_count = (rng.get_random() % 2) as usize;
+    let constraint_count = rng.random_range(0..2) as usize;
     let mut constraints = Vec::with_capacity(constraint_count);
 
     for _ in 0..constraint_count {
@@ -161,7 +178,7 @@ fn generate_random_column(rng: &mut ThreadRng) -> Column {
 
 fn generate_random_table(rng: &mut ThreadRng) -> Table {
     let name = generate_random_identifier(rng);
-    let column_count = (rng.get_random() % 10 + 1) as usize;
+    let column_count = rng.random_range(1..11) as usize;
     let mut columns = Vec::with_capacity(column_count);
     let mut column_names = HashSet::new();
 
@@ -179,7 +196,7 @@ fn generate_random_table(rng: &mut ThreadRng) -> Table {
     }
 
     // Then, randomly select one column to be the primary key
-    let pk_index = (rng.get_random() % column_count as u64) as usize;
+    let pk_index = rng.random_range(0..column_count);
     columns[pk_index].constraints.push(Constraint::PrimaryKey);
     Table {
         name,
@@ -188,12 +205,8 @@ fn generate_random_table(rng: &mut ThreadRng) -> Table {
     }
 }
 
-fn gen_bool(rng: &mut ThreadRng, probability_true: f64) -> bool {
-    (rng.get_random() as f64 / u64::MAX as f64) < probability_true
-}
-
 fn gen_schema(rng: &mut ThreadRng, table_count: Option<usize>) -> ArbitrarySchema {
-    let table_count = table_count.unwrap_or_else(|| (rng.get_random() % 10 + 1) as usize);
+    let table_count = table_count.unwrap_or_else(|| rng.random_range(1..11) as usize);
     let mut tables = Vec::with_capacity(table_count);
     let mut table_names = HashSet::new();
 
@@ -260,21 +273,21 @@ fn constraint_to_sql(constraint: &Constraint) -> String {
 /// Generate a random value for a given data type
 fn generate_random_value(rng: &mut ThreadRng, data_type: &DataType) -> String {
     match data_type {
-        DataType::Integer => (rng.get_random() % 1000).to_string(),
-        DataType::Real => format!("{:.2}", (rng.get_random() % 1000) as f64 / 100.0),
+        DataType::Integer => rng.random_range(0..1000).to_string(),
+        DataType::Real => format!("{:.2}", rng.random_range(0f32..100f32)),
         DataType::Text => format!("'{}'", generate_random_identifier(rng)),
         DataType::Blob => {
             // 20% chance of generating a large blob via zeroblob() to trigger
             // page allocation (the pattern that exposed the savepoint rollback
             // bug in tursodatabase/turso#6176).
-            if rng.get_random() % 5 == 0 {
-                let size = 1000 + (rng.get_random() % 8000);
+            if rng.random_ratio(1, 5) {
+                let size = rng.random_range(1000..9000);
                 format!("zeroblob({size})")
             } else {
                 format!("x'{}'", hex::encode(generate_random_identifier(rng)))
             }
         }
-        DataType::Numeric => (rng.get_random() % 1000).to_string(),
+        DataType::Numeric => rng.random_range(0..1000).to_string(),
     }
 }
 
@@ -293,9 +306,9 @@ fn generate_insert(rng: &mut ThreadRng, table: &Table) -> String {
         .map(|col| {
             if !table.pk_values.is_empty()
                 && col.constraints.contains(&Constraint::PrimaryKey)
-                && rng.get_random() % 100 < 50
+                && rng.random_ratio(1, 2)
             {
-                table.pk_values[rng.get_random() as usize % table.pk_values.len()].clone()
+                rng.choose(&table.pk_values).clone()
             } else {
                 generate_random_value(rng, &col.data_type)
             }
@@ -346,12 +359,8 @@ fn generate_update(rng: &mut ThreadRng, table: &Table) -> String {
             .join(", ")
     };
 
-    let where_clause = if !table.pk_values.is_empty() && rng.get_random() % 100 < 50 {
-        format!(
-            "{} = {}",
-            pk_column.name,
-            table.pk_values[rng.get_random() as usize % table.pk_values.len()]
-        )
+    let where_clause = if !table.pk_values.is_empty() && rng.random_ratio(1, 2) {
+        format!("{} = {}", pk_column.name, rng.choose(&table.pk_values))
     } else {
         format!(
             "{} = {}",
@@ -375,12 +384,8 @@ fn generate_delete(rng: &mut ThreadRng, table: &Table) -> String {
         .find(|col| col.constraints.contains(&Constraint::PrimaryKey))
         .expect("Table should have a primary key");
 
-    let where_clause = if !table.pk_values.is_empty() && rng.get_random() % 100 < 50 {
-        format!(
-            "{} = {}",
-            pk_column.name,
-            table.pk_values[rng.get_random() as usize % table.pk_values.len()]
-        )
+    let where_clause = if !table.pk_values.is_empty() && rng.random_ratio(1, 2) {
+        format!("{} = {}", pk_column.name, rng.choose(&table.pk_values))
     } else {
         format!(
             "{} = {}",
@@ -394,8 +399,8 @@ fn generate_delete(rng: &mut ThreadRng, table: &Table) -> String {
 
 /// Generate a random SQL statement for a schema
 fn generate_random_statement(rng: &mut ThreadRng, schema: &ArbitrarySchema) -> String {
-    let table = &schema.tables[rng.get_random() as usize % schema.tables.len()];
-    match rng.get_random() % 3 {
+    let table = rng.choose(&schema.tables);
+    match rng.random_range(0..=2) {
         0 => generate_insert(rng, table),
         1 => generate_update(rng, table),
         _ => generate_delete(rng, table),
@@ -706,15 +711,15 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                 all_threads_ready.wait().await;
                 for interaction_idx in stress_counter.iteration_idx(thread_idx)..opts.nr_iterations
                 {
-                    if gen_bool(&mut rng, 0.02) {
+                    if rng.random_ratio(1, 50) {
                         // Reconnect to the database
                         conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
                     }
 
                     let tx = match opts.tx_mode {
-                        TxMode::SQLite => gen_bool(&mut rng, 0.5).then_some("BEGIN;"),
+                        TxMode::SQLite => (rng.random_ratio(1, 2)).then_some("BEGIN;"),
                         TxMode::Concurrent => {
-                            gen_bool(&mut rng, 0.9).then_some("BEGIN CONCURRENT;")
+                            rng.random_ratio(9, 10).then_some("BEGIN CONCURRENT;")
                         }
                     };
 
@@ -732,13 +737,13 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     // This generates the pattern that exposed the pager rollback bug
                     // in tursodatabase/turso#6176: SAVEPOINT → DML (possibly with
                     // large blobs that allocate new pages) → ROLLBACK TO / RELEASE.
-                    if tx.is_some() && rng.get_random() % 100 < 30 {
-                        let sp_name = format!("sp_{}", rng.get_random() % 100);
+                    if tx.is_some() && rng.random_ratio(3, 10) {
+                        let sp_name = format!("sp_{}", rng.random_range(0..100));
                         let savepoint_sql = format!("SAVEPOINT {sp_name};");
                         let _ = conn.execute(&savepoint_sql, ()).await;
 
                         // Execute 1-3 DML statements inside the savepoint.
-                        let sp_stmts = 1 + (rng.get_random() % 3) as usize;
+                        let sp_stmts = rng.random_range(1..4) as usize;
                         for _ in 0..sp_stmts {
                             let sp_sql = generate_random_statement(&mut rng, &schema_for_task);
                             if let Err(turso::Error::Corrupt(e)) = conn.execute(&sp_sql, ()).await {
@@ -747,7 +752,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         }
 
                         // 50% ROLLBACK TO (partial undo), 50% RELEASE (keep changes).
-                        if rng.get_random() % 2 == 0 {
+                        if rng.random_ratio(1, 2) {
                             let rollback_sql = format!("ROLLBACK TO {sp_name};");
                             let _ = conn.execute(&rollback_sql, ()).await;
                         }
@@ -756,11 +761,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     }
 
                     if tx.is_some() {
-                        let end_tx = if rng.get_random() % 2 == 0 {
-                            "COMMIT;"
-                        } else {
-                            "ROLLBACK;"
-                        };
+                        let end_tx = *rng.choose(&["COMMIT;", "ROLLBACK;"]);
                         let _ = conn.execute(end_tx, ()).await;
                     }
 
@@ -800,7 +801,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         }
                     }
 
-                    if gen_bool(&mut rng, 0.01 / stress_counter.incomplete_threads() as f64) {
+                    if rng.random_ratio(1, 100 * stress_counter.incomplete_threads() as u32) {
                         reopen_requested.store(true, Ordering::Release);
                     }
                     if reopen_requested.load(Ordering::Acquire) {

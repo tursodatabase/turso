@@ -181,15 +181,16 @@ dependencies = [
 
 [[package]]
 name = "antithesis_sdk"
-version = "0.2.5"
+version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "201eba73b76341631014baf9c0018e703af204a1e0f15d7664d8a0947f6be74d"
+checksum = "08410fcac93669a476c006cd6c4512ac1e2b30fd117231a5d55d8a2c76599b82"
 dependencies = [
  "libc",
  "libloading 0.8.6",
  "linkme",
  "once_cell",
  "rand 0.8.6",
+ "rand_core 0.9.3",
  "rustc_version_runtime",
  "serde",
  "serde_json",

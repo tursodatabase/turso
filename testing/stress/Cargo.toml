@@ -38,7 +38,7 @@ turso_macros = { workspace = true }
 rusqlite = { workspace = true }
 
 [target.'cfg(antithesis)'.dependencies]
-antithesis_sdk = { workspace = true, features = ["full"] }
+antithesis_sdk = { workspace = true, features = ["full", "rand_v0_9"] }
 serde_json = { workspace = true }
 
 [target.'cfg(shuttle)'.dependencies]
