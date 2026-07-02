@@ -2332,7 +2332,11 @@ mod tests {
             .unwrap();
 
         let page_size: usize = 1024;
-        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let buffer_pool = BufferPool::begin_init(
+            &io,
+            BufferPool::TEST_ARENA_SIZE,
+            crate::alloc::DynAllocator::default(),
+        );
         buffer_pool
             .finalize_with_page_size(page_size)
             .expect("initialize buffer pool");
