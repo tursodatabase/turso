@@ -51,6 +51,14 @@ do_execsql_test_on_specific_db {:memory:} drop-virtual-table {
     DROP TABLE t;
 } {}
 
+do_execsql_test_on_specific_db {:memory:} insert-multi-row-values-into-vtab {
+    CREATE VIRTUAL TABLE v USING kv_store;
+    INSERT INTO v(key, value) VALUES ('k1', 'v1'), ('k2', 'v2'), ('k3', 'v3');
+    SELECT key, value FROM v ORDER BY key;
+} {k1|v1
+k2|v2
+k3|v3}
+
 do_execsql_test_in_memory_error_content drop-virtual-table-twice {
     CREATE VIRTUAL TABLE t USING kv_store;
     INSERT INTO t VALUES ('hello', 'world');
