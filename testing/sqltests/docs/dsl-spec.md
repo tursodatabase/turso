@@ -120,6 +120,22 @@ setup <name> {
 }
 ```
 
+Block contents also support a small macro preprocessor for generated SQL and
+expectations:
+
+```sql
+test expr-depth {
+    SELECT 1{{repeat:expr_depth_limit-1: OR 1}};
+}
+expect error {
+    Parse error: Expression tree is too large \(maximum depth {{expr_depth_limit}}\)
+}
+```
+
+- `{{expr_depth_limit}}` expands to `turso_parser::MAX_EXPR_DEPTH`
+- `{{repeat:<count-expr>:<text>}}` repeats `<text>` `count-expr` times
+- `count-expr` may be an integer literal or `expr_depth_limit` with `+N` / `-N`
+
 ### Rules
 
 1. Setup names must be unique within a file
