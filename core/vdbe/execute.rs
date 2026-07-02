@@ -5891,11 +5891,6 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
 /// - **ArrayAgg/Mode/PercentileCont/PercentileDisc**: buffer every input value by growing the
 ///   payload `Vec` (one push per row); the leading slots hold a running count and, for the
 ///   ordered-set aggregates, the collation / percentile fraction to use at finalize time.
-///
-/// The payload is passed as the growable `crate::alloc::Vec<Value>` (the same type
-/// `payload_vec_mut()` returns) rather than a slice, so the buffering aggregates above can push;
-/// the fixed-size aggregates only index the leading slots and never grow it. Using the crate's
-/// `alloc::Vec` alias keeps the signature correct under the nightly `TursoAllocator` cfg.
 fn update_agg_payload(
     func: &AggFunc,
     arg: &Value, // read-only; the buffering aggregates and Min/Max keep an owned copy (they clone)
