@@ -192,10 +192,6 @@ name = "count_benchmark"
 harness = false
 
 [[bench]]
-name = "correlated_subquery_benchmark"
-harness = false
-
-[[bench]]
 name = "mvcc_benchmark"
 harness = false
 
