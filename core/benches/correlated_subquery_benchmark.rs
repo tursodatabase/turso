@@ -75,7 +75,6 @@ fn drain_turso(db: &Database, stmt: &mut turso_core::Statement) {
     stmt.reset().unwrap();
 }
 
-#[turso_macros::codspeed_criterion_benchmark]
 fn bench_correlated(criterion: &mut Criterion) {
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
     let mut group = criterion.benchmark_group("correlated_subquery");
