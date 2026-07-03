@@ -3426,7 +3426,7 @@ fn test_checkpoint_post_durable_failure_then_unique_update_removes_stale_autoind
             CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
             LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
         )]);
-        checkpoint_conn.set_failure_injector(Some(failure_injector.clone()));
+        checkpoint_conn.set_failure_injector(Some(failure_injector));
         checkpoint_conn
             .execute("PRAGMA wal_checkpoint(TRUNCATE)")
             .expect_err("checkpoint should fail after pager commit");
@@ -3481,7 +3481,7 @@ fn test_checkpoint_post_durable_failure_then_delete_removes_stale_table_row() {
             CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
             LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
         )]);
-        checkpoint_conn.set_failure_injector(Some(failure_injector.clone()));
+        checkpoint_conn.set_failure_injector(Some(failure_injector));
         checkpoint_conn
             .execute("PRAGMA wal_checkpoint(TRUNCATE)")
             .expect_err("checkpoint should fail after pager commit");
