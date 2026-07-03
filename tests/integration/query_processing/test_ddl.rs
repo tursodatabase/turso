@@ -1,4 +1,92 @@
+use std::sync::Arc;
+
 use crate::common::{ExecRows, TempDatabase};
+use crate::queued_io::QueuedIo;
+use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, StepResult};
+
+fn open_queued_conn(io: Arc<QueuedIo>, path: &str) -> anyhow::Result<Arc<Connection>> {
+    let db =
+        Database::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None)?;
+    Ok(db.connect()?)
+}
+
+fn collect_rows(stmt: &mut turso_core::Statement) -> anyhow::Result<Vec<(i64, i64)>> {
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::IO => stmt._io().step()?,
+            StepResult::Yield => {}
+            StepResult::Row => {
+                let row = stmt.row().expect("row should be available after Row");
+                rows.push((row.get::<i64>(0)?, row.get::<i64>(1)?));
+            }
+            StepResult::Done => return Ok(rows),
+            StepResult::Interrupt | StepResult::Busy => {
+                anyhow::bail!("unexpected non-progress result while draining statement")
+            }
+        }
+    }
+}
+
+/// SQLite's OP_Destroy refuses to free a root page while any other statement
+/// is active on the connection (SQLITE_LOCKED "database table is locked"),
+/// because active cursors may hold references to pages that DROP TABLE would
+/// send to the freelist for reuse. A SELECT parked at its first I/O yield must
+/// therefore block DROP TABLE, and resume against intact table pages instead
+/// of a recycled root page.
+///
+/// Reference behavior verified against SQLite via rusqlite: with a stepped,
+/// unfinished SELECT on the same connection, DROP TABLE fails with
+/// SQLITE_LOCKED "database table is locked" while CREATE TABLE and INSERT
+/// still succeed, and DROP TABLE succeeds once the reader finishes.
+#[test]
+fn active_table_seek_after_drop_reuse_must_not_use_recycled_root_page() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let dir = tempfile::TempDir::new()?;
+    let path = dir.path().join("table-interior-drop-reuse.db");
+    let path = path.to_str().unwrap();
+    let conn = open_queued_conn(io, path)?;
+
+    conn.execute("PRAGMA page_size=512")?;
+    conn.execute("PRAGMA cache_size=9")?;
+    conn.execute("PRAGMA cache_spill=ON")?;
+    conn.execute("PRAGMA journal_mode='wal'")?;
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, b BLOB)")?;
+
+    for id in 1..=32 {
+        conn.execute(format!("INSERT INTO u VALUES({id}, zeroblob(60))"))?;
+    }
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let mut select = conn.prepare("SELECT id, length(b) FROM u WHERE id = 16")?;
+    match select.step()? {
+        StepResult::IO => select._io().step()?,
+        other => anyhow::bail!("SELECT did not yield at the root-page read: {other:?}"),
+    }
+
+    let err = conn
+        .execute("DROP TABLE u")
+        .expect_err("DROP TABLE must fail while a statement is active on the connection");
+    assert!(
+        matches!(err, turso_core::LimboError::TableLocked),
+        "expected TableLocked, got {err:?}"
+    );
+    conn.execute("CREATE TABLE reuse(id INTEGER PRIMARY KEY, b BLOB)")?;
+    conn.execute("INSERT INTO reuse VALUES(16, zeroblob(5000))")?;
+
+    let rows = collect_rows(&mut select)?;
+    assert_eq!(rows, vec![(16, 60)]);
+
+    conn.execute("DROP TABLE u")?;
+    let remaining: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name");
+    assert_eq!(remaining, vec![("reuse".to_string(),)]);
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+
+    Ok(())
+}
 
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
 fn test_fail_drop_indexed_column(tmp_db: TempDatabase) -> anyhow::Result<()> {

@@ -11397,6 +11397,17 @@ pub fn op_destroy(
     loop {
         match state.active_op_state.destroy() {
             OpDestroyState::CreateCursor => {
+                // Like SQLite's OP_Destroy, refuse to free a root page while any other
+                // statement is active on this connection: active cursors may still
+                // reference pages that would go to the freelist and be recycled.
+                if program
+                    .connection
+                    .n_active_root_statements
+                    .load(Ordering::SeqCst)
+                    > 1
+                {
+                    return Err(LimboError::TableLocked);
+                }
                 // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
                 // table btree cursor for both.
                 let cursor = BTreeCursor::new(destroy_pager.clone(), *root, 0);
