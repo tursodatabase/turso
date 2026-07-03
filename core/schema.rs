@@ -2705,48 +2705,48 @@ pub enum ColumnLayout {
 }
 
 impl ColumnLayout {
-    pub fn from_table(table: &Table) -> Self {
+    pub fn from_table(table: &Table) -> Result<Self, TryReserveError> {
         match table {
             Table::BTree(btree) => Self::from_btree(btree),
-            Table::Virtual(vtable) => Self::Identity {
+            Table::Virtual(vtable) => Ok(Self::Identity {
                 column_count: vtable.as_ref().columns.len(),
-            },
-            Table::FromClauseSubquery(subquery) => Self::Identity {
+            }),
+            Table::FromClauseSubquery(subquery) => Ok(Self::Identity {
                 column_count: subquery.columns.len(),
-            },
+            }),
         }
     }
 
-    pub fn from_btree(btree: &BTreeTable) -> Self {
+    pub fn from_btree(btree: &BTreeTable) -> Result<Self, TryReserveError> {
         let total = btree.columns.len();
         let non_virtual_col_count = btree
             .columns
             .iter()
             .filter(|c| !c.is_virtual_generated())
             .count();
-        let offsets = btree.logical_to_physical_map.clone();
+        let offsets = btree.logical_to_physical_map.try_clone()?;
         let is_identity = non_virtual_col_count == total && offsets.iter().copied().eq(0..total);
         if is_identity {
-            Self::Identity {
+            Ok(Self::Identity {
                 column_count: total,
-            }
+            })
         } else {
-            Self::Mapped {
+            Ok(Self::Mapped {
                 offsets,
                 non_virtual_col_count,
-            }
+            })
         }
     }
 
-    pub fn from_columns(columns: &[Column]) -> Self {
+    pub fn from_columns(columns: &[Column]) -> Result<Self, TryReserveError> {
         let total = columns.len();
         let non_virtual_col_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
         if non_virtual_col_count == total {
-            return Self::Identity {
+            return Ok(Self::Identity {
                 column_count: total,
-            };
+            });
         }
-        let mut offsets = vec![0usize; total];
+        let mut offsets = try_vec![0usize; total]?;
         let mut nv_idx = 0;
         let mut v_idx = non_virtual_col_count;
         for (i, col) in columns.iter().enumerate() {
@@ -2758,10 +2758,10 @@ impl ColumnLayout {
                 nv_idx += 1;
             }
         }
-        Self::Mapped {
+        Ok(Self::Mapped {
             offsets,
             non_virtual_col_count,
-        }
+        })
     }
 
     /// Map a schema column index to its register offset.
@@ -3349,7 +3349,7 @@ impl BTreeTable {
     }
 
     /// Build a `ColumnLayout` for this table's register mapping.
-    pub fn column_layout(&self) -> ColumnLayout {
+    pub fn column_layout(&self) -> Result<ColumnLayout, TryReserveError> {
         ColumnLayout::from_btree(self)
     }
 

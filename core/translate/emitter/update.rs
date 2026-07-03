@@ -1241,7 +1241,7 @@ fn emit_update_insns<'a>(
     };
     let table_name = target_table.table.get_name();
     let start = if is_virtual_table { beg + 2 } else { beg + 1 };
-    let layout = ColumnLayout::from_table(&target_table.as_ref().table);
+    let layout = ColumnLayout::from_table(&target_table.as_ref().table)?;
     let affected_columns = match target_table.table.btree() {
         Some(btree) => btree.columns_affected_by_update(&updated_column_indices)?,
         None => updated_column_indices.clone(),

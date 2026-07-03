@@ -490,7 +490,7 @@ pub fn emit_upsert(
         target_pc: ctx.loop_labels.row_done,
     });
     let num_cols = ctx.table.columns().len();
-    let layout = ctx.table.column_layout();
+    let layout = ctx.table.column_layout()?;
 
     let table_ref_id = table_references
         .joined_tables()

@@ -586,7 +586,7 @@ pub fn stabilize_new_row_for_fk(
         return Ok(());
     }
 
-    let layout = table_btree.column_layout();
+    let layout = table_btree.column_layout()?;
     for (pk_name, _) in &table_btree.primary_key_columns {
         let (pos, col) = table_btree
             .get_column(pk_name)
@@ -668,7 +668,7 @@ pub fn emit_parent_index_key_change_checks(
     }
 
     let idx_len = index.columns.len();
-    let layout = table_btree.column_layout();
+    let layout = table_btree.column_layout()?;
     let some_idx_columns_are_virtual = index
         .columns
         .iter()
@@ -2145,7 +2145,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                                 &parent_bt,
                                 parent_cols,
                                 replace_values_start,
-                                &ColumnLayout::from_btree(&parent_bt),
+                                &ColumnLayout::from_btree(&parent_bt)?,
                                 replace_rowid_reg,
                                 new_key_start,
                             )?;
@@ -2292,7 +2292,7 @@ pub fn fire_fk_update_actions(
     let old_image_layout = ColumnLayout::Identity {
         column_count: parent_bt.columns().len(),
     };
-    let new_image_layout = ColumnLayout::from_btree(&parent_bt);
+    let new_image_layout = ColumnLayout::from_btree(&parent_bt)?;
 
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(parent_table_name)
