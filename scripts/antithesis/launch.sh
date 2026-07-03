@@ -9,10 +9,6 @@ else
   TEST_TYPE="scheduled test"
 fi
 
-# Decide who receives the test report. NOTIFY_EVERYONE adds the shared recipient
-# list and NOTIFY_EMAIL adds a single custom address; when both are set the two
-# are combined into the semicolon-delimited list the API expects. When neither is
-# set the report is not emailed, so ad-hoc runs stay quiet by default.
 RECIPIENTS=""
 if [ "$NOTIFY_EVERYONE" = "true" ] && [ -n "$ANTITHESIS_EMAIL" ]; then
   RECIPIENTS="$ANTITHESIS_EMAIL"
