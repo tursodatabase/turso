@@ -3988,11 +3988,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         connection: &Arc<Connection>,
         table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
-    ) {
+    ) -> Result<()> {
         connection.with_schema_mut(|schema| {
             Self::rehydrate_table_valued_functions(schema, table_valued_functions);
-        });
+        })?;
         *connection.db.schema.lock() = connection.schema.read().clone();
+        Ok(())
     }
 
     /// Creates a new database whose skiplists allocate through `alloc`.
@@ -4363,7 +4364,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
                 BootstrapState::PreReparse { tvfs, reparse_st } => {
                     return_if_io!(bootstrap_conn.reparse_schema_nonblock(reparse_st));
-                    self.rehydrate_connection_table_valued_functions(bootstrap_conn, tvfs);
+                    self.rehydrate_connection_table_valued_functions(bootstrap_conn, tvfs)?;
                     // pre_metadata done. Decide whether metadata bootstrap IO is needed.
                     if !self.uses_durable_mvcc_metadata(bootstrap_conn) {
                         self.bootstrap_map_root_pages(bootstrap_conn)?;
@@ -7728,11 +7729,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     );
                     connection.with_schema_mut(|schema| {
                         schema.dropped_root_pages = dropped_root_pages;
-                    });
+                    })?;
                     if let Some(header) = self.global_header.read().as_ref() {
                         connection.with_schema_mut(|schema| {
                             schema.schema_version = header.schema_cookie.get();
-                        });
+                        })?;
                     }
                     *connection.db.schema.lock() = connection.schema.read().clone();
                     self.clock.reset(max_commit_ts_seen + 1);

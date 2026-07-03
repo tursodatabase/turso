@@ -1459,7 +1459,7 @@ impl Database {
                     // internally, so we can't use get_mut here.
                     //
                     // it's not ideal but correctness is OK - before prepare connection call maybe_update_schema and in case of divergence update schema ref from the db + we always check connection cookie in the VDBE program itself
-                    let schema = Arc::make_mut(&mut **guard);
+                    let schema = Schema::try_make_mut(&mut **guard)?;
                     schema.schema_version = header_schema_cookie;
 
                     state.phase = OpenDbAsyncPhase::LoadingSchema;
@@ -1485,7 +1485,7 @@ impl Database {
                     // so, we can't use get_mut here for now
                     //
                     // it's not ideal but correctness is OK - before prepare connection call maybe_update_schema and in case of divergence update schema ref from the db + we always check connection cookie in the VDBE program itself
-                    let schema = Arc::make_mut(&mut **guard);
+                    let schema = Schema::try_make_mut(&mut **guard)?;
 
                     let result = schema.make_from_btree(
                         &mut state.make_from_btree_state,
@@ -2845,8 +2845,12 @@ impl Database {
     #[inline]
     pub(crate) fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> Result<T>) -> Result<T> {
         let mut schema_ref = self.schema.lock();
-        let schema = Arc::make_mut(&mut *schema_ref);
+        let schema = Schema::try_make_mut(&mut *schema_ref)?;
         f(schema)
+    }
+
+    pub(crate) fn replace_schema(&self, schema: Arc<Schema>) {
+        *self.schema.lock() = schema;
     }
 
     /// Register an `InternalVirtualTable` into this database's catalog. The

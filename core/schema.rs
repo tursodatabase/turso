@@ -157,7 +157,6 @@ use bitflags::bitflags;
 use core::fmt;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::VecDeque;
-use std::ops::Deref;
 use std::sync::OnceLock;
 use tracing::trace;
 use turso_parser::ast::{
@@ -2627,71 +2626,160 @@ crate::alloc::impl_try_clone_via_clone!(
 // fallible impls when their fields become allocator-aware.
 crate::alloc::impl_try_clone_via_clone!(Column, IndexColumn, CheckConstraint);
 
-impl Clone for Schema {
-    /// Cloning a `Schema` requires deep cloning of all internal tables and indexes, even though they are wrapped in `Arc`.
+impl Schema {
+    pub(crate) fn try_make_mut(schema: &mut Arc<Self>) -> Result<&mut Self, TryReserveError> {
+        if Arc::get_mut(schema).is_none() {
+            *schema = Arc::new(schema.as_ref().try_clone()?);
+        }
+        Ok(Arc::get_mut(schema).expect("schema was made unique above"))
+    }
+}
+
+impl TryClone for View {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: self.name.clone(),
+            sql: self.sql.clone(),
+            select_stmt: self.select_stmt.clone(),
+            columns: self.columns.try_clone()?,
+            state: AtomicViewState::new(ViewState::Ready),
+        })
+    }
+}
+
+impl TryClone for VirtualTable {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: self.name.clone(),
+            columns: self.columns.try_clone()?,
+            kind: self.kind,
+            vtab_type: self.vtab_type.clone(),
+            vtab_id: self.vtab_id,
+            innocuous: self.innocuous,
+        })
+    }
+}
+
+impl TryClone for BTreeTable {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            root_page: self.root_page,
+            name: self.name.clone(),
+            primary_key_columns: self.primary_key_columns.try_clone()?,
+            columns: self.columns.try_clone()?,
+            has_rowid: self.has_rowid,
+            is_strict: self.is_strict,
+            has_autoincrement: self.has_autoincrement,
+            unique_sets: self.unique_sets.try_clone()?,
+            foreign_keys: self.foreign_keys.try_clone()?,
+            check_constraints: self.check_constraints.try_clone()?,
+            rowid_alias_conflict_clause: self.rowid_alias_conflict_clause,
+            has_virtual_columns: self.has_virtual_columns,
+            logical_to_physical_map: self.logical_to_physical_map.try_clone()?,
+            column_dependencies: Default::default(),
+        })
+    }
+}
+
+impl TryClone for FromClauseSubquery {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: self.name.clone(),
+            plan: self.plan.clone(),
+            columns: self.columns.try_clone()?,
+            result_columns_start_reg: self.result_columns_start_reg,
+            materialized_cursor_id: self.materialized_cursor_id,
+            cte: self.cte,
+        })
+    }
+}
+
+impl TryClone for Table {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(match self {
+            Table::BTree(table) => Table::BTree(Arc::new(table.as_ref().try_clone()?)),
+            Table::Virtual(table) => Table::Virtual(Arc::new(table.as_ref().try_clone()?)),
+            Table::FromClauseSubquery(from_clause_subquery) => {
+                Table::FromClauseSubquery(Arc::new(from_clause_subquery.as_ref().try_clone()?))
+            }
+        })
+    }
+}
+
+impl TryClone for Index {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: self.name.clone(),
+            table_name: self.table_name.clone(),
+            root_page: self.root_page,
+            columns: self.columns.try_clone()?,
+            unique: self.unique,
+            ephemeral: self.ephemeral,
+            has_rowid: self.has_rowid,
+            where_clause: self.where_clause.clone(),
+            index_method: self.index_method.clone(),
+            on_conflict: self.on_conflict,
+        })
+    }
+}
+
+impl TryClone for Schema {
+    /// Copying a `Schema` requires deep cloning of all internal tables and indexes, even though they are wrapped in `Arc`.
     /// Simply copying the `Arc` pointers would result in multiple `Schema` instances sharing the same underlying tables and indexes,
     /// which could lead to panics or data races if any instance attempts to modify them.
     /// To ensure each `Schema` is independent and safe to modify, we clone the underlying data for all tables and indexes.
-    fn clone(&self) -> Self {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
         let tables = self
             .tables
             .iter()
-            .map(|(name, table)| match table.deref() {
-                Table::BTree(table) => {
-                    let table = Arc::deref(table);
-                    (
-                        name.clone(),
-                        Arc::new(Table::BTree(Arc::new(table.clone()))),
-                    )
-                }
-                Table::Virtual(table) => {
-                    let table = Arc::deref(table);
-                    (
-                        name.clone(),
-                        Arc::new(Table::Virtual(Arc::new(table.clone()))),
-                    )
-                }
-                Table::FromClauseSubquery(from_clause_subquery) => (
-                    name.clone(),
-                    Arc::new(Table::FromClauseSubquery(Arc::new(
-                        (**from_clause_subquery).clone(),
-                    ))),
-                ),
+            .map(|(name, table)| {
+                Ok::<_, TryReserveError>((name.clone(), Arc::new(table.as_ref().try_clone()?)))
             })
-            .try_collect()
-            .expect("TODO: Clone is supposed to be fallible");
+            .try_collect::<Result<_, TryReserveError>>()??;
         let indexes = self
             .indexes
             .iter()
             .map(|(name, indexes)| {
                 let indexes = indexes
                     .iter()
-                    .map(|index| Arc::new((**index).clone()))
-                    .try_collect()?;
-                Ok::<_, LimboError>((name.clone(), indexes))
+                    .map(|index| index.as_ref().try_clone().map(Arc::new))
+                    .try_collect::<Result<VecDeque<_>, TryReserveError>>()??;
+                Ok::<_, TryReserveError>((name.clone(), indexes))
             })
-            .try_collect::<Result<_>>()
-            .expect("TODO: Clone is supposed to be fallible")
-            .unwrap();
-        let materialized_view_names = self.materialized_view_names.clone();
-        let materialized_view_sql = self.materialized_view_sql.clone();
+            .try_collect::<Result<_, TryReserveError>>()??;
+        let materialized_view_names = self.materialized_view_names.try_clone()?;
+        let materialized_view_sql = self.materialized_view_sql.try_clone()?;
         let incremental_views = self
             .incremental_views
             .iter()
             .map(|(name, view)| (name.clone(), view.clone()))
-            .try_collect()
-            .expect("TODO: Clone is supposed to be fallible");
+            .try_collect()?;
         let views = self
             .views
             .iter()
-            .map(|(name, view)| (name.clone(), Arc::new((**view).clone())))
-            .try_collect()
-            .expect("TODO: Clone is supposed to be fallible");
+            .map(|(name, view)| {
+                Ok::<_, TryReserveError>((name.clone(), Arc::new(view.as_ref().try_clone()?)))
+            })
+            .try_collect::<Result<_, TryReserveError>>()??;
         let triggers = self
             .triggers
             .iter()
             .map(|(table_name, triggers)| {
-                Ok::<_, LimboError>((
+                Ok::<_, TryReserveError>((
                     table_name.clone(),
                     triggers
                         .iter()
@@ -2699,31 +2787,29 @@ impl Clone for Schema {
                         .try_collect()?,
                 ))
             })
-            .try_collect::<Result<_>>()
-            .expect("TODO: Clone is supposed to be fallible")
-            .unwrap();
-        let incompatible_views = self.incompatible_views.clone();
-        Self {
+            .try_collect::<Result<_, TryReserveError>>()??;
+        let incompatible_views = self.incompatible_views.try_clone()?;
+        Ok(Self {
             tables,
             #[cfg(feature = "conn_raw_api")]
-            table_names_by_root_page: self.table_names_by_root_page.clone(),
+            table_names_by_root_page: self.table_names_by_root_page.try_clone()?,
             materialized_view_names,
             materialized_view_sql,
             incremental_views,
             views,
             triggers,
             indexes,
-            has_indexes: self.has_indexes.clone(),
+            has_indexes: self.has_indexes.try_clone()?,
             schema_version: self.schema_version,
             analyze_stats: self.analyze_stats.clone(),
-            table_to_materialized_views: self.table_to_materialized_views.clone(),
+            table_to_materialized_views: self.table_to_materialized_views.try_clone()?,
             incompatible_views,
-            broken_views: self.broken_views.clone(),
-            dropped_root_pages: self.dropped_root_pages.clone(),
-            type_registry: self.type_registry.clone(),
+            broken_views: self.broken_views.try_clone()?,
+            dropped_root_pages: self.dropped_root_pages.try_clone()?,
+            type_registry: self.type_registry.try_clone()?,
             generated_columns_enabled: self.generated_columns_enabled,
-            sequences: self.sequences.clone(),
-        }
+            sequences: self.sequences.try_clone()?,
+        })
     }
 }
 

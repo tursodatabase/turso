@@ -1,3 +1,4 @@
+use crate::alloc::TryClone;
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
@@ -1333,8 +1334,9 @@ impl Connection {
         // But in this occasion it will always reprepare, and we get an error. So we trick the statement by swapping our schema
         // with a new clean schema that has the same header cookie.
         self.with_schema_mut(|schema| {
-            *schema = fresh.clone();
-        });
+            *schema = fresh.try_clone()?;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
 
         let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
 
@@ -1423,8 +1425,9 @@ impl Connection {
                             let work = inner.fresh.sequence_backing_table_names();
                             if !work.is_empty() {
                                 self.with_schema_mut(|schema| {
-                                    *schema = inner.fresh.clone();
-                                });
+                                    *schema = inner.fresh.try_clone()?;
+                                    Ok::<_, crate::alloc::TryReserveError>(())
+                                })??;
                             }
                             *pending = Some(work);
                         }
@@ -1502,8 +1505,9 @@ impl Connection {
                     {
                         // Temporarily install the schema so we can query against it.
                         self.with_schema_mut(|schema| {
-                            *schema = inner.fresh.clone();
-                        });
+                            *schema = inner.fresh.try_clone()?;
+                            Ok::<_, crate::alloc::TryReserveError>(())
+                        })??;
                         let stmt = self.prepare_internal(format!(
                             "SELECT name, sql FROM {}",
                             crate::schema::TURSO_TYPES_TABLE_NAME
@@ -1563,7 +1567,7 @@ impl Connection {
                     );
                     self.with_schema_mut(|schema| {
                         *schema = fresh;
-                    });
+                    })?;
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -2284,12 +2288,10 @@ impl Connection {
         }
 
         let schema = self.schema.read().clone();
-        self.db
-            .with_schema_mut(|current| {
-                *current = schema.as_ref().clone();
-                Ok(())
-            })
-            .expect("external restore schema replacement should be infallible");
+        self.db.with_schema_mut(|current| {
+            *current = schema.as_ref().try_clone()?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -2688,7 +2690,7 @@ impl Connection {
                 Err(e) => return Err(e),
             }
             Ok(())
-        })
+        })?
     }
 
     // Clearly there is something to improve here, Vec<Vec<Value>> isn't a couple of tea
@@ -2867,10 +2869,10 @@ impl Connection {
     }
 
     #[inline]
-    pub fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> T) -> T {
+    pub fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> T) -> Result<T> {
         let mut schema_ref = self.schema.write();
-        let schema = Arc::make_mut(&mut *schema_ref);
-        f(schema)
+        let schema = Schema::try_make_mut(&mut *schema_ref)?;
+        Ok(f(schema))
     }
 
     /// Mutate the schema for a specific database (main or attached).
@@ -2878,7 +2880,7 @@ impl Connection {
         &self,
         database_id: usize,
         f: impl FnOnce(&mut Schema) -> T,
-    ) -> T {
+    ) -> Result<T> {
         match database_id {
             crate::MAIN_DB_ID => self.with_schema_mut(f),
             crate::TEMP_DB_ID => {
@@ -2890,10 +2892,10 @@ impl Connection {
                     .as_ref()
                     .expect("temp database should be initialized before schema mutation");
                 let mut schema_guard = temp_db.db.schema.lock();
-                let schema = Arc::make_mut(&mut schema_guard);
+                let schema = Schema::try_make_mut(&mut schema_guard)?;
                 let result = f(schema);
                 self.bump_prepare_context_generation();
-                result
+                Ok(result)
             }
             _ => {
                 // For attached databases, update a connection-local copy of the schema.
@@ -2910,10 +2912,10 @@ impl Connection {
                     let schema = db.schema.lock().clone();
                     schema
                 });
-                let schema = Arc::make_mut(schema_arc);
+                let schema = Schema::try_make_mut(schema_arc)?;
                 let result = f(schema);
                 self.bump_prepare_context_generation();
-                result
+                Ok(result)
             }
         }
     }
@@ -3828,7 +3830,7 @@ impl Connection {
                         schema
                             .sequences
                             .insert(normalized.clone(), Arc::new(sequence));
-                    });
+                    })?;
                     *idx += 1;
                     *stmt = None;
                     *meta = None;

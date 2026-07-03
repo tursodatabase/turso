@@ -495,7 +495,7 @@ pub fn op_drop_index(
             schema.dropped_root_pages.insert(index.root_page);
         }
         schema.remove_index(index);
-    });
+    })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -11565,7 +11565,7 @@ pub fn op_drop_table(
             schema.remove_indices_for_table(table_name);
             schema.remove_triggers_for_table(table_name);
             schema.remove_table(table_name);
-        });
+        })?;
         // SQLite also removes temp triggers that target the dropped table.
         // Only needed when dropping from a non-temp database. We must
         // scope the removal to triggers whose `target_database_id`
@@ -11575,7 +11575,7 @@ pub fn op_drop_table(
             let dropped_db = *db;
             conn.with_database_schema_mut(crate::TEMP_DB_ID, |temp_schema| {
                 temp_schema.remove_triggers_for_table_with_db(table_name, dropped_db);
-            });
+            })?;
         }
     }
     state.pc += 1;
@@ -11593,7 +11593,7 @@ pub fn op_drop_view(
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_view(view_name).ok();
         schema.broken_views.remove(view_name);
-    });
+    })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -11608,7 +11608,6 @@ pub fn op_drop_type(
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_type(type_name);
-        Ok::<(), crate::LimboError>(())
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -11645,7 +11644,7 @@ pub fn op_add_sequence(
         schema
             .sequences
             .insert(crate::util::normalize_ident(name), std::sync::Arc::new(seq));
-    });
+    })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -11660,7 +11659,7 @@ pub fn op_drop_sequence(
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_sequence(seq_name);
-    });
+    })?;
     // Drop this connection's stale currval. Otherwise a same-session
     // DROP SEQUENCE + CREATE SEQUENCE <same name> would let currval()
     // return the prior sequence's last value instead of erroring with
@@ -11680,7 +11679,7 @@ pub fn op_add_type(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(AddType { db, sql }, insn);
     let conn = program.connection.clone();
-    conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql))?;
+    conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql))??;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -12294,7 +12293,7 @@ pub fn op_drop_trigger(
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_trigger(trigger_name).ok();
-    });
+    })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -12522,7 +12521,7 @@ fn op_parse_schema_step(
                 let table_name = row.get::<&str>(2)?;
                 let root_page = row.get::<i64>(3)?;
                 let sql = row.get::<&str>(4).ok();
-                let schema = Arc::make_mut(&mut inner.schema_arc);
+                let schema = Schema::try_make_mut(&mut inner.schema_arc)?;
                 let syms = conn.syms.read();
                 let attached_resolver = |alias: &str| -> Option<usize> {
                     conn.attached_databases()
@@ -12563,7 +12562,7 @@ fn op_parse_schema_step(
                     .parse_schema()
                     .take()
                     .expect("parse schema state should exist");
-                let schema = Arc::make_mut(&mut schema_arc);
+                let schema = Schema::try_make_mut(&mut schema_arc)?;
                 let mv_store = stmt.mv_store();
                 let syms = conn.syms.read();
 
@@ -13057,9 +13056,9 @@ pub fn op_set_cookie(
                     // snapshot on the connection. Flag that it needs updating.
                     program.connection.mark_temp_schema_did_change();
                 }
-                program
-                    .connection
-                    .with_database_schema_mut(*db, |schema| schema.schema_version = *value as u32);
+                program.connection.with_database_schema_mut(*db, |schema| {
+                    schema.schema_version = *value as u32
+                })?;
                 header.schema_cookie = (*value as u32).into();
             }
         };
@@ -14001,9 +14000,9 @@ fn with_relevant_trigger_schemas_mut(
     table_db_id: usize,
     mut f: impl FnMut(&mut Schema) -> crate::Result<()>,
 ) -> crate::Result<()> {
-    conn.with_database_schema_mut(table_db_id, |schema| f(schema))?;
+    conn.with_database_schema_mut(table_db_id, |schema| f(schema))??;
     if table_db_id != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
-        conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| f(schema))?;
+        conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| f(schema))??;
     }
     Ok(())
 }
@@ -14207,7 +14206,7 @@ pub fn op_rename_table(
         }
 
         Ok(())
-    })?;
+    })??;
 
     if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
         conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| -> crate::Result<()> {
@@ -14221,7 +14220,7 @@ pub fn op_rename_table(
                 }
             }
             Ok(())
-        })?;
+        })??;
     }
 
     state.pc += 1;
@@ -14285,7 +14284,7 @@ pub fn op_drop_column(
 
         btree.shift_generated_column_indices_after_drop(*column_index)?;
         Ok(())
-    })?;
+    })??;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
         if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
@@ -14334,7 +14333,7 @@ pub fn op_drop_column(
             }
         }
         Ok(())
-    })?;
+    })??;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
         for (view_name, view) in schema.views.iter() {
@@ -14397,7 +14396,7 @@ pub fn op_add_column(
         // Resolve generated column expressions and update virtual column metadata
         btree.prepare_generated_columns()?;
         Ok(())
-    })?;
+    })??;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -14634,7 +14633,7 @@ pub fn op_alter_column(
             }
         }
         Ok(())
-    })?;
+    })??;
 
     if *rename {
         // Update in-memory trigger objects for the renamed column in both the
@@ -14663,7 +14662,7 @@ pub fn op_alter_column(
                     view.columns = rewritten.columns;
                 }
                 Ok(())
-            })?;
+            })??;
         }
 
         if *db != crate::MAIN_DB_ID {
