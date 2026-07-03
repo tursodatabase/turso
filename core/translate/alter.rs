@@ -2581,11 +2581,29 @@ fn rewrite_trigger_sql_for_column_rename(
     let old_col_norm = normalize_ident(old_column_name);
     let new_col_norm = normalize_ident(new_column_name);
 
-    // Get the trigger's owning table to check unqualified column references
+    // Get the trigger's owning table to check unqualified column references.
+    //
+    // The owning table does not necessarily live in the schema that stores
+    // the trigger: TEMP triggers may target tables in other databases
+    // (`CREATE TEMP TRIGGER trg ... ON t` where `t` is in `main`). An
+    // explicit qualifier (`ON main.t`) names the database directly; an
+    // unqualified name resolves temp-first with fallback to main, matching
+    // `table_reference_exists_after_rename`. See issue #7733.
     let trigger_table_name_raw = tbl_name.name.as_str();
     let trigger_table_name = normalize_ident(trigger_table_name_raw);
+    let trigger_table_database_id = if tbl_name.db_name.is_some() {
+        resolver.resolve_database_id(&tbl_name)?
+    } else if trigger_database_id == crate::TEMP_DB_ID
+        && resolver.with_schema(crate::TEMP_DB_ID, |schema| {
+            schema.get_btree_table(&trigger_table_name).is_none()
+        })
+    {
+        crate::MAIN_DB_ID
+    } else {
+        trigger_database_id
+    };
     let trigger_table = resolver
-        .with_schema(trigger_database_id, |schema| {
+        .with_schema(trigger_table_database_id, |schema| {
             schema.get_btree_table(&trigger_table_name)
         })
         .ok_or_else(|| {
@@ -2606,7 +2624,25 @@ fn rewrite_trigger_sql_for_column_rename(
         )));
     }
 
-    // Rewrite UPDATE OF column list if renaming a column in the trigger's owning table
+    // The trigger's owning table shares the ALTER target's name but lives in a
+    // different database (e.g. a TEMP table shadowing a main table of the same
+    // name). The trigger's NEW/OLD references and unqualified body references
+    // bind to its own table — not the renamed one — so the rename must leave
+    // the trigger untouched, matching SQLite. Returning early here also keeps
+    // the invariant relied on by the downstream rewrite/validation helpers
+    // (`apply_expr_for_column_rename` etc.), which compare the trigger table
+    // against the target by name only: past this point, a name match implies
+    // the trigger's owning table IS the altered table.
+    //
+    // Known limitation: SQLite still rewrites explicitly db-qualified body
+    // references (`SELECT a FROM main.t` in a temp trigger on the shadow);
+    // our rewrite machinery matches table references by name only and cannot
+    // distinguish those, so they are skipped along with the rest.
+    if trigger_table_name == target_table_name && trigger_table_database_id != target_database_id {
+        return Ok(trigger_sql.to_string());
+    }
+
+    // Rewrite UPDATE OF column list if renaming a column in the trigger's owning table.
     let is_renaming_trigger_table = trigger_table_name == target_table_name;
     let new_event = if is_renaming_trigger_table {
         match event {
@@ -2753,10 +2789,35 @@ fn rewrite_trigger_sql_for_column_rename(
             temporary,
             Some(target_database_id),
         );
+        // Pick the table shape to validate the rewritten trigger against:
+        //
+        // - Renaming a column of a TEMP table: SQLite refuses the rename when
+        //   a temp trigger references the column via NEW/OLD, reporting
+        //   "no such column: NEW.<new_name>" — i.e. the rewritten trigger is
+        //   checked against the PRE-rename table. Keep that quirk-for-quirk.
+        // - Renaming a column of a main/attached table (case C, issue #7733):
+        //   SQLite accepts the rename and rewrites the temp trigger, so the
+        //   rewritten trigger (which now references the new column name) must
+        //   be validated against the POST-rename table shape.
+        let validation_table = if target_database_id == crate::TEMP_DB_ID {
+            trigger_table.as_ref().clone()
+        } else {
+            let mut post_rename_table = trigger_table.as_ref().clone();
+            for column in post_rename_table.columns_mut().iter_mut() {
+                if column
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| normalize_ident(name) == old_col_norm)
+                {
+                    column.name = Some(new_col_norm.clone());
+                }
+            }
+            post_rename_table
+        };
         if let Some(bad_column) = validate_trigger_columns_after_drop(
             &rewritten_trigger,
             &target_table_name,
-            trigger_table.as_ref(),
+            &validation_table,
             resolver,
             trigger_database_id,
             target_database_id,
@@ -3950,13 +4011,32 @@ fn validate_trigger_columns_after_drop(
     altered_database_id: usize,
 ) -> Result<Option<String>> {
     let trigger_table_norm = normalize_ident(&trigger.table_name);
-    let allow_bare_owning_columns =
-        trigger_database_id == altered_database_id && trigger_table_norm == *altered_table_norm;
+    // Resolve the database that holds the trigger's owning table. It is not
+    // necessarily the schema that stores the trigger: TEMP triggers may
+    // target tables in other databases (issue #7733). Honor an explicitly
+    // recorded target database; otherwise resolve unqualified names
+    // temp-first with fallback to main, matching `get_table_columns`.
+    let trigger_table_database_id = match trigger.target_database_id {
+        Some(crate::INVALID_DB_ID) => None,
+        Some(db) => Some(db),
+        None => Some(
+            if trigger_database_id == crate::TEMP_DB_ID
+                && resolver.with_schema(crate::TEMP_DB_ID, |s| {
+                    s.get_table(&trigger_table_norm).is_none()
+                })
+            {
+                crate::MAIN_DB_ID
+            } else {
+                trigger_database_id
+            },
+        ),
+    };
+    let owning_is_altered_table = trigger_table_database_id == Some(altered_database_id)
+        && trigger_table_norm == *altered_table_norm;
+    let allow_bare_owning_columns = owning_is_altered_table;
 
     // Determine the trigger's owning table columns (post-drop if it's the altered table)
-    let owning_table_columns: Option<Vec<String>> = if trigger_database_id == altered_database_id
-        && trigger_table_norm == *altered_table_norm
-    {
+    let owning_table_columns: Option<Vec<String>> = if owning_is_altered_table {
         Some(
             post_drop_table
                 .columns()
@@ -3965,13 +4045,15 @@ fn validate_trigger_columns_after_drop(
                 .collect(),
         )
     } else {
-        resolver.with_schema(trigger_database_id, |s| {
-            s.get_table(&trigger_table_norm).and_then(|t| {
-                t.btree().map(|bt| {
-                    bt.columns()
-                        .iter()
-                        .filter_map(|c| c.name.as_deref().map(normalize_ident))
-                        .collect()
+        trigger_table_database_id.and_then(|db| {
+            resolver.with_schema(db, |s| {
+                s.get_table(&trigger_table_norm).and_then(|t| {
+                    t.btree().map(|bt| {
+                        bt.columns()
+                            .iter()
+                            .filter_map(|c| c.name.as_deref().map(normalize_ident))
+                            .collect()
+                    })
                 })
             })
         })
