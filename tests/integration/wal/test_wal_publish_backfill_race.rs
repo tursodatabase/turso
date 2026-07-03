@@ -3,15 +3,9 @@ use std::sync::Arc;
 use turso_core::vdbe::StepResult;
 use turso_core::{Connection, Database, Result};
 
-/// Step a statement to completion, pumping the queued IO.
-fn step_blocking(stmt: &mut turso_core::Statement) -> Result<StepResult> {
-    loop {
-        match stmt.step()? {
-            StepResult::IO => stmt._io().step()?,
-            StepResult::Yield => continue,
-            other => return Ok(other),
-        }
-    }
+fn exec(conn: &Arc<Connection>, sql: &str) -> Result<()> {
+    let mut stmt = conn.prepare(sql)?;
+    finish(&mut stmt)
 }
 
 fn exec_ints(conn: &Arc<Connection>, sql: &str) -> Result<Vec<i64>> {
@@ -36,284 +30,156 @@ fn exec_ints(conn: &Arc<Connection>, sql: &str) -> Result<Vec<i64>> {
     Ok(out)
 }
 
-fn exec(conn: &Arc<Connection>, sql: &str) -> Result<()> {
-    let mut stmt = conn.prepare(sql)?;
-    match step_blocking(&mut stmt)? {
-        StepResult::Done | StepResult::Row => Ok(()),
-        r => panic!("unexpected step result for `{sql}`: {r:?}"),
-    }
-}
-
-/// Rows in the first committed batch; enough that the auto-checkpoint
-/// threshold (1000 frames) is crossed during the second batch's commit.
-const BATCH1: usize = 500;
-const BATCH2: usize = 600;
-
-struct Setup {
-    _io: Arc<QueuedIo>,
-    db: Arc<Database>,
-    a: Arc<Connection>,
-    b: Arc<Connection>,
-    /// A's parked COMMIT statement (auto-checkpoint in progress), plus the
-    /// number of IO pumps consumed before parking.
-    commit_stmt: turso_core::Statement,
-    /// B's parked SELECT statement holding a read mark, if still open.
-    reader_stmt: Option<turso_core::Statement>,
-    a_done: bool,
-}
-
-/// Build the scenario and park A's COMMIT after `park` IO pumps.
-///
-/// Timeline reproduced (all single-threaded, deterministic):
-///   1. A commits BATCH1 rows (WAL grows, no checkpoint yet).
-///   2. B parks a `SELECT` mid-scan: it holds a read mark at the current
-///      WAL frame count M1.
-///   3. A runs one big transaction of BATCH2 rows. Its COMMIT crosses the
-///      auto-checkpoint threshold. commit_tx releases A's read+write locks
-///      BEFORE running the checkpoint (pager.rs commit_tx), and because B's
-///      read mark caps mxSafeFrame at M1 < max, the backfill is PARTIAL, so
-///      the WAL layer drops the checkpoint guard at its Finalize step while
-///      the pager still has SyncDbFile/ReadDbIdentity/PublishBackfill(M1)
-///      pending. Parking the COMMIT statement in that window leaves the
-///      checkpoint suspended with a pending stale `publish_backfill(M1)`
-///      and NO locks held.
-fn setup(park: usize) -> Setup {
-    let io = Arc::new(QueuedIo::new());
-    let db = Database::open_file(io.clone(), "publish-backfill-race.db").unwrap();
-    let a = db.connect().unwrap();
-    let b = db.connect().unwrap();
-
-    exec(&a, "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)").unwrap();
-    exec(&a, "BEGIN").unwrap();
-    for i in 0..BATCH1 {
-        exec(&a, &format!("INSERT INTO t VALUES ({i}, zeroblob(3000))")).unwrap();
-    }
-    exec(&a, "COMMIT").unwrap();
-
-    // B parks a scan, pinning a read mark at the current WAL tip.
-    let mut reader = b.prepare("SELECT id FROM t").unwrap();
-    loop {
-        match reader.step().unwrap() {
-            StepResult::IO => reader._io().step().unwrap(),
-            StepResult::Yield => continue,
-            StepResult::Row => break,
-            r => panic!("unexpected step result while parking reader: {r:?}"),
-        }
-    }
-
-    // A's big transaction; its COMMIT triggers the auto-checkpoint.
-    exec(&a, "BEGIN").unwrap();
-    for i in 0..BATCH2 {
-        exec(
-            &a,
-            &format!("INSERT INTO t VALUES ({}, zeroblob(3000))", BATCH1 + i),
-        )
-        .unwrap();
-    }
-    let mut commit_stmt = a.prepare("COMMIT").unwrap();
-    let mut pumps = 0;
-    let mut a_done = false;
+/// Step a statement to completion, pumping the queued IO.
+fn finish(stmt: &mut turso_core::Statement) -> Result<()> {
     let mut guard = 0;
     loop {
         guard += 1;
-        assert!(guard < 10_000_000, "commit statement seems stuck");
-        match commit_stmt.step().unwrap() {
-            StepResult::IO => {
-                if pumps >= park {
-                    break;
-                }
-                pumps += 1;
-                commit_stmt._io().step().unwrap();
-            }
-            StepResult::Row => {}
-            StepResult::Yield => {}
-            StepResult::Done => {
-                a_done = true;
-                break;
-            }
-            r => panic!("unexpected step result: {r:?}"),
-        }
-    }
-
-    Setup {
-        _io: io,
-        db,
-        a,
-        b,
-        commit_stmt,
-        reader_stmt: Some(reader),
-        a_done,
-    }
-}
-
-fn finish(stmt: &mut turso_core::Statement) {
-    let mut guard = 0;
-    loop {
-        guard += 1;
-        assert!(guard < 10_000_000, "statement seems stuck");
-        match stmt.step().unwrap() {
-            StepResult::IO => stmt._io().step().unwrap(),
-            StepResult::Row => {}
-            StepResult::Yield => {}
-            StepResult::Done => break,
+        assert!(guard < 1_000_000, "statement seems stuck");
+        match stmt.step()? {
+            StepResult::IO => stmt._io().step()?,
+            StepResult::Row | StepResult::Yield => {}
+            StepResult::Done => return Ok(()),
             r => panic!("unexpected step result: {r:?}"),
         }
     }
 }
 
-/// Reproducer: a parked auto-checkpoint publishes a stale backfill count
-/// into a restarted WAL generation, hiding committed rows (and, once later
-/// writers build on the stale view and the WAL is recovered, corrupting the
-/// B-tree — the `PageType::TableLeaf` assert in `cell_table_leaf_read_rowid`
-/// seen on Antithesis under `turso_stress`).
+/// Reproducer for the WAL bug behind the Antithesis
+/// `matches!(page_type(), Ok(PageType::TableLeaf))` assert in
+/// `cell_table_leaf_read_rowid` (`stress/singleton_driver_stress.sh`).
 ///
-/// See `setup` for the parked state. While A's COMMIT statement is parked
-/// inside its auto-checkpoint tail (no locks held, `publish_backfill(M1)`
-/// pending), B:
-///   1. finishes its parked scan (releases the read mark),
-///   2. runs `PRAGMA wal_checkpoint` — full backfill, publishes
-///      nbackfills == max_frame,
-///   3. INSERTs — the write path restarts the WAL (legal: fully
-///      backfilled, no locks held); frames renumber from 1,
-///   4. INSERTs more rows — new-generation commits.
-/// Then A's COMMIT is resumed: its checkpoint blindly stores the OLD
-/// generation's backfill count M1 into the NEW generation's `nbackfills`
-/// (`publish_backfill` has no monotonicity/generation guard), leaving
-/// nbackfills >> max_frame. Every later reader computes
-/// min_frame = nbackfills+1 and finds no WAL frame, so B's committed
-/// new-generation rows vanish.
+/// A partially backfilled checkpoint drops the checkpoint guard at the
+/// WAL-level Finalize step (core/storage/wal.rs, `!should_truncate()`
+/// branch) but publishes `nbackfills` only later, from the pager phases
+/// `SyncDbFile -> ReadDbIdentity -> PublishBackfill`, which yield on IO in
+/// between. `publish_backfill` is a blind store with no monotonicity or
+/// generation check. So:
 ///
-/// The parking spot is swept from the end of the COMMIT's IO yields.
+///   1. B parks a `SELECT` mid-scan: it holds a read mark at WAL frame M1.
+///   2. A commits a few more rows (max_frame M2 > M1) and runs
+///      `PRAGMA wal_checkpoint`. B's read mark caps mxSafeFrame at M1, the
+///      backfill is partial, the guard is dropped early, and we park A's
+///      statement at the next IO yield: `publish_backfill(M1)` is now
+///      pending and A holds NO locks (the checkpoint pragma runs with
+///      `TransactionMode::None`).
+///   3. B finishes its scan, runs a full `PRAGMA wal_checkpoint`
+///      (nbackfills == max_frame), INSERTs — the write path legally
+///      RESTARTS the WAL (frames renumber from 1) — and commits more rows
+///      into the new generation.
+///   4. A's parked statement resumes and stores the OLD generation's
+///      backfill count M1 into the NEW generation: nbackfills > max_frame.
+///
+/// Every later reader computes min_frame = nbackfills + 1 and finds no WAL
+/// frame in range, so B's committed new-generation rows vanish; writes
+/// building on the stale view then diverge from the invisible-but-durable
+/// frames, and WAL recovery merges both histories into b-tree corruption —
+/// which is how the stress workload trips the page-type assert.
+///
+/// Single-threaded and deterministic: QueuedIo defers every IO completion,
+/// so each IO yield of A's checkpoint statement is an external pause point;
+/// the test parks at each yield in turn until the vulnerable one is hit.
 #[test]
 fn wal_stale_publish_backfill_hides_committed_rows() {
-    // Count yields with an explicit dry run.
-    let total_yields = {
+    'sweep: for park in 0.. {
         let io = Arc::new(QueuedIo::new());
-        let db = Database::open_file(io.clone(), "publish-backfill-race-dry.db").unwrap();
+        let db = Database::open_file(io.clone(), "publish-backfill-race.db").unwrap();
         let a = db.connect().unwrap();
         let b = db.connect().unwrap();
-        exec(&a, "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)").unwrap();
-        exec(&a, "BEGIN").unwrap();
-        for i in 0..BATCH1 {
-            exec(&a, &format!("INSERT INTO t VALUES ({i}, zeroblob(3000))")).unwrap();
+
+        exec(&a, "CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
+        // Autocommit inserts: each is its own commit, so the WAL tip (and
+        // with it the stale value the parked checkpoint will publish) sits
+        // comfortably above anything B commits after the restart below.
+        for i in 0..24 {
+            exec(&a, &format!("INSERT INTO t VALUES ({i})")).unwrap();
         }
-        exec(&a, "COMMIT").unwrap();
+
+        // B parks a scan, pinning a read mark at the current WAL tip (M1).
         let mut reader = b.prepare("SELECT id FROM t").unwrap();
         loop {
             match reader.step().unwrap() {
                 StepResult::IO => reader._io().step().unwrap(),
                 StepResult::Yield => continue,
                 StepResult::Row => break,
-                r => panic!("unexpected: {r:?}"),
+                r => panic!("unexpected step result while parking reader: {r:?}"),
             }
         }
-        exec(&a, "BEGIN").unwrap();
-        for i in 0..BATCH2 {
-            exec(
-                &a,
-                &format!("INSERT INTO t VALUES ({}, zeroblob(3000))", BATCH1 + i),
-            )
-            .unwrap();
+
+        // Grow the WAL past B's mark so A's checkpoint is PARTIAL.
+        for i in 24..28 {
+            exec(&a, &format!("INSERT INTO t VALUES ({i})")).unwrap();
         }
-        let mut commit_stmt = a.prepare("COMMIT").unwrap();
-        let mut pumps = 0usize;
+
+        // Drive A's checkpoint, parking after `park` IO pump steps.
+        let mut ckpt = a.prepare("PRAGMA wal_checkpoint").unwrap();
+        let mut pumps = 0;
         loop {
-            match commit_stmt.step().unwrap() {
+            match ckpt.step().unwrap() {
                 StepResult::IO => {
+                    if pumps >= park {
+                        break; // parked mid-checkpoint
+                    }
                     pumps += 1;
-                    commit_stmt._io().step().unwrap();
+                    ckpt._io().step().unwrap();
                 }
                 StepResult::Row | StepResult::Yield => {}
-                StepResult::Done => break,
-                r => panic!("unexpected: {r:?}"),
+                // Swept past the checkpoint's last IO yield without ever
+                // reproducing: the bug is fixed.
+                StepResult::Done => return,
+                r => panic!("unexpected step result: {r:?}"),
             }
         }
-        pumps
-    };
-    // Sweep the last few parking spots (the checkpoint tail).
-    let from = total_yields.saturating_sub(8);
-    for park in (from..total_yields).rev() {
-        let mut s = setup(park);
-        if s.a_done {
-            continue;
-        }
 
-        // B releases its read mark.
-        drop(s.reader_stmt.take());
-
-        // B: full checkpoint, then writes that restart the WAL and commit
-        // into the new generation.
-        let ck = exec_ints(&s.b, "PRAGMA wal_checkpoint").unwrap();
+        // B: release the read mark, fully backfill, then write — which
+        // restarts the WAL — and commit into the new generation.
+        drop(reader);
+        let ck = exec_ints(&b, "PRAGMA wal_checkpoint").unwrap();
         if ck.first().copied() != Some(0) {
             // A still holds the checkpoint guard at this parking spot.
-            finish(&mut s.commit_stmt);
-            continue;
+            finish(&mut ckpt).unwrap();
+            continue 'sweep;
         }
-        exec(&s.b, "INSERT INTO t VALUES (1000001, zeroblob(3000))").unwrap();
-        exec(&s.b, "INSERT INTO t VALUES (1000002, zeroblob(3000))").unwrap();
-        exec(&s.b, "INSERT INTO t VALUES (1000003, zeroblob(3000))").unwrap();
-
-        // Resume A's parked COMMIT: its checkpoint publishes the stale
-        // backfill count into the restarted WAL generation.
-        finish(&mut s.commit_stmt);
-
-        // Oracle 1: B's committed rows must be visible.
-        let got = exec_ints(&s.b, "SELECT id FROM t WHERE id >= 1000000 ORDER BY id").unwrap();
-        let visible = got == vec![1000001, 1000002, 1000003];
-        if visible {
-            // This parking spot did not hit the window; try the next one.
-            continue;
+        for id in [9001, 9002, 9003] {
+            exec(&b, &format!("INSERT INTO t VALUES ({id})")).unwrap();
         }
 
-        // Bug detected: B's committed rows are gone. Demonstrate the
-        // follow-on corruption that surfaces as the
-        // `matches!(page_type(), Ok(PageType::TableLeaf))` assert /
-        // integrity check failures in the stress runs: keep writing on the
-        // stale view (a duplicate of an invisible-but-committed PRIMARY KEY
-        // succeeds!), then reopen so WAL recovery replays both divergent
-        // histories.
-        let dup = exec(&s.b, "INSERT INTO t VALUES (1000001, zeroblob(10))");
-        let integrity_after_reopen = {
-            let Setup {
-                _io: io,
-                db,
-                a,
-                b,
-                commit_stmt,
-                reader_stmt,
-                ..
-            } = s;
-            drop(commit_stmt);
-            drop(reader_stmt);
-            drop(a);
-            drop(b);
-            drop(db);
-            turso_core::clear_database_registry();
-            let db2 = Database::open_file(io, "publish-backfill-race.db").unwrap();
-            let c = db2.connect().unwrap();
-            let mut stmt = c.prepare("PRAGMA integrity_check").unwrap();
-            let mut msgs = Vec::new();
-            loop {
-                match stmt.step().unwrap() {
-                    StepResult::IO => stmt._io().step().unwrap(),
-                    StepResult::Yield => continue,
-                    StepResult::Row => {
-                        let row = stmt.row().unwrap();
-                        msgs.push(format!("{:?}", row.get_values().collect::<Vec<_>>()));
-                    }
-                    StepResult::Done => break,
-                    r => panic!("unexpected: {r:?}"),
-                }
-            }
-            msgs
-        };
+        // Resume A's parked checkpoint: it publishes the stale backfill
+        // count into the restarted WAL generation.
+        finish(&mut ckpt).unwrap();
+        drop(ckpt);
+
+        // Oracle: B's committed rows must be visible.
+        let got = exec_ints(&b, "SELECT id FROM t WHERE id >= 9000").unwrap();
+        if got == [9001, 9002, 9003] {
+            continue 'sweep; // this parking spot missed the window
+        }
+
+        // Bug hit. Two more user-visible consequences:
+        //  - a duplicate of an invisible-but-committed PRIMARY KEY is
+        //    accepted, and its page image is built on the stale view (a
+        //    leaf without 9001..9003);
+        //  - reopen + WAL recovery replays both divergent histories, and
+        //    the stale-view frame wins: 9002 and 9003 are permanently
+        //    destroyed even though their transactions committed. With
+        //    larger trees this same merge yields structural b-tree
+        //    corruption — the shape behind the PageType::TableLeaf assert.
+        let dup = exec(&b, "INSERT INTO t VALUES (9001)");
+        drop(a);
+        drop(b);
+        drop(db);
+        turso_core::clear_database_registry();
+        let db = Database::open_file(io, "publish-backfill-race.db").unwrap();
+        let c = db.connect().unwrap();
+        let after_reopen = exec_ints(&c, "SELECT id FROM t WHERE id >= 9000").unwrap();
 
         panic!(
-            "WAL generation poisoned by stale publish_backfill (COMMIT parked after \
-             {park}/{total_yields} IO pumps):\n\
-             - rows committed by connection B vanished: got {got:?}, expected [1000001, 1000002, 1000003]\n\
-             - re-INSERT of invisible committed PRIMARY KEY 1000001: {dup:?} (should be constraint error)\n\
-             - integrity_check after reopen+recovery: {integrity_after_reopen:?}"
+            "WAL generation poisoned by stale publish_backfill (checkpoint parked after \
+             {park} IO pumps):\n\
+             - rows committed by connection B vanished: got {got:?}, expected [9001, 9002, 9003]\n\
+             - re-INSERT of invisible committed PRIMARY KEY 9001: {dup:?} (expected constraint error)\n\
+             - after reopen + WAL recovery: {after_reopen:?} — committed rows 9002/9003 were \
+             permanently destroyed by the stale-view write"
         );
     }
 }
