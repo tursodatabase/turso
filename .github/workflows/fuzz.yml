@@ -118,6 +118,12 @@ jobs:
         RUST_BACKTRACE: "full"
         RUSTFLAGS: "--cfg=shuttle"
       run: cargo test -p turso_stress --locked --test shuttle_mvcc
+    - name: Run shuttle phantom-page reproducer (WAL frame-cache aliasing, PR #7658)
+      env:
+        RUST_BACKTRACE: "full"
+        RUSTFLAGS: "--cfg=shuttle"
+        PHANTOM_SCHEDULES: "500"
+      run: cargo test -p turso_stress --locked --test shuttle_phantom_page
     - name: Run shuttle stress test
       env:
         RUST_BACKTRACE: 1
