@@ -1365,6 +1365,128 @@ test json_valid_no_args {
 expect error {
 }
 
+# Single-arg json_valid validates strict RFC-8259: JSON5 input reports 0
+# even though every other JSON function accepts it (issue #7650).
+test json_valid_json5_array_trailing_comma {
+    SELECT json_valid('[1,2,]');
+}
+expect {
+    0
+}
+
+test json_valid_json5_object_trailing_comma {
+    SELECT json_valid('{"a":1,}');
+}
+expect {
+    0
+}
+
+test json_valid_json5_unquoted_key {
+    SELECT json_valid('{a:1}');
+}
+expect {
+    0
+}
+
+test json_valid_json5_line_comment {
+    SELECT json_valid('[1,2]//c');
+}
+expect {
+    0
+}
+
+test json_valid_json5_block_comment {
+    SELECT json_valid('/*c*/1');
+}
+expect {
+    0
+}
+
+test json_valid_json5_single_quoted_string {
+    SELECT json_valid('[''abc'']');
+}
+expect {
+    0
+}
+
+test json_valid_json5_hex_number {
+    SELECT json_valid('0x1A');
+}
+expect {
+    0
+}
+
+test json_valid_json5_leading_plus {
+    SELECT json_valid('+5');
+}
+expect {
+    0
+}
+
+test json_valid_json5_leading_dot {
+    SELECT json_valid('.5');
+}
+expect {
+    0
+}
+
+test json_valid_json5_trailing_dot {
+    SELECT json_valid('5.');
+}
+expect {
+    0
+}
+
+test json_valid_json5_infinity {
+    SELECT json_valid('Infinity'), json_valid('-Infinity'), json_valid('NaN');
+}
+expect {
+    0|0|0
+}
+
+test json_valid_json5_escape {
+    SELECT json_valid('["a\x41b"]');
+}
+expect {
+    0
+}
+
+test json_valid_json5_text_blob {
+    SELECT json_valid(CAST('{a:1}' AS BLOB));
+}
+expect {
+    0
+}
+
+test json_valid_strict_still_valid {
+    SELECT json_valid('{"a":1}'), json_valid(' [1,2] '), json_valid('9e999'), json_valid('"abc"');
+}
+expect {
+    1|1|1|1
+}
+
+test json_valid_strict_text_blob {
+    SELECT json_valid(CAST('{"a":1}' AS BLOB));
+}
+expect {
+    1
+}
+
+test json_valid_of_json_function_output {
+    SELECT json_valid(json('{a:1}'));
+}
+expect {
+    1
+}
+
+# JSON5 must remain accepted by the other JSON functions.
+test json_still_accepts_json5 {
+    SELECT json('{a:1, b: 0x1A, c: [1,2,]}');
+}
+expect {
+    {"a":1,"b":26,"c":[1,2]}
+}
+
 test json-patch-basic-1 {
     select json_patch('{"a":1}', '{"b":2}');
 }

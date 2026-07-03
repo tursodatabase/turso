@@ -176,16 +176,28 @@ const fn make_character_type_ok_table() -> [u8; 256] {
 
 static CHARACTER_TYPE_OK: [u8; 256] = make_character_type_ok_table();
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Jsonb {
     data: ValueBlob,
+    has_json5: bool,
 }
 
 impl TryClone for Jsonb {
     type Error = TryReserveError;
 
     fn try_clone(&self) -> std::result::Result<Self, Self::Error> {
-        Self::from_raw_data(&self.data)
+        let mut cloned = Self::from_raw_data(&self.data)?;
+        cloned.has_json5 = self.has_json5;
+        Ok(cloned)
+    }
+}
+
+/// Two JSONB values are equal when their encoded bytes match. The `has_json5`
+/// flag records how a value was parsed, not what it holds, so it is left out of
+/// equality on purpose.
+impl PartialEq for Jsonb {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
     }
 }
 
@@ -920,6 +932,7 @@ impl Jsonb {
     pub fn empty() -> Self {
         Self {
             data: <ValueBlob as TursoAllocExt>::new(),
+            has_json5: false,
         }
     }
 
@@ -927,7 +940,14 @@ impl Jsonb {
     pub fn new(capacity: usize) -> std::result::Result<Self, TryReserveError> {
         Ok(Self {
             data: <ValueBlob as TursoTryWithCapacityExt>::try_with_capacity_ext(capacity)?,
+            has_json5: false,
         })
+    }
+
+    /// Whether the JSON text this value was deserialized from used any JSON5
+    /// constructs. Always false for values built from raw JSONB bytes.
+    pub fn has_json5(&self) -> bool {
+        self.has_json5
     }
 
     pub fn len(&self) -> usize {
@@ -1551,6 +1571,12 @@ impl Jsonb {
         cursor
     }
 
+    fn skip_whitespace_and_flag_json5(&mut self, input: &[u8], pos: usize) -> usize {
+        let (pos, saw_comment) = skip_whitespace(input, pos);
+        self.has_json5 |= saw_comment;
+        pos
+    }
+
     fn deserialize_value(&mut self, input: &[u8], mut pos: usize, depth: usize) -> PResult<usize> {
         if depth > MAX_JSON_DEPTH {
             return Err(PError::Message {
@@ -1559,7 +1585,7 @@ impl Jsonb {
             });
         }
 
-        pos = skip_whitespace(input, pos);
+        pos = self.skip_whitespace_and_flag_json5(input, pos);
         if pos >= input.len() {
             return Err(PError::Message {
                 msg: "Unexpected end of input".to_string(),
@@ -1634,7 +1660,7 @@ impl Jsonb {
         let mut first = true;
 
         loop {
-            pos = skip_whitespace(input, pos);
+            pos = self.skip_whitespace_and_flag_json5(input, pos);
             if pos >= input.len() {
                 return Err(PError::Message {
                     msg: "Unexpected end of input".to_string(),
@@ -1659,7 +1685,7 @@ impl Jsonb {
                 }
                 b',' if !first => {
                     pos += 1; // consume ','
-                    pos = skip_whitespace(input, pos);
+                    pos = self.skip_whitespace_and_flag_json5(input, pos);
                     if pos >= input.len() {
                         return Err(PError::Message {
                             msg: "Unexpected end of input after comma in object".to_string(),
@@ -1672,12 +1698,16 @@ impl Jsonb {
                             location: Some(pos),
                         });
                     }
+                    if input[pos] == b'}' {
+                        // Trailing comma is JSON5
+                        self.has_json5 = true;
+                    }
                 }
                 _ => {
                     // Parse key (must be string)
                     pos = self.deserialize_string(input, pos)?;
 
-                    pos = skip_whitespace(input, pos);
+                    pos = self.skip_whitespace_and_flag_json5(input, pos);
                     if pos >= input.len() || input[pos] != b':' {
                         return Err(PError::Message {
                             msg: "Expected : after object key".to_string(),
@@ -1686,11 +1716,11 @@ impl Jsonb {
                     }
                     pos += 1; // consume ':'
 
-                    pos = skip_whitespace(input, pos);
+                    pos = self.skip_whitespace_and_flag_json5(input, pos);
 
                     // Parse value - can be any JSON value including another object
                     pos = self.deserialize_value(input, pos, depth + 1)?;
-                    pos = skip_whitespace(input, pos);
+                    pos = self.skip_whitespace_and_flag_json5(input, pos);
                     if pos < input.len() && !matches!(input[pos], b',' | b'}') {
                         return Err(PError::Message {
                             msg: "Should be , or }}".to_string(),
@@ -1721,7 +1751,7 @@ impl Jsonb {
         let mut first = true;
 
         loop {
-            pos = skip_whitespace(input, pos);
+            pos = self.skip_whitespace_and_flag_json5(input, pos);
             if pos >= input.len() {
                 return Err(PError::Message {
                     msg: "Unexpected end of input".to_string(),
@@ -1746,7 +1776,7 @@ impl Jsonb {
                 }
                 b',' if !first => {
                     pos += 1; // consume ','
-                    pos = skip_whitespace(input, pos);
+                    pos = self.skip_whitespace_and_flag_json5(input, pos);
                     if pos >= input.len() {
                         return Err(PError::Message {
                             msg: "Unexpected end of input after comma".to_string(),
@@ -1759,9 +1789,13 @@ impl Jsonb {
                             location: Some(pos),
                         });
                     }
+                    if input[pos] == b']' {
+                        // Trailing comma is JSON5
+                        self.has_json5 = true;
+                    }
                 }
                 _ => {
-                    pos = skip_whitespace(input, pos);
+                    pos = self.skip_whitespace_and_flag_json5(input, pos);
 
                     // Parse array element
                     pos = self.deserialize_value(input, pos, depth + 1)?;
@@ -1785,6 +1819,10 @@ impl Jsonb {
         pos += 1; // consume quote
 
         let quoted = quote == b'"' || quote == b'\'';
+        if quote != b'"' {
+            // Single-quoted strings and unquoted identifier keys are JSON5
+            self.has_json5 = true;
+        }
         let mut len = 0;
 
         if quoted {
@@ -2013,6 +2051,11 @@ impl Jsonb {
             }
         }
 
+        if element_type == ElementType::TEXT5 {
+            // JSON5-only escape or raw control character in the string
+            self.has_json5 = true;
+        }
+
         // Write final header with correct type and size
         self.write_element_header(string_start, element_type, len, false)
             .map_err(|_| PError::Message {
@@ -2083,6 +2126,7 @@ impl Jsonb {
                     });
                 }
 
+                self.has_json5 = true;
                 self.write_element_header(num_start, ElementType::INT5, len, false)
                     .map_err(|_| PError::Message {
                         msg: "Unexpected input after json".to_string(),
@@ -2124,6 +2168,7 @@ impl Jsonb {
             pos += infinity.len();
 
             // Write Infinity as 9.0e+999
+            self.has_json5 = true;
             self.data.extend_from_slice(b"9.0e+999");
             self.write_element_header(
                 num_start,
@@ -2190,6 +2235,10 @@ impl Jsonb {
                 msg: "Not a digit".to_string(),
                 location: Some(pos),
             });
+        }
+
+        if is_json5 {
+            self.has_json5 = true;
         }
 
         // Determine the appropriate element type
@@ -2276,6 +2325,7 @@ impl Jsonb {
             && (input[pos + 2] == b'n' || input[pos + 2] == b'N')
         {
             pos += 3;
+            self.has_json5 = true;
             self.data.push(ElementType::NULL as u8);
             return Ok(pos);
         }
@@ -2357,7 +2407,7 @@ impl Jsonb {
         pos = result.deserialize_value(input, pos, 0)?;
 
         // Skip any trailing whitespace
-        pos = skip_whitespace(input, pos);
+        pos = result.skip_whitespace_and_flag_json5(input, pos);
 
         // Check for any non-whitespace characters after the JSON value
         if pos < input.len() {
@@ -2387,6 +2437,7 @@ impl Jsonb {
     pub fn from_raw_data(data: &[u8]) -> std::result::Result<Self, TryReserveError> {
         Ok(Self {
             data: value_blob_from_slice(data)?,
+            has_json5: false,
         })
     }
 
@@ -3486,15 +3537,16 @@ pub fn unescape_string(input: &str) -> String {
 }
 
 #[inline]
-pub fn skip_whitespace(input: &[u8], mut pos: usize) -> usize {
+pub fn skip_whitespace(input: &[u8], mut pos: usize) -> (usize, bool) {
     let len = input.len();
+    let mut saw_comment = false;
     if pos >= len {
-        return pos;
+        return (pos, saw_comment);
     }
 
     // Fast path for non-whitespace, non-comment
     if (WS_TABLE[input[pos] as usize] & 1) == 0 && input[pos] != b'/' {
-        return pos;
+        return (pos, saw_comment);
     }
 
     // Process whitespace and comments
@@ -3508,6 +3560,7 @@ pub fn skip_whitespace(input: &[u8], mut pos: usize) -> usize {
             match input[pos + 1] {
                 b'/' => {
                     // Line comment - skip until newline
+                    saw_comment = true;
                     pos += 2;
                     while pos < len && input[pos] != b'\n' {
                         pos += 1;
@@ -3518,6 +3571,7 @@ pub fn skip_whitespace(input: &[u8], mut pos: usize) -> usize {
                 }
                 b'*' => {
                     // Block comment - skip until "*/"
+                    saw_comment = true;
                     pos += 2;
                     while pos + 1 < len {
                         if input[pos] == b'*' && input[pos + 1] == b'/' {
@@ -3538,7 +3592,7 @@ pub fn skip_whitespace(input: &[u8], mut pos: usize) -> usize {
         }
     }
 
-    pos
+    (pos, saw_comment)
 }
 
 #[inline]
@@ -4637,7 +4691,10 @@ mod path_operations_tests {
             0xFB, // ARRAY type (11) with 8-byte payload size marker (15 << 4)
             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // huge payload size
         ];
-        let jsonb = Jsonb { data: malformed };
+        let jsonb = Jsonb {
+            data: malformed,
+            has_json5: false,
+        };
 
         // Should return an error instead of panicking with overflow
         let result = jsonb.array_len();
