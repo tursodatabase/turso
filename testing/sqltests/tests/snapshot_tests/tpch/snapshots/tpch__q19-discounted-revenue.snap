@@ -101,8 +101,8 @@ addr  opcode       p1  p2  p3  p4                                     p5  commen
   48    Gt         59  60  58  Binary                                  0  if r[59]>r[60] goto 58
   49    Column      1   5  64                                          0  r[64]=part.P_SIZE
   50    Gt         64  65  58  Binary                                  0  if r[64]>r[65] goto 58
-  51    Column      1   5  68                                          0  r[68]=part.P_SIZE
-  52    Gt         67  68  58  Binary                                  0  if r[67]>r[68] goto 58
+  51    Column      1   5  67                                          0  r[67]=part.P_SIZE
+  52    Lt         67  68  58  Binary                                  0  if r[67]<r[68] goto 58
   53    Column      0   5  70                                          0  r[70]=lineitem.L_EXTENDEDPRICE
   54    Column      0   6  73                                          0  r[73]=lineitem.L_DISCOUNT
   55    Subtract   72  73  71                                          0  r[71]=r[72]-r[73]
@@ -146,6 +146,6 @@ addr  opcode       p1  p2  p3  p4                                     p5  commen
   93  Integer      10  62   0                                          0  r[62]=10
   94  Add          61  62  60                                          0  r[60]=r[61]+r[62]
   95  Integer      15  65   0                                          0  r[65]=15
-  96  Integer       1  67   0                                          0  r[67]=1
+  96  Integer       1  68   0                                          0  r[68]=1
   97  Integer       1  72   0                                          0  r[72]=1
   98  Goto          0   1   0                                          0
