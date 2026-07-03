@@ -1941,13 +1941,15 @@ impl Connection {
                     header.schema_cookie.get() < version,
                     "cookie can't go back in time"
                 );
-                self.set_tx_state(TransactionState::Write {
-                    schema_did_change: true,
-                });
-                self.with_schema_mut(|schema| schema.schema_version = version);
-                header.schema_cookie = version.into();
+                self.with_schema_mut(|schema| schema.schema_version = version)
+                    .map(|()| {
+                        self.set_tx_state(TransactionState::Write {
+                            schema_did_change: true,
+                        });
+                        header.schema_cookie = version.into();
+                    })
             })
-        })?;
+        })??;
         self.reparse_schema()?;
         Ok(())
     }
@@ -2871,7 +2873,7 @@ impl Connection {
     #[inline]
     pub fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> T) -> Result<T> {
         let mut schema_ref = self.schema.write();
-        let schema = Schema::try_make_mut(&mut *schema_ref)?;
+        let schema = Schema::try_make_mut(&mut schema_ref)?;
         Ok(f(schema))
     }
 

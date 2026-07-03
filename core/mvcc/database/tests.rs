@@ -14940,7 +14940,8 @@ fn test_integrity_check_ignores_dropped_root_that_is_live_after_recovery() {
 
     conn.with_schema_mut(|schema| {
         schema.dropped_root_pages.insert(root_page);
-    });
+    })
+    .unwrap();
 
     let rows = get_rows(&conn, "PRAGMA integrity_check");
     assert_eq!(rows.len(), 1);

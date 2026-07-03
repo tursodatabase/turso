@@ -1269,7 +1269,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // pager commit succeeds because the committed root pages are then visible
         // through WAL even if the later WAL checkpoint/log truncation is busy.
         let mut schema_ref = self.connection.db.schema.lock();
-        let schema = Schema::try_make_mut(&mut *schema_ref)?;
+        let schema = Schema::try_make_mut(&mut schema_ref)?;
         for (name, table) in schema.tables.iter_mut() {
             #[cfg(not(feature = "conn_raw_api"))]
             let _ = name;
