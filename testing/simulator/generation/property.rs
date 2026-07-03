@@ -38,7 +38,10 @@ use crate::{
         metrics::Remaining,
         property::{InteractiveQueryInfo, Property, PropertyDiscriminants},
     },
-    runner::env::SimulatorEnv,
+    runner::{
+        env::SimulatorEnv,
+        execution::{is_recoverable_tx_error, reconcile_recoverable_tx_error},
+    },
 };
 
 type PropertyQueryGenFunc<'a, R, G> =
@@ -1013,8 +1016,21 @@ impl Property {
                                     return Ok(Ok(()));
                                 }
 
-                                // On error we rollback the transaction if there is any active here
-                                env.rollback_conn(connection_index);
+                                if is_recoverable_tx_error(err) {
+                                    // A recoverable concurrency error: reconcile the
+                                    // model with the engine the same way the main
+                                    // execution path does — drop the model's
+                                    // transaction only if the engine rolled back (or
+                                    // we issue the prescribed rollback for a doomed
+                                    // stale-snapshot transaction); leave a still-live
+                                    // transaction intact otherwise.
+                                    reconcile_recoverable_tx_error(env, connection_index, err);
+                                } else {
+                                    // A genuine injected IO fault: the engine discarded
+                                    // the statement (and its autocommit transaction), so
+                                    // discard it from the model too.
+                                    env.rollback_conn(connection_index);
+                                }
                                 Ok(Ok(()))
                             }
                         }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::mem;
 use std::ops::{Deref, DerefMut};
@@ -126,6 +126,15 @@ pub enum TxOperation {
     },
 }
 
+/// Replace all tables belonging to attached database `db` (i.e. named
+/// `"{db}.<table>"`) inside `tables` with the supplied `fresh` set. Used to pin
+/// an attached database's read snapshot lazily on first access within a
+/// transaction.
+fn refresh_db_tables(tables: &mut Vec<Table>, db: &str, fresh: &[Table]) {
+    tables.retain(|t| t.name.split_once('.').map(|(p, _)| p != db).unwrap_or(true));
+    tables.extend(fresh.iter().cloned());
+}
+
 /// Database snapshot
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -137,6 +146,14 @@ pub struct Snapshot {
     savepoints: Vec<ShadowSavepoint>,
 
     transaction_mode: TransactionMode,
+
+    /// Attached databases (by name, e.g. "aux2") whose read snapshot has been
+    /// pinned for this transaction. Unlike the main database — whose snapshot is
+    /// pinned at the transaction's first read — turso (matching SQLite) acquires
+    /// each *attached* database's read snapshot lazily, on first access to that
+    /// database within the transaction. The main database is implicitly always
+    /// pinned (its tables carry no `db.` prefix), so it is never listed here.
+    pinned_dbs: HashSet<String>,
 }
 
 impl Snapshot {
@@ -672,6 +689,70 @@ where
         *self.transaction_tables = Some(TransactionTables::Deferred);
     }
 
+    /// Pin the read snapshot of every *attached* database referenced by `query`
+    /// that has not yet been accessed in this transaction.
+    ///
+    /// The main database is snapshotted eagerly at transaction start (see
+    /// [`Self::create_snapshot`]), which matches turso's per-database strong
+    /// serializability. Attached databases, however, get their read snapshot
+    /// lazily on first access — a row another connection commits to an attached
+    /// database *after* this transaction began is visible on the transaction's
+    /// first read of that attached database (verified against both turso and
+    /// SQLite). To mirror that, we refresh the attached database's tables from
+    /// the latest committed state at the moment it is first touched, and inject
+    /// that freshly-pinned base into any pre-existing savepoints (a savepoint
+    /// rollback releases writes, not the read snapshot, so earlier savepoints
+    /// must also observe the pinned base).
+    pub fn ensure_dbs_pinned(&mut self, query: &Query) {
+        // Only a materialized transaction snapshot has anything to pin; in
+        // autocommit (and in a not-yet-snapshotted deferred transaction) reads
+        // and writes go straight to committed state. Check that before computing
+        // `uses()` so the common autocommit path avoids the allocation.
+        if !matches!(
+            self.transaction_tables,
+            Some(TransactionTables::Snapshot(_))
+        ) {
+            return;
+        }
+        // `uses()` rather than `dependencies()`: it additionally reports the
+        // target of a `CREATE TABLE`, so an attached database is pinned *before*
+        // a freshly created (still uncommitted) table is layered into the
+        // working set — otherwise a later read of a sibling table in the same
+        // attached database would refresh from committed state and drop it.
+        let deps = query.uses();
+        if deps.is_empty() {
+            return;
+        }
+        let committed = &*self.commited_tables;
+        let Some(TransactionTables::Snapshot(snapshot)) = self.transaction_tables.as_mut() else {
+            return;
+        };
+        for dep in &deps {
+            let Some((db, _)) = dep.split_once('.') else {
+                // Unqualified name: belongs to the (already-pinned) main database.
+                continue;
+            };
+            if !snapshot.pinned_dbs.insert(db.to_string()) {
+                // Already pinned earlier in this transaction.
+                continue;
+            }
+            let fresh: Vec<Table> = committed
+                .iter()
+                .filter(|t| {
+                    t.name
+                        .split_once('.')
+                        .map(|(p, _)| p == db)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            refresh_db_tables(&mut snapshot.current_tables, db, &fresh);
+            for savepoint in &mut snapshot.savepoints {
+                refresh_db_tables(&mut savepoint.current_tables, db, &fresh);
+            }
+        }
+    }
+
     #[inline]
     pub fn create_snapshot(&mut self, transaction_mode: TransactionMode) {
         *self.transaction_tables = Some(TransactionTables::Snapshot(Snapshot {
@@ -679,6 +760,7 @@ where
             operations: Vec::new(),
             savepoints: Vec::new(),
             transaction_mode,
+            pinned_dbs: HashSet::new(),
         }));
     }
 
@@ -1027,6 +1109,90 @@ mod tests {
             .expect("outer transaction should remain open")
             .expect_snaphot();
         assert!(snapshot.savepoints.is_empty());
+    }
+
+    /// The main database snapshot is pinned at transaction start, but each
+    /// attached database's snapshot is acquired lazily on first access (matching
+    /// turso/SQLite). Verify the model reflects both behaviors.
+    #[test]
+    fn attached_db_snapshot_is_pinned_lazily_on_first_access() {
+        use crate::model::Query;
+        use sql_generation::model::query::{Select, predicate::Predicate};
+
+        let row = |n: i64| vec![SimValue(turso_core::Value::from_i64(n))];
+        let table = |name: &str, rows: Vec<Vec<SimValue>>| Table {
+            name: name.to_string(),
+            columns: vec![],
+            rows,
+            indexes: vec![],
+        };
+        let select = |t: &str| Query::Select(Select::simple(t.to_string(), Predicate::true_()));
+        let rows_of = |tt: &Option<TransactionTables>, name: &str| -> usize {
+            tt.as_ref()
+                .unwrap()
+                .expect_snaphot()
+                .current_tables
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap()
+                .rows
+                .len()
+        };
+
+        let mut commited_tables = vec![
+            table("main_t", vec![row(1)]),
+            table("aux1.aux_t", vec![row(10)]),
+        ];
+        let mut transaction_tables = None;
+        let mut sequences = Vec::new();
+
+        // Open a read transaction: the main snapshot is taken now.
+        shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        )
+        .create_snapshot(TransactionMode::Read);
+
+        // Another connection commits to both databases after our snapshot began.
+        commited_tables[0].rows.push(row(2)); // main_t
+        commited_tables[1].rows.push(row(20)); // aux1.aux_t
+
+        {
+            let mut tables = shadow_tables_mut(
+                &mut commited_tables,
+                &mut transaction_tables,
+                &mut sequences,
+            );
+            // First access to aux1 pins it now -> observes the just-committed row.
+            tables.ensure_dbs_pinned(&select("aux1.aux_t"));
+            // Touching the main database changes nothing: it was pinned at start.
+            tables.ensure_dbs_pinned(&select("main_t"));
+        }
+        assert_eq!(
+            rows_of(&transaction_tables, "aux1.aux_t"),
+            2,
+            "attached db pinned lazily must observe a commit made before its first access"
+        );
+        assert_eq!(
+            rows_of(&transaction_tables, "main_t"),
+            1,
+            "main db snapshot is pinned at transaction start and must not observe later commits"
+        );
+
+        // A further commit to aux1 after it was pinned must not become visible.
+        commited_tables[1].rows.push(row(30));
+        shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        )
+        .ensure_dbs_pinned(&select("aux1.aux_t"));
+        assert_eq!(
+            rows_of(&transaction_tables, "aux1.aux_t"),
+            2,
+            "once pinned, an attached db must not observe later commits"
+        );
     }
 }
 
