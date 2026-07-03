@@ -12,6 +12,7 @@ mod traits;
 mod vec;
 mod vec_deque;
 
+pub(crate) use traits::impl_try_clone_via_clone;
 #[cfg(nightly)]
 pub use traits::TursoFromIteratorIn;
 pub use traits::{

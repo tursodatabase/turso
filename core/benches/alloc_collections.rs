@@ -30,6 +30,15 @@ struct NonCopyValue {
     payload: [usize; 4],
 }
 
+impl turso_core::alloc::TryClone for NonCopyValue {
+    type Error = std::convert::Infallible;
+
+    #[inline(always)]
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(self.clone())
+    }
+}
+
 impl NonCopyValue {
     fn new(id: usize) -> Self {
         Self {

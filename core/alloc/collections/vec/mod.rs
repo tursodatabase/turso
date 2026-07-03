@@ -100,13 +100,22 @@ impl<T: Clone> TursoSliceExt<T> for [T] {
 }
 
 #[cfg(not(nightly))]
-impl<T: Clone> TryClone for Vec<T> {
+impl<T: TryClone> TryClone for Vec<T>
+where
+    TryReserveError: From<T::Error>,
+{
     type Error = TryReserveError;
 
     #[inline(always)]
     fn try_clone(&self) -> Result<Self, Self::Error> {
+        // Same `TryClone` bound as the nightly impl so code compiles
+        // identically on both cfgs. Elements clone through `TryClone`; on
+        // stable this is Clone-forwarded for std-pinned types anyway.
         let mut cloned = <Self as TursoTryWithCapacityExt>::try_with_capacity_ext(self.len())?;
-        cloned.extend(self.iter().cloned());
+        for item in self {
+            // Capacity reserved above; push cannot allocate.
+            cloned.push(item.try_clone()?);
+        }
         Ok(cloned)
     }
 }

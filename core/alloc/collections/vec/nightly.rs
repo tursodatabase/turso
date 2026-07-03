@@ -114,7 +114,8 @@ impl<T: Clone> TursoSliceExt<T> for [T] {
 
 impl<T, A> TryClone for Vec<T, A>
 where
-    T: Clone,
+    T: TryClone,
+    TryReserveError: From<T::Error>,
     A: Allocator + Clone,
 {
     type Error = TryReserveError;
@@ -122,9 +123,17 @@ where
     #[inline(always)]
     fn try_clone(&self) -> Result<Self, Self::Error> {
         let allocator = self.allocator().clone();
+        // `|_| TryReserveError`: `TryReserveError::from` is ambiguous here
+        // because the `TryReserveError: From<T::Error>` bound adds a second
+        // candidate `From` impl.
         let mut cloned =
-            Self::try_with_capacity_in(self.len(), allocator).map_err(TryReserveError::from)?;
-        cloned.try_spec_extend_ref(self.iter())?;
+            Self::try_with_capacity_in(self.len(), allocator).map_err(|_| TryReserveError)?;
+        for item in self {
+            // Capacity reserved above; push cannot allocate. Elements clone
+            // through `TryClone` so nested allocator-backed allocations fail
+            // with `TryReserveError` instead of aborting.
+            cloned.push(item.try_clone()?);
+        }
         Ok(cloned)
     }
 }
@@ -448,5 +457,40 @@ where
         unsafe {
             self.vec.set_len(self.len);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Element type whose fallible clone always fails: proves `Vec::try_clone`
+    /// clones elements through `TryClone` instead of the infallible `Clone`.
+    #[derive(Clone)]
+    struct FallibleElem;
+
+    impl TryClone for FallibleElem {
+        type Error = TryReserveError;
+
+        fn try_clone(&self) -> Result<Self, Self::Error> {
+            Err(TryReserveError)
+        }
+    }
+
+    #[test]
+    fn vec_try_clone_clones_elements_fallibly() {
+        let mut source: Vec<FallibleElem> = vec();
+        source.try_push(FallibleElem).unwrap();
+        assert!(
+            source.try_clone().is_err(),
+            "Vec::try_clone must clone elements through TryClone"
+        );
+    }
+
+    #[test]
+    fn vec_try_clone_bulk_copies_copy_elements() {
+        let mut source: Vec<u32> = vec();
+        source.try_push(7).unwrap();
+        assert_eq!(source.try_clone().unwrap().as_slice(), &[7]);
     }
 }
