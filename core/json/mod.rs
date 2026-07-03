@@ -831,9 +831,15 @@ where
     json_string_to_db_type(json, ElementType::OBJECT, OutputVariant::Binary)
 }
 
-/// Tries to convert the value to jsonb. Returns Value::from_i64(1) if the conversion
-/// succeeded, and Value::from_i64(0) if it didn't.
+/// Implements single-argument json_valid(X): 1 only if the value converts to
+/// JSONB without using any JSON5 extension, matching SQLite's default flags=1
+/// (strict RFC-8259 text). JSON5 input is well-formed for every other JSON
+/// function but reports 0 here.
 pub fn is_json_valid(json_value: impl AsValueRef) -> Value {
+    fn strict_validity(json: Jsonb) -> Value {
+        Value::from_i64(if json.has_json5() { 0 } else { 1 })
+    }
+
     let json_value = json_value.as_value_ref();
     match json_value {
         ValueRef::Null => Value::Null,
@@ -847,12 +853,12 @@ pub fn is_json_valid(json_value: impl AsValueRef) -> Value {
                 Value::from_i64(0)
             } else {
                 parse_as_json_text(slice, Conv::Strict)
-                    .map(|_| Value::from_i64(1))
+                    .map(strict_validity)
                     .unwrap_or_else(|_| Value::from_i64(0))
             }
         }
         _ => convert_dbtype_to_jsonb(json_value, Conv::Strict)
-            .map(|_| Value::from_i64(1))
+            .map(strict_validity)
             .unwrap_or_else(|_| Value::from_i64(0)),
     }
 }
@@ -958,6 +964,53 @@ mod tests {
         match result {
             Ok(_) => panic!("Expected error for malformed JSON"),
             Err(e) => assert!(e.to_string().contains("malformed JSON")),
+        }
+    }
+
+    #[test]
+    fn test_json_valid_rejects_json5() {
+        for json5 in [
+            "[1,2,]",       // trailing comma, array
+            "{\"a\":1,}",   // trailing comma, object
+            "{a:1}",        // identifier without quotes
+            "[1,2]//c",     // comment
+            "/*c*/1",       // multi-line comment
+            "'abc'",        // single-quoted string
+            "0x1A",         // hex number
+            "+5",           // positive sign
+            ".5",           // leading decimal point
+            "5.",           // trailing decimal point
+            "Infinity",     // Infinity
+            "-Infinity",    // negative Infinity
+            "NaN",          // Not a Number
+            "[\"a\\x41\"]", // JSON5 hex escape (\xHH)
+            "[\"a\tb\"]",   // raw control character (unescaped tab)
+        ] {
+            assert_eq!(
+                is_json_valid(Value::build_text(json5)),
+                Value::from_i64(0),
+                "json_valid({json5:?}) should be 0"
+            );
+        }
+    }
+
+    #[test]
+    fn test_json_valid_accepts_rfc8259() {
+        for strict in [
+            "{\"a\":1}",
+            " [1,2] ",
+            "9e999",
+            "\"abc\"",
+            "null",
+            "true",
+            "-1.5e-3",
+            "{\"a\":[{\"b\":\"c\\u0041\"}]}",
+        ] {
+            assert_eq!(
+                is_json_valid(Value::build_text(strict)),
+                Value::from_i64(1),
+                "json_valid({strict:?}) should be 1"
+            );
         }
     }
 
