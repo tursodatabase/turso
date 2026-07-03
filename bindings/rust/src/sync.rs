@@ -2,7 +2,7 @@ use std::{
     future::Future,
     io::ErrorKind,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -577,12 +577,6 @@ fn normalize_base_url(input: &str) -> std::result::Result<String, String> {
 // The IO worker owns a dedicated Tokio runtime on a separate thread, and processes
 // the SyncEngine IO queue (HTTP and atomic file operations).
 struct IoWorker {
-    // Reference to the sync database to pull IO items from its queue.
-    sync: Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
-    // Normalized base URL (http/https).
-    base_url: Option<String>,
-    // Optional auth token provider (resolved per request).
-    auth_token: Option<AuthTokenFn>,
     // Channel to wake the worker to process IO.
     tx: mpsc::UnboundedSender<()>,
     // Wakers to notify pending futures when IO makes progress.
@@ -597,17 +591,15 @@ impl IoWorker {
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel::<()>();
         let wakers = Arc::new(Mutex::new(Vec::new()));
+        let weak_sync = Arc::downgrade(&sync);
 
         let worker = Arc::new(Self {
-            sync,
-            base_url,
-            auth_token,
             tx,
             wakers: wakers.clone(),
         });
 
-        // Spin a separate Tokio runtime on its own thread to process IO queue.
-        let worker_clone = worker.clone();
+        // Keep the worker thread independent from the handle so dropping the
+        // last Database releases the sync engine immediately on Windows.
         std::thread::Builder::new()
             .name("turso-sync-io".to_string())
             .spawn(move || {
@@ -617,7 +609,7 @@ impl IoWorker {
                     .expect("failed to build IO runtime");
 
                 rt.block_on(async move {
-                    IoWorker::run_loop(worker_clone, rx, wakers).await;
+                    IoWorker::run_loop(weak_sync, base_url, auth_token, rx, wakers).await
                 });
             })
             .expect("failed to spawn IO worker thread");
@@ -637,7 +629,7 @@ impl IoWorker {
     }
 
     // Called from the IO thread once progress has been made to notify all pending futures.
-    fn notify_progress(wakers: &Arc<Mutex<Vec<Waker>>>) {
+    fn notify_progress(wakers: &Mutex<Vec<Waker>>) {
         let wakers = {
             let mut guard = wakers.lock().unwrap();
             std::mem::take(&mut *guard)
@@ -648,7 +640,9 @@ impl IoWorker {
     }
 
     async fn run_loop(
-        this: Arc<IoWorker>,
+        sync: Weak<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
+        base_url: Option<String>,
+        auth_token: Option<AuthTokenFn>,
         mut rx: mpsc::UnboundedReceiver<()>,
         wakers: Arc<Mutex<Vec<Waker>>>,
     ) {
@@ -665,12 +659,15 @@ impl IoWorker {
             Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https);
 
         while rx.recv().await.is_some() {
+            let Some(sync) = sync.upgrade() else {
+                break;
+            };
             // Process all pending items in the sync IO queue.
             let mut made_progress = false;
             loop {
-                let item = this.sync.take_io_item();
+                let item = sync.take_io_item();
                 let Some(item) = item else {
-                    this.sync.step_io_callbacks();
+                    sync.step_io_callbacks();
                     IoWorker::notify_progress(&wakers);
                     break;
                 };
@@ -686,7 +683,10 @@ impl IoWorker {
                         headers,
                     } => {
                         IoWorker::process_http(
-                            &this,
+                            &sync,
+                            base_url.as_deref(),
+                            auth_token.as_ref(),
+                            &wakers,
                             &client,
                             url.as_deref(),
                             method,
@@ -698,12 +698,8 @@ impl IoWorker {
                         .await;
                     }
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullRead { path } => {
-                        IoWorker::process_full_read(
-                            path,
-                            item.get_completion().clone(),
-                            &this.sync,
-                        )
-                        .await;
+                        IoWorker::process_full_read(path, item.get_completion().clone(), &sync)
+                            .await;
                     }
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullWrite {
                         path,
@@ -713,7 +709,7 @@ impl IoWorker {
                             path,
                             content,
                             item.get_completion().clone(),
-                            &this.sync,
+                            &sync,
                         )
                         .await;
                     }
@@ -723,7 +719,7 @@ impl IoWorker {
             // Run queued IO callbacks and wake all pending ops, yielding control
             // to allow them to make progress before we loop again.
             if made_progress {
-                this.sync.step_io_callbacks();
+                sync.step_io_callbacks();
                 IoWorker::notify_progress(&wakers);
                 // Let waiting tasks run on their executors.
                 tokio::task::yield_now().await;
@@ -733,7 +729,10 @@ impl IoWorker {
 
     #[allow(clippy::too_many_arguments)]
     async fn process_http(
-        this: &Arc<IoWorker>,
+        sync: &turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>,
+        base_url: Option<&str>,
+        auth_token: Option<&AuthTokenFn>,
+        wakers: &Mutex<Vec<Waker>>,
         client: &Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
         url: Option<&str>,
         method: &str,
@@ -752,7 +751,7 @@ impl IoWorker {
             } else {
                 format!("/{path}")
             };
-            let Some(url) = this.base_url.as_deref().or(url) else {
+            let Some(url) = base_url.or(url) else {
                 completion.poison("remote_url is not available".to_string());
                 return;
             };
@@ -762,12 +761,12 @@ impl IoWorker {
         // Resolve auth token (may fail if a dynamic provider returns an error).
         // Resolved here rather than once at spawn so dynamic providers can rotate
         // the token between requests.
-        let auth_token = match &this.auth_token {
+        let auth_token = match auth_token {
             Some(provider) => match provider().await {
                 Ok(token) => Some(token),
                 Err(err) => {
                     completion.poison(format!("failed to resolve auth token: {err}"));
-                    this.sync.step_io_callbacks();
+                    sync.step_io_callbacks();
                     return;
                 }
             },
@@ -803,7 +802,7 @@ impl IoWorker {
             Ok(r) => r,
             Err(err) => {
                 completion.poison(format!("failed to build request: {err}"));
-                this.sync.step_io_callbacks();
+                sync.step_io_callbacks();
                 return;
             }
         };
@@ -812,7 +811,7 @@ impl IoWorker {
             Ok(r) => r,
             Err(err) => {
                 completion.poison(format!("http request failed: {err}"));
-                this.sync.step_io_callbacks();
+                sync.step_io_callbacks();
                 return;
             }
         };
@@ -820,8 +819,8 @@ impl IoWorker {
         // Propagate status
         let status = response.status().as_u16();
         completion.status(status as u32);
-        this.sync.step_io_callbacks();
-        IoWorker::notify_progress(&this.wakers);
+        sync.step_io_callbacks();
+        IoWorker::notify_progress(wakers);
 
         // Stream response body in chunks
         while let Some(frame_res) = response.body_mut().frame().await {
@@ -829,14 +828,14 @@ impl IoWorker {
                 Ok(frame) => {
                     if let Some(chunk) = frame.data_ref() {
                         completion.push_buffer(chunk.clone());
-                        this.sync.step_io_callbacks();
-                        IoWorker::notify_progress(&this.wakers);
+                        sync.step_io_callbacks();
+                        IoWorker::notify_progress(wakers);
                     }
                 }
                 Err(err) => {
                     completion.poison(format!("error reading response body: {err}"));
-                    this.sync.step_io_callbacks();
-                    IoWorker::notify_progress(&this.wakers);
+                    sync.step_io_callbacks();
+                    IoWorker::notify_progress(wakers);
                     return;
                 }
             }
@@ -844,14 +843,14 @@ impl IoWorker {
 
         // Done streaming
         completion.done();
-        this.sync.step_io_callbacks();
-        IoWorker::notify_progress(&this.wakers);
+        sync.step_io_callbacks();
+        IoWorker::notify_progress(wakers);
     }
 
     async fn process_full_read(
         path: &str,
         completion: turso_sync_sdk_kit::sync_engine_io::SyncEngineIoCompletion<Bytes>,
-        sync: &Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
+        sync: &turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>,
     ) {
         match tokio::fs::read(path).await {
             Ok(content) => {
@@ -871,7 +870,7 @@ impl IoWorker {
         path: &str,
         content: &Vec<u8>,
         completion: turso_sync_sdk_kit::sync_engine_io::SyncEngineIoCompletion<Bytes>,
-        sync: &Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
+        sync: &turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>,
     ) {
         // Write the whole content in one go (non-chunked)
         match tokio::fs::write(path, content).await {
