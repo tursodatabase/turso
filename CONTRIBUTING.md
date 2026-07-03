@@ -459,6 +459,9 @@ And launch an Antithesis test run with:
 scripts/antithesis/launch.sh
 ```
 
+By default the launch script does not email anyone the results. To notify
+everyone on `$ANTITHESIS_EMAIL`, run it with `NOTIFY_EVERYONE=true`.
+
 ## Annotating intent with Aristo
 
 Turso uses [Aristo](https://github.com/aretta-ai/aristo) to capture design intent that the code alone doesn't spell out — invariants a refactor could silently break — as `#[aristo::intent("...")]` annotations attached to the code. They're optional; reach for one only when a property is invisible from the signature and not already guarded by a test. For example, on the WAL trait in `core/storage/wal.rs`:

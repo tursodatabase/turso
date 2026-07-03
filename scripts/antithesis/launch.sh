@@ -9,11 +9,18 @@ else
   TEST_TYPE="scheduled test"
 fi
 
+# Only notify everyone of the test results when explicitly opted in, so that
+# ad-hoc runs don't email the whole recipient list by default.
+REPORT_RECIPIENTS=""
+if [ "$NOTIFY_EVERYONE" = "true" ] && [ -n "$ANTITHESIS_EMAIL" ]; then
+  REPORT_RECIPIENTS=",
+      \"antithesis.report.recipients\":\"$ANTITHESIS_EMAIL\""
+fi
+
 curl --fail -u "$ANTITHESIS_USER:$ANTITHESIS_PASSWD" \
   -X POST https://$ANTITHESIS_TENANT.antithesis.com/api/v1/launch/limbo \
   -d "{\"params\": { \"antithesis.description\":\"$TEST_TYPE on $BRANCH @ $COMMIT\",
       \"custom.duration\":\"4\",
       \"antithesis.config_image\":\"$ANTITHESIS_DOCKER_REPO/limbo-config:antithesis-latest\",
-      \"antithesis.images\":\"$ANTITHESIS_DOCKER_REPO/limbo-workload:antithesis-latest\",
-      \"antithesis.report.recipients\":\"$ANTITHESIS_EMAIL\"
+      \"antithesis.images\":\"$ANTITHESIS_DOCKER_REPO/limbo-workload:antithesis-latest\"$REPORT_RECIPIENTS
       } }"
