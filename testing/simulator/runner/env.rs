@@ -1531,6 +1531,15 @@ impl SimulatorEnv {
             .is_some_and(|t| t.is_some())
     }
 
+    /// Whether the underlying database connection is currently inside an explicit transaction
+    pub fn conn_db_in_transaction(&self, conn_index: usize) -> bool {
+        match self.connections.get(conn_index) {
+            Some(SimConnection::LimboConnection(conn)) => !conn.get_auto_commit(),
+            Some(SimConnection::SQLiteConnection(conn)) => !conn.is_autocommit(),
+            _ => false,
+        }
+    }
+
     pub fn has_conn_executed_query_after_transaction(&self, conn_index: usize) -> bool {
         self.connection_last_query.get(conn_index)
     }
