@@ -28,17 +28,6 @@ fn collect_rows(stmt: &mut turso_core::Statement) -> anyhow::Result<Vec<(i64, i6
     }
 }
 
-/// SQLite's OP_Destroy refuses to free a root page while any other statement
-/// is active on the connection (SQLITE_LOCKED "database table is locked"),
-/// because active cursors may hold references to pages that DROP TABLE would
-/// send to the freelist for reuse. A SELECT parked at its first I/O yield must
-/// therefore block DROP TABLE, and resume against intact table pages instead
-/// of a recycled root page.
-///
-/// Reference behavior verified against SQLite via rusqlite: with a stepped,
-/// unfinished SELECT on the same connection, DROP TABLE fails with
-/// SQLITE_LOCKED "database table is locked" while CREATE TABLE and INSERT
-/// still succeed, and DROP TABLE succeeds once the reader finishes.
 #[test]
 fn active_table_seek_after_drop_reuse_must_not_use_recycled_root_page() -> anyhow::Result<()> {
     let io = Arc::new(QueuedIo::new());

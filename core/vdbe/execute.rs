@@ -11397,9 +11397,6 @@ pub fn op_destroy(
     loop {
         match state.active_op_state.destroy() {
             OpDestroyState::CreateCursor => {
-                // Like SQLite's OP_Destroy, refuse to free a root page while any other
-                // statement is active on this connection: active cursors may still
-                // reference pages that would go to the freelist and be recycled.
                 if program
                     .connection
                     .n_active_root_statements
