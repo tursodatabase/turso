@@ -3402,17 +3402,15 @@ fn test_checkpoint_post_durable_failure_then_unique_update_removes_stale_autoind
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
-        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
-            .unwrap();
-        conn.execute("CREATE TABLE t(a TEXT UNIQUE, b REAL, c NUMERIC NOT NULL PRIMARY KEY)")
-            .unwrap();
-
-        conn.execute("INSERT INTO t VALUES ('old', 1.0, 1)")
-            .unwrap();
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-        conn.execute("UPDATE t SET a = 'mid', b = 2.0 WHERE c = 1")
-            .unwrap();
+        vec![
+            "PRAGMA mvcc_checkpoint_threshold = -1",
+            "CREATE TABLE t(a UNIQUE, b, c PRIMARY KEY)",
+            "INSERT INTO t VALUES ('old', 1.0, 1)",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            "UPDATE t SET a = 'mid', b = 2.0 WHERE c = 1",
+        ]
+        .iter()
+        .for_each(|sql| conn.execute(sql).unwrap());
 
         let checkpoint_conn = db.connect();
         let failure_injector = FixedFailureInjector::new([(
@@ -3423,7 +3421,6 @@ fn test_checkpoint_post_durable_failure_then_unique_update_removes_stale_autoind
         checkpoint_conn
             .execute("PRAGMA wal_checkpoint(TRUNCATE)")
             .expect_err("checkpoint should fail after pager commit");
-        checkpoint_conn.set_failure_injector(None);
 
         conn.execute("UPDATE t SET a = 'new', b = 3.0 WHERE c = 1")
             .unwrap();
