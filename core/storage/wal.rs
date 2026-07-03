@@ -4825,7 +4825,14 @@ impl WalFile {
                     // during 'read_page', so the caller will use the result to determine if:
                     // a. the max frame == num wal frames (everything backfilled)
                     // b. the max frame > 0 (we have something to truncate)
-                    if checkpoint_result.should_truncate() {
+                    if checkpoint_result.should_truncate()
+                        || checkpoint_result.wal_checkpoint_backfilled > 0
+                    {
+                        // Backfilled frames are not globally durable until
+                        // the pager syncs the DB file and publishes
+                        // nbackfills. Keep the checkpoint guard through that
+                        // tail so another writer cannot restart the WAL
+                        // generation underneath a pending publish.
                         checkpoint_result.maybe_guard = self.checkpoint_guard.write().take();
                     } else {
                         let _ = self.checkpoint_guard.write().take();
