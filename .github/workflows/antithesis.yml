@@ -19,16 +19,16 @@ on:
         required: false
         default: ""
         type: string
+      notify_email:
+        description: "Custom email to notify of test results"
+        required: false
+        default: ""
+        type: string
       notify_everyone:
         description: "Notify everyone of test results"
         required: false
         default: false
         type: boolean
-      notify_email:
-        description: "Email to notify of test results (combined with 'notify everyone' if both are set)"
-        required: false
-        default: ""
-        type: string
   workflow_call:
     inputs:
       test_name:
@@ -41,14 +41,14 @@ on:
         required: false
         default: ""
         type: string
-      notify_everyone:
-        required: false
-        default: false
-        type: boolean
       notify_email:
         required: false
         default: ""
         type: string
+      notify_everyone:
+        required: false
+        default: false
+        type: boolean
 
 env:
   ANTITHESIS_DOCKER_HOST: us-central1-docker.pkg.dev
