@@ -8059,9 +8059,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             allocator.insert_row_id_maybe_update(rowid.row_id.to_int_or_panic());
                         }
                         StreamingResult::DeleteTableRow {
-                            rowid,
-                            commit_ts,
-                            btree_resident,
+                            rowid, commit_ts, ..
                         } => {
                             max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
                             if commit_ts <= replay_cutoff_ts {
@@ -8122,7 +8120,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                             TxTimestampOrID::Timestamp(commit_ts),
                                         )),
                                         row: tombstone_row.clone(),
-                                        btree_resident,
+                                        // The version this delete ends was not replayed, so its
+                                        // frame is at or below the durable replay boundary: the
+                                        // deleted row is in the DB file. Mark the tombstone
+                                        // btree-resident so checkpoint applies the delete even
+                                        // though the logged flag predates the row becoming durable.
+                                        btree_resident: true,
                                     };
                                     self.insert_version_raw(&mut versions, row_version)?;
                                 }
@@ -8135,7 +8138,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                         TxTimestampOrID::Timestamp(commit_ts),
                                     )),
                                     row: tombstone_row,
-                                    btree_resident,
+                                    // Same invariant as above: no replayed version means the
+                                    // deleted row is already durable in the DB file.
+                                    btree_resident: true,
                                 };
                                 let versions =
                                     self.get_or_create_table_row_versions(rowid.clone())?;
@@ -8201,7 +8206,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             row,
                             rowid,
                             commit_ts,
-                            btree_resident,
+                            ..
                         } => {
                             max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
                             if commit_ts <= replay_cutoff_ts {
@@ -8232,7 +8237,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     TxTimestampOrID::Timestamp(commit_ts),
                                 )),
                                 row: row.clone(),
-                                btree_resident,
+                                // The index entry this delete ends was not replayed, so its
+                                // frame is at or below the durable replay boundary: the entry
+                                // is in the DB file. Mark the tombstone btree-resident so
+                                // checkpoint applies the delete even though the logged flag
+                                // predates the entry becoming durable (e.g. a checkpoint that
+                                // failed after its pager commit).
+                                btree_resident: true,
                             };
                             self.insert_index_version(rowid.table_id, sortable_key, row_version)?;
                         }
