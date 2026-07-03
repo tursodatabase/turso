@@ -1,0 +1,125 @@
+# Publishes a one-off build of @tursodatabase/database-wasm to npm under a
+# custom dist-tag (default: `fuzzy-demo`), so a special build (e.g. one with the
+# fuzzy string extension linked in) can be consumed by an online demo WITHOUT
+# merging to main or disturbing the `latest`/`next` dist-tags.
+#
+# Two ways to run it:
+#
+#   1. Tag push (works from any branch, no merge to main required):
+#        git tag wasm-fuzzy-demo            # on the branch commit you want
+#        git push origin wasm-fuzzy-demo
+#      The npm version is auto-generated as <X.Y.Z>-fuzzy-demo.<run_number>.
+#      To republish, move the tag: `git tag -f wasm-fuzzy-demo && git push -f origin wasm-fuzzy-demo`.
+#
+#   2. Manually from the Actions UI (workflow_dispatch) once this file is on the
+#      default branch — lets you pass an explicit version and dist-tag.
+#
+# The tag name MUST NOT start with `v` and MUST NOT contain an X.Y.Z substring,
+# otherwise it would also trigger napi.yml / publish-crates.yml / release.yml.
+# `wasm-fuzzy-demo` (optionally with a non-version suffix) satisfies both rules.
+name: Publish wasm demo to npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "npm version to publish (leave empty to auto-generate). Must be a version not already on npm."
+        required: false
+        type: string
+      dist_tag:
+        description: "npm dist-tag (must NOT be latest or next)"
+        required: true
+        default: fuzzy-demo
+        type: string
+  push:
+    tags:
+      - "wasm-fuzzy-demo*"
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+
+defaults:
+  run:
+    working-directory: bindings/javascript
+
+jobs:
+  publish:
+    name: Build & publish @tursodatabase/database-wasm
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version and dist-tag
+        id: meta
+        working-directory: bindings/javascript/packages/wasm
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            BASE=$(node -pe "require('./package.json').version.split('-')[0]")
+            VERSION="${BASE}-fuzzy-demo.${{ github.run_number }}"
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            DIST_TAG="${{ inputs.dist_tag }}"
+          else
+            DIST_TAG="fuzzy-demo"
+          fi
+
+          case "$DIST_TAG" in
+            latest|next|"")
+              echo "Refusing to publish demo build to dist-tag '$DIST_TAG'" >&2
+              exit 1 ;;
+          esac
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=$DIST_TAG" >> "$GITHUB_OUTPUT"
+          echo "Will publish @tursodatabase/database-wasm@$VERSION under dist-tag '$DIST_TAG'"
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Update npm
+        run: npm install -g npm@11
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-wasip1-threads
+
+      - name: Setup wasi-sdk
+        run: |
+          wget https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
+          tar -xf wasi-sdk-25.0-x86_64-linux.tar.gz
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Build wasm package
+        run: |
+          export WASI_SDK_PATH="$(pwd)/wasi-sdk-25.0-x86_64-linux"
+          export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+          export TARGET_CXXFLAGS="--target=wasm32-wasi-threads --sysroot=$(pwd)/wasi-sdk-25.0-x86_64-linux/share/wasi-sysroot -pthread -mllvm -wasm-enable-sjlj -lsetjmp"
+          export TARGET_CFLAGS="$TARGET_CXXFLAGS"
+          yarn workspace @tursodatabase/database-common build
+          yarn workspace @tursodatabase/database-wasm-common build
+          yarn workspace @tursodatabase/database-wasm build
+
+      - name: Set demo version
+        working-directory: bindings/javascript/packages/wasm
+        run: npm pkg set version="${{ steps.meta.outputs.version }}"
+
+      - name: Publish
+        working-directory: bindings/javascript/packages/wasm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance --tag "${{ steps.meta.outputs.dist_tag }}"

@@ -348,6 +348,19 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
         conn.set_query_timeout(query_timeout);
     }
 
+    // In the wasm build we statically link the fuzzy string extension so its
+    // functions (fuzzy_leven, fuzzy_damlev, ...) are available without a
+    // separate `.load` step. This powers the online demo.
+    #[cfg(feature = "browser")]
+    unsafe {
+        let mut ext_api = conn._build_turso_ext();
+        let result = limbo_fuzzy::register_extension_static(&mut ext_api);
+        conn._free_extension_ctx(ext_api);
+        if !result.is_ok() {
+            return Err(create_generic_error("failed to register fuzzy extension"));
+        }
+    }
+
     let connect = DatabaseConnect {
         _db: Some(db_core),
         conn,
