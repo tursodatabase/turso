@@ -12394,6 +12394,14 @@ pub struct OpParseSchemaInner {
 
 pub type OpParseSchemaState = Option<Box<OpParseSchemaInner>>;
 
+impl OpParseSchemaInner {
+    /// The connection's `auto_commit` value saved at ParseSchema entry, so
+    /// abort paths can restore it when the op never reached its Done arm.
+    pub(crate) fn previous_auto_commit(&self) -> bool {
+        self.previous_auto_commit
+    }
+}
+
 pub fn op_parse_schema(
     program: &Program,
     state: &mut ProgramState,

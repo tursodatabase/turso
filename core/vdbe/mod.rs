@@ -621,6 +621,19 @@ impl ActiveOpStateSlot {
         None
     );
 
+    /// Take the ParseSchema op state if it is the active one, without
+    /// touching (or panicking on) any other live op state. Used by abort
+    /// cleanup, which runs regardless of which opcode was executing.
+    fn take_parse_schema_if_active(&mut self) -> execute::OpParseSchemaState {
+        if let ActiveOpState::ParseSchema(inner) = &mut self.state {
+            let taken = inner.take();
+            self.state = ActiveOpState::None;
+            taken
+        } else {
+            None
+        }
+    }
+
     fn program_ref(&self) -> Option<&OpProgramState> {
         match &self.state {
             ActiveOpState::Program(state) => Some(state),
@@ -2398,6 +2411,22 @@ impl Program {
         state
             .commit_state
             .cleanup_abandoned_mvcc_commit(&self.connection);
+
+        // ParseSchema owns a nested helper statement on this connection and
+        // stores `auto_commit=false` for its duration. If the program aborts
+        // while that state is live (error mid-schema-row), release it here:
+        // restore the saved auto_commit and drop the inner statement so its
+        // nested guard is released BEFORE the `is_nested_stmt()` check below.
+        // Otherwise this top-level statement misclassifies itself as nested,
+        // skips transaction rollback, and leaks the DDL's exclusive MVCC tx
+        // (and the cleared auto_commit) into subsequent statements — which
+        // then appear to succeed without ever committing.
+        if let Some(inner) = state.active_op_state.take_parse_schema_if_active() {
+            self.connection
+                .auto_commit
+                .store(inner.previous_auto_commit(), Ordering::SeqCst);
+            drop(inner);
+        }
 
         // VACUUM (and VACUUM INTO) state can own internal helper statements whose drop path
         // releases nested guards. Clean it before checking whether this program
