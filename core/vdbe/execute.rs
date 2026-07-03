@@ -1173,6 +1173,22 @@ pub fn op_open_read(
         );
     }
     let cursors = &mut state.cursors;
+
+    // Fast path: if this cursor slot already holds a btree cursor open on the same root
+    // page, reuse it instead of reconstructing. This is critical for correlated subqueries
+    // and nested loops, where OpenRead executes once per outer row: rebuilding the
+    // BTreeCursor every iteration (allocation + pager registration + dropping the previous
+    // cursor) dominated runtime. A subsequent Seek/Rewind repositions the reused cursor.
+    // Mirrors op_open_write's existing reuse and SQLite's OP_OpenRead behavior.
+    let can_reuse_cursor = matches!(
+        cursors.get(*cursor_id),
+        Some(Some(Cursor::BTree(btree_cursor))) if btree_cursor.root_page() == *root_page
+    );
+    if can_reuse_cursor {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     let num_columns = match cursor_type {
         CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
         CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
