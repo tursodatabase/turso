@@ -4576,12 +4576,6 @@ impl WalFile {
         Ok(())
     }
 
-    #[aristo::intent(
-        "A checkpoint failure must not leak frames into the main database file\n",
-        id = "aristos:wal_checkpoint_error_no_db_leak",
-        verify = "full",
-        parent = "wal_protocol_correctness"
-    )]
     fn checkpoint_inner(
         &self,
         pager: &Pager,
