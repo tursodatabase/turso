@@ -191,13 +191,15 @@ jobs:
         run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official'
 
       # Code-sign the Windows native DLL with Azure Artifact Signing (formerly
-      # Trusted Signing). Runs only for the windows-msvc targets and only when
-      # the AZURE_SIGNING_ENABLED repo variable is set to "true" (so forks and
-      # PRs without access to the signing secrets are skipped). The action only
-      # works on Windows runners, which is why signing happens here in the
-      # native build job rather than in the Linux pack/publish job.
+      # Trusted Signing). Runs only for the windows-msvc targets, only when
+      # the AZURE_SIGNING_ENABLED repo variable is set to "true", and only on
+      # main pushes or manual dispatch: the Entra federated credential matches
+      # the exact ref (refs/heads/main), so OIDC login fails on any other
+      # branch, and dev-branch artifacts don't need signing anyway. The action
+      # only works on Windows runners, which is why signing happens here in
+      # the native build job rather than in the Linux pack/publish job.
       - name: Azure login (OIDC) for code signing
-        if: ${{ contains(matrix.target, 'pc-windows-msvc') && vars.AZURE_SIGNING_ENABLED == 'true' }}
+        if: ${{ contains(matrix.target, 'pc-windows-msvc') && vars.AZURE_SIGNING_ENABLED == 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') }}
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -205,7 +207,7 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Code sign Windows native library
-        if: ${{ contains(matrix.target, 'pc-windows-msvc') && vars.AZURE_SIGNING_ENABLED == 'true' }}
+        if: ${{ contains(matrix.target, 'pc-windows-msvc') && vars.AZURE_SIGNING_ENABLED == 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') }}
         uses: azure/trusted-signing-action@v0
         with:
           endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
