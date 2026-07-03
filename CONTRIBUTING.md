@@ -460,7 +460,9 @@ scripts/antithesis/launch.sh
 ```
 
 By default the launch script does not email anyone the results. To notify
-everyone on `$ANTITHESIS_EMAIL`, run it with `NOTIFY_EVERYONE=true`.
+everyone on `$ANTITHESIS_EMAIL`, run it with `NOTIFY_EVERYONE=true`; to notify a
+single custom address instead, run it with `NOTIFY_EMAIL=you@turso.tech`
+(`NOTIFY_EVERYONE` takes precedence when both are set).
 
 ## Annotating intent with Aristo
 

@@ -9,12 +9,19 @@ else
   TEST_TYPE="scheduled test"
 fi
 
-# Only notify everyone of the test results when explicitly opted in, so that
-# ad-hoc runs don't email the whole recipient list by default.
+# Decide who receives the test report. NOTIFY_EVERYONE uses the shared recipient
+# list; otherwise fall back to a single custom NOTIFY_EMAIL. When neither is set
+# the report is not emailed, so ad-hoc runs stay quiet by default.
+if [ "$NOTIFY_EVERYONE" = "true" ]; then
+  RECIPIENTS="$ANTITHESIS_EMAIL"
+else
+  RECIPIENTS="$NOTIFY_EMAIL"
+fi
+
 REPORT_RECIPIENTS=""
-if [ "$NOTIFY_EVERYONE" = "true" ] && [ -n "$ANTITHESIS_EMAIL" ]; then
+if [ -n "$RECIPIENTS" ]; then
   REPORT_RECIPIENTS=",
-      \"antithesis.report.recipients\":\"$ANTITHESIS_EMAIL\""
+      \"antithesis.report.recipients\":\"$RECIPIENTS\""
 fi
 
 curl --fail -u "$ANTITHESIS_USER:$ANTITHESIS_PASSWD" \
