@@ -459,10 +459,10 @@ And launch an Antithesis test run with:
 scripts/antithesis/launch.sh
 ```
 
-By default the launch script does not email anyone the results. To notify
-everyone on `$ANTITHESIS_EMAIL`, run it with `NOTIFY_EVERYONE=true`; to notify a
-single custom address instead, run it with `NOTIFY_EMAIL=you@turso.tech`
-(`NOTIFY_EVERYONE` takes precedence when both are set).
+By default the launch script does not email anyone the results. Set
+`NOTIFY_EVERYONE=true` to notify everyone on `$ANTITHESIS_EMAIL`, set
+`NOTIFY_EMAIL=you@turso.tech` to notify a single custom address, or set both to
+notify everyone plus that address.
 
 ## Annotating intent with Aristo
 

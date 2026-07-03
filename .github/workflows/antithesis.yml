@@ -25,7 +25,7 @@ on:
         default: false
         type: boolean
       notify_email:
-        description: "Email to notify (ignored if 'notify everyone' is checked)"
+        description: "Email to notify of test results (combined with 'notify everyone' if both are set)"
         required: false
         default: ""
         type: string
@@ -100,7 +100,9 @@ jobs:
           Turso - ${{ github.event_name }}
           on ${{ github.ref_name }} (${{ github.sha }})
           by ${{ github.actor }}${{ inputs.test_name && format(' ({0})', inputs.test_name) || '' }}${{ inputs.diff_base && format(' diff vs {0}', inputs.diff_base) || '' }}
-        email_recipients: ${{ inputs.notify_everyone && secrets.ANTITHESIS_EMAIL || inputs.notify_email }}
+        # Report recipients: the shared list when "notify everyone" is set, plus
+        # any custom address, joined with ';' (the action's delimiter) when both.
+        email_recipients: ${{ inputs.notify_everyone && secrets.ANTITHESIS_EMAIL || '' }}${{ (inputs.notify_everyone && secrets.ANTITHESIS_EMAIL != '' && inputs.notify_email != '') && ';' || '' }}${{ inputs.notify_email }}
         test_name: ${{ inputs.test_name }}
         additional_parameters: |-
           antithesis.duration=${{ inputs.duration }}
