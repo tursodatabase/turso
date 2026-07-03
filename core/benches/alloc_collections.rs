@@ -1,6 +1,6 @@
 #![cfg_attr(nightly, feature(allocator_api))]
 
-use divan::{black_box, AllocProfiler, Bencher};
+use divan::{black_box, black_box_drop, AllocProfiler, Bencher};
 use mimalloc::MiMalloc;
 use rustc_hash::FxBuildHasher;
 use turso_core::alloc::{
@@ -757,14 +757,24 @@ fn vec_non_copy_extend_turso(bencher: Bencher, len: usize) {
 fn vec_non_copy_clone_std(bencher: Bencher, len: usize) {
     bencher
         .with_inputs(|| non_copy_values_std(len))
-        .bench_local_values(|values| black_box(values).clone());
+        .bench_local_values(|values| {
+            let values = black_box(values);
+            let cloned = values.clone();
+            black_box(values.len());
+            black_box_drop(cloned);
+        });
 }
 
 #[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_non_copy_clone_turso(bencher: Bencher, len: usize) {
     bencher
         .with_inputs(|| non_copy_values_turso(len))
-        .bench_local_values(|values| black_box(values).clone());
+        .bench_local_values(|values| {
+            let values = black_box(values);
+            let cloned = values.clone();
+            black_box(values.len());
+            black_box_drop(cloned);
+        });
 }
 
 #[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
