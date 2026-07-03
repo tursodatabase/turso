@@ -343,9 +343,6 @@ impl Limbo {
                 self.writeln(&hint).map_err(|e| io_error(e, "write"))?;
             }
 
-            self.writeln(
-                "This software is in BETA, use caution with production data and ensure you have backups."
-            ).map_err(|e| io_error(e, "write"))?;
             self.display_in_memory().map_err(|e| io_error(e, "write"))?;
         }
         Ok(())

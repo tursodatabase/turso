@@ -31,9 +31,7 @@
 
 ## About
 
-Turso Database is an in-process SQL database written in Rust, compatible with SQLite.
-
-> **⚠️ Warning:** This software is in BETA. It may still contain bugs and unexpected behavior. Use caution with production data and ensure you have backups.
+Turso Database is an in-process SQL database written in Rust, compatible with SQLite. It runs in production today at multiple organizations — see the [FAQ](#faq) for where the project stands on its way to 1.0.
 
 ## Features and Roadmap
 
@@ -426,13 +424,19 @@ We'd love to have you contribute to Turso Database! Please check out the [contri
 
 ### Is Turso Database ready for production use?
 
-Turso powers production apps today. That includes [Turso Cloud](https://turso.tech/signup), the [Kin AI assistant](https://mykin.ai/), and [Spice.ai](https://github.com/spiceai/spiceai). However, it is still under active development and for mission-critical applications, caution is advised. Independent backups are encouraged. Turso is extensively tested by a collection of tools including a native Deterministic Simulation Testing suite and [Antithesis](https://antithesis.com), so we are generally confident in the end result. But our bar is SQLite-level reliability, and we will still recommend caution until we are confident it meets that bar.
+Yes — Turso powers production applications today at multiple organizations, including [Turso Cloud](https://turso.tech/signup), the [Kin AI assistant](https://mykin.ai/), and [Spice.ai](https://github.com/spiceai/spiceai). Reliability is our top priority: Turso is extensively tested by a collection of tools including a native Deterministic Simulation Testing suite and [Antithesis](https://antithesis.com).
+
+That said, we have not yet reached 1.0. The project is under active development, and some features are explicitly marked experimental. Our bar is SQLite-level reliability — one of the most rigorously tested pieces of software in the world — and until we declare 1.0, we recommend the same discipline you would apply to any database: keep independent backups.
+
+### How compatible is Turso Database with SQLite?
+
+Turso is compatible with SQLite at the SQL dialect, file format, and C API levels, and existing SQLite database files work as-is. We are not at 100% yet, so some differences are still expected — [COMPAT.md](COMPAT.md) tracks the details — but the gap is closing quickly, and full compatibility is a requirement for 1.0.
 
 ### How is Turso Database different from Turso's libSQL?
 
 Turso Database is a project to build the next evolution of SQLite in Rust, with a strong open contribution focus and features like native async support, vector search, and more. The libSQL project is also an attempt to evolve SQLite in a similar direction, but through a fork rather than a rewrite.
 
-Rewriting SQLite in Rust started as an unassuming experiment, and due to its incredible success, replaces libSQL as our intended direction. At this point, libSQL is production ready, Turso Database is not - although it is evolving rapidly. More details [here](https://turso.tech/blog/we-will-rewrite-sqlite-and-we-are-going-all-in).
+Rewriting SQLite in Rust started as an unassuming experiment, and due to its incredible success, replaces libSQL as our intended direction. Both run in production today: libSQL has been battle-tested for longer, while Turso Database is where our development effort is focused and is evolving rapidly. More details [here](https://turso.tech/blog/we-will-rewrite-sqlite-and-we-are-going-all-in).
 
 ## Publications
 
