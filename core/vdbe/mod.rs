@@ -1417,8 +1417,6 @@ pub struct PreparedProgram {
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
     pub is_subprogram: bool,
-    /// Whether the program contains any trigger subprograms.
-    pub contains_trigger_subprograms: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
     /// Set of attached database indices that need write transactions.

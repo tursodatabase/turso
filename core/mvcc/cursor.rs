@@ -2157,7 +2157,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         }
     }
 
-    fn seek_to_last(&mut self, _always_seek: bool) -> Result<IOResult<()>> {
+    fn seek_to_last(&mut self) -> Result<IOResult<()>> {
         match self.seek(SeekKey::TableRowId(i64::MAX), SeekOp::LE { eq_only: false })? {
             IOResult::Done(_) => Ok(IOResult::Done(())),
             IOResult::IO(iocompletions) => Ok(IOResult::IO(iocompletions)),
