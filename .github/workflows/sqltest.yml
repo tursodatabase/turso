@@ -38,7 +38,6 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
-      - uses: "./.github/shared/setup-sccache"
       - uses: "./.github/shared/install_sqlite"
       - name: Build tursodb
         run: make -C testing/sqltests build-tursodb
@@ -81,7 +80,6 @@ jobs:
         uses: useblacksmith/setup-node@v5
         with:
           node-version: 20
-      - uses: "./.github/shared/setup-sccache"
       - name: Install JS dependencies
         run: yarn install
       - name: Build common package

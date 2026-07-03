@@ -87,7 +87,6 @@ jobs:
           prefix-key: "v1-rust-codspeed-${{ env.TOOLCHAIN_LABEL }}"
           cache-on-failure: true
 
-      - uses: "./.github/shared/setup-sccache"
 
       - name: Install cargo-codspeed
         uses: taiki-e/install-action@v2
@@ -156,7 +155,6 @@ jobs:
           prefix-key: "v1-rust-codspeed-${{ env.TOOLCHAIN_LABEL }}"
           cache-on-failure: true
 
-      - uses: "./.github/shared/setup-sccache"
 
       - name: Install cargo-codspeed
         uses: taiki-e/install-action@v2
@@ -325,9 +323,6 @@ jobs:
   #         prefix-key: "v1-rust-codspeed"
   #         cache-on-failure: true
 
-  #     - name: Setup sccache
-  #       uses: mozilla-actions/sccache-action@v0.0.9
-
   #     - name: Install cargo-codspeed
   #       uses: taiki-e/install-action@v2
   #       with:
@@ -347,10 +342,7 @@ jobs:
   #       run: wget -O $DB_FILE --no-verbose $DB_URL
 
   #     - name: Build TPC-H benchmark
-  #       env:
-  #         SCCACHE_GHA_ENABLED: "true"
-  #         RUSTC_WRAPPER: "sccache"
-  #       run: cargo codspeed build --features codspeed --bench tpc_h_benchmark 
+  #       run: cargo codspeed build --features codspeed --bench tpc_h_benchmark
 
   #     - name: Run TPC-H benchmark
   #       uses: CodSpeedHQ/action@v4.17.0

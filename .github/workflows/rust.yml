@@ -75,7 +75,6 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - uses: "./.github/shared/setup-sccache"
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Install cargo-llvm-cov
@@ -133,7 +132,6 @@ jobs:
         with:
           prefix-key: "v1-rust-windows-arm64-cli"
           cache-on-failure: true
-      - uses: "./.github/shared/setup-sccache"
       - name: Build Windows ARM64 CLI
         shell: pwsh
         run: |
@@ -164,7 +162,6 @@ jobs:
         with:
           prefix-key: "v1-rust-shuttle"
           cache-on-failure: true
-      - uses: "./.github/shared/setup-sccache"
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Run shuttle tests
@@ -183,7 +180,6 @@ jobs:
         with:
           prefix-key: "v1-rust-conn-raw-api"
           cache-on-failure: true
-      - uses: "./.github/shared/setup-sccache"
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Run conn_raw_api-gated core tests
@@ -201,7 +197,6 @@ jobs:
   #       with:
   #         prefix-key: "v1-rust-shuttle"
   #         cache-on-failure: true
-  #     - uses: "./.github/shared/setup-sccache"
   #     - name: Check for uncontrolled nondeterminism
   #       env:
   #         RUSTFLAGS: "--cfg tokio_unstable --cfg shuttle"
@@ -260,7 +255,6 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - uses: "./.github/shared/setup-sccache"
       # Run these with for loops (instead of --loop flag in sim) so that each iteration gets a separate seed -- this produces much easier-to-debug traces when there's a failure since we don't have to potentially
       # run 10 iterations of the same seed to get to the failure
       - name: Simulator ${{ matrix.profile.name }}
@@ -305,7 +299,6 @@ jobs:
   #       with:
   #         prefix-key: "v1-rust"
   #         cache-on-failure: true
-  #     - uses: "./.github/shared/setup-sccache"
   #     - name: Windows Simulator ${{ matrix.profile.name }}
   #       shell: pwsh
   #       run: |
@@ -329,12 +322,7 @@ jobs:
   #       with:
   #         prefix-key: "v1-rust"
   #         cache-on-failure: true
-  #     - name: Setup sccache
-  #       uses: mozilla-actions/sccache-action@v0.0.9
   #     - name: Run differential_fuzzer
-  #       env:
-  #         SCCACHE_GHA_ENABLED: "true"
-  #         RUSTC_WRAPPER: "sccache"
   #       run: |
   #         cargo run -p differential-fuzzer -- -n 1000 loop 10
 
@@ -350,7 +338,6 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - uses: "./.github/shared/setup-sccache"
 
       - name: Install uv
         uses: useblacksmith/setup-uv@v4
@@ -406,7 +393,6 @@ jobs:
         with:
           prefix-key: "v1-rust-whopper-${{ matrix.toolchain.label }}"
           cache-on-failure: true
-      - uses: "./.github/shared/setup-sccache"
       - name: Run turso_whopper regression tests
         if: matrix.profile.name == 'in-process'
         env:
@@ -432,7 +418,6 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - uses: "./.github/shared/setup-sccache"
       - name: Run Windows concurrent simulator multiprocess regressions
         run: cargo test -q -p turso_whopper --test regression_tests
       - name: Run Windows concurrent simulator cross-platform regression
