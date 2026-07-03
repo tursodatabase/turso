@@ -6082,6 +6082,10 @@ impl CursorTrait for BTreeCursor {
         if matches!(self.state, CursorState::None) {
             self.pager.invalidate_peer_cursors(self);
             self.invalidate_count_cache();
+            // Every page in this btree is about to be freed, so our own cached
+            // rightmost page id is meaningless too (the id may even be
+            // reallocated to an unrelated page after a refill).
+            self.move_to_right_state.1 = None;
         }
         self.destroy_btree_contents(true)
     }
@@ -6349,6 +6353,13 @@ impl CursorTrait for BTreeCursor {
     /// across an in-flight Insert/Delete — in which case the caller falls back
     /// to invalidate_btree_cache.
     fn try_save_position_for_external_balance(&mut self) -> Result<IOResult<SavePositionResult>> {
+        // The peer is about to modify this btree's structure, so any cached
+        // knowledge of the tree shape goes stale: the rightmost page id
+        // (move_to_rightmost's skip-a-seek optimization) and the memoized
+        // count. Positional state is preserved separately via save_context.
+        // Idempotent, so safe across IO re-entry into this function.
+        self.move_to_right_state.1 = None;
+        self.invalidate_count_cache();
         if self.valid_state != CursorValidState::Valid || !self.has_record() {
             // Nothing to save: cursor has no live position. No invalidation
             // needed either — the stack is already in a state where the next
