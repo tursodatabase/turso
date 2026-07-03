@@ -1667,6 +1667,49 @@ fn test_cdc_v2_txn_id_reset_after_commit(db: TempDatabase) {
     assert_ne!(rows[0][0], rows[1][0]);
 }
 
+/// Regression test for https://github.com/tursodatabase/turso/issues/7677.
+///
+/// With CDC v2 enabled, an explicit COMMIT emits a CDC commit record. For a transaction that
+/// captured no changes (empty or read-only) that record used to be written without
+/// establishing a write transaction, leaving a dirty CDC page that the commit path never
+/// flushed or cleared. The leaked page then tripped the "dirty pages should be empty for read
+/// txn" assertion when the *next* transaction was rolled back.
+///
+/// A committed no-change transaction followed by a rolled-back one must not panic, and
+/// no-change transactions must not emit CDC commit records (they stay read-only).
+#[turso_macros::test]
+fn test_cdc_v2_no_change_commit_then_rollback(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA capture_data_changes_conn('full,turso_cdc')")
+        .unwrap();
+
+    // An explicit transaction that captures no changes, committed.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    // A subsequent read-only transaction that is rolled back used to panic here.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    // The connection is still usable...
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT x FROM t");
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+    // ...and the no-change BEGIN/COMMIT and BEGIN/ROLLBACK contributed no commit records:
+    // the only ones come from the autocommit CREATE TABLE and INSERT above.
+    let commits = limbo_exec_rows(
+        &conn,
+        "SELECT change_txn_id FROM turso_cdc WHERE change_type = 2",
+    );
+    assert_eq!(commits.len(), 2);
+    assert!(commits
+        .iter()
+        .all(|row| !matches!(row[0], Value::Integer(-1))));
+}
+
 #[turso_macros::test]
 fn test_cdc_v2_schema_has_9_columns(db: TempDatabase) {
     let conn = db.connect_limbo();

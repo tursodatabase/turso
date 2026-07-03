@@ -1065,17 +1065,22 @@ fn build_rowid_column() -> Column {
 pub fn prepare_cdc_if_necessary(
     program: &mut ProgramBuilder,
     schema: &Schema,
-    changed_table_name: &str,
+    changed_table_name: Option<&str>,
 ) -> Result<Option<(usize, Arc<BTreeTable>)>> {
     let mode = program.capture_data_changes_info();
     let cdc_table = mode.table();
     let Some(cdc_table) = cdc_table else {
         return Ok(None);
     };
-    if changed_table_name == cdc_table
-        || changed_table_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
-    {
-        return Ok(None);
+    // Self-exclusion: never capture changes to CDC's own bookkeeping tables. `None` means the
+    // caller has no associated table (e.g. a transaction-boundary COMMIT record) and always
+    // gets the cursor.
+    if let Some(changed_table_name) = changed_table_name {
+        if changed_table_name == cdc_table
+            || changed_table_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
+        {
+            return Ok(None);
+        }
     }
     let Some(turso_cdc_table) = schema.get_table(cdc_table) else {
         crate::bail_parse_error!("no such table: {}", cdc_table);
@@ -1599,6 +1604,64 @@ pub fn emit_cdc_autocommit_commit(
         program.preassign_label_to_next_insn(skip_label);
     }
 
+    Ok(())
+}
+
+/// Emit the CDC COMMIT record for an explicit `COMMIT` statement, gated on the transaction
+/// having actually captured a change.
+///
+/// Data-modifying statements always establish a write transaction before reaching their CDC
+/// emission, but an explicit `COMMIT` does not: for an empty or read-only transaction the
+/// connection's `tx_state` is still `None`/`Read`. Emitting the record unconditionally would
+/// then dirty the CDC table page without a write transaction; the commit path neither flushes
+/// nor clears that page, so it leaks into the next transaction and trips the "dirty pages
+/// should be empty for read txn" assertion on a later ROLLBACK
+/// (https://github.com/tursodatabase/turso/issues/7677).
+///
+/// `conn_txn_id(-1)` returns the active CDC transaction id, or -1 when nothing was captured.
+/// When it is set, the transaction already performed a write (the data-change statement
+/// established the write transaction), so inserting the commit record is safe. When it is -1
+/// the transaction made no changes and we skip the record entirely, leaving the transaction
+/// read-only.
+pub fn emit_cdc_explicit_commit_insns(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    resolver: &Resolver,
+) -> Result<()> {
+    let minus_one_reg = program.alloc_register();
+    program.emit_int(-1, minus_one_reg);
+    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1)? else {
+        bail_parse_error!("no function {}", "conn_txn_id");
+    };
+    let txn_id_reg = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: minus_one_reg,
+        dest: txn_id_reg,
+        func: crate::function::FuncCtx {
+            func: conn_txn_id_fn,
+            arg_count: 1,
+        },
+    });
+
+    // Skip the whole record (including the CDC OpenWrite) when no change was captured.
+    // `emit_cdc_commit_insns` recomputes `conn_txn_id(-1)` for the record itself; because the
+    // opcode is an idempotent get-or-set, the second call returns the same value we gated on.
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::Eq {
+        lhs: txn_id_reg,
+        rhs: minus_one_reg,
+        target_pc: skip_label,
+        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        collation: None,
+    });
+
+    // A COMMIT record has no associated table, so pass `None` (no self-exclusion check).
+    if let Some((cdc_cursor_id, _)) = prepare_cdc_if_necessary(program, schema, None)? {
+        emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
+    }
+
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 /// Initialize the limit/offset counters and registers.

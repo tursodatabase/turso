@@ -3,7 +3,9 @@ package turso
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -357,6 +359,64 @@ func TestSyncBootstrap(t *testing.T) {
 		values = append(values, value)
 	}
 	require.Equal(t, values, []string{"hello", "turso", "sync-go"})
+}
+
+// TestSyncRollbackReadTxnAfterCommit reproduces https://github.com/tursodatabase/turso/issues/7677
+// through the sync SDK, using the reporter's setup verbatim: a purely local sync database
+// (no remote server, BootstrapIfEmpty=false). The sync engine enables change-data-capture on
+// every connection, so with CDC v2 a committed transaction emits a CDC commit record. For an
+// empty/read-only transaction that record used to be written without establishing a write
+// transaction, leaking a dirty page that the commit path never cleared; a subsequent
+// read-only transaction that rolled back then panicked in the pager with "dirty pages should
+// be empty for read txn".
+func TestSyncRollbackReadTxnAfterCommit(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	bootstrapIfEmpty := false
+	sdb, err := NewTursoSyncDb(ctx, TursoSyncDbConfig{
+		Path:             path.Join(dir, "shared.db"),
+		BootstrapIfEmpty: &bootstrapIfEmpty,
+	})
+	require.Nil(t, err)
+	db, err := sdb.Connect(ctx)
+	require.Nil(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	// Single connection so the committed and rolled-back transactions share a pager.
+	db.SetMaxOpenConns(1)
+
+	_, err = db.ExecContext(ctx, "CREATE TABLE lists (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)")
+	require.Nil(t, err)
+	_, err = db.ExecContext(ctx, "INSERT INTO lists VALUES (1, 3)")
+	require.Nil(t, err)
+
+	// lookup runs a read-only transaction: it commits when the row exists and rolls back
+	// (mirroring the reporter's `function`) when it does not.
+	lookup := func(id int) (version int, found bool) {
+		tx, err := db.BeginTx(ctx, nil)
+		require.Nil(t, err)
+		err = tx.QueryRowContext(ctx, "SELECT version FROM lists WHERE id = ?", id).Scan(&version)
+		if errors.Is(err, sql.ErrNoRows) {
+			require.Nil(t, tx.Rollback()) // used to panic in the pager
+			return 0, false
+		}
+		require.Nil(t, err)
+		require.Nil(t, tx.Commit())
+		return version, true
+	}
+
+	// First lookup finds the row and commits.
+	version, found := lookup(1)
+	require.True(t, found)
+	require.Equal(t, 3, version)
+
+	// Second lookup finds nothing and rolls back the read-only transaction.
+	_, found = lookup(999)
+	require.False(t, found)
+
+	// The connection is still usable afterwards.
+	_, err = db.ExecContext(ctx, "INSERT INTO lists VALUES (2, 5)")
+	require.Nil(t, err)
 }
 
 func TestSyncConfigPersistence(t *testing.T) {
