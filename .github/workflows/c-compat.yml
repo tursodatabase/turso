@@ -40,7 +40,6 @@ jobs:
           prefix-key: "v1-rust"
           cache-on-failure: true
 
-      - uses: "./.github/shared/setup-sccache"
 
       - name: Build Turso C bindings
         run: cargo build -p turso_sqlite3 --features capi --locked

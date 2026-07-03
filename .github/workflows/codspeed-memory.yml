@@ -32,7 +32,6 @@ jobs:
           prefix-key: "v1-rust-codspeed-memory"
           cache-on-failure: true
 
-      - uses: "./.github/shared/setup-sccache"
 
       - name: Install cargo-codspeed
         uses: taiki-e/install-action@v2

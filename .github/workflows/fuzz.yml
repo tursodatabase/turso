@@ -33,7 +33,6 @@ jobs:
       with:
         prefix-key: "v1-rust"
         cache-on-failure: true
-    - uses: "./.github/shared/setup-sccache"
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
     - name: Set up Python 3.10
@@ -61,7 +60,6 @@ jobs:
       with:
         prefix-key: "v1-rust"
         cache-on-failure: true
-    - uses: "./.github/shared/setup-sccache"
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
     - name: Set up Python 3.10
@@ -88,7 +86,6 @@ jobs:
       with:
         prefix-key: "v1-rust"
         cache-on-failure: true
-    - uses: "./.github/shared/setup-sccache"
     - name: Set up Python 3.10
       uses: useblacksmith/setup-python@v6
       with:
@@ -112,7 +109,6 @@ jobs:
       with:
         prefix-key: "v1-rust-shuttle"
         cache-on-failure: true
-    - uses: "./.github/shared/setup-sccache"
     - name: Run shuttle mvcc tests
       env:
         RUST_BACKTRACE: "full"

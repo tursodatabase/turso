@@ -45,7 +45,6 @@ jobs:
         with:
           prefix-key: "v1-rust"
 
-      - uses: "./.github/shared/setup-sccache"
 
       - name: Setup Java
         uses: actions/setup-java@v4

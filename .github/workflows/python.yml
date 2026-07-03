@@ -61,7 +61,6 @@ jobs:
           prefix-key: "v1-rust"
           cache-on-failure: true
 
-      - uses: "./.github/shared/setup-sccache"
 
       - name: Build Rust (debug)
         run: cargo build --verbose --locked
