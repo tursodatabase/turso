@@ -117,30 +117,46 @@ fn uuid7_ts(args: &[Value]) -> Value {
 
 #[scalar(name = "uuid_str")]
 fn uuid_str(args: &[Value]) -> Value {
-    let Some(blob) = args.first().and_then(|a| a.to_blob()) else {
-        return Value::error_with_message(
-            "wrong number of arguments to function uuid_str()".into(),
-        );
-    };
-    let parsed = uuid::Uuid::from_slice(blob.as_slice())
-        .ok()
-        .map(|u| u.to_string());
-    match parsed {
-        Some(s) => Value::from_text(s),
-        None => Value::null(),
+    match args.first() {
+        Some(arg) => match arg.to_blob() {
+            Some(blob) => {
+                let parsed = uuid::Uuid::from_slice(blob.as_slice())
+                    .ok()
+                    .map(|u| u.to_string());
+                match parsed {
+                    Some(s) => Value::from_text(s),
+                    None => Value::null(),
+                }
+            }
+            None => {
+                // just return Null here if there is an arg but it's not convertable to a blob,
+                // if 'select uuid_str(c) from t' is called on null `c` we don't want to throw err
+                return Value::null();
+            }
+        },
+        None => {
+            return Value::error_with_message(
+                "wrong number of arguments to function uuid_str()".into(),
+            );
+        }
     }
 }
 
 #[scalar(name = "uuid_blob")]
 fn uuid_blob(&self, args: &[Value]) -> Value {
-    let Some(text) = args.first().and_then(|a| a.to_text()) else {
-        return Value::error_with_message(
-            "wrong number of arguments to function uuid_blob()".into(),
-        );
-    };
-    match uuid::Uuid::parse_str(text) {
-        Ok(uuid) => Value::from_blob(uuid.as_bytes().to_vec()),
-        Err(_) => Value::null(),
+    match args.first() {
+        Some(arg) => match arg.to_text() {
+            Some(text) => match uuid::Uuid::parse_str(text) {
+                Ok(uuid) => Value::from_blob(uuid.as_bytes().to_vec()),
+                Err(_) => Value::null(),
+            },
+            None => return Value::null(),
+        },
+        None => {
+            return Value::error_with_message(
+                "wrong number of arguments to function uuid_blob()".into(),
+            );
+        }
     }
 }
 
