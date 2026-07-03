@@ -369,9 +369,9 @@ pub fn sqlite_schema_btree_identity(version: &RowVersion) -> Option<SqliteSchema
     };
 
     let kind = match col0 {
-        ValueRef::Text(type_str) => match type_str.as_str() {
-            "table" => SqliteSchemaBtreeKind::Table,
-            "index" => SqliteSchemaBtreeKind::Index,
+        ValueRef::Text(type_str) => match type_str.as_bytes() {
+            b"table" => SqliteSchemaBtreeKind::Table,
+            b"index" => SqliteSchemaBtreeKind::Index,
             _ => return None,
         },
         _ => panic!("sqlite_schema.type column must be TEXT, got {col0:?}"),

@@ -18,7 +18,7 @@ pub fn parse_vector<'a>(
     match value.value_type() {
         ValueType::Text => operations::text::vector_from_text(
             type_hint.unwrap_or(VectorType::Float32Dense),
-            value.to_text().expect("value must be text"),
+            &value.to_text_str_lossy().expect("value must be text"),
         ),
         ValueType::Blob => {
             let Some(blob) = value.to_blob() else {

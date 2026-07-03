@@ -7952,7 +7952,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                         "sqlite_schema type must be text".to_string(),
                                     ));
                                 };
-                                let row_type = row_type.as_str();
+                                let row_type = row_type.as_bytes();
                                 let val = match record.get_value_opt(3) {
                                     Some(v) => v,
                                     None => {
@@ -7968,25 +7968,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     panic!("Expected integer value for root page, got {val:?}");
                                 };
                                 let sql = match record.get_value_opt(4) {
-                                    Some(ValueRef::Text(v)) => Some(v.as_str()),
+                                    Some(ValueRef::Text(v)) => Some(v.as_bytes()),
                                     _ => None,
                                 };
-                                let is_virtual_table = row_type == "table"
+                                let is_virtual_table = row_type == b"table"
                                     && sql.is_some_and(|sql| {
-                                        contains_ignore_ascii_case!(
-                                            sql.as_bytes(),
-                                            b"create virtual"
-                                        )
+                                        contains_ignore_ascii_case!(sql, b"create virtual")
                                     });
                                 let has_btree = match row_type {
-                                    "index" => true,
-                                    "table" => !is_virtual_table,
+                                    b"index" => true,
+                                    b"table" => !is_virtual_table,
                                     _ => false,
                                 };
                                 if has_btree {
                                     if root_page == 0 {
                                         return Err(LimboError::Corrupt(format!(
-                                            "sqlite_schema root_page=0 for btree {row_type}"
+                                            "sqlite_schema root_page=0 for btree {}",
+                                            String::from_utf8_lossy(row_type)
                                         )));
                                     }
                                     if root_page < 0 {
@@ -8019,7 +8017,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     }
                                 } else if root_page != 0 {
                                     return Err(LimboError::Corrupt(format!(
-                                        "sqlite_schema root_page must be 0 for {row_type}, got {root_page}"
+                                        "sqlite_schema root_page must be 0 for {}, got {root_page}",
+                                        String::from_utf8_lossy(row_type)
                                     )));
                                 }
                                 let rowid_int = rowid.row_id.to_int_or_panic();
@@ -8165,8 +8164,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                             .to_string(),
                                     ));
                                 };
-                                let row_type = row_type.as_str();
-                                if (row_type == "table" || row_type == "index") && root_page > 0 {
+                                let row_type = row_type.as_bytes();
+                                if (row_type == b"table" || row_type == b"index") && root_page > 0 {
                                     dropped_root_pages.insert(root_page);
                                 }
                                 schema_rows.remove(&rowid_int);
@@ -8312,7 +8311,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         for rowid in &sorted_rowids {
             let record = &schema_rows[rowid];
             let ty = match record.get_value_opt(0) {
-                Some(ValueRef::Text(v)) => v.as_str(),
+                Some(ValueRef::Text(v)) => v.to_str_lossy(),
                 _ => {
                     return Err(LimboError::Corrupt(
                         "sqlite_schema type must be text".to_string(),
@@ -8320,7 +8319,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
             };
             let name = match record.get_value_opt(1) {
-                Some(ValueRef::Text(v)) => v.as_str(),
+                Some(ValueRef::Text(v)) => v.to_str_lossy(),
                 _ => {
                     return Err(LimboError::Corrupt(
                         "sqlite_schema name must be text".to_string(),
@@ -8328,7 +8327,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
             };
             let table_name = match record.get_value_opt(2) {
-                Some(ValueRef::Text(v)) => v.as_str(),
+                Some(ValueRef::Text(v)) => v.to_str_lossy(),
                 _ => {
                     return Err(LimboError::Corrupt(
                         "sqlite_schema tbl_name must be text".to_string(),
@@ -8344,7 +8343,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
             };
             let sql = match record.get_value_opt(4) {
-                Some(ValueRef::Text(v)) => Some(v.as_str()),
+                Some(ValueRef::Text(v)) => Some(v.to_str_lossy()),
                 _ => None,
             };
             let attached_resolver = |alias: &str| -> Option<usize> {
@@ -8355,11 +8354,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .map(|(idx, _)| idx)
             };
             fresh.handle_schema_row(
-                ty,
-                name,
-                table_name,
+                &ty,
+                &name,
+                &table_name,
                 root_page,
-                sql,
+                sql.as_deref(),
                 &syms,
                 &mut from_sql_indexes,
                 &mut automatic_indices,

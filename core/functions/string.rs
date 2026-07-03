@@ -12,7 +12,7 @@ use crate::types::Value;
 pub fn exec_repeat(input: &Value, count: &Value) -> Value {
     let s = match input {
         Value::Null => return Value::Null,
-        Value::Text(t) => t.as_str().to_owned(),
+        Value::Text(t) => t.to_str_lossy().into_owned(),
         v => v.to_string(),
     };
     let n = match count {
@@ -22,7 +22,7 @@ pub fn exec_repeat(input: &Value, count: &Value) -> Value {
             let f: f64 = (*f).into();
             f as i64
         }
-        Value::Text(t) => t.as_str().parse::<i64>().unwrap_or(0),
+        Value::Text(t) => t.to_str_lossy().parse::<i64>().unwrap_or(0),
         _ => return Value::Null,
     };
     if n <= 0 {
@@ -51,7 +51,7 @@ pub fn exec_rpad(input: &Value, length: &Value, fill: Option<&Value>) -> Value {
 fn pad(input: &Value, length: &Value, fill: Option<&Value>, on_left: bool) -> Value {
     let s = match input {
         Value::Null => return Value::Null,
-        Value::Text(t) => t.as_str().to_owned(),
+        Value::Text(t) => t.to_str_lossy().into_owned(),
         v => v.to_string(),
     };
     let target_len = match length {
@@ -61,7 +61,7 @@ fn pad(input: &Value, length: &Value, fill: Option<&Value>, on_left: bool) -> Va
             let f: f64 = (*f).into();
             f as i64
         }
-        Value::Text(t) => t.as_str().parse::<i64>().unwrap_or(0),
+        Value::Text(t) => t.to_str_lossy().parse::<i64>().unwrap_or(0),
         _ => return Value::Null,
     };
     if target_len <= 0 {
@@ -78,7 +78,7 @@ fn pad(input: &Value, length: &Value, fill: Option<&Value>, on_left: bool) -> Va
     let fill_str = match fill {
         None => " ".to_string(),
         Some(Value::Null) => return Value::Null,
-        Some(Value::Text(t)) => t.as_str().to_owned(),
+        Some(Value::Text(t)) => t.to_str_lossy().into_owned(),
         Some(v) => v.to_string(),
     };
     let fill_chars: Vec<char> = fill_str.chars().collect();

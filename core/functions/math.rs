@@ -84,7 +84,7 @@ fn value_as_i64(v: &Value) -> Option<i64> {
                 None
             }
         }
-        Value::Text(t) => t.as_str().parse::<i64>().ok(),
+        Value::Text(t) => t.to_str_lossy().parse::<i64>().ok(),
         _ => None,
     }
 }

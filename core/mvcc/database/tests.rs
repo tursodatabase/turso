@@ -988,7 +988,7 @@ fn tamper_db_metadata_row_value(db_path: &str, metadata_root_page: u32, new_valu
     };
     let new_record = ImmutableRecord::from_values(
         &[
-            Value::Text(Text::new(key.as_str().to_string())),
+            Value::Text(Text::from_bytes(key.as_bytes().to_vec())),
             Value::from_i64(new_value),
         ],
         2,
@@ -1016,7 +1016,7 @@ fn tamper_db_metadata_row_value_by_key(
         let ValueRef::Text(key) = key else {
             panic!("metadata key must be text");
         };
-        if key.as_str() != target_key {
+        if key.as_bytes() != target_key.as_bytes() {
             continue;
         }
         let new_record = ImmutableRecord::from_values(
@@ -5427,7 +5427,7 @@ fn test_commit_dep_threaded_abort_cascades() {
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0][0].to_text().unwrap(),
-        "modified",
+        b"modified",
         "reader should have speculatively read the Preparing writer's value"
     );
 
@@ -5445,7 +5445,7 @@ fn test_commit_dep_threaded_abort_cascades() {
         let mut stmt = conn.prepare("SELECT value FROM t WHERE id = 1").unwrap();
         let rows = stmt.run_collect_rows().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0].to_text().unwrap(), "initial");
+        assert_eq!(rows[0][0].to_text().unwrap(), b"initial");
 
         // Reader's INSERT must not be visible (cascade-aborted)
         let mut stmt = conn.prepare("SELECT * FROM t WHERE id = 2").unwrap();
@@ -5533,7 +5533,7 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
     for handle in handles {
         let (rows, commit_result) = handle.join().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0].to_text().unwrap(), "modified");
+        assert_eq!(rows[0][0].to_text().unwrap(), b"modified");
         assert!(
             matches!(commit_result, Err(LimboError::CommitDependencyAborted)),
             "expected CommitDependencyAborted, got: {commit_result:?}",
@@ -5646,7 +5646,7 @@ fn test_commit_dep_threaded_commit_resolves() {
 
     // Reader speculatively read the writer's value
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0].to_text().unwrap(), "committed");
+    assert_eq!(rows[0][0].to_text().unwrap(), b"committed");
 
     // Reader's COMMIT succeeds: dependency resolved by writer's commit
     assert!(
@@ -5660,8 +5660,8 @@ fn test_commit_dep_threaded_commit_resolves() {
         let mut stmt = conn.prepare("SELECT value FROM t ORDER BY id").unwrap();
         let rows = stmt.run_collect_rows().unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0][0].to_text().unwrap(), "committed");
-        assert_eq!(rows[1][0].to_text().unwrap(), "reader_data");
+        assert_eq!(rows[0][0].to_text().unwrap(), b"committed");
+        assert_eq!(rows[1][0].to_text().unwrap(), b"reader_data");
     }
 }
 
@@ -5734,7 +5734,7 @@ fn test_commit_dep_threaded_readonly_abort_cascades() {
     let (rows, commit_result) = reader_handle.join().unwrap();
 
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0].to_text().unwrap(), "modified");
+    assert_eq!(rows[0][0].to_text().unwrap(), b"modified");
 
     // Read-only tx must still fail when its dependency aborts
     assert!(
@@ -6135,7 +6135,7 @@ fn test_exclusive_tx_does_not_deadlock_behind_preparing_concurrent_commit() {
 
     let rows = get_rows(&conn_a, "SELECT key FROM t ORDER BY key");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0].to_text().unwrap(), "a");
+    assert_eq!(rows[0][0].to_text().unwrap(), b"a");
 
     conn_a.close().unwrap();
     conn_b.close().unwrap();
@@ -6223,7 +6223,7 @@ fn test_restart() {
         let record = get_record_value(&row);
         match record.get_value(0).unwrap() {
             ValueRef::Text(text) => {
-                assert_eq!(text.as_str(), "bar");
+                assert_eq!(text.as_bytes(), b"bar");
             }
             _ => panic!("Expected Text value"),
         }
@@ -6250,7 +6250,7 @@ fn test_connection_sees_other_connection_changes() {
     let mut stmt = conn1.query("SELECT * FROM test_table").unwrap().unwrap();
     stmt.run_with_row_callback(|row| {
         let text = row.get_value(1).to_text().unwrap();
-        assert_eq!(text, "text_877");
+        assert_eq!(text, b"text_877");
         Ok(())
     })
     .unwrap();
@@ -12877,7 +12877,7 @@ fn test_mvcc_encrypted_log_recovery_and_wrong_key() {
             .unwrap();
         let record = get_record_value(&row);
         match record.get_value(0).unwrap() {
-            ValueRef::Text(text) => assert_eq!(text.as_str(), "encrypted_value"),
+            ValueRef::Text(text) => assert_eq!(text.as_bytes(), b"encrypted_value"),
             other => panic!("Expected Text, got {other:?}"),
         }
         conn.close().unwrap();

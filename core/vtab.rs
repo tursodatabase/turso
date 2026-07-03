@@ -710,7 +710,7 @@ mod tests {
             .into_iter()
             .map(|cols| {
                 let key = match &cols[0] {
-                    Value::Text(t) => t.as_str().to_string(),
+                    Value::Text(t) => t.to_str_lossy().into_owned(),
                     other => panic!("unexpected key type {other:?}"),
                 };
                 let value = match &cols[1] {

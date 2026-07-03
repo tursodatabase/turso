@@ -212,8 +212,9 @@ fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
         Value::Numeric(Numeric::Integer(i)) => Ok(BigDecimal::from(*i)),
         Value::Numeric(Numeric::Float(f)) => BigDecimal::from_str(&f.to_string())
             .map_err(|_| LimboError::Constraint(format!("invalid numeric value: {f}"))),
-        Value::Text(t) => BigDecimal::from_str(&t.value)
-            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: \"{}\"", t.value))),
+        Value::Text(t) => BigDecimal::from_str(&t.to_str_lossy()).map_err(|_| {
+            LimboError::Constraint(format!("invalid numeric value: \"{}\"", t.to_str_lossy()))
+        }),
         Value::Blob(b) => crate::numeric::decimal::blob_to_bigdecimal(b),
         _ => Err(LimboError::Constraint(format!(
             "cannot convert to numeric: \"{val}\""
@@ -250,7 +251,7 @@ fn make_sort_comparator(
             std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
                 fn reverse_str(v: &ValueRef) -> String {
                     match v {
-                        ValueRef::Text(t) => t.to_string().chars().rev().collect(),
+                        ValueRef::Text(t) => t.to_str_lossy().chars().rev().collect(),
                         _ => String::new(),
                     }
                 }
@@ -275,7 +276,7 @@ fn make_sort_comparator(
                                 None
                             }
                         }
-                        ValueRef::Text(t) => t.to_string().parse::<u64>().ok(),
+                        ValueRef::Text(t) => t.to_str_lossy().parse::<u64>().ok(),
                         _ => None,
                     }
                 }
@@ -302,8 +303,8 @@ fn make_sort_comparator(
                             .unwrap_or(Ordering::Equal)
                     }
                     (ValueRef::Text(a_text), ValueRef::Text(b_text)) => {
-                        let a_vals = crate::vdbe::array::parse_text_array(a_text);
-                        let b_vals = crate::vdbe::array::parse_text_array(b_text);
+                        let a_vals = crate::vdbe::array::parse_text_array(&a_text.to_str_lossy());
+                        let b_vals = crate::vdbe::array::parse_text_array(&b_text.to_str_lossy());
                         match (a_vals, b_vals) {
                             (Some(av), Some(bv)) => {
                                 let a_blob = crate::vdbe::array::values_to_record_blob(&av)?;
@@ -340,7 +341,7 @@ fn compare_with_collation(
             if let Some(comparator) = collation_comparator {
                 comparator(&lhs.as_ref(), &rhs.as_ref())?
             } else if let Some(coll) = collation {
-                coll.compare_strings(lhs_text.as_str(), rhs_text.as_str())
+                coll.compare_strings(lhs_text.as_bytes(), rhs_text.as_bytes())
             } else {
                 lhs.cmp(rhs)
             }
@@ -365,8 +366,8 @@ where
         if let (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) = (lhs, rhs) {
             return program.connection.compare_external_collation(
                 collation,
-                lhs_text.as_str(),
-                rhs_text.as_str(),
+                &lhs_text.to_str_lossy(),
+                &rhs_text.to_str_lossy(),
             );
         }
     }
@@ -2152,7 +2153,7 @@ pub fn op_array_encode(
     // Extract elements from either blob (MakeArray) or text (JSON literal)
     let raw_elements = match val {
         Value::Blob(b) => array_values_from_blob(b).ok(),
-        Value::Text(text) => parse_text_array(text.as_str()),
+        Value::Text(text) => parse_text_array(&text.to_str_lossy()),
         _ => None,
     };
     let Some(raw_elements) = raw_elements else {
@@ -2290,10 +2291,10 @@ pub fn op_array_element(
                     // contain invalid UTF-8 (from_utf8_unchecked in the
                     // record decoder). Validate and demote to blob if needed.
                     if let ValueRef::Text(t) = &vref {
-                        if t.value.as_bytes().iter().any(|&b| b > 0x7F)
-                            && std::str::from_utf8(t.value.as_bytes()).is_err()
+                        if t.value.iter().any(|&b| b > 0x7F)
+                            && std::str::from_utf8(t.value).is_err()
                         {
-                            return Value::Blob(t.value.as_bytes().to_vec());
+                            return Value::Blob(t.value.to_vec());
                         }
                     }
                     vref.to_owned()
@@ -5977,7 +5978,7 @@ fn update_agg_payload(
                     apply_kbn_step(sum_val, f64::from(*f), &mut sum_state);
                 }
                 Value::Text(t) => {
-                    let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
+                    let (parse_result, parsed_number) = try_for_float(t.as_bytes());
                     match parsed_number {
                         ParsedNumber::Integer(i) => {
                             if matches!(parse_result, NumericParseResult::ValidPrefixOnly) {
@@ -6072,7 +6073,7 @@ fn update_agg_payload(
                     _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
                 },
                 Value::Text(t) => {
-                    let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
+                    let (parse_result, parsed_number) = try_for_float(t.as_bytes());
                     handle_text_sum(acc, &mut sum_state, parsed_number, parse_result, false);
                 }
                 Value::Blob(b) => {
@@ -6360,7 +6361,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
 fn ordered_set_compare(a: &Value, b: &Value, collation: CollationSeq) -> std::cmp::Ordering {
     match (a, b) {
         (Value::Text(lhs), Value::Text(rhs)) => {
-            collation.compare_strings(lhs.as_str(), rhs.as_str())
+            collation.compare_strings(lhs.as_bytes(), rhs.as_bytes())
         }
         _ => a.cmp(b),
     }
@@ -7408,19 +7409,19 @@ pub fn op_function(
                 // However, Rust strings uses utf-8
                 // so the behavior at the moment is slightly different
                 // To the way blobs are parsed here in SQLite.
-                let indent = match indent {
+                let indent: String = match indent {
                     Some(value) => match value.get_value() {
-                        Value::Text(text) => text.as_str(),
-                        Value::Numeric(Numeric::Integer(val)) => &val.to_string(),
-                        Value::Numeric(Numeric::Float(val)) => &f64::from(*val).to_string(),
-                        Value::Blob(val) => &String::from_utf8_lossy(val),
-                        _ => "    ",
+                        Value::Text(text) => text.to_str_lossy().into_owned(),
+                        Value::Numeric(Numeric::Integer(val)) => val.to_string(),
+                        Value::Numeric(Numeric::Float(val)) => f64::from(*val).to_string(),
+                        Value::Blob(val) => String::from_utf8_lossy(val).into_owned(),
+                        _ => "    ".to_string(),
                     },
                     // If the second argument is omitted or is NULL, then indentation is four spaces per level
-                    None => "    ",
+                    None => "    ".to_string(),
                 };
 
-                let json_str = get_json(json_value.get_value(), Some(indent))?;
+                let json_str = get_json(json_value.get_value(), Some(indent.as_str()))?;
                 state.registers[*dest].set_value(json_str);
             }
             JsonFunc::JsonSet => {
@@ -7475,7 +7476,7 @@ pub fn op_function(
                 };
                 let result = reg_value_argument
                     .get_value()
-                    .exec_cast(reg_value_type.as_str());
+                    .exec_cast(&reg_value_type.to_str_lossy());
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Changes => {
@@ -7518,7 +7519,7 @@ pub fn op_function(
                     state.registers[*dest].set_null();
                 } else {
                     let pattern_cow = match pattern_value {
-                        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                        Value::Text(s) => s.to_str_lossy(),
                         v => match v.exec_cast("TEXT") {
                             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                             _ => unreachable!("Cast to TEXT should yield Text"),
@@ -7526,7 +7527,7 @@ pub fn op_function(
                     };
 
                     let match_cow = match match_value {
-                        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                        Value::Text(s) => s.to_str_lossy(),
                         v => match v.exec_cast("TEXT") {
                             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                             _ => unreachable!("Cast to TEXT should yield Text"),
@@ -7573,7 +7574,7 @@ pub fn op_function(
                             }
                             _ => {
                                 let escape_cow = match escape_value {
-                                    Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                                    Value::Text(s) => s.to_str_lossy(),
                                     v => match v.exec_cast("TEXT") {
                                         Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                         _ => unreachable!("Cast to TEXT should yield Text"),
@@ -7597,7 +7598,7 @@ pub fn op_function(
                     } else {
                         // 3. Prepare Pattern and Text
                         let pattern_cow = match pattern_value {
-                            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                            Value::Text(s) => s.to_str_lossy(),
                             v => match v.exec_cast("TEXT") {
                                 Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                 _ => unreachable!("Cast to TEXT should yield Text"),
@@ -7605,7 +7606,7 @@ pub fn op_function(
                         };
 
                         let match_cow = match match_value {
-                            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                            Value::Text(s) => s.to_str_lossy(),
                             v => match v.exec_cast("TEXT") {
                                 Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                 _ => unreachable!("Cast to TEXT should yield Text"),
@@ -7631,7 +7632,7 @@ pub fn op_function(
             }
             ScalarFunc::CurrVal => {
                 let seq_name = match state.registers[*start_reg].get_value() {
-                    Value::Text(t) => t.as_str().to_string(),
+                    Value::Text(t) => t.to_str_lossy().into_owned(),
                     _ => {
                         return Err(crate::LimboError::ParseError(
                             "currval() requires a text argument".to_string(),
@@ -7671,7 +7672,7 @@ pub fn op_function(
                 // requirement. The autonomous-tx mechanism (planned for MVCC
                 // concurrency in a follow-up) will subsume serialization.
                 let seq_name = match state.registers[*start_reg].get_value() {
-                    Value::Text(t) => t.as_str().to_string(),
+                    Value::Text(t) => t.to_str_lossy().into_owned(),
                     _ => {
                         return Err(crate::LimboError::ParseError(
                             "setval() requires a text argument".to_string(),
@@ -7977,7 +7978,7 @@ pub fn op_function(
                     };
                     let table = {
                         let schema = program.connection.schema.read();
-                        match schema.get_table(table.as_str()) {
+                        match schema.get_table(&table.to_str_lossy()) {
                             Some(table) => table,
                             None => {
                                 return Err(LimboError::InvalidArgument(format!(
@@ -7993,7 +7994,7 @@ pub fn op_function(
 
                         let name = column.name.as_ref().expect("column should have a name");
                         let name_json = json::convert_ref_dbtype_to_jsonb(
-                            ValueRef::Text(TextRef::new(name, TextSubtype::Text)),
+                            ValueRef::Text(TextRef::new(name.as_bytes(), TextSubtype::Text)),
                             json::Conv::ToString,
                         )?;
                         json.append_jsonb_to_end(name_json.data());
@@ -8039,7 +8040,7 @@ pub fn op_function(
                         ));
                     };
                     let mut columns_json_array =
-                        json::jsonb::Jsonb::from_str(columns_str.as_str())?;
+                        json::jsonb::Jsonb::from_str(&columns_str.to_str_lossy())?;
                     let columns_len = columns_json_array.array_len()?;
 
                     let mut payload_iterator = ValueIterator::new(bin_record.as_slice())?;
@@ -8105,8 +8106,8 @@ pub fn op_function(
                 };
 
                 return_if_io!(program.connection.attach_database(
-                    filename_str.as_str(),
-                    dbname_str.as_str(),
+                    &filename_str.to_str_lossy(),
+                    &dbname_str.to_str_lossy(),
                     state.active_op_state.attach(),
                 ));
                 // Sequence descriptors for the attached database are
@@ -8131,7 +8132,9 @@ pub fn op_function(
                 };
 
                 // Call the detach_database method on the connection
-                program.connection.detach_database(dbname_str.as_str())?;
+                program
+                    .connection
+                    .detach_database(&dbname_str.to_str_lossy())?;
 
                 // Set result to NULL (detach doesn't return a value)
                 state.registers[*dest].set_null();
@@ -8222,7 +8225,7 @@ pub fn op_function(
             ScalarFunc::SequenceWatermark => {
                 assert_eq!(arg_count, 1);
                 let sequence_name = match state.registers[*start_reg].get_value() {
-                    Value::Text(text) => text.as_str(),
+                    Value::Text(text) => text.to_str_lossy(),
                     Value::Null => {
                         state.registers[*dest].set_value(Value::Null);
                         return Ok(InsnFunctionStepResult::Step);
@@ -8240,9 +8243,9 @@ pub fn op_function(
                             crate::util::normalize_ident(sequence_name),
                         )
                     } else {
-                        (MAIN_DB_ID, crate::util::normalize_ident(sequence_name))
+                        (MAIN_DB_ID, crate::util::normalize_ident(&sequence_name))
                     };
-                program.connection.find_sequence(sequence_name)?;
+                program.connection.find_sequence(&sequence_name)?;
                 let watermark = program
                     .connection
                     .mv_store_for_db(db_id)
@@ -8424,7 +8427,7 @@ pub fn op_function(
                         }
                     },
                     Value::Text(t) => {
-                        let v = &t.value;
+                        let v = t.to_str_lossy();
                         match v.to_ascii_lowercase().as_str() {
                             "true" | "t" | "yes" | "on" | "1" => Value::from_i64(1),
                             "false" | "f" | "no" | "off" | "0" => Value::from_i64(0),
@@ -8459,7 +8462,7 @@ pub fn op_function(
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
                     Value::Text(t) => {
-                        let v = &t.value;
+                        let v = t.to_str_lossy();
                         v.parse::<std::net::IpAddr>().map_err(|_| {
                             LimboError::Constraint(format!("invalid input for type inet: \"{v}\""))
                         })?;
@@ -8506,7 +8509,7 @@ pub fn op_function(
                         let text = match other {
                             Value::Numeric(Numeric::Integer(i)) => i.to_string(),
                             Value::Numeric(Numeric::Float(f)) => f.to_string(),
-                            Value::Text(t) => t.value.to_string(),
+                            Value::Text(t) => t.to_str_lossy().into_owned(),
                             _ => {
                                 return Err(LimboError::Constraint(format!(
                                     "invalid input for type numeric: \"{other}\""
@@ -8878,7 +8881,9 @@ pub fn op_function(
                 AlterTableFunc::RenameTable => {
                     let rename_from = {
                         match &state.registers[*start_reg + 5].get_value() {
-                            Value::Text(rename_from) => normalize_ident(rename_from.as_str()),
+                            Value::Text(rename_from) => {
+                                normalize_ident(&rename_from.to_str_lossy())
+                            }
                             _ => panic!("rename_from parameter should be TEXT"),
                         }
                     };
@@ -8889,7 +8894,7 @@ pub fn op_function(
                             _ => panic!("rename_to parameter should be TEXT"),
                         }
                     };
-                    let rename_to = normalize_ident(original_rename_to.as_str());
+                    let rename_to = normalize_ident(&original_rename_to.to_str_lossy());
 
                     let new_name = if let Some(column) =
                         &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
@@ -8912,7 +8917,7 @@ pub fn op_function(
                             break 'sql None;
                         };
 
-                        let mut parser = Parser::new(sql.as_str().as_bytes());
+                        let mut parser = Parser::new(sql.as_bytes());
                         let ast::Cmd::Stmt(stmt) =
                             parser.next().expect("parser should have next item")?
                         else {
@@ -8983,7 +8988,7 @@ pub fn op_function(
                                         any_change |= rewrite_fk_parent_table_if_needed(
                                             clause,
                                             &rename_from,
-                                            original_rename_to.as_str(),
+                                            &original_rename_to.to_str_lossy(),
                                         );
                                     }
                                 }
@@ -8991,7 +8996,7 @@ pub fn op_function(
                                     any_change |= rewrite_inline_col_fk_target_if_needed(
                                         col,
                                         &rename_from,
-                                        original_rename_to.as_str(),
+                                        &original_rename_to.to_str_lossy(),
                                     );
                                 }
 
@@ -9116,7 +9121,7 @@ pub fn op_function(
                                     rewrite_check_expr_table_refs(
                                         when,
                                         &rename_from,
-                                        original_rename_to.as_str(),
+                                        &original_rename_to.to_str_lossy(),
                                     );
                                 }
 
@@ -9125,7 +9130,7 @@ pub fn op_function(
                                     rewrite_trigger_cmd_table_refs(
                                         cmd,
                                         &rename_from,
-                                        original_rename_to.as_str(),
+                                        &original_rename_to.to_str_lossy(),
                                     );
                                 }
 
@@ -9153,7 +9158,7 @@ pub fn op_function(
                 AlterTableFunc::AlterColumn | AlterTableFunc::RenameColumn => {
                     let table = {
                         match &state.registers[*start_reg + 5].get_value() {
-                            Value::Text(rename_to) => normalize_ident(rename_to.as_str()),
+                            Value::Text(rename_to) => normalize_ident(&rename_to.to_str_lossy()),
                             _ => panic!("table parameter should be TEXT"),
                         }
                     };
@@ -9164,11 +9169,11 @@ pub fn op_function(
                             _ => panic!("rename_from parameter should be TEXT"),
                         }
                     };
-                    let rename_from = normalize_ident(original_rename_from.as_str());
+                    let rename_from = normalize_ident(&original_rename_from.to_str_lossy());
 
                     let column_def = {
                         match &state.registers[*start_reg + 7].get_value() {
-                            Value::Text(column_def) => column_def.as_str(),
+                            Value::Text(column_def) => column_def.to_str_lossy(),
                             _ => panic!("rename_to parameter should be TEXT"),
                         }
                     };
@@ -9183,7 +9188,7 @@ pub fn op_function(
                             break 'sql None;
                         };
 
-                        let mut parser = Parser::new(sql.as_str().as_bytes());
+                        let mut parser = Parser::new(sql.as_bytes());
                         let ast::Cmd::Stmt(stmt) =
                             parser.next().expect("parser should have next item")?
                         else {
@@ -10774,7 +10779,7 @@ fn coerce_register_to_integer(state: &mut ProgramState, reg: usize) -> Result<bo
     let converted = match state.registers[reg].get_value() {
         Value::Numeric(Numeric::Integer(_)) => return Ok(true),
         Value::Numeric(Numeric::Float(f)) => cast_real_to_integer(f64::from(*f)).ok(),
-        Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
+        Value::Text(text) => match checked_cast_text_to_numeric(&text.to_str_lossy(), true) {
             Ok(Value::Numeric(Numeric::Integer(i))) => Some(i),
             Ok(Value::Numeric(Numeric::Float(f))) => cast_real_to_integer(f64::from(f)).ok(),
             _ => None,
@@ -11708,7 +11713,7 @@ pub fn op_sequence_compute_next(
     );
 
     let seq_name = match state.registers[*seq_name_reg].get_value() {
-        Value::Text(t) => t.as_str().to_string(),
+        Value::Text(t) => t.to_str_lossy().into_owned(),
         _ => {
             return Err(crate::LimboError::ParseError(
                 "SequenceComputeNext: seq_name_reg must be text".to_string(),
@@ -11824,7 +11829,7 @@ pub fn op_set_sequence_currval(
     );
 
     let seq_name = match state.registers[*seq_name_reg].get_value() {
-        Value::Text(t) => t.as_str().to_string(),
+        Value::Text(t) => t.to_str_lossy().into_owned(),
         _ => {
             return Err(crate::LimboError::ParseError(
                 "SetSequenceCurrval: seq_name_reg must be text".to_string(),
@@ -11867,7 +11872,7 @@ pub fn op_sequence_track_allocation(
     );
 
     let seq_name = match state.registers[*seq_name_reg].get_value() {
-        Value::Text(t) => t.as_str().to_string(),
+        Value::Text(t) => t.to_str_lossy().into_owned(),
         _ => {
             return Err(crate::LimboError::ParseError(
                 "SequenceTrackAllocation: seq_name_reg must be text".to_string(),
@@ -11959,7 +11964,7 @@ pub fn op_sequence_register_allocation(
     };
 
     let seq_name = match state.registers[*seq_name_reg].get_value() {
-        Value::Text(t) => t.as_str().to_string(),
+        Value::Text(t) => t.to_str_lossy().into_owned(),
         _ => {
             return Err(crate::LimboError::ParseError(
                 "SequenceRegisterAllocation: seq_name_reg must be text".to_string(),
@@ -13121,7 +13126,7 @@ pub fn op_add_imm(
     let lhs = match current_value {
         Value::Numeric(Numeric::Integer(i)) => *i,
         Value::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(*f)),
-        Value::Text(s) => crate::numeric::str_to_i64(s.as_str()).unwrap_or(0),
+        Value::Text(s) => crate::numeric::str_to_i64(s.to_str_lossy()).unwrap_or(0),
         Value::Blob(b) => {
             crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
         }
@@ -15663,7 +15668,8 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                 }
 
                 if let Value::Text(t) = value {
-                    let text = trim_ascii_whitespace(t.as_str());
+                    let text_lossy = t.to_str_lossy();
+                    let text = trim_ascii_whitespace(&text_lossy);
 
                     // Handle hex numbers - they shouldn't be converted
                     if text.starts_with("0x") {
@@ -15715,7 +15721,8 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                     return true;
                 }
                 Value::Text(t) => {
-                    let text = trim_ascii_whitespace(t.as_str());
+                    let text_lossy = t.to_str_lossy();
+                    let text = trim_ascii_whitespace(&text_lossy);
                     if text.starts_with("0x") {
                         return false;
                     }
@@ -15807,7 +15814,7 @@ pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
     match value {
         ValueRef::Numeric(Numeric::Integer(i)) => i,
         ValueRef::Numeric(Numeric::Float(f)) => real_to_i64(f64::from(f)),
-        ValueRef::Text(t) => crate::numeric::str_to_i64(t.as_str()).unwrap_or(0),
+        ValueRef::Text(t) => crate::numeric::str_to_i64(t.to_str_lossy()).unwrap_or(0),
         ValueRef::Blob(b) => {
             crate::numeric::str_to_i64(String::from_utf8_lossy(b).as_ref()).unwrap_or(0)
         }
@@ -17173,7 +17180,7 @@ mod tests {
             match register {
                 Register::Value(Value::Text(t)) => {
                     assert_eq!(
-                        t.as_str().chars().count(),
+                        t.to_str_lossy().chars().count(),
                         expected_len,
                         "String '{input}' should have {expected_len} characters",
                     );
@@ -17195,7 +17202,11 @@ mod tests {
             apply_affinity_char(&mut register, Affinity::Integer);
             match register {
                 Register::Value(Value::Text(t)) => {
-                    assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
+                    assert_eq!(
+                        t.as_bytes(),
+                        input.as_bytes(),
+                        "Unexpected conversion for '{input}'"
+                    );
                 }
                 other => {
                     panic!("'{input}' should remain text, got {other:?}");
@@ -17206,7 +17217,11 @@ mod tests {
             apply_affinity_char(&mut register, Affinity::Numeric);
             match register {
                 Register::Value(Value::Text(t)) => {
-                    assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
+                    assert_eq!(
+                        t.as_bytes(),
+                        input.as_bytes(),
+                        "Unexpected conversion for '{input}'"
+                    );
                 }
                 other => {
                     panic!("'{input}' should remain text, got {other:?}");

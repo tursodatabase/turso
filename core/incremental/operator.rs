@@ -593,9 +593,9 @@ mod tests {
         for (row, weight) in &state.changes {
             assert_eq!(*weight, 1);
             if let Value::Text(team) = &row.values[0] {
-                if team.as_str() == "red" {
+                if team.as_bytes() == b"red" {
                     red_sum = Some(&row.values[1]);
-                } else if team.as_str() == "blue" {
+                } else if team.as_bytes() == b"blue" {
                     blue_sum = Some(&row.values[1]);
                 }
             }
@@ -645,7 +645,7 @@ mod tests {
 
         for (row, weight) in &output_delta.changes {
             if let Value::Text(team) = &row.values[0] {
-                assert_eq!(team.as_str(), "red", "Only red team should have changes");
+                assert_eq!(team.as_bytes(), b"red", "Only red team should have changes");
 
                 if *weight == -1 {
                     // Retraction of old value
@@ -3714,7 +3714,7 @@ mod tests {
 
             // Extract name (column 1 from left) and quantity (column 3 from right)
             let name = match &row.values[1] {
-                Value::Text(t) => t.as_str().to_string(),
+                Value::Text(t) => t.to_str_lossy().into_owned(),
                 _ => panic!("Expected text value for name"),
             };
             let quantity = match &row.values[4] {
@@ -4546,7 +4546,7 @@ mod tests {
             .iter()
             .map(|(row, _)| {
                 let category = match &row.values[0] {
-                    Value::Text(s) => s.value.clone().into_owned(),
+                    Value::Text(s) => s.to_str_lossy().into_owned(),
                     _ => panic!("Expected text for category"),
                 };
                 let value = match &row.values[1] {

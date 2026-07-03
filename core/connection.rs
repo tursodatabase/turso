@@ -4095,8 +4095,8 @@ impl Connection {
 
     pub(crate) fn custom_collation_compare(
         external: &function::ExternalCollation,
-        left: &str,
-        right: &str,
+        left: &[u8],
+        right: &[u8],
     ) -> CmpOrdering {
         let result = unsafe {
             (external.callback)(
@@ -4116,7 +4116,7 @@ impl Connection {
         Arc::new(move |left, right| {
             Ok(match (left, right) {
                 (crate::ValueRef::Text(left), crate::ValueRef::Text(right)) => {
-                    Self::custom_collation_compare(&external, left.as_str(), right.as_str())
+                    Self::custom_collation_compare(&external, left.as_bytes(), right.as_bytes())
                 }
                 _ => left.partial_cmp(right).unwrap_or(CmpOrdering::Equal),
             })
@@ -4138,7 +4138,11 @@ impl Connection {
         right: &str,
     ) -> Result<CmpOrdering> {
         let external = self.get_external_collation(collation)?;
-        Ok(Self::custom_collation_compare(&external, left, right))
+        Ok(Self::custom_collation_compare(
+            &external,
+            left.as_bytes(),
+            right.as_bytes(),
+        ))
     }
 
     pub(crate) fn database_ptr(&self) -> usize {
@@ -4781,9 +4785,9 @@ mod tests {
         }
     }
 
-    fn text_value(value: &Value) -> &str {
+    fn text_value(value: &Value) -> String {
         match value {
-            Value::Text(text) => text.as_str(),
+            Value::Text(text) => text.to_str_lossy().into_owned(),
             other => panic!("expected text value, got {other:?}"),
         }
     }

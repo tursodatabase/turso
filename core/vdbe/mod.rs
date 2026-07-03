@@ -2739,7 +2739,7 @@ impl<'a> FromValueRow<'a> for f64 {
 impl<'a> FromValueRow<'a> for String {
     fn from_value(value: &'a Value) -> Result<Self> {
         match value {
-            Value::Text(s) => Ok(s.as_str().to_string()),
+            Value::Text(s) => Ok(s.to_str_lossy().into_owned()),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
     }
@@ -2748,7 +2748,8 @@ impl<'a> FromValueRow<'a> for String {
 impl<'a> FromValueRow<'a> for &'a str {
     fn from_value(value: &'a Value) -> Result<Self> {
         match value {
-            Value::Text(s) => Ok(s.as_str()),
+            Value::Text(s) => std::str::from_utf8(s.as_bytes())
+                .map_err(|_| LimboError::ConversionError("Expected valid UTF-8 text value".into())),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
     }
@@ -2992,27 +2993,16 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 }
                 self.set_data_section(&data[content_size..]);
                 let text_data = &data[..content_size];
-                // SAFETY: TEXT serial type contains valid UTF-8
-                let text_str = if cfg!(debug_assertions) {
-                    match std::str::from_utf8(text_data) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Some(Err(LimboError::InternalError(format!(
-                                "Invalid UTF-8 in TEXT serial type: {e}"
-                            ))));
-                        }
-                    }
-                } else {
-                    unsafe { std::str::from_utf8_unchecked(text_data) }
-                };
                 match dest {
                     Register::Value(Value::Text(existing_text)) => {
-                        if let Err(err) = existing_text.do_extend(&text_str) {
+                        let text_ref =
+                            crate::types::TextRef::new(text_data, crate::types::TextSubtype::Text);
+                        if let Err(err) = existing_text.do_extend(&text_ref) {
                             return Some(Err(err));
                         }
                     }
                     _ => {
-                        if let Err(err) = dest.set_text(Text::new(text_str.to_string())) {
+                        if let Err(err) = dest.set_text(Text::from_bytes(text_data.to_vec())) {
                             return Some(Err(err));
                         }
                     }
@@ -3120,7 +3110,7 @@ mod shuttle_tests {
                         Register::Value(Value::Numeric(Numeric::Integer(42)))
                     ));
                     if let Register::Value(Value::Text(t)) = &state.registers[1] {
-                        assert_eq!(t.as_str(), "test");
+                        assert_eq!(t.as_bytes(), b"test");
                     } else {
                         panic!("Expected text value");
                     }

@@ -678,10 +678,7 @@ fn convert_value_to_core(value: &Value) -> CoreValue {
         Value::None | Value::Null => CoreValue::Null,
         Value::Integer { value } => CoreValue::from_i64(*value),
         Value::Float { value } => CoreValue::from_f64(*value),
-        Value::Text { value } => CoreValue::Text(turso_core::types::Text {
-            value: std::borrow::Cow::Owned(value.clone()),
-            subtype: turso_core::types::TextSubtype::Text,
-        }),
+        Value::Text { value } => CoreValue::Text(turso_core::types::Text::new(value.clone())),
         Value::Blob { value } => CoreValue::Blob(value.to_vec()),
     }
 }
@@ -694,7 +691,7 @@ fn convert_core_to_value(value: CoreValue) -> Value {
             value: f64::from(v),
         },
         CoreValue::Text(t) => Value::Text {
-            value: t.value.to_string(),
+            value: t.to_str_lossy().into_owned(),
         },
         CoreValue::Blob(b) => Value::Blob {
             value: Bytes::from(b),

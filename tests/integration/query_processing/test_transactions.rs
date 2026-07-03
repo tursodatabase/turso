@@ -399,7 +399,7 @@ fn test_mvcc_update_same_row_twice(tmp_db: TempDatabase) {
     let Value::Text(value) = &row[0] else {
         panic!("expected text value");
     };
-    assert_eq!(value.as_str(), "second");
+    assert_eq!(value.as_bytes(), b"second");
 
     conn1
         .execute("UPDATE test SET value = 'third' WHERE id = 1")
@@ -413,7 +413,7 @@ fn test_mvcc_update_same_row_twice(tmp_db: TempDatabase) {
     let Value::Text(value) = &row[0] else {
         panic!("expected text value");
     };
-    assert_eq!(value.as_str(), "third");
+    assert_eq!(value.as_bytes(), b"third");
 }
 
 #[test]
@@ -1584,8 +1584,8 @@ fn test_wal_savepoint_rollback_on_constraint_violation() {
         panic!("Expected text value");
     };
     assert_eq!(
-        val.as_str(),
-        &padding,
+        val.as_bytes(),
+        padding.as_bytes(),
         "Row should have original value after failed UPDATE rollback"
     );
 

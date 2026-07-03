@@ -29,7 +29,7 @@ pub fn encode_value(value: &Value, output: &mut Vec<u8>) {
         }
         Value::Text(text) => {
             output.push(b'3');
-            output.extend_from_slice(text.as_str().as_bytes());
+            output.extend_from_slice(text.as_bytes());
         }
         Value::Blob(b) => {
             output.push(b'4');

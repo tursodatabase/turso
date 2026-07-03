@@ -1569,7 +1569,9 @@ mod tests {
                 let mut rows = Vec::new();
                 let mut stmt = conn3.prepare("SELECT name FROM sqlite_master").unwrap();
                 while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
-                    rows.push(row.get_value(0).to_text().unwrap().to_string());
+                    rows.push(
+                        String::from_utf8_lossy(row.get_value(0).to_text().unwrap()).into_owned(),
+                    );
                 }
                 assert_eq!(
                     rows,
@@ -1661,7 +1663,7 @@ mod tests {
                     .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
                     .unwrap();
                 let row = run_stmt_once(&coro, &mut stmt).await.unwrap().unwrap();
-                let sql = row.get_value(0).to_text().unwrap().to_string();
+                let sql = String::from_utf8_lossy(row.get_value(0).to_text().unwrap()).into_owned();
                 assert!(
                     sql.contains("z"),
                     "schema should contain z column after ALTER TABLE: {sql}"
@@ -2235,7 +2237,7 @@ mod tests {
                     .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
                     .unwrap();
                 let row = run_stmt_once(&coro, &mut stmt).await.unwrap().unwrap();
-                let sql = row.get_value(0).to_text().unwrap().to_string();
+                let sql = String::from_utf8_lossy(row.get_value(0).to_text().unwrap()).into_owned();
                 assert!(
                     sql.contains("z"),
                     "schema should still contain z column: {sql}"

@@ -1088,10 +1088,11 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     content_size
                 ))
             })?;
-            // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-            let val = unsafe { std::str::from_utf8_unchecked(data) };
+            // TEXT is stored as raw bytes; it is not required to be valid UTF-8
+            // (SQLite permits e.g. CAST(X'FF' AS TEXT)). Codepoint semantics are
+            // applied lazily by the consumer via TextRef::to_str_lossy.
             Ok((
-                ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
+                ValueRef::Text(TextRef::new(data, TextSubtype::Text)),
                 content_size,
             ))
         }
@@ -1216,10 +1217,10 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-                let val = unsafe { std::str::from_utf8_unchecked(data) };
+                // TEXT is stored as raw bytes; see read_value for why it is not
+                // validated as UTF-8 here.
                 Ok((
-                    ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new(data, TextSubtype::Text)),
                     content_size,
                 ))
             }
