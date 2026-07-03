@@ -2301,7 +2301,7 @@ impl Program {
                     // Commit dirty pages to WAL, then end write+read transactions.
                     // We disable auto-checkpoint and avoid pager.commit_tx() since
                     // the checkpoint logic can leave read locks held.
-                    match attached_pager.commit_dirty_pages(
+                    match attached_pager.commit_wal(
                         WalAutoActions::empty(),
                         SyncMode::Normal,
                         false,
@@ -2309,7 +2309,7 @@ impl Program {
                         Ok(IOResult::Done(_)) => {}
                         Ok(IOResult::IO(io)) => {
                             // IO pending — return so the caller can yield and re-enter.
-                            // commit_dirty_pages tracks its own internal state, so calling
+                            // commit_wal tracks its own internal state, so calling
                             // it again on re-entry will resume correctly.
                             return Ok(IOResult::IO(io));
                         }
@@ -2320,7 +2320,7 @@ impl Program {
                     connection.publish_database_schema(db_id);
                     attached_pager.end_write_tx();
                     attached_pager.end_read_tx();
-                    attached_pager.commit_dirty_pages_end();
+                    attached_pager.commit_wal_end();
                 } else {
                     // Discard any local schema changes on rollback
                     connection.database_schemas().write().remove(&db_id);

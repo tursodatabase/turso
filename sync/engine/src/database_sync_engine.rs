@@ -1093,7 +1093,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             assert!(!replay.conn().get_auto_commit());
         }
 
-        // Final: now we did all necessary operations as one big transaction and we are ready to commit
+        // Final: now we did all necessary operations as one big transaction and we are ready to commit.
+        // wal_insert_end(force_commit=true) fsyncs the WAL before returning, so the
+        // caller can durably record this revision as synced in the metadata.
         main_conn.end_nested();
         main_session.wal_session.end(true)?;
 
