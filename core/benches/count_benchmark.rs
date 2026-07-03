@@ -90,6 +90,7 @@ fn drain_turso(db: &Database, stmt: &mut turso_core::Statement) {
     stmt.reset().unwrap();
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_count(criterion: &mut Criterion) {
     let dir = seed_db(N);
     let path = dir.path().join("count.db");
