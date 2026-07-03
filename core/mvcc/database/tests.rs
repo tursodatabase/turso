@@ -3397,13 +3397,6 @@ fn test_checkpoint_stale_boundary_does_not_replay_checkpointed_create_table_afte
     assert_eq!(&rows[0][1].to_string(), "persisted");
 }
 
-/// What this test checks: a checkpoint failure after the durable boundary advanced must not
-/// leave a stale unique-index entry behind after restart recovery plus a later checkpoint.
-/// Why this matters: the torn checkpoint makes the 'old'->'mid' UPDATE durable in the B-tree
-/// but fails before truncating the logical log. On restart that frame is (correctly) skipped
-/// at the replay boundary, so the later 'mid'->'new' UPDATE replays its index delete as a
-/// standalone tombstone; the next checkpoint must still apply that delete to the B-tree, or
-/// the 'mid' autoindex entry survives alongside 'new' for the same rowid.
 #[test]
 fn test_checkpoint_post_durable_failure_then_unique_update_removes_stale_autoindex_entry() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
@@ -3458,10 +3451,6 @@ fn test_checkpoint_post_durable_failure_then_unique_update_removes_stale_autoind
     assert_integrity_ok(&conn);
 }
 
-/// What this test checks: the table-row flavor of the same torn-checkpoint bug. A row insert
-/// made durable by a failed checkpoint must still be deletable after restart: recovery creates
-/// a standalone tombstone for the row, and the next checkpoint must apply that delete to the
-/// B-tree even though the tombstone's inserting frame was truncated from replay.
 #[test]
 fn test_checkpoint_post_durable_failure_then_delete_removes_stale_table_row() {
     let mut db = MvccTestDbNoConn::new_with_random_db();

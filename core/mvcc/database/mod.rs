@@ -8120,11 +8120,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                             TxTimestampOrID::Timestamp(commit_ts),
                                         )),
                                         row: tombstone_row.clone(),
-                                        // The version this delete ends was not replayed, so its
-                                        // frame is at or below the durable replay boundary: the
-                                        // deleted row is in the DB file. Mark the tombstone
-                                        // btree-resident so checkpoint applies the delete even
-                                        // though the logged flag predates the row becoming durable.
                                         btree_resident: true,
                                     };
                                     self.insert_version_raw(&mut versions, row_version)?;
@@ -8138,8 +8133,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                         TxTimestampOrID::Timestamp(commit_ts),
                                     )),
                                     row: tombstone_row,
-                                    // Same invariant as above: no replayed version means the
-                                    // deleted row is already durable in the DB file.
                                     btree_resident: true,
                                 };
                                 let versions =
@@ -8237,12 +8230,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     TxTimestampOrID::Timestamp(commit_ts),
                                 )),
                                 row: row.clone(),
-                                // The index entry this delete ends was not replayed, so its
-                                // frame is at or below the durable replay boundary: the entry
-                                // is in the DB file. Mark the tombstone btree-resident so
-                                // checkpoint applies the delete even though the logged flag
-                                // predates the entry becoming durable (e.g. a checkpoint that
-                                // failed after its pager commit).
                                 btree_resident: true,
                             };
                             self.insert_index_version(rowid.table_id, sortable_key, row_version)?;
