@@ -2627,6 +2627,7 @@ crate::alloc::impl_try_clone_via_clone!(
 crate::alloc::impl_try_clone_via_clone!(Column, IndexColumn, CheckConstraint);
 
 impl Schema {
+    #[turso_macros::allocation_site(crate::alloc::SchemaAllocationSite::MakeMut)]
     pub(crate) fn try_make_mut(schema: &mut Arc<Self>) -> Result<&mut Self, TryReserveError> {
         if Arc::get_mut(schema).is_none() {
             *schema = Arc::new(schema.as_ref().try_clone()?);

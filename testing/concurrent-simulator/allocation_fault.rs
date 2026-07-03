@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use turso_core::alloc::{
     AllocError, AllocationSite, ApiAllocator, Global, Layout, MvStoreAllocationSite,
-    MvccCheckpointAllocationSite, SetAllocatorError, TursoAllocBackend,
+    MvccCheckpointAllocationSite, SchemaAllocationSite, SetAllocatorError, TursoAllocBackend,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -216,6 +216,9 @@ fn allocation_site_id(site: AllocationSite) -> u64 {
             MvccCheckpointAllocationSite::CheckpointIndexWriteSet => 9,
             MvccCheckpointAllocationSite::CheckpointMetadataPayload => 10,
             MvccCheckpointAllocationSite::CheckpointSequenceCompactions => 11,
+        },
+        AllocationSite::Schema(site) => match site {
+            SchemaAllocationSite::MakeMut => 14,
         },
     }
 }
