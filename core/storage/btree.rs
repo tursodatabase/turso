@@ -11932,6 +11932,64 @@ mod tests {
             cursor
         }
 
+        /// A peer's insert must invalidate this cursor's cached rightmost
+        /// page id (move_to_rightmost's skip-a-seek optimization). Once the
+        /// peer's appends split the rightmost leaf, a long-lived cursor's
+        /// last() would otherwise trust the stale cache and return the old
+        /// page's last cell instead of the true maximum.
+        #[test]
+        fn peer_write_invalidates_rightmost_page_cache() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut reader = make_registered_cursor(&pager, root_page, 1);
+
+            // Blob payloads so a handful of appends split the rightmost leaf.
+            for rowid in 1..=8 {
+                insert_record(&mut writer, &pager, rowid, Value::Blob(vec![0u8; 1000])).unwrap();
+            }
+
+            // Positions the reader on the last row and caches the rightmost page id.
+            run_until_done(|| reader.last(), pager.deref()).unwrap();
+            let max1 = run_until_done(|| reader.rowid(), pager.deref()).unwrap();
+            assert_eq!(max1, Some(8));
+
+            // Peer appends: balance_quick allocates a new rightmost leaf.
+            for rowid in 9..=16 {
+                insert_record(&mut writer, &pager, rowid, Value::Blob(vec![0u8; 1000])).unwrap();
+            }
+
+            run_until_done(|| reader.last(), pager.deref()).unwrap();
+            let max2 = run_until_done(|| reader.rowid(), pager.deref()).unwrap();
+            assert_eq!(
+                max2,
+                Some(16),
+                "last() must see the true maximum after a peer split the rightmost leaf"
+            );
+        }
+
+        /// A peer's insert must reset this cursor's memoized count():
+        /// count_state stays at CountState::Finish after a full count, so
+        /// without invalidation every later count() returns the stale value.
+        #[test]
+        fn peer_write_invalidates_count_cache() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut reader = make_registered_cursor(&pager, root_page, 1);
+
+            for rowid in 1..=5 {
+                insert_record(&mut writer, &pager, rowid, Value::from_i64(rowid)).unwrap();
+            }
+            let count1 = run_until_done(|| reader.count(), pager.deref()).unwrap();
+            assert_eq!(count1, 5);
+
+            insert_record(&mut writer, &pager, 6, Value::from_i64(6)).unwrap();
+            let count2 = run_until_done(|| reader.count(), pager.deref()).unwrap();
+            assert_eq!(
+                count2, 6,
+                "count() must not return the memoized pre-write value"
+            );
+        }
+
         #[test]
         fn registry_toggles_has_peers_flag() {
             let (pager, root_page, _db, _conn) = empty_btree();
