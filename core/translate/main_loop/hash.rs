@@ -1,5 +1,5 @@
 use super::*;
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
 use crate::translate::plan::ColumnUsedMask;
@@ -174,7 +174,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                 }
                 _ => {
                     let payload_signature_columns: ColumnUsedMask =
-                        build_table.col_used_mask.clone();
+                        build_table.col_used_mask.try_clone()?;
                     let payload_columns = payload_signature_columns
                         .iter()
                         .map(|col_idx| {

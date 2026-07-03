@@ -6,7 +6,7 @@
 //! union/intersection-specific decomposition, costing, and residual handling on
 //! top.
 
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Index, Schema};
 use crate::stats::AnalyzeStats;
 use crate::translate::expr::expr_references_any_subquery;
@@ -955,7 +955,7 @@ pub fn consider_multi_index_union(
             continue;
         }
 
-        let mut allowed_mask = lhs_mask.clone();
+        let mut allowed_mask = lhs_mask.try_clone()?;
         let Some(rhs_idx) = table_references
             .joined_tables()
             .iter()

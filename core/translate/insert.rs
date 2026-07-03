@@ -897,7 +897,7 @@ pub fn translate_insert(
         // Child-side FK check must run before any writes (IdxInsert / Insert).
         // For immediate FKs this emits a direct Halt, so no index entry is written
         // when the parent is missing — matching SQLite's bytecode order.
-        let fk_layout = btree_table.column_layout();
+        let fk_layout = btree_table.column_layout()?;
         emit_fk_child_insert_checks(
             program,
             &btree_table,
@@ -1082,7 +1082,7 @@ pub fn translate_insert(
                 insertion.first_col_register(),
                 insertion.record_register(),
                 insertion.key_register(),
-                &ColumnLayout::from_table(&table),
+                &ColumnLayout::from_table(&table)?,
             ))
         } else {
             None
@@ -1110,7 +1110,7 @@ pub fn translate_insert(
             insertion.first_col_register(),
             insertion.key_register(),
             resolver,
-            &btree_table.column_layout(),
+            &btree_table.column_layout()?,
         )?;
         let result: Result<()> = (|| {
             for subquery in returning_subqueries
@@ -1145,7 +1145,7 @@ pub fn translate_insert(
             insertion.key_register(),
             resolver,
             ctx.returning_buffer.as_ref(),
-            &btree_table.column_layout(),
+            &btree_table.column_layout()?,
         )?;
     }
     program.emit_insn(Insn::Goto {
@@ -2509,6 +2509,7 @@ fn build_insertion<'a>(
     let layout = table
         .btree()
         .map(|bt| bt.column_layout())
+        .transpose()?
         .unwrap_or(ColumnLayout::Identity {
             column_count: num_cols,
         });
@@ -4317,7 +4318,7 @@ fn emit_custom_type_encode(
         .iter()
         .map(|m| m.column.clone())
         .collect();
-    let layout = ColumnLayout::from_columns(&columns);
+    let layout = ColumnLayout::from_columns(&columns)?;
     crate::translate::expr::emit_custom_type_encode_columns(
         program,
         resolver,

@@ -1,4 +1,4 @@
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
@@ -199,7 +199,7 @@ pub fn translate_create_index(
             index_method = Some(index_module.attach(&IndexMethodConfiguration {
                 table_name: tbl.name.clone(),
                 index_name: idx_name.clone(),
-                columns: columns.clone(),
+                columns: columns.try_clone()?,
                 parameters,
             })?);
         }
@@ -902,6 +902,7 @@ fn resolve_sorted_columns_with_resolver(
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
                 GeneratedType::NotGenerated => None,
             };
+            // Capacity is preallocated to cols.len(); this loop pushes at most one column per input.
             resolved.push(IndexColumn {
                 name: column_name,
                 order,
@@ -915,6 +916,7 @@ fn resolve_sorted_columns_with_resolver(
         if !validate_index_expression(unwrapped_expr, table) {
             crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
         }
+        // Capacity is preallocated to cols.len(); this loop pushes at most one column per input.
         resolved.push(IndexColumn {
             name: sc.expr.to_string(),
             order,

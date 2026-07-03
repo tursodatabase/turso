@@ -107,3 +107,32 @@ pub trait TryClone: Sized {
 
     fn try_clone(&self) -> Result<Self, Self::Error>;
 }
+
+impl<T> TryClone for Option<T>
+where
+    T: TryClone,
+{
+    type Error = T::Error;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        match self {
+            Some(value) => Ok(Some(value.try_clone()?)),
+            None => Ok(None),
+        }
+    }
+}
+
+impl<T, E> TryClone for Result<T, E>
+where
+    T: TryClone,
+    E: TryClone<Error = T::Error>,
+{
+    type Error = T::Error;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        match self {
+            Ok(value) => Ok(Ok(value.try_clone()?)),
+            Err(err) => Ok(Err(err.try_clone()?)),
+        }
+    }
+}

@@ -12,7 +12,7 @@ use super::{
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
-    schema::{CheckConstraint, Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
+    schema::{CheckConstraint, Column, ColumnLayout, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
@@ -622,7 +622,7 @@ fn emit_add_virtual_column_validation(
         dest: rowid_reg,
     });
 
-    let layout = resolved_table.column_layout();
+    let layout = resolved_table.column_layout()?;
     let base_dest_reg = program.alloc_registers(layout.column_count());
     for (idx, table_column) in resolved_table.columns().iter().enumerate() {
         if table_column.is_virtual_generated() || table_column.is_rowid_alias() {
@@ -1159,6 +1159,26 @@ pub fn translate_alter_table(
                 ));
             };
 
+            let rewrite_rows = if !original_btree.columns()[dropped_index].is_virtual_generated() {
+                let source_column_by_schema_idx: Vec<Option<usize>> = btree
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(new_idx, column)| {
+                        if column.is_virtual_generated() {
+                            None
+                        } else if new_idx < dropped_index {
+                            Some(new_idx)
+                        } else {
+                            Some(new_idx + 1)
+                        }
+                    })
+                    .collect();
+                Some((source_column_by_schema_idx, btree.column_layout()?))
+            } else {
+                None
+            };
+
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -1166,27 +1186,13 @@ pub fn translate_alter_table(
                 connection,
                 input,
                 |program| {
-                    if !original_btree.columns()[dropped_index].is_virtual_generated() {
-                        let source_column_by_schema_idx = btree
-                            .columns()
-                            .iter()
-                            .enumerate()
-                            .map(|(new_idx, column)| {
-                                if column.is_virtual_generated() {
-                                    None
-                                } else if new_idx < dropped_index {
-                                    Some(new_idx)
-                                } else {
-                                    Some(new_idx + 1)
-                                }
-                            })
-                            .collect();
-
+                    if let Some((source_column_by_schema_idx, layout)) = &rewrite_rows {
                         emit_rewrite_table_rows(
                             program,
                             original_btree.clone(),
                             &btree,
                             source_column_by_schema_idx,
+                            layout,
                             connection,
                             database_id,
                         );
@@ -2199,7 +2205,7 @@ pub fn translate_alter_table(
                 )?;
 
                 let original_columns = original_btree.columns();
-                let source_column_by_schema_idx = rewritten_table
+                let source_column_by_schema_idx: Vec<Option<usize>> = rewritten_table
                     .columns()
                     .iter()
                     .enumerate()
@@ -2225,11 +2231,13 @@ pub fn translate_alter_table(
                         }
                     })
                     .collect();
+                let layout = rewritten_table.column_layout()?;
                 emit_rewrite_table_rows(
                     program,
                     original_btree.clone(),
                     &rewritten_table,
-                    source_column_by_schema_idx,
+                    &source_column_by_schema_idx,
+                    &layout,
                     connection,
                     database_id,
                 );
@@ -2268,7 +2276,8 @@ fn emit_rewrite_table_rows(
     program: &mut ProgramBuilder,
     original_btree: Arc<BTreeTable>,
     rewritten_table: &BTreeTable,
-    source_column_by_schema_idx: Vec<Option<usize>>,
+    source_column_by_schema_idx: &[Option<usize>],
+    layout: &ColumnLayout,
     connection: &Arc<crate::Connection>,
     database_id: usize,
 ) {
@@ -2277,7 +2286,6 @@ fn emit_rewrite_table_rows(
         rewritten_table.columns().len()
     );
 
-    let layout = rewritten_table.column_layout();
     let non_virtual_column_count = layout.num_non_virtual_cols();
     let root_page = rewritten_table.root_page;
     let table_name = rewritten_table.name.clone();

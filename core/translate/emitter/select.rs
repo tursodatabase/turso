@@ -452,7 +452,9 @@ pub(crate) fn emit_materialized_build_inputs(
         };
         let internal_id = program.table_reference_counter.next();
         let columns = match &spec.mode {
-            MaterializedBuildInputMode::RowidOnly => crate::alloc::vec![build_rowid_column()],
+            MaterializedBuildInputMode::RowidOnly => {
+                std::iter::once(build_rowid_column()).try_collect()?
+            }
             MaterializedBuildInputMode::KeyPayload {
                 num_keys,
                 payload_columns,
@@ -738,28 +740,20 @@ fn build_materialized_input_columns(
     num_keys: usize,
     payload_columns: &[MaterializedColumnRef],
 ) -> Result<crate::alloc::Vec<Column>> {
-    let mut columns = crate::alloc::vec![];
-    columns.try_reserve(num_keys + payload_columns.len())?;
-    for i in 0..num_keys {
-        columns.push(Column::new_default_text(
-            Some(format!("key_{i}")),
-            "BLOB".to_string(),
-            None,
-        ));
-    }
-    for (i, payload) in payload_columns.iter().enumerate() {
-        let name = Some(format!("payload_{i}"));
-        let column = match payload {
-            MaterializedColumnRef::RowId { .. } => {
-                Column::new_default_integer(name, "INTEGER".to_string(), None)
+    Ok((0..num_keys)
+        .map(|i| Column::new_default_text(Some(format!("key_{i}")), "BLOB".to_string(), None))
+        .chain(payload_columns.iter().enumerate().map(|(i, payload)| {
+            let name = Some(format!("payload_{i}"));
+            match payload {
+                MaterializedColumnRef::RowId { .. } => {
+                    Column::new_default_integer(name, "INTEGER".to_string(), None)
+                }
+                MaterializedColumnRef::Column { .. } => {
+                    Column::new_default_text(name, "BLOB".to_string(), None)
+                }
             }
-            MaterializedColumnRef::Column { .. } => {
-                Column::new_default_text(name, "BLOB".to_string(), None)
-            }
-        };
-        columns.push(column);
-    }
-    Ok(columns)
+        }))
+        .try_collect()?)
 }
 
 /// Construct a SELECT plan that materializes build-side inputs into an ephemeral table.
