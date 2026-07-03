@@ -4715,9 +4715,6 @@ impl Pager {
                     clear_page_cache,
                     max_frame,
                 } => {
-                    // The checkpoint guard held in `state.result` blocks WAL restarts
-                    // until the publish below, so the backfilled watermark can never
-                    // exceed the WAL tip of the generation it was backfilled from.
                     let wal_max_frame = wal.get_max_frame_in_wal();
                     turso_assert!(
                         max_frame <= wal_max_frame,
