@@ -3402,7 +3402,7 @@ fn test_checkpoint_post_durable_failure_then_unique_update_removes_stale_autoind
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
-        vec![
+        [
             "PRAGMA mvcc_checkpoint_threshold = -1",
             "CREATE TABLE t(a UNIQUE, b, c PRIMARY KEY)",
             "INSERT INTO t VALUES ('old', 1.0, 1)",
