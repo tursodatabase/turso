@@ -1,0 +1,15 @@
+services:
+  ldap:
+    image: osixia/openldap:1.5.0
+    container_name: turso-ldap-demo
+    environment:
+      LDAP_ORGANISATION: "Example Org"
+      LDAP_DOMAIN: "example.org"
+      LDAP_BASE_DN: "dc=example,dc=org"
+      LDAP_ADMIN_PASSWORD: "admin_password"
+      # The connector only ever talks plain ldap://, and this image's TLS cert
+      # (re)generation is flaky across restarts (needed to activate syncprov) --
+      # disable it outright rather than fight cfssl for a listener we don't use.
+      LDAP_TLS: "false"
+    ports:
+      - "3389:389"

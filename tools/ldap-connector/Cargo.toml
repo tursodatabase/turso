@@ -1,0 +1,20 @@
+[package]
+name = "turso-ldap-connector"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "LDAP-to-Turso sync connector demonstrating CDC-tracked full and incremental (RFC 4533) resync"
+
+[[bin]]
+name = "turso-ldap-connector"
+path = "src/main.rs"
+
+[dependencies]
+turso_core = { workspace = true, features = ["fs"] }
+ldap3 = { version = "0.11", default-features = false, features = ["sync"] }
+clap = { workspace = true, features = ["derive"] }
+anyhow = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
