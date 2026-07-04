@@ -3910,6 +3910,26 @@ pub fn op_transaction_inner(
                 *state.active_op_state.transaction() = OpTransactionState::BeginStatement;
             }
             OpTransactionState::BeginStatement => {
+                if program.contains_destroy
+                    && matches!(tx_mode, TransactionMode::Write)
+                    && program.connection.mv_store_for_db(*db).is_none()
+                {
+                    if program
+                        .connection
+                        .n_active_root_statements
+                        .load(Ordering::SeqCst)
+                        > 1
+                    {
+                        return Err(LimboError::TableLocked);
+                    }
+                    if !state.holds_destroy_guard {
+                        assert!(!program
+                            .connection
+                            .destroy_in_progress
+                            .swap(true, Ordering::SeqCst));
+                        state.holds_destroy_guard = true;
+                    }
+                }
                 let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
                 let in_explicit_txn = !program.connection.auto_commit.load(Ordering::SeqCst);
                 if *db == crate::MAIN_DB_ID && needs_stmt_journal {
@@ -11404,6 +11424,13 @@ pub fn op_destroy(
                     > 1
                 {
                     return Err(LimboError::TableLocked);
+                }
+                if !state.holds_destroy_guard {
+                    assert!(!program
+                        .connection
+                        .destroy_in_progress
+                        .swap(true, Ordering::SeqCst));
+                    state.holds_destroy_guard = true;
                 }
                 // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
                 // table btree cursor for both.

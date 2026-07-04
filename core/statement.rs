@@ -501,6 +501,16 @@ impl Statement {
     }
 
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        if matches!(self.origin, StatementOrigin::Root)
+            && !self.state.holds_destroy_guard
+            && self
+                .program
+                .connection
+                .destroy_in_progress
+                .load(Ordering::SeqCst)
+        {
+            return Err(LimboError::TableLocked);
+        }
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
             self.program
                 .connection
@@ -1429,6 +1439,14 @@ impl Statement {
                 .n_active_writes
                 .fetch_sub(1, Ordering::SeqCst);
             self.state.is_active_write = false;
+        }
+        if self.state.holds_destroy_guard {
+            assert!(self
+                .program
+                .connection
+                .destroy_in_progress
+                .swap(false, Ordering::SeqCst));
+            self.state.holds_destroy_guard = false;
         }
         if self.counted_as_active_root && !preserve_active_root_count {
             self.release_active_root_if_counted();

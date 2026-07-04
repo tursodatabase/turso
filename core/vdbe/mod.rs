@@ -769,6 +769,7 @@ pub struct ProgramState {
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
+    pub(crate) holds_destroy_guard: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
     pub n_change: AtomicI64,
@@ -832,6 +833,7 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
+            holds_destroy_guard: false,
             has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
@@ -962,6 +964,7 @@ impl ProgramState {
         self.ephemeral_temp_files.clear();
         self.uses_subjournal = false;
         self.is_active_write = false;
+        assert!(!self.holds_destroy_guard);
         self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
@@ -1115,6 +1118,10 @@ impl ProgramState {
         if self.is_active_write {
             connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
             self.is_active_write = false;
+        }
+        if self.holds_destroy_guard {
+            assert!(connection.destroy_in_progress.swap(false, Ordering::SeqCst));
+            self.holds_destroy_guard = false;
         }
         // If begin_statement was never called, no savepoint/FK cleanup needed.
         if !self.has_stmt_transaction {
@@ -1371,6 +1378,7 @@ pub struct PreparedProgram {
     pub is_subprogram: bool,
     /// Whether the program contains any trigger subprograms.
     pub contains_trigger_subprograms: bool,
+    pub contains_destroy: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
     /// Set of attached database indices that need write transactions.
