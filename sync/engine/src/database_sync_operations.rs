@@ -2479,6 +2479,33 @@ pub async fn max_local_change_id<Ctx>(
     }
 }
 
+/// Read the CDC change-id sequence watermark: the first change id that is NOT
+/// yet safe for the push loop to consume.
+pub async fn read_cdc_sequence_watermark<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+    cdc_table: &str,
+) -> Result<Option<i64>> {
+    let seq_name = turso_core::schema::autoincrement_sequence_name(cdc_table);
+    let mut stmt = conn.prepare("SELECT sequence_watermark_experimental(?)")?;
+    stmt.bind_at(
+        1.try_into().unwrap(),
+        turso_core::Value::build_text(seq_name),
+    )?;
+
+    let value = match run_stmt_expect_one_row(coro, &mut stmt).await? {
+        Some(row) => row[0].clone(),
+        None => return Ok(None),
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Numeric(turso_core::Numeric::Integer(value)) => Ok(Some(value)),
+        other => Err(Error::DatabaseSyncEngineError(format!(
+            "unexpected sequence_watermark_experimental column type: {other:?}"
+        ))),
+    }
+}
+
 pub async fn update_last_change_id<Ctx>(
     coro: &Coro<Ctx>,
     conn: &Arc<turso_core::Connection>,
@@ -2740,6 +2767,21 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     let replay_floor_change_id = last_change_id.unwrap_or(0);
 
     tracing::debug!("push_logical_changes: last_change_id={:?}", last_change_id);
+
+    // In MVCC mode, bound the scan by the CDC sequence watermark so snapshot
+    // isolation cannot make us skip a change id that a concurrent transaction
+    // commits below the current max after we advance the push watermark. WAL mode
+    // keeps its unbounded scan (change ids there come from NewRowid, and the WAL
+    // push loop does not rely on the sequence watermark).
+    let max_change_id_exclusive = if source_conn.mvcc_enabled() {
+        let watermark =
+            read_cdc_sequence_watermark(ctx.coro, &source_conn, source.cdc_table()).await?;
+        tracing::debug!("push_logical_changes: cdc sequence watermark={watermark:?}");
+        watermark
+    } else {
+        None
+    };
+
     let replay_opts = DatabaseReplaySessionOpts {
         use_implicit_rowid: false,
     };
@@ -2750,6 +2792,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         first_change_id: last_change_id.map(|x| x + 1),
         mode: DatabaseChangesIteratorMode::Apply,
         ignore_schema_changes: false,
+        max_change_id_exclusive,
         ..Default::default()
     };
 

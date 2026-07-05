@@ -225,6 +225,8 @@ pub struct ProgramBuilder {
     /// Curr collation sequence. Bool indicates whether it was set by a COLLATE expr
     collation: Option<(CollationSeq, bool)>,
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
+    /// Whether the main database uses MVCC journal mode, set once at translation time from the connection.
+    mvcc_enabled: bool,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
     /// Set of database IDs that need write transactions (for attached databases).
@@ -668,6 +670,7 @@ impl ProgramBuilder {
             init_label: BranchOffset::Placeholder,
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
+            mvcc_enabled: false,
             txn_mode: TransactionMode::None,
             write_databases: BitSet::default(),
             read_databases: BitSet::default(),
@@ -835,6 +838,15 @@ impl ProgramBuilder {
 
     pub const fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
         &self.capture_data_changes_info
+    }
+
+    /// Whether the main database uses MVCC journal mode. See [`Self::mvcc_enabled`].
+    pub const fn is_mvcc_enabled(&self) -> bool {
+        self.mvcc_enabled
+    }
+
+    pub fn set_mvcc_enabled(&mut self, enabled: bool) {
+        self.mvcc_enabled = enabled;
     }
 
     pub fn extend(&mut self, opts: &ProgramBuilderOpts) {

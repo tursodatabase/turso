@@ -216,6 +216,11 @@ impl DatabaseTape {
     }
 
     /// Builds an iterator which emits [DatabaseTapeOperation] by extracting data from CDC table
+    /// Name of the CDC table this tape reads/writes (default `turso_cdc`).
+    pub fn cdc_table(&self) -> &str {
+        &self.cdc_table
+    }
+
     pub fn iterate_changes(
         &self,
         opts: DatabaseChangesIteratorOpts,
@@ -243,6 +248,7 @@ impl DatabaseTape {
             mode: opts.mode,
             batch_size: opts.batch_size,
             ignore_schema_changes: opts.ignore_schema_changes,
+            max_change_id_exclusive: opts.max_change_id_exclusive,
         })
     }
     /// Start raw WAL edit session which can append or rollback pages directly in the current WAL
@@ -407,13 +413,22 @@ pub enum DatabaseChangesIteratorMode {
 }
 
 impl DatabaseChangesIteratorMode {
-    pub fn query(&self, table_name: &str, limit: usize) -> String {
+    pub fn query(&self, table_name: &str, limit: usize, bounded_above: bool) -> String {
         let (operation, order) = match self {
             DatabaseChangesIteratorMode::Apply => (">=", "ASC"),
             DatabaseChangesIteratorMode::Revert => ("<=", "DESC"),
         };
+        // `change_id < ?` (bound param 2) restricts the scan to change ids the
+        // caller has deemed safe to consume — used by the sync push loop to stop
+        // at `sequence_watermark_experimental` so it never reads a change id that
+        // a concurrent MVCC transaction may still commit below the current max.
+        let upper_bound = if bounded_above {
+            " AND change_id < ?"
+        } else {
+            ""
+        };
         format!(
-            "SELECT * FROM {table_name} WHERE change_id {operation} ? ORDER BY change_id {order} LIMIT {limit}",
+            "SELECT * FROM {table_name} WHERE change_id {operation} ?{upper_bound} ORDER BY change_id {order} LIMIT {limit}",
         )
     }
     pub fn first_id(&self) -> i64 {
@@ -436,6 +451,11 @@ pub struct DatabaseChangesIteratorOpts {
     pub batch_size: usize,
     pub mode: DatabaseChangesIteratorMode,
     pub ignore_schema_changes: bool,
+    /// Exclusive upper bound on `change_id`: only rows with `change_id < bound`
+    /// are returned. `None` means unbounded. The sync push loop sets this to the
+    /// CDC sequence watermark so snapshot-isolation reordering cannot make it skip
+    /// a not-yet-committed lower change id.
+    pub max_change_id_exclusive: Option<i64>,
 }
 
 impl Default for DatabaseChangesIteratorOpts {
@@ -445,6 +465,7 @@ impl Default for DatabaseChangesIteratorOpts {
             batch_size: DEFAULT_CHANGES_BATCH_SIZE,
             mode: DatabaseChangesIteratorMode::Apply,
             ignore_schema_changes: true,
+            max_change_id_exclusive: None,
         }
     }
 }
@@ -460,6 +481,7 @@ pub struct DatabaseChangesIterator {
     mode: DatabaseChangesIteratorMode,
     batch_size: usize,
     ignore_schema_changes: bool,
+    max_change_id_exclusive: Option<i64>,
 }
 
 const SQLITE_SCHEMA_TABLE: &str = "sqlite_schema";
@@ -491,7 +513,11 @@ impl DatabaseChangesIterator {
     }
     async fn refill<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<()> {
         if self.query_stmt.is_none() {
-            let query = self.mode.query(&self.cdc_table, self.batch_size);
+            let query = self.mode.query(
+                &self.cdc_table,
+                self.batch_size,
+                self.max_change_id_exclusive.is_some(),
+            );
             let stmt = match self.conn.prepare(&query) {
                 Ok(stmt) => stmt,
                 Err(LimboError::ParseError(err)) if err.contains("no such table") => return Ok(()),
@@ -507,6 +533,12 @@ impl DatabaseChangesIterator {
             1.try_into().unwrap(),
             turso_core::Value::from_i64(change_id_filter),
         )?;
+        if let Some(max_change_id_exclusive) = self.max_change_id_exclusive {
+            query_stmt.bind_at(
+                2.try_into().unwrap(),
+                turso_core::Value::from_i64(max_change_id_exclusive),
+            )?;
+        }
 
         let mut last_change_id = None;
         while let Some(row) = run_stmt_once(coro, query_stmt).await? {
@@ -1274,6 +1306,106 @@ mod tests {
             }) if table_name == "t"
         ));
         assert!(matches!(changes[4], DatabaseTapeOperation::Commit));
+    }
+
+    /// in MVCC mode the CDC `change_id` is drawn from the CDC
+    /// table's AUTOINCREMENT sequence, so ids are never reused after CDC rows are
+    /// pruned, and `read_cdc_sequence_watermark` reports the exclusive safe upper
+    /// bound the push loop scans up to. Bounding the scan by that watermark is
+    /// what stops the push loop from skipping a change id a concurrent
+    /// transaction commits below the current max under snapshot isolation.
+    #[test]
+    pub fn test_mvcc_cdc_change_id_sequence_backed_and_watermark_bounds_scan() {
+        fn row_change_ids(changes: &[DatabaseTapeOperation]) -> Vec<i64> {
+            changes
+                .iter()
+                .filter_map(|change| match change {
+                    DatabaseTapeOperation::RowChange(change) => Some(change.change_id),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        db1.connect()
+            .unwrap()
+            .execute("PRAGMA journal_mode = 'mvcc'")
+            .unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db1 = db1.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db1.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE t(x)").unwrap();
+                conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+                // No in-flight allocations: watermark == max(change_id) + 1.
+                let watermark = crate::database_sync_operations::read_cdc_sequence_watermark(
+                    &coro,
+                    &conn,
+                    db1.cdc_table(),
+                )
+                .await
+                .unwrap();
+
+                let mut opts = DatabaseChangesIteratorOpts {
+                    ignore_schema_changes: false,
+                    ..Default::default()
+                };
+                let mut unbounded = Vec::new();
+                let mut iterator = db1.iterate_changes(opts.clone()).unwrap();
+                while let Some(change) = iterator.next(&coro).await.unwrap() {
+                    unbounded.push(change);
+                }
+
+                // Bounded scan stops strictly below the bound.
+                opts.max_change_id_exclusive = Some(4);
+                let mut bounded = Vec::new();
+                let mut iterator = db1.iterate_changes(opts).unwrap();
+                while let Some(change) = iterator.next(&coro).await.unwrap() {
+                    bounded.push(change);
+                }
+
+                // Prune the CDC table, then write again: the new change id must
+                // continue past the old high-water mark, not reuse a low id.
+                conn.execute("DELETE FROM turso_cdc").unwrap();
+                conn.execute("INSERT INTO t VALUES (4)").unwrap();
+                let mut after_prune = Vec::new();
+                let mut iterator = db1
+                    .iterate_changes(DatabaseChangesIteratorOpts {
+                        ignore_schema_changes: false,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                while let Some(change) = iterator.next(&coro).await.unwrap() {
+                    after_prune.push(change);
+                }
+
+                (watermark, unbounded, bounded, after_prune)
+            }
+        });
+        let (watermark, unbounded, bounded, after_prune) = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+
+        // CREATE TABLE row (change_id 1) + COMMIT (2) + three inserts (3,4,5) +
+        // COMMIT (6). Watermark is the first unallocated id: 7.
+        assert_eq!(watermark, Some(7));
+        assert_eq!(row_change_ids(&unbounded), vec![1, 3, 4, 5]);
+        // Bound of 4 keeps only change ids < 4 (the schema row 1 and insert 3).
+        assert_eq!(row_change_ids(&bounded), vec![1, 3]);
+        // After pruning, the reinserted row's change id continues at 7 (the old
+        // watermark), never reusing an id at or below the previously pushed max.
+        assert_eq!(row_change_ids(&after_prune), vec![7]);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -100,14 +100,13 @@ mod tests {
     use super::{
         create_main_db_log_path, create_main_db_wal_path, create_meta_path,
         create_replace_base_marker_path, create_revert_db_wal_path,
-        ensure_stream_kind_can_use_legacy_page_apply, filter_pushed_self_changes_touched_by_remote,
-        logical_mvcc_pull_disable_reason, replace_base_backup_path,
-        resolve_local_replay_floor_change_id, should_replay_raw_pages_on_sql_conn,
-        should_request_logical_pull, should_use_logical_mvcc_pull,
-        stream_kind_applies_remote_pages, stream_kind_for_pull_updates_v1_result,
-        synced_change_id_after_remote_apply, use_pushed_change_hint_for_local_replay,
-        DatabaseSyncEngine, DatabaseSyncEngineOpts, ReplaceBaseApplyGuard,
-        REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER,
+        ensure_stream_kind_can_use_legacy_page_apply, logical_mvcc_pull_disable_reason,
+        replace_base_backup_path, resolve_local_replay_floor_change_id,
+        should_replay_raw_pages_on_sql_conn, should_request_logical_pull,
+        should_use_logical_mvcc_pull, stream_kind_applies_remote_pages,
+        stream_kind_for_pull_updates_v1_result, synced_change_id_after_remote_apply,
+        use_pushed_change_hint_for_local_replay, DatabaseSyncEngine, DatabaseSyncEngineOpts,
+        ReplaceBaseApplyGuard, REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER,
     };
     use crate::{
         client_proto::{
@@ -127,16 +126,14 @@ mod tests {
         },
         types::{
             Coro, DatabaseMetadata, DatabasePullRevision, DatabaseSavedConfiguration,
-            DatabaseSyncEngineProtocolVersion, DatabaseTapeRowChange, DatabaseTapeRowChangeType,
-            DbChangesStatus, DbChangesStreamKind, PartialSyncOpts, SyncEngineIoResult,
-            DATABASE_METADATA_VERSION,
+            DatabaseSyncEngineProtocolVersion, DbChangesStatus, DbChangesStreamKind,
+            PartialSyncOpts, SyncEngineIoResult, DATABASE_METADATA_VERSION,
         },
         Result,
     };
     use bytes::Bytes;
     use prost::Message;
     use std::{
-        collections::BTreeSet,
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -315,24 +312,12 @@ mod tests {
     }
 
     #[test]
-    fn logical_replay_does_not_use_last_pushed_hint_when_sync_row_is_stale() {
-        let floor = resolve_local_replay_floor_change_id(false, true, 7, 7, Some(12), 7, 34, 12);
-        assert_eq!(floor, Some(12));
-    }
-
-    #[test]
-    fn logical_replay_uses_pre_push_floor_when_remote_sync_row_matches_last_push() {
-        let floor = resolve_local_replay_floor_change_id(false, true, 7, 7, Some(34), 7, 34, 12);
-        assert_eq!(floor, Some(12));
-    }
-
-    #[test]
     fn v1_page_replay_uses_remote_snapshot_sync_row_not_later_push_hint() {
         assert!(!use_pushed_change_hint_for_local_replay(
             DbChangesStreamKind::Pages,
             false
         ));
-        let floor = resolve_local_replay_floor_change_id(false, false, 7, 7, Some(12), 7, 34, 12);
+        let floor = resolve_local_replay_floor_change_id(false, 7, 7, Some(12), 7, 34);
         assert_eq!(floor, Some(12));
     }
 
@@ -342,75 +327,19 @@ mod tests {
             DbChangesStreamKind::LegacyPages,
             false
         ));
-        let floor = resolve_local_replay_floor_change_id(true, false, 7, 7, Some(12), 7, 34, 12);
+        let floor = resolve_local_replay_floor_change_id(true, 7, 7, Some(12), 7, 34);
         assert_eq!(floor, Some(34));
     }
 
     #[test]
     fn local_replay_ignores_last_pushed_hint_from_stale_pull_generation() {
-        let floor = resolve_local_replay_floor_change_id(true, false, 7, 7, Some(12), 6, 34, 12);
+        let floor = resolve_local_replay_floor_change_id(true, 7, 7, Some(12), 6, 34);
         assert_eq!(floor, Some(12));
     }
 
     #[test]
-    fn logical_replay_skips_pushed_self_rows_touched_by_remote() {
-        let local_changes = vec![
-            DatabaseTapeRowChange {
-                change_id: 13,
-                change_time: 1,
-                table_name: "items".to_string(),
-                id: 1,
-                change: DatabaseTapeRowChangeType::Update {
-                    before: vec![turso_core::Value::build_text("old")],
-                    after: vec![turso_core::Value::build_text("pushed")],
-                    updates: None,
-                },
-            },
-            DatabaseTapeRowChange {
-                change_id: 14,
-                change_time: 1,
-                table_name: "items".to_string(),
-                id: 2,
-                change: DatabaseTapeRowChangeType::Update {
-                    before: vec![turso_core::Value::build_text("old")],
-                    after: vec![turso_core::Value::build_text("untouched")],
-                    updates: None,
-                },
-            },
-            DatabaseTapeRowChange {
-                change_id: 35,
-                change_time: 1,
-                table_name: "items".to_string(),
-                id: 1,
-                change: DatabaseTapeRowChangeType::Update {
-                    before: vec![turso_core::Value::build_text("pushed")],
-                    after: vec![turso_core::Value::build_text("unpushed")],
-                    updates: None,
-                },
-            },
-        ];
-        let remote_touched_rows = BTreeSet::from([("items".to_string(), 1)]);
-
-        let (filtered, skipped) = filter_pushed_self_changes_touched_by_remote(
-            local_changes,
-            true,
-            34,
-            &remote_touched_rows,
-        );
-
-        assert_eq!(skipped, 1);
-        assert_eq!(
-            filtered
-                .iter()
-                .map(|change| change.change_id)
-                .collect::<Vec<_>>(),
-            vec![14, 35]
-        );
-    }
-
-    #[test]
     fn raw_wal_replay_preserves_existing_floor_when_hints_are_disabled() {
-        let floor = resolve_local_replay_floor_change_id(false, false, 7, 7, Some(12), 7, 34, 12);
+        let floor = resolve_local_replay_floor_change_id(false, 7, 7, Some(12), 7, 34);
         assert_eq!(floor, Some(12));
     }
 
@@ -1724,6 +1653,42 @@ fn remove_file_if_present(io: &Arc<dyn turso_core::IO>, path: &str) -> Result<()
     Ok(())
 }
 
+/// Fsync the directory that contains `path`, making newly created or removed
+/// directory entries (the replace-base marker and backups) durable across a
+/// crash. Fsyncing a file's contents does not guarantee its *directory entry*
+/// survives a crash, so the guard's crash-safety ordering (marker/backups
+/// created before the apply mutates real files; marker removed before backups
+/// during cleanup) is only meaningful once the containing directory is synced.
+///
+/// The replace-base guard requires real durable storage (memory paths are
+/// rejected in [`ReplaceBaseApplyGuard::create`]), so a direct `std::fs`
+/// directory fsync is appropriate here even though normal file IO flows through
+/// [`turso_core::IO`], which has no directory concept. On platforms without
+/// POSIX directory-fsync semantics this is a no-op.
+fn sync_parent_dir(path: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = std::path::Path::new(path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let dir = std::fs::File::open(&parent).map_err(|err| {
+            Error::DatabaseSyncEngineError(format!(
+                "failed to open directory {parent:?} for fsync: {err}"
+            ))
+        })?;
+        dir.sync_all().map_err(|err| {
+            Error::DatabaseSyncEngineError(format!("failed to fsync directory {parent:?}: {err}"))
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 async fn copy_sync_engine_file<Ctx, IO: SyncEngineIo>(
     coro: &Coro<Ctx>,
     io: Arc<dyn turso_core::IO>,
@@ -1815,6 +1780,12 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
         )
         .await?;
         sync_path_if_present(coro, &io, &marker_path).await?;
+        // Barrier: the marker and all backups (contents already fsynced above and
+        // in `copy_sync_engine_file`) must have durable *directory entries* before
+        // the caller begins mutating the real db/wal/log/meta files. Otherwise a
+        // crash mid-apply could leave the real files partially replaced with no
+        // recoverable marker to roll them back.
+        sync_parent_dir(main_db_path)?;
         Ok(Self {
             io,
             sync_engine_io,
@@ -1890,13 +1861,21 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
     }
 
     async fn cleanup<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
-        for file in &self.manifest.files {
-            remove_file_if_present(&self.io, &file.backup_path)?;
-        }
+        // Remove the marker BEFORE the backups. The marker is the sole signal
+        // that "backups are authoritative and must be restored on recovery", so
+        // its removal must be made durable before any backup disappears.
+        // Removing backups first would let a crash in this window leave a marker
+        // pointing at missing backups, which fails `restore` on the next open and
+        // bricks the database. Once the marker is durably gone, leftover backups
+        // are merely orphaned files (harmless, overwritten by the next apply).
         remove_file_if_present(
             &self.io,
             &create_replace_base_marker_path(&self.main_db_path),
         )?;
+        sync_parent_dir(&self.main_db_path)?;
+        for file in &self.manifest.files {
+            remove_file_if_present(&self.io, &file.backup_path)?;
+        }
         sync_path_if_present(coro, &self.io, &self.main_db_path).await?;
         Ok(())
     }
@@ -2197,31 +2176,19 @@ fn should_replay_raw_pages_on_sql_conn(
         )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn resolve_local_replay_floor_change_id(
     use_pushed_change_hint: bool,
-    use_pushed_replay_floor_hint: bool,
     local_pull_gen: i64,
     remote_pull_gen: i64,
     remote_last_change_id: Option<i64>,
     last_pushed_pull_gen_hint: i64,
     last_pushed_change_id_hint: i64,
-    last_pushed_replay_floor_change_id_hint: i64,
 ) -> Option<i64> {
     let mut last_change_id = if remote_pull_gen == local_pull_gen {
         remote_last_change_id
     } else {
         Some(0)
     };
-
-    if use_pushed_replay_floor_hint
-        && last_pushed_pull_gen_hint == local_pull_gen
-        && last_pushed_change_id_hint > 0
-        && last_change_id == Some(last_pushed_change_id_hint)
-        && last_pushed_replay_floor_change_id_hint < last_pushed_change_id_hint
-    {
-        last_change_id = Some(last_pushed_replay_floor_change_id_hint);
-    }
 
     if use_pushed_change_hint
         && last_pushed_pull_gen_hint == local_pull_gen
@@ -2252,38 +2219,6 @@ fn use_pushed_change_hint_for_local_replay(
     raw_page_replay_on_sql_conn: bool,
 ) -> bool {
     !raw_page_replay_on_sql_conn && matches!(stream_kind, DbChangesStreamKind::LegacyPages)
-}
-
-fn use_pushed_replay_floor_hint_for_local_replay(stream_kind: DbChangesStreamKind) -> bool {
-    matches!(stream_kind, DbChangesStreamKind::Logical)
-}
-
-fn filter_pushed_self_changes_touched_by_remote(
-    local_changes: Vec<DatabaseTapeRowChange>,
-    replaying_pushed_self_range: bool,
-    last_pushed_change_id_hint: i64,
-    remote_logical_touched_rows: &BTreeSet<(String, i64)>,
-) -> (Vec<DatabaseTapeRowChange>, usize) {
-    if !replaying_pushed_self_range || remote_logical_touched_rows.is_empty() {
-        return (local_changes, 0);
-    }
-
-    let mut skipped = 0usize;
-    let local_changes = local_changes
-        .into_iter()
-        .filter(|change| {
-            let already_pushed_self_change = change.change_id <= last_pushed_change_id_hint;
-            let touched_by_remote =
-                remote_logical_touched_rows.contains(&(change.table_name.clone(), change.id));
-            if already_pushed_self_change && touched_by_remote {
-                skipped += 1;
-                false
-            } else {
-                true
-            }
-        })
-        .collect::<Vec<_>>();
-    (local_changes, skipped)
 }
 
 impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
@@ -3182,43 +3117,31 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 	                remote_apply_stats.touched_rows.len()
 	            );
 
-            let (
-                last_pushed_pull_gen_hint,
-                last_pushed_change_id_hint,
-                last_pushed_replay_floor_change_id_hint,
-            ) = {
+            let (last_pushed_pull_gen_hint, last_pushed_change_id_hint) = {
                 let meta = self.meta();
                 (
                     meta.last_pushed_pull_gen_hint,
                     meta.last_pushed_change_id_hint,
-                    meta.last_pushed_replay_floor_change_id_hint,
                 )
             };
+            // Raise the replay floor to the pushed change-id hint so already-pushed
+            // local changes are excluded from replay. A subsequent remote update to
+            // a row this replica pushed (e.g. sync-fuzzer phase 3 push then phase 4
+            // remote update of the same rows) then wins, instead of being clobbered
+            // by re-replaying the stale pushed value.
             let last_change_id = resolve_local_replay_floor_change_id(
                 true,
-                false,
                 local_pull_gen,
                 local_pull_gen,
                 local_last_change_id,
                 last_pushed_pull_gen_hint,
                 last_pushed_change_id_hint,
-                last_pushed_replay_floor_change_id_hint,
             );
             let replay_floor = last_change_id.unwrap_or(0);
             let local_changes = precollected_local_changes
                 .into_iter()
                 .filter(|change| change.change_id > replay_floor)
                 .collect::<Vec<_>>();
-            let replaying_pushed_self_range = last_pushed_change_id_hint > 0
-                && last_pushed_replay_floor_change_id_hint < last_pushed_change_id_hint
-                && replay_floor == last_pushed_replay_floor_change_id_hint;
-            let (local_changes, skipped_pushed_self_changes_touched_by_remote) =
-                filter_pushed_self_changes_touched_by_remote(
-                    local_changes,
-                    replaying_pushed_self_range,
-                    last_pushed_change_id_hint,
-                    &remote_apply_stats.touched_rows,
-                );
             let mut skipped_internal_local_changes = 0usize;
             let local_changes = local_changes
                 .into_iter()
@@ -3233,10 +3156,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 .collect::<Result<Vec<_>>>()?;
             let replayed_local_changes = !local_changes.is_empty();
             tracing::info!(
-                "apply_logical_mvcc_changes(path={}): logical local replay floor={replay_floor}; local_changes={} skipped_pushed_self_changes_touched_by_remote={} skipped_internal_local_changes={}",
+                "apply_logical_mvcc_changes(path={}): logical local replay floor={replay_floor}; local_changes={} skipped_internal_local_changes={}",
                 self.main_db_path,
                 local_changes.len(),
-                skipped_pushed_self_changes_touched_by_remote,
                 skipped_internal_local_changes,
             );
 
@@ -3413,16 +3335,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             local_last_change_id,
             replace_base_pages,
         );
-        let (
-            last_pushed_pull_gen_hint,
-            last_pushed_change_id_hint,
-            last_pushed_replay_floor_change_id_hint,
-        ) = {
+        let (last_pushed_pull_gen_hint, last_pushed_change_id_hint) = {
             let meta = self.meta();
             (
                 meta.last_pushed_pull_gen_hint,
                 meta.last_pushed_change_id_hint,
-                meta.last_pushed_replay_floor_change_id_hint,
             )
         };
 
@@ -3445,13 +3362,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             } else {
                 resolve_local_replay_floor_change_id(
                     true,
-                    false,
                     local_pull_gen,
                     local_pull_gen,
                     local_last_change_id,
                     last_pushed_pull_gen_hint,
                     last_pushed_change_id_hint,
-                    last_pushed_replay_floor_change_id_hint,
                 )
             }
         } else {
@@ -3553,7 +3468,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
             // Phase 2: after revert DB has no local changes in its latest state - so its safe to apply changes from remote
             let mut logical_replay_conn = None;
-            let mut remote_logical_touched_rows = BTreeSet::new();
             let applied_raw_db_size: u32;
             let mut revert_since_wal_watermark = None;
             let mut followup_revision = None;
@@ -3740,21 +3654,19 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                                 },
                                             },
                                         };
-                                        let replay_stats =
-                                            apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
-                                                coro,
-                                                &mut replay,
-                                                changes_file,
-                                                &self.client_unique_id,
-                                                &mut logical_table_names_by_stable_id,
-                                            )
-                                            .await
-                                            .map_err(|error| {
-                                                Error::DatabaseSyncEngineError(format!(
-                                                    "failed to apply replace-base follow-up logical transactions: {error}",
-                                                ))
-                                            })?;
-                                        remote_logical_touched_rows = replay_stats.touched_rows;
+                                        apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
+                                            coro,
+                                            &mut replay,
+                                            changes_file,
+                                            &self.client_unique_id,
+                                            &mut logical_table_names_by_stable_id,
+                                        )
+                                        .await
+                                        .map_err(|error| {
+                                            Error::DatabaseSyncEngineError(format!(
+                                                "failed to apply replace-base follow-up logical transactions: {error}",
+                                            ))
+                                        })?;
                                     }
                                 }
                                 (_, PullUpdatesV1Result::Pages { replace_base }) => {
@@ -3835,8 +3747,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
             let use_pushed_change_hint =
                 use_pushed_change_hint_for_local_replay(stream_kind, raw_page_replay_on_sql_conn);
-            let use_pushed_replay_floor_hint =
-                use_pushed_replay_floor_hint_for_local_replay(stream_kind);
 
             // Phase 4: as now DB has all data from remote - let's read pull generation and last change id for current client
             let (remote_pull_gen, remote_last_change_id) = if replace_base_pages {
@@ -3871,25 +3781,21 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
             let last_change_id = resolve_local_replay_floor_change_id(
                 use_pushed_change_hint,
-                use_pushed_replay_floor_hint,
                 local_pull_gen,
                 remote_pull_gen,
                 remote_last_change_id,
                 last_pushed_pull_gen_hint,
                 last_pushed_change_id_hint,
-                last_pushed_replay_floor_change_id_hint,
             );
             tracing::info!(
-                "apply_changes(path={}): local replay floor: use_pushed_change_hint={} use_pushed_replay_floor_hint={} local_pull_gen={} remote_pull_gen={} remote_last_change_id={:?} last_pushed_pull_gen_hint={} last_pushed_change_id_hint={} last_pushed_replay_floor_change_id_hint={} resolved_last_change_id={:?}",
+                "apply_changes(path={}): local replay floor: use_pushed_change_hint={} local_pull_gen={} remote_pull_gen={} remote_last_change_id={:?} last_pushed_pull_gen_hint={} last_pushed_change_id_hint={} resolved_last_change_id={:?}",
                 self.main_db_path,
                 use_pushed_change_hint,
-                use_pushed_replay_floor_hint,
                 local_pull_gen,
                 remote_pull_gen,
                 remote_last_change_id,
                 last_pushed_pull_gen_hint,
                 last_pushed_change_id_hint,
-                last_pushed_replay_floor_change_id_hint,
                 last_change_id,
             );
 
@@ -3921,17 +3827,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 }
                 local_changes
             };
-            let replaying_pushed_self_range = use_pushed_replay_floor_hint
-                && last_pushed_change_id_hint > 0
-                && last_pushed_replay_floor_change_id_hint < last_pushed_change_id_hint
-                && replay_floor == last_pushed_replay_floor_change_id_hint;
-            let (local_changes, skipped_pushed_self_changes_touched_by_remote) =
-                filter_pushed_self_changes_touched_by_remote(
-                    local_changes,
-                    replaying_pushed_self_range,
-                    last_pushed_change_id_hint,
-                    &remote_logical_touched_rows,
-                );
             let mut skipped_internal_local_changes = 0usize;
             let local_changes = local_changes
                 .into_iter()
@@ -3945,19 +3840,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 })
                 .collect::<Result<Vec<_>>>()?;
             let replayed_local_changes = !local_changes.is_empty();
-            let delay_cdc_for_pushed_self_replay = logical_replay_conn.is_some()
-                && replaying_pushed_self_range
-                && had_cdc_table;
-            let mut recaptured_local_changes = replayed_local_changes;
-            if delay_cdc_for_pushed_self_replay {
-                recaptured_local_changes = false;
-            }
+            let recaptured_local_changes = replayed_local_changes;
             let mut preserve_local_replay_floor = None;
             tracing::info!(
-                "apply_changes(path={}): collected {} changes, skipped_pushed_self_changes_touched_by_remote={} skipped_internal_local_changes={}",
+                "apply_changes(path={}): collected {} changes, skipped_internal_local_changes={}",
                 self.main_db_path,
                 local_changes.len(),
-                skipped_pushed_self_changes_touched_by_remote,
                 skipped_internal_local_changes,
             );
             let post_remote_apply_change_id = if replace_base_pages || raw_page_replay_on_sql_conn {
@@ -3998,7 +3886,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 }
 
                 let mut cdc_enabled_for_local_replay = false;
-                if replayed_local_changes && had_cdc_table && !delay_cdc_for_pushed_self_replay {
+                if replayed_local_changes && had_cdc_table {
                     tracing::info!(
                         "apply_changes(path={}): reinitialize CDC pragma before local replay",
                         self.main_db_path,
@@ -4059,10 +3947,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
                 assert!(!replay.conn().get_auto_commit());
                 for (i, change) in local_changes.into_iter().enumerate() {
-                    let should_recapture_change = !delay_cdc_for_pushed_self_replay
-                        || change.change_id > last_pushed_change_id_hint;
-                    let preserve_original_change_floor = should_recapture_change
-                        && matches!(&change.change, DatabaseTapeRowChangeType::Delete { .. });
+                    let preserve_original_change_floor =
+                        matches!(&change.change, DatabaseTapeRowChangeType::Delete { .. });
                     let original_change_floor = change.change_id.saturating_sub(1);
                     let operation = if should_transform_local_change(&change) {
                         if let Some(transformed) = &mut transformed {
@@ -4086,7 +3972,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     } else {
                         DatabaseTapeOperation::RowChange(change)
                     };
-                    if should_recapture_change && had_cdc_table && !cdc_enabled_for_local_replay {
+                    if had_cdc_table && !cdc_enabled_for_local_replay {
                         tracing::info!(
                             "apply_changes(path={}): reinitialize CDC pragma before unpushed local replay",
                             self.main_db_path,
@@ -4099,9 +3985,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                 ))
                             })?;
                         cdc_enabled_for_local_replay = true;
-                    }
-                    if should_recapture_change {
-                        recaptured_local_changes = true;
                     }
                     if preserve_original_change_floor {
                         preserve_local_replay_floor = Some(

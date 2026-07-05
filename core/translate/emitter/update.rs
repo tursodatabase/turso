@@ -2565,6 +2565,7 @@ fn emit_update_insns<'a>(
                 if updates_rowid {
                     emit_cdc_insns(
                         program,
+                        &t_ctx.resolver,
                         OperationMode::DELETE,
                         cdc_cursor_id,
                         cdc_rowid_before_reg,
@@ -2575,6 +2576,7 @@ fn emit_update_insns<'a>(
                     )?;
                     emit_cdc_insns(
                         program,
+                        &t_ctx.resolver,
                         OperationMode::INSERT,
                         cdc_cursor_id,
                         cdc_rowid_after_reg,
@@ -2586,6 +2588,7 @@ fn emit_update_insns<'a>(
                 } else {
                     emit_cdc_insns(
                         program,
+                        &t_ctx.resolver,
                         OperationMode::UPDATE(if uses_write_set {
                             UpdateRowSource::PrebuiltEphemeralTable {
                                 ephemeral_table_cursor_id: iteration_cursor_id,
