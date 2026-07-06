@@ -1227,6 +1227,7 @@ struct SavepointSnapshot {
     db_size: u32,
     wal_max_frame: u64,
     wal_checksum: (u32, u32),
+    wal_checkpoint_seq: u32,
     deferred_fk_violations: isize,
 }
 
@@ -1247,6 +1248,10 @@ struct Savepoint {
     wal_max_frame: AtomicU64,
     /// WAL checksum at the start of the savepoint.
     wal_checksum: RwLock<(u32, u32)>,
+    /// WAL checkpoint sequence (generation) at the start of the savepoint.
+    /// `wal_max_frame`/`wal_checksum` are only meaningful within this
+    /// generation; a WAL restart invalidates them.
+    wal_checkpoint_seq: AtomicU32,
     /// Deferred FK counter value at the start of this savepoint.
     deferred_fk_violations: AtomicIsize,
 }
@@ -1258,6 +1263,7 @@ impl Savepoint {
         db_size: u32,
         wal_max_frame: u64,
         wal_checksum: (u32, u32),
+        wal_checkpoint_seq: u32,
         deferred_fk_violations: isize,
     ) -> Self {
         Self {
@@ -1268,6 +1274,7 @@ impl Savepoint {
             db_size: AtomicU32::new(db_size),
             wal_max_frame: AtomicU64::new(wal_max_frame),
             wal_checksum: RwLock::new(wal_checksum),
+            wal_checkpoint_seq: AtomicU32::new(wal_checkpoint_seq),
             deferred_fk_violations: AtomicIsize::new(deferred_fk_violations),
         }
     }
@@ -1299,6 +1306,7 @@ impl Savepoint {
             db_size: self.db_size.load(Ordering::Acquire),
             wal_max_frame: self.wal_max_frame.load(Ordering::Acquire),
             wal_checksum: *self.wal_checksum.read(),
+            wal_checkpoint_seq: self.wal_checkpoint_seq.load(Ordering::Acquire),
             deferred_fk_violations: self.deferred_fk_violations.load(Ordering::Acquire),
         }
     }
@@ -1312,6 +1320,7 @@ impl Savepoint {
             db_size: AtomicU32::new(snapshot.db_size),
             wal_max_frame: AtomicU64::new(snapshot.wal_max_frame),
             wal_checksum: RwLock::new(snapshot.wal_checksum),
+            wal_checkpoint_seq: AtomicU32::new(snapshot.wal_checkpoint_seq),
             deferred_fk_violations: AtomicIsize::new(snapshot.deferred_fk_violations),
         }
     }
@@ -2152,10 +2161,14 @@ impl Pager {
             .last()
             .map(|savepoint| savepoint.write_offset())
             .unwrap_or(0);
-        let (wal_max_frame, wal_checksum) = if let Some(wal) = &self.wal {
-            (wal.get_max_frame(), wal.get_last_checksum())
+        let (wal_max_frame, wal_checksum, wal_checkpoint_seq) = if let Some(wal) = &self.wal {
+            (
+                wal.get_max_frame(),
+                wal.get_last_checksum(),
+                wal.get_checkpoint_seq(),
+            )
         } else {
-            (0, (0, 0))
+            (0, (0, 0), 0)
         };
         let savepoint = Savepoint::new(
             kind,
@@ -2163,6 +2176,7 @@ impl Pager {
             db_size,
             wal_max_frame,
             wal_checksum,
+            wal_checkpoint_seq,
             deferred_fk_violations,
         );
         self.savepoints.write().push(savepoint);
@@ -2265,10 +2279,15 @@ impl Pager {
             wal.rollback(Some(RollbackTo {
                 frame: savepoint.wal_max_frame,
                 checksum: savepoint.wal_checksum,
+                checkpoint_seq: savepoint.wal_checkpoint_seq,
             }));
+            // Use the WAL position the rollback actually installed rather
+            // than the savepoint's recorded frame: if the savepoint predates
+            // a WAL restart, the rollback clamps to the authority snapshot
+            // and the recorded frame belongs to the previous generation.
             self.page_cache
                 .write()
-                .delete_clean_pages_after_wal_frame(savepoint.wal_max_frame)
+                .delete_clean_pages_after_wal_frame(wal.get_max_frame())
                 .map_err(|e| {
                     LimboError::InternalError(format!(
                         "failed to invalidate rolled-back WAL pages: {e:?}"
@@ -2929,6 +2948,17 @@ impl Pager {
         return_if_io!(self.maybe_allocate_page1());
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
+        };
+        // Open savepoints record the connection's WAL position (frame +
+        // checksum). Restarting the WAL header here would start a new
+        // generation and invalidate those positions, so a later ROLLBACK TO
+        // would rewind the WAL state into the previous generation and corrupt
+        // the append position. Keep the log as-is until the savepoints are
+        // resolved.
+        let allowed_auto_actions = if self.savepoints.read().is_empty() {
+            allowed_auto_actions
+        } else {
+            allowed_auto_actions.difference(WalAutoActions::Restart)
         };
         Ok(IOResult::Done(wal.begin_write_tx(allowed_auto_actions)?))
     }

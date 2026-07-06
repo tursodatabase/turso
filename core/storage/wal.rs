@@ -3,7 +3,7 @@
 use crate::io::FileSyncType;
 use crate::sync::Mutex;
 use crate::sync::OnceLock;
-use crate::{turso_assert, turso_assert_greater_than, turso_debug_assert};
+use crate::{turso_assert, turso_assert_greater_than, turso_debug_assert, turso_soft_unreachable};
 use branches::mark_unlikely;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::array;
@@ -51,6 +51,12 @@ use crate::{
 pub struct RollbackTo {
     pub frame: u64,
     pub checksum: (u32, u32),
+    /// WAL checkpoint sequence (generation) the frame/checksum pair was
+    /// captured in. A WAL restart starts a new generation, renumbering
+    /// frames from zero with a fresh checksum chain, so a rollback target
+    /// from an older generation must not be installed as the connection's
+    /// WAL position.
+    pub checkpoint_seq: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3884,6 +3890,30 @@ impl Wal for WalFile {
     fn rollback(&self, rollback_to: Option<RollbackTo>) {
         let is_savepoint = rollback_to.is_some();
         let snapshot = self.load_coordination_snapshot();
+        // A savepoint's recorded WAL position is only meaningful within the
+        // WAL generation it was captured in. If the log has been restarted
+        // since (new generation: frames renumbered from zero, new salts and
+        // checksum chain), installing the old-generation frame/checksum would
+        // make the next append continue from a bogus offset with a stale
+        // checksum seed, physically overwriting or misplacing WAL frames.
+        // Every frame this connection appended in the current generation came
+        // after such a savepoint, so the correct rollback target is the
+        // authoritative committed snapshot itself.
+        let rollback_to = rollback_to.filter(|r| {
+            let same_generation = r.checkpoint_seq == snapshot.checkpoint_seq;
+            if !same_generation {
+                turso_soft_unreachable!(
+                    "savepoint rollback across a WAL restart; clamping to the authority snapshot",
+                    {
+                        "savepoint_checkpoint_seq": r.checkpoint_seq,
+                        "authority_checkpoint_seq": snapshot.checkpoint_seq,
+                        "savepoint_frame": r.frame,
+                        "authority_max_frame": snapshot.max_frame
+                    }
+                );
+            }
+            same_generation
+        });
         let max_frame = rollback_to
             .as_ref()
             .map(|r| r.frame)
@@ -3903,6 +3933,14 @@ impl Wal for WalFile {
         self.coordination.rollback_cache(cache_rollback_frame);
         *self.last_checksum.write() = last_checksum;
         self.max_frame.store(max_frame, Ordering::Release);
+        if max_frame <= snapshot.max_frame {
+            // Every frame this connection appended past the committed
+            // high-water mark has been discarded, so no unpublished frames
+            // remain. Leaving the flag set would make a later
+            // `prepare_frames` trust the connection-local WAL position over
+            // the authority snapshot.
+            self.has_unpublished_frames.store(false, Ordering::Release);
+        }
         if !is_savepoint {
             self.reset_internal_states();
         }
@@ -4156,7 +4194,7 @@ impl Wal for WalFile {
                     && local_state.snapshot.checkpoint_seq == snapshot.checkpoint_seq
                     && local_state.snapshot.transaction_count == snapshot.transaction_count
                     && local_state.snapshot.last_checksum != snapshot.last_checksum;
-                if local_prepared_zero_frame_header {
+                let seed = if local_prepared_zero_frame_header {
                     // We already prepared the WAL header for the current
                     // zero-frame generation locally, but the authority snapshot
                     // still carries the pre-header checksum until the first
@@ -4198,7 +4236,13 @@ impl Wal for WalFile {
                         local_state.snapshot.last_checksum,
                         local_state.snapshot.max_frame + 1,
                     )
-                }
+                };
+                turso_assert!(
+                    seed.1 > snapshot.max_frame,
+                    "WAL append position must be past the committed high-water mark, otherwise committed frames get overwritten",
+                    { "next_frame_id": seed.1, "authority_max_frame": snapshot.max_frame }
+                );
+                seed
             }
         };
 
@@ -6746,6 +6790,7 @@ pub mod test {
         wal.rollback(Some(RollbackTo {
             frame: 10,
             checksum: (13, 21),
+            checkpoint_seq: 1,
         }));
 
         assert_eq!(coordination.find_frame(7, 0, 30, None), Some(10));
