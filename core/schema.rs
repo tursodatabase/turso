@@ -4372,15 +4372,15 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             }
                         };
                         primary_key_columns
-                            .push((col_name, column.order.unwrap_or(SortOrder::Asc)));
-                        pk_collations.push(collation);
+                            .try_push((col_name, column.order.unwrap_or(SortOrder::Asc)))?;
+                        pk_collations.try_push(collation)?;
                     }
-                    unique_sets_constraints.push(UniqueSet {
-                        columns: primary_key_columns.clone(),
+                    unique_sets_constraints.try_push(UniqueSet {
+                        columns: primary_key_columns.try_clone()?,
                         collations: pk_collations,
                         is_primary_key: true,
                         conflict_clause: *conflict_clause,
-                    });
+                    })?;
                 } else if let ast::TableConstraint::Unique {
                     columns,
                     conflict_clause,
@@ -4390,21 +4390,20 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     let mut unique_collations = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
                         let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
-                        // preallocated enough to not need try_push
                         match expr {
-                            Expr::Id(id) => unique_columns.push((
+                            Expr::Id(id) => unique_columns.try_push((
                                 id.as_str().to_string(),
                                 column.order.unwrap_or(SortOrder::Asc),
-                            )),
-                            Expr::Literal(Literal::String(value)) => unique_columns.push((
+                            ))?,
+                            Expr::Literal(Literal::String(value)) => unique_columns.try_push((
                                 value.trim_matches('\'').to_owned(),
                                 column.order.unwrap_or(SortOrder::Asc),
-                            )),
+                            ))?,
                             expr => {
                                 bail_parse_error!("unsupported unique key expression: {}", expr)
                             }
                         }
-                        unique_collations.push(collation);
+                        unique_collations.try_push(collation)?;
                     }
                     let unique_set = UniqueSet {
                         columns: unique_columns,
@@ -4412,7 +4411,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         is_primary_key: false,
                         conflict_clause: *conflict_clause,
                     };
-                    unique_sets_constraints.push(unique_set);
+                    unique_sets_constraints.try_push(unique_set)?;
                 } else if let ast::TableConstraint::ForeignKey {
                     columns,
                     clause,
@@ -4480,10 +4479,14 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         deferred,
                         decl_order: table_fk_order,
                     };
+                    foreign_keys.try_push(Arc::new(fk))?;
                     table_fk_order += 1;
-                    foreign_keys.push(Arc::new(fk));
                 } else if let ast::TableConstraint::Check(expr) = &c.constraint {
-                    check_constraints.push(CheckConstraint::new(c.name.as_ref(), expr, None));
+                    check_constraints.try_push(CheckConstraint::new(
+                        c.name.as_ref(),
+                        expr,
+                        None,
+                    ))?;
                 }
             }
 
@@ -4548,11 +4551,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 for c_def in constraints {
                     match &c_def.constraint {
                         ast::ColumnConstraint::Check(expr) => {
-                            check_constraints.push(CheckConstraint::new(
+                            check_constraints.try_push(CheckConstraint::new(
                                 c_def.name.as_ref(),
                                 expr,
                                 Some(&name),
-                            ));
+                            ))?;
                         }
                         ast::ColumnConstraint::Generated { expr, typ } => {
                             if typ
@@ -4583,12 +4586,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             if let Some(o) = o {
                                 order = *o;
                             }
-                            unique_sets_columns.push(UniqueSet {
-                                columns: vec![(name.clone(), order)],
-                                collations: vec![None],
+                            unique_sets_columns.try_push(UniqueSet {
+                                columns: try_vec![(name.clone(), order)]?,
+                                collations: try_vec![None]?,
                                 is_primary_key: true,
                                 conflict_clause: *conflict_clause,
-                            });
+                            })?;
                         }
                         ast::ColumnConstraint::NotNull {
                             nullable,
@@ -4607,12 +4610,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         }
                         ast::ColumnConstraint::Unique(conflict) => {
                             unique = true;
-                            unique_sets_columns.push(UniqueSet {
-                                columns: vec![(name.clone(), order)],
-                                collations: vec![None],
+                            unique_sets_columns.try_push(UniqueSet {
+                                columns: try_vec![(name.clone(), order)]?,
+                                collations: try_vec![None]?,
                                 is_primary_key: false,
                                 conflict_clause: *conflict,
-                            });
+                            })?;
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
                             let collation_seq = CollationSeq::new(collation_name.as_str())?;
@@ -4676,8 +4679,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 },
                                 decl_order: column_fk_order,
                             };
+                            foreign_keys.try_push(Arc::new(fk))?;
                             column_fk_order += 1;
-                            foreign_keys.push(Arc::new(fk));
                         }
                     }
                 }
@@ -4705,7 +4708,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 }
 
                 if primary_key {
-                    primary_key_columns.push((name.clone(), order));
+                    primary_key_columns.try_push((name.clone(), order))?;
                     if order == SortOrder::Desc {
                         primary_key_desc_columns_constraint = true;
                     }
