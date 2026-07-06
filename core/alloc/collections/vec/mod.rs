@@ -100,13 +100,50 @@ impl<T: Clone> TursoSliceExt<T> for [T] {
 }
 
 #[cfg(not(nightly))]
-impl<T: Clone> TryClone for Vec<T> {
+impl<T: TryClone> TryClone for Vec<T>
+where
+    TryReserveError: From<T::Error>,
+{
     type Error = TryReserveError;
 
     #[inline(always)]
     fn try_clone(&self) -> Result<Self, Self::Error> {
+        // Same `TryClone` bound as the nightly impl so code compiles
+        // identically on both cfgs. Elements clone through `TryClone`; on
+        // stable this is Clone-forwarded for std-pinned types anyway.
+        //
+        // Write into spare capacity directly instead of `push`: the
+        // per-element capacity check defeats vectorization (6x slower for
+        // Copy elements, 1.7x for non-Copy in alloc_collections benches).
+        // The guard keeps `len` covering exactly the elements written, so an
+        // `Err` from an element clone (or a panic) drops a consistent vec.
+        struct SetLenOnDrop<'a, T> {
+            vec: &'a mut Vec<T>,
+            len: usize,
+        }
+        impl<T> Drop for SetLenOnDrop<'_, T> {
+            #[inline]
+            fn drop(&mut self) {
+                unsafe {
+                    self.vec.set_len(self.len);
+                }
+            }
+        }
+
         let mut cloned = <Self as TursoTryWithCapacityExt>::try_with_capacity_ext(self.len())?;
-        cloned.extend(self.iter().cloned());
+        let ptr = cloned.as_mut_ptr();
+        let mut guard = SetLenOnDrop {
+            vec: &mut cloned,
+            len: 0,
+        };
+        for item in self {
+            let item = item.try_clone()?;
+            unsafe {
+                std::ptr::write(ptr.add(guard.len), item);
+            }
+            guard.len += 1;
+        }
+        drop(guard);
         Ok(cloned)
     }
 }

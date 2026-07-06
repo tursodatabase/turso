@@ -2589,6 +2589,31 @@ impl Schema {
     }
 }
 
+impl TryClone for UniqueSet {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            columns: self.columns.try_clone()?,
+            collations: self.collations.try_clone()?,
+            is_primary_key: self.is_primary_key,
+            conflict_clause: self.conflict_clause,
+        })
+    }
+}
+
+// Copy enums stored as `Vec` elements: their clone cannot allocate.
+crate::alloc::impl_try_clone_via_clone!(
+    turso_parser::ast::SortOrder,
+    crate::translate::collate::CollationSeq,
+);
+
+// Std-pinned schema element types: every owned field allocates through the
+// std global allocator (Strings, `std::vec::Vec`, boxed parser AST), so
+// forwarding to `Clone` is correct today. TODO(alloc): give these real
+// fallible impls when their fields become allocator-aware.
+crate::alloc::impl_try_clone_via_clone!(Column, IndexColumn, CheckConstraint);
+
 impl Clone for Schema {
     /// Cloning a `Schema` requires deep cloning of all internal tables and indexes, even though they are wrapped in `Arc`.
     /// Simply copying the `Arc` pointers would result in multiple `Schema` instances sharing the same underlying tables and indexes,

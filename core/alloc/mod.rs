@@ -22,6 +22,7 @@ pub use api::ApiAllocator;
 pub use api::{AllocError, Global, Layout};
 pub use arc::{try_arc_slice_from_slice, try_arc_slice_from_slice_in, ArcSlice};
 pub use backend::{set_allocator, SetAllocatorError, TursoAllocBackend};
+pub(crate) use collections::impl_try_clone_via_clone;
 #[cfg(nightly)]
 pub use collections::TursoFromIteratorIn;
 pub use collections::{
@@ -53,6 +54,14 @@ impl From<api::TryReserveError> for TryReserveError {
 impl From<std::collections::TryReserveError> for TryReserveError {
     fn from(_: std::collections::TryReserveError) -> Self {
         Self
+    }
+}
+
+/// Lets containers whose elements clone infallibly (`TryClone<Error =
+/// Infallible>`) satisfy `TryReserveError: From<T::Error>` bounds.
+impl From<std::convert::Infallible> for TryReserveError {
+    fn from(never: std::convert::Infallible) -> Self {
+        match never {}
     }
 }
 

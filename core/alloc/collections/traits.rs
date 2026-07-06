@@ -108,6 +108,72 @@ pub trait TryClone: Sized {
     fn try_clone(&self) -> Result<Self, Self::Error>;
 }
 
+/// Forward `TryClone` to `Clone` for element types whose clone either cannot
+/// allocate at all (`Copy` primitives) or only allocates through the std
+/// global allocator for now (std-pinned types like `String`). The
+/// `Infallible` error encodes that these clones never return `Err`. The
+/// std-pinned group is a migration marker: once such a type becomes
+/// allocator-aware, give it a real `TryClone<Error = TryReserveError>` impl
+/// and remove it from this list.
+macro_rules! impl_try_clone_via_clone {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl TryClone for $ty {
+                type Error = std::convert::Infallible;
+
+                #[inline(always)]
+                fn try_clone(&self) -> Result<Self, Self::Error> {
+                    Ok(self.clone())
+                }
+            }
+        )+
+    };
+}
+
+pub(crate) use impl_try_clone_via_clone;
+
+impl_try_clone_via_clone!(
+    bool,
+    char,
+    u8,
+    u16,
+    u32,
+    u64,
+    u128,
+    usize,
+    i8,
+    i16,
+    i32,
+    i64,
+    i128,
+    isize,
+    f32,
+    f64,
+    std::string::String,
+);
+
+impl<A, B> TryClone for (A, B)
+where
+    A: TryClone,
+    B: TryClone<Error = A::Error>,
+{
+    type Error = A::Error;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok((self.0.try_clone()?, self.1.try_clone()?))
+    }
+}
+
+/// `Arc` clones are refcount bumps — no allocation, never fails.
+impl<T> TryClone for crate::sync::Arc<T> {
+    type Error = std::convert::Infallible;
+
+    #[inline(always)]
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(self.clone())
+    }
+}
+
 impl<T> TryClone for Option<T>
 where
     T: TryClone,

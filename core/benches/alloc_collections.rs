@@ -30,6 +30,15 @@ struct NonCopyValue {
     payload: [usize; 4],
 }
 
+impl turso_core::alloc::TryClone for NonCopyValue {
+    type Error = std::convert::Infallible;
+
+    #[inline(always)]
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(self.clone())
+    }
+}
+
 impl NonCopyValue {
     fn new(id: usize) -> Self {
         Self {
@@ -58,6 +67,40 @@ fn non_copy_values_turso(len: usize) -> alloc::Vec<NonCopyValue> {
 
 fn non_copy_values_std(len: usize) -> std::vec::Vec<NonCopyValue> {
     (0..len).map(NonCopyValue::new).collect()
+}
+
+/// Element type whose `TryClone` does real fallible work: owns an
+/// allocator-backed vec, like `schema::UniqueSet`. Exercises the
+/// element-wise `TryClone` path of `Vec::try_clone`.
+#[derive(Clone)]
+struct FallibleValue {
+    inner: alloc::Vec<usize>,
+}
+
+impl turso_core::alloc::TryClone for FallibleValue {
+    type Error = turso_core::alloc::TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            inner: self.inner.try_clone()?,
+        })
+    }
+}
+
+fn fallible_values_turso(len: usize) -> alloc::Vec<FallibleValue> {
+    (0..len)
+        .map(|id| FallibleValue {
+            inner: (id..id + 4).try_collect().unwrap(),
+        })
+        .try_collect()
+        .unwrap()
+}
+
+fn string_values_turso(len: usize) -> alloc::Vec<alloc::String> {
+    (0..len)
+        .map(|id| format!("value-{id:08}"))
+        .try_collect()
+        .unwrap()
 }
 
 struct LowerBoundOnly<I> {
@@ -781,6 +824,36 @@ fn vec_non_copy_clone_turso(bencher: Bencher, len: usize) {
 fn vec_non_copy_try_clone_turso(bencher: Bencher, len: usize) {
     bencher
         .with_inputs(|| non_copy_values_turso(len))
+        .bench_local_values(|values| black_box(values).try_clone().unwrap());
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_string_clone_turso(bencher: Bencher, len: usize) {
+    #[expect(clippy::redundant_clone)]
+    bencher
+        .with_inputs(|| string_values_turso(len))
+        .bench_local_values(|values| black_box(values).clone());
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_string_try_clone_turso(bencher: Bencher, len: usize) {
+    bencher
+        .with_inputs(|| string_values_turso(len))
+        .bench_local_values(|values| black_box(values).try_clone().unwrap());
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_fallible_clone_turso(bencher: Bencher, len: usize) {
+    #[expect(clippy::redundant_clone)]
+    bencher
+        .with_inputs(|| fallible_values_turso(len))
+        .bench_local_values(|values| black_box(values).clone());
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_fallible_try_clone_turso(bencher: Bencher, len: usize) {
+    bencher
+        .with_inputs(|| fallible_values_turso(len))
         .bench_local_values(|values| black_box(values).try_clone().unwrap());
 }
 
