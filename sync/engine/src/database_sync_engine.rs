@@ -1993,6 +1993,38 @@ fn force_reparse_schema_with_retry(conn: &Arc<turso_core::Connection>) -> Result
     Ok(())
 }
 
+/// Reparse only this connection's own schema after a raw page/WAL replay,
+/// without publishing it to the shared database cache. The caller must publish
+/// once the schema is complete (see [`Connection::force_reparse_schema_without_publish`]).
+fn force_reparse_schema_without_publish_with_retry(
+    conn: &Arc<turso_core::Connection>,
+) -> Result<()> {
+    for attempt in 0..=2 {
+        match conn.force_reparse_schema_without_publish() {
+            Ok(()) => return Ok(()),
+            Err(LimboError::SchemaUpdated) if attempt < 2 => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Refresh this connection's own schema from freshly replayed pages without
+/// publishing to the shared cache. Publishing is deferred to the caller so the
+/// shared schema is only ever updated once the CDC table has been recreated,
+/// preventing concurrent statements from observing a `turso_cdc`-less schema.
+fn refresh_schema_after_raw_wal_replay_local(
+    conn: &Arc<turso_core::Connection>,
+    context: &str,
+) -> Result<()> {
+    conn.get_pager().clear_page_cache(true);
+    force_reparse_schema_without_publish_with_retry(conn).map_err(|error| {
+        Error::DatabaseSyncEngineError(
+            format!("failed to refresh schema after {context}: {error}",),
+        )
+    })
+}
+
 /// Refreshes an open connection after sync has restored files outside SQLite.
 ///
 /// This rebuilds WAL/MVCC state, clears cached pages, reparses schema, and
@@ -2023,22 +2055,6 @@ fn reload_connection_after_external_restore(
             )));
         }
     }
-    conn.get_pager().clear_page_cache(true);
-    force_reparse_schema_with_retry(conn).map_err(|error| {
-        Error::DatabaseSyncEngineError(
-            format!("failed to refresh schema after {context}: {error}",),
-        )
-    })?;
-    publish_schema_after_external_restore(conn, context)?;
-    Ok(())
-}
-
-/// Publishes schema after raw WAL replay mutates database pages externally.
-#[allow(dead_code)]
-fn publish_schema_after_raw_wal_replay(
-    conn: &Arc<turso_core::Connection>,
-    context: &str,
-) -> Result<()> {
     conn.get_pager().clear_page_cache(true);
     force_reparse_schema_with_retry(conn).map_err(|error| {
         Error::DatabaseSyncEngineError(
@@ -3707,13 +3723,23 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     ))
                 })?;
                 drop(finished_main_session);
-                publish_schema_after_raw_wal_replay(&main_conn, "raw WAL replay")?;
+                // Refresh main_conn's own schema from the replayed pages, but do NOT publish
+                // it to the shared cache. Publishing the intermediate schema here would expose
+                // a turso_cdc-less view (the raw pages replace the local-only CDC table) to
+                // concurrent CDC-enabled statements on other connections, which would then fail
+                // to compile with "no such table: turso_cdc". The shared cache is published
+                // once, at the end of apply, after the replay connection recreates turso_cdc.
+                refresh_schema_after_raw_wal_replay_local(&main_conn, "raw WAL replay")?;
 
                 let conn = connect_untracked(&self.main_tape).map_err(|error| {
                     Error::DatabaseSyncEngineError(format!(
                         "failed to open post-raw-apply replay connection: {error}",
                     ))
                 })?;
+                // The replay connection is seeded from the (deliberately not-yet-updated)
+                // shared schema, so reparse it locally from the freshly replayed pages before
+                // it replays local changes.
+                refresh_schema_after_raw_wal_replay_local(&conn, "raw WAL replay replay-conn")?;
                 execute_with_schema_retry(&conn, "BEGIN IMMEDIATE").map_err(|error| {
                     Error::DatabaseSyncEngineError(format!(
                         "failed to begin post-raw-apply replay transaction: {error}",
@@ -4010,7 +4036,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         "failed to commit remote apply replay transaction: {error}",
                     ))
                 })?;
-                logical_conn.publish_schema_if_newer();
                 if had_cdc_table || replace_base_pages {
                     tracing::info!(
                         "apply_changes(path={}): reinitialize CDC pragma after logical replay commit",
@@ -4023,7 +4048,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                 "failed to reinitialize CDC pragma after remote apply: {error}",
                             ))
                         })?;
-                    logical_conn.publish_schema_if_newer();
                     let change_id = max_local_change_id(coro, &logical_conn).await?.unwrap_or(0);
                     tracing::info!(
                         "apply_changes(path={}): post-logical-replay CDC high-water mark: {}",
@@ -4064,6 +4088,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         .await?;
                     }
                 }
+                // Publish the post-apply schema to the shared cache exactly once, and only
+                // after any turso_cdc recreation above. Publishing between the replay commit
+                // and the CDC-table recreation would briefly expose a version-bumped schema
+                // that omits turso_cdc.
+                logical_conn.publish_schema_if_newer();
                 let logical_table_names_by_stable_id =
                     read_logical_replay_table_map(coro, &logical_conn).await?;
                 return Ok((
@@ -4072,6 +4101,35 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     followup_revision,
                 ));
             }
+            let raw_replay_refresh = replace_base_pages || raw_page_replay_on_sql_conn;
+            let recreate_cdc =
+                replace_base_pages || had_cdc_table && stream_kind_applies_remote_pages(stream_kind);
+
+            // Common path (no external page replacement): recreate turso_cdc *inside* the apply
+            // transaction, before the commit below, so the committed on-disk state is never
+            // observed without turso_cdc. A concurrent reader that sees the new schema cookie
+            // reparses its schema from disk (see Connection::maybe_reparse_schema); if turso_cdc
+            // were missing from the committed image at that instant, a CDC-enabled statement
+            // would fail to compile with "no such table: turso_cdc". Recreating within the same
+            // commit keeps the transition atomic (this matches the pre-MVCC apply ordering).
+            //
+            // The raw-replay path cannot do this: it must commit first so the schema can be
+            // reparsed from the externally replaced pages, so it recreates turso_cdc after the
+            // commit instead (see below).
+            if recreate_cdc && !raw_replay_refresh {
+                tracing::info!(
+                    "apply_changes(path={}): reinitialize CDC pragma before remote apply commit",
+                    self.main_db_path,
+                );
+                main_conn
+                    .pragma_update(CDC_PRAGMA_NAME, "'full'")
+                    .map_err(|error| {
+                        Error::DatabaseSyncEngineError(format!(
+                            "failed to reinitialize CDC pragma before remote apply commit: {error}",
+                        ))
+                    })?;
+            }
+
             if main_conn.has_main_mvcc_tx_for_wal_session() {
                 main_conn
                     .commit_main_mvcc_tx_for_wal_session()
@@ -4094,25 +4152,42 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         "failed to finalize raw WAL session after remote apply: {error}",
                     ))
                 })?;
-            if replace_base_pages || raw_page_replay_on_sql_conn {
-                publish_schema_after_raw_wal_replay(&main_conn, "raw WAL replay")?;
+            if raw_replay_refresh {
+                // Refresh this connection's own schema from the replayed pages, but do NOT
+                // publish it to the shared cache yet. Publishing happens once below, after
+                // any turso_cdc recreation, so a concurrent CDC-enabled statement on another
+                // connection never reparses to a schema that lacks turso_cdc.
+                refresh_schema_after_raw_wal_replay_local(&main_conn, "raw WAL replay")?;
+                if recreate_cdc {
+                    tracing::info!(
+                        "apply_changes(path={}): reinitialize CDC pragma after WAL replay commit",
+                        self.main_db_path,
+                    );
+                    execute_with_schema_retry(
+                        &main_conn,
+                        &format!("PRAGMA {CDC_PRAGMA_NAME} = 'full'"),
+                    )
+                    .map_err(|error| {
+                        Error::DatabaseSyncEngineError(format!(
+                            "failed to reinitialize CDC pragma after remote apply: {error}",
+                        ))
+                    })?;
+                }
             }
-            if replace_base_pages || had_cdc_table && stream_kind_applies_remote_pages(stream_kind)
-            {
-                tracing::info!(
-                    "apply_changes(path={}): reinitialize CDC pragma after WAL replay commit",
-                    self.main_db_path,
-                );
-                execute_with_schema_retry(
+            // Publish the post-replay schema to the shared cache once turso_cdc has been
+            // recreated (either pre-commit for the common path, or just above for the
+            // raw-replay path) and before the high-water-mark bookkeeping below. The published
+            // schema always contains turso_cdc, so the transition is atomic — a concurrent
+            // CDC-enabled statement never observes a schema lacking turso_cdc ("no such table:
+            // turso_cdc"). Publishing before the bookkeeping also lets concurrent readers adopt
+            // the shared schema cheaply instead of reparsing from disk during that window.
+            if raw_replay_refresh || recreate_cdc {
+                publish_schema_after_external_restore(
                     &main_conn,
-                    &format!("PRAGMA {CDC_PRAGMA_NAME} = 'full'"),
-                )
-                .map_err(|error| {
-                    Error::DatabaseSyncEngineError(format!(
-                        "failed to reinitialize CDC pragma after remote apply: {error}",
-                    ))
-                })?;
-                publish_schema_after_external_restore(&main_conn, "post-WAL-replay CDC refresh")?;
+                    "post-raw-WAL-replay schema publish",
+                )?;
+            }
+            if recreate_cdc {
                 let change_id = max_local_change_id(coro, &main_conn).await?.unwrap_or(0);
                 tracing::info!(
                     "apply_changes(path={}): post-WAL-replay CDC high-water mark: {}",

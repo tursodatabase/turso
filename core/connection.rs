@@ -1170,6 +1170,19 @@ impl Connection {
     /// pages, so cookie-based refresh would keep stale btree metadata.
     #[cfg(feature = "conn_raw_api")]
     pub fn force_reparse_schema(self: &Arc<Connection>) -> Result<()> {
+        self.force_reparse_schema_inner(true)
+    }
+
+    /// Like [`Self::force_reparse_schema`], but refreshes only this connection's
+    /// own schema snapshot without publishing it to the shared database cache.
+    ///
+    /// Use this when the caller must further mutate the schema before it becomes
+    /// visible to other connections.
+    pub fn force_reparse_schema_without_publish(self: &Arc<Connection>) -> Result<()> {
+        self.force_reparse_schema_inner(false)
+    }
+
+    fn force_reparse_schema_inner(self: &Arc<Connection>, publish: bool) -> Result<()> {
         if self.get_tx_state() != TransactionState::None {
             return Err(LimboError::Busy);
         }
@@ -1197,8 +1210,10 @@ impl Connection {
 
         reparse_result?;
 
-        let schema = self.schema.read().clone();
-        self.db.update_schema_if_newer(schema);
+        if publish {
+            let schema = self.schema.read().clone();
+            self.db.update_schema_if_newer(schema);
+        }
         Ok(())
     }
 
