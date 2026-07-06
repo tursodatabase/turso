@@ -1707,6 +1707,8 @@ impl Func {
             #[cfg(feature = "json")]
             "json_patch" => Ok(Some(Self::Json(JsonFunc::JsonPatch))),
             #[cfg(feature = "json")]
+            "jsonb_patch" => Ok(Some(Self::Json(JsonFunc::JsonbPatch))),
+            #[cfg(feature = "json")]
             "json_remove" => Ok(Some(Self::Json(JsonFunc::JsonRemove))),
             #[cfg(feature = "json")]
             "jsonb_remove" => Ok(Some(Self::Json(JsonFunc::JsonbRemove))),
