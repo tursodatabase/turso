@@ -4613,7 +4613,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         col.set_array_dimensions(t.array_dimensions);
                     }
                 }
-                cols.push(col);
+                cols.try_push(col)?;
             }
         }
         CreateTableBody::AsSelect(_) => {
