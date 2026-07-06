@@ -2201,6 +2201,48 @@ expect {
     text
 }
 
+test jsonb_replace_basic {
+    SELECT json(jsonb_replace('{"a":1}', '$.a', 2))
+}
+expect {
+    {"a":2}
+}
+
+test jsonb_replace_multiple_paths {
+    SELECT json(jsonb_replace('{"a":1,"b":2}', '$.a', 9, '$.b', 8))
+}
+expect {
+    {"a":9,"b":8}
+}
+
+test jsonb_replace_missing_path_noop {
+    SELECT json(jsonb_replace('{"a":1}', '$.missing', 5))
+}
+expect {
+    {"a":1}
+}
+
+test jsonb_replace_root {
+    SELECT hex(jsonb_replace('{"a":1}', '$', 5))
+}
+expect {
+    1335
+}
+
+test jsonb_replace_returns_blob {
+    SELECT typeof(jsonb_replace('{"a":1}', '$.a', 2))
+}
+expect {
+    blob
+}
+
+test jsonb_replace_blob_bytes {
+    SELECT hex(jsonb_replace('{"a":1}', '$.a', 2))
+}
+expect {
+    4C17611332
+}
+
 # Tests for json_remove() function
 # Basic removal tests
 test json_remove_basic_1 {
