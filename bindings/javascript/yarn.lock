@@ -1831,7 +1831,7 @@ __metadata:
     "@napi-rs/cli": "npm:^3.1.5"
     "@tursodatabase/database-common": "npm:^0.7.0-pre.18"
     "@types/node": "npm:^24.3.1"
-    better-sqlite3: "npm:^12.2.0"
+    better-sqlite3: "npm:12.9.0"
     drizzle-kit: "npm:^0.31.4"
     drizzle-orm: "npm:^0.45.2"
     typescript: "npm:^5.9.2"
@@ -2112,14 +2112,14 @@ __metadata:
   languageName: node
   linkType: hard
 
-"better-sqlite3@npm:^12.2.0":
-  version: 12.11.1
-  resolution: "better-sqlite3@npm:12.11.1"
+"better-sqlite3@npm:12.9.0":
+  version: 12.9.0
+  resolution: "better-sqlite3@npm:12.9.0"
   dependencies:
     bindings: "npm:^1.5.0"
     node-gyp: "npm:latest"
     prebuild-install: "npm:^7.1.1"
-  checksum: 10c0/162d3fa6c19a68191d09537bd113bd54a636c9fb38b0fc0796f4f270032770695ef35a1bca041a0a0fa9bfa47e20b9e17c94484a3899c31f38881af4d12b7fa5
+  checksum: 10c0/69ee0d908fa6a5c8643872aa664686ed02476e88cb654fe37f0fef5845081430d4280c82f5d370e169c2abe7a14a85d9bc718ea720058abf4f7cd9a8dbe227f0
   languageName: node
   linkType: hard
 
