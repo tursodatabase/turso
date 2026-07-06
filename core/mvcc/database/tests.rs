@@ -16988,3 +16988,82 @@ fn test_checkpoint_seek_skip_divider_reinsert_loses_row() {
         );
     }
 }
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/7477.
+///
+/// A large committed DELETE whose commit statement is dropped mid-flight
+/// (after `LogRecordPrepared`, before finishing tombstone TxID rewriting)
+/// must not leave tombstones pointing at the removed TxID; otherwise a
+/// later writer panics with
+/// "check_version_conflicts: tombstone end TxID not found in txn map".
+#[test]
+fn mvcc_bug_repro_dropped_committed_delete_rewrites_all_tombstone_txids() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    let n_rows = MVCC_COMMIT_BATCH_SIZE + 476;
+    let values = (1..=n_rows)
+        .map(|i| format!("({i}, 'v{i}')"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    setup
+        .execute(format!("INSERT INTO t(id, v) VALUES {values}"))
+        .unwrap();
+
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    setup.close().unwrap();
+
+    let conn_a = db.connect();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("DELETE FROM t").unwrap();
+
+    let log_record_prepared =
+        FixedYieldInjector::new([CommitYieldPoint::LogRecordPrepared.point()]);
+    conn_a.set_yield_injector(Some(log_record_prepared.clone()));
+
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+
+    for _ in 0..10_000 {
+        match commit_a.step().unwrap() {
+            StepResult::IO | StepResult::Yield if log_record_prepared.is_empty() => break,
+            StepResult::IO | StepResult::Yield => {}
+            StepResult::Done => panic!("COMMIT completed before LogRecordPrepared yielded"),
+            other => panic!("unexpected COMMIT result before LogRecordPrepared: {other:?}"),
+        }
+    }
+
+    conn_a.set_yield_injector(None);
+
+    match commit_a.step().unwrap() {
+        StepResult::IO | StepResult::Yield => {}
+        StepResult::Done => panic!("COMMIT completed before RewriteLiveVersions yielded"),
+        other => panic!("unexpected COMMIT result after LogRecordPrepared: {other:?}"),
+    }
+
+    drop(commit_a);
+
+    let conn_b = db.connect();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        conn_b.execute("BEGIN CONCURRENT").unwrap();
+        conn_b
+            .execute(format!(
+                "INSERT INTO t(id, v) VALUES ({n_rows}, 'replacement')"
+            ))
+            .unwrap();
+        conn_b.execute("COMMIT")
+    }));
+
+    assert!(
+        result.is_ok(),
+        "later public writer must not panic on a stale removed tombstone TxID"
+    );
+
+    result
+        .unwrap()
+        .expect("later public writer must not conflict on a stale removed tombstone TxID");
+}
