@@ -131,7 +131,7 @@ use storage::database::DatabaseFile;
 use storage::shared_wal_coordination::MappedSharedWalCoordination;
 use storage::{page_cache::PageCache, sqlite3_ondisk::PageSize};
 use tracing::{instrument, Level};
-use turso_macros::{match_ignore_ascii_case, AtomicEnum};
+use turso_macros::AtomicEnum;
 use turso_parser::{ast, ast::Cmd, parser::Parser};
 
 pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};

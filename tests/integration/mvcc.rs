@@ -1025,6 +1025,33 @@ fn test_create_insert_drop_checkpoint_recover(db: TempDatabase) -> anyhow::Resul
     Ok(())
 }
 
+/// Reproducer for #7475: MVCC recovery detects virtual tables by
+/// substring-matching the schema SQL for "create virtual", so a regular
+/// table whose SQL merely contains that substring (e.g. in a column
+/// DEFAULT literal) is misclassified as a virtual table and recovery
+/// fails with "sqlite_schema root_page must be 0 for table".
+#[turso_macros::test]
+fn test_recover_table_with_create_virtual_substring_in_sql(db: TempDatabase) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        conn.execute("pragma journal_mode = 'mvcc'")?;
+        conn.execute("create table t(x text default 'create virtual')")?;
+        conn.execute("insert into t default values")?;
+    }
+    drop(db);
+
+    // Reopen — triggers bootstrap / log replay; must not report corruption.
+    let db = Database::open_file(io, path.to_str().unwrap())?;
+    let conn = db.connect()?;
+    let rows: Vec<(String,)> = conn.exec_rows("select x from t");
+    assert_eq!(rows, vec![("create virtual".to_string(),)]);
+
+    Ok(())
+}
+
 /// Same-tx CREATE INDEX + DROP INDEX: the index schema row is inserted and
 /// deleted in the same transaction, producing an insert-delete cycle in
 /// sqlite_schema that must not panic during log replay.

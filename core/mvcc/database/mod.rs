@@ -33,6 +33,7 @@ use crate::types::ImmutableRecord;
 use crate::types::ImmutableRecordRef;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
+use crate::Completion;
 use crate::File;
 use crate::IOExt;
 use crate::LimboError;
@@ -41,9 +42,6 @@ use crate::Result;
 #[cfg(feature = "conn_raw_api")]
 use crate::Value;
 use crate::ValueRef;
-use crate::{
-    contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, Completion,
-};
 use crate::{io::FileSyncType, io_yield_one, return_if_io};
 use crate::{
     turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable, Numeric,
@@ -7972,12 +7970,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     _ => None,
                                 };
                                 let is_virtual_table = row_type == "table"
-                                    && sql.is_some_and(|sql| {
-                                        contains_ignore_ascii_case!(
-                                            sql.as_bytes(),
-                                            b"create virtual"
-                                        )
-                                    });
+                                    && sql.is_some_and(crate::util::sql_is_create_virtual_table);
                                 let has_btree = match row_type {
                                     "index" => true,
                                     "table" => !is_virtual_table,
