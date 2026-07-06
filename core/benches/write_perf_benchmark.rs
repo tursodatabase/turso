@@ -607,7 +607,7 @@ fn bench_delete_performance(criterion: &mut Criterion) {
 
 /// Benchmark: Large transaction commit (many dirty pages)
 ///
-/// Specifically targets the commit_dirty_pages path with many pages
+/// Specifically targets the commit_wal path with many pages
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_large_transaction_commit(criterion: &mut Criterion) {
     let enable_rusqlite =

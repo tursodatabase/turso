@@ -2036,12 +2036,12 @@ impl Connection {
                 pager
                     .io
                     .block(|| {
-                        return_if_io!(pager.commit_dirty_pages(
+                        return_if_io!(pager.commit_wal(
                             WalAutoActions::empty(),
                             self.get_sync_mode(),
                             self.get_data_sync_retry(),
                         ));
-                        pager.commit_dirty_pages_end();
+                        pager.commit_wal_end();
                         Ok(IOResult::Done(()))
                     })
                     .err()

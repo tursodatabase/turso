@@ -1001,9 +1001,15 @@ enum CommitState {
     PrepareFrames { db_size: u32 },
     /// All frames prepared, writes are in flight
     WaitWrites,
-    /// Writes are complete, wait for WAL sync to complete
+    /// Wait for the WAL fsync that makes the commit durable. Every commit
+    /// converges here once its writes (if any) have completed. The fsync is
+    /// submitted here, and skipped when the WAL is not dirty (no frames
+    /// appended since the last successful fsync) or sync_mode is not FULL.
+    /// Commits that prepared frames continue to WalCommitDone to publish
+    /// them; otherwise the commit finishes here, since frames written through
+    /// `write_frame_raw` published themselves when they were appended.
     WaitSync,
-    /// Wait for WAL sync to complete and finalize the WAL commit.
+    /// Finalize the WAL commit by publishing the prepared frames.
     /// After this state, the write transaction is durable.
     /// If autocheckpoint is enabled and the autocheckpoint threshold is reached, checkpoint will be attempted.
     WalCommitDone,
@@ -2979,7 +2985,7 @@ impl Pager {
             if update_transaction_state {
                 connection.set_tx_state(TransactionState::None);
             }
-            self.commit_dirty_pages_end();
+            self.commit_wal_end();
         };
 
         loop {
@@ -3010,7 +3016,7 @@ impl Pager {
                     return Ok(IOResult::Done(()));
                 }
                 _ => {
-                    return_if_io!(self.commit_dirty_pages(
+                    return_if_io!(self.commit_wal(
                         connection.wal_auto_actions(),
                         connection.get_sync_mode(),
                         connection.get_data_sync_retry(),
@@ -3402,7 +3408,7 @@ impl Pager {
     }
 
     /// Flush all dirty pages to disk (async/re-entrant).
-    /// Unlike commit_dirty_pages, this function does not commit, checkpoint nor sync the WAL/Database.
+    /// Unlike commit_wal, this function does not commit, checkpoint nor sync the WAL/Database.
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn cacheflush(&self) -> Result<IOResult<Vec<Completion>>> {
         let wal = self
@@ -3953,8 +3959,11 @@ impl Pager {
         Ok(IOResult::Done(()))
     }
 
-    /// Flush all dirty pages to disk.
-    /// In the base case, it will write the dirty pages to the WAL and then fsync the WAL.
+    /// Commit the write transaction to the WAL: write any dirty pages as WAL
+    /// frames, fsync the WAL if it is dirty, and publish the commit. The WAL
+    /// can be dirty without any dirty pages (frames inserted through
+    /// `write_frame_raw` bypass dirty-page tracking), so under
+    /// synchronous=FULL this fsyncs even when there is nothing to write.
     /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
     /// the database file and then fsync the database file.
     ///
@@ -3963,7 +3972,7 @@ impl Pager {
     /// gates the post-commit auto-checkpoint when `should_checkpoint()` is
     /// true.
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn commit_dirty_pages(
+    pub fn commit_wal(
         &self,
         allowed_auto_actions: WalAutoActions,
         sync_mode: SyncMode,
@@ -3981,30 +3990,29 @@ impl Pager {
             return Ok(IOResult::IO(c));
         }
 
-        let result =
-            self.commit_dirty_pages_inner(allowed_auto_actions, sync_mode, data_sync_retry);
+        let result = self.commit_wal_inner(allowed_auto_actions, sync_mode, data_sync_retry);
         if result.is_err() {
             self.commit_info.write().reset();
         }
         result
     }
 
-    pub fn commit_dirty_pages_end(&self) {
+    pub fn commit_wal_end(&self) {
         self.commit_info.write().reset();
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
     #[aristo::intent("A commit frame must reach stable storage via fsync before the transaction is reported as durable\n", id = "aristos:wal_commit_requires_fsync", verify = "full", parent = "wal_protocol_correctness")]
-    fn commit_dirty_pages_inner(
+    fn commit_wal_inner(
         &self,
         allowed_auto_actions: WalAutoActions,
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<()>> {
         let Some(wal) = self.wal.as_ref() else {
-            turso_soft_unreachable!("commit_dirty_pages() called without WAL");
+            turso_soft_unreachable!("commit_wal() called without WAL");
             return Err(LimboError::InternalError(
-                "commit_dirty_pages() called without WAL".into(),
+                "commit_wal() called without WAL".into(),
             ));
         };
 
@@ -4043,7 +4051,14 @@ impl Pager {
                     let dirty_pages = self.dirty_pages.read();
 
                     if dirty_pages.is_empty() {
-                        return Ok(IOResult::Done(()));
+                        // No dirty pages to flush, but that does not mean the
+                        // WAL is clean: frames written through
+                        // write_frame_raw() bypass dirty-page tracking, and
+                        // callers (e.g. the sync engine ending a raw-insert
+                        // session) treat this commit as their durability
+                        // barrier. WaitSync fsyncs if the WAL is dirty.
+                        commit_info.state = CommitState::WaitSync;
+                        continue;
                     }
                     commit_info.initialize(dirty_pages.len() as usize);
                     let mut cache = self.page_cache.write();
@@ -4212,16 +4227,9 @@ impl Pager {
                     }
                     commit_info.completions.clear();
                     commit_info.completion_group = None;
-                    // Writes done, submit fsync if needed.
-                    // NORMAL mode skips fsync on WAL commit (but still fsyncs on checkpoint and wal restart).
-                    if sync_mode == SyncMode::Full {
-                        let sync_c = wal.sync(self.get_sync_type())?;
-                        // Reuse the existing Vec instead of allocating a new one
-                        commit_info.completions.push(sync_c);
-                        commit_info.state = CommitState::WaitSync;
-                    } else {
-                        commit_info.state = CommitState::WalCommitDone;
-                    }
+                    // All writes complete; WaitSync submits the WAL fsync if
+                    // one is owed.
+                    commit_info.state = CommitState::WaitSync;
                 }
                 // To protect against partial writes, we MUST ensure that all write Completions
                 // finish before submitting the fsync. It is possible that a partial write will
@@ -4231,29 +4239,60 @@ impl Pager {
                 // to ensure durability in the case of partial writes is to ensure the pwritev
                 // completes before the fsync is submitted.
                 CommitState::WaitSync => {
-                    let sync_c = self.commit_info.read().completions[0].clone();
-                    // Wait for fsync to complete
-                    if !sync_c.finished() {
-                        io_yield_one!(sync_c);
-                    }
-                    // Check for fsync error as we might need to panic on data_sync_retry=off
-                    let mut commit_info = self.commit_info.write();
-                    if !sync_c.succeeded() {
-                        commit_info.completions.clear();
-                        commit_info.prepared_frames.clear();
-
-                        if !data_sync_retry {
-                            panic!(
-                                "fsync error (data_sync_retry=off): {:?}",
-                                sync_c.get_error()
-                            );
+                    // A pending completion means a previous entry into this
+                    // state already submitted the fsync; wait on it instead
+                    // of submitting a second one. At most one fsync is ever in
+                    // flight, so completions holds either the pending fsync or
+                    // nothing.
+                    assert!(
+                        self.commit_info.read().completions.len() <= 1,
+                        "WaitSync expects at most one in-flight fsync completion"
+                    );
+                    let pending = self.commit_info.read().completions.first().cloned();
+                    let sync_c = match pending {
+                        Some(c) => Some(c),
+                        // Skip the fsync when the WAL is not dirty (no frames
+                        // appended since the last successful fsync).
+                        // NORMAL mode skips fsync on WAL commit (but still
+                        // fsyncs on checkpoint and wal restart).
+                        None if sync_mode == SyncMode::Full && wal.is_dirty() => {
+                            let sync_c = wal.sync(self.get_sync_type())?;
+                            self.commit_info.write().completions.push(sync_c.clone());
+                            Some(sync_c)
                         }
-                        return Err(LimboError::CompletionError(CompletionError::IOError(
-                            std::io::ErrorKind::Other,
-                            "sync",
-                        )));
+                        None => None,
+                    };
+                    if let Some(sync_c) = sync_c {
+                        // Wait for fsync to complete
+                        if !sync_c.finished() {
+                            io_yield_one!(sync_c);
+                        }
+                        // Check for fsync error as we might need to panic on data_sync_retry=off
+                        let mut commit_info = self.commit_info.write();
+                        if !sync_c.succeeded() {
+                            commit_info.completions.clear();
+                            commit_info.prepared_frames.clear();
+
+                            if !data_sync_retry {
+                                panic!(
+                                    "fsync error (data_sync_retry=off): {:?}",
+                                    sync_c.get_error()
+                                );
+                            }
+                            return Err(LimboError::CompletionError(CompletionError::IOError(
+                                std::io::ErrorKind::Other,
+                                "sync",
+                            )));
+                        }
+                        commit_info.completions.clear();
                     }
-                    commit_info.completions.clear();
+                    let mut commit_info = self.commit_info.write();
+                    if commit_info.prepared_frames.is_empty() {
+                        // Nothing to publish: the frames this fsync covered
+                        // published themselves via finish_append_frames_commit()
+                        // when they were appended.
+                        return Ok(IOResult::Done(()));
+                    }
                     commit_info.state = CommitState::WalCommitDone;
                 }
                 CommitState::WalCommitDone => {

@@ -721,6 +721,11 @@ pub trait Wal: Debug + Send + Sync {
     fn publish_backfill(&self, max_frame: u64);
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
     fn is_syncing(&self) -> bool;
+    /// Whether the WAL file is dirty: frames were appended that no successful
+    /// WAL fsync has covered yet. A dirty WAL owes an fsync before a commit
+    /// may be reported durable, even when the committer itself has no dirty
+    /// pages to write (e.g. frames inserted through [Wal::write_frame_raw]).
+    fn is_dirty(&self) -> bool;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
     fn get_max_frame(&self) -> u64;
@@ -2631,6 +2636,14 @@ pub struct WalFile {
     /// meaning the coordination backend's max_frame is behind our connection-local
     /// max_frame. Cleared once `finish_append_frames_commit` publishes the state.
     has_unpublished_frames: AtomicBool,
+
+    /// The WAL file is dirty: frames were appended that no successful fsync
+    /// has covered yet. Set whenever a frame is recorded via
+    /// `complete_append_frame`, cleared when a WAL fsync completes
+    /// successfully. A dirty WAL owes an fsync before a commit may be
+    /// reported durable under synchronous=FULL.
+    /// Shared with the fsync completion callback, hence the Arc.
+    dirty: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for WalFile {
@@ -3842,10 +3855,13 @@ impl Wal for WalFile {
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
         tracing::debug!("wal_sync");
         let syncing = self.syncing.clone();
+        let dirty = self.dirty.clone();
         let completion = Completion::new_sync(move |result| {
             tracing::debug!("wal_sync finish");
             if let Err(err) = result {
                 tracing::debug!("wal_sync failed: {err}");
+            } else {
+                dirty.store(false, Ordering::Release);
             }
             syncing.store(false, Ordering::Release);
         });
@@ -3858,6 +3874,10 @@ impl Wal for WalFile {
     // Currently used for assertion purposes
     fn is_syncing(&self) -> bool {
         self.syncing.load(Ordering::Acquire)
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
     }
 
     fn get_max_frame_in_wal(&self) -> u64 {
@@ -4510,6 +4530,7 @@ impl WalFile {
             checkpoint_guard: RwLock::new(None),
             io_ctx: RwLock::new(IOContext::default()),
             has_unpublished_frames: AtomicBool::new(false),
+            dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -4553,6 +4574,7 @@ impl WalFile {
     }
 
     fn complete_append_frame(&self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {
+        self.dirty.store(true, Ordering::Release);
         *self.last_checksum.write() = checksums;
         self.max_frame.store(frame_id, Ordering::Release);
         self.coordination.cache_frame(page_id, frame_id);
@@ -5639,7 +5661,7 @@ impl WalFileShared {
             self.metadata.max_frame.store(0, Ordering::Release);
             self.metadata.nbackfills.store(0, Ordering::Release);
             self.metadata.last_checksum = (hdr.checksum_1, hdr.checksum_2);
-            // `prepare_wal_start` (used in the `commit_dirty_pages_inner`) do the work only if WAL is not initialized yet (so, self.initialized is false)
+            // `prepare_wal_start` (used in the `commit_wal_inner`) do the work only if WAL is not initialized yet (so, self.initialized is false)
             // we change WAL state here, so on next write attempt `prepare_wal_start` will update WAL header
             self.metadata.initialized.store(false, Ordering::Release);
         }
