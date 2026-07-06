@@ -2169,6 +2169,20 @@ impl Pager {
         Ok(())
     }
 
+    #[aristo::intent(
+        "Rolling back to a savepoint rewinds the database shape and the page bytes to \
+         one consistent snapshot, split at the savepoint's database size. Each page at \
+         or below that size that was modified during the savepoint is restored from its \
+         pre-savepoint image, kept dirty, and re-inserted into the cache. Pages left \
+         untouched during the savepoint keep their existing content. Every page beyond \
+         that size is removed from both the dirty set and the cache. No page reachable \
+         by the restored header page count or by a restored btree pointer is left as an \
+         unwritten zero slot. Restoring the pre-images and discarding the beyond-boundary \
+         pages must happen together; dropping either half leaves a live page pointing at \
+         zeroed bytes, which the next read rejects as an invalid page type.",
+        verify = "neural",
+        id = "savepoint_rollback_shape_and_bytes_consistent"
+    )]
     fn rollback_to_snapshot(
         &self,
         savepoint: &SavepointSnapshot,
