@@ -373,3 +373,83 @@ fn try_with_capacity_builds_turso_collections() {
     assert!(queue.capacity() >= 3);
     assert!(heap.capacity() >= 3);
 }
+
+/// Element type whose fallible clone always fails: proves `Vec::try_clone`
+/// clones elements through `TryClone` instead of the infallible `Clone`.
+#[derive(Clone)]
+struct FallibleElem;
+
+impl TryClone for FallibleElem {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Err(TryReserveError)
+    }
+}
+
+#[test]
+fn vec_try_clone_clones_elements_fallibly() {
+    let mut source: Vec<FallibleElem> = self::vec![];
+    source.try_push(FallibleElem).unwrap();
+    assert!(
+        source.try_clone().is_err(),
+        "Vec::try_clone must clone elements through TryClone"
+    );
+}
+
+#[test]
+fn vec_try_clone_bulk_copies_copy_elements() {
+    let mut source: Vec<u32> = self::vec![];
+    source.try_push(7).unwrap();
+    assert_eq!(source.try_clone().unwrap().as_slice(), &[7]);
+}
+
+/// Fails cloning a marked element: exercises the early-`Err` path of the
+/// spare-capacity write loop (partially written clone must drop cleanly,
+/// source must stay intact).
+#[derive(Clone, Debug, PartialEq)]
+struct FailOnMarked {
+    payload: std::string::String,
+    fail: bool,
+}
+
+impl TryClone for FailOnMarked {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        if self.fail {
+            Err(TryReserveError)
+        } else {
+            Ok(self.clone())
+        }
+    }
+}
+
+#[test]
+fn vec_try_clone_partial_element_failure_is_clean() {
+    let elem = |payload: &str, fail| FailOnMarked {
+        payload: payload.into(),
+        fail,
+    };
+    let mut source: Vec<FailOnMarked> = self::vec![];
+    source.try_push(elem("a", false)).unwrap();
+    source.try_push(elem("b", false)).unwrap();
+    source.try_push(elem("c", true)).unwrap();
+    source.try_push(elem("d", false)).unwrap();
+
+    assert!(source.try_clone().is_err());
+    // Source unchanged; the two successfully written clones were dropped.
+    assert_eq!(source.len(), 4);
+    assert_eq!(source[0], elem("a", false));
+    assert_eq!(source[3], elem("d", false));
+}
+
+#[test]
+fn vec_try_clone_deep_values_roundtrip() {
+    let mut source: Vec<(std::string::String, u32)> = self::vec![];
+    for i in 0..100u32 {
+        source.try_push((format!("value-{i}"), i)).unwrap();
+    }
+    let cloned = source.try_clone().unwrap();
+    assert_eq!(cloned.as_slice(), source.as_slice());
+}
