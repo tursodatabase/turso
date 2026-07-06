@@ -59,7 +59,12 @@ jobs:
     timeout-minutes: ${{ matrix.os == 'windows-latest' && 120 || 30 }}
     strategy:
       matrix:
-        os: [blacksmith-4vcpu-ubuntu-2404, blacksmith-6vcpu-macos-latest, windows-latest]
+        os:
+          [
+            blacksmith-4vcpu-ubuntu-2404,
+            blacksmith-6vcpu-macos-latest,
+            windows-latest,
+          ]
 
     runs-on: ${{ matrix.os }}
 
@@ -372,6 +377,9 @@ jobs:
           - name: in-process-mvcc
             iterations: 25
             args: "--mode fast --reopen-probability 0.01 --enable-mvcc --allocation-fault-probability 0.01"
+          - name: schema-clone-faults
+            iterations: 10
+            args: "--mode schema-clone-faults --reopen-probability 0.0001 --allocation-fault-probability 0.01"
           - name: btree-rebalance
             iterations: 5
             args: "--mode btree-rebalance --allocation-fault-probability 0"

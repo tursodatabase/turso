@@ -252,6 +252,118 @@ impl Workload for WalCheckpointWorkload {
     }
 }
 
+/// Run the checkpoint mode that is valid for both WAL and MVCC.
+pub struct TruncateCheckpointWorkload;
+
+impl Workload for TruncateCheckpointWorkload {
+    fn generate(&self, ctx: &WorkloadContext, _rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if *ctx.fiber_state != FiberState::Idle {
+            return None;
+        }
+        Some(Operation::WalCheckpoint {
+            mode: "TRUNCATE".to_string(),
+        })
+    }
+}
+
+/// Churn schema objects to force schema copy-on-write under allocation faults.
+pub struct SchemaChurnWorkload;
+
+impl Workload for SchemaChurnWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if *ctx.fiber_state == FiberState::InConcurrentTx {
+            return None;
+        }
+
+        let table_id = rng.random_range(0..64);
+        let index_id = rng.random_range(0..256);
+        let sql = match rng.random_range(0..12) {
+            0..=2 => schema_churn_create_table_sql(table_id),
+            3..=4 => schema_churn_create_index_sql(table_id, index_id),
+            5 => schema_churn_create_view_sql(table_id),
+            6 => schema_churn_create_trigger_sql(table_id),
+            7 => schema_churn_drop_index_sql(table_id, index_id),
+            8 => schema_churn_drop_view_sql(table_id),
+            9 => schema_churn_schema_read_sql(table_id),
+            10 => existing_table_index_sql(&ctx.tables_vec, index_id, rng)
+                .unwrap_or_else(|| schema_churn_create_table_sql(table_id)),
+            _ => "SELECT name, sql FROM sqlite_schema WHERE name LIKE 'schema_clone_%' ORDER BY name LIMIT 8".to_string(),
+        };
+        Some(Operation::Execute { sql })
+    }
+}
+
+fn schema_churn_table_name(table_id: u32) -> String {
+    format!("schema_clone_t_{table_id}")
+}
+
+fn schema_churn_create_table_sql(table_id: u32) -> String {
+    let table_name = schema_churn_table_name(table_id);
+    format!(
+        "CREATE TABLE IF NOT EXISTS {table_name} (\
+         id INTEGER PRIMARY KEY, \
+         k TEXT NOT NULL DEFAULT 'k', \
+         v INTEGER NOT NULL DEFAULT 0, \
+         payload BLOB, \
+         CHECK (v >= 0), \
+         UNIQUE (k, v))"
+    )
+}
+
+fn schema_churn_create_index_sql(table_id: u32, index_id: u32) -> String {
+    let table_name = schema_churn_table_name(table_id);
+    format!(
+        "CREATE INDEX IF NOT EXISTS schema_clone_idx_{table_id}_{index_id} \
+         ON {table_name}(k, v) WHERE v >= 0"
+    )
+}
+
+fn schema_churn_create_view_sql(table_id: u32) -> String {
+    let table_name = schema_churn_table_name(table_id);
+    format!(
+        "CREATE VIEW IF NOT EXISTS schema_clone_v_{table_id} AS \
+         SELECT id, k, v FROM {table_name} WHERE v >= 0"
+    )
+}
+
+fn schema_churn_create_trigger_sql(table_id: u32) -> String {
+    let table_name = schema_churn_table_name(table_id);
+    format!(
+        "CREATE TRIGGER IF NOT EXISTS schema_clone_tr_{table_id} \
+         AFTER INSERT ON {table_name} \
+         WHEN new.v > 100 \
+         BEGIN \
+             UPDATE {table_name} SET v = new.v WHERE id = new.id; \
+         END"
+    )
+}
+
+fn schema_churn_drop_index_sql(table_id: u32, index_id: u32) -> String {
+    format!("DROP INDEX IF EXISTS schema_clone_idx_{table_id}_{index_id}")
+}
+
+fn schema_churn_drop_view_sql(table_id: u32) -> String {
+    format!("DROP VIEW IF EXISTS schema_clone_v_{table_id}")
+}
+
+fn schema_churn_schema_read_sql(table_id: u32) -> String {
+    let table_name = schema_churn_table_name(table_id);
+    format!("PRAGMA table_info('{table_name}')")
+}
+
+fn existing_table_index_sql(
+    tables: &[Table],
+    index_id: u32,
+    rng: &mut ChaCha8Rng,
+) -> Option<String> {
+    let table = tables.choose(rng)?;
+    let column = table.columns.choose(rng)?;
+    Some(format!(
+        "CREATE INDEX IF NOT EXISTS schema_clone_existing_idx_{}_{} ON {}({})",
+        table.name, index_id, table.name, column.name
+    ))
+}
+
 /// Commit the current transaction.
 pub struct CommitWorkload;
 
@@ -619,5 +731,74 @@ impl Workload for AutoincDeleteWorkload {
     fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         let id = rng.random_range(1..10_000i64);
         Some(Operation::AutoincDelete { id })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::SeedableRng;
+    use sql_generation::{
+        generation::Opts,
+        model::table::{Column, ColumnType, Table},
+    };
+
+    use super::*;
+
+    #[test]
+    fn schema_churn_create_table_uses_schema_features() {
+        let sql = schema_churn_create_table_sql(7);
+
+        assert!(sql.contains("schema_clone_t_7"));
+        assert!(sql.contains("UNIQUE"));
+        assert!(sql.contains("CHECK"));
+    }
+
+    #[test]
+    fn schema_churn_skips_concurrent_transactions() {
+        let table = Table {
+            name: "table_0".to_string(),
+            columns: vec![Column {
+                name: "id".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![],
+            }],
+            rows: vec![],
+            indexes: vec![],
+        };
+        let state = SimulatorState::new(vec![table.clone()], vec![]);
+        let opts = Opts::default();
+        let tables_vec = vec![table];
+        let ctx = WorkloadContext {
+            fiber_state: &FiberState::InConcurrentTx,
+            sim_state: &state,
+            opts: &opts,
+            enable_mvcc: true,
+            tables_vec,
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+
+        assert!(SchemaChurnWorkload.generate(&ctx, &mut rng).is_none());
+    }
+
+    #[test]
+    fn existing_table_index_targets_generated_schema() {
+        let table = Table {
+            name: "table_0".to_string(),
+            columns: vec![Column {
+                name: "col_0".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![],
+            }],
+            rows: vec![],
+            indexes: vec![],
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+
+        let sql = existing_table_index_sql(&[table], 9, &mut rng).unwrap();
+
+        assert_eq!(
+            sql,
+            "CREATE INDEX IF NOT EXISTS schema_clone_existing_idx_table_0_9 ON table_0(col_0)"
+        );
     }
 }
