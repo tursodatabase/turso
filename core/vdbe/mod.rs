@@ -1363,7 +1363,7 @@ pub struct PreparedProgram {
     pub sql: String,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.
-    /// See [crate::vdbe::builder::ProgramBuilder::is_multi_write] and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
+    /// See [crate::vdbe::builder::ProgramBuilderFlags::is_multi_write] for more details.
     pub needs_stmt_subtransactions: Arc<AtomicBool>,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,

@@ -1169,11 +1169,6 @@ pub fn translate_insert(
 
     {
         let has_statement_conflict = ctx.statement_on_conflict.is_some();
-        let notnull_col_exists = insertion
-            .col_mappings
-            .iter()
-            .any(|m| m.column.notnull() && !m.column.is_rowid_alias());
-        let has_unique = !constraints.constraints_to_check.is_empty();
         let has_triggers = has_before_triggers || has_after_triggers;
         set_insert_stmt_journal_flags(
             program,
@@ -1184,11 +1179,8 @@ pub fn translate_insert(
             ctx.on_conflict,
             inserting_multiple_rows,
             has_triggers,
-            has_fks,
             has_upsert,
             btree_table.has_autoincrement,
-            notnull_col_exists,
-            has_unique,
         );
     }
 

@@ -2355,7 +2355,7 @@ fn run_fk_constraint_case(
 
 /// Multi-row UPDATE that violates child-side FK: all rows must be rolled back.
 /// The FkCounter is incremented during the scan, then Halt checks the counter.
-/// Statement journal is required because multi_write=true (has_fks) and may_abort=true.
+/// Statement journal is required because multi_write=true (has_fks).
 #[turso_macros::test]
 fn test_update_fk_child_violation_multi_row_rollback(tmp_db: TempDatabase) -> anyhow::Result<()> {
     drop(tmp_db);

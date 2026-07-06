@@ -297,21 +297,17 @@ pub struct ProgramBuilderFlags(u8);
 impl ProgramBuilderFlags {
     const ROLLBACK: u8 = 1 << 0;
     const IS_MULTI_WRITE: u8 = 1 << 1;
-    const MAY_ABORT: u8 = 1 << 2;
-    const READONLY: u8 = 1 << 3;
-    const IS_SUBPROGRAM: u8 = 1 << 4;
-    const HAS_STATEMENT_CONFLICT: u8 = 1 << 5;
-    const SUPPRESS_CUSTOM_TYPE_DECODE: u8 = 1 << 6;
-    const SUPPRESS_COLUMN_DEFAULT: u8 = 1 << 7;
+    const READONLY: u8 = 1 << 2;
+    const IS_SUBPROGRAM: u8 = 1 << 3;
+    const HAS_STATEMENT_CONFLICT: u8 = 1 << 4;
+    const SUPPRESS_CUSTOM_TYPE_DECODE: u8 = 1 << 5;
+    const SUPPRESS_COLUMN_DEFAULT: u8 = 1 << 6;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
         new.set_is_multi_write(true);
-        new.set_may_abort(true);
         new.set_readonly(true);
         new.set_is_subprogram(is_subprogram);
-        new.set_is_multi_write(true);
-        new.set_may_abort(true);
         new
     }
 
@@ -350,18 +346,6 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_is_multi_write(&mut self, v: bool) {
         self.set(Self::IS_MULTI_WRITE, v)
-    }
-
-    #[inline]
-    /// Mirrors SQLite's mayAbort: true if the statement may throw an ABORT exception.
-    /// This flag is used in combination with is_multi_write to determine if statement subjournaling is required.
-    /// Defaults to true for safety; specific translate paths (e.g., INSERT with no constraints) set false.
-    pub const fn may_abort(self) -> bool {
-        self.get(Self::MAY_ABORT)
-    }
-    #[inline]
-    pub const fn set_may_abort(&mut self, v: bool) {
-        self.set(Self::MAY_ABORT, v)
     }
 
     #[inline]
@@ -826,11 +810,6 @@ impl ProgramBuilder {
     /// When false, statement journals are skipped since single-write statements are atomic.
     pub const fn set_multi_write(&mut self, is_multi_write: bool) {
         self.flags.set_is_multi_write(is_multi_write);
-    }
-
-    /// Mark that this statement may throw an ABORT exception (mirrors SQLite's sqlite3MayAbort).
-    pub const fn set_may_abort(&mut self, may_abort: bool) {
-        self.flags.set_may_abort(may_abort);
     }
 
     pub const fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
@@ -1944,14 +1923,22 @@ impl ProgramBuilder {
 
         self.parameters.list.dedup();
 
-        // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
-        // Statement journals are only needed when a statement writes multiple rows AND could
-        // abort midway (e.g. constraint violation). Single-row writes are atomic and don't
-        // need statement-level rollback. Both flags default to true; specific translate paths
-        // (e.g., single-row INSERT) set is_multi_write=false to opt out.
-        let needs_stmt_subtransactions = matches!(self.txn_mode, TransactionMode::Write)
-            && self.flags.is_multi_write()
-            && self.flags.may_abort();
+        // SQLite uses: usesStmtJournal = isMultiWrite && mayAbort. It can skip the
+        // statement journal for multi-write statements that cannot SQL-abort because
+        // its VDBE never returns control to the application mid-mutation: a statement
+        // either runs to completion or fails, and "cannot abort" implies "no partial
+        // state to roll back".
+        //
+        // Turso cannot rely on the mayAbort half of that rule. The VM yields
+        // `StepResult::IO` in the middle of built-in row mutation, and the caller may
+        // drop (abandon) the statement at any such yield point. An abandoned
+        // multi-write statement inside an explicit transaction must roll back its
+        // prefix table/index writes on reset, or a later COMMIT persists a corrupt
+        // prefix (see #7594). So every multi-write statement needs the statement
+        // savepoint boundary, whether or not it can SQL-abort. Single-row writes are
+        // atomic and still opt out via is_multi_write=false in the translate paths.
+        let needs_stmt_subtransactions =
+            matches!(self.txn_mode, TransactionMode::Write) && self.flags.is_multi_write();
 
         let contains_trigger_subprograms = self
             .insns
