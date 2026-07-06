@@ -22,7 +22,7 @@
   "devDependencies": {
     "@napi-rs/cli": "^3.1.5",
     "@types/node": "^24.3.1",
-    "better-sqlite3": "^12.2.0",
+    "better-sqlite3": "12.9.0",
     "drizzle-kit": "^0.31.4",
     "drizzle-orm": "^0.45.2",
     "typescript": "^5.9.2",
