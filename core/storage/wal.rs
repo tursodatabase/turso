@@ -3103,6 +3103,15 @@ impl WalFile {
         // Snapshot the shared WAL state. We haven't taken a read lock yet, so we need
         // to validate these values later.
         let shared_snapshot = self.load_coordination_snapshot();
+        turso_assert!(
+            shared_snapshot.nbackfills <= shared_snapshot.max_frame,
+            "WAL snapshot cannot have backfills beyond max frame",
+            {
+                "nbackfills": shared_snapshot.nbackfills,
+                "max_frame": shared_snapshot.max_frame,
+                "checkpoint_seq": shared_snapshot.checkpoint_seq
+            }
+        );
         tracing::debug!(
             "try_begin_read_tx: shared_max={}, nbackfills={}, last_checksum={:?}, checkpoint_seq={:?}, transaction_count={}",
             shared_snapshot.max_frame,
@@ -3834,6 +3843,16 @@ impl Wal for WalFile {
     }
 
     fn publish_backfill(&self, max_frame: u64) {
+        let snapshot = self.load_coordination_snapshot();
+        turso_assert!(
+            (snapshot.nbackfills..=snapshot.max_frame).contains(&max_frame),
+            "published backfill must stay within the current WAL generation",
+            {
+                "publish_backfill": max_frame,
+                "current_nbackfills": snapshot.nbackfills,
+                "current_max_frame": snapshot.max_frame
+            }
+        );
         self.coordination.publish_backfill(max_frame);
     }
 
