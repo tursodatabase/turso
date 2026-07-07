@@ -4156,23 +4156,7 @@ impl Wal for WalFile {
             None => {
                 let snapshot = self.load_coordination_snapshot();
                 let local_state = self.connection_state();
-                let local_prepared_zero_frame_header = snapshot.max_frame == 0
-                    && self.coordination.wal_is_initialized()
-                    && local_state.snapshot.max_frame == 0
-                    && local_state.snapshot.checkpoint_seq == snapshot.checkpoint_seq
-                    && local_state.snapshot.transaction_count == snapshot.transaction_count
-                    && local_state.snapshot.last_checksum != snapshot.last_checksum;
-                if local_prepared_zero_frame_header {
-                    // We already prepared the WAL header for the current
-                    // zero-frame generation locally, but the authority snapshot
-                    // still carries the pre-header checksum until the first
-                    // commit publishes it. Seed the checksum chain from the
-                    // prepared local header, not the stale authority checksum.
-                    (
-                        local_state.snapshot.last_checksum,
-                        local_state.snapshot.max_frame + 1,
-                    )
-                } else if snapshot != local_state.snapshot {
+                let seed = if snapshot != local_state.snapshot {
                     let has_unpublished_frames =
                         self.has_unpublished_frames.load(Ordering::Acquire);
                     if has_unpublished_frames {
@@ -4198,9 +4182,26 @@ impl Wal for WalFile {
                         local_state.snapshot.last_checksum,
                         local_state.snapshot.max_frame + 1,
                     )
-                }
+                };
+                turso_assert!(
+                    seed.1 > snapshot.max_frame,
+                    "WAL append position must be past the committed high-water mark, otherwise committed frames get overwritten",
+                    { "next_frame_id": seed.1, "authority_max_frame": snapshot.max_frame }
+                );
+                seed
             }
         };
+
+        // The first frame of a generation always chains from the WAL header
+        // checksum, like SQLite's walFrames at mxFrame == 0. Connection and
+        // authority state may still carry the pre-header checksum here: a
+        // restart resets the position before the next append writes the new
+        // header, and a savepoint rollback can reinstall a position captured
+        // in that window. The wal_is_initialized assert above guarantees
+        // `header` is the current generation's synced header.
+        if next_frame_id == 1 {
+            rolling_checksum = (header.checksum_1, header.checksum_2);
+        }
 
         let first_frame_id = next_frame_id;
 
