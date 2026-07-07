@@ -2602,16 +2602,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             let (_id, row_versions) = &write_set.entries[ctx.cursor];
             let mut row_versions = row_versions.write();
             for row_version in row_versions.iter_mut() {
-                if let Some(TxTimestampOrID::TxID(rv_id)) = row_version.begin() {
-                    if rv_id == tx_id {
-                        row_version.set_begin(Some(TxTimestampOrID::Timestamp(end_ts)));
-                    }
-                }
-                if let Some(TxTimestampOrID::TxID(rv_id)) = row_version.end() {
-                    if rv_id == tx_id {
-                        row_version.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
-                    }
-                }
+                row_version.rewrite_txid_to_timestamp(tx_id, end_ts);
             }
             ctx.cursor += 1;
             iterations += 1;
@@ -5995,7 +5986,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             Some(TransactionState::Active | TransactionState::Preparing(_)) => {
                 self.rollback_tx_inner(tx_id, Some(connection), db_id);
             }
-            Some(TransactionState::Committed(_)) => {
+            Some(TransactionState::Committed(end_ts)) => {
+                // The dropped statement may have been interrupted mid
+                // `RewriteLiveVersions`, leaving live row versions (e.g. b-tree
+                // tombstones) that still reference this TxID. Finish the rewrite
+                // synchronously before removing the tx from `txs`, otherwise later
+                // visibility/conflict checks would find versions pointing at a
+                // removed TxID (https://github.com/tursodatabase/turso/issues/7477).
+                self.rewrite_live_versions_for_committed_tx(tx_id, end_ts);
                 if let Some(tx) = self.txs.get(&tx_id) {
                     self.unlock_commit_lock_if_held(tx.value());
                 }
@@ -6013,6 +6011,30 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
                 }
+            }
+        }
+    }
+
+    /// Rewrite every live row version in `tx_id`'s write set that still
+    /// references the TxID to the committed timestamp `end_ts`.
+    ///
+    /// Synchronous (unchunked) counterpart of `step_rewrite_live_versions`:
+    /// a commit statement dropped mid-`RewriteLiveVersions` must finish
+    /// publishing its timestamps before the tx is removed from `txs`, so no
+    /// row version is left referencing a TxID that no longer resolves.
+    fn rewrite_live_versions_for_committed_tx(&self, tx_id: TxID, end_ts: u64) {
+        let Some(tx_entry) = self.txs.get(&tx_id) else {
+            return;
+        };
+        turso_assert!(
+            matches!(tx_entry.value().state.load(), TransactionState::Committed(ts) if ts == end_ts),
+            "rewrite_live_versions_for_committed_tx requires a committed transaction state"
+        );
+        let write_set = tx_entry.value().write_set.lock();
+        for (_id, row_versions) in write_set.iter() {
+            let mut row_versions = row_versions.write();
+            for row_version in row_versions.iter_mut() {
+                row_version.rewrite_txid_to_timestamp(tx_id, end_ts);
             }
         }
     }
@@ -8607,6 +8629,24 @@ impl RowVersion {
     #[inline]
     pub fn set_end(&mut self, value: Option<TxTimestampOrID>) {
         self.end = crate::mvcc::database::PackedTs::pack(value);
+    }
+
+    /// Replace `begin`/`end` references to `tx_id` with the committed
+    /// timestamp `end_ts`. Shared by the chunked commit step
+    /// (`step_rewrite_live_versions`) and the dropped-statement cleanup path
+    /// (`rewrite_live_versions_for_committed_tx`) so the two cannot drift.
+    #[inline]
+    fn rewrite_txid_to_timestamp(&mut self, tx_id: TxID, end_ts: u64) {
+        if let Some(TxTimestampOrID::TxID(rv_id)) = self.begin() {
+            if rv_id == tx_id {
+                self.set_begin(Some(TxTimestampOrID::Timestamp(end_ts)));
+            }
+        }
+        if let Some(TxTimestampOrID::TxID(rv_id)) = self.end() {
+            if rv_id == tx_id {
+                self.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
+            }
+        }
     }
 
     /// A row is visible to a transaction if:
