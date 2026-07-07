@@ -3781,6 +3781,13 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// because operations like last() on an index are much easier when we don't have to take the
     /// table identifier into account.
     pub index_rows: SkipMap<MVTableId, IndexRowsMap<A>, BasicComparator, A>,
+    /// Bumped whenever the key set of `index_rows` may change (every
+    /// [`Self::insert_index_version`], which is the single funnel through which
+    /// new index keys are created). Forward-scan cursors snapshot this next to
+    /// their [`crate::mvcc::cursor::IndexShadowFinger`] and reset the finger on
+    /// a mismatch, since a key inserted at or behind an already-positioned
+    /// finger would otherwise be skipped (#7578).
+    index_rows_epoch: AtomicU64,
     txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
@@ -3973,6 +3980,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             rows: SkipMap::new_in(alloc.clone()),
             table_id_to_rootpage,
             index_rows: SkipMap::new_in(alloc.clone()),
+            index_rows_epoch: AtomicU64::new(0),
             txs: SkipMap::new_in(alloc.clone()),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
             alloc,
@@ -6979,6 +6987,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         key: Arc<SortableIndexKey>,
         mut row_version: RowVersion,
     ) -> Result<(Arc<SortableIndexKey>, RowVersions<A>)> {
+        // Publish the key-set mutation *before* the key becomes visible in the
+        // map: a concurrent shadow finger that races with this insert may then
+        // reset spuriously, but can never miss the new key (#7578).
+        self.index_rows_epoch.fetch_add(1, Ordering::SeqCst);
         let index = self.get_or_create_index_rows(index_id)?;
         let index = index.value();
         let entry = self.get_or_create_index_key_entry(index, key)?;
@@ -6990,6 +7002,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let row_versions = entry.value().clone();
         self.insert_version_raw(&mut row_versions.write(), row_version)?;
         Ok((canonical_key, row_versions))
+    }
+
+    /// Current epoch of `index_rows` key-set mutations; see the field docs.
+    pub(crate) fn index_rows_epoch(&self) -> u64 {
+        self.index_rows_epoch.load(Ordering::SeqCst)
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::IndexRowsEntry)]

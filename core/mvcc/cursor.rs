@@ -517,6 +517,16 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     dual_peek: DualCursorPeek<A>,
     /// Forward-scan finger over `index_rows`; see [`IndexShadowFinger`].
     index_finger: IndexShadowFinger<A>,
+    /// [`MvStore::index_rows_epoch`] snapshot taken the last time
+    /// `index_finger` was consulted. New index keys can be created at or
+    /// behind an already-positioned finger while the scan's cursor is open
+    /// (e.g. a DELETE on the same connection inserts a tombstone key
+    /// mid-scan, #7578); versions appended to *existing* keys are fine
+    /// (chains are read live through their `Arc`), but a new key would be
+    /// silently skipped. On an epoch mismatch the finger is reset so it
+    /// reseeds at the current B-tree key instead of trusting its stale
+    /// position.
+    index_finger_epoch: u64,
 }
 
 pub enum NextRowidResult {
@@ -568,6 +578,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
             index_finger: IndexShadowFinger::default(),
+            index_finger_epoch: 0,
         })
     }
 
@@ -577,6 +588,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         let RowKey::Record(rec) = key else {
             return self.query_btree_version_is_valid(key);
         };
+        // Read the epoch before the finger (re)seeds: if a key insert races
+        // past this load, the next shadow check observes the mismatch and
+        // resets. See `index_finger_epoch`.
+        let epoch = self.db.index_rows_epoch();
+        if self.index_finger_epoch != epoch {
+            self.index_finger.reset();
+            self.index_finger_epoch = epoch;
+        }
         let valid = self
             .index_finger
             .btree_row_is_valid(&self.db, self.table_id, self.tx_id, rec);
