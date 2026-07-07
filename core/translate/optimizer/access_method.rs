@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
-use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt};
+use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
 use crate::translate::collate::CollationSeq;
@@ -1668,30 +1668,32 @@ fn materialized_subquery_ephemeral_index(
         if !seen_col_positions.insert(col_pos) {
             continue;
         }
-        // Capacity is preallocated to subquery.columns.len(); key columns are deduplicated.
-        index_columns.push(IndexColumn {
-            name: column.name.clone().unwrap_or_default(),
-            order: SortOrder::Asc,
-            pos_in_table: col_pos,
-            collation: column.collation_opt(),
-            default: column.default.clone(),
-            expr: None,
-        });
+        index_columns
+            .push_within_capacity(IndexColumn {
+                name: column.name.clone().unwrap_or_default(),
+                order: SortOrder::Asc,
+                pos_in_table: col_pos,
+                collation: column.collation_opt(),
+                default: column.default.clone(),
+                expr: None,
+            })
+            .expect("subquery index columns vector was preallocated to subquery.columns.len()");
     }
 
     for (col_pos, column) in subquery.columns.iter().enumerate() {
         if seen_col_positions.contains(&col_pos) {
             continue;
         }
-        // Capacity is preallocated to subquery.columns.len(); non-key columns fill the remainder.
-        index_columns.push(IndexColumn {
-            name: column.name.clone().unwrap_or_default(),
-            order: SortOrder::Asc,
-            pos_in_table: col_pos,
-            collation: column.collation_opt(),
-            default: column.default.clone(),
-            expr: None,
-        });
+        index_columns
+            .push_within_capacity(IndexColumn {
+                name: column.name.clone().unwrap_or_default(),
+                order: SortOrder::Asc,
+                pos_in_table: col_pos,
+                collation: column.collation_opt(),
+                default: column.default.clone(),
+                expr: None,
+            })
+            .expect("subquery index columns vector was preallocated to subquery.columns.len()");
     }
 
     Ok(Arc::new(Index {

@@ -35,6 +35,22 @@ impl<T> TursoVecExt<T> for Vec<T> {
     }
 
     #[inline(always)]
+    fn push_within_capacity(&mut self, value: T) -> Result<&mut T, T> {
+        if self.len() == self.capacity() {
+            return Err(value);
+        }
+
+        unsafe {
+            let end = self.as_mut_ptr().add(self.len());
+            std::ptr::write(end, value);
+            self.set_len(self.len() + 1);
+
+            // SAFETY: We just wrote a value to the pointer that will live the lifetime of the reference.
+            Ok(&mut *end)
+        }
+    }
+
+    #[inline(always)]
     fn try_push(&mut self, value: T) -> Result<(), TryReserveError> {
         self.push(value);
         Ok(())

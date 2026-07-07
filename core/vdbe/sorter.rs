@@ -905,8 +905,9 @@ impl BoxedSortableRecord {
                 Some(Ok(value)) => {
                     // SAFETY: value points into record which lives as long as this struct
                     let value: ValueRef<'static> = unsafe { std::mem::transmute(value) };
-                    // Preallocated enough space
-                    key_values.push(value);
+                    key_values
+                        .push_within_capacity(value)
+                        .expect("sort key vector was preallocated");
                 }
                 Some(Err(err)) => {
                     mark_unlikely();

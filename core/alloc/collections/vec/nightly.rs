@@ -28,12 +28,28 @@ impl<T> TursoVecExt<T> for Vec<T> {
     }
 
     #[inline(always)]
+    fn push_within_capacity(&mut self, value: T) -> Result<&mut T, T> {
+        if self.len() == self.capacity() {
+            return Err(value);
+        }
+
+        unsafe {
+            let end = self.as_mut_ptr().add(self.len());
+            ptr::write(end, value);
+            self.set_len(self.len() + 1);
+
+            // SAFETY: We just wrote a value to the pointer that will live the lifetime of the reference.
+            Ok(&mut *end)
+        }
+    }
+
+    #[inline(always)]
     fn try_push(&mut self, value: T) -> Result<(), TryReserveError> {
-        match self.push_within_capacity(value) {
+        match <Self as TursoVecExt<T>>::push_within_capacity(self, value) {
             Ok(_) => Ok(()),
             Err(value) => {
                 self.try_reserve(1).map_err(TryReserveError::from)?;
-                match self.push_within_capacity(value) {
+                match <Self as TursoVecExt<T>>::push_within_capacity(self, value) {
                     Ok(_) => Ok(()),
                     Err(_) => unreachable!("Vec::try_reserve(1) did not make room"),
                 }

@@ -1,4 +1,4 @@
-use crate::alloc::{TryClone, TursoIteratorExt};
+use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
@@ -902,29 +902,31 @@ fn resolve_sorted_columns_with_resolver(
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
                 GeneratedType::NotGenerated => None,
             };
-            // Capacity is preallocated to cols.len(); this loop pushes at most one column per input.
-            resolved.push(IndexColumn {
-                name: column_name,
-                order,
-                pos_in_table: pos,
-                collation,
-                default: column.default.clone(),
-                expr,
-            });
+            resolved
+                .push_within_capacity(IndexColumn {
+                    name: column_name,
+                    order,
+                    pos_in_table: pos,
+                    collation,
+                    default: column.default.clone(),
+                    expr,
+                })
+                .expect("resolved index columns vector was preallocated to cols.len()");
             continue;
         }
         if !validate_index_expression(unwrapped_expr, table) {
             crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
         }
-        // Capacity is preallocated to cols.len(); this loop pushes at most one column per input.
-        resolved.push(IndexColumn {
-            name: sc.expr.to_string(),
-            order,
-            pos_in_table: EXPR_INDEX_SENTINEL,
-            collation: explicit_collation,
-            default: None,
-            expr: Some(sc.expr.clone()),
-        });
+        resolved
+            .push_within_capacity(IndexColumn {
+                name: sc.expr.to_string(),
+                order,
+                pos_in_table: EXPR_INDEX_SENTINEL,
+                collation: explicit_collation,
+                default: None,
+                expr: Some(sc.expr.clone()),
+            })
+            .expect("resolved index columns vector was preallocated to cols.len()");
     }
     Ok(resolved)
 }
