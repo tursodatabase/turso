@@ -303,6 +303,148 @@ pub fn translate_create_index(
     Ok(())
 }
 
+/// Emits the bytecode that deletes every entry of `idx` by scanning `tbl` and computing
+/// each row's index key from the current row image.
+///
+/// `ALTER TABLE ... ALTER COLUMN` uses this before rewriting the table rows so stale
+/// index entries are removed while the pre-rewrite values (which the index keys were
+/// built from) are still readable. Unlike `ClearBtree`, this also works in MVCC mode.
+pub(crate) fn emit_delete_index_entries(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    tbl: &Arc<BTreeTable>,
+    idx: &Arc<Index>,
+) -> crate::Result<()> {
+    let table_ref = program.table_reference_counter.next();
+    let table_cursor_id = program.alloc_cursor_id_keyed(
+        CursorKey::table(table_ref),
+        CursorType::BTreeTable(tbl.clone()),
+    );
+    let index_cursor_id = program.alloc_cursor_index(None, idx)?;
+    let tbl_name = normalize_ident(tbl.name.as_str());
+
+    let mut table_references = TableReferences::new(
+        vec![JoinedTable {
+            op: Operation::Scan(Scan::BTreeTable {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            }),
+            table: Table::BTree(tbl.clone()),
+            identifier: tbl_name,
+            internal_id: table_ref,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id,
+            indexed: None,
+        }],
+        vec![],
+    );
+    let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver);
+
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: table_cursor_id,
+        root_page: tbl.root_page,
+        db: database_id,
+    });
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: index_cursor_id,
+        root_page: RegisterOrLiteral::Literal(idx.root_page),
+        db: database_id,
+    });
+
+    let loop_start_label = program.allocate_label();
+    let loop_end_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: table_cursor_id,
+        pc_if_empty: loop_end_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+
+    let mut skip_row_label = None;
+    if let Some(where_clause) = where_clause {
+        let label = program.allocate_label();
+        let condition_true_label = program.allocate_label();
+        translate_condition_expr(
+            program,
+            &table_references,
+            &where_clause,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_false: label,
+                jump_target_when_true: condition_true_label,
+                jump_target_when_null: label,
+            },
+            resolver,
+        )?;
+        program.preassign_label_to_next_insn(condition_true_label);
+        skip_row_label = Some(label);
+    }
+
+    let num_regs = idx.columns.len() + 1;
+    let start_reg = program.alloc_registers(num_regs);
+    for (i, col) in idx.columns.iter().enumerate() {
+        emit_index_column_value_from_cursor(
+            program,
+            resolver,
+            &mut table_references,
+            table_cursor_id,
+            tbl,
+            col,
+            start_reg + i,
+        )?;
+    }
+    program.emit_insn(Insn::RowId {
+        cursor_id: table_cursor_id,
+        dest: start_reg + idx.columns.len(),
+    });
+    program.emit_insn(Insn::IdxDelete {
+        start_reg,
+        num_regs,
+        cursor_id: index_cursor_id,
+        raise_error_if_no_matching_entry: idx.where_clause.is_none(),
+    });
+
+    if let Some(skip_row_label) = skip_row_label {
+        program.preassign_label_to_next_insn(skip_row_label);
+    }
+    program.emit_insn(Insn::Next {
+        cursor_id: table_cursor_id,
+        pc_if_next: loop_start_label,
+    });
+    program.preassign_label_to_next_insn(loop_end_label);
+
+    program.close_cursors(&[table_cursor_id, index_cursor_id]);
+    Ok(())
+}
+
+/// Emits the bytecode that rebuilds `idx` into its existing, already emptied b-tree
+/// from a full scan of `tbl`.
+///
+/// `ALTER TABLE ... ALTER COLUMN` uses this after `emit_delete_index_entries` removed
+/// the stale entries, so the index reflects the post-ALTER column values.
+pub(crate) fn emit_rebuild_index(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    tbl: &Arc<BTreeTable>,
+    idx: &Arc<Index>,
+) -> crate::Result<()> {
+    let index_cursor_id = program.alloc_cursor_index(None, idx)?;
+    emit_refill_index(
+        program,
+        resolver,
+        database_id,
+        tbl,
+        idx,
+        index_cursor_id,
+        RegisterOrLiteral::Literal(idx.root_page),
+        None,
+    )
+}
+
 /// Emits the bytecode that rebuilds `idx` from a full scan of `tbl`.
 ///
 /// `CREATE INDEX` calls this with a newly allocated root page. `REINDEX` calls it with

@@ -6,13 +6,17 @@ use turso_parser::{
 };
 
 use super::{
+    index::{emit_delete_index_entries, emit_rebuild_index},
     schema::{validate_check_expr, SQLITE_TABLEID},
     update::translate_update_for_schema_change,
 };
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
-    schema::{CheckConstraint, Column, ColumnLayout, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
+    schema::{
+        CheckConstraint, Column, ColumnLayout, ForeignKey, GeneratedType, Index, Table,
+        RESERVED_TABLE_PREFIXES,
+    },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
@@ -21,8 +25,8 @@ use crate::{
     },
     util::{
         check_expr_references_column, escape_sql_string_literal, normalize_ident,
-        parse_numeric_literal, rewrite_check_expr_table_refs, rewrite_trigger_cmd_table_refs,
-        rewrite_view_sql_for_column_rename,
+        parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
+        rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
     },
     vdbe::{
         affinity::Affinity,
@@ -1819,34 +1823,106 @@ pub fn translate_alter_table(
                 ));
             }
 
-            let (rewrites_physical_layout, replacement_column) = match rename {
-                true => (false, None),
-                false => {
-                    let replacement_column = Column::try_from(&definition)?;
-                    let old_column = &btree.columns()[column_index];
-                    let becomes_generated =
-                        !old_column.is_generated() && replacement_column.is_generated();
-                    // Toggling the virtual-generated bit changes whether the column
-                    // occupies a stored slot, so the on-disk row layout shifts even
-                    // if neither side is "becomes_generated" (e.g. virtual -> regular).
-                    // Without rewriting, post-ALTER reads use the new schema's column
-                    // indexes against rows that still hold the pre-ALTER layout, and
-                    // values land in the wrong logical columns. See issue #6624.
-                    let virtuality_changed = old_column.is_virtual_generated()
-                        != replacement_column.is_virtual_generated();
-                    // A change of declared type can change the column's affinity, in
-                    // which case existing on-disk values must be coerced to match the
-                    // new affinity. Without this, the row payload retains the old
-                    // serial type and SQLite's `PRAGMA integrity_check` reports the
-                    // file as corrupt (e.g. "NUMERIC value in <table>.<col>" when
-                    // changing NUMERIC -> TEXT). See issue #3706.
-                    let affinity_changed = old_column.affinity_with_strict(btree.is_strict)
-                        != replacement_column.affinity_with_strict(btree.is_strict);
-                    let rewrites_physical_layout =
-                        becomes_generated || virtuality_changed || affinity_changed;
-                    (rewrites_physical_layout, Some(replacement_column))
+            // ALTER COLUMN replaces the column's definition, and the new definition
+            // cannot carry UNIQUE or PRIMARY KEY constraints (rejected above). If the
+            // old column's constraint is enforced by an automatic index
+            // (sqlite_autoindex_*), the rewritten CREATE TABLE would no longer declare
+            // the constraint while the index row stays behind in sqlite_schema, which
+            // corrupts the database: SQLite reports "orphan index" and Turso fails to
+            // reload the schema. Reject the operation instead. See issue #7077.
+            // (RENAME COLUMN keeps the constraint in the table SQL, so it stays allowed,
+            // as does altering a rowid-alias INTEGER PRIMARY KEY, which has no
+            // automatic index.)
+            if !rename {
+                let old_column = &btree.columns()[column_index];
+                if old_column.unique() {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot alter column \"{from}\": UNIQUE"
+                    )));
                 }
-            };
+                let is_pk_member = btree
+                    .primary_key_columns
+                    .iter()
+                    .any(|(name, _)| normalize_ident(name) == normalize_ident(from));
+                if !old_column.is_rowid_alias() && is_pk_member {
+                    if btree.primary_key_columns.len() == 1 {
+                        return Err(LimboError::ParseError(format!(
+                            "cannot alter column \"{from}\": PRIMARY KEY"
+                        )));
+                    }
+                    // A composite PRIMARY KEY is a table-level constraint, which
+                    // survives the rewrite with the column renamed, so altering a
+                    // member is fine in general. But a generated column cannot be
+                    // part of the PRIMARY KEY: allowing it would write a schema
+                    // that fails to reload ("malformed database schema").
+                    if definition
+                        .constraints
+                        .iter()
+                        .any(|c| matches!(c.constraint, ast::ColumnConstraint::Generated { .. }))
+                    {
+                        return Err(LimboError::ParseError(format!(
+                            "generated column \"{col_name}\" cannot be part of the PRIMARY KEY"
+                        )));
+                    }
+                }
+            }
+
+            let (rewrites_physical_layout, rewrites_column_values, replacement_column) =
+                match rename {
+                    true => (false, false, None),
+                    false => {
+                        let replacement_column = Column::try_from(&definition)?;
+                        let old_column = &btree.columns()[column_index];
+                        let becomes_generated =
+                            !old_column.is_generated() && replacement_column.is_generated();
+                        // Toggling the virtual-generated bit changes whether the column
+                        // occupies a stored slot, so the on-disk row layout shifts even
+                        // if neither side is "becomes_generated" (e.g. virtual -> regular).
+                        // Without rewriting, post-ALTER reads use the new schema's column
+                        // indexes against rows that still hold the pre-ALTER layout, and
+                        // values land in the wrong logical columns. See issue #6624.
+                        let virtuality_changed = old_column.is_virtual_generated()
+                            != replacement_column.is_virtual_generated();
+                        // A change of declared type can change the column's affinity, in
+                        // which case existing on-disk values must be coerced to match the
+                        // new affinity. Without this, the row payload retains the old
+                        // serial type and SQLite's `PRAGMA integrity_check` reports the
+                        // file as corrupt (e.g. "NUMERIC value in <table>.<col>" when
+                        // changing NUMERIC -> TEXT). See issue #3706.
+                        let affinity_changed = old_column.affinity_with_strict(btree.is_strict)
+                            != replacement_column.affinity_with_strict(btree.is_strict);
+                        let rewrites_physical_layout =
+                            becomes_generated || virtuality_changed || affinity_changed;
+                        // Changing a virtual generated column's expression keeps the
+                        // on-disk row layout intact (the column occupies no stored slot),
+                        // but its logical values still change, so any index containing
+                        // the column must be rebuilt just like in the layout-rewriting
+                        // cases. See issue #7077.
+                        let generated_expr_changed = match (
+                            old_column.generated_type(),
+                            replacement_column.generated_type(),
+                        ) {
+                            (
+                                GeneratedType::Virtual {
+                                    original_sql: old_sql,
+                                    ..
+                                },
+                                GeneratedType::Virtual {
+                                    original_sql: new_sql,
+                                    ..
+                                },
+                            ) => old_sql != new_sql,
+                            _ => false,
+                        };
+                        let rewrites_column_values =
+                            rewrites_physical_layout || generated_expr_changed;
+                        (
+                            rewrites_physical_layout,
+                            rewrites_column_values,
+                            Some(replacement_column),
+                        )
+                    }
+                };
             let clears_autoincrement_sequence = !rename
                 && btree.has_autoincrement
                 && btree.columns()[column_index].is_rowid_alias()
@@ -1895,12 +1971,12 @@ pub fn translate_alter_table(
                 }
             }
 
-            let rewritten_table = if rewrites_physical_layout {
+            let rewritten_table = if rewrites_column_values {
                 let mut table = btree.clone();
                 table.columns_mut()[column_index] =
                     replacement_column.expect("replacement_column must exist for ALTER COLUMN");
                 table.prepare_generated_columns()?;
-                Some(table)
+                Some(Arc::new(table))
             } else {
                 None
             };
@@ -2204,43 +2280,80 @@ pub fn translate_alter_table(
                     database_id,
                 )?;
 
-                let original_columns = original_btree.columns();
-                let source_column_by_schema_idx: Vec<Option<usize>> = rewritten_table
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, column)| {
-                        if column.is_virtual_generated() {
-                            // Virtual columns don't occupy a slot in the rewritten record.
-                            None
-                        } else if original_columns
-                            .get(idx)
-                            .is_some_and(|c| c.is_virtual_generated())
-                        {
-                            // Newly-stored slot (the original column was virtual): no
-                            // source value exists on the old row image — leave NULL.
-                            None
-                        } else {
-                            // The cursor is opened on the original btree, so the logical
-                            // index passed here is mapped to the original physical slot
-                            // by `emit_column_or_rowid` via the original's logical-to-
-                            // physical map. Schema order is preserved by ALTER COLUMN,
-                            // so the rewritten schema_idx also identifies the same
-                            // logical column in the original.
-                            Some(idx)
-                        }
-                    })
-                    .collect();
-                let layout = rewritten_table.column_layout()?;
-                emit_rewrite_table_rows(
-                    program,
-                    original_btree.clone(),
-                    &rewritten_table,
-                    &source_column_by_schema_idx,
-                    &layout,
-                    connection,
-                    database_id,
-                );
+                // Secondary indexes are keyed on column values, so changing the
+                // column's values (generated-ness, virtuality, affinity, or a
+                // virtual column's expression) leaves the existing index entries
+                // stale, which later corrupts DELETE/UPDATE (IdxDelete misses)
+                // and index-driven reads. Delete the old entries while the
+                // pre-ALTER values (which the index keys were built from) are
+                // still readable, then refill each index from the rewritten
+                // rows below. See issue #7077.
+                for index in &table_indexes {
+                    emit_delete_index_entries(
+                        program,
+                        resolver,
+                        database_id,
+                        &original_btree,
+                        index,
+                    )?;
+                }
+
+                if rewrites_physical_layout {
+                    let original_columns = original_btree.columns();
+                    let source_column_by_schema_idx: Vec<Option<usize>> = rewritten_table
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, column)| {
+                            if column.is_virtual_generated() {
+                                // Virtual columns don't occupy a slot in the rewritten record.
+                                None
+                            } else if original_columns
+                                .get(idx)
+                                .is_some_and(|c| c.is_virtual_generated())
+                            {
+                                // Newly-stored slot (the original column was virtual): no
+                                // source value exists on the old row image — leave NULL.
+                                None
+                            } else {
+                                // The cursor is opened on the original btree, so the logical
+                                // index passed here is mapped to the original physical slot
+                                // by `emit_column_or_rowid` via the original's logical-to-
+                                // physical map. Schema order is preserved by ALTER COLUMN,
+                                // so the rewritten schema_idx also identifies the same
+                                // logical column in the original.
+                                Some(idx)
+                            }
+                        })
+                        .collect();
+                    let layout = rewritten_table.column_layout()?;
+                    emit_rewrite_table_rows(
+                        program,
+                        original_btree.clone(),
+                        &rewritten_table,
+                        &source_column_by_schema_idx,
+                        &layout,
+                        connection,
+                        database_id,
+                    );
+                }
+
+                for index in &table_indexes {
+                    let remapped_index = Arc::new(remap_index_for_altered_column(
+                        index,
+                        &rewritten_table,
+                        column_index,
+                        from,
+                        col_name,
+                    ));
+                    emit_rebuild_index(
+                        program,
+                        resolver,
+                        database_id,
+                        &rewritten_table,
+                        &remapped_index,
+                    )?;
+                }
             }
 
             if clears_autoincrement_sequence {
@@ -2340,6 +2453,43 @@ fn emit_rewrite_table_rows(
             table_name: table_name.clone(),
         });
     });
+}
+
+/// Clone `index` and remap it to the post-ALTER definition of the altered column so a
+/// rebuild reads the new column values.
+///
+/// Plain references to the altered column pick up its new name and, when the column is
+/// (now) virtual generated, its generated expression, mirroring how `CREATE INDEX`
+/// resolves index columns on virtual columns. Expression-index columns and partial-index
+/// WHERE clauses that mention the old column name are renamed to the new name so they
+/// bind against `rewritten_table`.
+fn remap_index_for_altered_column(
+    index: &Index,
+    rewritten_table: &BTreeTable,
+    column_index: usize,
+    old_column_name: &str,
+    new_column_name: &str,
+) -> Index {
+    let old_name = normalize_ident(old_column_name);
+    let new_name = normalize_ident(new_column_name);
+    let mut index = index.clone();
+    let column = &rewritten_table.columns()[column_index];
+    for index_column in &mut index.columns {
+        if index_column.pos_in_table == column_index {
+            index_column.name.clone_from(&new_name);
+            index_column.default.clone_from(&column.default);
+            index_column.expr = match column.generated_type() {
+                GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
+                GeneratedType::NotGenerated => None,
+            };
+        } else if let Some(expr) = &mut index_column.expr {
+            rename_identifiers(expr, &old_name, &new_name);
+        }
+    }
+    if let Some(where_clause) = &mut index.where_clause {
+        rename_identifiers(where_clause, &old_name, &new_name);
+    }
+    index
 }
 
 fn non_virtual_affinity_str(table: &BTreeTable) -> String {
