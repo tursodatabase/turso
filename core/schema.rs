@@ -3045,9 +3045,9 @@ impl GeneratedColGraph {
     fn build(columns: &[Column]) -> Result<Self> {
         let n = columns.len();
 
-        let mut direct_deps = vec![ColumnMask::default(); n];
-        let mut direct_dependents = vec![ColumnMask::default(); n];
-        let mut in_degree: Vec<u32> = vec![0; n];
+        let mut direct_deps = try_vec![ColumnMask::default(); n]?;
+        let mut direct_dependents = try_vec![ColumnMask::default(); n]?;
+        let mut in_degree: Vec<u32> = try_vec![0; n]?;
 
         // walk each virtual column's expression once to extract edges
         for (j, col) in columns.iter().enumerate() {
@@ -3096,21 +3096,21 @@ impl GeneratedColGraph {
         }
 
         // compute transitive closures.
-        let mut dependencies = vec![ColumnMask::default(); n];
+        let mut dependencies = try_vec![ColumnMask::default(); n]?;
         for &j in &topological_sort {
-            dependencies[j] = direct_deps[j].clone();
+            dependencies[j] = direct_deps[j].try_clone()?;
             for i in direct_deps[j].iter() {
-                let snapshot = dependencies[i].clone();
+                let snapshot = dependencies[i].try_clone()?;
                 dependencies[j].union_with(&snapshot)?;
             }
         }
 
         // compute transitive closures of the transpose graph (dependents)
-        let mut dependents = vec![ColumnMask::default(); n];
+        let mut dependents = try_vec![ColumnMask::default(); n]?;
         for &i in topological_sort.iter().rev() {
-            dependents[i] = direct_dependents[i].clone();
+            dependents[i] = direct_dependents[i].try_clone()?;
             for j in direct_dependents[i].iter() {
-                let snapshot = dependents[j].clone();
+                let snapshot = dependents[j].try_clone()?;
                 dependents[i].union_with(&snapshot)?;
             }
         }
@@ -3744,7 +3744,7 @@ impl BTreeTable {
         for i in updated_cols {
             affected.set(i)?;
             if i < graph.dependents.len() {
-                let snapshot = graph.dependents[i].clone();
+                let snapshot = graph.dependents[i].try_clone()?;
                 affected.union_with(&snapshot)?;
             }
         }
