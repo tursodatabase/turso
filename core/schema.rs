@@ -903,7 +903,7 @@ impl Schema {
         #[allow(clippy::arc_with_non_send_sync)]
         tables.insert(
             SCHEMA_TABLE_NAME.to_string(),
-            Arc::new(Table::BTree(sqlite_schema_table().into())),
+            Arc::new(Table::BTree(sqlite_schema_table()?.into())),
         );
         #[cfg(feature = "conn_raw_api")]
         table_names_by_root_page.insert(1, SCHEMA_TABLE_NAME.to_string());
@@ -3616,7 +3616,16 @@ impl BTreeTable {
         primary_key_columns: &[(String, SortOrder)],
         has_rowid: bool,
     ) -> Vec<usize> {
-        let mut map = vec![usize::MAX; columns.len()];
+        Self::try_build_logical_to_physical_map(columns, primary_key_columns, has_rowid)
+            .expect(crate::alloc::ALLOC_ERR_MSG)
+    }
+
+    pub fn try_build_logical_to_physical_map(
+        columns: &[Column],
+        primary_key_columns: &[(String, SortOrder)],
+        has_rowid: bool,
+    ) -> Result<Vec<usize>, crate::alloc::TryReserveError> {
+        let mut map = try_vec![usize::MAX; columns.len()]?;
         let mut physical = 0;
 
         if !has_rowid {
@@ -3650,7 +3659,7 @@ impl BTreeTable {
                 physical += 1;
             }
         }
-        map
+        Ok(map)
     }
 
     pub fn prepare_generated_columns(&mut self) -> Result<()> {
@@ -5421,31 +5430,32 @@ impl fmt::Display for Type {
     }
 }
 
-pub fn sqlite_schema_table() -> BTreeTable {
-    let columns = vec![
+pub fn sqlite_schema_table() -> Result<BTreeTable> {
+    let columns = try_vec![
         Column::new_default_text(Some("type".to_string()), "TEXT".to_string(), None),
         Column::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
         Column::new_default_text(Some("tbl_name".to_string()), "TEXT".to_string(), None),
         Column::new_default_integer(Some("rootpage".to_string()), "INT".to_string(), None),
         Column::new_default_text(Some("sql".to_string()), "TEXT".to_string(), None),
-    ];
-    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns, &[], true);
-    BTreeTable {
+    ]?;
+    let logical_to_physical_map =
+        BTreeTable::try_build_logical_to_physical_map(&columns, &[], true)?;
+    Ok(BTreeTable {
         root_page: 1,
         name: "sqlite_schema".to_string(),
         has_rowid: true,
         is_strict: false,
         has_autoincrement: false,
-        primary_key_columns: vec![],
+        primary_key_columns: try_vec![]?,
         columns,
-        foreign_keys: vec![],
-        check_constraints: vec![],
+        foreign_keys: try_vec![]?,
+        check_constraints: try_vec![]?,
         rowid_alias_conflict_clause: None,
-        unique_sets: vec![],
+        unique_sets: try_vec![]?,
         has_virtual_columns: false,
         logical_to_physical_map,
         column_dependencies: Default::default(),
-    }
+    })
 }
 
 #[allow(dead_code)]
@@ -6122,10 +6132,11 @@ mod tests {
     }
 
     #[test]
-    pub fn test_sqlite_schema() {
+    pub fn test_sqlite_schema() -> Result<()> {
         let expected = r#"CREATE TABLE sqlite_schema (type TEXT, name TEXT, tbl_name TEXT, rootpage INT, sql TEXT)"#;
-        let actual = sqlite_schema_table().to_sql();
+        let actual = sqlite_schema_table()?.to_sql();
         assert_eq!(expected, actual);
+        Ok(())
     }
 
     #[test]
