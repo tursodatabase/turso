@@ -26,6 +26,8 @@ pub use turso_sync_sdk_kit::rsapi::PartialSyncOpts;
 
 // Constants used across the sync module
 const DEFAULT_CLIENT_NAME: &str = "turso-sync-rust";
+const CHECKPOINT_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+const CHECKPOINT_BUSY_MAX_ATTEMPTS: usize = 100;
 
 /// Future returned by an auth token provider. Resolves to a bearer token string
 /// (without the `Bearer ` prefix — that prefix is added when building the header).
@@ -104,6 +106,8 @@ pub struct Builder {
     remote_encryption_key: Option<String>,
     // Encryption cipher for the Turso Cloud database
     remote_encryption_cipher: Option<RemoteEncryptionCipher>,
+    // Use MVCC logical-log incremental pulls instead of page-stream pulls.
+    logical_mvcc_pull: bool,
     // Experimental engine features to enable on the local synced database.
     // These mirror the local [`crate::Builder`] flags so synced databases
     // expose the same SQL surface as their local-only counterparts. Local
@@ -133,6 +137,7 @@ impl Builder {
             partial_sync_config_experimental: None,
             remote_encryption_key: None,
             remote_encryption_cipher: None,
+            logical_mvcc_pull: false,
             enable_attach: false,
             enable_custom_types: false,
             enable_index_method: false,
@@ -286,6 +291,15 @@ impl Builder {
         self
     }
 
+    /// Use MVCC logical-log incremental pulls.
+    ///
+    /// MVCC-mode remotes accept page-stream pulls only for bootstrap; callers
+    /// using legacy WAL/page sync should keep the default `false` value.
+    pub fn with_logical_mvcc_pull(mut self, enable: bool) -> Self {
+        self.logical_mvcc_pull = enable;
+        self
+    }
+
     /// Compose the `experimental_features` comma-separated string consumed by
     /// [`turso_sdk_kit::rsapi::TursoDatabaseConfig`] (and ultimately
     /// `turso_core::DatabaseOpts::with_experimental_feature`) from the boolean
@@ -370,6 +384,7 @@ impl Builder {
             remote_encryption_key: self.remote_encryption_key.clone(),
             push_operations_threshold: None,
             pull_bytes_threshold: None,
+            logical_mvcc_pull: self.logical_mvcc_pull,
         };
 
         // Create sync wrapper.
@@ -432,8 +447,19 @@ impl Database {
 
     // Force WAL checkpoint for the main database.
     pub async fn checkpoint(&self) -> Result<()> {
-        let op = self.sync.checkpoint();
-        drive_operation(op, self.io.clone()).await?;
+        for attempt in 0..CHECKPOINT_BUSY_MAX_ATTEMPTS {
+            let op = self.sync.checkpoint();
+            let result = drive_operation(op, self.io.clone()).await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if is_sync_busy_error(&error) && attempt + 1 < CHECKPOINT_BUSY_MAX_ATTEMPTS =>
+                {
+                    tokio::time::sleep(CHECKPOINT_BUSY_RETRY_DELAY).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(())
     }
 
@@ -493,6 +519,14 @@ async fn drive_operation_result(
 ) -> Result<Option<turso_sync_sdk_kit::turso_async_operation::TursoAsyncOperationResult>> {
     let fut = AsyncOpFuture::new(op, io);
     fut.await
+}
+
+fn is_sync_busy_error(error: &Error) -> bool {
+    match error {
+        Error::Busy(_) => true,
+        Error::Error(message) => message.contains("Database is busy"),
+        _ => false,
+    }
 }
 
 // Custom Future that integrates with TursoDatabaseAsyncOperation and our IO worker.
@@ -950,6 +984,18 @@ mod tests {
                 .experimental_features_string()
                 .as_deref(),
             Some("attach,custom_types,index_method,views,vacuum,generated_columns,multiprocess_wal,without_rowid")
+        );
+    }
+
+    #[test]
+    fn logical_mvcc_pull_is_opt_in() {
+        use crate::sync::Builder;
+
+        assert!(!Builder::new_remote(":memory:").logical_mvcc_pull);
+        assert!(
+            Builder::new_remote(":memory:")
+                .with_logical_mvcc_pull(true)
+                .logical_mvcc_pull
         );
     }
 
@@ -2018,7 +2064,16 @@ mod tests {
                         Err(crate::Error::Busy(_)) => continue,
                         Err(e) => panic!("reader query failed: {e:?}"),
                     };
-                    let all = all_rows(rows).await.unwrap();
+                    let all = match all_rows(rows).await {
+                        Ok(all) => all,
+                        Err(e)
+                            if e.downcast_ref::<crate::Error>()
+                                .is_some_and(|error| matches!(error, crate::Error::Busy(_))) =>
+                        {
+                            continue;
+                        }
+                        Err(e) => panic!("reader query failed: {e:?}"),
+                    };
                     let Value::Integer(n) = all[0][0] else {
                         panic!("unexpected reader value: {:?}", all[0][0]);
                     };
@@ -2046,7 +2101,15 @@ mod tests {
             total += cnt as i64;
 
             applied_total.store(total, Ordering::Release);
-            db.pull().await.unwrap();
+            loop {
+                match db.pull().await {
+                    Ok(_) => break,
+                    Err(e) if super::is_sync_busy_error(&e) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(e) => panic!("pull failed: {e:?}"),
+                }
+            }
 
             let _ = db.checkpoint().await;
 

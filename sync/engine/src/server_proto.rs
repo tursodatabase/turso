@@ -17,6 +17,12 @@ pub struct PullUpdatesReqProtoBody {
     /// requested encoding of the pages
     #[prost(enumeration = "PageUpdatesEncodingReq", tag = "1")]
     pub encoding: i32,
+    /// requested update stream kind
+    ///
+    /// Kept at tag 8 so older boolean clients remain wire-compatible:
+    /// false/absent decodes as Pages(0), true decodes as MvccLogicalLog(1).
+    #[prost(enumeration = "PullUpdatesStreamKind", tag = "8")]
+    pub stream_kind: i32,
     /// revision of the requested pages on server side; can be None - in which case server will pick latest revision
     #[prost(string, tag = "2")]
     pub server_revision: String,
@@ -48,6 +54,24 @@ pub struct PageData {
     pub encoded_page: Bytes,
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+#[derive(prost::Enumeration)]
+#[repr(i32)]
+pub enum PullUpdatesStreamKind {
+    Pages = 0,
+    MvccLogicalLog = 1,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+#[derive(prost::Enumeration)]
+#[repr(i32)]
+pub enum PullUpdatesApplyMode {
+    Incremental = 0,
+    ReplaceBase = 1,
+}
+
 #[derive(prost::Message)]
 pub struct PageSetRawEncodingProto {}
 
@@ -57,6 +81,30 @@ pub struct PageSetZstdEncodingProto {
     pub level: i32,
     #[prost(uint32, repeated, tag = "2")]
     pub pages_dict: Vec<u32>,
+}
+
+#[derive(prost::Message, Clone, PartialEq, Eq)]
+pub struct MvccLogicalLogRangeProto {
+    #[prost(uint64, tag = "1")]
+    pub generation: u64,
+    #[prost(uint64, tag = "2")]
+    pub start_offset: u64,
+    #[prost(uint64, tag = "3")]
+    pub end_offset: u64,
+    #[prost(bool, tag = "4")]
+    pub starts_with_header: bool,
+    #[prost(bytes, optional, tag = "5")]
+    pub crc_seed: Option<Vec<u8>>,
+}
+
+#[derive(prost::Message, Clone, PartialEq, Eq)]
+pub struct MvccLogicalLogMetadataProto {
+    #[prost(string, tag = "1")]
+    pub format: String,
+    #[prost(bool, tag = "2")]
+    pub checkpoint_transition: bool,
+    #[prost(message, repeated, tag = "3")]
+    pub ranges: Vec<MvccLogicalLogRangeProto>,
 }
 
 #[derive(prost::Message)]
@@ -70,6 +118,12 @@ pub struct PullUpdatesRespProtoBody {
     pub raw_encoding: Option<PageSetRawEncodingProto>,
     #[prost(optional, message, tag = "4")]
     pub zstd_encoding: Option<PageSetZstdEncodingProto>,
+    #[prost(enumeration = "PullUpdatesStreamKind", tag = "5")]
+    pub stream_kind: i32,
+    #[prost(enumeration = "PullUpdatesApplyMode", tag = "6")]
+    pub apply_mode: i32,
+    #[prost(optional, message, tag = "7")]
+    pub mvcc_log: Option<MvccLogicalLogMetadataProto>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -471,5 +525,79 @@ pub(crate) mod bytes_as_base64_pad {
             D::Error::invalid_value(de::Unexpected::Str(text), &"binary data encoded as base64")
         })?;
         Ok(Bytes::from(bytes))
+    }
+}
+
+#[cfg(test)]
+mod pull_updates_tests {
+    use super::{
+        MvccLogicalLogMetadataProto, MvccLogicalLogRangeProto, PageSetRawEncodingProto,
+        PageUpdatesEncodingReq, PullUpdatesApplyMode, PullUpdatesReqProtoBody,
+        PullUpdatesRespProtoBody, PullUpdatesStreamKind,
+    };
+    use prost::Message;
+
+    #[test]
+    fn pull_updates_request_stream_kind_round_trips_proto() {
+        let req = PullUpdatesReqProtoBody {
+            encoding: PageUpdatesEncodingReq::Raw as i32,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            server_revision: "server-rev".to_string(),
+            client_revision: "client-rev".to_string(),
+            long_poll_timeout_ms: 123,
+            server_pages_selector: Vec::new().into(),
+            server_query_selector: String::new(),
+            client_pages: Vec::new().into(),
+        };
+
+        let decoded = PullUpdatesReqProtoBody::decode(req.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(
+            PullUpdatesStreamKind::try_from(decoded.stream_kind).unwrap(),
+            PullUpdatesStreamKind::MvccLogicalLog
+        );
+    }
+
+    #[test]
+    fn pull_updates_mvcc_log_header_round_trips_metadata() {
+        let header = PullUpdatesRespProtoBody {
+            server_revision: "rev-42".to_string(),
+            db_size: 3,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: true,
+                ranges: vec![MvccLogicalLogRangeProto {
+                    generation: 7,
+                    start_offset: 11,
+                    end_offset: 99,
+                    starts_with_header: false,
+                    crc_seed: Some(vec![1, 2, 3, 4]),
+                }],
+            }),
+        };
+
+        let decoded = PullUpdatesRespProtoBody::decode_length_delimited(
+            header.encode_length_delimited_to_vec().as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            PullUpdatesStreamKind::try_from(decoded.stream_kind).unwrap(),
+            PullUpdatesStreamKind::MvccLogicalLog
+        );
+        assert_eq!(
+            PullUpdatesApplyMode::try_from(decoded.apply_mode).unwrap(),
+            PullUpdatesApplyMode::Incremental
+        );
+        let mvcc_log = decoded.mvcc_log.unwrap();
+        assert_eq!(mvcc_log.format, "lml3");
+        assert!(mvcc_log.checkpoint_transition);
+        assert_eq!(mvcc_log.ranges[0].end_offset, 99);
+        assert_eq!(
+            mvcc_log.ranges[0].crc_seed.as_deref(),
+            Some(&[1, 2, 3, 4][..])
+        );
     }
 }

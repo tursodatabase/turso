@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 
@@ -72,10 +72,25 @@ pub struct DbSyncStatus {
     pub max_frame_no: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbChangesStreamKind {
+    LegacyPages,
+    Pages,
+    Logical,
+    ReplaceBasePages,
+}
+
 pub struct DbChangesStatus {
     pub time: turso_core::WallClockInstant,
     pub revision: DatabasePullRevision,
     pub file_slot: Option<MutexSlot<Arc<dyn turso_core::File>>>,
+    pub stream_kind: DbChangesStreamKind,
+}
+
+impl DbChangesStatus {
+    pub fn is_empty(&self) -> bool {
+        self.file_slot.is_none()
+    }
 }
 
 impl std::fmt::Debug for DbChangesStatus {
@@ -84,6 +99,7 @@ impl std::fmt::Debug for DbChangesStatus {
             .field("time", &self.time)
             .field("revision", &self.revision)
             .field("file_slot.is_some()", &self.file_slot.is_some())
+            .field("stream_kind", &self.stream_kind)
             .finish()
     }
 }
@@ -126,7 +142,15 @@ pub struct DatabaseMetadata {
     pub last_push_unix_time: Option<i64>,
     pub last_pushed_pull_gen_hint: i64,
     pub last_pushed_change_id_hint: i64,
+    #[serde(default)]
+    pub last_pushed_replay_floor_change_id_hint: i64,
     pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
+    #[serde(default)]
+    pub fresh_bootstrap_pending_cdc_ack: bool,
+    #[serde(default)]
+    pub logical_mvcc_pull_active: bool,
+    #[serde(default)]
+    pub logical_table_names_by_stable_id: BTreeMap<u64, String>,
     /// optional saved configuration
     /// this will be used by sync engine if some parameters were omitted
     pub saved_configuration: Option<DatabaseSavedConfiguration>,
@@ -406,8 +430,16 @@ impl DatabaseChange {
         let change_id = get_core_value_i64(row, 0)?;
         let change_time = get_core_value_i64(row, 1)? as u64;
         let change_txn_id = get_core_value_i64_or_null(row, 2)?;
-        let change_type = get_core_value_i64(row, 3)?;
-        let change_type = parse_change_type(change_type)?;
+        let change_type = match get_core_value_i64_or_null(row, 3)? {
+            Some(change_type) => parse_change_type(change_type)?,
+            None if is_null_cdc_v2_commit_payload(row) => DatabaseChangeType::Commit,
+            None => {
+                return Err(Error::DatabaseTapeError(
+                    "column 3 type mismatch: expected integer for non-COMMIT CDC row, got NULL"
+                        .to_string(),
+                ))
+            }
+        };
         // COMMIT records have NULL for table_name and id
         let table_name = get_core_value_text_or_null(row, 4)?.unwrap_or_default();
         let id = get_core_value_i64_or_null(row, 5)?.unwrap_or(0);
@@ -433,6 +465,10 @@ impl DatabaseChange {
             turso_core::CdcVersion::V1 => Self::from_row_v1(row),
         }
     }
+}
+
+fn is_null_cdc_v2_commit_payload(row: &turso_core::Row) -> bool {
+    (4..=8).all(|index| matches!(row.get_value(index), turso_core::Value::Null))
 }
 
 pub struct DatabaseRowMutation {
@@ -490,8 +526,36 @@ impl From<&DatabaseTapeRowChangeType> for DatabaseChangeType {
 #[derive(Debug)]
 pub enum DatabaseTapeOperation {
     StmtReplay(DatabaseStatementReplay),
+    SchemaReplay(DatabaseSchemaReplay),
     RowChange(DatabaseTapeRowChange),
     Commit,
+}
+
+#[derive(Debug)]
+pub enum DatabaseSchemaReplay {
+    Create {
+        sql: String,
+    },
+    Drop {
+        kind: DatabaseSchemaKind,
+        name: String,
+    },
+    Refresh {
+        kind: DatabaseSchemaKind,
+        name: String,
+        sql: String,
+    },
+    Alter {
+        sql: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseSchemaKind {
+    Table,
+    Index,
+    Trigger,
+    View,
 }
 
 /// [DatabaseTapeRowChange] is the specific operation over single row which can be performed on database
@@ -592,5 +656,35 @@ pub fn parse_bin_record(
         Err(err) => Err(Error::DatabaseTapeError(format!(
             "unable to parse bin record: {err}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DatabaseMetadata;
+
+    #[test]
+    fn metadata_load_defaults_missing_logical_table_map() {
+        let meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": null,
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(meta.last_pushed_replay_floor_change_id_hint, 0);
+        assert!(!meta.fresh_bootstrap_pending_cdc_ack);
+        assert!(!meta.logical_mvcc_pull_active);
+        assert!(meta.logical_table_names_by_stable_id.is_empty());
     }
 }

@@ -1204,8 +1204,64 @@ pub fn emit_cdc_full_record(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Allocate the rowid for a CDC row into `dest_reg`. The CDC table's `change_id`
+/// column is `INTEGER PRIMARY KEY`, so the rowid IS the change id.
+///
+/// In MVCC journal mode the id is drawn from the CDC table's implicit
+/// AUTOINCREMENT sequence. This makes change ids monotonic and never reused after
+/// CDC rows are pruned, and registers each in-flight allocation with the MVCC
+/// store so the sync push loop can call `sequence_watermark_experimental` to
+/// avoid advancing the push watermark past a change id that a concurrent
+/// transaction commits out of change-id order under snapshot isolation. In WAL
+/// mode we keep the cheaper `NewRowid` (max rowid + 1) assignment; the WAL push
+/// loop does not depend on the sequence watermark, so its insert path is
+/// unchanged and pays no per-row sequence cost.
+fn emit_cdc_change_id(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    cdc_cursor_id: usize,
+    dest_reg: usize,
+) -> Result<()> {
+    if !program.is_mvcc_enabled() {
+        program.emit_insn(Insn::NewRowid {
+            cursor: cdc_cursor_id,
+            rowid_reg: dest_reg,
+            prev_largest_reg: 0,
+        });
+        return Ok(());
+    }
+    let Some(cdc_table) = program
+        .capture_data_changes_info()
+        .as_ref()
+        .map(|info| info.table.clone())
+    else {
+        return Err(crate::LimboError::InternalError(
+            "CDC change-id allocation requested without an active CDC config".to_string(),
+        ));
+    };
+    let seq_name = crate::schema::autoincrement_sequence_name(&cdc_table);
+    let seq = resolver
+        .with_schema(crate::MAIN_DB_ID, |s| s.get_sequence(&seq_name).cloned())
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "missing implicit AUTOINCREMENT sequence for CDC table \"{cdc_table}\""
+            ))
+        })?;
+    crate::translate::sequence::emit_disk_read_nextval(
+        program,
+        resolver,
+        crate::MAIN_DB_ID,
+        &seq_name,
+        &seq,
+        dest_reg,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn emit_cdc_insns(
     program: &mut ProgramBuilder,
+    resolver: &Resolver,
     operation_mode: OperationMode,
     cdc_cursor_id: usize,
     rowid_reg: usize,
@@ -1218,6 +1274,7 @@ pub fn emit_cdc_insns(
     match cdc_info.map(|info| info.cdc_version()) {
         Some(crate::CdcVersion::V2) => emit_cdc_insns_v2(
             program,
+            resolver,
             operation_mode,
             cdc_cursor_id,
             rowid_reg,
@@ -1352,8 +1409,10 @@ fn emit_cdc_insns_v1(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_cdc_insns_v2(
     program: &mut ProgramBuilder,
+    resolver: &Resolver,
     operation_mode: OperationMode,
     cdc_cursor_id: usize,
     rowid_reg: usize,
@@ -1382,14 +1441,12 @@ fn emit_cdc_insns_v2(
         func: unixepoch_fn_ctx,
     });
 
-    // change_txn_id = conn_txn_id(new_rowid)
-    // First generate a candidate rowid, then pass it to conn_txn_id for get-or-set.
+    // change_txn_id = conn_txn_id(change_id)
+    // First allocate the change id (the CDC rowid), then pass it to conn_txn_id
+    // for get-or-set. In MVCC mode this draws from the CDC AUTOINCREMENT sequence
+    // (see `emit_cdc_change_id`); in WAL mode it is a plain NewRowid.
     let candidate_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: cdc_cursor_id,
-        rowid_reg: candidate_reg,
-        prev_largest_reg: 0,
-    });
+    emit_cdc_change_id(program, resolver, cdc_cursor_id, candidate_reg)?;
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
@@ -1538,12 +1595,11 @@ pub fn emit_cdc_commit_insns(
     });
     program.mark_last_insn_constant();
 
+    // Allocate the COMMIT record's change id from the same source as row records
+    // (the CDC AUTOINCREMENT sequence in MVCC mode) so COMMIT and row change ids
+    // stay in one monotonic, never-reused stream.
     let rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: cdc_cursor_id,
-        rowid_reg,
-        prev_largest_reg: 0,
-    });
+    emit_cdc_change_id(program, resolver, cdc_cursor_id, rowid_reg)?;
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {

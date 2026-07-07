@@ -1554,6 +1554,7 @@ pub fn emit_schema_entry(
         };
         emit_cdc_insns(
             program,
+            resolver,
             OperationMode::INSERT,
             cdc_table_cursor_id,
             rowid_reg,
@@ -1913,6 +1914,7 @@ pub fn translate_drop_table(
         };
         emit_cdc_insns(
             program,
+            resolver,
             OperationMode::DELETE,
             cdc_cursor_id,
             row_id_reg,

@@ -1083,6 +1083,7 @@ impl Connection {
         if self.get_tx_state() != TransactionState::None {
             return Ok(());
         }
+        let had_main_mv_tx = self.get_mv_tx().is_some();
 
         if self.db.shared_wal_coordination()?.is_some() {
             // Cross-process schema changes can leave page 1 and sqlite_schema
@@ -1151,12 +1152,85 @@ impl Connection {
         if previous == TransactionState::Read {
             pager.end_read_tx();
         }
+        if !had_main_mv_tx {
+            self.clear_internal_main_mvcc_tx(&pager);
+        }
 
         reparse_result?;
 
         let schema = self.schema.read().clone();
         self.db.update_schema_if_newer(schema);
         Ok(())
+    }
+
+    /// Parse schema from scratch even if the schema cookie did not change.
+    ///
+    /// Sync replace-base can install a page snapshot outside ordinary SQL DDL.
+    /// The replacement may reuse the same schema cookie while changing root
+    /// pages, so cookie-based refresh would keep stale btree metadata.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn force_reparse_schema(self: &Arc<Connection>) -> Result<()> {
+        self.force_reparse_schema_inner(true)
+    }
+
+    /// Like [`Self::force_reparse_schema`], but refreshes only this connection's
+    /// own schema snapshot without publishing it to the shared database cache.
+    ///
+    /// Use this when the caller must further mutate the schema before it becomes
+    /// visible to other connections.
+    pub fn force_reparse_schema_without_publish(self: &Arc<Connection>) -> Result<()> {
+        self.force_reparse_schema_inner(false)
+    }
+
+    fn force_reparse_schema_inner(self: &Arc<Connection>, publish: bool) -> Result<()> {
+        if self.get_tx_state() != TransactionState::None {
+            return Err(LimboError::Busy);
+        }
+        if self.get_mv_tx().is_some() || self.next_attached_mv_tx().is_some() {
+            return Err(LimboError::Busy);
+        }
+
+        let pager = self.pager.load().clone();
+        pager.clear_page_cache(false);
+        pager.set_schema_cookie(None);
+        pager.begin_read_tx()?;
+        self.set_tx_state(TransactionState::Read);
+
+        let reparse_result = self.reparse_schema();
+
+        let previous = self.transaction_state.swap(TransactionState::None);
+        turso_assert!(
+            matches!(previous, TransactionState::None | TransactionState::Read),
+            "unexpected end transaction state"
+        );
+        if previous == TransactionState::Read {
+            pager.end_read_tx();
+        }
+        self.clear_internal_main_mvcc_tx(&pager);
+
+        reparse_result?;
+
+        if publish {
+            let schema = self.schema.read().clone();
+            self.db.update_schema_if_newer(schema);
+        }
+        Ok(())
+    }
+
+    fn clear_internal_main_mvcc_tx(&self, pager: &Arc<Pager>) {
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return;
+        };
+        if let Some(mv_store) = self.mv_store().as_ref() {
+            if mv_store.is_tx_rollbackable(tx_id) {
+                mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+            } else {
+                self.set_mv_tx(None);
+            }
+        } else {
+            self.set_mv_tx(None);
+        }
+        pager.cleanup_read_tx();
     }
 
     /// Blocking shim: drives [`Self::reparse_schema_nonblock`] to completion.
@@ -2185,6 +2259,94 @@ impl Connection {
             return WalAutoActions::empty();
         }
         WalAutoActions::from_bits_truncate(self.wal_auto_actions.load(Ordering::SeqCst))
+    }
+
+    /// Publish the connection's current schema snapshot to the shared database
+    /// cache after a successful commit so other live connections can refresh.
+    pub fn publish_schema_if_newer(&self) {
+        let schema = self.schema.read().clone();
+        self.db.update_schema_if_newer(schema);
+    }
+
+    /// Publish the connection's current schema snapshot after pages were
+    /// replaced outside normal SQL commit ordering.
+    ///
+    /// External restore paths can move the schema cookie backwards. In that
+    /// case the shared schema cache must be replaced rather than updated
+    /// monotonically, otherwise new connections can re-adopt stale metadata.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn publish_schema_after_external_restore(&self) -> Result<()> {
+        if self.get_tx_state() != TransactionState::None {
+            return Err(LimboError::Busy);
+        }
+        if self.get_mv_tx().is_some() || self.next_attached_mv_tx().is_some() {
+            return Err(LimboError::Busy);
+        }
+
+        let schema = self.schema.read().clone();
+        self.db
+            .with_schema_mut(|current| {
+                *current = schema.as_ref().clone();
+                Ok(())
+            })
+            .expect("external restore schema replacement should be infallible");
+        Ok(())
+    }
+
+    /// Roll back the main-database MVCC transaction while keeping the
+    /// surrounding raw WAL-insert session open.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn reset_main_mvcc_tx_for_wal_session(&self) {
+        let mv_store = self.mv_store();
+        let Some(mv_store) = mv_store.as_ref() else {
+            return;
+        };
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return;
+        };
+        let pager = self.pager.load();
+        mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+    }
+
+    /// Discard the main-db MVCC transaction left by a sync raw-WAL session
+    /// before reparsing state after external file replacement.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn discard_main_mvcc_tx_after_external_restore(&self) {
+        let pager = self.pager.load();
+        self.clear_internal_main_mvcc_tx(&pager);
+    }
+
+    /// Returns whether the main database currently has a live MVCC transaction.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn has_main_mvcc_tx_for_wal_session(&self) -> bool {
+        self.get_mv_tx_id().is_some()
+    }
+
+    /// Commit the main-database MVCC transaction while keeping the surrounding
+    /// raw WAL-insert session open.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn commit_main_mvcc_tx_for_wal_session(self: &Arc<Self>) -> Result<()> {
+        let mv_store_handle = self.mv_store();
+        let Some(mv_store) = mv_store_handle.as_ref() else {
+            return Ok(());
+        };
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return Ok(());
+        };
+
+        let mut state_machine = mv_store.commit_tx(tx_id, self, MAIN_DB_ID)?;
+        while let IOResult::IO(io) = state_machine.step(mv_store)? {
+            io.wait(self.db.io.as_ref())?;
+        }
+        assert!(state_machine.is_finalized());
+        self.set_mv_tx(None);
+        self.publish_schema_if_newer();
+        Ok(())
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn reload_wal_after_external_restore(&self) -> Result<()> {
+        self.db.reload_wal_after_external_restore()
     }
 
     /// Enable or disable writing portable logical-change metadata into MVCC

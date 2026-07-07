@@ -12787,17 +12787,12 @@ fn drive_init_cdc_version(
             },
             StepResult::Done => match inner.phase {
                 OpInitCdcVersionPhase::CheckTable => {
-                    let change_id_column = if conn.mvcc_enabled() {
-                        "change_id INTEGER PRIMARY KEY"
-                    } else {
-                        "change_id INTEGER PRIMARY KEY AUTOINCREMENT"
-                    };
                     let create_sql = match version {
                         CdcVersion::V1 => format!(
-                            "CREATE TABLE IF NOT EXISTS {cdc_table_name} ({change_id_column}, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+                            "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
                         ),
                         CdcVersion::V2 => format!(
-                            "CREATE TABLE IF NOT EXISTS {cdc_table_name} ({change_id_column}, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+                            "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
                         ),
                     };
                     inner.stmt = prepare_cdc_internal(conn, create_sql)?;

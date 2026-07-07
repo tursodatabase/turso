@@ -631,7 +631,7 @@ impl LogicalLog {
         let payload_size_u64 = payload_size as u64;
 
         #[cfg(feature = "conn_raw_api")]
-        let has_portable_changes = !tx.portable_changes.is_empty();
+        let has_portable_changes = tx.portable_changes_required || !tx.portable_changes.is_empty();
         #[cfg(not(feature = "conn_raw_api"))]
         let has_portable_changes = false;
         #[cfg(feature = "conn_raw_api")]

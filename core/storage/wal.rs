@@ -5677,6 +5677,27 @@ impl WalFileShared {
             lock.set_value_exclusive(READMARK_NOT_USED);
         }
     }
+
+    /// Replace restored WAL state while preserving process-local locks owned by
+    /// existing connections.
+    ///
+    /// External restore paths rebuild metadata/cache/file state from disk while
+    /// other connections may still hold read guards. Those guards are tied to
+    /// the process-local lock objects, not to the restored on-disk WAL view, so
+    /// replacing the lock objects would make normal `end_read_tx` unlock a
+    /// fresh empty lock. Keep lock identity stable and refresh only state
+    /// derived from storage.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn replace_after_external_restore(&mut self, restored: WalFileShared) {
+        self.metadata = restored.metadata;
+        self.runtime.frame_cache = restored.runtime.frame_cache;
+        self.runtime.file = restored.runtime.file;
+        self.runtime.epoch.store(
+            restored.runtime.epoch.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        self.runtime.overflow_fallback_coverage = restored.runtime.overflow_fallback_coverage;
+    }
 }
 
 #[cfg(test)]
@@ -5813,6 +5834,50 @@ pub mod test {
             self.inner.truncate(len, c)
         }
     }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn replace_after_external_restore_preserves_lock_identity() {
+        let shared = WalFileShared::new_noop();
+        let restored = WalFileShared::new_noop();
+
+        let read_lock_ptrs = {
+            let shared = shared.read();
+            shared
+                .runtime
+                .read_locks
+                .iter()
+                .map(std::ptr::from_ref)
+                .collect::<Vec<_>>()
+        };
+        {
+            let shared = shared.read();
+            assert!(shared.runtime.read_locks[1].write());
+            shared.runtime.read_locks[1].set_value_exclusive(7);
+            shared.runtime.read_locks[1].unlock();
+        }
+        {
+            let restored = restored.read();
+            restored.metadata.max_frame.store(42, Ordering::Release);
+            assert!(restored.runtime.read_locks[1].write());
+            restored.runtime.read_locks[1].set_value_exclusive(99);
+            restored.runtime.read_locks[1].unlock();
+        }
+
+        let restored = match Arc::try_unwrap(restored) {
+            Ok(restored) => restored.into_inner(),
+            Err(_) => panic!("restored WAL test state should not be shared"),
+        };
+        shared.write().replace_after_external_restore(restored);
+
+        let shared = shared.read();
+        assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 42);
+        assert_eq!(shared.runtime.read_locks[1].get_value(), 7);
+        for (idx, lock) in shared.runtime.read_locks.iter().enumerate() {
+            assert_eq!(std::ptr::from_ref(lock), read_lock_ptrs[idx]);
+        }
+    }
+
     #[test]
     fn test_truncate_file() {
         let (db, _path) = get_database();
