@@ -1855,8 +1855,9 @@ impl Schema {
                                 col_name, table.name
                             )));
                         };
-                        // preallocated enough to no use try_push
-                        column_indices_and_sort_orders.push((pos_in_table, *sort_order));
+                        column_indices_and_sort_orders
+                            .push_within_capacity((pos_in_table, *sort_order))
+                            .expect("unique columns vector was preallocated to its input length");
                     }
                     if let Some(index_entry) = automatic_indexes.pop() {
                         self.add_index(Arc::new(Index::automatic_from_unique(
@@ -2421,8 +2422,13 @@ impl Schema {
             let parent_tbl = self
                 .get_btree_table(&parent_name)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))?;
-            // Preallocated enough to not use try_push
-            out.push(self.resolve_fk(fk, &child, &parent_tbl, /*require_unique=*/ true)?);
+            out.push_within_capacity(self.resolve_fk(
+                fk,
+                &child,
+                &parent_tbl,
+                /*require_unique=*/ true,
+            )?)
+            .expect("resolved FK vector was preallocated to child.foreign_keys.len()");
         }
         Ok(out)
     }
@@ -2448,8 +2454,9 @@ impl Schema {
             let (i, _) = child
                 .get_column(cname)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?;
-            // Preallocated enough to not use try_push
-            child_pos.push(i);
+            child_pos
+                .push_within_capacity(i)
+                .expect("child FK position vector was preallocated to fk.child_columns.len()");
         }
 
         // Resolve parent columns: explicit list, or default to parent's PK columns.
@@ -2481,8 +2488,9 @@ impl Schema {
             let Some(p) = pos else {
                 return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
             };
-            // Preallocated enough to not use try_push
-            parent_pos.push(p);
+            parent_pos
+                .push_within_capacity(p)
+                .expect("parent FK position vector was preallocated to parent_cols.len()");
         }
 
         // A single-column parent key is the rowid when it names rowid/_rowid_/oid
@@ -5690,19 +5698,20 @@ impl Index {
                 )));
             };
             let (_, column) = table.get_column(col_name).unwrap();
-            // preallocated enough to not need try_push
-            primary_keys.push(IndexColumn {
-                name: normalize_ident(col_name),
-                order: *order,
-                pos_in_table,
-                collation: collation_overrides
-                    .get(i)
-                    .copied()
-                    .flatten()
-                    .or_else(|| column.collation_opt()),
-                default: column.default.clone(),
-                expr: None,
-            });
+            primary_keys
+                .push_within_capacity(IndexColumn {
+                    name: normalize_ident(col_name),
+                    order: *order,
+                    pos_in_table,
+                    collation: collation_overrides
+                        .get(i)
+                        .copied()
+                        .flatten()
+                        .or_else(|| column.collation_opt()),
+                    default: column.default.clone(),
+                    expr: None,
+                })
+                .expect("primary key index columns vector was preallocated");
         }
 
         assert!(primary_keys.len() == column_count);
@@ -5743,19 +5752,20 @@ impl Index {
                     table.name
                 )));
             };
-            // preallocated enough to not need try_push
-            unique_cols.push(IndexColumn {
-                name: normalize_ident(col.name.as_ref().unwrap()),
-                order: *sort_order,
-                pos_in_table,
-                collation: collation_overrides
-                    .get(i)
-                    .copied()
-                    .flatten()
-                    .or_else(|| col.collation_opt()),
-                default: col.default.clone(),
-                expr: None,
-            });
+            unique_cols
+                .push_within_capacity(IndexColumn {
+                    name: normalize_ident(col.name.as_ref().unwrap()),
+                    order: *sort_order,
+                    pos_in_table,
+                    collation: collation_overrides
+                        .get(i)
+                        .copied()
+                        .flatten()
+                        .or_else(|| col.collation_opt()),
+                    default: col.default.clone(),
+                    expr: None,
+                })
+                .expect("unique index columns vector was preallocated");
         }
 
         Ok(Index {

@@ -149,6 +149,25 @@ fn try_extend_accepts_underreported_lower_bound_iterators() {
 }
 
 #[test]
+fn vec_push_within_capacity_uses_reserved_slot() {
+    let mut values = <Vec<usize> as TursoTryWithCapacityExt>::try_with_capacity_ext(1).unwrap();
+    let initial_capacity = values.capacity();
+
+    *values.push_within_capacity(1).unwrap() = 2;
+
+    assert_eq!(values.as_slice(), &[2]);
+    assert_eq!(values.capacity(), initial_capacity);
+}
+
+#[test]
+fn vec_push_within_capacity_returns_value_when_full() {
+    let mut values = <Vec<usize> as TursoTryWithCapacityExt>::try_with_capacity_ext(0).unwrap();
+
+    assert_eq!(values.push_within_capacity(1), Err(1));
+    assert!(values.is_empty());
+}
+
+#[test]
 fn iterator_try_collect_accepts_iterators_without_upper_bounds() {
     let values: Vec<_> = LowerBoundOnly { next: 0, end: 3 }.try_collect().unwrap();
 

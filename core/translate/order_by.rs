@@ -752,20 +752,23 @@ pub fn order_by_deduplicate_result_columns(
             .iter()
             .enumerate()
             .find(|(_, (expr, _, _))| exprs_are_equivalent(expr, &rc.expr));
-        // No need to use `try_push` as we preallocated enough capacity already
         if let Some((j, _)) = found {
-            result_column_remapping.push(OrderByRemapping {
-                orderby_sorter_idx: j,
-                deduplicated: true,
-            });
+            result_column_remapping
+                .push_within_capacity(OrderByRemapping {
+                    orderby_sorter_idx: j,
+                    deduplicated: true,
+                })
+                .expect("ORDER BY remapping vector was preallocated to result_columns.len()");
         } else {
             // This result column is not a duplicate of any ORDER BY key, so its sorter
             // index comes after all ORDER BY entries (hence the +order_by_len). The
             // counter `i` tracks how many such non-duplicate result columns we've seen.
-            result_column_remapping.push(OrderByRemapping {
-                orderby_sorter_idx: order_by_len + sequence_offset + i,
-                deduplicated: false,
-            });
+            result_column_remapping
+                .push_within_capacity(OrderByRemapping {
+                    orderby_sorter_idx: order_by_len + sequence_offset + i,
+                    deduplicated: false,
+                })
+                .expect("ORDER BY remapping vector was preallocated to result_columns.len()");
             i += 1;
         }
     }

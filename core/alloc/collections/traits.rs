@@ -22,6 +22,19 @@ pub trait TursoBoxExt<T>: Sized {
 
 pub trait TursoVecExt<T>: Sized {
     fn with_capacity(capacity: usize) -> Self;
+
+    /// Appends an element and returns a reference to it if there is sufficient spare capacity,
+    /// otherwise an error is returned with the element.
+    ///
+    /// Unlike `push`, this method does not reallocate when capacity is exhausted. Callers should
+    /// reserve capacity before using this when insertion must succeed.
+    ///
+    /// Mirrors the unstable standard library implementation:
+    /// <https://doc.rust-lang.org/src/alloc/vec/mod.rs.html#2786>
+    ///
+    /// Takes O(1) time.
+    fn push_within_capacity(&mut self, value: T) -> Result<&mut T, T>;
+
     fn try_push(&mut self, value: T) -> Result<(), TryReserveError>;
 }
 

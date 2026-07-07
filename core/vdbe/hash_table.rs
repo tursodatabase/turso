@@ -453,8 +453,9 @@ impl HashEntry {
         let mut key_values = Vec::try_with_capacity_ext(num_keys as usize)?;
         for _ in 0..num_keys {
             let (value, consumed) = Self::deserialize_value(&buf[offset..])?;
-            // Preallocated enough already
-            key_values.push(value);
+            key_values
+                .push_within_capacity(value)
+                .expect("key values vector was preallocated");
             offset += consumed;
         }
 
@@ -465,8 +466,9 @@ impl HashEntry {
         let mut payload_values = Vec::try_with_capacity_ext(num_payload as usize)?;
         for _ in 0..num_payload {
             let (value, consumed) = Self::deserialize_value(&buf[offset..])?;
-            // Preallocated enough already
-            payload_values.push(value);
+            payload_values
+                .push_within_capacity(value)
+                .expect("payload values vector was preallocated");
             offset += consumed;
         }
 
@@ -1466,8 +1468,9 @@ impl HashTable {
         let mut total_size = 0usize;
         for entry in &partition.entries {
             let entry_size = entry.serialized_size();
-            // Preallocated enough already
-            entry_sizes.push(entry_size);
+            entry_sizes
+                .push_within_capacity(entry_size)
+                .expect("entry sizes vector was preallocated");
             total_size += varint_len(entry_size as u64) + entry_size;
         }
 
@@ -1589,8 +1592,9 @@ impl HashTable {
             let mut partition_size = 0usize;
             for entry in &partition.entries {
                 let entry_size = entry.serialized_size();
-                // Preallocated enough
-                entry_sizes.push(entry_size);
+                entry_sizes
+                    .push_within_capacity(entry_size)
+                    .expect("entry sizes vector was preallocated");
                 partition_size += varint_len(entry_size as u64) + entry_size;
             }
 
@@ -1618,8 +1622,9 @@ impl HashTable {
         let mut partition_offsets = Vec::try_with_capacity_ext(metas.len())?;
 
         for meta in &metas {
-            // Preallocated enough already
-            partition_offsets.push(offset);
+            partition_offsets
+                .push_within_capacity(offset)
+                .expect("partition offsets vector was preallocated");
             let partition = &spill_state.partition_buffers[meta.idx];
 
             for (entry, &entry_size) in partition.entries.iter().zip(meta.entry_sizes.iter()) {
@@ -2443,7 +2448,6 @@ impl HashTable {
             } else {
                 let mut combined =
                     Vec::try_with_capacity_ext(partition.partial_entry.len() + data.len())?;
-                // Preallocated enough already
                 combined.extend_from_slice(&partition.partial_entry);
                 combined.extend_from_slice(data);
                 combined
