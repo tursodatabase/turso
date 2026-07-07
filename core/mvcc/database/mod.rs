@@ -6292,6 +6292,36 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         })
     }
 
+    /// Returns true if some other write transaction has already committed with
+    /// an end timestamp newer than `begin_ts` but is still present in `txs`,
+    /// i.e. it was marked Committed in CommitEnd but has not yet published
+    /// `last_committed_tx_ts` in FinalizeCommit. Such a transaction is
+    /// invisible to both the `has_preparing_tx_other_than` check and the
+    /// `last_committed_tx_ts` watermark check, so exclusive acquisition must
+    /// scan for it explicitly; otherwise an older transaction could take the
+    /// exclusive slot and e.g. build an index from a snapshot that misses the
+    /// committed rows (#7481). Read-only transactions (empty write set, clean
+    /// header) are excluded: they publish nothing, matching the read-only
+    /// commit fast path that deliberately skips the watermark update.
+    ///
+    /// ORDERING: callers must run this scan BEFORE loading
+    /// `last_committed_tx_ts`. FinalizeCommit bumps the watermark before
+    /// `finish_committed_tx` removes the tx from `txs`, so a committed writer
+    /// missing from the scan has necessarily already published the watermark
+    /// and is caught by the subsequent load. Checking the watermark first
+    /// leaves a gap: the writer can bump the watermark and vanish from `txs`
+    /// between the (stale) watermark load and the scan.
+    fn has_committed_write_tx_newer_than(&self, tx_id: TxID, begin_ts: u64) -> bool {
+        self.txs.iter().any(|entry| {
+            if *entry.key() == tx_id {
+                return false;
+            }
+            let tx = entry.value();
+            matches!(tx.state.load(), TransactionState::Committed(end_ts) if end_ts > begin_ts)
+                && (tx.header_dirty.load(Ordering::Acquire) || !tx.write_set.lock().is_empty())
+        })
+    }
+
     /// Acquires the exclusive transaction lock to the given transaction ID.
     fn acquire_exclusive_tx(
         &self,
@@ -6316,7 +6346,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // txn gets exclusive txn status. check below after the CAS
         if let Some(tx) = self.txs.get(tx_id) {
             let tx = tx.value();
-            if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
+            // The `txs` scan catches writers that CommitEnd already marked
+            // Committed but whose FinalizeCommit has not yet published
+            // `last_committed_tx_ts` (#7481). It must run BEFORE the watermark
+            // load: FinalizeCommit bumps the watermark before removing the tx
+            // from `txs`, so a writer missing from the scan is guaranteed to
+            // be visible to the subsequent watermark check.
+            if self.has_committed_write_tx_newer_than(*tx_id, tx.begin_ts)
+                || tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire)
+            {
                 // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
                 // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
                 return Err(LimboError::Busy);
@@ -6367,7 +6405,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // `CommitState::Initial`.
                 if let Some(tx) = self.txs.get(tx_id) {
                     let tx = tx.value();
-                    if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
+                    // Scan `txs` BEFORE loading the watermark (see
+                    // `has_committed_write_tx_newer_than`): a committed writer
+                    // absent from the scan has already published
+                    // `last_committed_tx_ts`, so the watermark load below
+                    // catches it. The reverse order has a gap where the writer
+                    // bumps the watermark and leaves `txs` between the two
+                    // checks. Writers cannot newly enter Preparing here: we
+                    // hold the exclusive slot, so `CommitState::Initial`
+                    // aborts them with an exclusive conflict.
+                    if self.has_committed_write_tx_newer_than(*tx_id, tx.begin_ts)
+                        || tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire)
+                    {
                         self.release_exclusive_tx(tx_id);
                         return Err(LimboError::Busy);
                     }

@@ -16842,6 +16842,91 @@ fn test_global_header_regression_would_lose_committed_user_version() {
     );
 }
 
+/// Regression: `CREATE INDEX` in a transaction that began before a writer
+/// committed must not succeed while the writer's commit is paused between
+/// being marked Committed and publishing the committed watermark /
+/// global_header. If it does, the index is built without the committed row
+/// and index scans silently miss it.
+#[test]
+fn test_create_index_exclusive_acquire_rechecks_committed_tx_before_watermark_publish() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN DEFERRED").unwrap();
+    let mut read = ddl.prepare("SELECT COUNT(*) FROM t").unwrap();
+    read.run_ignore_rows().unwrap();
+    drop(read);
+
+    // Pause the writer's commit after it has been marked Committed but
+    // before it publishes the committed watermark / global_header.
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeGlobalHeaderUpdate.point(),
+    ])));
+
+    let mut writer_commit = writer.prepare("COMMIT").unwrap();
+    let mut yielded = false;
+    for _ in 0..200 {
+        match writer_commit.step().unwrap() {
+            StepResult::Yield => {
+                yielded = true;
+                break;
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert!(
+        yielded,
+        "writer COMMIT should yield before publishing global_header"
+    );
+
+    // The DDL transaction is older than the already-committed writer, so it
+    // must not be allowed to build the index from its stale snapshot.
+    let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
+    assert!(
+        matches!(result, Err(crate::LimboError::Busy)),
+        "DDL transaction older than an already-committed writer should return Busy, got {result:?}"
+    );
+
+    // Let the writer finish publishing and clean up.
+    writer.set_yield_injector(None);
+    writer_commit.run_ignore_rows().unwrap();
+    drop(writer_commit);
+    if ddl.get_mv_tx_id().is_some() {
+        ddl.execute("ROLLBACK").unwrap();
+    }
+
+    // A fresh connection can build the index, and it must see the committed
+    // row through the index.
+    let observer = db.connect();
+    observer.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+
+    let integrity = get_rows(&observer, "PRAGMA integrity_check");
+    assert_eq!(integrity.len(), 1);
+    assert_eq!(integrity[0][0].to_string(), "ok");
+
+    let rows = get_rows(
+        &observer,
+        "SELECT id, v FROM t INDEXED BY idx_v WHERE v = 200",
+    );
+    assert_eq!(
+        rows.len(),
+        1,
+        "index scan must find the committed row (2, 200)"
+    );
+}
+
 #[test]
 fn test_create_index_exclusive_acquire_rechecks_timestamp_after_cas() {
     let db = MvccTestDbNoConn::new_with_random_db();
