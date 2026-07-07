@@ -4562,6 +4562,7 @@ impl WalFile {
         Ok(())
     }
 
+    #[aristo::intent("Checkpoint backfill copies a log frame into the main database file only after that frame is durable in the log, so a crash can never recover a database torn between persisted backfill pages and dropped log frames", id = "aristos:wal_checkpoint_backfill_crash_atomic", verify = "full", parent = "wal_protocol_correctness")]
     fn checkpoint_inner(
         &self,
         pager: &Pager,
