@@ -1226,13 +1226,22 @@ pub enum SavepointResult {
     NotFound,
 }
 
+/// A connection's WAL position (max frame, running frame checksum, and the
+/// WAL generation they belong to), captured as one unit for savepoint
+/// rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SavepointWalPos {
+    max_frame: u64,
+    checksum: (u32, u32),
+    checkpoint_seq: u32,
+}
+
 #[derive(Debug, Clone)]
 struct SavepointSnapshot {
     kind: SavepointKind,
     start_offset: u64,
     db_size: u32,
-    wal_max_frame: u64,
-    wal_checksum: (u32, u32),
+    wal_pos: Option<SavepointWalPos>,
     deferred_fk_violations: isize,
 }
 
@@ -1248,11 +1257,12 @@ struct Savepoint {
     /// If the database grows during the savepoint and a rollback to the savepoint is performed,
     /// the pages exceeding the database size at the start of the savepoint will be ignored.
     db_size: AtomicU32,
-    /// We might want to rollback.
-    /// WAL max frame at the start of the savepoint.
-    wal_max_frame: AtomicU64,
-    /// WAL checksum at the start of the savepoint.
-    wal_checksum: RwLock<(u32, u32)>,
+    /// WAL position to rewind to on `ROLLBACK TO`. Captured only under the
+    /// write lock: eagerly if the savepoint is opened inside a write
+    /// transaction, otherwise at write upgrade. `None` while the
+    /// transaction has never held the write lock (no frames to rewind), or
+    /// when the pager has no WAL.
+    wal_pos: RwLock<Option<SavepointWalPos>>,
     /// Deferred FK counter value at the start of this savepoint.
     deferred_fk_violations: AtomicIsize,
 }
@@ -1262,8 +1272,7 @@ impl Savepoint {
         kind: SavepointKind,
         subjournal_offset: u64,
         db_size: u32,
-        wal_max_frame: u64,
-        wal_checksum: (u32, u32),
+        wal_pos: Option<SavepointWalPos>,
         deferred_fk_violations: isize,
     ) -> Self {
         Self {
@@ -1272,8 +1281,7 @@ impl Savepoint {
             write_offset: AtomicU64::new(subjournal_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
             db_size: AtomicU32::new(db_size),
-            wal_max_frame: AtomicU64::new(wal_max_frame),
-            wal_checksum: RwLock::new(wal_checksum),
+            wal_pos: RwLock::new(wal_pos),
             deferred_fk_violations: AtomicIsize::new(deferred_fk_violations),
         }
     }
@@ -1303,8 +1311,7 @@ impl Savepoint {
             kind: self.kind.clone(),
             start_offset: self.start_offset(),
             db_size: self.db_size.load(Ordering::Acquire),
-            wal_max_frame: self.wal_max_frame.load(Ordering::Acquire),
-            wal_checksum: *self.wal_checksum.read(),
+            wal_pos: *self.wal_pos.read(),
             deferred_fk_violations: self.deferred_fk_violations.load(Ordering::Acquire),
         }
     }
@@ -1316,8 +1323,7 @@ impl Savepoint {
             write_offset: AtomicU64::new(snapshot.start_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
             db_size: AtomicU32::new(snapshot.db_size),
-            wal_max_frame: AtomicU64::new(snapshot.wal_max_frame),
-            wal_checksum: RwLock::new(snapshot.wal_checksum),
+            wal_pos: RwLock::new(snapshot.wal_pos),
             deferred_fk_violations: AtomicIsize::new(snapshot.deferred_fk_violations),
         }
     }
@@ -2158,17 +2164,20 @@ impl Pager {
             .last()
             .map(|savepoint| savepoint.write_offset())
             .unwrap_or(0);
-        let (wal_max_frame, wal_checksum) = if let Some(wal) = &self.wal {
-            (wal.get_max_frame(), wal.get_last_checksum())
-        } else {
-            (0, (0, 0))
-        };
+        let wal_pos = self
+            .wal
+            .as_ref()
+            .filter(|wal| wal.holds_write_lock())
+            .map(|wal| SavepointWalPos {
+                max_frame: wal.get_max_frame(),
+                checksum: wal.get_last_checksum(),
+                checkpoint_seq: wal.get_checkpoint_seq(),
+            });
         let savepoint = Savepoint::new(
             kind,
             subjournal_offset,
             db_size,
-            wal_max_frame,
-            wal_checksum,
+            wal_pos,
             deferred_fk_violations,
         );
         self.savepoints.write().push(savepoint);
@@ -2267,14 +2276,17 @@ impl Pager {
             cache.truncate(db_size as usize)?;
         }
 
-        if let Some(wal) = &self.wal {
+        // No WAL position: the transaction never upgraded to a write
+        // transaction, so there are no frames to rewind.
+        if let (Some(wal), Some(wal_pos)) = (&self.wal, savepoint.wal_pos) {
             wal.rollback(Some(RollbackTo {
-                frame: savepoint.wal_max_frame,
-                checksum: savepoint.wal_checksum,
+                frame: wal_pos.max_frame,
+                checksum: wal_pos.checksum,
+                checkpoint_seq: wal_pos.checkpoint_seq,
             }));
             self.page_cache
                 .write()
-                .delete_clean_pages_after_wal_frame(savepoint.wal_max_frame)
+                .delete_clean_pages_after_wal_frame(wal_pos.max_frame)
                 .map_err(|e| {
                     LimboError::InternalError(format!(
                         "failed to invalidate rolled-back WAL pages: {e:?}"
@@ -2936,7 +2948,32 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
         };
-        Ok(IOResult::Done(wal.begin_write_tx(allowed_auto_actions)?))
+        wal.begin_write_tx(allowed_auto_actions)?;
+        // Must run after the upgrade (and any log restart it performed) so
+        // the positions belong to the current WAL generation.
+        self.materialize_savepoint_wal_positions();
+        Ok(IOResult::Done(()))
+    }
+
+    /// Fill in the WAL position of savepoints opened before this write
+    /// transaction, mirroring SQLite's `sqlite3PagerOpenSavepoint` at
+    /// write-transaction begin. Idempotent: only fills unmaterialized
+    /// positions, so upgrade retry loops (Busy/BusySnapshot) are safe.
+    fn materialize_savepoint_wal_positions(&self) {
+        let Some(wal) = self.wal.as_ref() else {
+            return;
+        };
+        let pos = SavepointWalPos {
+            max_frame: wal.get_max_frame(),
+            checksum: wal.get_last_checksum(),
+            checkpoint_seq: wal.get_checkpoint_seq(),
+        };
+        for savepoint in self.savepoints.read().iter() {
+            let mut wal_pos = savepoint.wal_pos.write();
+            if wal_pos.is_none() {
+                *wal_pos = Some(pos);
+            }
+        }
     }
 
     /// Acquire exclusive WAL access + block new transactions (used by VACUUM).

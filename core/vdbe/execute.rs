@@ -4190,6 +4190,14 @@ pub fn op_savepoint(
                             deferred_fk_violations,
                         );
                     } else {
+                        // TODO: SQLite's SAVEPOINT takes no locks and no
+                        // snapshot; its pager savepoint materializes at
+                        // write-tx begin (sqlite3PagerOpenSavepoint). The
+                        // eager read tx here pins the snapshot too early and
+                        // holds a read lock while idle — not needed for
+                        // correctness, since the WAL position already
+                        // materializes at write upgrade and db_size could
+                        // move there the same way.
                         if !pager.holds_read_lock() {
                             pager.begin_read_tx()?;
                         }
