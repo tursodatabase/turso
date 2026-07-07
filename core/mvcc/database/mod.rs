@@ -7275,7 +7275,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         }
                         *st = CompleteCheckpointState::DriveEarlyTruncate {
                             header_result,
-                            checkpoint_result: CheckpointResult::new(0, 0, 0),
+                            checkpoint_result: CheckpointResult::new(0, 0, 0, 0),
                         };
                         continue;
                     }
@@ -7376,7 +7376,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         io_yield_one!(c);
                     }
                     let checkpoint_result =
-                        std::mem::replace(checkpoint_result, CheckpointResult::new(0, 0, 0));
+                        std::mem::replace(checkpoint_result, CheckpointResult::new(0, 0, 0, 0));
                     *st = CompleteCheckpointState::RetryHeader {
                         checkpoint_result,
                         retried_crc: false,
@@ -7435,7 +7435,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         if crc_valid {
                             let checkpoint_result = std::mem::replace(
                                 checkpoint_result,
-                                CheckpointResult::new(0, 0, 0),
+                                CheckpointResult::new(0, 0, 0, 0),
                             );
                             *st = CompleteCheckpointState::DriveFinalTruncate { checkpoint_result };
                         } else {

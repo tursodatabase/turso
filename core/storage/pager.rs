@@ -1032,6 +1032,7 @@ struct CheckpointState {
 #[derive(Clone, Debug)]
 struct PendingCheckpointDbIdentityRead {
     max_frame: u64,
+    checkpoint_seq: u32,
     header_buf: Arc<Buffer>,
     bytes_read: Arc<AtomicUsize>,
     read_sent: bool,
@@ -1065,11 +1066,13 @@ enum CheckpointPhase {
     SyncBackfillProof {
         clear_page_cache: bool,
         max_frame: u64,
+        checkpoint_seq: u32,
     },
     /// Publish the durable backfill progress after the proof is installed and synced.
     PublishBackfill {
         clear_page_cache: bool,
         max_frame: u64,
+        checkpoint_seq: u32,
     },
     /// Truncate the WAL file after DB file is safely synced (only for TRUNCATE checkpoint mode).
     /// This must happen AFTER SyncDbFile to ensure data durability.
@@ -4479,6 +4482,7 @@ impl Pager {
                 clear_page_cache,
                 read: PendingCheckpointDbIdentityRead {
                     max_frame: result.wal_total_backfilled,
+                    checkpoint_seq: result.checkpoint_seq,
                     header_buf: Arc::new(Buffer::new_temporary(PageSize::MIN as usize)),
                     bytes_read: Arc::new(AtomicUsize::new(usize::MAX)),
                     read_sent: false,
@@ -4745,30 +4749,35 @@ impl Pager {
                         self.checkpoint_state.write().phase = CheckpointPhase::SyncBackfillProof {
                             clear_page_cache,
                             max_frame: read.max_frame,
+                            checkpoint_seq: read.checkpoint_seq,
                         };
                         io_yield_one!(c);
                     }
                     self.checkpoint_state.write().phase = CheckpointPhase::PublishBackfill {
                         clear_page_cache,
                         max_frame: read.max_frame,
+                        checkpoint_seq: read.checkpoint_seq,
                     };
                     continue;
                 }
                 CheckpointPhase::SyncBackfillProof {
                     clear_page_cache,
                     max_frame,
+                    checkpoint_seq,
                 } => {
                     self.checkpoint_state.write().phase = CheckpointPhase::PublishBackfill {
                         clear_page_cache,
                         max_frame,
+                        checkpoint_seq,
                     };
                     continue;
                 }
                 CheckpointPhase::PublishBackfill {
                     clear_page_cache,
                     max_frame,
+                    checkpoint_seq,
                 } => {
-                    wal.publish_backfill(max_frame);
+                    wal.publish_backfill(max_frame, checkpoint_seq);
                     let next_phase = {
                         let state = self.checkpoint_state.read();
                         if matches!(state.mode, Some(CheckpointMode::Truncate { .. })) {

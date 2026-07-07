@@ -62,6 +62,7 @@ pub struct CheckpointResult {
     pub wal_total_backfilled: u64,
     /// amount of new frames backfilled to the DB file during this checkpoint procedure
     pub wal_checkpoint_backfilled: u64,
+    pub checkpoint_seq: u32,
     /// In the case of everything backfilled, we need to hold the locks until the db
     /// file is truncated.
     maybe_guard: Option<CheckpointLocks>,
@@ -84,11 +85,13 @@ impl CheckpointResult {
         wal_max_frame: u64,
         wal_total_backfilled: u64,
         wal_checkpoint_backfilled: u64,
+        checkpoint_seq: u32,
     ) -> Self {
         Self {
             wal_max_frame,
             wal_total_backfilled,
             wal_checkpoint_backfilled,
+            checkpoint_seq,
             maybe_guard: None,
             db_sync_sent: false,
             db_truncate_sent: false,
@@ -479,7 +482,7 @@ trait WalCoordination: Debug + Send + Sync {
     fn publish_commit(&self, commit: WalCommitState);
 
     /// Publish the highest frame durably backfilled during checkpoint.
-    fn publish_backfill(&self, max_frame: u64);
+    fn publish_backfill(&self, max_frame: u64, checkpoint_seq: u32);
 
     /// Install any backend-specific durable proof before publishing backfill.
     /// Returns an optional completion that must finish before `publish_backfill`.
@@ -718,7 +721,7 @@ pub trait Wal: Debug + Send + Sync {
         db_header_crc32c: u32,
         sync_type: FileSyncType,
     ) -> Result<Option<Completion>>;
-    fn publish_backfill(&self, max_frame: u64);
+    fn publish_backfill(&self, max_frame: u64, checkpoint_seq: u32);
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
     fn is_syncing(&self) -> bool;
     /// Whether the WAL file is dirty: frames were appended that no successful
@@ -874,12 +877,25 @@ impl WalCoordination for InProcessWalCoordination {
             .store(commit.transaction_count, Ordering::Release);
     }
 
-    fn publish_backfill(&self, max_frame: u64) {
-        self.shared
-            .write()
+    fn publish_backfill(&self, max_frame: u64, checkpoint_seq: u32) {
+        let shared = self.shared.write();
+        let current_seq = shared.metadata.wal_header.lock().checkpoint_seq;
+        if current_seq != checkpoint_seq {
+            tracing::debug!(
+                "publish_backfill: rejecting stale publish from checkpoint_seq={checkpoint_seq} (current_seq={current_seq}, max_frame={max_frame})"
+            );
+            return;
+        }
+        let shared_max_frame = shared.metadata.max_frame.load(Ordering::Acquire);
+        turso_assert!(
+            max_frame <= shared_max_frame,
+            "nbackfills must never exceed max_frame",
+            { "nbackfills": max_frame, "max_frame": shared_max_frame, "checkpoint_seq": checkpoint_seq }
+        );
+        shared
             .metadata
             .nbackfills
-            .store(max_frame, Ordering::Release);
+            .fetch_max(max_frame, Ordering::AcqRel);
     }
 
     fn install_durable_backfill_proof(
@@ -1874,12 +1890,25 @@ impl WalCoordination for ShmWalCoordination {
         }
     }
 
-    fn publish_backfill(&self, max_frame: u64) {
-        self.shared
-            .write()
+    fn publish_backfill(&self, max_frame: u64, checkpoint_seq: u32) {
+        let shared = self.shared.write();
+        let authority_snapshot = self.authority.snapshot();
+        if authority_snapshot.checkpoint_seq != checkpoint_seq {
+            tracing::debug!(
+                "publish_backfill: rejecting stale publish from checkpoint_seq={checkpoint_seq} (current_seq={}, max_frame={max_frame})",
+                authority_snapshot.checkpoint_seq
+            );
+            return;
+        }
+        turso_assert!(
+            max_frame <= authority_snapshot.max_frame,
+            "nbackfills must never exceed max_frame",
+            { "nbackfills": max_frame, "max_frame": authority_snapshot.max_frame, "checkpoint_seq": checkpoint_seq }
+        );
+        shared
             .metadata
             .nbackfills
-            .store(max_frame, Ordering::Release);
+            .fetch_max(max_frame, Ordering::AcqRel);
         self.authority.publish_backfill(max_frame);
     }
 
@@ -3833,8 +3862,9 @@ impl Wal for WalFile {
         )
     }
 
-    fn publish_backfill(&self, max_frame: u64) {
-        self.coordination.publish_backfill(max_frame);
+    fn publish_backfill(&self, max_frame: u64, checkpoint_seq: u32) {
+        self.coordination
+            .publish_backfill(max_frame, checkpoint_seq);
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
@@ -4592,7 +4622,10 @@ impl WalFile {
                         // there are no frames to copy over and we don't need to reset
                         // the log so we can return early success.
                         return Ok(IOResult::Done(CheckpointResult::new(
-                            max_frame, nbackfills, 0,
+                            max_frame,
+                            nbackfills,
+                            0,
+                            snapshot.checkpoint_seq,
                         )));
                     }
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
@@ -4763,7 +4796,8 @@ impl WalFile {
                         ongoing_chkpt.complete(),
                         "checkpoint pending flush must have finished"
                     );
-                    let wal_max_frame = self.load_coordination_snapshot().max_frame;
+                    let snapshot = self.load_coordination_snapshot();
+                    let wal_max_frame = snapshot.max_frame;
                     let wal_total_backfilled = ongoing_chkpt.max_frame;
                     // Record two num pages fields to return as checkpoint result to caller.
                     // Ref: pnLog, pnCkpt on https://www.sqlite.org/c3ref/wal_checkpoint_v2.html
@@ -4776,6 +4810,7 @@ impl WalFile {
                         wal_max_frame,
                         wal_total_backfilled,
                         wal_checkpoint_backfilled,
+                        snapshot.checkpoint_seq,
                     );
                     tracing::debug!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
@@ -6615,7 +6650,7 @@ pub mod test {
                 .extend([(1, vec![1, 4, 8]), (2, vec![2, 6])]);
         }
 
-        coordination.publish_backfill(8);
+        coordination.publish_backfill(8, snapshot.checkpoint_seq);
         assert_eq!(coordination.load_snapshot().nbackfills, 8);
         assert_eq!(coordination.bump_checkpoint_epoch(), 5);
         assert_eq!(coordination.checkpoint_epoch(), 6);
@@ -6639,6 +6674,29 @@ pub mod test {
         }
         assert!(guard.runtime.frame_cache.lock().is_empty());
         assert!(!guard.metadata.initialized.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_in_process_coordination_rejects_stale_backfill_publish() {
+        let (shared, _wal) = make_test_wal();
+        let coordination = make_test_coordination(&shared);
+        let snapshot = WalSnapshot {
+            max_frame: 9,
+            nbackfills: 3,
+            last_checksum: (55, 89),
+            checkpoint_seq: 7,
+            transaction_count: 11,
+        };
+        set_shared_snapshot(&shared, snapshot);
+
+        coordination.publish_backfill(8, snapshot.checkpoint_seq.wrapping_sub(1));
+        assert_eq!(coordination.load_snapshot().nbackfills, 3);
+
+        coordination.publish_backfill(8, snapshot.checkpoint_seq);
+        assert_eq!(coordination.load_snapshot().nbackfills, 8);
+
+        coordination.publish_backfill(5, snapshot.checkpoint_seq);
+        assert_eq!(coordination.load_snapshot().nbackfills, 8);
     }
 
     #[test]
