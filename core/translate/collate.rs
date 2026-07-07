@@ -149,13 +149,21 @@ impl CollationSeq {
         }
     }
 
+    /// Compare two TEXT payloads. TEXT is stored as raw bytes (not required to be
+    /// valid UTF-8), and SQLite's built-in collations are byte-wise, so these
+    /// operate on bytes directly. Locale collations require Unicode and decode
+    /// lossily.
     #[inline(always)]
-    pub fn compare_strings(&self, lhs: &str, rhs: &str) -> Ordering {
+    pub fn compare_strings(&self, lhs: &[u8], rhs: &[u8]) -> Ordering {
         match *self {
             Self::Unset | Self::Binary => Self::binary_cmp(lhs, rhs),
             Self::NoCase => Self::nocase_cmp(lhs, rhs),
             Self::Rtrim => Self::rtrim_cmp(lhs, rhs),
-            Self::Locale(id) => LocaleCollationRegistry::global().compare(id, lhs, rhs),
+            Self::Locale(id) => LocaleCollationRegistry::global().compare(
+                id,
+                &String::from_utf8_lossy(lhs),
+                &String::from_utf8_lossy(rhs),
+            ),
             // Immutable comparison paths have no connection to fetch the external
             // callback from. Runtime VDBE paths dispatch custom collations via
             // `Connection`; schema/index paths reject them before storage.
@@ -164,13 +172,13 @@ impl CollationSeq {
     }
 
     #[inline(always)]
-    fn binary_cmp(lhs: &str, rhs: &str) -> Ordering {
+    fn binary_cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
         lhs.cmp(rhs)
     }
 
     #[inline(always)]
-    fn nocase_cmp(lhs: &str, rhs: &str) -> Ordering {
-        for (left, right) in lhs.bytes().zip(rhs.bytes()) {
+    fn nocase_cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
+        for (left, right) in lhs.iter().copied().zip(rhs.iter().copied()) {
             let left = left.to_ascii_lowercase();
             let right = right.to_ascii_lowercase();
             if left != right {
@@ -184,8 +192,15 @@ impl CollationSeq {
     }
 
     #[inline(always)]
-    fn rtrim_cmp(lhs: &str, rhs: &str) -> Ordering {
-        lhs.trim_end_matches(' ').cmp(rhs.trim_end_matches(' '))
+    fn rtrim_cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
+        fn trim_trailing_spaces(s: &[u8]) -> &[u8] {
+            let mut end = s.len();
+            while end > 0 && s[end - 1] == b' ' {
+                end -= 1;
+            }
+            &s[..end]
+        }
+        trim_trailing_spaces(lhs).cmp(trim_trailing_spaces(rhs))
     }
 
     pub fn hash_key(&self, text: &str) -> Vec<u8> {
@@ -556,15 +571,15 @@ mod tests {
     fn test_locale_collation_compare() {
         let traditional_spanish = CollationSeq::new("es-u-co-trad").unwrap();
         assert_eq!(
-            traditional_spanish.compare_strings("pollo", "polvo"),
+            traditional_spanish.compare_strings(b"pollo", b"polvo"),
             Ordering::Greater
         );
 
         let upper_first = CollationSeq::new("en-u-kf-upper").unwrap();
-        assert_eq!(upper_first.compare_strings("A", "a"), Ordering::Less);
+        assert_eq!(upper_first.compare_strings(b"A", b"a"), Ordering::Less);
 
         let upper_first_us = CollationSeq::new("en-US-u-kf-upper").unwrap();
-        assert_eq!(upper_first_us.compare_strings("A", "a"), Ordering::Less);
+        assert_eq!(upper_first_us.compare_strings(b"A", b"a"), Ordering::Less);
     }
 
     #[test]

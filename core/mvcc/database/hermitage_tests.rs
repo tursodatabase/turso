@@ -41,7 +41,7 @@ impl FromValue for i64 {
 
 impl FromValue for String {
     fn from_value(v: &Value) -> Self {
-        v.to_text().unwrap().to_string()
+        String::from_utf8_lossy(v.to_text().unwrap()).into_owned()
     }
 }
 

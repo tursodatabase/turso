@@ -71,7 +71,7 @@ fn query_rows_with_reset(
                     rusqlite::types::Value::Real(f64::from(*value))
                 }
                 turso_core::Value::Text(value) => {
-                    rusqlite::types::Value::Text(value.as_str().to_string())
+                    rusqlite::types::Value::Text(value.to_str_lossy().into_owned())
                 }
                 turso_core::Value::Blob(value) => rusqlite::types::Value::Blob(value.to_vec()),
             })
@@ -101,7 +101,7 @@ fn collect_limbo_prepared_rows(
                     rusqlite::types::Value::Real(f64::from(*value))
                 }
                 turso_core::Value::Text(value) => {
-                    rusqlite::types::Value::Text(value.as_str().to_string())
+                    rusqlite::types::Value::Text(value.to_str_lossy().into_owned())
                 }
                 turso_core::Value::Blob(value) => rusqlite::types::Value::Blob(value.to_vec()),
             })

@@ -44,10 +44,10 @@ impl SchemaIntrospector {
         rows.run_with_row_callback(|row| {
             if let turso_core::Value::Text(name) = row.get_value(0) {
                 let strict = match row.get_value(1) {
-                    turso_core::Value::Text(sql) => Self::sql_is_strict(sql.as_str()),
+                    turso_core::Value::Text(sql) => Self::sql_is_strict(&sql.to_str_lossy()),
                     _ => false,
                 };
-                tables.push((name.as_str().to_string(), strict));
+                tables.push((name.to_str_lossy().into_owned(), strict));
             }
             Ok(())
         })
@@ -140,9 +140,8 @@ impl SchemaIntrospector {
 
         rows.run_with_row_callback(|row| {
             if let turso_core::Value::Text(name) = row.get_value(1) {
-                let name = name.as_str();
-                if name != "main" {
-                    databases.push(name.to_string());
+                if name.as_bytes() != b"main" {
+                    databases.push(name.to_str_lossy().into_owned());
                 }
             }
             Ok(())
@@ -181,12 +180,12 @@ impl SchemaIntrospector {
 
         rows.run_with_row_callback(|row| {
             let name = match row.get_value(1) {
-                turso_core::Value::Text(s) => s.as_str().to_string(),
+                turso_core::Value::Text(s) => s.to_str_lossy().into_owned(),
                 _ => return Ok(()),
             };
 
             let type_str = match row.get_value(2) {
-                turso_core::Value::Text(s) => s.as_str().to_uppercase(),
+                turso_core::Value::Text(s) => s.to_str_lossy().to_uppercase(),
                 _ => "TEXT".to_string(),
             };
 
@@ -349,7 +348,7 @@ impl SchemaIntrospector {
 
         rows.run_with_row_callback(|row| {
             let name = match row.get_value(1) {
-                turso_core::Value::Text(s) => s.as_str().to_string(),
+                turso_core::Value::Text(s) => s.to_str_lossy().into_owned(),
                 _ => return Ok(()),
             };
             let unique = match row.get_value(2) {
@@ -357,7 +356,7 @@ impl SchemaIntrospector {
                 _ => false,
             };
             let origin = match row.get_value(3) {
-                turso_core::Value::Text(s) => Some(s.as_str().to_string()),
+                turso_core::Value::Text(s) => Some(s.to_str_lossy().into_owned()),
                 _ => None,
             };
             if origin.as_deref().is_some_and(|origin| origin != "c")
@@ -454,7 +453,7 @@ impl SchemaIntrospector {
                 return Ok(());
             }
             if let turso_core::Value::Text(name) = row.get_value(2) {
-                columns.push(name.as_str().to_string());
+                columns.push(name.to_str_lossy().into_owned());
             }
             Ok(())
         })

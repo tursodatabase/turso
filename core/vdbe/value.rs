@@ -183,6 +183,70 @@ fn sqlite_text_prefix(s: &str) -> &str {
     }
 }
 
+/// Number of codepoints in a TEXT payload under lenient READ_UTF8 rules: a lead
+/// byte plus its trailing continuation bytes is one codepoint, and a lone
+/// continuation or short byte counts as its own. Matches SQLite's character
+/// counting for `length()`/`substr()` over non-UTF-8 bytes.
+fn utf8_char_count(bytes: &[u8]) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        n += 1;
+        i += 1;
+        while i < bytes.len() && (bytes[i] & 0xc0) == 0x80 {
+            i += 1;
+        }
+    }
+    n
+}
+
+/// Byte offset reached after skipping `chars` codepoints (see [`utf8_char_count`]).
+fn utf8_char_byte_offset(bytes: &[u8], mut chars: usize) -> usize {
+    let mut i = 0;
+    while chars > 0 && i < bytes.len() {
+        i += 1;
+        while i < bytes.len() && (bytes[i] & 0xc0) == 0x80 {
+            i += 1;
+        }
+        chars -= 1;
+    }
+    i
+}
+
+/// Decode the first codepoint of a TEXT payload using SQLite's lenient
+/// `READ_UTF8` semantics (see SQLite's `utf.c`). A byte below 0xC0 (ASCII or a
+/// lone continuation byte) is returned as its own value; a lead byte greedily
+/// consumes the following continuation bytes, and only an overlong, surrogate,
+/// or noncharacter result folds to U+FFFD. This intentionally differs from
+/// `str::from_utf8` / `from_utf8_lossy`, which would fold a bare 0xFF/0x80 to
+/// U+FFFD. Returns `None` when the payload is empty.
+fn read_utf8_first_codepoint(bytes: &[u8]) -> Option<u32> {
+    let mut iter = bytes.iter();
+    let first = *iter.next()? as u32;
+    if first < 0xc0 {
+        // ASCII byte or a lone continuation byte: value is the byte itself.
+        return Some(first);
+    }
+    // Initial data bits by lead-byte class (2-, 3-, or 4+-byte start).
+    let mut c = if first < 0xe0 {
+        first & 0x1f
+    } else if first < 0xf0 {
+        first & 0x0f
+    } else {
+        first & 0x07
+    };
+    for &b in iter {
+        if b & 0xc0 != 0x80 {
+            break;
+        }
+        c = (c << 6) + (0x3f & b as u32);
+    }
+    if c < 0x80 || (c & 0xffff_f800) == 0xd800 || (c & 0xffff_fffe) == 0xfffe {
+        c = 0xfffd;
+    }
+    Some(c)
+}
+
 enum TrimType {
     All,
     Left,
@@ -191,14 +255,27 @@ enum TrimType {
 
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
-        self.cast_text()
-            .map(|s| Value::build_text(s.to_ascii_lowercase()))
+        match self {
+            // Case-fold only ASCII, preserving other (possibly non-UTF-8) bytes,
+            // matching SQLite's byte-wise lower().
+            Value::Text(t) => Some(Value::Text(crate::types::Text::from_bytes(
+                t.as_bytes().to_ascii_lowercase(),
+            ))),
+            _ => self
+                .cast_text()
+                .map(|s| Value::build_text(s.to_ascii_lowercase())),
+        }
     }
 
     pub fn exec_length(&self) -> Self {
         match self {
             Value::Text(t) => {
-                Value::from_i64(sqlite_text_prefix(t.as_str()).chars().count() as i64)
+                let bytes = t.as_bytes();
+                let bytes = match bytes.iter().position(|&b| b == 0) {
+                    Some(i) => &bytes[..i],
+                    None => bytes,
+                };
+                Value::from_i64(utf8_char_count(bytes) as i64)
             }
             Value::Numeric(_) => {
                 // For numbers, SQLite returns the length of the string representation
@@ -211,7 +288,7 @@ impl Value {
 
     pub fn exec_octet_length(&self) -> Self {
         match self {
-            Value::Text(s) => Value::from_i64(s.as_str().len() as i64),
+            Value::Text(s) => Value::from_i64(s.as_bytes().len() as i64),
             Value::Blob(blob) => Value::from_i64(blob.len() as i64),
             Value::Numeric(_) => Value::from_i64(self.to_string().len() as i64),
             _ => self.to_owned(),
@@ -219,8 +296,15 @@ impl Value {
     }
 
     pub fn exec_upper(&self) -> Option<Self> {
-        self.cast_text()
-            .map(|s| Value::build_text(s.to_ascii_uppercase()))
+        match self {
+            // Case-fold only ASCII, preserving other (possibly non-UTF-8) bytes.
+            Value::Text(t) => Some(Value::Text(crate::types::Text::from_bytes(
+                t.as_bytes().to_ascii_uppercase(),
+            ))),
+            _ => self
+                .cast_text()
+                .map(|s| Value::build_text(s.to_ascii_uppercase())),
+        }
     }
 
     pub fn exec_sign(&self) -> Option<Value> {
@@ -238,7 +322,7 @@ impl Value {
     /// Generates the Soundex code for a given word
     pub fn exec_soundex(&self) -> Value {
         let s = match self {
-            Value::Text(s) => s.as_str(),
+            Value::Text(s) => s.to_str_lossy(),
             Value::Null => return Value::build_text("?000"),
             _ => return Value::build_text("?000"),
         };
@@ -306,7 +390,7 @@ impl Value {
             Value::Numeric(Numeric::Float(non_nan)) => Value::from_f64(f64::from(*non_nan).abs()),
             _ => {
                 let s = match self {
-                    Value::Text(text) => std::borrow::Cow::Borrowed(text.as_str()),
+                    Value::Text(text) => text.to_str_lossy(),
                     Value::Blob(blob) => String::from_utf8_lossy(blob),
                     _ => unreachable!(),
                 };
@@ -335,7 +419,7 @@ impl Value {
         let length = match self {
             Value::Numeric(Numeric::Integer(i)) => *i,
             Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i64,
-            Value::Text(t) => t.as_str().parse().unwrap_or(1),
+            Value::Text(t) => t.to_str_lossy().parse().unwrap_or(1),
             _ => 1,
         }
         .max(1);
@@ -368,9 +452,10 @@ impl Value {
                 Value::build_text(quoted)
             }
             Value::Text(s) => {
-                let mut quoted = String::with_capacity(s.as_str().len() + 2);
+                let s = s.to_str_lossy();
+                let mut quoted = String::with_capacity(s.len() + 2);
                 quoted.push('\'');
-                for c in s.as_str().chars() {
+                for c in s.chars() {
                     if c == '\0' {
                         break;
                     } else if c == '\'' {
@@ -391,7 +476,7 @@ impl Value {
 
         match self {
             Value::Text(s) => {
-                let s = s.as_str();
+                let s = s.to_str_lossy();
                 let mut end = s.len();
                 let mut has_ctrl = false;
 
@@ -551,6 +636,22 @@ impl Value {
                 let (start, end) = calculate_postions(start, b.len(), length_value.as_ref());
                 Value::from_blob(b[start..end].to_vec())
             }
+            (Value::Text(t), Value::Numeric(Numeric::Integer(start))) => {
+                // substr on TEXT indexes by codepoint (lenient READ_UTF8) but
+                // returns the underlying bytes, so non-UTF-8 content survives.
+                let bytes = t.as_bytes();
+                let bytes = match bytes.iter().position(|&b| b == 0) {
+                    Some(i) => &bytes[..i],
+                    None => bytes,
+                };
+                let char_count = utf8_char_count(bytes);
+                let (start, end) = calculate_postions(start, char_count, length_value.as_ref());
+                let start_byte = utf8_char_byte_offset(bytes, start);
+                let end_byte = utf8_char_byte_offset(bytes, end);
+                Value::Text(crate::types::Text::from_bytes(
+                    bytes[start_byte..end_byte].to_vec(),
+                ))
+            }
             (value, Value::Numeric(Numeric::Integer(start))) => {
                 if let Some(text) = value.cast_text() {
                     let s = sqlite_text_prefix(text.as_str());
@@ -599,19 +700,25 @@ impl Value {
 
         let reg_str;
         let reg = match self {
-            Value::Text(s) => s.as_str(),
+            Value::Text(s) => {
+                reg_str = s.to_str_lossy();
+                reg_str.as_ref()
+            }
             _ => {
-                reg_str = self.to_string();
-                reg_str.as_str()
+                reg_str = std::borrow::Cow::Owned(self.to_string());
+                reg_str.as_ref()
             }
         };
 
         let pattern_str;
         let pattern = match pattern {
-            Value::Text(s) => s.as_str(),
+            Value::Text(s) => {
+                pattern_str = s.to_str_lossy();
+                pattern_str.as_ref()
+            }
             _ => {
-                pattern_str = pattern.to_string();
-                pattern_str.as_str()
+                pattern_str = std::borrow::Cow::Owned(pattern.to_string());
+                pattern_str.as_ref()
             }
         };
 
@@ -637,10 +744,10 @@ impl Value {
 
     pub fn exec_hex(&self) -> Value {
         match self {
-            Value::Text(_) | Value::Numeric(_) => {
-                let text = self.to_string();
-                Value::build_text(hex::encode_upper(text))
-            }
+            // TEXT hexes its raw bytes (not a lossy UTF-8 rendering), matching
+            // SQLite; a lossy conversion would turn X'FF' into EF BF BD.
+            Value::Text(t) => Value::build_text(hex::encode_upper(t.as_bytes())),
+            Value::Numeric(_) => Value::build_text(hex::encode_upper(self.to_string())),
             Value::Blob(blob_bytes) => Value::build_text(hex::encode_upper(blob_bytes)),
             Value::Null => Value::build_text(""),
         }
@@ -700,7 +807,17 @@ impl Value {
 
     pub fn exec_unicode(&self) -> Value {
         match self {
-            Value::Text(_) | Value::Numeric(_) | Value::Blob(_) => {
+            // TEXT is stored as raw bytes and is not required to be valid UTF-8.
+            // Decode the first codepoint with SQLite's lenient READ_UTF8 rules
+            // (see utf.c): a lone continuation/short byte is returned as its raw
+            // value, and only a malformed *multi-byte* sequence folds to U+FFFD.
+            // This differs from `from_utf8_lossy`, which would yield U+FFFD for a
+            // bare 0xFF/0x80.
+            Value::Text(t) => match read_utf8_first_codepoint(t.as_bytes()) {
+                None | Some(0) => Value::Null,
+                Some(c) => Value::from_i64(c as i64),
+            },
+            Value::Numeric(_) | Value::Blob(_) => {
                 let text = self.to_string();
                 if let Some(first_char) = text.chars().next() {
                     if first_char == '\0' {
@@ -717,7 +834,7 @@ impl Value {
 
     pub fn exec_unistr(&self) -> Result<Value> {
         let text = match self {
-            Value::Text(t) => std::borrow::Cow::Borrowed(t.as_str()),
+            Value::Text(t) => t.to_str_lossy(),
             Value::Numeric(_) | Value::Blob(_) => std::borrow::Cow::Owned(self.to_string()),
             _ => return Ok(Value::Null),
         };
@@ -806,7 +923,7 @@ impl Value {
 
     fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value {
         let text_cow = match self {
-            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+            Value::Text(s) => s.to_str_lossy(),
             Value::Null => return Value::Null,
             _ => std::borrow::Cow::Owned(self.to_string()),
         };
@@ -816,7 +933,7 @@ impl Value {
                     return Value::Null;
                 }
                 let pat_cow = match p {
-                    Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                    Value::Text(s) => s.to_str_lossy(),
                     _ => std::borrow::Cow::Owned(p.to_string()),
                 };
                 let p_str = pat_cow.as_ref();
@@ -853,7 +970,7 @@ impl Value {
         let length: i64 = match self {
             Value::Numeric(Numeric::Integer(i)) => *i,
             Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i64,
-            Value::Text(s) => s.as_str().parse().unwrap_or(0),
+            Value::Text(s) => s.to_str_lossy().parse().unwrap_or(0),
             _ => 0,
         }
         .max(0);
@@ -891,11 +1008,18 @@ impl Value {
             }
             // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
             // Casting an INTEGER or REAL value into TEXT renders the value as if via sqlite3_snprintf() except that the resulting TEXT uses the encoding of the database connection.
-            Affinity::Text => {
-                // Convert everything to text representation
-                // TODO: handle encoding and whatever sqlite3_snprintf does
-                Value::build_text(self.to_string())
-            }
+            Affinity::Text => match self {
+                // Casting a BLOB to TEXT reinterprets the raw bytes as text
+                // without conversion; the bytes need not be valid UTF-8 (SQLite:
+                // "the sequence of bytes that make up the BLOB is interpreted as
+                // text"). A lossy conversion here would corrupt e.g. X'FF'.
+                Value::Blob(b) => Value::Text(crate::types::Text::from_bytes(b.clone())),
+                Value::Text(t) => {
+                    Value::Text(crate::types::Text::from_bytes(t.as_bytes().to_vec()))
+                }
+                // Numeric/other: render via snprintf-equivalent (always UTF-8).
+                _ => Value::build_text(self.to_string()),
+            },
             Affinity::Real => match self {
                 Value::Blob(b) => {
                     let text = String::from_utf8_lossy(b);
@@ -905,9 +1029,11 @@ impl Value {
                             .unwrap_or(0.0),
                     )
                 }
-                Value::Text(t) => {
-                    Value::from_f64(crate::numeric::str_to_f64(t).map(f64::from).unwrap_or(0.0))
-                }
+                Value::Text(t) => Value::from_f64(
+                    crate::numeric::str_to_f64(t.to_str_lossy())
+                        .map(f64::from)
+                        .unwrap_or(0.0),
+                ),
                 Value::Numeric(Numeric::Integer(i)) => Value::from_f64(*i as f64),
                 Value::Numeric(Numeric::Float(f)) => Value::Numeric(Numeric::Float(*f)),
                 _ => Value::from_f64(0.0),
@@ -918,7 +1044,9 @@ impl Value {
                     let text = String::from_utf8_lossy(b);
                     Value::from_i64(crate::numeric::str_to_i64(&text).unwrap_or(0))
                 }
-                Value::Text(t) => Value::from_i64(crate::numeric::str_to_i64(t).unwrap_or(0)),
+                Value::Text(t) => {
+                    Value::from_i64(crate::numeric::str_to_i64(t.to_str_lossy()).unwrap_or(0))
+                }
                 Value::Numeric(Numeric::Integer(i)) => Value::from_i64(*i),
                 // A cast of a REAL value into an INTEGER follows SQLite's sqlite3RealToI64:
                 // truncate toward zero and clamp to i64::MIN/MAX if outside the safe range.
@@ -931,7 +1059,7 @@ impl Value {
                 Value::Numeric(Numeric::Float(v)) => Value::Numeric(Numeric::Float(*v)),
                 _ => {
                     let s = match self {
-                        Value::Text(text) => text.as_str().into(),
+                        Value::Text(text) => text.to_str_lossy(),
                         Value::Blob(blob) => String::from_utf8_lossy(blob.as_slice()),
                         _ => unreachable!(),
                     };
@@ -963,13 +1091,14 @@ impl Value {
         // If any of the casts failed, panic as text casting is not expected to fail.
         match (&source, &pattern, &replacement) {
             (Value::Text(source), Value::Text(pattern), Value::Text(replacement)) => {
-                if pattern.as_str().is_empty() || pattern.as_str().starts_with('\0') {
+                let pattern_str = pattern.to_str_lossy();
+                if pattern_str.is_empty() || pattern_str.starts_with('\0') {
                     return Value::Text(source.clone());
                 }
 
                 let result = source
-                    .as_str()
-                    .replace(pattern.as_str(), replacement.as_str());
+                    .to_str_lossy()
+                    .replace(pattern_str.as_ref(), &replacement.to_str_lossy());
                 Value::build_text(result)
             }
             _ => unreachable!("text cast should never fail"),
@@ -1149,15 +1278,25 @@ impl Value {
             return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat());
         }
 
-        let Some(lhs) = self.cast_text() else {
+        // `||` converts both operands to TEXT and concatenates the raw byte
+        // sequences (SQLite). TEXT bytes are carried through verbatim so that
+        // non-UTF-8 content is preserved.
+        fn concat_bytes(v: &Value) -> Option<std::borrow::Cow<'_, [u8]>> {
+            match v {
+                Value::Null => None,
+                Value::Text(t) => Some(std::borrow::Cow::Borrowed(t.as_bytes())),
+                Value::Blob(b) => Some(std::borrow::Cow::Borrowed(b.as_slice())),
+                Value::Numeric(_) => Some(std::borrow::Cow::Owned(v.to_string().into_bytes())),
+            }
+        }
+
+        let (Some(lhs), Some(rhs)) = (concat_bytes(self), concat_bytes(rhs)) else {
             return Value::Null;
         };
-
-        let Some(rhs) = rhs.cast_text() else {
-            return Value::Null;
-        };
-
-        Value::build_text(lhs + &rhs)
+        let mut out = Vec::with_capacity(lhs.len() + rhs.len());
+        out.extend_from_slice(&lhs);
+        out.extend_from_slice(&rhs);
+        Value::Text(crate::types::Text::from_bytes(out))
     }
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
@@ -1302,7 +1441,9 @@ impl Value {
         let Value::Text(text) = self else {
             panic!("concat_to_text must be called only on Value::Text");
         };
-        text.value.to_mut().push_str(&other.to_string());
+        text.value
+            .to_mut()
+            .extend_from_slice(other.to_string().as_bytes());
     }
 
     pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
@@ -1310,7 +1451,7 @@ impl Value {
         for val in registers {
             match val {
                 Value::Null => continue,
-                Value::Text(s) => result.push_str(s.as_str()),
+                Value::Text(s) => result.push_str(&s.to_str_lossy()),
                 Value::Blob(b) => result.push_str(&String::from_utf8_lossy(b)),
                 Value::Numeric(Numeric::Integer(i)) => result.push_str(&i.to_string()),
                 Value::Numeric(Numeric::Float(f)) => result.push_str(&format_float(f64::from(*f))),

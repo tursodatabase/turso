@@ -258,13 +258,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         }
         if args.len() == 2 && matches!(self.traversal_mode, JsonTraversalMode::Tree) {
             if let Value::Text(ref text) = args[1] {
-                if !text.value.is_empty()
-                    && text
-                        .value
-                        .as_bytes()
-                        .windows(3)
-                        .any(|chars| chars == b"[#-")
-                {
+                if !text.value.is_empty() && text.value.windows(3).any(|chars| chars == b"[#-") {
                     return Err(LimboError::InvalidArgument(
                         "Json paths with negative indices in json_tree are not supported yet"
                             .to_owned(),
@@ -284,12 +278,15 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                     "root path should be text".to_owned(),
                 ));
             };
+            let path = std::str::from_utf8(&path.value).map_err(|_| {
+                LimboError::InvalidArgument("root path should be valid UTF-8".to_owned())
+            })?;
             let root_json = if let Some(json) = navigate_to_path(&mut jsonb, &args[1])? {
                 json
             } else {
                 return Ok(false);
             };
-            (path.as_str(), root_json)
+            (path, root_json)
         };
 
         self.json = root_json;

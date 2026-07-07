@@ -1616,7 +1616,7 @@ fn run_integrity_check(
             rows.run_with_row_callback(|row| {
                 let value = row
                     .get_value(0)
-                    .to_text()
+                    .to_text_str_lossy()
                     .ok_or_else(|| {
                         LimboError::InternalError(
                             "integrity_check returned a non-text value".to_string(),

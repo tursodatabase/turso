@@ -123,7 +123,7 @@ fn get_table_names(
             StepResult::Row => {
                 let row = stmt.row().unwrap();
                 let name = row.get_value(0).to_text().expect("table name must be text");
-                names.push(name.to_string());
+                names.push(String::from_utf8_lossy(name).into_owned());
             }
             StepResult::IO => io.step()?,
             StepResult::Yield => continue,

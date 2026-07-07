@@ -110,7 +110,7 @@ fn row_to_obj_array<'local>(
             turso_core::Value::Numeric(turso_core::Numeric::Float(f)) => {
                 env.new_object("java/lang/Double", "(D)V", &[JValue::Double(f64::from(*f))])?
             }
-            turso_core::Value::Text(s) => env.new_string(s.as_str())?.into(),
+            turso_core::Value::Text(s) => env.new_string(&*s.to_str_lossy())?.into(),
             turso_core::Value::Blob(b) => env.byte_array_from_slice(b.as_slice())?.into(),
         };
         if let Err(e) = env.set_object_array_element(&obj_array, i as i32, obj) {

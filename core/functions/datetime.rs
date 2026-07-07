@@ -872,7 +872,7 @@ where
         let first = values.next().unwrap();
         match first.as_value_ref() {
             ValueRef::Text(s) => {
-                if parse_date_or_time(s.as_str(), &mut p).is_err() {
+                if parse_date_or_time(&s.to_str_lossy(), &mut p).is_err() {
                     return Value::Null;
                 }
             }
@@ -899,7 +899,7 @@ where
     for (i, val) in values.enumerate() {
         has_modifier = true;
         if let ValueRef::Text(s) = val.as_value_ref() {
-            if parse_modifier(&mut p, s.as_str(), i).is_err() {
+            if parse_modifier(&mut p, &s.to_str_lossy(), i).is_err() {
                 return Value::Null;
             }
         } else {
@@ -1042,7 +1042,7 @@ where
     let val1 = values.next().unwrap();
     match val1.as_value_ref() {
         ValueRef::Text(s) => {
-            if parse_date_or_time(s.as_str(), &mut d1).is_err() {
+            if parse_date_or_time(&s.to_str_lossy(), &mut d1).is_err() {
                 return Value::Null;
             }
         }
@@ -1069,7 +1069,7 @@ where
     let val2 = values.next().unwrap();
     match val2.as_value_ref() {
         ValueRef::Text(s) => {
-            if parse_date_or_time(s.as_str(), &mut d2).is_err() {
+            if parse_date_or_time(&s.to_str_lossy(), &mut d2).is_err() {
                 return Value::Null;
             }
         }
@@ -1190,7 +1190,7 @@ where
 
     let fmt_val = values.next().unwrap();
     let fmt_str = match fmt_val.as_value_ref() {
-        ValueRef::Text(s) => Cow::Borrowed(s.as_str()),
+        ValueRef::Text(s) => s.to_str_lossy(),
         ValueRef::Null => return Value::Null,
         val => Cow::Owned(val.to_string()),
     };
@@ -1202,7 +1202,7 @@ where
         let init_val = values.next().unwrap();
         match init_val.as_value_ref() {
             ValueRef::Text(s) => {
-                let s_str = s.as_str();
+                let s_str = s.to_str_lossy();
                 if s_str.eq_ignore_ascii_case("now") {
                     set_to_current(&mut p);
                 } else if let Ok(val) = s_str.parse::<f64>() {
@@ -1214,7 +1214,7 @@ where
                     }
                 } else {
                     let mut temp_p = DateTime::default();
-                    if parse_date_or_time(s_str, &mut temp_p).is_ok() {
+                    if parse_date_or_time(&s_str, &mut temp_p).is_ok() {
                         p = temp_p;
                     } else {
                         return Value::Null;
@@ -1242,7 +1242,7 @@ where
 
         for (i, val) in values.enumerate() {
             if let ValueRef::Text(s) = val.as_value_ref() {
-                if parse_modifier(&mut p, s.as_str(), i).is_err() {
+                if parse_modifier(&mut p, &s.to_str_lossy(), i).is_err() {
                     return Value::Null;
                 }
             } else {
@@ -1633,7 +1633,7 @@ mod tests {
         for (input, expected) in test_cases {
             let result = exec_time(&[input]);
             if let Value::Text(result_str) = result {
-                assert_eq!(result_str.as_str(), expected);
+                assert_eq!(&*result_str.to_str_lossy(), expected);
             } else {
                 panic!("Expected Value::Text, but got: {result:?}");
             }
@@ -1837,7 +1837,7 @@ mod tests {
                 Value::build_text(modifier.to_string()),
             ];
             let val = exec_datetime_full(args);
-            val.to_text().unwrap().to_string()
+            val.to_text_str_lossy().unwrap().to_string()
         };
 
         assert_eq!(run("+2023-05-15"), "4023-06-16 00:00:00");
@@ -1852,7 +1852,7 @@ mod tests {
                 Value::build_text(modifier.to_string()),
             ];
             let val = exec_datetime_full(args);
-            val.to_text().unwrap().to_string()
+            val.to_text_str_lossy().unwrap().to_string()
         };
 
         assert_eq!(run("+2023-05-15 14:30"), "4023-06-16 14:30:00");
@@ -1889,7 +1889,7 @@ mod tests {
                 Value::build_text(modifier.to_string()),
             ];
             let val = exec_datetime_full(args);
-            val.to_text().unwrap().to_string()
+            val.to_text_str_lossy().unwrap().to_string()
         };
 
         let base = "2023-06-15 12:30:45";
@@ -1928,7 +1928,7 @@ mod tests {
                 Value::build_text(modifier.to_string()),
             ];
             let val = exec_date(args);
-            val.to_text().unwrap().to_string()
+            val.to_text_str_lossy().unwrap().to_string()
         };
 
         // 2023-01-01 was a Sunday (0)
@@ -1994,7 +1994,10 @@ mod tests {
                 Value::build_text("2023-06-15 12:30:45".to_string()),
                 Value::build_text(mod_str.to_string()),
             ];
-            exec_datetime_full(args).to_text().unwrap().to_string()
+            exec_datetime_full(args)
+                .to_text_str_lossy()
+                .unwrap()
+                .to_string()
         };
 
         assert_eq!(run("5 days"), "2023-06-20 12:30:45");
@@ -2008,7 +2011,10 @@ mod tests {
                 Value::build_text("2023-06-15 12:30:45".to_string()),
                 Value::build_text(mod_str.to_string()),
             ];
-            exec_datetime_full(args).to_text().unwrap().to_string()
+            exec_datetime_full(args)
+                .to_text_str_lossy()
+                .unwrap()
+                .to_string()
         };
 
         assert_eq!(run("6 hours"), "2023-06-15 18:30:45");
@@ -2022,7 +2028,10 @@ mod tests {
                 Value::build_text("2023-06-15 12:30:45".to_string()),
                 Value::build_text(mod_str.to_string()),
             ];
-            exec_datetime_full(args).to_text().unwrap().to_string()
+            exec_datetime_full(args)
+                .to_text_str_lossy()
+                .unwrap()
+                .to_string()
         };
 
         assert_eq!(run("45 minutes"), "2023-06-15 13:15:45");
@@ -2036,7 +2045,10 @@ mod tests {
                 Value::build_text("2023-06-15 12:30:45".to_string()),
                 Value::build_text(mod_str.to_string()),
             ];
-            exec_datetime_full(args).to_text().unwrap().to_string()
+            exec_datetime_full(args)
+                .to_text_str_lossy()
+                .unwrap()
+                .to_string()
         };
 
         assert_eq!(run("30 seconds"), "2023-06-15 12:31:15");
@@ -2116,7 +2128,10 @@ mod tests {
                 Value::build_text("2023-06-15 12:30:45".to_string()),
                 Value::build_text(mod_str.to_string()),
             ];
-            exec_datetime_full(args).to_text().unwrap().to_string()
+            exec_datetime_full(args)
+                .to_text_str_lossy()
+                .unwrap()
+                .to_string()
         };
 
         assert_eq!(run("+01:30"), "2023-06-15 14:00:45");
@@ -2130,7 +2145,10 @@ mod tests {
                 Value::build_text("2023-06-15 12:30:45".to_string()),
                 Value::build_text(mod_str.to_string()),
             ];
-            exec_datetime_full(args).to_text().unwrap().to_string()
+            exec_datetime_full(args)
+                .to_text_str_lossy()
+                .unwrap()
+                .to_string()
         };
 
         assert_eq!(run("+0001-01-01 01:01"), "2024-07-16 13:31:45");
@@ -2145,7 +2163,7 @@ mod tests {
             Value::build_text("2023-06-15 12:30:45"),
             Value::build_text("start of year"),
         ]);
-        assert_eq!(res.to_text().unwrap(), "2023-01-01 00:00:00");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-01-01 00:00:00");
     }
 
     #[test]
@@ -2154,7 +2172,7 @@ mod tests {
             Value::build_text("2023-06-15 12:30:45"),
             Value::build_text("start of day"),
         ]);
-        assert_eq!(res.to_text().unwrap(), "2023-06-15 00:00:00");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-06-15 00:00:00");
     }
 
     #[test]
@@ -2163,7 +2181,7 @@ mod tests {
             Value::build_text("2023-06-15 12:30:45"),
             Value::build_text("-1 day"),
         ]);
-        assert_eq!(res.to_text().unwrap(), "2023-06-14 12:30:45");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-06-14 12:30:45");
     }
 
     #[test]
@@ -2173,7 +2191,7 @@ mod tests {
             Value::build_text("-1 day"),
             Value::build_text("+3 hours"),
         ]);
-        assert_eq!(res.to_text().unwrap(), "2023-06-14 15:30:45");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-06-14 15:30:45");
     }
 
     #[test]
@@ -2185,7 +2203,7 @@ mod tests {
             ],
             "time",
         );
-        assert_eq!(res.to_text().unwrap(), "12:30:45.000");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "12:30:45.000");
     }
 
     #[test]
@@ -2195,7 +2213,7 @@ mod tests {
             Value::build_text("start of day"),
             Value::build_text("-1 day"),
         ]);
-        assert_eq!(res.to_text().unwrap(), "2023-06-14 00:00:00");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-06-14 00:00:00");
     }
 
     #[test]
@@ -2205,7 +2223,7 @@ mod tests {
             Value::build_text("start of month"),
             Value::build_text("+1 day"),
         ]);
-        assert_eq!(res.to_text().unwrap(), "2023-06-02 00:00:00");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-06-02 00:00:00");
     }
 
     #[test]
@@ -2216,7 +2234,7 @@ mod tests {
             Value::build_text("+30 days"),
             Value::build_text("+5 hours"),
         ]);
-        assert_eq!(res.to_text().unwrap(), "2023-01-31 05:00:00");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-01-31 05:00:00");
     }
 
     #[test]
@@ -2242,7 +2260,7 @@ mod tests {
             .to_string();
 
         assert_eq!(
-            res_local.to_text().unwrap(),
+            res_local.to_text_str_lossy().unwrap(),
             expected_local,
             "localtime modifier mismatch"
         );
@@ -2263,7 +2281,7 @@ mod tests {
                     .format("%Y-%m-%d %H:%M:%S")
                     .to_string();
                 assert_eq!(
-                    res_utc.to_text().unwrap(),
+                    res_utc.to_text_str_lossy().unwrap(),
                     expected_utc,
                     "utc modifier mismatch"
                 );
@@ -2271,7 +2289,7 @@ mod tests {
             _ => {
                 // Fallback if local time is ambiguous/invalid in test environment
                 // Ensure result is at least a valid string and not Null
-                assert!(res_utc.to_text().is_some());
+                assert!(res_utc.to_text_str_lossy().is_some());
                 assert_ne!(res_utc, Value::Null);
             }
         }
@@ -2288,14 +2306,17 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         let result = exec_datetime_full(args);
-        assert_eq!(result.to_text().unwrap(), "1999-12-31 05:30:15.000");
+        assert_eq!(
+            result.to_text_str_lossy().unwrap(),
+            "1999-12-31 05:30:15.000"
+        );
     }
 
     #[test]
     fn test_max_datetime_limit() {
         let args = vec![Value::build_text("9999-12-31 23:59:59".to_string())];
         let result = exec_datetime_full(args);
-        assert_eq!(result.to_text().unwrap(), "9999-12-31 23:59:59");
+        assert_eq!(result.to_text_str_lossy().unwrap(), "9999-12-31 23:59:59");
     }
 
     #[test]
@@ -2312,7 +2333,7 @@ mod tests {
             Value::build_text("weekday 0".to_string()),
         ];
         let result = exec_datetime_full(args);
-        assert_eq!(result.to_text().unwrap(), "2023-01-01 12:00:00");
+        assert_eq!(result.to_text_str_lossy().unwrap(), "2023-01-01 12:00:00");
     }
 
     #[test]
@@ -2322,14 +2343,14 @@ mod tests {
             Value::build_text("weekday 1".to_string()),
         ];
         let res1 = exec_datetime_full(args1);
-        assert_eq!(res1.to_text().unwrap(), "2023-01-02 12:00:00");
+        assert_eq!(res1.to_text_str_lossy().unwrap(), "2023-01-02 12:00:00");
 
         let args2 = vec![
             Value::build_text("2023-01-03 12:00:00".to_string()),
             Value::build_text("weekday 5".to_string()),
         ];
         let res2 = exec_datetime_full(args2);
-        assert_eq!(res2.to_text().unwrap(), "2023-01-06 12:00:00");
+        assert_eq!(res2.to_text_str_lossy().unwrap(), "2023-01-06 12:00:00");
     }
 
     #[test]
@@ -2339,14 +2360,14 @@ mod tests {
             Value::build_text("weekday 0".to_string()),
         ];
         let res1 = exec_datetime_full(args1);
-        assert_eq!(res1.to_text().unwrap(), "2023-01-08 12:00:00");
+        assert_eq!(res1.to_text_str_lossy().unwrap(), "2023-01-08 12:00:00");
 
         let args2 = vec![
             Value::build_text("2023-01-08 12:00:00".to_string()),
             Value::build_text("weekday 0".to_string()),
         ];
         let res2 = exec_datetime_full(args2);
-        assert_eq!(res2.to_text().unwrap(), "2023-01-08 12:00:00");
+        assert_eq!(res2.to_text_str_lossy().unwrap(), "2023-01-08 12:00:00");
     }
 
     #[test]
@@ -2356,7 +2377,7 @@ mod tests {
             Value::build_text("weekday 4".to_string()),
         ];
         let res = exec_datetime_full(args);
-        assert_eq!(res.to_text().unwrap(), "2023-01-05 12:00:00");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-01-05 12:00:00");
     }
 
     #[test]
@@ -2366,7 +2387,7 @@ mod tests {
             Value::build_text("weekday 5".to_string()),
         ];
         let res = exec_datetime_full(args);
-        assert_eq!(res.to_text().unwrap(), "2023-01-06 12:00:00");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-01-06 12:00:00");
     }
 
     #[test]
@@ -2376,7 +2397,7 @@ mod tests {
 
         let dt_args = vec![jd_val, Value::build_text("auto".to_string())];
         let dt_res = exec_datetime_full(dt_args);
-        assert_eq!(dt_res.to_text().unwrap(), "2000-01-01 12:00:00");
+        assert_eq!(dt_res.to_text_str_lossy().unwrap(), "2000-01-01 12:00:00");
     }
 
     #[test]
@@ -2386,7 +2407,7 @@ mod tests {
             Value::build_text("start of month".to_string()),
         ];
         let res = exec_datetime_full(args);
-        assert_eq!(res.to_text().unwrap(), "2023-06-01 00:00:00");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-06-01 00:00:00");
     }
 
     #[test]
@@ -2396,7 +2417,7 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         let res = exec_datetime_general(args, "datetime");
-        assert_eq!(res.to_text().unwrap(), "2023-06-15 12:30:45.000");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-06-15 12:30:45.000");
     }
 
     #[test]
@@ -2407,7 +2428,7 @@ mod tests {
             Value::build_text("floor".to_string()),
         ];
         let res = exec_datetime_full(args);
-        assert_eq!(res.to_text().unwrap(), "2023-02-28 00:00:00");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-02-28 00:00:00");
     }
 
     #[test]
@@ -2418,7 +2439,7 @@ mod tests {
             Value::build_text("floor".to_string()),
         ];
         let res = exec_datetime_full(args);
-        assert_eq!(res.to_text().unwrap(), "2023-02-15 00:00:00");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-02-15 00:00:00");
     }
 
     #[test]
@@ -2429,7 +2450,7 @@ mod tests {
             Value::build_text("+1 month".to_string()),
         ];
         let res = exec_datetime_full(args);
-        assert_eq!(res.to_text().unwrap(), "2023-03-03 00:00:00");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-03-03 00:00:00");
     }
 
     #[test]
@@ -2439,7 +2460,7 @@ mod tests {
             Value::build_text("start of month".to_string()),
         ];
         let res = exec_datetime_full(args);
-        assert_eq!(res.to_text().unwrap(), "2023-06-01 00:00:00");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-06-01 00:00:00");
     }
 
     #[test]
@@ -2449,7 +2470,7 @@ mod tests {
             Value::build_text("start of month".to_string()),
         ];
         let res = exec_datetime_full(args);
-        assert_eq!(res.to_text().unwrap(), "2023-06-01 00:00:00");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-06-01 00:00:00");
     }
 
     #[test]
@@ -2459,7 +2480,7 @@ mod tests {
             Value::build_text("start of month".to_string()),
         ];
         let res = exec_datetime_full(args);
-        assert_eq!(res.to_text().unwrap(), "2023-07-01 00:00:00");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-07-01 00:00:00");
     }
 
     #[test]
@@ -2469,7 +2490,7 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         let res = exec_datetime_full(args);
-        assert_eq!(res.to_text().unwrap(), "2023-06-15 12:30:45.123");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2023-06-15 12:30:45.123");
     }
 
     #[test]
@@ -2479,7 +2500,7 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         let res = exec_datetime_full(args);
-        assert_eq!(res.to_text().unwrap(), "2025-01-02 04:12:21.891");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2025-01-02 04:12:21.891");
     }
 
     #[test]
@@ -2489,7 +2510,7 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         let res = exec_datetime_full(args);
-        assert_eq!(res.to_text().unwrap(), "2025-01-02 04:12:21.000");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2025-01-02 04:12:21.000");
     }
 
     #[test]
@@ -2499,7 +2520,7 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         let res = exec_datetime_full(args);
-        assert_eq!(res.to_text().unwrap(), "2025-01-02 04:12:21.891");
+        assert_eq!(res.to_text_str_lossy().unwrap(), "2025-01-02 04:12:21.891");
     }
 
     #[test]
@@ -2626,7 +2647,10 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         let result = exec_datetime_full(args);
-        assert_eq!(result.to_text().unwrap(), "2024-01-01 12:00:00.000");
+        assert_eq!(
+            result.to_text_str_lossy().unwrap(),
+            "2024-01-01 12:00:00.000"
+        );
     }
 
     #[test]
@@ -2636,7 +2660,10 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         let result = exec_datetime_full(args);
-        assert_eq!(result.to_text().unwrap(), "2024-01-01 00:00:00.000");
+        assert_eq!(
+            result.to_text_str_lossy().unwrap(),
+            "2024-01-01 00:00:00.000"
+        );
     }
 
     #[test]
@@ -2646,7 +2673,10 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         let result = exec_datetime_full(args);
-        assert_eq!(result.to_text().unwrap(), "2024-01-01 15:30:00.000");
+        assert_eq!(
+            result.to_text_str_lossy().unwrap(),
+            "2024-01-01 15:30:00.000"
+        );
     }
 
     #[test]
@@ -2657,7 +2687,10 @@ mod tests {
             Value::build_text("+1 hour".to_string()),
         ];
         let result = exec_datetime_full(args);
-        assert_eq!(result.to_text().unwrap(), "2024-01-01 13:00:00.000");
+        assert_eq!(
+            result.to_text_str_lossy().unwrap(),
+            "2024-01-01 13:00:00.000"
+        );
     }
 
     #[test]
@@ -2668,7 +2701,10 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         let result = exec_datetime_full(args);
-        assert_eq!(result.to_text().unwrap(), "2024-01-01 13:00:00.000");
+        assert_eq!(
+            result.to_text_str_lossy().unwrap(),
+            "2024-01-01 13:00:00.000"
+        );
     }
 
     #[test]
@@ -2679,7 +2715,10 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         let result = exec_datetime_full(args);
-        assert_eq!(result.to_text().unwrap(), "2024-01-01 12:00:01.999");
+        assert_eq!(
+            result.to_text_str_lossy().unwrap(),
+            "2024-01-01 12:00:01.999"
+        );
     }
 
     #[test]
@@ -2689,7 +2728,10 @@ mod tests {
             Value::build_text("SuBsEc".to_string()),
         ];
         let result = exec_datetime_full(args);
-        assert_eq!(result.to_text().unwrap(), "2024-01-01 12:00:00.000");
+        assert_eq!(
+            result.to_text_str_lossy().unwrap(),
+            "2024-01-01 12:00:00.000"
+        );
     }
 
     #[test]
@@ -2877,31 +2919,31 @@ mod tests {
     fn test_fast_path_date_only() {
         assert_eq!(
             exec_date(vec![Value::build_text("2024-01-01".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "2024-01-01"
         );
         assert_eq!(
             exec_date(vec![Value::build_text("0001-01-01".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "0001-01-01"
         );
         assert_eq!(
             exec_date(vec![Value::build_text("9999-12-31".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "9999-12-31"
         );
         assert_eq!(
             exec_date(vec![Value::build_text("2024-02-29".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "2024-02-29"
         );
         assert_eq!(
             exec_date(vec![Value::build_text("2023-02-29".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "2023-03-01"
         );
@@ -2946,13 +2988,13 @@ mod tests {
     fn test_fast_path_datetime_formats() {
         assert_eq!(
             exec_datetime_full(vec![Value::build_text("2024-01-15 10:30".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "2024-01-15 10:30:00"
         );
         assert_eq!(
             exec_datetime_full(vec![Value::build_text("2024-01-15T10:30".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "2024-01-15 10:30:00"
         );
@@ -2962,13 +3004,13 @@ mod tests {
         );
         assert_eq!(
             exec_datetime_full(vec![Value::build_text("2024-01-15 10:30:45".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "2024-01-15 10:30:45"
         );
         assert_eq!(
             exec_datetime_full(vec![Value::build_text("2024-01-15T10:30:45".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "2024-01-15 10:30:45"
         );
@@ -2991,25 +3033,25 @@ mod tests {
     fn test_fast_path_time_only() {
         assert_eq!(
             exec_time(vec![Value::build_text("10:30".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "10:30:00"
         );
         assert_eq!(
             exec_time(vec![Value::build_text("00:00".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "00:00:00"
         );
         assert_eq!(
             exec_time(vec![Value::build_text("23:59".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "23:59:00"
         );
         assert_eq!(
             exec_time(vec![Value::build_text("24:00".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "24:00:00"
         );
@@ -3020,19 +3062,19 @@ mod tests {
 
         assert_eq!(
             exec_time(vec![Value::build_text("10:30:45".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "10:30:45"
         );
         assert_eq!(
             exec_time(vec![Value::build_text("00:00:00".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "00:00:00"
         );
         assert_eq!(
             exec_time(vec![Value::build_text("23:59:59".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "23:59:59"
         );
@@ -3044,7 +3086,7 @@ mod tests {
             ],
             "time",
         );
-        assert_eq!(res1.to_text().unwrap(), "10:30:45.123");
+        assert_eq!(res1.to_text_str_lossy().unwrap(), "10:30:45.123");
 
         let res2 = exec_datetime_general(
             vec![
@@ -3053,14 +3095,14 @@ mod tests {
             ],
             "time",
         );
-        assert_eq!(res2.to_text().unwrap(), "10:30:45.100");
+        assert_eq!(res2.to_text_str_lossy().unwrap(), "10:30:45.100");
     }
 
     #[test]
     fn test_fast_path_skips_timezone_strings() {
         assert_eq!(
             exec_datetime_full(vec![Value::build_text("2024-01-15 10:30:45Z".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "2024-01-15 10:30:45"
         );
@@ -3068,7 +3110,7 @@ mod tests {
             exec_datetime_full(vec![Value::build_text(
                 "2024-01-15 10:30:45+02:00".to_string()
             )])
-            .to_text()
+            .to_text_str_lossy()
             .unwrap(),
             "2024-01-15 08:30:45"
         );
@@ -3076,13 +3118,13 @@ mod tests {
             exec_datetime_full(vec![Value::build_text(
                 "2024-01-15 10:30:45-05:00".to_string()
             )])
-            .to_text()
+            .to_text_str_lossy()
             .unwrap(),
             "2024-01-15 15:30:45"
         );
         assert_eq!(
             exec_time(vec![Value::build_text("10:30:45+02:00".to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap(),
             "08:30:45"
         );
@@ -3095,7 +3137,7 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         assert_eq!(
-            exec_datetime_full(args1).to_text().unwrap(),
+            exec_datetime_full(args1).to_text_str_lossy().unwrap(),
             "2024-01-15 10:30:45.123"
         );
 
@@ -3104,7 +3146,7 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         assert_eq!(
-            exec_datetime_full(args2).to_text().unwrap(),
+            exec_datetime_full(args2).to_text_str_lossy().unwrap(),
             "2024-01-15 10:30:45.100"
         );
 
@@ -3113,7 +3155,7 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         assert_eq!(
-            exec_datetime_full(args3).to_text().unwrap(),
+            exec_datetime_full(args3).to_text_str_lossy().unwrap(),
             "2024-01-15 10:30:45.100"
         );
 
@@ -3122,7 +3164,7 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         assert_eq!(
-            exec_datetime_full(args4).to_text().unwrap(),
+            exec_datetime_full(args4).to_text_str_lossy().unwrap(),
             "2024-01-15 10:30:45.000"
         );
     }
@@ -3131,7 +3173,7 @@ mod tests {
     fn test_fast_path_month_day_boundaries() {
         let run = |s: &str| -> String {
             exec_datetime_full(&[Value::build_text(s.to_string())])
-                .to_text()
+                .to_text_str_lossy()
                 .unwrap()
                 .to_string()
         };
@@ -3151,7 +3193,7 @@ mod tests {
         let run = |s: &str| -> Value { exec_datetime_full(&[Value::build_text(s.to_string())]) };
 
         // Helper for cases expected to succeed (return String)
-        let run_str = |s: &str| -> String { run(s).to_text().unwrap().to_string() };
+        let run_str = |s: &str| -> String { run(s).to_text_str_lossy().unwrap().to_string() };
 
         assert_eq!(run(""), Value::Null);
         assert_eq!(run("a"), Value::Null);
@@ -3176,7 +3218,9 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         assert_eq!(
-            exec_datetime_general(dt_args, "time").to_text().unwrap(),
+            exec_datetime_general(dt_args, "time")
+                .to_text_str_lossy()
+                .unwrap(),
             "10:30:45.120"
         );
     }

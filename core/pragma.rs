@@ -426,7 +426,7 @@ impl PragmaVirtualTableCursor {
             )));
         }
 
-        let to_text = |v: &Value| v.to_text().map(str::to_owned);
+        let to_text = |v: &Value| v.to_text_str_lossy().map(|s| s.into_owned());
         let (arg, schema) = match args.as_slice() {
             [arg0] if self.has_pragma_arg => (to_text(arg0), None),
             [arg0] => (None, to_text(arg0)),

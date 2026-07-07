@@ -281,9 +281,11 @@ impl Property for IntegrityCheckProperty {
                     );
                 }
                 match &row[0] {
-                    Value::Text(text) if text.as_str() == "ok" => Ok(()),
+                    Value::Text(text) if text.as_bytes() == b"ok" => Ok(()),
                     // "Page N: never used" is informational in MVCC mode, not corruption
-                    Value::Text(text) if is_integrity_check_informational(text.as_str()) => Ok(()),
+                    Value::Text(text) if is_integrity_check_informational(&text.to_str_lossy()) => {
+                        Ok(())
+                    }
                     other => {
                         bail!(
                             "step {step}, fiber {fiber_id}: integrity_check returned {:?}, expected \"ok\"",
@@ -2182,7 +2184,7 @@ fn parse_read_result(result: &OpResult) -> Option<Vec<i64>> {
         } else if let Some(row) = rows.first() {
             if let Some(value) = row.first() {
                 match value {
-                    Value::Text(csv_str) => parse_comma_separated_ints(csv_str.as_str()),
+                    Value::Text(csv_str) => parse_comma_separated_ints(&csv_str.to_str_lossy()),
                     Value::Null => Some(vec![]),
                     _ => Some(vec![]),
                 }

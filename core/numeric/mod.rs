@@ -53,7 +53,7 @@ impl Numeric {
         match value {
             ValueRef::Null => None,
             ValueRef::Numeric(v) => Some(v),
-            ValueRef::Text(text) => Some(Numeric::from(text.as_str())),
+            ValueRef::Text(text) => Some(Numeric::from(text.to_str_lossy())),
             ValueRef::Blob(blob) => {
                 let text = String::from_utf8_lossy(blob);
                 Some(Numeric::from(&text))
@@ -67,14 +67,14 @@ impl Numeric {
             Value::Null | Value::Blob(_) => None,
             Value::Numeric(n) => Some(*n),
             Value::Text(text) => {
-                let s = text.as_str();
+                let s = text.to_str_lossy();
 
-                match str_to_f64(s) {
+                match str_to_f64(&s) {
                     None
                     | Some(StrToF64::FractionalPrefix(_))
                     | Some(StrToF64::DecimalPrefix(_)) => None,
                     Some(StrToF64::Fractional(value)) => Some(Self::Float(value)),
-                    Some(StrToF64::Decimal(real)) => Some(match str_to_i64_checked(s) {
+                    Some(StrToF64::Decimal(real)) => Some(match str_to_i64_checked(&s) {
                         Ok(integer) => Self::Integer(integer),
                         Err(_) => Self::Float(real),
                     }),
@@ -212,7 +212,7 @@ impl From<&Value> for Option<Numeric> {
         match value {
             Value::Null => None,
             Value::Numeric(n) => Some(*n),
-            Value::Text(text) => Some(Numeric::from(text.as_str())),
+            Value::Text(text) => Some(Numeric::from(text.to_str_lossy())),
             Value::Blob(blob) => {
                 let text = String::from_utf8_lossy(blob.as_slice());
                 Some(Numeric::from(&text))
@@ -335,7 +335,7 @@ impl From<&Value> for NullableInteger {
             Value::Null => Self::Null,
             Value::Numeric(Numeric::Integer(v)) => Self::Integer(*v),
             Value::Numeric(Numeric::Float(v)) => Self::Integer(f64::from(*v) as i64),
-            Value::Text(text) => Self::from(text.as_str()),
+            Value::Text(text) => Self::from(text.to_str_lossy()),
             Value::Blob(blob) => {
                 let text = String::from_utf8_lossy(blob.as_slice());
                 Self::from(text)

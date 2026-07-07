@@ -2062,7 +2062,10 @@ mod tests {
                     .unwrap();
                 assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
                 assert_integer(stmt.row_value(0).unwrap(), 1);
-                assert_eq!(stmt.row_value(1).unwrap().to_text(), Some("secret_data"));
+                assert_eq!(
+                    stmt.row_value(1).unwrap().to_text(),
+                    Some("secret_data".as_bytes())
+                );
             }
 
             // 4. Verify opening with wrong key fails

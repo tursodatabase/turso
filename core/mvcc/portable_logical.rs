@@ -82,7 +82,7 @@ pub(crate) fn portable_schema_row_from_record(record_bytes: &[u8]) -> Result<Por
 
     let text = |value: ValueRef<'_>, field: &str| -> Result<String> {
         match value {
-            ValueRef::Text(text) => Ok(text.as_str().to_string()),
+            ValueRef::Text(text) => Ok(text.to_str_lossy().into_owned()),
             other => Err(LimboError::Corrupt(format!(
                 "{field} must be text in sqlite_schema record, got {other:?}"
             ))),

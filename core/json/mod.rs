@@ -130,12 +130,13 @@ fn is_jsonb_blob(slice: &[u8]) -> bool {
 pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Result<Jsonb> {
     match val {
         ValueRef::Text(text) => {
+            let text_str = text.to_str_lossy();
             let res = if text.subtype == TextSubtype::Json || matches!(strict, Conv::Strict) {
-                Jsonb::from_str_with_mode(&text, strict)
+                Jsonb::from_str_with_mode(&text_str, strict)
             } else {
                 // Handle as a string literal otherwise
                 // Escape backslashes first, then double quotes
-                let mut str = text.replace('\\', "\\\\").replace('"', "\\\"");
+                let mut str = text_str.replace('\\', "\\\\").replace('"', "\\\"");
                 // Quote the string to make it a JSON string
                 str.insert(0, '"');
                 str.push('"');
@@ -687,20 +688,28 @@ fn json_path_from_db_value<'a>(
     let path = path.as_value_ref();
     let json_path = if strict {
         match path {
-            ValueRef::Text(t) => json_path(t.as_str())?,
+            ValueRef::Text(t) => {
+                let Ok(s) = std::str::from_utf8(t.value) else {
+                    crate::bail_constraint_error!("JSON path error near: {:?}", path.to_string());
+                };
+                json_path(s)?
+            }
             ValueRef::Null => return Ok(None),
             _ => crate::bail_constraint_error!("JSON path error near: {:?}", path.to_string()),
         }
     } else {
         match path {
             ValueRef::Text(t) => {
-                if t.as_str().starts_with("$") {
-                    json_path(t.as_str())?
+                let Ok(s) = std::str::from_utf8(t.value) else {
+                    crate::bail_constraint_error!("JSON path error near: {:?}", path.to_string());
+                };
+                if s.starts_with("$") {
+                    json_path(s)?
                 } else {
                     JsonPath {
                         elements: vec![
                             PathElement::Root(),
-                            PathElement::Key(Cow::Borrowed(t.as_str()), false),
+                            PathElement::Key(Cow::Borrowed(s), false),
                         ],
                     }
                 }
@@ -727,7 +736,7 @@ fn json_path_from_db_value<'a>(
 
 pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
     match json.as_value_ref() {
-        ValueRef::Text(t) => match Jsonb::from_str(t.as_str()) {
+        ValueRef::Text(t) => match Jsonb::from_str(&t.to_str_lossy()) {
             Ok(_) => Ok(Value::from_i64(0)),
             Err(JsonError::Message { location, .. }) => {
                 if let Some(loc) = location {
@@ -871,7 +880,7 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
             let mut escaped_value = String::with_capacity(t.value.len() + 4);
             escaped_value.push('"');
 
-            for c in t.as_str().chars() {
+            for c in t.to_str_lossy().chars() {
                 match c {
                     '"' | '\\' | '\n' | '\r' | '\t' | '\u{0008}' | '\u{000c}' => {
                         escaped_value.push('\\');
@@ -908,7 +917,7 @@ mod tests {
         let input = Value::build_text("{ key: 'value' }");
         let result = get_json(&input, None).unwrap();
         if let Value::Text(result_str) = result {
-            assert!(result_str.as_str().contains("\"key\":\"value\""));
+            assert!(result_str.to_str_lossy().contains("\"key\":\"value\""));
             assert_eq!(result_str.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text");
@@ -920,7 +929,7 @@ mod tests {
         let input = Value::build_text("{ \"key\": Infinity }");
         let result = get_json(&input, None).unwrap();
         if let Value::Text(result_str) = result {
-            assert!(result_str.as_str().contains("{\"key\":9e999}"));
+            assert!(result_str.to_str_lossy().contains("{\"key\":9e999}"));
             assert_eq!(result_str.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text");
@@ -932,7 +941,7 @@ mod tests {
         let input = Value::build_text("{ \"key\": -Infinity }");
         let result = get_json(&input, None).unwrap();
         if let Value::Text(result_str) = result {
-            assert!(result_str.as_str().contains("{\"key\":-9e999}"));
+            assert!(result_str.to_str_lossy().contains("{\"key\":-9e999}"));
             assert_eq!(result_str.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text");
@@ -944,7 +953,7 @@ mod tests {
         let input = Value::build_text("{ \"key\": NaN }");
         let result = get_json(&input, None).unwrap();
         if let Value::Text(result_str) = result {
-            assert!(result_str.as_str().contains("{\"key\":null}"));
+            assert!(result_str.to_str_lossy().contains("{\"key\":null}"));
             assert_eq!(result_str.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text");
@@ -966,7 +975,7 @@ mod tests {
         let input = Value::build_text("{\"key\":\"value\"}");
         let result = get_json(&input, None).unwrap();
         if let Value::Text(result_str) = result {
-            assert!(result_str.as_str().contains("\"key\":\"value\""));
+            assert!(result_str.to_str_lossy().contains("\"key\":\"value\""));
             assert_eq!(result_str.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text");
@@ -989,7 +998,7 @@ mod tests {
         let input = Value::Blob(binary_json);
         let result = get_json(&input, None).unwrap();
         if let Value::Text(result_str) = result {
-            assert!(result_str.as_str().contains(r#"{"hey":"yo"}"#));
+            assert!(result_str.to_str_lossy().contains(r#"{"hey":"yo"}"#));
             assert_eq!(result_str.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text");
@@ -1027,7 +1036,7 @@ mod tests {
 
         let result = json_array(&input).unwrap();
         if let Value::Text(res) = result {
-            assert_eq!(res.as_str(), "[\"value1\",\"value2\",1,1.1]");
+            assert_eq!(res.to_str_lossy(), "[\"value1\",\"value2\",1,1.1]");
             assert_eq!(res.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text");
@@ -1042,7 +1051,7 @@ mod tests {
 
         let result = json_array(&input).unwrap();
         if let Value::Text(res) = result {
-            assert_eq!(res.as_str(), "[1,9.0e+999,-9.0e+999]");
+            assert_eq!(res.to_str_lossy(), "[1,9.0e+999,-9.0e+999]");
             assert_eq!(res.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text");
@@ -1057,7 +1066,7 @@ mod tests {
 
         let result = json_object(&input).unwrap();
         if let Value::Text(res) = result {
-            assert_eq!(res.as_str(), r#"{"k":9.0e+999}"#);
+            assert_eq!(res.to_str_lossy(), r#"{"k":9.0e+999}"#);
             assert_eq!(res.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text");
@@ -1072,7 +1081,7 @@ mod tests {
 
         let result = json_object(&input).unwrap();
         if let Value::Text(res) = result {
-            assert_eq!(res.as_str(), r#"{"k":-9.0e+999}"#);
+            assert_eq!(res.to_str_lossy(), r#"{"k":-9.0e+999}"#);
             assert_eq!(res.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text");
@@ -1084,7 +1093,7 @@ mod tests {
         let infinity = Value::from_f64(f64::INFINITY);
         let result = get_json(&infinity, None).unwrap();
         if let Value::Text(res) = result {
-            assert_eq!(res.as_str(), "9e999");
+            assert_eq!(res.to_str_lossy(), "9e999");
             assert_eq!(res.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text, got {result:?}");
@@ -1096,7 +1105,7 @@ mod tests {
         let neg_infinity = Value::from_f64(f64::NEG_INFINITY);
         let result = get_json(&neg_infinity, None).unwrap();
         if let Value::Text(res) = result {
-            assert_eq!(res.as_str(), "-9e999");
+            assert_eq!(res.to_str_lossy(), "-9e999");
             assert_eq!(res.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text, got {result:?}");
@@ -1109,7 +1118,7 @@ mod tests {
 
         let result = json_array(input).unwrap();
         if let Value::Text(res) = result {
-            assert_eq!(res.as_str(), "[]");
+            assert_eq!(res.to_str_lossy(), "[]");
             assert_eq!(res.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text");
@@ -1347,7 +1356,7 @@ mod tests {
         let Value::Text(json_text) = result else {
             panic!("Expected Value::Text");
         };
-        assert_eq!(json_text.as_str(), r#"{"key":"value"}"#);
+        assert_eq!(json_text.to_str_lossy(), r#"{"key":"value"}"#);
     }
 
     #[test]
@@ -1381,7 +1390,7 @@ mod tests {
             panic!("Expected Value::Text");
         };
         assert_eq!(
-            json_text.as_str(),
+            json_text.to_str_lossy(),
             r#"{"text_key":"text_value","json_key":{"json":"value","number":1},"integer_key":1,"float_key":1.1,"null_key":null}"#
         );
     }
@@ -1396,7 +1405,7 @@ mod tests {
         let Value::Text(json_text) = result else {
             panic!("Expected Value::Text");
         };
-        assert_eq!(json_text.as_str(), r#"{"key":{"json":"value"}}"#);
+        assert_eq!(json_text.to_str_lossy(), r#"{"key":{"json":"value"}}"#);
     }
 
     #[test]
@@ -1409,7 +1418,10 @@ mod tests {
         let Value::Text(json_text) = result else {
             panic!("Expected Value::Text");
         };
-        assert_eq!(json_text.as_str(), r#"{"key":"{\"json\":\"value\"}"}"#);
+        assert_eq!(
+            json_text.to_str_lossy(),
+            r#"{"key":"{\"json\":\"value\"}"}"#
+        );
     }
 
     #[test]
@@ -1427,7 +1439,10 @@ mod tests {
         let Value::Text(json_text) = result else {
             panic!("Expected Value::Text");
         };
-        assert_eq!(json_text.as_str(), r#"{"parent_key":{"key":"value"}}"#);
+        assert_eq!(
+            json_text.to_str_lossy(),
+            r#"{"parent_key":{"key":"value"}}"#
+        );
     }
 
     #[test]
@@ -1440,7 +1455,7 @@ mod tests {
         let Value::Text(json_text) = result else {
             panic!("Expected Value::Text");
         };
-        assert_eq!(json_text.as_str(), r#"{"key":"value","key":"value"}"#);
+        assert_eq!(json_text.to_str_lossy(), r#"{"key":"value","key":"value"}"#);
     }
 
     #[test]
@@ -1451,7 +1466,7 @@ mod tests {
         let Value::Text(json_text) = result else {
             panic!("Expected Value::Text");
         };
-        assert_eq!(json_text.as_str(), r#"{}"#);
+        assert_eq!(json_text.to_str_lossy(), r#"{}"#);
     }
 
     #[test]
@@ -1499,7 +1514,7 @@ mod tests {
                 panic!("Expected Value::Text");
             };
             assert_eq!(
-                json_text.as_str(),
+                json_text.to_str_lossy(),
                 expected,
                 "Failed for key={key:?}, value={value:?}"
             );
@@ -1647,7 +1662,10 @@ mod tests {
 
         assert!(result.is_ok());
 
-        assert_eq!(result.unwrap().to_text().unwrap(), r#"{"field":"value"}"#);
+        assert_eq!(
+            result.unwrap().to_text_str_lossy().unwrap(),
+            r#"{"field":"value"}"#
+        );
     }
 
     #[test]
@@ -1665,7 +1683,7 @@ mod tests {
         assert!(result.is_ok());
 
         assert_eq!(
-            result.unwrap().to_text().unwrap(),
+            result.unwrap().to_text_str_lossy().unwrap(),
             r#"{"field":"new_value"}"#
         );
     }
@@ -1685,7 +1703,7 @@ mod tests {
         assert!(result.is_ok());
 
         assert_eq!(
-            result.unwrap().to_text().unwrap(),
+            result.unwrap().to_text_str_lossy().unwrap(),
             r#"{"object":{"doesnt":{"exist":"value"}}}"#
         );
     }
@@ -1704,7 +1722,7 @@ mod tests {
 
         assert!(result.is_ok());
 
-        assert_eq!(result.unwrap().to_text().unwrap(), r#"["value"]"#);
+        assert_eq!(result.unwrap().to_text_str_lossy().unwrap(), r#"["value"]"#);
     }
 
     #[test]
@@ -1722,7 +1740,7 @@ mod tests {
         assert!(result.is_ok());
 
         assert_eq!(
-            result.unwrap().to_text().unwrap(),
+            result.unwrap().to_text_str_lossy().unwrap(),
             r#"{"some_array":[123]}"#
         );
     }
@@ -1741,7 +1759,7 @@ mod tests {
 
         assert!(result.is_ok());
 
-        assert_eq!(result.unwrap().to_text().unwrap(), "[123,456]");
+        assert_eq!(result.unwrap().to_text_str_lossy().unwrap(), "[123,456]");
     }
 
     #[test]
@@ -1758,7 +1776,7 @@ mod tests {
 
         assert!(result.is_ok());
 
-        assert_eq!(result.unwrap().to_text().unwrap(), "[123]");
+        assert_eq!(result.unwrap().to_text_str_lossy().unwrap(), "[123]");
     }
 
     #[test]
@@ -1775,7 +1793,7 @@ mod tests {
 
         assert!(result.is_ok());
 
-        assert_eq!(result.unwrap().to_text().unwrap(), "[456]");
+        assert_eq!(result.unwrap().to_text_str_lossy().unwrap(), "[456]");
     }
 
     #[test]
@@ -1788,7 +1806,7 @@ mod tests {
 
         assert!(result.is_ok());
 
-        assert_eq!(result.unwrap().to_text().unwrap(), "{}");
+        assert_eq!(result.unwrap().to_text_str_lossy().unwrap(), "{}");
     }
 
     #[test]
@@ -1807,7 +1825,7 @@ mod tests {
 
         assert!(result.is_ok());
 
-        assert_eq!(result.unwrap().to_text().unwrap(), "[456,789]");
+        assert_eq!(result.unwrap().to_text_str_lossy().unwrap(), "[456,789]");
     }
 
     #[test]
@@ -1825,7 +1843,7 @@ mod tests {
         assert!(result.is_ok());
 
         assert_eq!(
-            result.unwrap().to_text().unwrap(),
+            result.unwrap().to_text_str_lossy().unwrap(),
             r#"{"object":[{"field":123}]}"#
         );
     }
@@ -1844,7 +1862,10 @@ mod tests {
 
         assert!(result.is_ok());
 
-        assert_eq!(result.unwrap().to_text().unwrap(), r#"{"object":[[123]]}"#);
+        assert_eq!(
+            result.unwrap().to_text_str_lossy().unwrap(),
+            r#"{"object":[[123]]}"#
+        );
     }
 
     #[test]
@@ -1863,7 +1884,10 @@ mod tests {
 
         assert!(result.is_ok());
 
-        assert_eq!(result.unwrap().to_text().unwrap(), r#"{"field":"value"}"#,);
+        assert_eq!(
+            result.unwrap().to_text_str_lossy().unwrap(),
+            r#"{"field":"value"}"#,
+        );
     }
 
     #[test]

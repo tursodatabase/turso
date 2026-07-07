@@ -292,7 +292,7 @@ fn assert_integrity_check_ok(whopper: &mut MultiprocessWhopper, worker_idx: usiz
     );
     assert_eq!(
         rows[0][0].to_text(),
-        Some("ok"),
+        Some(b"ok".as_slice()),
         "integrity_check should report ok"
     );
 }

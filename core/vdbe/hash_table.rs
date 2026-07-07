@@ -44,9 +44,9 @@ const BLOB_HASH: u8 = 4;
 #[inline]
 /// Hash text case-insensitively without allocation (ASCII-only for SQLite NOCASE).
 /// SQLite's NOCASE collation only considers ASCII case, so to_ascii_lowercase() is correct.
-fn hash_text_nocase(hasher: &mut impl Hasher, text: &str) {
+fn hash_text_nocase(hasher: &mut impl Hasher, text: &[u8]) {
     hasher.write_usize(text.len());
-    for byte in text.bytes() {
+    for &byte in text {
         hasher.write_u8(byte.to_ascii_lowercase());
         if byte == 0 {
             break;
@@ -87,17 +87,18 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
                 hasher.write_u8(TEXT_HASH);
                 match *collation {
                     CollationSeq::NoCase => {
-                        hash_text_nocase(&mut hasher, text.as_str());
+                        hash_text_nocase(&mut hasher, text.as_bytes());
                     }
                     CollationSeq::Rtrim => {
-                        let trimmed = text.as_str().trim_end_matches(' ');
-                        hasher.write(trimmed.as_bytes());
+                        let bytes = text.as_bytes();
+                        let end = bytes.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1);
+                        hasher.write(&bytes[..end]);
                     }
                     CollationSeq::Binary | CollationSeq::Unset => {
                         hasher.write(text.as_bytes());
                     }
                     CollationSeq::Locale(_) => {
-                        hasher.write(&collation.hash_key(text.as_str()));
+                        hasher.write(&collation.hash_key(&text.to_str_lossy()));
                     }
                     CollationSeq::Custom(_) => {
                         unreachable!(
@@ -162,7 +163,7 @@ fn values_equal(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
         (ValueRef::Blob(b1), ValueRef::Blob(b2)) => b1 == b2,
         (ValueRef::Text(t1), ValueRef::Text(t2)) => {
             // Use collation for text comparison
-            collation.compare_strings(t1.as_str(), t2.as_str()) == Ordering::Equal
+            collation.compare_strings(t1.as_bytes(), t2.as_bytes()) == Ordering::Equal
         }
         _ => false,
     }
@@ -281,7 +282,7 @@ impl HashEntry {
         let value_size = |v: &Value| match v {
             Value::Null => 1,
             Value::Numeric(_) => 8,
-            Value::Text(t) => t.as_str().len(),
+            Value::Text(t) => t.as_bytes().len(),
             Value::Blob(b) => b.len(),
         };
         let key_size: usize = key_values.iter().map(value_size).sum();
@@ -296,7 +297,7 @@ impl HashEntry {
             Value::Null => 0,
             Value::Numeric(_) => 8,
             Value::Text(t) => {
-                let len = t.as_str().len();
+                let len = t.as_bytes().len();
                 varint_len(len as u64) + len
             }
             Value::Blob(b) => varint_len(b.len() as u64) + b.len(),
@@ -362,7 +363,7 @@ impl HashEntry {
             Value::Text(t) => {
                 buf[offset] = TEXT_HASH;
                 offset += 1;
-                let bytes = t.as_str().as_bytes();
+                let bytes = t.as_bytes();
                 offset += write_varint(&mut buf[offset..], bytes.len() as u64);
                 buf[offset..offset + bytes.len()].copy_from_slice(bytes);
                 offset += bytes.len();
@@ -419,7 +420,7 @@ impl HashEntry {
             }
             Value::Text(t) => {
                 buf.push(TEXT_HASH);
-                let bytes = t.as_str().as_bytes();
+                let bytes = t.as_bytes();
                 let len = write_varint(varint_buf, bytes.len() as u64);
                 buf.extend_from_slice(&varint_buf[..len]);
                 buf.extend_from_slice(bytes);
@@ -524,13 +525,9 @@ impl HashEntry {
                         "HashEntry: buffer too small for text".to_string(),
                     ));
                 }
-                // SAFETY: We serialized this data ourselves, so it should be valid UTF-8.
-                // Skipping validation here for performance in the spill/reload path.
-                // Doing checked utf8 construction here is a massive performance hit.
                 let bytes = buf[offset..offset + str_len as usize].to_vec();
-                let s = unsafe { String::from_utf8_unchecked(bytes) };
                 offset += str_len as usize;
-                Value::Text(s.into())
+                Value::Text(crate::types::Text::from_bytes(bytes))
             }
             BLOB_HASH => {
                 let (blob_len, varint_len) = read_varint(&buf[offset..])?;
@@ -3303,21 +3300,21 @@ mod hashtests {
         let keys1 = vec![
             ValueRef::from_i64(42),
             ValueRef::Text(crate::types::TextRef::new(
-                "hello",
+                b"hello",
                 crate::types::TextSubtype::Text,
             )),
         ];
         let keys2 = vec![
             ValueRef::from_i64(42),
             ValueRef::Text(crate::types::TextRef::new(
-                "hello",
+                b"hello",
                 crate::types::TextSubtype::Text,
             )),
         ];
         let keys3 = vec![
             ValueRef::from_i64(43),
             ValueRef::Text(crate::types::TextRef::new(
-                "hello",
+                b"hello",
                 crate::types::TextSubtype::Text,
             )),
         ];
@@ -3361,14 +3358,14 @@ mod hashtests {
         let key2 = vec![
             ValueRef::from_i64(42),
             ValueRef::Text(crate::types::TextRef::new(
-                "hello",
+                b"hello",
                 crate::types::TextSubtype::Text,
             )),
         ];
         let key3 = vec![
             ValueRef::from_i64(43),
             ValueRef::Text(crate::types::TextRef::new(
-                "hello",
+                b"hello",
                 crate::types::TextSubtype::Text,
             )),
         ];
@@ -3521,7 +3518,7 @@ mod hashtests {
                 (Value::Numeric(Numeric::Integer(i1)), Value::Numeric(Numeric::Integer(i2))) => {
                     assert_eq!(i1, i2)
                 }
-                (Value::Text(t1), Value::Text(t2)) => assert_eq!(t1.as_str(), t2.as_str()),
+                (Value::Text(t1), Value::Text(t2)) => assert_eq!(t1.as_bytes(), t2.as_bytes()),
                 (Value::Numeric(Numeric::Float(f1)), Value::Numeric(Numeric::Float(f2))) => {
                     assert!((f64::from(*f1) - f64::from(*f2)).abs() < 1e-10)
                 }
@@ -3825,8 +3822,8 @@ mod hashtests {
     fn test_hash_function_respects_collation_nocase() {
         use crate::types::{TextRef, TextSubtype};
 
-        let keys1 = vec![ValueRef::Text(TextRef::new("Hello", TextSubtype::Text))];
-        let keys2 = vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))];
+        let keys1 = vec![ValueRef::Text(TextRef::new(b"Hello", TextSubtype::Text))];
+        let keys2 = vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))];
 
         // Under BINARY: hashes must differ
         let bin_coll = vec![CollationSeq::Binary];
@@ -3847,8 +3844,14 @@ mod hashtests {
 
         // SQLite NOCASE only affects ASCII a-z/A-Z.
         // Non-ASCII characters like ü should hash identically regardless of case conversion.
-        let keys1 = vec![ValueRef::Text(TextRef::new("über", TextSubtype::Text))];
-        let keys2 = vec![ValueRef::Text(TextRef::new("ÜBER", TextSubtype::Text))];
+        let keys1 = vec![ValueRef::Text(TextRef::new(
+            "über".as_bytes(),
+            TextSubtype::Text,
+        ))];
+        let keys2 = vec![ValueRef::Text(TextRef::new(
+            "ÜBER".as_bytes(),
+            TextSubtype::Text,
+        ))];
 
         // Under NOCASE: ASCII portion differs (b/B), so hashes should differ
         // (because SQLite NOCASE doesn't handle Unicode case folding)
@@ -3870,9 +3873,9 @@ mod hashtests {
         use crate::types::{TextRef, TextSubtype};
 
         let nocase_coll = vec![CollationSeq::NoCase];
-        let keys1 = vec![ValueRef::Text(TextRef::new("A\0x", TextSubtype::Text))];
-        let keys2 = vec![ValueRef::Text(TextRef::new("a\0y", TextSubtype::Text))];
-        let keys3 = vec![ValueRef::Text(TextRef::new("a\0yz", TextSubtype::Text))];
+        let keys1 = vec![ValueRef::Text(TextRef::new(b"A\0x", TextSubtype::Text))];
+        let keys2 = vec![ValueRef::Text(TextRef::new(b"a\0y", TextSubtype::Text))];
+        let keys3 = vec![ValueRef::Text(TextRef::new(b"a\0yz", TextSubtype::Text))];
 
         assert!(values_equal(keys1[0], keys2[0], CollationSeq::NoCase));
         assert_eq!(
@@ -3891,8 +3894,8 @@ mod hashtests {
     fn test_values_equal_with_collations() {
         use crate::types::{TextRef, TextSubtype};
 
-        let h1 = ValueRef::Text(TextRef::new("Hello  ", TextSubtype::Text));
-        let h2 = ValueRef::Text(TextRef::new("hello", TextSubtype::Text));
+        let h1 = ValueRef::Text(TextRef::new(b"Hello  ", TextSubtype::Text));
+        let h2 = ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text));
 
         // Binary: case / trailing spaces matter
         assert!(!values_equal(h1, h2, CollationSeq::Binary));
@@ -3901,7 +3904,7 @@ mod hashtests {
         assert!(!values_equal(h1, h2, CollationSeq::NoCase));
 
         // RTRIM: ignore trailing spaces, but case is still significant
-        let h3 = ValueRef::Text(TextRef::new("Hello", TextSubtype::Text));
+        let h3 = ValueRef::Text(TextRef::new(b"Hello", TextSubtype::Text));
         assert!(values_equal(h1, h3, CollationSeq::Rtrim));
     }
 
@@ -3910,7 +3913,7 @@ mod hashtests {
         use crate::types::{TextRef, TextSubtype};
 
         let key1 = vec![Value::Text("Hello".into())];
-        let key2 = vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))];
+        let key2 = vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))];
 
         // Binary: not equal
         assert!(!keys_equal(&key1, &key2, &[CollationSeq::Binary]));
@@ -4737,7 +4740,7 @@ mod hashtests {
                     let expected_payload = format!("payload_{}", build_entry.rowid);
                     assert_eq!(build_entry.payload_values.len(), 1);
                     match &build_entry.payload_values[0] {
-                        Value::Text(t) => assert_eq!(t.as_str(), expected_payload.as_str()),
+                        Value::Text(t) => assert_eq!(t.as_bytes(), expected_payload.as_bytes()),
                         other => panic!("expected text payload, got {other:?}"),
                     }
                     match_count += 1;

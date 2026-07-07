@@ -673,7 +673,7 @@ fn convert_to_args(
                 value: f64::from(value),
             },
             Value::Text(value) => server_proto::Value::Text {
-                value: value.as_str().to_string(),
+                value: value.to_str_lossy().into_owned(),
             },
             Value::Blob(value) => server_proto::Value::Blob {
                 value: value.into(),
