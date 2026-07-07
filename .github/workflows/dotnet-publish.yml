@@ -70,25 +70,25 @@ jobs:
           artifact-name: native-android-x86
           target: i686-linux-android
 
-        - os: macos-latest
+        - os: macos-26-intel
           make-target: build-rust-macos64
           artifact-name: native-osx-x64
           target: x86_64-apple-darwin
           macos-deployment-target: "10.13"
 
-        - os: macos-latest
+        - os: macos-26
           make-target: build-rust-macosarm64
           target: aarch64-apple-darwin
           artifact-name: native-osx-arm64
           macos-deployment-target: "11.0"
 
-        - os: macos-latest
+        - os: macos-26
           make-target: build-rust-iosarm64
           target: aarch64-apple-ios
           artifact-name: native-ios-arm64
           ios-deployment-target: "12.2"
 
-        - os: macos-latest
+        - os: macos-26
           make-target: build-rust-iossimulatorarm64
           target: aarch64-apple-ios-sim
           artifact-name: native-iossimulator-arm64
@@ -133,7 +133,7 @@ jobs:
 
       - name: Set up Android SDK
         if: contains(matrix.target, 'linux-android')
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install Android NDK
         if: contains(matrix.target, 'linux-android')
@@ -190,6 +190,48 @@ jobs:
         if: ${{ !contains(matrix.target, 'unknown-linux-gnu') && !contains(matrix.target, 'apple-darwin') && !contains(matrix.target, 'apple-ios') }}
         run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official'
 
+      - name: Collect Windows static native dependencies
+        if: contains(matrix.target, 'pc-windows-msvc')
+        shell: pwsh
+        run: |
+          $target = '${{ matrix.target }}'
+          $arch = if ($target -eq 'x86_64-pc-windows-msvc') { 'x86_64' } else { 'aarch64' }
+          $crate = "windows_${arch}_msvc"
+          $destination = "rs_compiled\$target\release-official\native-static-libs"
+          New-Item -ItemType Directory -Force $destination | Out-Null
+
+          $versions = @()
+          $currentPackage = $null
+          foreach ($line in Get-Content "..\..\Cargo.lock") {
+            if ($line -match '^name = "([^"]+)"') {
+              $currentPackage = $Matches[1]
+            } elseif ($currentPackage -eq $crate -and $line -match '^version = "([^"]+)"') {
+              $versions += $Matches[1]
+              $currentPackage = $null
+            }
+          }
+          if (-not $versions) {
+            throw "No $crate package entries were found in Cargo.lock"
+          }
+
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+          $registrySrc = Join-Path $cargoHome "registry\src"
+          foreach ($version in ($versions | Sort-Object -Unique)) {
+            Get-ChildItem -Path $registrySrc -Recurse -Directory -Filter "$crate-$version" |
+              ForEach-Object {
+                Copy-Item -Path (Join-Path $_.FullName "lib\windows*.lib") -Destination $destination -Force
+              }
+          }
+
+          $collected = Get-ChildItem -Path $destination -Filter "windows*.lib"
+          if (-not $collected) {
+            throw "No windows*.lib static dependencies were collected for $target"
+          }
+          $now = [DateTime]::UtcNow
+          foreach ($library in $collected) {
+            $library.LastWriteTimeUtc = $now
+          }
+
       # Code-sign the Windows native DLL with Azure Artifact Signing (formerly
       # Trusted Signing). Runs only for the windows-msvc targets, only when
       # the AZURE_SIGNING_ENABLED repo variable is set to "true", and only on
@@ -224,14 +266,17 @@ jobs:
           name: ${{ matrix.artifact-name }}
           path: |
             ${{ env.working-directory }}/rs_compiled/**/turso_sdk_kit.dll
+            ${{ env.working-directory }}/rs_compiled/**/turso_sdk_kit.lib
+            ${{ env.working-directory }}/rs_compiled/**/windows*.lib
             ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.so
             ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.dylib
+            ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.a
 
           retention-days: 1
 
   package-ios-framework:
     needs: build-natives
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 15
     permissions:
       contents: read
@@ -295,7 +340,7 @@ jobs:
         run:
           make pack
 
-      - name: Verify mobile NuGet native assets
+      - name: Verify NuGet native assets
         shell: bash
         run: |
           set -euo pipefail
@@ -322,6 +367,59 @@ jobs:
             fi
           done
 
+          max_package_bytes=250000000
+          package_size=$(stat -c%s "$package")
+          if [ "$package_size" -gt "$max_package_bytes" ]; then
+            echo "$package is $package_size bytes, which exceeds nuget.org's $max_package_bytes byte package limit"
+            exit 1
+          fi
+
+          if grep -Eq '^buildTransitive/native/(win|linux|osx)-' package-files.txt; then
+            echo "Static NativeAOT assets must stay in RID-specific companion packages, not $package"
+            exit 1
+          fi
+
+          static_packages=(
+            "win-x64:turso_sdk_kit.lib"
+            "win-arm64:turso_sdk_kit.lib"
+            "linux-x64:libturso_sdk_kit.a"
+            "linux-arm64:libturso_sdk_kit.a"
+            "osx-x64:libturso_sdk_kit.a"
+            "osx-arm64:libturso_sdk_kit.a"
+          )
+          for static_package_spec in "${static_packages[@]}"; do
+            rid="${static_package_spec%%:*}"
+            library="${static_package_spec#*:}"
+            static_package=$(find src/Turso.Data.Sqlite.NativeAot/bin/Release -maxdepth 1 -name "Turso.Data.Sqlite.NativeAot.${rid}.*.nupkg" | head -n 1)
+            if [ -z "$static_package" ]; then
+              echo "No Turso.Data.Sqlite.NativeAot.${rid} NuGet package found"
+              exit 1
+            fi
+
+            static_package_size=$(stat -c%s "$static_package")
+            if [ "$static_package_size" -gt "$max_package_bytes" ]; then
+              echo "$static_package is $static_package_size bytes, which exceeds nuget.org's $max_package_bytes byte package limit"
+              exit 1
+            fi
+
+            unzip -Z1 "$static_package" > "package-files-${rid}.txt"
+            required_static_files=(
+              "buildTransitive/Turso.Data.Sqlite.NativeAot.${rid}.targets"
+              "buildTransitive/native/${rid}/${library}"
+            )
+            for required_static_file in "${required_static_files[@]}"; do
+              if ! grep -Fxq "$required_static_file" "package-files-${rid}.txt"; then
+                echo "Missing $required_static_file in $static_package"
+                exit 1
+              fi
+            done
+
+            if [[ "$rid" == win-* ]] && ! grep -Eq "^buildTransitive/native/${rid}/windows.*\\.lib$" "package-files-${rid}.txt"; then
+              echo "Missing Windows static dependency libraries in $static_package"
+              exit 1
+            fi
+          done
+
       - name: Collect NuGet packages
         run: |
           set -euo pipefail
@@ -330,6 +428,7 @@ jobs:
           mkdir -p artifacts/nuget-packages
           files=(
             src/Turso.Data.Sqlite/bin/Release/Turso.Data.Sqlite.*.nupkg
+            src/Turso.Data.Sqlite.NativeAot/bin/Release/Turso.Data.Sqlite.NativeAot.*.nupkg
           )
           if [ ${#files[@]} -eq 0 ]; then
             echo "No NuGet packages found to upload"
@@ -344,8 +443,150 @@ jobs:
           path: ${{ env.working-directory }}/artifacts/nuget-packages/*.nupkg
           retention-days: 7
 
+  validate-nativeaot-static-package:
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: windows-2025
+          rid: win-x64
+          executable: NativeAotSample.exe
+
+        - os: windows-11-arm
+          rid: win-arm64
+          executable: NativeAotSample.exe
+
+        - os: ubuntu-latest
+          rid: linux-x64
+          executable: NativeAotSample
+
+        - os: ubuntu-24.04-arm
+          rid: linux-arm64
+          executable: NativeAotSample
+
+        - os: macos-26-intel
+          rid: osx-x64
+          executable: NativeAotSample
+
+        - os: macos-26
+          rid: osx-arm64
+          executable: NativeAotSample
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install dotnet SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Verify NativeAOT prerequisites
+        if: startsWith(matrix.rid, 'linux-')
+        run: |
+          set -euo pipefail
+          clang --version
+          if [ ! -f /usr/include/zlib.h ]; then
+            echo "zlib1g-dev is required for Linux NativeAOT validation"
+            exit 1
+          fi
+
+      - name: Download NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          name: nuget-packages
+          path: ${{ env.working-directory }}/artifacts/nuget-packages
+
+      - name: Publish NativeAOT sample from package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sampleProject = "${{ env.working-directory }}/samples/NativeAot/NativeAotSample.csproj"
+          $packageSource = Resolve-Path "${{ env.working-directory }}/artifacts/nuget-packages"
+          $publishDirectory = "${{ runner.temp }}/nativeaot-${{ matrix.rid }}"
+          $nugetConfig = "${{ env.working-directory }}/samples/NativeAot/NuGet.config"
+
+          @"
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="$packageSource" />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+            <packageSourceMapping>
+              <packageSource key="local">
+                <package pattern="Turso.Data.Sqlite" />
+                <package pattern="Turso.Data.Sqlite.NativeAot.*" />
+              </packageSource>
+              <packageSource key="nuget.org">
+                <package pattern="*" />
+              </packageSource>
+            </packageSourceMapping>
+          </configuration>
+          "@ | Set-Content -Path $nugetConfig -Encoding UTF8
+
+          dotnet restore $sampleProject -r "${{ matrix.rid }}" --configfile $nugetConfig
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          dotnet publish $sampleProject -c Release -r "${{ matrix.rid }}" -o $publishDirectory --no-restore
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          $sidecars = Get-ChildItem -Path $publishDirectory -Recurse -File |
+            Where-Object { $_.Name -in @("turso_sdk_kit.dll", "libturso_sdk_kit.so", "libturso_sdk_kit.dylib") }
+          if ($sidecars) {
+            throw "NativeAOT publish produced a Turso dynamic sidecar: $($sidecars.FullName -join ', ')"
+          }
+
+          $executable = Join-Path $publishDirectory "${{ matrix.executable }}"
+          if (-not (Test-Path $executable)) {
+            throw "NativeAOT executable was not produced at $executable"
+          }
+
+          if (-not $IsWindows) {
+            chmod +x $executable
+          }
+
+          $output = & $executable
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if ($output -notcontains "Rows: 3") {
+            throw "Unexpected NativeAOT sample output: $output"
+          }
+
+  publish-to-nuget:
+    needs: validate-nativeaot-static-package
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.skip-publish && !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Install dotnet SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Download NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          name: nuget-packages
+          path: nuget-packages
+
       # https://learn.microsoft.com/en-us/nuget/nuget-org/publish-a-package
       - name: Publish to nuget
-        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.skip-publish && !inputs.dry-run }}
         run: |
-          dotnet nuget push ${{ env.working-directory }}/src/Turso.Data.Sqlite/bin/Release/Turso.Data.Sqlite.*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+          for package in nuget-packages/*.nupkg; do
+            dotnet nuget push "$package" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+          done
