@@ -4805,6 +4805,36 @@ impl Pager {
                     clear_page_cache,
                     max_frame,
                 } => {
+                    {
+                        let state = self.checkpoint_state.read();
+                        let result = state.result.as_ref().expect("result should be set");
+                        turso_assert!(
+                            result.wal_checkpoint_backfilled > 0,
+                            "PublishBackfill phase requires frames backfilled during checkpoint",
+                            {
+                                "publish_backfill": max_frame,
+                                "wal_max_frame": result.wal_max_frame,
+                                "wal_total_backfilled": result.wal_total_backfilled,
+                                "wal_checkpoint_backfilled": result.wal_checkpoint_backfilled
+                            }
+                        );
+                        turso_assert!(
+                            max_frame == result.wal_total_backfilled,
+                            "PublishBackfill target must match checkpoint result",
+                            {
+                                "publish_backfill": max_frame,
+                                "wal_total_backfilled": result.wal_total_backfilled
+                            }
+                        );
+                        turso_assert!(
+                            result.wal_total_backfilled <= result.wal_max_frame,
+                            "checkpoint result cannot backfill beyond WAL max frame",
+                            {
+                                "wal_total_backfilled": result.wal_total_backfilled,
+                                "wal_max_frame": result.wal_max_frame
+                            }
+                        );
+                    }
                     wal.publish_backfill(max_frame);
                     let next_phase = {
                         let state = self.checkpoint_state.read();

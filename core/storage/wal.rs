@@ -3101,6 +3101,15 @@ impl WalFile {
         // Snapshot the shared WAL state. We haven't taken a read lock yet, so we need
         // to validate these values later.
         let shared_snapshot = self.load_coordination_snapshot();
+        turso_assert!(
+            shared_snapshot.nbackfills <= shared_snapshot.max_frame,
+            "WAL snapshot cannot have backfills beyond max frame",
+            {
+                "nbackfills": shared_snapshot.nbackfills,
+                "max_frame": shared_snapshot.max_frame,
+                "checkpoint_seq": shared_snapshot.checkpoint_seq
+            }
+        );
         tracing::debug!(
             "try_begin_read_tx: shared_max={}, nbackfills={}, last_checksum={:?}, checkpoint_seq={:?}, transaction_count={}",
             shared_snapshot.max_frame,
@@ -3830,6 +3839,16 @@ impl Wal for WalFile {
     }
 
     fn publish_backfill(&self, max_frame: u64) {
+        let snapshot = self.load_coordination_snapshot();
+        turso_assert!(
+            (snapshot.nbackfills..=snapshot.max_frame).contains(&max_frame),
+            "published backfill must stay within the current WAL generation",
+            {
+                "publish_backfill": max_frame,
+                "current_nbackfills": snapshot.nbackfills,
+                "current_max_frame": snapshot.max_frame
+            }
+        );
         self.coordination.publish_backfill(max_frame);
     }
 
@@ -4835,7 +4854,14 @@ impl WalFile {
                     // during 'read_page', so the caller will use the result to determine if:
                     // a. the max frame == num wal frames (everything backfilled)
                     // b. the max frame > 0 (we have something to truncate)
-                    if checkpoint_result.should_truncate() {
+                    if checkpoint_result.should_truncate()
+                        || checkpoint_result.wal_checkpoint_backfilled > 0
+                    {
+                        // Backfilled frames are not globally durable until
+                        // the pager syncs the DB file and publishes
+                        // nbackfills. Keep the checkpoint guard through that
+                        // tail so another writer cannot restart the WAL
+                        // generation underneath a pending publish.
                         checkpoint_result.maybe_guard = self.checkpoint_guard.write().take();
                     } else {
                         let _ = self.checkpoint_guard.write().take();
