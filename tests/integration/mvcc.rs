@@ -1385,3 +1385,59 @@ fn test_mvcc_update_btree_only_row_after_truncate_checkpoint(
 
     Ok(())
 }
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/7578
+///
+/// An active MVCC index scan must not return a row deleted after the scan
+/// cursor was opened. Pre-fix, the scan panicked with
+/// `index finger diverged from query_btree_version_is_valid` in
+/// core/mvcc/cursor.rs (or, without the assertion, returned the deleted row).
+#[turso_macros::test]
+fn test_mvcc_index_scan_does_not_return_row_deleted_mid_scan(
+    db: TempDatabase,
+) -> anyhow::Result<()> {
+    fn next_pair(stmt: &mut turso_core::Statement) -> anyhow::Result<Option<(i64, i64)>> {
+        loop {
+            match stmt.step()? {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    return Ok(Some((row.get::<i64>(0)?, row.get::<i64>(1)?)));
+                }
+                StepResult::Done => return Ok(None),
+                StepResult::IO => {
+                    stmt._io().step()?;
+                }
+                StepResult::Yield => {}
+                other => anyhow::bail!("unexpected step result: {other:?}"),
+            }
+        }
+    }
+
+    let conn = db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")?;
+    conn.execute("CREATE INDEX t_x ON t(x)")?;
+
+    conn.execute("INSERT INTO t VALUES (1,1),(2,3),(3,4),(4,5)")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    // Creates an MVCC-only index entry (x=2,id=2) shadowing the durable
+    // old index entry (x=3,id=2).
+    conn.execute("UPDATE t SET x=2 WHERE id=2")?;
+
+    let mut scan = conn.prepare("SELECT id,x FROM t INDEXED BY t_x WHERE x>=1 ORDER BY x")?;
+
+    assert_eq!(next_pair(&mut scan)?, Some((1, 1)));
+    assert_eq!(next_pair(&mut scan)?, Some((2, 2)));
+
+    // Delete a later durable index key while the original index cursor is still open.
+    conn.execute("DELETE FROM t WHERE id=4")?;
+
+    let mut rest = Vec::new();
+    while let Some(row) = next_pair(&mut scan)? {
+        rest.push(row);
+    }
+
+    assert_eq!(rest, vec![(3, 4)]);
+    Ok(())
+}
