@@ -27,6 +27,7 @@ use turso_parser::ast::{ColumnConstraint, SortOrder};
 mod allocation_fault;
 pub mod chaotic_btree;
 pub mod chaotic_elle;
+pub mod chaotic_mvcc;
 pub mod elle;
 pub mod error_handling;
 mod io;

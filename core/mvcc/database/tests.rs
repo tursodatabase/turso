@@ -2778,6 +2778,236 @@ fn test_running_integrity_check_reprepares_after_checkpoint_root_publish() {
     );
 }
 
+/// `PRAGMA integrity_check` scans the durable B-tree image directly, so it must
+/// serialize behind an active MVCC checkpoint while that checkpoint owns the
+/// stop-the-world checkpoint lock.
+#[test]
+fn test_integrity_check_is_busy_during_running_mvcc_checkpoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+
+    for id in 1..=64 {
+        writer
+            .execute(format!("INSERT INTO t VALUES ({id}, 'v{id}')"))
+            .unwrap();
+    }
+
+    let integrity_conn = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let injector =
+        FixedYieldInjector::new([CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point()]);
+    writer.set_yield_injector(Some(injector.clone()));
+    let mut checkpointing_insert = writer
+        .prepare("INSERT INTO t VALUES (1000, 'late')")
+        .unwrap();
+
+    for _ in 0..10_000 {
+        match checkpointing_insert.step().unwrap() {
+            crate::StepResult::Yield if injector.is_empty() => break,
+            crate::StepResult::IO | crate::StepResult::Yield => {}
+            crate::StepResult::Done => {
+                panic!("INSERT completed before checkpoint durable-boundary yield fired")
+            }
+            other => panic!("unexpected INSERT step result before yield: {other:?}"),
+        }
+    }
+    assert!(
+        injector.is_empty(),
+        "expected INSERT auto-checkpoint to yield while holding the checkpoint lock"
+    );
+
+    let mut integrity_check = integrity_conn.prepare("PRAGMA integrity_check").unwrap();
+    match integrity_check.step() {
+        Err(LimboError::Busy) | Ok(crate::StepResult::Busy) => {}
+        other => panic!("integrity_check should be busy during MVCC checkpoint, got {other:?}"),
+    }
+    drop(integrity_check);
+
+    loop {
+        match checkpointing_insert.step().unwrap() {
+            crate::StepResult::Done => break,
+            crate::StepResult::IO => writer.db.io.step().unwrap(),
+            crate::StepResult::Yield => {}
+            other => panic!("unexpected INSERT step result while finishing checkpoint: {other:?}"),
+        }
+    }
+    writer.set_yield_injector(None);
+
+    let rows = get_rows(&writer, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_integrity_check_runs_during_uncommitted_mvcc_schema_writer() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT)")
+        .unwrap();
+    for id in 1..=105 {
+        setup
+            .execute(format!("INSERT INTO t(payload) VALUES ('p{id}')"))
+            .unwrap();
+    }
+    setup
+        .execute("CREATE INDEX idx_t_payload ON t(payload)")
+        .unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN IMMEDIATE").unwrap();
+    writer.execute("DROP INDEX idx_t_payload").unwrap();
+    writer
+        .execute("INSERT INTO t(payload) VALUES ('late')")
+        .unwrap();
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    writer.execute("COMMIT").unwrap();
+    let rows = get_rows(&observer, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_running_integrity_check_allows_mvcc_index_dml_writer() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    for id in 1..=32 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({id}, 'p{id}')"))
+            .unwrap();
+    }
+    setup
+        .execute("CREATE INDEX idx_t_payload ON t(payload)")
+        .unwrap();
+
+    let integrity_conn = db.connect();
+    let writer = db.connect();
+    let injector = FixedYieldInjector::new([CursorYieldPoint::NextStart.point()]);
+    integrity_conn.set_yield_injector(Some(injector.clone()));
+    let mut integrity_check = integrity_conn.prepare("PRAGMA integrity_check").unwrap();
+
+    for _ in 0..10_000 {
+        match integrity_check.step().unwrap() {
+            crate::StepResult::Yield if injector.is_empty() => break,
+            crate::StepResult::IO => integrity_conn.db.io.step().unwrap(),
+            crate::StepResult::Yield | crate::StepResult::Row => {}
+            crate::StepResult::Done => {
+                panic!("integrity_check completed before cursor yield fired")
+            }
+            crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                panic!("unexpected integrity_check step result while waiting for yield")
+            }
+        }
+    }
+    assert!(
+        injector.is_empty(),
+        "expected integrity_check to yield while holding its MVCC guard"
+    );
+
+    writer
+        .execute("INSERT INTO t VALUES (1000, 'late')")
+        .unwrap();
+
+    integrity_conn.set_yield_injector(None);
+    let rows = integrity_check.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_running_integrity_check_blocks_mvcc_schema_publish() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    for id in 1..=32 {
+        setup
+            .execute(format!("INSERT INTO t VALUES ({id}, 'p{id}')"))
+            .unwrap();
+    }
+    setup
+        .execute("CREATE INDEX idx_t_payload ON t(payload)")
+        .unwrap();
+
+    let integrity_conn = db.connect();
+    let writer = db.connect();
+    let injector = FixedYieldInjector::new([CursorYieldPoint::NextStart.point()]);
+    integrity_conn.set_yield_injector(Some(injector.clone()));
+    let mut integrity_check = integrity_conn.prepare("PRAGMA integrity_check").unwrap();
+
+    for _ in 0..10_000 {
+        match integrity_check.step().unwrap() {
+            crate::StepResult::Yield if injector.is_empty() => break,
+            crate::StepResult::IO => integrity_conn.db.io.step().unwrap(),
+            crate::StepResult::Yield | crate::StepResult::Row => {}
+            crate::StepResult::Done => {
+                panic!("integrity_check completed before cursor yield fired")
+            }
+            crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                panic!("unexpected integrity_check step result while waiting for yield")
+            }
+        }
+    }
+    assert!(
+        injector.is_empty(),
+        "expected integrity_check to yield while holding its MVCC guard"
+    );
+
+    let mut create_index = writer
+        .prepare("CREATE INDEX idx_t_payload_2 ON t(payload)")
+        .unwrap();
+    for _ in 0..10_000 {
+        match create_index.step() {
+            Ok(crate::StepResult::Done) => {
+                panic!("schema-changing writer completed while integrity_check held")
+            }
+            Ok(crate::StepResult::IO) | Ok(crate::StepResult::Yield) => {
+                writer.db.io.step().unwrap();
+            }
+            Ok(crate::StepResult::Row) => {
+                panic!("CREATE INDEX should not produce rows")
+            }
+            Ok(crate::StepResult::Busy) | Err(LimboError::Busy) => break,
+            Ok(crate::StepResult::Interrupt) => {
+                panic!("CREATE INDEX should not be interrupted")
+            }
+            Err(err) => panic!("unexpected CREATE INDEX error: {err:?}"),
+        }
+    }
+
+    integrity_conn.set_yield_injector(None);
+    let rows = integrity_check.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    create_index.run_collect_rows().unwrap();
+
+    writer
+        .execute("INSERT INTO t VALUES (1000, 'late')")
+        .unwrap();
+    let rows = get_rows(&writer, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
 /// Steps:
 /// 1. Create an MVCC database with a table and unique index whose roots are still logical MVCC roots.
 /// 2. Open a deferred transaction on a second connection without starting its MVCC read transaction yet.
