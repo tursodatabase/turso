@@ -51,6 +51,9 @@ use crate::{
 pub struct RollbackTo {
     pub frame: u64,
     pub checksum: (u32, u32),
+    /// WAL checkpoint sequence (generation) the position was captured in;
+    /// asserted against the current generation on rollback.
+    pub checkpoint_seq: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3890,6 +3893,37 @@ impl Wal for WalFile {
     fn rollback(&self, rollback_to: Option<RollbackTo>) {
         let is_savepoint = rollback_to.is_some();
         let snapshot = self.load_coordination_snapshot();
+        if let Some(r) = &rollback_to {
+            // Savepoint WAL positions are captured under the write lock
+            // (still held here), and no restart can happen while it is
+            // held: the writer-upgrade restart runs before positions
+            // materialize, and checkpoint RESTART/TRUNCATE takes the writer
+            // lock. A cross-generation position is therefore impossible.
+            // (SQLite must clamp instead — sqlite3WalSavepointUndo resets
+            // aWalData on an nCkpt mismatch — because it captures at
+            // write-tx begin but restarts later, at the first frame write.)
+            turso_assert!(
+                r.checkpoint_seq == snapshot.checkpoint_seq,
+                "savepoint WAL position must be from the current WAL generation",
+                {
+                    "savepoint_checkpoint_seq": r.checkpoint_seq,
+                    "authority_checkpoint_seq": snapshot.checkpoint_seq,
+                    "savepoint_frame": r.frame,
+                    "authority_max_frame": snapshot.max_frame
+                }
+            );
+            // The committed mark cannot advance while the write lock is
+            // held, so the position can never be behind it.
+            turso_assert!(
+                r.frame >= snapshot.max_frame,
+                "savepoint WAL position must not be behind the committed high-water mark",
+                { "savepoint_frame": r.frame, "authority_max_frame": snapshot.max_frame }
+            );
+        }
+        // Restored verbatim, like SQLite's aWalData. A checksum captured at
+        // frame 0 of a freshly restarted generation predates the new WAL
+        // header; that is harmless because prepare_frames seeds frame 1
+        // from the header itself.
         let max_frame = rollback_to
             .as_ref()
             .map(|r| r.frame)
@@ -3898,17 +3932,14 @@ impl Wal for WalFile {
             .as_ref()
             .map(|r| r.checksum)
             .unwrap_or(snapshot.last_checksum);
-        // Savepoints can be opened on a stale connection-local WAL snapshot.
-        // Do not let that rollback remove frame-cache mappings for frames that
-        // are already globally committed by another connection.
-        let cache_rollback_frame = if is_savepoint {
-            max_frame.max(snapshot.max_frame)
-        } else {
-            max_frame
-        };
-        self.coordination.rollback_cache(cache_rollback_frame);
+        self.coordination.rollback_cache(max_frame);
         *self.last_checksum.write() = last_checksum;
         self.max_frame.store(max_frame, Ordering::Release);
+        if max_frame == snapshot.max_frame {
+            // Everything past the committed mark was discarded, so no
+            // unpublished frames remain.
+            self.has_unpublished_frames.store(false, Ordering::Release);
+        }
         if !is_savepoint {
             self.reset_internal_states();
         }
@@ -6711,7 +6742,7 @@ pub mod test {
     }
 
     #[test]
-    fn test_savepoint_rollback_preserves_committed_frame_cache() {
+    fn test_savepoint_rollback_discards_frame_cache_past_rollback_point() {
         let (shared, wal) = make_test_wal();
         let coordination = make_test_coordination(&shared);
         set_shared_snapshot(
@@ -6725,20 +6756,40 @@ pub mod test {
             },
         );
 
+        // The connection spilled uncommitted frames past the committed
+        // high-water mark (25); a savepoint opened mid-transaction recorded
+        // frame 27.
         coordination.cache_frame(7, 10);
-        coordination.cache_frame(9, 20);
-        coordination.cache_frame(11, 30);
+        coordination.cache_frame(9, 26);
+        coordination.cache_frame(11, 28);
         wal.max_frame.store(30, Ordering::Release);
+        wal.has_unpublished_frames.store(true, Ordering::Release);
 
         wal.rollback(Some(RollbackTo {
-            frame: 10,
+            frame: 27,
             checksum: (13, 21),
+            checkpoint_seq: 1,
         }));
 
+        // Mappings at or below the rollback point survive, later ones are
+        // discarded; frames 26..=27 remain as unpublished spills.
         assert_eq!(coordination.find_frame(7, 0, 30, None), Some(10));
-        assert_eq!(coordination.find_frame(9, 0, 30, None), Some(20));
+        assert_eq!(coordination.find_frame(9, 0, 30, None), Some(26));
         assert_eq!(coordination.find_frame(11, 0, 30, None), None);
-        assert_eq!(wal.get_max_frame(), 10);
+        assert_eq!(wal.get_max_frame(), 27);
+        assert_eq!(*wal.last_checksum.read(), (13, 21));
+        assert!(wal.has_unpublished_frames.load(Ordering::Acquire));
+
+        // Rolling back to the committed high-water mark discards every
+        // spill, so no unpublished frames remain.
+        wal.rollback(Some(RollbackTo {
+            frame: 25,
+            checksum: (55, 89),
+            checkpoint_seq: 1,
+        }));
+        assert_eq!(coordination.find_frame(9, 0, 30, None), None);
+        assert_eq!(wal.get_max_frame(), 25);
+        assert!(!wal.has_unpublished_frames.load(Ordering::Acquire));
     }
 
     #[test]
