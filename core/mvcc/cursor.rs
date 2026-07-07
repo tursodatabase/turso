@@ -1479,17 +1479,28 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         //    INCORRECTLY finds the index cursor exhausted and breaks out of the delete loop, even
         //    though there are still b-tree-resident rows to delete.
         if self.state.is_none() && op.eq_only() {
-            if let CursorPosition::Loaded { row_id, .. } = &self.current_pos {
+            if let CursorPosition::Loaded {
+                row_id, in_btree, ..
+            } = &self.current_pos
+            {
                 if current_pos_matches_seek_key(&row_id.row_id, &seek_key, &self.mv_cursor_type)? {
                     let maybe_index_id = match &self.mv_cursor_type {
                         MvccCursorType::Index(_) => Some(self.table_id),
                         MvccCursorType::Table => None,
                     };
-                    if self
+                    // The current row is visible either because MvStore has a visible version
+                    // for it, or because it is a b-tree-resident row that is not shadowed by
+                    // any MVCC version. Both cases must short-circuit: otherwise a b-tree-only
+                    // row would fall through to the full eq-only seek below, which resets the
+                    // iterators and marks the MVCC peek exhausted, skipping MvStore-resident
+                    // rows that the enclosing range scan (see the comment above) still needs
+                    // to visit.
+                    let visible = self
                         .db
                         .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
                         .is_some()
-                    {
+                        || (*in_btree && self.query_btree_version_is_valid(&row_id.row_id));
+                    if visible {
                         // We need to clear the null flag for the table cursor before seeking,
                         // because it might have been set to false by an unmatched left-join row
                         // during the previous iteration on the outer loop.
