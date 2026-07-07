@@ -11,7 +11,7 @@ use crate::mvcc::database::{
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
-use crate::schema::Index;
+use crate::schema::{Index, Schema};
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
@@ -1269,14 +1269,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // pager commit succeeds because the committed root pages are then visible
         // through WAL even if the later WAL checkpoint/log truncation is busy.
         let mut schema_ref = self.connection.db.schema.lock();
-        let schema = Arc::make_mut(&mut *schema_ref);
+        let schema = Schema::try_make_mut(&mut schema_ref)?;
         for (name, table) in schema.tables.iter_mut() {
+            #[cfg(not(feature = "conn_raw_api"))]
+            let _ = name;
             let table = Arc::get_mut(table).expect("this should be the only reference");
             let Some(btree_table) = table.btree_mut() else {
                 continue;
             };
             let btree_table = Arc::make_mut(btree_table);
             if btree_table.root_page < 0 {
+                #[cfg(feature = "conn_raw_api")]
                 let old_root_page = btree_table.root_page;
                 let table_id = MVTableId::from(btree_table.root_page);
                 let entry = self

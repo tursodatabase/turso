@@ -507,6 +507,7 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::TryClone;
     use crate::io::MemoryIO;
     use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
     use crate::Database;
@@ -553,7 +554,7 @@ mod tests {
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
 
-        let mut schema = db.schema.lock().as_ref().clone();
+        let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
         let seq_root_page = schema
             .get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
             .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
@@ -597,7 +598,7 @@ mod tests {
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
 
-        let mut schema = db.schema.lock().as_ref().clone();
+        let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
         schema.tables.remove(SQLITE_SEQUENCE_TABLE_NAME);
 
         let pager = conn.pager.load().clone();

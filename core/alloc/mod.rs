@@ -14,7 +14,7 @@ mod collections;
 
 pub use allocation_site::{
     current_allocation_site, enter_allocation_site, AllocationSite, AllocationSiteGuard,
-    MvStoreAllocationSite, MvccCheckpointAllocationSite,
+    MvStoreAllocationSite, MvccCheckpointAllocationSite, SchemaAllocationSite,
 };
 /// The underlying allocator trait: `allocator_api2::alloc::Allocator` on
 /// stable, `std::alloc::Allocator` on `--cfg nightly` builds.
@@ -31,7 +31,7 @@ pub use collections::{
     TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt, TursoVecInExt,
 };
 
-pub const ALLOC_ERR_MSG: &str = "TODO: fallible allocations";
+pub const ALLOC_ERR_MSG: &str = "fallible allocations";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TryReserveError;

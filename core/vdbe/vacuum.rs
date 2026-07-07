@@ -545,7 +545,7 @@ pub(crate) fn vacuum_target_build_step(
                         for (name, td) in &config.source_custom_types {
                             target_schema.type_registry.insert(name.clone(), td.clone());
                         }
-                    });
+                    })?;
                 }
 
                 // Auto-vacuum must be installed before MVCC bootstrap creates
@@ -1554,12 +1554,7 @@ struct VacuumCommittedImageMeta {
 }
 
 fn replace_shared_schema_after_vacuum(source_db: &Database, schema: Arc<Schema>) {
-    source_db
-        .with_schema_mut(|current| {
-            *current = schema.as_ref().clone();
-            Ok(())
-        })
-        .expect("VACUUM shared schema replacement should be infallible");
+    source_db.replace_schema(schema);
 }
 
 fn install_mvcc_state_after_vacuum_commit(
@@ -2731,7 +2726,7 @@ mod tests {
 
         conn.with_schema_mut(|schema| {
             schema.schema_version = 1;
-        });
+        })?;
         db.with_schema_mut(|schema| {
             schema.schema_version = 1;
             Ok(())
@@ -2767,7 +2762,7 @@ mod tests {
 
         conn.with_schema_mut(|schema| {
             schema.schema_version = 1;
-        });
+        })?;
         db.with_schema_mut(|schema| {
             schema.schema_version = 1;
             Ok(())

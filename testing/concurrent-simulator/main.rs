@@ -31,7 +31,7 @@ struct Args {
     #[command(subcommand)]
     subcommand: Option<SubCmd>,
 
-    /// Simulation mode (fast, chaos, btree-rebalance/btree-rekey, recovery-heavy, ragnarök/ragnarok)
+    /// Simulation mode (fast, chaos, schema-clone-faults, btree-rebalance/btree-rekey, recovery-heavy, ragnarök/ragnarok)
     #[arg(long, default_value = "fast")]
     mode: String,
     /// Max connections
@@ -163,6 +163,7 @@ fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     let base_max_steps = match args.mode.as_str() {
         "fast" => 100_000,
         "chaos" => 10_000_000,
+        "schema-clone-faults" => 10_000,
         "btree-rebalance" | "btree-rekey" => 500_000,
         "ragnarök" | "ragnarok" => 1_000_000,
         mode => return Err(anyhow::anyhow!("Unknown mode: {}", mode)),
@@ -401,6 +402,19 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
         )];
 
         (w, p, vec![], chaotic)
+    } else if is_schema_clone_fault_mode(&args.mode) {
+        let w: Vec<(u32, Box<dyn Workload>)> = vec![
+            (45, Box::new(SchemaChurnWorkload)),
+            (20, Box::new(TruncateCheckpointWorkload)),
+            (20, Box::new(BeginWorkload)),
+            (10, Box::new(CommitWorkload)),
+            (15, Box::new(RollbackWorkload)),
+            (10, Box::new(IntegrityCheckWorkload)),
+            (8, Box::new(SelectWorkload)),
+        ];
+        let p: Vec<Box<dyn Property>> = vec![Box::new(IntegrityCheckProperty)];
+
+        (w, p, vec![], vec![])
     } else {
         let w: Vec<(u32, Box<dyn Workload>)> = vec![
             (10, Box::new(IntegrityCheckWorkload)),
@@ -448,6 +462,7 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
     let mut base_opts = match args.mode.as_str() {
         "fast" => WhopperOpts::fast(),
         "chaos" => WhopperOpts::chaos(),
+        "schema-clone-faults" => WhopperOpts::schema_clone_faults(),
         "btree-rebalance" | "btree-rekey" => WhopperOpts::btree_rebalance(),
         "ragnarök" | "ragnarok" => WhopperOpts::ragnarok(),
         "recovery-heavy" => WhopperOpts::recovery_heavy(),
@@ -468,7 +483,7 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_seed(seed)
         .with_max_connections(args.max_connections)
         .with_keep_files(args.keep)
-        .with_enable_mvcc(args.enable_mvcc)
+        .with_enable_mvcc(args.enable_mvcc || is_schema_clone_fault_mode(&args.mode))
         .with_enable_encryption(args.enable_encryption)
         .with_elle_tables(elle_tables)
         .with_workloads(workloads)
@@ -481,6 +496,10 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
 
 fn is_btree_rebalance_mode(mode: &str) -> bool {
     matches!(mode, "btree-rebalance" | "btree-rekey")
+}
+
+fn is_schema_clone_fault_mode(mode: &str) -> bool {
+    mode == "schema-clone-faults"
 }
 
 fn format_stats(stats: &turso_whopper::Stats, elle_mode: bool) -> String {

@@ -393,6 +393,21 @@ impl WhopperOpts {
         }
     }
 
+    pub fn schema_clone_faults() -> Self {
+        Self {
+            max_steps: 200_000,
+            schema_bias: SchemaBias {
+                non_rowid_pk_prob: 0.4,
+                unique_col_prob: 0.8,
+                num_tables_range: 6..=12,
+                num_columns_range: 8..=16,
+                initial_rows_per_table: 2,
+            },
+            reopen_probability: 0.05,
+            ..Default::default()
+        }
+    }
+
     pub fn btree_rebalance() -> Self {
         Self {
             max_steps: 500_000,
