@@ -2621,11 +2621,6 @@ pub struct WalFile {
 
     io_ctx: RwLock<IOContext>,
 
-    /// Set when WAL frames are appended without a commit marker (`db_size == 0`),
-    /// meaning the coordination backend's max_frame is behind our connection-local
-    /// max_frame. Cleared once `finish_append_frames_commit` publishes the state.
-    has_unpublished_frames: AtomicBool,
-
     /// The WAL file is dirty: frames were appended that no successful fsync
     /// has covered yet. Set whenever a frame is recorded via
     /// `complete_append_frame`, cleared when a WAL fsync completes
@@ -3777,8 +3772,6 @@ impl Wal for WalFile {
         self.complete_append_frame(page_id, frame_id, checksums);
         if db_size > 0 {
             self.finish_append_frames_commit()?;
-        } else {
-            self.has_unpublished_frames.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -3935,11 +3928,6 @@ impl Wal for WalFile {
         self.coordination.rollback_cache(max_frame);
         *self.last_checksum.write() = last_checksum;
         self.max_frame.store(max_frame, Ordering::Release);
-        if max_frame == snapshot.max_frame {
-            // Everything past the committed mark was discarded, so no
-            // unpublished frames remain.
-            self.has_unpublished_frames.store(false, Ordering::Release);
-        }
         if !is_savepoint {
             self.reset_internal_states();
         }
@@ -4042,7 +4030,6 @@ impl Wal for WalFile {
             last_checksum,
             transaction_count,
         });
-        self.has_unpublished_frames.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -4187,39 +4174,37 @@ impl Wal for WalFile {
             None => {
                 let snapshot = self.load_coordination_snapshot();
                 let local_state = self.connection_state();
-                let seed = if snapshot != local_state.snapshot {
-                    let has_unpublished_frames =
-                        self.has_unpublished_frames.load(Ordering::Acquire);
-                    if has_unpublished_frames {
-                        // Spill/raw frames have no commit marker yet
-                        // (db_size == 0), so the coordination backend's
-                        // max_frame is behind our local max_frame. Chain from
-                        // local state so we don't overwrite those frames.
-                        (
-                            local_state.snapshot.last_checksum,
-                            local_state.snapshot.max_frame + 1,
-                        )
-                    } else {
-                        // The current generation was restarted/truncated back to
-                        // frame 0 or another process changed the durable WAL
-                        // state. Re-seed this connection from the authoritative
-                        // snapshot so replacement generations after
-                        // RESTART/TRUNCATE do not append using stale local state.
-                        self.install_connection_state(local_state.with_snapshot(snapshot));
-                        (snapshot.last_checksum, snapshot.max_frame + 1)
-                    }
-                } else {
+                if local_state.snapshot.max_frame > snapshot.max_frame {
+                    // The local position is past the committed high-water
+                    // mark exactly when this connection has spilled or
+                    // raw-inserted frames that carry no commit marker yet.
+                    // Chain from local state so we don't overwrite them.
                     (
                         local_state.snapshot.last_checksum,
                         local_state.snapshot.max_frame + 1,
                     )
-                };
-                turso_assert!(
-                    seed.1 > snapshot.max_frame,
-                    "WAL append position must be past the committed high-water mark, otherwise committed frames get overwritten",
-                    { "next_frame_id": seed.1, "authority_max_frame": snapshot.max_frame }
-                );
-                seed
+                } else {
+                    // Inside a write transaction the local position can
+                    // never be behind the committed mark: the upgrade
+                    // requires a fresh snapshot, and the mark cannot advance
+                    // while the write lock is held.
+                    turso_assert!(
+                        local_state.snapshot.max_frame == snapshot.max_frame,
+                        "connection WAL position must not be behind the committed high-water mark",
+                        {
+                            "local_max_frame": local_state.snapshot.max_frame,
+                            "authority_max_frame": snapshot.max_frame
+                        }
+                    );
+                    // At the mark the authority owns the seed; re-sync local
+                    // state if it drifted (e.g. a savepoint rollback
+                    // reinstalled a pre-header checksum at frame 0, or a
+                    // concurrent checkpoint advanced nbackfills).
+                    if snapshot != local_state.snapshot {
+                        self.install_connection_state(local_state.with_snapshot(snapshot));
+                    }
+                    (snapshot.last_checksum, snapshot.max_frame + 1)
+                }
             }
         };
 
@@ -4422,12 +4407,6 @@ impl Wal for WalFile {
 
         self.io.drain_completions(std::slice::from_ref(&c))?;
 
-        if !page_frame_and_checksum.is_empty() {
-            // Spill frames are durable but unpublished until the commit marker
-            // advances the shared WAL snapshot.
-            self.has_unpublished_frames.store(true, Ordering::Release);
-        }
-
         for (page, fid, csum) in &page_frame_and_checksum {
             self.complete_append_frame(page.get().id as u64, *fid, *csum);
         }
@@ -4525,7 +4504,6 @@ impl WalFile {
             last_checksum: RwLock::new(last_checksum),
             checkpoint_guard: RwLock::new(None),
             io_ctx: RwLock::new(IOContext::default()),
-            has_unpublished_frames: AtomicBool::new(false),
             dirty: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -6763,7 +6741,6 @@ pub mod test {
         coordination.cache_frame(9, 26);
         coordination.cache_frame(11, 28);
         wal.max_frame.store(30, Ordering::Release);
-        wal.has_unpublished_frames.store(true, Ordering::Release);
 
         wal.rollback(Some(RollbackTo {
             frame: 27,
@@ -6778,10 +6755,9 @@ pub mod test {
         assert_eq!(coordination.find_frame(11, 0, 30, None), None);
         assert_eq!(wal.get_max_frame(), 27);
         assert_eq!(*wal.last_checksum.read(), (13, 21));
-        assert!(wal.has_unpublished_frames.load(Ordering::Acquire));
 
         // Rolling back to the committed high-water mark discards every
-        // spill, so no unpublished frames remain.
+        // spill.
         wal.rollback(Some(RollbackTo {
             frame: 25,
             checksum: (55, 89),
@@ -6789,7 +6765,6 @@ pub mod test {
         }));
         assert_eq!(coordination.find_frame(9, 0, 30, None), None);
         assert_eq!(wal.get_max_frame(), 25);
-        assert!(!wal.has_unpublished_frames.load(Ordering::Acquire));
     }
 
     #[test]
