@@ -26,7 +26,7 @@ jobs:
             echo "has_command=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: PThorpe92/fossier@55e7dd21039e405fbad7c43ac6f3bef42e308836
+      - uses: PThorpe92/fossier@d2ef6eacab5f50cb799703da21e50c860f2fc739
         if: github.event_name != 'issue_comment' || steps.check-cmd.outputs.has_command == 'true'
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
