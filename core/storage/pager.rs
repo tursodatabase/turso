@@ -3294,6 +3294,15 @@ impl Pager {
         {
             let mut page_cache = self.page_cache.write();
             let page_key = PageCacheKey::new(page_idx);
+            // A concurrent fiber may have inserted a page for this key after
+            // the caller checked the cache but before we acquired the write
+            // lock (e.g. after a spill-yield re-entry via `pending_reads`).
+            // Upsert our caller-owned PageRef so the cache and the caller
+            // share the same canonical Arc rather than duplicating keys.
+            if page_cache.peek(&page_key, false).is_some() {
+                page_cache.upsert_page(page_key, page)?;
+                return Ok(IOResult::Done(()));
+            }
             match page_cache.insert(page_key, page.clone()) {
                 Ok(_) => return Ok(IOResult::Done(())),
                 Err(CacheError::KeyExists) => {
@@ -3310,10 +3319,16 @@ impl Pager {
             IOResult::Done(true) => {
                 let mut page_cache = self.page_cache.write();
                 let page_key = PageCacheKey::new(page_idx);
-                match page_cache.insert(page_key, page) {
-                    Ok(_) => Ok(IOResult::Done(())),
-                    Err(CacheError::KeyExists) => Ok(IOResult::Done(())),
-                    Err(e) => Err(e.into()),
+                // After spilling, check whether a concurrent fiber inserted a
+                // page for this key while we were yielding.  Upsert our
+                // caller-owned PageRef so the cache stays canonical and the
+                // caller's modifications are not silently lost.
+                if page_cache.peek(&page_key, false).is_some() {
+                    page_cache.upsert_page(page_key, page)?;
+                    Ok(IOResult::Done(()))
+                } else {
+                    page_cache.insert(page_key, page)?;
+                    Ok(IOResult::Done(()))
                 }
             }
             IOResult::Done(false) => Err(LimboError::Busy),
@@ -6289,6 +6304,73 @@ mod ptrmap_tests {
             }
             IOResult::IO(_) => panic!("loaded cache hit must not yield"),
         }
+    }
+
+    /// A concurrent fiber may insert a page for key X into the cache after
+    /// the first fiber's `read_page` has created its own PageRef (stored in
+    /// `pending_reads`) but before `cache_insert` acquires the page-cache
+    /// write lock.  `cache_insert` must upsert rather than panic on the
+    /// different-Arc assertion in `_insert`, so that the cache stays
+    /// canonical and the caller's modifications are not silently lost.
+    #[test]
+    fn cache_insert_handles_concurrently_inserted_key() {
+        let target: i64 = 9999;
+        let pager = test_pager_setup(4096, 10);
+
+        // Simulate the state after `read_page_no_cache` + `pending_reads`
+        // insertion but before `cache_insert` acquired the cache lock.
+        let our_page = Arc::new(Page::new(target));
+        our_page.set_loaded();
+
+        // Concurrent fiber inserted a *different* PageRef for the same key.
+        let concurrent_page = Arc::new(Page::new(target));
+        concurrent_page.set_loaded();
+        pager
+            .page_cache
+            .write()
+            .insert(PageCacheKey::new(target as usize), concurrent_page)
+            .unwrap();
+
+        // Pre-populate pending_reads so read_page uses the re-entry path
+        // which calls `cache_insert` directly (with no cache check).
+        let stub_completion = Completion::new_yield();
+        pager.pending_reads.write().insert(
+            target,
+            PendingRead {
+                page: our_page.clone(),
+                disk_read: Some(stub_completion),
+            },
+        );
+
+        // This would previously panic at the `Arc::ptr_eq` assertion in
+        // `_insert` because the cache already has a different PageRef for
+        // the same key.  Now `cache_insert` must upsert gracefully.
+        let res = pager.read_page(target).unwrap();
+        let (page, c) = match res {
+            IOResult::Done(v) => v,
+            IOResult::IO(_) => panic!("should not yield"),
+        };
+
+        // The cache should now hold *our* PageRef (the upsert replaced it).
+        assert!(
+            Arc::ptr_eq(&page, &our_page),
+            "cache_insert must return the caller's PageRef"
+        );
+        assert!(
+            c.is_some(),
+            "should return the disk-read completion from pending_reads"
+        );
+        assert!(
+            pager.pending_reads.read().get(&target).is_none(),
+            "pending_reads entry must be cleared once read_page returns Done"
+        );
+
+        // Verify the cache indeed has our page.
+        let cached = pager.cache_get(target as usize).unwrap().unwrap();
+        assert!(
+            Arc::ptr_eq(&cached, &our_page),
+            "cache must hold the caller's PageRef after upsert"
+        );
     }
 }
 
