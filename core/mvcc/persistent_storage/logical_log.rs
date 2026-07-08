@@ -988,21 +988,7 @@ impl LogicalLog {
         self.write_header(header)
     }
 
-    /// Truncate the log to reclaim checkpointed frames. `checkpointed_through_ts` is the
-    /// boundary the checkpoint published; frames with `commit_ts <= boundary` are durable
-    /// in the WAL/DB. If any frame ABOVE the boundary remains (a commit during the off-lock
-    /// prepare phase, not in this pass's backfill), truncating would destroy it, so we skip
-    /// entirely — recovery replays only `commit_ts > boundary` and a later checkpoint
-    /// reclaims the space. Race-free: appends and truncation share the write lock.
-    pub fn truncate(&mut self, checkpointed_through_ts: u64) -> Result<Completion> {
-        if self.max_appended_commit_ts > checkpointed_through_ts {
-            // Uncheckpointed frames above the boundary remain — keep the whole log
-            // (offset/salt/CRC unchanged) so they survive to the next pass. No-op.
-            let c = Completion::new_trunc(|_| {});
-            c.complete(0);
-            return Ok(c);
-        }
-
+    fn truncate_to_zero(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.
         let mut header = self.current_or_new_header()?;
@@ -1020,6 +1006,19 @@ impl LogicalLog {
         self.offset = 0;
         self.max_appended_commit_ts = 0;
         Ok(c)
+    }
+
+    /// Truncate the logical log if we've checkpointed up to the last available commit timestamp in logical log.
+    /// If there is another commit after the checkpoint, we don't truncate the log.
+    pub fn truncate(&mut self, checkpointed_through_ts: u64) -> Result<Completion> {
+        if self.max_appended_commit_ts > checkpointed_through_ts {
+            // Uncheckpointed frames above the boundary remain — keep the whole log
+            // (offset/salt/CRC unchanged) so they survive to the next pass. No-op.
+            let c = Completion::new_trunc(|_| {});
+            c.complete(0);
+            return Ok(c);
+        }
+        self.truncate_to_zero()
     }
 
     /// Reset the log to a header-only file and return one completion for the

@@ -1453,9 +1453,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         self.mvstore.storage.sync(self.pager.get_sync_type())
     }
 
-    /// Truncate the logical log file. Pass the published boundary so the log
-    /// preserves frames for commits that landed (above this boundary) during the
-    /// off-lock prepare phase.
     fn truncate_logical_log(&self) -> Result<Completion> {
         self.mvstore.storage.truncate(self.durable_txid_max_new)
     }
@@ -1936,12 +1933,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     self.owns_checkpoint_in_progress = true;
                 }
 
-                // Clamp below any in-flight (Preparing) commit so the published durable
-                // boundary can never straddle a commit that assigned a lower end_ts but is
-                // not yet durable in the logical log (it would be lost on reopen).
-                self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
-
                 if passive {
+                    self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
                     // Checkpoint state machines can be created before they are run.
                     // Resample after serializing so already-durable index deletes are not replayed.
                     self.refresh_checkpoint_bounds();
@@ -1963,6 +1956,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     self.lock_states.blocking_checkpoint_lock_held = true;
                 }
 
+                // Sample the snapshot only after the stop-the-world lock: no concurrent
+                // commits can land between snapshot_ts and collection on this path.
+                self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
                 // Checkpoint state machines can be created before they are run.
                 // Resample after serializing with other checkpoints so already-durable
                 // index deletes are not replayed, and keep schema-derived index metadata
@@ -2763,6 +2759,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 self.state = CheckpointState::FsyncLogicalLog;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
+                    if self.mode.should_restart_log() {
+                        turso_assert!(
+                            self.mvstore.storage.logical_log_offset() == 0,
+                            "TRUNCATE checkpoint must reset logical log offset to 0"
+                        );
+                        turso_assert!(
+                            self.mvstore
+                                .get_logical_log_file()
+                                .size()
+                                .expect("logical log file size should be readable after truncate")
+                                == 0,
+                            "TRUNCATE checkpoint must zero the logical log file"
+                        );
+                    }
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
