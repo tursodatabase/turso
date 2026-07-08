@@ -1378,10 +1378,18 @@ impl Jsonb {
                             }
                         }
 
-                        // Default case - just push the character
+                        // Default case - just push the character. `ch` may be the
+                        // lead byte of a multi-byte UTF-8 sequence (e.g. non-ASCII
+                        // letters), so decode the whole sequence rather than
+                        // casting a single byte to `char`, which mangles it.
                         _ => {
-                            string.push(ch as char);
-                            i += 1;
+                            let seq_len = utf8_sequence_len(ch);
+                            let end = (i + seq_len).min(word_slice.len());
+                            match std::str::from_utf8(&word_slice[i..end]) {
+                                Ok(s) => string.push_str(s),
+                                Err(_) => string.push(ch as char),
+                            }
+                            i = end;
                         }
                     }
                 }
@@ -3522,6 +3530,22 @@ fn is_json_ok(ch: u8) -> bool {
     (CHARACTER_TYPE_OK[ch as usize] & 4) != 0
 }
 
+/// Length in bytes of the UTF-8 sequence starting with lead byte `ch`.
+#[inline]
+fn utf8_sequence_len(ch: u8) -> usize {
+    if ch & 0x80 == 0 {
+        1
+    } else if ch & 0xE0 == 0xC0 {
+        2
+    } else if ch & 0xF0 == 0xE0 {
+        3
+    } else if ch & 0xF8 == 0xF0 {
+        4
+    } else {
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3764,6 +3788,15 @@ world""#,
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
         assert!(matches!(header.0, ElementType::TEXT5));
+
+        // Multi-byte UTF-8 alongside a raw control byte (regression for #7786:
+        // TEXT5 serialization was casting each raw byte to `char`, corrupting
+        // multi-byte UTF-8 sequences).
+        let json_input = "\"ä\nworld\"";
+        let parsed = Jsonb::from_str(json_input).unwrap();
+        let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
+        assert!(matches!(header.0, ElementType::TEXT5));
+        assert_eq!(parsed.to_string().unwrap(), "\"ä\\nworld\"");
     }
 
     #[test]

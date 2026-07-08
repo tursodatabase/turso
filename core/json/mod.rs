@@ -1490,6 +1490,8 @@ mod tests {
             ("key", "Hello\rWorld", r#"{"key":"Hello\rWorld"}"#),
             ("key", "Hello\x01World", r#"{"key":"Hello\u0001World"}"#),
             ("key", "Hello\x08\x0cWorld", r#"{"key":"Hello\b\fWorld"}"#),
+            ("key", "ä\n", "{\"key\":\"ä\\n\"}"),
+            ("key", "日本語\t", "{\"key\":\"日本語\\t\"}"),
         ];
 
         for (key, value, expected) in cases {
