@@ -1,0 +1,14 @@
+{
+  "extraKnownMarketplaces": {
+    "antithesis-skills": {
+      "source": {
+        "source": "github",
+        "repo": "antithesishq/antithesis-skills"
+      },
+      "autoUpdate": true
+    }
+  },
+  "enabledPlugins": {
+    "antithesis-skills@antithesis-skills": true
+  }
+}
