@@ -1,0 +1,95 @@
+@database :memory:
+
+# Regression tests for #7765: an inner JOIN's ON clause could not reference a
+# table alias that appears later in the FROM list, even though SQLite resolves
+# ON clauses against the whole FROM clause. Reordering the joins was the only
+# workaround. Binding the inner-join ON predicates after every table has been
+# added lets them see the later tables.
+
+setup abc {
+    CREATE TABLE a(x);
+    CREATE TABLE b(y);
+    CREATE TABLE c(z);
+    INSERT INTO a VALUES (1);
+    INSERT INTO b VALUES (1);
+    INSERT INTO c VALUES (1);
+}
+
+@setup abc
+test on-references-later-table {
+    SELECT * FROM a
+    JOIN b ON a.x = c.z
+    JOIN c ON b.y = c.z;
+}
+expect {
+1|1|1
+}
+
+# The already-working ordering must keep working.
+@setup abc
+test on-references-earlier-table {
+    SELECT * FROM a
+    JOIN c ON a.x = c.z
+    JOIN b ON b.y = c.z;
+}
+expect {
+1|1|1
+}
+
+# An unqualified column that only exists in a later table now resolves to it.
+@setup abc
+test on-bare-column-from-later-table {
+    SELECT * FROM a
+    JOIN b ON z = 1
+    JOIN c ON b.y = c.z;
+}
+expect {
+1|1|1
+}
+
+setup chain {
+    CREATE TABLE a(x);
+    CREATE TABLE b(y);
+    CREATE TABLE c(z);
+    CREATE TABLE d(w);
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (1), (2);
+    INSERT INTO c VALUES (1), (2);
+    INSERT INTO d VALUES (1), (2);
+}
+
+# Forward references across a multi-way join, including one inside an AND.
+@setup chain
+test on-forward-reference-chain {
+    SELECT * FROM a
+    JOIN b ON a.x = d.w AND a.x = b.y
+    JOIN c ON b.y = c.z
+    JOIN d ON c.z = d.w
+    ORDER BY 1, 2, 3, 4;
+}
+expect {
+1|1|1|1
+2|2|2|2
+}
+
+# An inner join whose ON references a table that is LEFT JOINed later still
+# matches SQLite, including when that table is null-extended.
+setup abc_multi {
+    CREATE TABLE a(x);
+    CREATE TABLE b(y);
+    CREATE TABLE c(z);
+    INSERT INTO a VALUES (1), (2), (3);
+    INSERT INTO b VALUES (1), (2);
+    INSERT INTO c VALUES (2);
+}
+
+@setup abc_multi
+test on-references-later-outer-joined-table {
+    SELECT a.x, b.y, c.z FROM a
+    JOIN b ON a.x = c.z
+    LEFT JOIN c ON b.y = c.z
+    ORDER BY 1, 2, 3;
+}
+expect {
+2|2|2
+}

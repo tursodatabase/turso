@@ -1467,6 +1467,12 @@ pub fn parse_from(
             connection,
         )?;
 
+        // ON predicates of inner joins are resolved after every table in the FROM
+        // clause has been added, so they can reference any table regardless of its
+        // position (SQLite treats the whole FROM clause as one namespace). Outer
+        // joins keep binding against the tables to their left to preserve their
+        // null-extension semantics.
+        let mut deferred_inner_on: Vec<usize> = vec![];
         for join in joins_owned.into_iter() {
             parse_join(
                 join,
@@ -1477,6 +1483,16 @@ pub fn parse_from(
                 vtab_predicates,
                 table_references,
                 connection,
+                &mut deferred_inner_on,
+            )?;
+        }
+        for idx in deferred_inner_on {
+            bind_and_rewrite_expr(
+                &mut out_where_clause[idx].expr,
+                Some(table_references),
+                None,
+                resolver,
+                BindingBehavior::TryResultColumnsFirst,
             )?;
         }
     }
@@ -1811,6 +1827,7 @@ fn parse_join(
     vtab_predicates: &mut Vec<Expr>,
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
+    deferred_inner_on: &mut Vec<usize>,
 ) -> Result<()> {
     let ast::JoinedSelectTable {
         operator: join_operator,
@@ -1918,19 +1935,23 @@ fn parse_join(
             ast::JoinConstraint::On(ref expr) => {
                 let start_idx = out_where_clause.len();
                 break_predicate_at_and_boundaries(expr, out_where_clause);
-                for predicate in out_where_clause[start_idx..].iter_mut() {
+                for (offset, predicate) in out_where_clause[start_idx..].iter_mut().enumerate() {
                     predicate.from_outer_join = if outer {
                         Some(table_references.joined_tables().last().unwrap().internal_id)
                     } else {
                         None
                     };
-                    bind_and_rewrite_expr(
-                        &mut predicate.expr,
-                        Some(table_references),
-                        None,
-                        resolver,
-                        BindingBehavior::TryResultColumnsFirst,
-                    )?;
+                    if outer {
+                        bind_and_rewrite_expr(
+                            &mut predicate.expr,
+                            Some(table_references),
+                            None,
+                            resolver,
+                            BindingBehavior::TryResultColumnsFirst,
+                        )?;
+                    } else {
+                        deferred_inner_on.push(start_idx + offset);
+                    }
                 }
             }
             ast::JoinConstraint::Using(distinct_names) => {
