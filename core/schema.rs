@@ -4291,6 +4291,15 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
         Expr::IsNull(inner) | Expr::NotNull(inner) => {
             validate_generated_expr(inner)?;
         }
+        // CURRENT_TIME/DATE/TIMESTAMP parse as literals but evaluate to a
+        // different value on every read; SQLite rejects them like any other
+        // non-deterministic function (an index on such a column goes stale
+        // as soon as the value is recomputed).
+        Expr::Literal(
+            ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp,
+        ) => {
+            bail_parse_error!("non-deterministic functions prohibited in generated columns");
+        }
         _ => {}
     }
     Ok(())

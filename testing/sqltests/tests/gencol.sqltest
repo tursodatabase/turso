@@ -3220,6 +3220,45 @@ expect error {
     non-deterministic functions prohibited in generated columns
 }
 
+# CURRENT_TIMESTAMP/CURRENT_DATE/CURRENT_TIME literals are as
+# non-deterministic as random(); an index on such a column desyncs as soon
+# as the value is recomputed on a later read.
+test gencol_create_current_timestamp_rejected {
+    CREATE TABLE t1(a, b AS (CURRENT_TIMESTAMP));
+}
+expect error {
+    non-deterministic functions prohibited in generated columns
+}
+
+test gencol_create_current_date_rejected {
+    CREATE TABLE t1(a, b AS (current_date));
+}
+expect error {
+    non-deterministic functions prohibited in generated columns
+}
+
+test gencol_create_current_time_rejected {
+    CREATE TABLE t1(a, b AS (CURRENT_TIME));
+}
+expect error {
+    non-deterministic functions prohibited in generated columns
+}
+
+test gencol_create_current_timestamp_nested_rejected {
+    CREATE TABLE t1(a, b AS ('at ' || CURRENT_TIMESTAMP));
+}
+expect error {
+    non-deterministic functions prohibited in generated columns
+}
+
+test gencol_alter_add_current_timestamp_rejected {
+    CREATE TABLE t1(a INTEGER);
+    ALTER TABLE t1 ADD COLUMN b AS (CURRENT_TIMESTAMP) VIRTUAL;
+}
+expect error {
+    non-deterministic functions prohibited in generated columns
+}
+
 test gencol_alter_add_column_generated_pk_rejected {
     CREATE TABLE t1(a INTEGER);
     ALTER TABLE t1 ADD COLUMN b AS (a+1) PRIMARY KEY;
