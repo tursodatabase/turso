@@ -20,6 +20,16 @@
 //!
 //! Both flags default to `true` (conservative). Each DML translate path calls
 //! into this module to set them to `false` when safe.
+//!
+//! NOTE: SQLite's optimization is currently disabled — every write statement
+//! gets a statement subtransaction regardless of these flags (see
+//! `ProgramBuilder::build_prepared_program`). Its soundness relies on write
+//! statements never being observable mid-execution, which does not hold in
+//! Turso: statements yield at I/O boundaries and can be abandoned (dropped)
+//! there, leaving partial multi-btree writes that only a statement savepoint
+//! can undo (#7682). The analysis is kept because it still describes
+//! per-statement abort semantics and can gate the optimization again if
+//! abandonment is ever handled without eager savepoints.
 
 use crate::translate::emitter::Resolver;
 use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};

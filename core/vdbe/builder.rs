@@ -1956,14 +1956,19 @@ impl ProgramBuilder {
 
         self.parameters.list.dedup();
 
-        // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
-        // Statement journals are only needed when a statement writes multiple rows AND could
-        // abort midway (e.g. constraint violation). Single-row writes are atomic and don't
-        // need statement-level rollback. Both flags default to true; specific translate paths
-        // (e.g., single-row INSERT) set is_multi_write=false to opt out.
-        let needs_stmt_subtransactions = matches!(self.txn_mode, TransactionMode::Write)
-            && self.flags.is_multi_write()
-            && self.flags.may_abort();
+        // SQLite only opens statement journals when a statement writes multiple rows
+        // AND could abort midway (usesStmtJournal = isMultiWrite && mayAbort; see
+        // translate/stmt_journal.rs). That optimization relies on statements never
+        // being observable mid-write: sqlite3_step runs each write statement to
+        // completion synchronously. Turso instead yields to the caller at every I/O
+        // boundary, so ANY write statement can be abandoned (dropped/reset) midway,
+        // leaving partially-applied changes — e.g. an index entry written but not the
+        // matching table row. Inside an explicit transaction those partial effects can
+        // only be undone with a statement savepoint, so every write statement needs
+        // one regardless of the is_multi_write/may_abort analysis. begin_statement
+        // still skips pager savepoints in autocommit mode, where statement abort
+        // escalates to full-transaction rollback.
+        let needs_stmt_subtransactions = matches!(self.txn_mode, TransactionMode::Write);
 
         let contains_trigger_subprograms = self
             .insns
