@@ -2191,6 +2191,128 @@ fn test_checkpoint_truncates_wal_last() {
     );
 }
 
+/// Regression for blocking TRUNCATE leaving a non-empty logical log (and possible
+/// `integrity_check` orphan-page errors) when a sibling commit lands between early
+/// `snapshot_ts` sampling and `AcquireLock`.
+///
+/// Reproduces the old failure mode:
+/// 1. A follow-up INSERT with `mvcc_checkpoint_threshold = 0` auto-checkpoints in
+///    TRUNCATE mode and yields at `BeforeAcquireLock` (blocking lock not yet held).
+/// 2. A sibling connection commits `CREATE TABLE` + `INSERT` while the checkpoint is parked.
+/// 3. On the old path those versions had `begin_ts > snapshot_ts` (snapshot in
+///    `PrepareCheckpoint`), so they were not collected.
+/// 4. Conditional `truncate(durable_txid_max_new)` skipped while WAL truncation still
+///    ran — `.db-log` stayed non-empty after TRUNCATE.
+///
+/// With the fix (`snapshot_ts` after the lock), the logical log must be 0 and
+/// `integrity_check` must pass.
+#[test]
+fn test_blocking_truncate_zeros_log_when_commit_races_acquire_lock() {
+    use crate::StepResult;
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (0, 'seed')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (1, 'pending')").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforeAcquireLock.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut insert_stmt = conn
+        .prepare("INSERT INTO t1 VALUES (2, 'trigger')")
+        .unwrap();
+    let mut parked = false;
+    for _ in 0..10_000 {
+        match insert_stmt.step().unwrap() {
+            StepResult::IO | StepResult::Yield if injector.is_empty() => {
+                parked = true;
+                break;
+            }
+            StepResult::IO | StepResult::Yield => {}
+            StepResult::Done => {
+                panic!("INSERT completed before the checkpoint acquire-lock yield fired")
+            }
+            other => panic!("unexpected INSERT step result before yield: {other:?}"),
+        }
+    }
+    assert!(
+        parked,
+        "blocking TRUNCATE auto-checkpoint should yield before acquiring the lock"
+    );
+
+    let sibling = db.connect();
+    sibling
+        .execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+        .unwrap();
+    sibling
+        .execute("CREATE TABLE t2(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    sibling.execute("INSERT INTO t2 VALUES (1, 'x')").unwrap();
+
+    let mut finished = false;
+    for _ in 0..100_000 {
+        match insert_stmt.step().unwrap() {
+            StepResult::Done => {
+                finished = true;
+                break;
+            }
+            StepResult::IO | StepResult::Yield => {}
+            other => panic!("unexpected resume step result: {other:?}"),
+        }
+    }
+    conn.set_yield_injector(None);
+    assert!(
+        finished,
+        "TRUNCATE checkpoint must complete after sibling commit"
+    );
+    drop(insert_stmt);
+
+    assert_eq!(
+        mvcc_store.get_logical_log_file().size().unwrap(),
+        0,
+        "blocking TRUNCATE must zero the logical log even when a sibling commit raced acquire-lock"
+    );
+    let wal_path = wal_path_for_db(db.path.as_ref().unwrap());
+    assert_eq!(
+        wal_path.metadata().map(|m| m.len()).unwrap_or(0),
+        0,
+        "blocking TRUNCATE must zero the WAL"
+    );
+
+    let tables = get_rows(
+        &conn,
+        "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('t1','t2') ORDER BY name",
+    );
+    assert_eq!(tables.len(), 2, "both tables must exist: {tables:?}");
+    let t2_rows = get_rows(&conn, "SELECT id, v FROM t2");
+    assert_eq!(t2_rows.len(), 1);
+    assert_eq!(t2_rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(t2_rows[0][1].to_string(), "x");
+
+    assert_integrity_ok(&conn);
+
+    db.restart();
+    let conn = db.connect();
+    assert_integrity_ok(&conn);
+    let t2_after_reopen = get_rows(&conn, "SELECT id, v FROM t2");
+    assert_eq!(t2_after_reopen.len(), 1);
+    assert_eq!(t2_after_reopen[0][1].to_string(), "x");
+    assert_eq!(
+        db.get_mvcc_store().get_logical_log_file().size().unwrap(),
+        0,
+        "logical log must stay empty after reopen following TRUNCATE checkpoint"
+    );
+}
+
 /// What this test checks: Checkpoint accepts sqlite_schema index-row updates for already-checkpointed indexes
 /// (e.g. column rename), without requiring create/destroy special writes.
 /// Why this matters: RENAME COLUMN on indexed tables rewrites sqlite_schema index SQL text while preserving rootpage.
