@@ -8973,6 +8973,7 @@ pub fn op_function(
                                     mut columns,
                                     mut constraints,
                                     options,
+                                    partition,
                                 } = body
                                 else {
                                     return Err(LimboError::InternalError(
@@ -9046,6 +9047,7 @@ pub fn op_function(
                                             columns,
                                             constraints,
                                             options,
+                                            partition,
                                         },
                                     };
                                     Some(new_stmt.to_string())
@@ -9063,6 +9065,7 @@ pub fn op_function(
                                                 columns,
                                                 constraints,
                                                 options,
+                                                partition,
                                             },
                                         }
                                         .to_string(),
@@ -9256,6 +9259,7 @@ pub fn op_function(
                                     mut columns,
                                     mut constraints,
                                     options,
+                                    partition,
                                 } = body
                                 else {
                                     return Err(LimboError::InternalError(
@@ -9423,6 +9427,7 @@ pub fn op_function(
                                             columns,
                                             constraints,
                                             options,
+                                            partition,
                                         },
                                         temporary,
                                         if_not_exists,

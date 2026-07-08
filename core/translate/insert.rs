@@ -57,9 +57,94 @@ use gencol::compute_virtual_columns;
 use std::num::NonZeroUsize;
 use turso_macros::turso_assert;
 use turso_parser::ast::{
-    self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
-    TriggerTime, Upsert, UpsertDo, With,
+    self, Expr, InsertBody, Literal, OneSelect, PartitionSpec, QualifiedName, ResolveType,
+    ResultColumn, TriggerEvent, TriggerTime, Upsert, UpsertDo, With,
 };
+
+/// Extract the partition timestamp value from an INSERT body.
+fn extract_partition_timestamp(
+    body: &InsertBody,
+    columns: &[ast::Name],
+    table: &Arc<BTreeTable>,
+    partition_spec: &PartitionSpec,
+) -> Result<i64> {
+    let partition_col_name = normalize_ident(partition_spec.column.as_str());
+    let partition_col_idx = if columns.is_empty() {
+        table
+            .columns()
+            .iter()
+            .position(|c| {
+                c.name
+                    .as_ref()
+                    .map(|n| normalize_ident(n) == partition_col_name)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                LimboError::ParseError(format!(
+                    "partition column '{}' not found in table '{}'",
+                    partition_col_name, table.name
+                ))
+            })?
+    } else {
+        columns
+            .iter()
+            .position(|c| normalize_ident(c.as_str()) == partition_col_name)
+            .ok_or_else(|| {
+                LimboError::ParseError(format!(
+                    "partition column '{}' must be included in INSERT column list",
+                    partition_col_name
+                ))
+            })?
+    };
+
+    match body {
+        InsertBody::Select(select, _) => match &select.body.select {
+            OneSelect::Values(rows) => {
+                let first_row = rows
+                    .first()
+                    .ok_or_else(|| LimboError::ParseError("VALUES clause is empty".to_string()))?;
+                let expr = first_row.get(partition_col_idx).ok_or_else(|| {
+                    LimboError::ParseError(format!(
+                        "partition column index {} out of bounds in VALUES",
+                        partition_col_idx
+                    ))
+                })?;
+                extract_timestamp_from_expr(expr)
+            }
+            OneSelect::Select { .. } => Err(LimboError::ParseError(
+                "INSERT ... SELECT into partitioned tables is not yet supported".to_string(),
+            )),
+        },
+        InsertBody::DefaultValues => Err(LimboError::ParseError(
+            "DEFAULT VALUES cannot be used with partitioned tables".to_string(),
+        )),
+    }
+}
+
+fn extract_timestamp_from_expr(expr: &Expr) -> Result<i64> {
+    match expr {
+        Expr::Literal(Literal::Numeric(num_str)) => num_str.parse::<i64>().map_err(|_| {
+            LimboError::ParseError(format!(
+                "invalid partition timestamp '{}' - expected integer microseconds",
+                num_str
+            ))
+        }),
+        Expr::Unary(ast::UnaryOperator::Negative, inner) => {
+            let Expr::Literal(Literal::Numeric(num_str)) = inner.as_ref() else {
+                return Err(LimboError::ParseError(
+                    "partition timestamp must be a numeric literal".to_string(),
+                ));
+            };
+            let value = num_str.parse::<i64>().map_err(|_| {
+                LimboError::ParseError(format!("invalid partition timestamp '-{}'", num_str))
+            })?;
+            Ok(-value)
+        }
+        _ => Err(LimboError::ParseError(
+            "partition timestamp must be a numeric literal".to_string(),
+        )),
+    }
+}
 
 /// Validate anything with this insert statement that should throw an early parse error
 fn validate(
@@ -263,7 +348,7 @@ pub fn translate_insert(
         // for RETURNING clause subqueries - handled below via with_for_returning.
     }
 
-    let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
+    let mut database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let table_name = &tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,
@@ -297,6 +382,50 @@ pub fn translate_insert(
     let Some(btree_table) = table.btree() else {
         crate::bail_parse_error!("no such table: {}", table_name);
     };
+
+    if let Some(partition_spec) = &btree_table.partition_spec {
+        if !connection.is_table_partitioned(table_name.as_str()) {
+            crate::bail_parse_error!(
+                "INSERT into partitioned table '{}' requires partition configuration",
+                table_name
+            );
+        }
+
+        let timestamp = extract_partition_timestamp(&body, &columns, &btree_table, partition_spec)?;
+        let partition_info = connection
+            .ensure_partition(table_name.as_str(), timestamp)
+            .map_err(|e| {
+                LimboError::ParseError(format!(
+                    "failed to ensure partition for timestamp {}: {}",
+                    timestamp, e
+                ))
+            })?;
+
+        let partition_path = std::path::PathBuf::from(&partition_info.file_path);
+        if !partition_info.attached {
+            connection
+                .attach_partition(table_name.as_str(), &partition_path)
+                .map_err(|e| {
+                    LimboError::ParseError(format!(
+                        "failed to attach partition {}: {}",
+                        partition_info.db_alias, e
+                    ))
+                })?;
+        }
+
+        database_id = connection
+            .partition_manager
+            .read()
+            .route_insert(table_name.as_str(), timestamp)
+            .map_err(|e| LimboError::ParseError(format!("failed to route INSERT: {}", e)))?
+            .database_id
+            .ok_or_else(|| {
+                LimboError::ParseError(format!(
+                    "partition {} is not attached",
+                    partition_info.db_alias
+                ))
+            })?;
+    }
 
     let BoundInsertResult {
         mut values,

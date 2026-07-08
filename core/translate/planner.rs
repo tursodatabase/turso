@@ -1096,10 +1096,55 @@ fn parse_table(
     if let Some(table) = table {
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         let internal_id = program.table_reference_counter.next();
+        let mut joined_database_id = database_id;
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
             Table::Virtual(tbl.clone())
         } else if let Table::BTree(table) = table.as_ref() {
+            if let Some(partition_spec) = &table.partition_spec {
+                if !connection.is_table_partitioned(&table.name) {
+                    crate::bail_parse_error!(
+                        "SELECT from partitioned table '{}' requires partition configuration for column '{}'",
+                        table.name,
+                        partition_spec.column.as_str()
+                    );
+                }
+
+                let attached_partitions = connection.get_attached_partitions(&table.name);
+                if attached_partitions.is_empty() {
+                    crate::bail_parse_error!("no partitions attached for table '{}'", table.name);
+                }
+                if attached_partitions.len() > 1 {
+                    let partition_names = attached_partitions
+                        .iter()
+                        .map(|p| p.db_alias.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    crate::bail_parse_error!(
+                        "SELECT from partitioned table '{}' with multiple attached partitions requires explicit UNION ALL. Attached partitions: [{}]",
+                        table.name,
+                        partition_names
+                    );
+                }
+
+                let partition = attached_partitions.first().ok_or_else(|| {
+                    crate::LimboError::ParseError(format!(
+                        "no partitions attached for table '{}'",
+                        table.name
+                    ))
+                })?;
+                joined_database_id = connection
+                    .partition_manager
+                    .read()
+                    .get_partition_by_alias(&table.name, &partition.db_alias)
+                    .and_then(|p| p.database_id)
+                    .ok_or_else(|| {
+                        crate::LimboError::ParseError(format!(
+                            "partition {} database_id not found",
+                            partition.db_alias
+                        ))
+                    })?;
+            }
             Table::BTree(table.clone())
         } else {
             return Err(crate::LimboError::InvalidArgument(
@@ -1115,7 +1160,7 @@ fn parse_table(
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id,
+            database_id: joined_database_id,
             indexed,
         });
         return Ok(());

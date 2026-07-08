@@ -1577,6 +1577,7 @@ fn initialize_btree_storage_table(
             ],
             constraints: vec![],
             options: ast::TableOptions::empty(),
+            partition: None,
         },
         temporary: false,
         if_not_exists: true,

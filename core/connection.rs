@@ -19,6 +19,7 @@ use crate::Page;
 use crate::{
     ast, function,
     io::{MemoryIO, IO},
+    partition::PartitionManager,
     progress::{ProgressHandler, ProgressHandlerCallback},
     translate,
     translate::collate::CollationSeq,
@@ -472,6 +473,8 @@ pub struct Connection {
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
+    /// Partition manager for handling time-partitioned tables.
+    pub(crate) partition_manager: RwLock<PartitionManager>,
     /// Connection-level named savepoint stack used to mirror savepoint state
     /// onto temp/attached databases that start participating after SAVEPOINT.
     pub(crate) named_savepoints: RwLock<Vec<NamedSavepointFrame>>,
@@ -1829,6 +1832,183 @@ impl Connection {
 
     pub(crate) fn increment_deferred_foreign_key_violations(&self, v: isize) {
         self.fk_deferred_violations.fetch_add(v, Ordering::AcqRel);
+    }
+
+    /// Register a table for time-based partitioning.
+    pub fn register_partitioned_table(
+        &self,
+        table_name: &str,
+        config: crate::partition::PartitionConfig,
+    ) -> Result<()> {
+        self.partition_manager
+            .write()
+            .register_table(table_name, config)
+            .map_err(|e| LimboError::InternalError(e.to_string()))
+    }
+
+    /// Unregister a table from partitioning without deleting partition files.
+    pub fn unregister_partitioned_table(&self, table_name: &str) -> Result<()> {
+        self.partition_manager
+            .write()
+            .unregister_table(table_name)
+            .map_err(|e| LimboError::InternalError(e.to_string()))
+    }
+
+    /// Check if a table is registered for partitioning.
+    pub fn is_table_partitioned(&self, table_name: &str) -> bool {
+        self.partition_manager.read().is_partitioned(table_name)
+    }
+
+    /// List known partitions for a table.
+    pub fn list_partitions(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<crate::partition::PartitionInfo>> {
+        self.partition_manager
+            .read()
+            .list_partitions(table_name)
+            .map_err(|e| LimboError::InternalError(e.to_string()))
+    }
+
+    /// Ensure a partition descriptor and file exist for the given timestamp.
+    pub fn ensure_partition(
+        &self,
+        table_name: &str,
+        timestamp_micros: i64,
+    ) -> Result<crate::partition::PartitionInfo> {
+        let mut manager = self.partition_manager.write();
+        let partition = manager
+            .ensure_partition(table_name, timestamp_micros)
+            .map_err(|e| LimboError::InternalError(e.to_string()))?;
+        Ok(partition.to_info())
+    }
+
+    /// Attach a partition file to this connection.
+    #[cfg(feature = "fs")]
+    pub fn attach_partition(
+        &self,
+        table_name: &str,
+        path: &std::path::Path,
+    ) -> Result<crate::partition::PartitionInfo> {
+        let info = self
+            .partition_manager
+            .write()
+            .attach_partition(table_name, path)
+            .map_err(|e| LimboError::InternalError(e.to_string()))?;
+
+        let path_str = path.to_string_lossy();
+        let mut state = AttachDatabaseState::default();
+        loop {
+            match self.attach_database(&path_str, &info.db_alias, &mut state) {
+                Ok(IOResult::Done(())) => break,
+                Ok(IOResult::IO(io)) => io.wait(self.db.io.as_ref())?,
+                Err(e) => {
+                    let _ = self
+                        .partition_manager
+                        .write()
+                        .detach_partition(table_name, path);
+                    return Err(e);
+                }
+            }
+        }
+
+        let database_id = self.get_database_id_by_name(&info.db_alias)?;
+        self.partition_manager
+            .write()
+            .update_partition_database_id(table_name, path, database_id);
+
+        Ok(info)
+    }
+
+    /// Attach a partition file to this connection.
+    #[cfg(not(feature = "fs"))]
+    pub fn attach_partition(
+        &self,
+        _table_name: &str,
+        _path: &std::path::Path,
+    ) -> Result<crate::partition::PartitionInfo> {
+        Err(LimboError::InvalidArgument(
+            "attach_partition not available in this build (no-fs)".to_string(),
+        ))
+    }
+
+    /// Detach a partition file from this connection.
+    #[cfg(feature = "fs")]
+    pub fn detach_partition(&self, table_name: &str, path: &std::path::Path) -> Result<()> {
+        let alias = {
+            let manager = self.partition_manager.read();
+            manager
+                .get_partition_alias(table_name, path)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!("partition not found: {}", path.display()))
+                })?
+        };
+
+        self.detach_database(&alias)?;
+        self.partition_manager
+            .write()
+            .detach_partition(table_name, path)
+            .map_err(|e| LimboError::InternalError(e.to_string()))
+    }
+
+    /// Detach a partition file from this connection.
+    #[cfg(not(feature = "fs"))]
+    pub fn detach_partition(&self, _table_name: &str, _path: &std::path::Path) -> Result<()> {
+        Err(LimboError::InvalidArgument(
+            "detach_partition not available in this build (no-fs)".to_string(),
+        ))
+    }
+
+    /// Get information about all attached partitions for a table.
+    pub fn get_attached_partitions(
+        &self,
+        table_name: &str,
+    ) -> Vec<crate::partition::PartitionInfo> {
+        self.partition_manager
+            .read()
+            .get_attached_partitions(table_name)
+            .into_iter()
+            .map(|p| p.to_info())
+            .collect()
+    }
+
+    /// Discover existing partition files on disk.
+    pub fn discover_partitions(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<crate::partition::PartitionInfo>> {
+        self.partition_manager
+            .write()
+            .discover_partitions(table_name)
+            .map_err(|e| LimboError::InternalError(e.to_string()))
+    }
+
+    /// Route an insert to the correct partition based on timestamp.
+    pub fn route_insert(
+        &self,
+        table_name: &str,
+        timestamp_micros: i64,
+    ) -> Result<crate::partition::PartitionInfo> {
+        self.partition_manager
+            .read()
+            .route_insert(table_name, timestamp_micros)
+            .map(|p| p.to_info())
+            .map_err(|e| LimboError::InternalError(e.to_string()))
+    }
+
+    /// Filter attached partitions by time range.
+    pub fn filter_partitions_by_range(
+        &self,
+        table_name: &str,
+        start: Option<i64>,
+        end: Option<i64>,
+    ) -> Vec<crate::partition::PartitionInfo> {
+        self.partition_manager
+            .read()
+            .filter_by_range(table_name, start, end)
+            .into_iter()
+            .map(|p| p.to_info())
+            .collect()
     }
 
     /// Query the CREATE TYPE SQL definitions stored in __turso_internal_types.

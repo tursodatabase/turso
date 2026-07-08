@@ -1710,6 +1710,7 @@ impl ToTokens for CreateTableBody {
                 columns,
                 constraints,
                 options,
+                partition,
             } => {
                 s.append(TK_LP, None)?;
                 comma(columns, s, context)?;
@@ -1730,6 +1731,9 @@ impl ToTokens for CreateTableBody {
                 if let Some(ref strict) = options.strict_text {
                     s.append(TK_ID, Some(strict))?;
                 }
+                if let Some(spec) = partition {
+                    spec.to_tokens(s, context)?;
+                }
                 Ok(())
             }
             Self::AsSelect(select) => {
@@ -1737,6 +1741,22 @@ impl ToTokens for CreateTableBody {
                 select.to_tokens(s, context)
             }
         }
+    }
+}
+
+impl_display_for_to_tokens!(PartitionSpec);
+impl ToTokens for PartitionSpec {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        s.append(TK_PARTITION, None)?;
+        s.append(TK_BY, None)?;
+        s.append(TK_LP, None)?;
+        self.column.to_tokens(s, context)?;
+        s.append(TK_RP, None)?;
+        Ok(())
     }
 }
 

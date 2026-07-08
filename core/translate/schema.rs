@@ -730,6 +730,7 @@ fn validate(
         options,
         columns,
         constraints,
+        partition: _,
     } = &body
     {
         let column_names: Vec<&str> = columns.iter().map(|c| c.col_name.as_str()).collect();
@@ -1117,6 +1118,7 @@ pub fn translate_create_table(
                 columns: col_defs,
                 constraints: vec![],
                 options: ast::TableOptions::empty(),
+                partition: None,
             };
             (body, Some(info))
         }
@@ -1632,6 +1634,7 @@ fn create_table_body_to_str(
             columns: _,
             constraints: _,
             options: _,
+            partition: _,
         } => {}
         ast::CreateTableBody::AsSelect(_select) => {
             crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")

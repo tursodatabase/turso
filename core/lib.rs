@@ -62,6 +62,7 @@ mod json;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod numeric;
 mod parameters;
+pub mod partition;
 #[cfg(feature = "percentile")]
 mod percentile;
 mod pragma;
@@ -2212,6 +2213,7 @@ impl Database {
             n_active_root_statements: AtomicI32::new(0),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
+            partition_manager: RwLock::new(partition::PartitionManager::new()),
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),

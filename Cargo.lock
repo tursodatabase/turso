@@ -6684,6 +6684,7 @@ dependencies = [
  "env_logger",
  "fallible-iterator",
  "fastbloom",
+ "glob",
  "hex",
  "icu_collator",
  "icu_locale",
