@@ -977,18 +977,18 @@ impl Connection {
         let result = (|| {
             let sql = sql.as_ref();
             tracing::debug!("Preparing: {}", sql);
+
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
-                let mut parser = Parser::new(sql.as_bytes());
-                let cmd = match parser.next_cmd()? {
-                    Some(cmd) => cmd,
-                    None => {
-                        return Err(LimboError::InvalidArgument(
-                            "The supplied SQL string contains no statements".to_string(),
-                        ));
-                    }
-                };
-                (cmd, parser.offset())
+                self.parse_sql(sql)?
+            };
+            let cmd = match cmd {
+                Some(cmd) => cmd,
+                None => {
+                    return Err(LimboError::InvalidArgument(
+                        "The supplied SQL string contains no statements".to_string(),
+                    ));
+                }
             };
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
@@ -1625,14 +1625,15 @@ impl Connection {
         }
         let sql = sql.as_ref();
         tracing::trace!("Preparing and executing batch: {}", sql);
-        let mut parser = Parser::new(sql.as_bytes());
-        while let Some(cmd) = parser.next_cmd()? {
-            let byte_offset_end = parser.offset();
-            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+
+        let mut remaining = sql;
+        while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
+            let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input)?;
-            Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+            Statement::new(program, pager, mode, 0).run_ignore_rows()?;
+            remaining = &remaining[byte_offset_end..];
         }
         Ok(())
     }
@@ -1644,9 +1645,8 @@ impl Connection {
         }
         let sql = sql.as_ref();
         tracing::trace!("Querying: {}", sql);
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
-        let byte_offset_end = parser.offset();
+
+        let (cmd, byte_offset_end) = self.parse_sql(sql)?;
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
@@ -1703,17 +1703,23 @@ impl Connection {
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Statement, usize)>> {
-        let mut parser = Parser::new(sql.as_ref().as_bytes());
-        let Some(cmd) = parser.next_cmd()? else {
+        let (cmd, byte_offset_end) = self.parse_sql(sql.as_ref())?;
+        let Some(cmd) = cmd else {
             return Ok(None);
         };
-        let byte_offset_end = parser.offset();
         let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
         let (program, pager, mode) = self.compile_cmd(cmd, input)?;
         let stmt = Statement::new(program, pager, mode, 0);
-        Ok(Some((stmt, parser.offset())))
+        Ok(Some((stmt, byte_offset_end)))
+    }
+
+    fn parse_sql(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        let mut parser = Parser::new(sql.as_bytes());
+        let cmd = parser.next_cmd()?;
+        let offset = parser.offset();
+        Ok((cmd, offset))
     }
 
     #[cfg(feature = "fs")]
