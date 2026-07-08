@@ -1,0 +1,26 @@
+[package]
+name = "turso_pg"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PostgreSQL frontend for Turso"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+chrono = { workspace = true, default-features = false, features = ["clock"] }
+parking_lot = { workspace = true }
+rustc-hash = "2.0"
+tempfile = { workspace = true }
+turso_core = { workspace = true, default-features = true, features = [
+    "conn_raw_api",
+] }
+turso_parser = { workspace = true }
+turso_ext = { workspace = true, features = ["core_only"] }
+turso_parser_pg = { workspace = true }
+
+[lints]
+workspace = true
