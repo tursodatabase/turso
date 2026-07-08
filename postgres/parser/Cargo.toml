@@ -1,0 +1,29 @@
+[package]
+name = "turso_parser_pg"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PostgreSQL parser for Turso"
+
+[lints]
+workspace = true
+
+[lib]
+name = "turso_parser_pg"
+path = "lib.rs"
+
+[dependencies]
+pg_query = "6.1"
+miette = { workspace = true }
+thiserror = { workspace = true }
+turso_parser = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[features]
+default = []
+# Enable validation against real PostgreSQL (requires psql installed)
+validate_psql = []
