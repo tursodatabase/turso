@@ -3077,6 +3077,13 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::Register(src_reg) => {
+            // When a column reference has been rewritten to a register
+            // (UPSERT DO UPDATE WHERE/SET), the register still carries the
+            // column's implicit collation for comparison purposes, same as
+            // the Expr::Column arm above.
+            if let Some(collation) = resolver.register_collations.get(src_reg) {
+                program.set_collation(Some((*collation, false)));
+            }
             // For DBSP expression compilation: copy from source register to target
             program.emit_insn(Insn::Copy {
                 src_reg: *src_reg,

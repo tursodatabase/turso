@@ -865,11 +865,15 @@ pub fn translate_insert(
     //
     // Without this, comparisons like `integer_col < '2'` lose their
     // INTEGER affinity and evaluate under type-ordering rules, producing
-    // wrong index entries.
+    // wrong index entries. Collations likewise: a rewritten reference to a
+    // NOCASE column must keep comparing case-insensitively.
     for cm in &insertion.col_mappings {
         resolver
             .register_affinities
             .insert(cm.register, cm.column.affinity());
+        resolver
+            .register_collations
+            .insert(cm.register, cm.column.collation());
     }
     resolver
         .register_affinities
@@ -928,6 +932,7 @@ pub fn translate_insert(
     }
 
     resolver.register_affinities.clear();
+    resolver.register_collations.clear();
 
     let mut insert_flags = InsertFlags::new();
 

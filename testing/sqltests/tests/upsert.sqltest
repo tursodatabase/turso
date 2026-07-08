@@ -808,3 +808,68 @@ test upsert-overrides-pk-on-conflict-ignore-deferred-fk {
 }
 expect error {
 }
+
+# The DO UPDATE arm's WHERE/SET expressions rewrite target-table column
+# references to registers; the rewrite must preserve the column's declared
+# affinity and collation or predicates evaluate differently than SQLite
+# (e.g. `a < '2'` on an INTEGER column must compare 10 < 2, not int < text).
+
+@cross-check-integrity
+test upsert-do-update-where-uses-column-affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, x INT);
+    CREATE INDEX idx_x ON t(x);
+    INSERT INTO t VALUES(1,10,100);
+    INSERT INTO t VALUES(2,20,200);
+    INSERT OR FAIL INTO t(id,a,x) VALUES(1,99,999)
+    ON CONFLICT(id) DO UPDATE SET id=2
+    WHERE a < '2';
+    SELECT id,a,x FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|10|100
+    2|20|200
+    ok
+}
+
+@cross-check-integrity
+test upsert-do-update-where-uses-column-collation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT COLLATE NOCASE, x INT);
+    CREATE INDEX idx_x ON t(x);
+    INSERT INTO t VALUES(1,'A',100);
+    INSERT INTO t VALUES(2,'B',200);
+    INSERT OR FAIL INTO t(id,a,x) VALUES(1,'Z',999)
+    ON CONFLICT(id) DO UPDATE SET id=2
+    WHERE a != 'a';
+    SELECT id,a,x FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|A|100
+    2|B|200
+    ok
+}
+
+@cross-check-integrity
+test upsert-do-update-set-expr-uses-column-affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, x INT);
+    INSERT INTO t VALUES(1,10,100);
+    INSERT INTO t VALUES(1,0,0)
+    ON CONFLICT(id) DO UPDATE SET x = (a < '2');
+    SELECT id,a,x FROM t;
+}
+expect {
+    1|10|0
+}
+
+@cross-check-integrity
+test upsert-do-update-set-expr-uses-column-collation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT COLLATE NOCASE, x INT);
+    INSERT INTO t VALUES(1,'A',100);
+    INSERT INTO t VALUES(1,'z',0)
+    ON CONFLICT(id) DO UPDATE SET x = (a = 'a');
+    SELECT id,a,x FROM t;
+}
+expect {
+    1|A|1
+}
