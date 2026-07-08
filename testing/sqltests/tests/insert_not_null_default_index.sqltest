@@ -77,3 +77,32 @@ expect {
     1|5|0|10
     2|6|0|20
 }
+
+# The substituted default must also get the column's affinity applied: the
+# early Affinity insn runs before the NOT NULL substitution overwrites the
+# register, so a text default like '5' on an INT column must be re-converted
+# or the index key stores text while the table row stores an integer.
+
+@cross-check-integrity
+test insert-or-replace-not-null-default-affinity {
+    CREATE TABLE t3 (a INT NOT NULL DEFAULT '5');
+    CREATE INDEX idx3 ON t3 (a);
+    INSERT OR REPLACE INTO t3 VALUES (NULL);
+    SELECT typeof(a), a FROM t3;
+    PRAGMA integrity_check;
+}
+expect {
+    integer|5
+    ok
+}
+
+@cross-check-integrity
+test insert-or-replace-not-null-default-affinity-index-lookup {
+    CREATE TABLE t4 (a INT NOT NULL DEFAULT '7');
+    CREATE INDEX idx4 ON t4 (a);
+    INSERT OR REPLACE INTO t4 VALUES (NULL);
+    SELECT count(*) FROM t4 WHERE a = 7;
+}
+expect {
+    1
+}

@@ -1800,6 +1800,20 @@ fn emit_notnulls(
                     NoConstantOptReason::RegisterReuse,
                 )?;
 
+                // The statement-level Affinity insn already ran on the
+                // original (NULL) value, so the substituted default needs the
+                // column affinity applied here or index keys copied from this
+                // register keep the default's literal type (e.g. text '5' for
+                // an INT column) while MakeRecord converts the table row.
+                let affinity = column_mapping.column.affinity();
+                if !ctx.table.is_strict && affinity != Affinity::Blob {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: column_mapping.register,
+                        count: NonZeroUsize::MIN,
+                        affinities: affinity.aff_mask().to_string(),
+                    });
+                }
+
                 program.preassign_label_to_next_insn(skip_label);
             }
             // OR REPLACE but no DEFAULT, fall through to ABORT behavior
