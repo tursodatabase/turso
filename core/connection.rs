@@ -953,10 +953,12 @@ impl Connection {
         self._prepare(sql)
     }
 
-    pub(crate) fn prepare_internal(
-        self: &Arc<Connection>,
-        sql: impl AsRef<str>,
-    ) -> Result<Statement> {
+    pub fn prepare_sqlite(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
+        self.prepare_with_origin(sql, StatementOrigin::Root)
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_internal(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self.prepare_with_origin(sql, StatementOrigin::InternalHelper)
     }
 
@@ -966,7 +968,7 @@ impl Connection {
     }
 
     #[turso_macros::trace_stack]
-    fn prepare_with_origin(
+    pub(crate) fn prepare_with_origin(
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
         origin: StatementOrigin,
@@ -2829,6 +2831,36 @@ impl Connection {
         self.db.dialect()
     }
 
+    pub fn register_internal_vtab<T>(&self, table: T) -> Result<String>
+    where
+        T: crate::vtab::InternalVirtualTable + 'static,
+    {
+        let name = self.db.register_internal_vtab(table)?;
+        *self.schema.write() = self.db.clone_schema();
+        self.bump_prepare_context_generation();
+        Ok(name)
+    }
+
+    pub fn register_virtual_table(&self, table: Arc<crate::VirtualTable>) -> Result<String> {
+        let name = self.db.register_virtual_table(table)?;
+        *self.schema.write() = self.db.clone_schema();
+        self.bump_prepare_context_generation();
+        Ok(name)
+    }
+
+    pub fn current_schema(&self) -> Arc<Schema> {
+        self.schema.read().clone()
+    }
+
+    pub fn attached_database_names(&self) -> Vec<String> {
+        self.attached_databases
+            .read()
+            .name_to_index
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     pub fn experimental_views_enabled(&self) -> bool {
         self.db.experimental_views_enabled()
     }
@@ -3100,7 +3132,7 @@ impl Connection {
         }
     }
 
-    fn is_attached(&self, alias: &str) -> bool {
+    pub(crate) fn is_attached(&self, alias: &str) -> bool {
         self.attached_databases
             .read()
             .name_to_index
@@ -4258,6 +4290,11 @@ impl Connection {
                 }
             }
         }
+    }
+
+    #[doc(hidden)]
+    pub fn db_file_path(&self) -> &str {
+        &self.db.path
     }
 
     /// Create a `TempDir` honoring `TURSO_TMPDIR` and `SQLITE_TMPDIR`,
