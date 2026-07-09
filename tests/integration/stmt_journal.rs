@@ -563,3 +563,114 @@ fn insert_replace_notnull_no_default_preserves_row(tmp_db: TempDatabase) -> anyh
     conn.execute("ROLLBACK")?;
     Ok(())
 }
+
+// ──────────────────────────────────────────────────────────
+// Throwing index expressions (issue 6877)
+// ──────────────────────────────────────────────────────────
+
+/// OR REPLACE with an expression index whose key expression can throw at
+/// runtime (LIKE with a multi-char ESCAPE) must use a statement journal:
+/// the conflicting row is deleted before the index key is evaluated, and
+/// the error must roll the delete back.
+#[turso_macros::test]
+fn insert_or_replace_throwing_expr_index_may_abort(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b INT)")?;
+    conn.execute("CREATE INDEX idx ON t(CASE WHEN b=2 THEN 'x' LIKE 'x' ESCAPE 'yy' ELSE b END)")?;
+    assert!(needs_stmt_journal(
+        &conn,
+        "INSERT OR REPLACE INTO t VALUES (1, 2)"
+    ));
+    Ok(())
+}
+
+/// Function calls can throw (abs() raises on i64::MIN), matching SQLite's
+/// usesStmtJournal=1 for the same statement.
+#[turso_macros::test]
+fn insert_or_replace_function_expr_index_may_abort(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b INT)")?;
+    conn.execute("CREATE INDEX idx ON t(abs(b))")?;
+    assert!(needs_stmt_journal(
+        &conn,
+        "INSERT OR REPLACE INTO t VALUES (1, 2)"
+    ));
+    Ok(())
+}
+
+/// Pure arithmetic cannot throw; SQLite reports usesStmtJournal=0 here and
+/// so must we — this pins the precision of the can-throw analysis.
+#[turso_macros::test]
+fn insert_or_replace_arithmetic_expr_index_no_journal(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b INT)")?;
+    conn.execute("CREATE INDEX idx ON t(b+1)")?;
+    assert!(!needs_stmt_journal(
+        &conn,
+        "INSERT OR REPLACE INTO t VALUES (1, 2)"
+    ));
+    Ok(())
+}
+
+/// A partial index with a throwing WHERE expression needs the journal too.
+#[turso_macros::test]
+fn insert_or_replace_throwing_partial_where_may_abort(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b INT)")?;
+    conn.execute("CREATE INDEX idx ON t(b) WHERE b LIKE 'x' ESCAPE 'y'")?;
+    assert!(needs_stmt_journal(
+        &conn,
+        "INSERT OR REPLACE INTO t VALUES (1, 2)"
+    ));
+    Ok(())
+}
+
+/// A partial index with a simple comparison WHERE does not.
+#[turso_macros::test]
+fn insert_or_replace_simple_partial_where_no_journal(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b INT)")?;
+    conn.execute("CREATE INDEX idx ON t(b) WHERE b > 5")?;
+    assert!(!needs_stmt_journal(
+        &conn,
+        "INSERT OR REPLACE INTO t VALUES (1, 2)"
+    ));
+    Ok(())
+}
+
+/// End-to-end regression for issue 6877: inside an explicit transaction, an
+/// INSERT OR REPLACE that deletes the conflicting row and then fails
+/// evaluating the expression-index key must restore the row; SQLite keeps
+/// 1|1 and integrity_check stays ok.
+#[turso_macros::test]
+fn insert_or_replace_expr_index_error_restores_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b INT)")?;
+    conn.execute("CREATE INDEX idx ON t(CASE WHEN b=2 THEN 'x' LIKE 'x' ESCAPE 'yy' ELSE b END)")?;
+    conn.execute("INSERT INTO t VALUES (1, 1)")?;
+    conn.execute("BEGIN")?;
+    assert!(
+        conn.execute("INSERT OR REPLACE INTO t VALUES (1, 2)")
+            .is_err(),
+        "index key evaluation must fail on the malformed ESCAPE"
+    );
+    conn.execute("COMMIT")?;
+    assert_eq!(query_rows(&conn, "SELECT id, b FROM t"), vec!["1|1"]);
+    assert_eq!(query_rows(&conn, "PRAGMA integrity_check"), vec!["ok"]);
+    Ok(())
+}
+
+/// A throwing function in the statement's own expressions (not an index)
+/// must also force the journal: SQLite emits usesStmtJournal=1 for this
+/// statement because any OP_Function taints mayAbort (sqlite3VdbeAddFunctionCall).
+#[turso_macros::test]
+fn insert_or_replace_function_in_values_may_abort(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b INT)")?;
+    conn.execute("CREATE INDEX idx ON t(b)")?;
+    assert!(needs_stmt_journal(
+        &conn,
+        "INSERT OR REPLACE INTO t VALUES (1, abs(5))"
+    ));
+    Ok(())
+}
