@@ -158,7 +158,12 @@ class Database {
 
   private db: NativeDatabase;
   private ioStep: () => Promise<void>;
-  private execLock: AsyncLock;
+  // Serializes native calls on this connection. Subclasses that also drive
+  // the same underlying core database from async worker tasks (the sync
+  // engine on wasm) must hold this lock around those windows too: on
+  // browser wasm the main thread cannot block on a contended core lock, so
+  // main-thread native calls must never overlap an in-flight worker task.
+  protected execLock: AsyncLock;
   protected connected: boolean = false;
 
   constructor(db: NativeDatabase, ioStep?: () => Promise<void>) {
