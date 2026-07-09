@@ -1101,6 +1101,8 @@ struct CommitInfo {
     page_sources: Vec<PageSource>,
     page_source_cursor: usize,
     prepared_frames: Vec<PreparedFrames>,
+    #[cfg(test)]
+    wal_frames_cached_before_commit_publish: bool,
 }
 
 /// Represents a dirty page that will be committed to the log.
@@ -1120,6 +1122,10 @@ impl CommitInfo {
         self.page_sources.clear();
         self.prepared_frames.clear();
         self.page_source_cursor = 0;
+        #[cfg(test)]
+        {
+            self.wal_frames_cached_before_commit_publish = false;
+        }
     }
 
     /// Clear and reserve space for n pages in each vector.
@@ -1357,6 +1363,8 @@ pub struct Pager {
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
+    #[cfg(test)]
+    commit_yield_after_wal_frames_cached_before_publish: AtomicBool,
     checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
     auto_vacuum_mode: AtomicU8,
@@ -1651,7 +1659,11 @@ impl Pager {
                 prepared_frames: Vec::new(),
                 page_sources: Vec::new(),
                 page_source_cursor: 0,
+                #[cfg(test)]
+                wal_frames_cached_before_commit_publish: false,
             }),
+            #[cfg(test)]
+            commit_yield_after_wal_frames_cached_before_publish: AtomicBool::new(false),
             syncing: Arc::new(AtomicBool::new(false)),
             checkpoint_state: RwLock::new(CheckpointState::default()),
             buffer_pool,
@@ -4333,11 +4345,33 @@ impl Pager {
                 CommitState::WalCommitDone => {
                     // all I/O complete, NOW it's safe to advance WAL state
                     let mut commit_info = self.commit_info.write();
-                    wal.commit_prepared_frames(&commit_info.prepared_frames);
+                    #[cfg(test)]
+                    {
+                        if !commit_info.wal_frames_cached_before_commit_publish {
+                            wal.commit_prepared_frames(&commit_info.prepared_frames);
+                            commit_info.wal_frames_cached_before_commit_publish = true;
+                        }
+                        if self
+                            .commit_yield_after_wal_frames_cached_before_publish
+                            .swap(false, Ordering::AcqRel)
+                        {
+                            return Ok(IOResult::IO(
+                                IOCompletions::Single(Completion::new_yield()),
+                            ));
+                        }
+                    }
+                    #[cfg(not(test))]
+                    {
+                        wal.commit_prepared_frames(&commit_info.prepared_frames);
+                    }
                     wal.finalize_committed_pages(&commit_info.prepared_frames);
                     wal.finish_append_frames_commit()?;
                     self.dirty_pages.write().clear();
                     commit_info.prepared_frames.clear();
+                    #[cfg(test)]
+                    {
+                        commit_info.wal_frames_cached_before_commit_publish = false;
+                    }
 
                     let need_checkpoint = allowed_auto_actions.contains(WalAutoActions::Checkpoint)
                         && wal.should_checkpoint();
@@ -5924,13 +5958,106 @@ pub(crate) mod ptrmap {
 
 #[cfg(test)]
 mod tests {
-    use crate::sync::Arc;
-
-    use crate::sync::RwLock;
-
     use crate::storage::page_cache::{PageCache, PageCacheKey};
+    use crate::sync::atomic::Ordering;
+    use crate::sync::Arc;
+    use crate::sync::RwLock;
+    use crate::{Connection, Database, PlatformIO, StepResult, IO};
 
     use super::Page;
+
+    const CREATE_TABLE: &str = "CREATE TABLE t(k BLOB PRIMARY KEY, v INTEGER)";
+    const CONN0_INSERT: &str = "INSERT INTO t(k, v) VALUES (zeroblob(5735), 577)";
+
+    fn exec_ok(conn: &Arc<Connection>, sql: &str) {
+        conn.execute(sql)
+            .unwrap_or_else(|err| panic!("failed `{sql}`: {err}"));
+    }
+
+    fn is_locked_error(err: &str) -> bool {
+        let err = err.to_ascii_lowercase();
+        err.contains("database is locked") || err.contains("database is busy")
+    }
+
+    fn exec_locked(conn: &Arc<Connection>, sql: &str) {
+        let err = conn
+            .execute(sql)
+            .expect_err("statement should be blocked by conn0's write tx")
+            .to_string();
+        assert!(
+            is_locked_error(&err),
+            "expected lock error for `{sql}`, got {err}"
+        );
+    }
+
+    fn query_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
+        let mut stmt = conn
+            .prepare(sql)
+            .unwrap_or_else(|err| panic!("failed to prepare `{sql}`: {err}"));
+        match stmt.step().unwrap() {
+            StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
+            other => panic!("expected row from `{sql}`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn committed_row_visible_after_wal_frames_cached_before_commit_publish_yield() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wal-frame-cache-visible-before-publish.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io.clone(), db_path.to_str().unwrap()).unwrap();
+
+        let setup = db.connect().unwrap();
+        exec_ok(&setup, "PRAGMA data_sync_retry = 1");
+        exec_ok(&setup, CREATE_TABLE);
+
+        let conn0 = db.connect().unwrap();
+        let conn1 = db.connect().unwrap();
+        exec_ok(&conn0, "PRAGMA data_sync_retry = 1");
+        exec_ok(&conn1, "PRAGMA data_sync_retry = 1");
+
+        conn0
+            .pager
+            .load()
+            .commit_yield_after_wal_frames_cached_before_publish
+            .store(true, Ordering::Release);
+
+        let mut conn0_stmt = conn0.prepare(CONN0_INSERT).unwrap();
+        loop {
+            match conn0_stmt.step().unwrap() {
+                StepResult::Yield => break,
+                StepResult::IO => io.step().unwrap(),
+                StepResult::Done => panic!("conn0 completed before commit-publish yield fired"),
+                StepResult::Row => {}
+                StepResult::Interrupt | StepResult::Busy => {
+                    panic!("conn0 stopped before commit-publish yield fired")
+                }
+            }
+        }
+
+        exec_ok(&conn1, "BEGIN");
+        exec_ok(&conn1, "SAVEPOINT s");
+        exec_locked(
+            &conn1,
+            "INSERT INTO t(k, v) VALUES (x'6c6f75645f73756e5f383333', 233)",
+        );
+        exec_ok(&conn1, "ROLLBACK TO s");
+
+        conn0_stmt.run_ignore_rows().unwrap();
+
+        let conn2 = db.connect().unwrap();
+        exec_ok(&conn2, "PRAGMA data_sync_retry = 1");
+        assert_eq!(
+            query_single_i64(
+                &conn2,
+                "SELECT COUNT(*) FROM t WHERE k = zeroblob(5735) AND v = 577",
+            ),
+            1
+        );
+
+        exec_ok(&conn1, "RELEASE s");
+        exec_ok(&conn1, "COMMIT");
+    }
 
     #[test]
     fn test_shared_cache() {
