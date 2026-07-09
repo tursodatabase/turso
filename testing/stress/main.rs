@@ -810,6 +810,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
                     progress_bar.tick();
                     iteration_count_this_batch += 1;
+                    turso_stress::note_progress();
                 }
 
                 // In case this thread is running an exclusive transaction, commit it so that it doesn't block other threads.
