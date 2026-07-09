@@ -2219,7 +2219,8 @@ fn test_blocking_truncate_zeros_log_when_commit_races_acquire_lock() {
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
         .unwrap();
-    conn.execute("INSERT INTO t1 VALUES (1, 'pending')").unwrap();
+    conn.execute("INSERT INTO t1 VALUES (1, 'pending')")
+        .unwrap();
 
     let mvcc_store = db.get_mvcc_store();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
@@ -16734,11 +16735,10 @@ fn test_integrity_check_tolerates_dropped_root_reused_as_btree_child() {
         .as_int()
         .unwrap();
     assert!(page_count > root_page, "t should span multiple pages");
-    {
-        let mut schema_guard = conn.db.schema.lock();
-        let schema = std::sync::Arc::make_mut(&mut schema_guard);
+    conn.with_schema_mut(|schema| {
         schema.dropped_root_pages.insert(page_count);
-    }
+    })
+    .unwrap();
 
     let rows = get_rows(&conn, "PRAGMA integrity_check");
     assert_eq!(rows.len(), 1);

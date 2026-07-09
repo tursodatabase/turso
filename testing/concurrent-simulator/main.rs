@@ -401,7 +401,12 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
     } else if is_btree_rebalance_mode(&args.mode) {
         let w: Vec<(u32, Box<dyn Workload>)> = vec![
             (20, Box::new(IntegrityCheckWorkload)),
-            (5, Box::new(WalCheckpointWorkload)),
+            (
+                5,
+                Box::new(WalCheckpointWorkload {
+                    allow_passive: false,
+                }),
+            ),
         ];
         let p: Vec<Box<dyn Property>> = vec![Box::new(IntegrityCheckProperty)];
         let chaotic: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)> = vec![(

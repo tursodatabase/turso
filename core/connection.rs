@@ -1875,7 +1875,9 @@ impl Connection {
             // materialized, so consumers that skip negative roots (integrity_check) see them.
             let mv_store_guard = self.db.get_mv_store();
             if let Some(mv_store) = mv_store_guard.as_ref() {
-                mv_store.resolve_schema_negative_roots(Arc::make_mut(&mut adopted));
+                if let Ok(schema) = Schema::try_make_mut(&mut adopted) {
+                    mv_store.resolve_schema_negative_roots(schema);
+                }
             }
             *self.schema.write() = adopted;
             self.bump_prepare_context_generation();

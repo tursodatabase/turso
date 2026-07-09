@@ -2089,6 +2089,7 @@ impl Database {
                 self.durable_storage.clone(),
                 None,
                 self.mv_store_allocator.clone(),
+                self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));
             let mvcc_bootstrap_conn = self._connect(true, None, None)?;
