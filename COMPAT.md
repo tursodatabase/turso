@@ -152,6 +152,13 @@ writer without risking the second writer's state. Returning `SQLITE_BUSY` keeps
 the connection state simple: finish or reset the active writer first, then start
 the next write statement.
 
+`SAVEPOINT`, `RELEASE`, and `ROLLBACK TO` also return `SQLITE_BUSY` while a
+write statement on the connection is active. SQLite rejects `SAVEPOINT` and
+`RELEASE` the same way ("SQL statements in progress"); for `ROLLBACK TO` it
+instead aborts the in-progress statements, which Turso does not support, so
+Turso rejects that too rather than let a suspended writer resume over pages the
+rollback just restored.
+
 These same-connection `SQLITE_BUSY` rejections are errors ("... - SQL
 statements in progress") that abort the rejected statement: it must be reset
 or re-executed, not merely stepped again, and the busy handler is never

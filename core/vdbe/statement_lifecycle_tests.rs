@@ -1101,6 +1101,95 @@ fn test_insert_is_busy_while_delete_returning_writer_is_active() {
     assert_eq!(env.observer_ids(), Vec::<i64>::new());
 }
 
+/// SQLite rejects SAVEPOINT and RELEASE with SQLITE_BUSY while write
+/// statements are in progress (vdbe.c, OP_Savepoint), and aborts in-progress
+/// statements on ROLLBACK TO. Turso cannot abort a suspended statement, so all
+/// three savepoint operations are rejected while a writer is suspended; the
+/// writer can then resume and the savepoint stack stays usable.
+#[test]
+fn test_wal_savepoint_ops_are_busy_while_writer_suspended() {
+    let env = SameConnectionWal::new(":memory:wal-savepoint-busy-mid-writer");
+    env.setup_rows_table();
+    env.conn
+        .execute("INSERT INTO rows VALUES (10, 'ten'), (20, 'twenty')")
+        .unwrap();
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    env.conn.execute("BEGIN").unwrap();
+    env.conn.execute("SAVEPOINT s").unwrap();
+
+    let mut writer = prepare_wal_update_yielding_on_table_read(&env, "updated");
+    expect_busy(
+        env.conn.execute("SAVEPOINT t"),
+        "SAVEPOINT while a writer is suspended",
+    );
+    expect_busy(
+        env.conn.execute("ROLLBACK TO s"),
+        "ROLLBACK TO while a writer is suspended",
+    );
+    expect_busy(
+        env.conn.execute("RELEASE s"),
+        "RELEASE while a writer is suspended",
+    );
+
+    finish_without_rows(&mut writer);
+    env.conn.execute("RELEASE s").unwrap();
+    env.conn.execute("COMMIT").unwrap();
+
+    assert_eq!(
+        scalar_text(&env.observer, "SELECT v FROM rows WHERE id = 10"),
+        "updated"
+    );
+    assert_eq!(
+        scalar_text(&env.observer, "SELECT v FROM rows WHERE id = 20"),
+        "updated"
+    );
+}
+
+#[test]
+fn test_wal_savepoint_is_busy_while_autocommit_writer_suspended() {
+    let env = SameConnectionWal::new(":memory:wal-savepoint-busy-autocommit-writer");
+    env.setup_rows_table();
+    env.conn
+        .execute("INSERT INTO rows VALUES (10, 'ten')")
+        .unwrap();
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mut writer = prepare_wal_update_yielding_on_table_read(&env, "updated");
+    expect_busy(
+        env.conn.execute("SAVEPOINT s"),
+        "SAVEPOINT while an autocommit writer is suspended",
+    );
+
+    finish_without_rows(&mut writer);
+    assert_eq!(
+        scalar_text(&env.observer, "SELECT v FROM rows WHERE id = 10"),
+        "updated"
+    );
+    env.conn.execute("SAVEPOINT s").unwrap();
+    env.conn.execute("RELEASE s").unwrap();
+}
+
+#[test]
+fn test_mvcc_savepoint_is_busy_while_writer_suspended() {
+    let env = SameConnectionMvcc::new(":memory:mvcc-savepoint-busy-mid-writer");
+    env.setup_rows_table();
+    env.conn
+        .execute("INSERT INTO rows VALUES (10, 'ten')")
+        .unwrap();
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    env.conn.execute("BEGIN").unwrap();
+
+    let mut writer = prepare_yielding_update_all_rows(&env.conn, "updated");
+    expect_busy(
+        env.conn.execute("SAVEPOINT s"),
+        "SAVEPOINT while an MVCC writer is suspended",
+    );
+
+    finish_without_rows(&mut writer);
+    env.conn.execute("COMMIT").unwrap();
+    assert_eq!(env.observer_value_for_id(10), "updated");
+}
+
 /// A same-connection rejection must bypass the busy handler: only the
 /// application finishing or resetting its own statement can resolve it, so
 /// retrying would burn the whole busy_timeout before failing anyway. The

@@ -4256,6 +4256,24 @@ pub fn op_savepoint(
     let conn = program.connection.clone();
     let mv_store = conn.mv_store();
 
+    // No savepoint operation may run while a write statement on this
+    // connection is suspended mid-execution. SQLite rejects SAVEPOINT and
+    // RELEASE with SQLITE_BUSY while write statements are in progress
+    // (vdbe.c, OP_Savepoint: "cannot open/release savepoint - SQL statements
+    // in progress"). SQLite does allow ROLLBACK TO there because it trips all
+    // open cursors so the affected statements abort instead of resuming;
+    // Turso has no cursor-tripping mechanism, and letting a suspended writer
+    // resume on top of pages restored by ROLLBACK TO would interleave two
+    // inconsistent page states. Rejecting all three keeps the rule simple:
+    // finish or reset the active writer first.
+    if !conn.is_nested_stmt() && conn.n_active_writes.load(Ordering::SeqCst) > 0 {
+        return Err(LimboError::StatementsInProgress(match *op {
+            SavepointOp::Begin => "cannot open savepoint",
+            SavepointOp::Release => "cannot release savepoint",
+            SavepointOp::RollbackTo => "cannot rollback savepoint",
+        }));
+    }
+
     match *op {
         SavepointOp::Begin => {
             conn.with_savepoint_schema_snapshot(
