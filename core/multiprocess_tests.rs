@@ -29,6 +29,8 @@ const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
 const MULTIPROCESS_SHM_EXPECT_OPEN_FAILURE_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_expect_open_failure_child_process";
 const DEFAULT_LOCKED_DB_CHILD_TEST: &str = "multiprocess_tests::default_locked_db_child_process";
+const MULTIPROCESS_ASYNC_OPEN_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_async_open_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
@@ -131,6 +133,31 @@ fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
         multiprocess_wal_db_opts(),
         None,
     )
+}
+
+/// Mimic the sdk-kit async open path: the caller pre-opens the DB file with
+/// NoLock but hands `OpenFlags::default()` to `open_with_flags_async`, so the
+/// async entrypoint itself must re-derive the multiprocess lock mode before
+/// the WAL file is opened.
+fn open_multiprocess_db_async(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
+    let file = io.open_file(path, OpenFlags::default() | OpenFlags::NoLock, true)?;
+    let db_file = Arc::new(DatabaseFile::new(file));
+    let mut state = OpenDbAsyncState::new();
+    loop {
+        match Database::open_with_flags_async(
+            &mut state,
+            io.clone(),
+            path,
+            db_file.clone(),
+            OpenFlags::default(),
+            multiprocess_wal_db_opts(),
+            None,
+            None,
+        )? {
+            IOResult::Done(db) => return Ok(db),
+            IOResult::IO(io_completion) => io_completion.wait(&*io)?,
+        }
+    }
 }
 
 fn open_multiprocess_db_with_flags(
@@ -352,6 +379,47 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_multiproce
         String::from_utf8_lossy(&child_output.stdout),
         String::from_utf8_lossy(&child_output.stderr)
     );
+}
+
+#[test]
+fn database_open_async_with_default_flags_allows_second_multiprocess_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-async-open.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db_async(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(value) values ('parent')")
+        .unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_ASYNC_OPEN_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "second async multiprocess open must not be blocked by a WAL file lock: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+#[test]
+fn multiprocess_async_open_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db_async(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db.connect().unwrap();
+    assert_eq!(count_test_rows(&conn), 1);
 }
 
 #[test]

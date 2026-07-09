@@ -1113,6 +1113,11 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<IOResult<Arc<Database>>> {
+        // Re-derive lock-mode flags from opts the same way the sync
+        // `open_file_with_flags` path does: multiprocess WAL must open the
+        // WAL file with NoLock or the second process fails to lock `-wal`.
+        #[cfg(feature = "fs")]
+        let flags = Self::effective_open_flags_for_path(&io, path, flags, opts)?;
         Self::open_with_flags_async_with_allocator(
             state,
             io,
