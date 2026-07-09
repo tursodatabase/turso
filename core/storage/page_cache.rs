@@ -212,7 +212,8 @@ impl PageCache {
         self._insert(key, value, true, false)
     }
 
-    /// Insert or replace a page without enforcing the cache capacity.
+    /// Insert or replace a page, exceeding the cache capacity if eviction
+    /// cannot make room.
     ///
     /// Savepoint rollback uses this while restoring subjournaled before-images:
     /// rollback must restore every page it journaled even when the cache is full
@@ -224,7 +225,31 @@ impl PageCache {
         key: PageCacheKey,
         value: PageRef,
     ) -> Result<(), CacheError> {
-        self._insert(key, value, true, true)
+        match self.upsert_page(key, value.clone()) {
+            Err(CacheError::Full) => self._insert(key, value, true, true),
+            result => result,
+        }
+    }
+
+    /// Insert a page, exceeding the cache capacity if eviction cannot make
+    /// room.
+    ///
+    /// The capacity is a soft limit, as in SQLite: when a normal insert
+    /// fails with [`CacheError::Full`] every resident page is unevictable
+    /// (pinned, held by a cursor, or dirty and unspillable), so refusing the
+    /// insert cannot reclaim any memory — the page and its buffer are
+    /// already allocated — it can only fail the statement. Admit the page
+    /// over capacity instead; subsequent inserts drain the excess back under
+    /// capacity as pages become evictable again.
+    pub fn force_insert_page(
+        &mut self,
+        key: PageCacheKey,
+        value: PageRef,
+    ) -> Result<(), CacheError> {
+        match self.insert(key, value.clone()) {
+            Err(CacheError::Full) => self._insert(key, value, false, true),
+            result => result,
+        }
     }
 
     pub fn _insert(
@@ -1093,6 +1118,43 @@ mod tests {
 
         assert_eq!(result, Err(CacheError::Full));
         assert_eq!(cache.len(), 2);
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_force_insert_allows_temporary_over_capacity_cache() {
+        let mut cache = PageCache::new_with_spill(2, true);
+        let key1 = insert_page(&mut cache, 1);
+        let key2 = insert_page(&mut cache, 2);
+
+        // Make both pages dirty (unevictable): a normal insert must fail.
+        for key in [key1, key2] {
+            cache.notify_page_dirty(key);
+            cache.peek(&key, false).unwrap().set_dirty();
+        }
+        let key3 = create_key(3);
+        assert_eq!(
+            cache.insert(key3, page_with_content(3)),
+            Err(CacheError::Full)
+        );
+
+        // The capacity is a soft limit: a forced insert must succeed.
+        cache.force_insert_page(key3, page_with_content(3)).unwrap();
+        assert_eq!(cache.len(), 3);
+        assert!(cache.contains_key(&key3));
+        cache.verify_cache_integrity();
+
+        // Once pages become evictable again, the next normal insert drains
+        // the excess back under capacity.
+        for key in [key1, key2] {
+            cache.notify_page_spilled(key);
+            cache.peek(&key, false).unwrap().set_spilled();
+        }
+        let key4 = create_key(4);
+        cache.insert(key4, page_with_content(4)).unwrap();
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_key(&key4));
         cache.verify_cache_integrity();
     }
 
