@@ -26,6 +26,16 @@ impl YieldInjector for FixedYieldInjector {
     }
 }
 
+fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) {
+    let mut state = crate::connection::AttachDatabaseState::default();
+    loop {
+        match conn.attach_database(path, alias, &mut state).unwrap() {
+            crate::IOResult::Done(()) => return,
+            crate::IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
+        }
+    }
+}
+
 fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     let mut stmt = conn.prepare(query).unwrap();
     let mut rows = Vec::new();
@@ -181,10 +191,17 @@ fn expect_unfinished_write_commit_error(result: Result<()>) {
     );
 }
 
-fn expect_io_yield(stmt: &mut crate::Statement, context: &str) {
-    match stmt.step().unwrap() {
-        crate::StepResult::IO => {}
-        other => panic!("expected injected IO yield during {context}, got {other:?}"),
+/// Step until the injected yield suspends the statement mid-execution,
+/// driving any genuine I/O encountered before the injection point. Injected
+/// yields surface as `StepResult::Yield` (explicit yields are not stored as
+/// pending I/O), so the statement stays parked at the same PC afterwards.
+fn expect_injected_yield(stmt: &mut crate::Statement, context: &str) {
+    loop {
+        match stmt.step().unwrap() {
+            crate::StepResult::Yield => return,
+            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            other => panic!("expected injected yield during {context}, got {other:?}"),
+        }
     }
 }
 
@@ -229,7 +246,7 @@ fn prepare_yielding_statement(
 ) -> crate::Statement {
     conn.set_yield_injector(Some(FixedYieldInjector::new([yield_point.point()])));
     let mut stmt = conn.prepare(sql).unwrap();
-    expect_io_yield(&mut stmt, context);
+    expect_injected_yield(&mut stmt, context);
     conn.set_yield_injector(None);
     stmt
 }
@@ -256,7 +273,7 @@ fn prepare_wal_update_yielding_on_table_read(
         .conn
         .prepare(format!("UPDATE rows SET v = '{value}'"))
         .unwrap();
-    expect_io_yield(&mut stmt, "WAL UPDATE table read");
+    expect_injected_yield(&mut stmt, "WAL UPDATE table read");
     stmt
 }
 
@@ -788,12 +805,12 @@ fn test_attached_only_returning_writer_defers_shared_auto_txn_commit() {
     let aux_path = aux_path.to_str().unwrap();
 
     let conn = db.connect().unwrap();
-    conn.attach_database(aux_path, "aux").unwrap();
+    drive_attach(&conn, aux_path, "aux");
     conn.execute("CREATE TABLE aux.rows(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
 
     let observer = db.connect().unwrap();
-    observer.attach_database(aux_path, "aux").unwrap();
+    drive_attach(&observer, aux_path, "aux");
 
     let mut returning = conn
         .prepare("INSERT INTO aux.rows VALUES (1, 'one'), (2, 'two') RETURNING id")
