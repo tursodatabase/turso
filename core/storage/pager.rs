@@ -3346,7 +3346,7 @@ impl Pager {
         }
 
         match self.try_spill_dirty_pages()? {
-            IOResult::Done(_) => {
+            IOResult::Done(()) => {
                 let mut page_cache = self.page_cache.write();
                 let page_key = PageCacheKey::new(page_idx);
                 match page_cache.force_insert_page(page_key, page) {
@@ -3721,7 +3721,7 @@ impl Pager {
     /// then mark them as spilled so they can be evicted even while dirty.
     /// For ephemeral tables: writes pages directly to the temp database file.
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn try_spill_dirty_pages(&self) -> Result<IOResult<bool>> {
+    fn try_spill_dirty_pages(&self) -> Result<IOResult<()>> {
         loop {
             let state = self.spill_state.read().clone();
             match state {
@@ -3733,17 +3733,17 @@ impl Pager {
                     };
                     match spill_result {
                         SpillResult::NotNeeded | SpillResult::Disabled => {
-                            return Ok(IOResult::Done(false));
+                            return Ok(IOResult::Done(()));
                         }
                         SpillResult::CacheFull => {
                             tracing::debug!(
                                 "try_spill_dirty_pages: cache full, no spillable pages"
                             );
-                            return Ok(IOResult::Done(false));
+                            return Ok(IOResult::Done(()));
                         }
                         SpillResult::PagesToSpill(pages) => {
                             if pages.is_empty() {
-                                return Ok(IOResult::Done(false));
+                                return Ok(IOResult::Done(()));
                             }
                             let page_count = pages.len();
                             tracing::debug!("try_spill_dirty_pages: spilling {} pages", page_count);
@@ -3779,7 +3779,7 @@ impl Pager {
                                 let completions = self.spill_pages_to_disk(&pages)?;
                                 if completions.is_empty() {
                                     self.finish_ephemeral_spill(&pages);
-                                    return Ok(IOResult::Done(true));
+                                    return Ok(IOResult::Done(()));
                                 }
                                 for completion in &completions {
                                     group.add(completion);
@@ -3853,7 +3853,7 @@ impl Pager {
                         spilled_count,
                         pages.len(),
                     );
-                    return Ok(IOResult::Done(true));
+                    return Ok(IOResult::Done(()));
                 }
                 SpillState::WritingToDisk { pages, completions } => {
                     let all_done = completions.iter().all(|c| c.succeeded());
@@ -3871,18 +3871,18 @@ impl Pager {
                         "try_spill_dirty_pages: successfully spilled {} pages to disk",
                         pages.len()
                     );
-                    return Ok(IOResult::Done(true));
+                    return Ok(IOResult::Done(()));
                 }
             }
         }
     }
 
-    /// Append the prepared spill `pages` as WAL frames. Returns
-    /// `Done(true)` if the write completed synchronously, otherwise
-    /// transitions to `SpillState::WritingToWal` and yields the write
-    /// completion. The WAL must already be initialized (callers route
-    /// through `PreparingWal*` first).
-    fn spill_append_frames_to_wal(&self, pages: Vec<PinGuard>) -> Result<IOResult<bool>> {
+    /// Append the prepared spill `pages` as WAL frames. Returns `Done` if
+    /// the write completed synchronously, otherwise transitions to
+    /// `SpillState::WritingToWal` and yields the write completion. The WAL
+    /// must already be initialized (callers route through `PreparingWal*`
+    /// first).
+    fn spill_append_frames_to_wal(&self, pages: Vec<PinGuard>) -> Result<IOResult<()>> {
         let wal = self
             .wal
             .as_ref()
@@ -3913,7 +3913,7 @@ impl Pager {
                 }
             }
             *self.spill_state.write() = SpillState::Idle;
-            return Ok(IOResult::Done(true));
+            return Ok(IOResult::Done(()));
         }
         *self.spill_state.write() = SpillState::WritingToWal {
             pages,
@@ -3931,7 +3931,7 @@ impl Pager {
                 return Ok(IOResult::Done(()));
             }
             match self.try_spill_dirty_pages()? {
-                IOResult::Done(_) => continue,
+                IOResult::Done(()) => continue,
                 IOResult::IO(c) => return Ok(IOResult::IO(c)),
             }
         }
@@ -3968,7 +3968,7 @@ impl Pager {
 
     /// Check if the cache needs spilling and attempt to spill if necessary.
     /// This should be called before inserting new pages into the cache.
-    pub fn ensure_cache_space(&self) -> Result<IOResult<()>> {
+    fn ensure_cache_space(&self) -> Result<IOResult<()>> {
         let needs_spill = {
             let cache = self.page_cache.read();
             cache.needs_spill()
@@ -3976,7 +3976,7 @@ impl Pager {
 
         if needs_spill {
             match self.try_spill_dirty_pages()? {
-                IOResult::Done(_) => {
+                IOResult::Done(()) => {
                     // Whether or not anything could be spilled, proceed: the
                     // capacity is a soft limit, and the upcoming insert
                     // evicts what it can and admits the page over capacity

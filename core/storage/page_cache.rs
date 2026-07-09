@@ -1,4 +1,4 @@
-use crate::sync::{atomic::Ordering, Arc};
+use crate::sync::Arc;
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
 use rustc_hash::FxHashMap as HashMap;
 use tracing::trace;
@@ -126,8 +126,6 @@ pub enum CacheError {
     Dirty { pgno: usize },
     #[error("page {pgno} is pinned")]
     Pinned { pgno: usize },
-    #[error("cache active refs")]
-    ActiveRefs,
     #[error("Page cache is full")]
     Full,
     #[error("key already exists")]
@@ -157,7 +155,7 @@ impl PageCache {
     }
 
     /// Create a new PageCache with explicit spill control.
-    pub fn new_with_spill(capacity: usize, spill_enabled: bool) -> Self {
+    fn new_with_spill(capacity: usize, spill_enabled: bool) -> Self {
         let spill_threshold = (capacity * DEFAULT_SPILL_THRESHOLD_PERCENT) / 100;
         Self {
             capacity,
@@ -208,7 +206,7 @@ impl PageCache {
     }
 
     #[inline]
-    pub fn upsert_page(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
+    fn upsert_page(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
         self._insert(key, value, true, false)
     }
 
@@ -252,7 +250,7 @@ impl PageCache {
         }
     }
 
-    pub fn _insert(
+    fn _insert(
         &mut self,
         key: PageCacheKey,
         value: PageRef,
@@ -493,18 +491,6 @@ impl PageCache {
         self.spill_enabled = enabled;
     }
 
-    /// Get the current spill threshold (number of pages).
-    #[inline]
-    pub fn spill_threshold(&self) -> usize {
-        self.spill_threshold
-    }
-
-    /// Set a custom spill threshold (number of pages).
-    /// The threshold will be clamped to be at least 1 and at most capacity.
-    pub fn set_spill_threshold(&mut self, threshold: usize) {
-        self.spill_threshold = threshold.clamp(1, self.capacity);
-    }
-
     #[inline]
     fn spillable(page: &PageRef) -> bool {
         page.is_dirty()
@@ -562,13 +548,13 @@ impl PageCache {
 
     /// Get the current evictable page count (for diagnostics/testing).
     #[cfg(test)]
-    pub fn evictable_count(&self) -> usize {
+    fn evictable_count(&self) -> usize {
         self.evictable_count
     }
 
     /// Collect dirty pages that can be spilled to make room in the cache.
     /// Pages that are locked or pinned are skipped.
-    pub fn collect_spillable_pages(&self, max_pages: usize) -> Vec<PinGuard> {
+    fn collect_spillable_pages(&self, max_pages: usize) -> Vec<PinGuard> {
         if !self.spill_enabled || max_pages == 0 {
             return Vec::new();
         }
@@ -587,17 +573,6 @@ impl PageCache {
         }
         spillable.sort_by_key(|pg| pg.get().id);
         spillable
-    }
-
-    /// Returns the number of dirty pages currently in the cache.
-    pub fn dirty_count(&self) -> usize {
-        self.map
-            .values()
-            .filter(|&&entry_ptr| {
-                let entry = unsafe { &*entry_ptr };
-                entry.page.is_dirty()
-            })
-            .count()
     }
 
     /// Check if the cache needs spilling and return appropriate result.
@@ -626,7 +601,7 @@ impl PageCache {
     /// their ref_bit and leaving them in place; only pages with ref_bit == 0 are evicted.
     ///
     /// Returns `CacheError::Full` if not enough pages can be evicted
-    pub fn make_room_for(&mut self, n: usize, bypass_capacity: bool) -> Result<(), CacheError> {
+    fn make_room_for(&mut self, n: usize, bypass_capacity: bool) -> Result<(), CacheError> {
         if bypass_capacity {
             return Ok(());
         }
@@ -784,7 +759,10 @@ impl PageCache {
         Ok(())
     }
 
-    pub fn print(&self) {
+    #[cfg(test)]
+    fn print(&self) {
+        use crate::sync::atomic::Ordering;
+
         tracing::debug!("page_cache_len={}", self.map.len());
 
         let mut cursor = self.queue.front();
@@ -1417,7 +1395,7 @@ mod tests {
 
                     tracing::debug!("inserting page {:?}", key);
                     match cache.insert(key, page.clone()) {
-                        Err(CacheError::Full | CacheError::ActiveRefs) => {} // Expected, ignore
+                        Err(CacheError::Full) => {} // Expected, ignore
                         Err(err) => {
                             panic!("Cache insertion failed unexpectedly: {err:?}");
                         }
