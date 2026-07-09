@@ -3397,6 +3397,99 @@ fn test_checkpoint_stale_boundary_does_not_replay_checkpointed_create_table_afte
     assert_eq!(&rows[0][1].to_string(), "persisted");
 }
 
+#[test]
+fn test_checkpoint_post_durable_failure_then_unique_update_removes_stale_autoindex_entry() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        [
+            "PRAGMA mvcc_checkpoint_threshold = -1",
+            "CREATE TABLE t(a UNIQUE, b, c PRIMARY KEY)",
+            "INSERT INTO t VALUES ('old', 1.0, 1)",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            "UPDATE t SET a = 'mid', b = 2.0 WHERE c = 1",
+        ]
+        .iter()
+        .for_each(|sql| conn.execute(sql).unwrap());
+
+        let checkpoint_conn = db.connect();
+        let failure_injector = FixedFailureInjector::new([(
+            CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+            LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+        )]);
+        checkpoint_conn.set_failure_injector(Some(failure_injector));
+        checkpoint_conn
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect_err("checkpoint should fail after pager commit");
+
+        conn.execute("UPDATE t SET a = 'new', b = 3.0 WHERE c = 1")
+            .unwrap();
+        assert_integrity_ok(&conn);
+    }
+
+    db.restart();
+    let conn = db.connect();
+    assert_integrity_ok(&conn);
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(
+        &conn,
+        "SELECT rowid, a, b, c FROM t INDEXED BY sqlite_autoindex_t_1 WHERE c = 1",
+    );
+    assert_eq!(
+        rows.len(),
+        1,
+        "stale autoindex entries after checkpoint: {rows:?}"
+    );
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "new");
+    assert_eq!(rows[0][3].as_int().unwrap(), 1);
+    assert_integrity_ok(&conn);
+}
+
+#[test]
+fn test_checkpoint_post_durable_failure_then_delete_removes_stale_table_row() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'keep')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        conn.execute("INSERT INTO t VALUES (2, 'doomed')").unwrap();
+
+        let checkpoint_conn = db.connect();
+        let failure_injector = FixedFailureInjector::new([(
+            CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+            LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+        )]);
+        checkpoint_conn.set_failure_injector(Some(failure_injector));
+        checkpoint_conn
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect_err("checkpoint should fail after pager commit");
+        checkpoint_conn.set_failure_injector(None);
+
+        conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+        assert_integrity_ok(&conn);
+    }
+
+    db.restart();
+    let conn = db.connect();
+    assert_integrity_ok(&conn);
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1, "stale table rows after checkpoint: {rows:?}");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "keep");
+    assert_integrity_ok(&conn);
+}
+
 /// What this test checks: Replay gate uses metadata boundary and never applies frames at or below it.
 /// Why this matters: This enforces exactly-once effects at the DB-file apply boundary.
 #[test]

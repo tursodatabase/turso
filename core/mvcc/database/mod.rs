@@ -8120,9 +8120,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             allocator.insert_row_id_maybe_update(rowid.row_id.to_int_or_panic());
                         }
                         StreamingResult::DeleteTableRow {
-                            rowid,
-                            commit_ts,
-                            btree_resident,
+                            rowid, commit_ts, ..
                         } => {
                             max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
                             if commit_ts <= replay_cutoff_ts {
@@ -8183,7 +8181,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                             TxTimestampOrID::Timestamp(commit_ts),
                                         )),
                                         row: tombstone_row.clone(),
-                                        btree_resident,
+                                        btree_resident: true,
                                     };
                                     self.insert_version_raw(&mut versions, row_version)?;
                                 }
@@ -8196,7 +8194,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                         TxTimestampOrID::Timestamp(commit_ts),
                                     )),
                                     row: tombstone_row,
-                                    btree_resident,
+                                    btree_resident: true,
                                 };
                                 let versions =
                                     self.get_or_create_table_row_versions(rowid.clone())?;
@@ -8262,7 +8260,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             row,
                             rowid,
                             commit_ts,
-                            btree_resident,
+                            ..
                         } => {
                             max_commit_ts_seen = max_commit_ts_seen.max(commit_ts);
                             if commit_ts <= replay_cutoff_ts {
@@ -8293,7 +8291,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     TxTimestampOrID::Timestamp(commit_ts),
                                 )),
                                 row: row.clone(),
-                                btree_resident,
+                                btree_resident: true,
                             };
                             self.insert_index_version(rowid.table_id, sortable_key, row_version)?;
                         }
