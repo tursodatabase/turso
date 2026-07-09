@@ -554,10 +554,6 @@ pub struct LogicalLog {
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
     encrypted_payload_chunk_size: usize,
-    /// Highest `commit_ts` appended since the last truncation. Lets `truncate` avoid
-    /// discarding frames above a checkpoint's boundary (commits that landed during the
-    /// off-lock checkpoint). Maintained under the write lock that also serializes appends,
-    /// so the comparison is race-free.
     max_appended_commit_ts: u64,
 }
 
@@ -627,8 +623,6 @@ impl LogicalLog {
     ) -> Result<(Completion, u64)> {
         let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
-        // Updated on write, not offset-advance: an abandoned deferred write can only
-        // over-estimate, making `truncate` conservatively skip — never lose frames.
         self.max_appended_commit_ts = self.max_appended_commit_ts.max(commit_ts);
         // `tx.buf` is laid out as:
         //   [LOG_HDR slot (56B, zeros)] [TX_HEADER slot (24B, zeros)] [payload]

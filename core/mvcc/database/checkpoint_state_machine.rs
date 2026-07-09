@@ -1454,7 +1454,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 
     fn truncate_logical_log(&self) -> Result<Completion> {
-        self.mvstore.storage.truncate(self.durable_txid_max_new)
+        let boundary = if self.mode.should_restart_log() {
+            u64::MAX
+        } else {
+            self.durable_txid_max_new
+        };
+        self.mvstore.storage.truncate(boundary)
     }
 
     /// Perform a TRUNCATE checkpoint on the WAL
