@@ -862,6 +862,133 @@ impl HybridBTreeDirectory {
         Ok(result)
     }
 
+    /// Read a file's full contents straight from the BTree, bypassing the
+    /// catalog and every cache layer. Returns `None` when the BTree holds no
+    /// rows for the path. Used to validate the shared directory cache
+    /// against durable state at cursor checkout.
+    fn read_file_from_btree_uncached(&self, path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+        let path_str = path.to_string_lossy().to_string();
+        let mut cursor =
+            BTreeCursor::new(self.pager.clone(), self.btree_root_page, Self::CHUNK_LEN);
+        cursor.index_info = Some(Arc::new(
+            IndexInfo::new(
+                [key_info(), key_info(), key_info()],
+                false,
+                Self::CHUNK_LEN,
+                false,
+            )
+            .expect(ALLOC_ERR_MSG),
+        ));
+
+        let seek_key = ImmutableRecord::from_values(
+            &[
+                Value::Text(Text::new(path_str.clone())),
+                Value::from_i64(0),
+                Value::Blob(vec![]),
+            ],
+            Self::CHUNK_LEN,
+        )
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        loop {
+            match cursor.seek(SeekKey::IndexKey(&seek_key), SeekOp::GE { eq_only: false }) {
+                Ok(IOResult::Done(SeekResult::Found)) => break,
+                Ok(IOResult::Done(SeekResult::TryAdvance)) => {
+                    loop {
+                        match cursor.next() {
+                            Ok(IOResult::Done(_)) => break,
+                            Ok(IOResult::IO(_)) => {
+                                self.pager
+                                    .io
+                                    .step()
+                                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                            }
+                            Err(e) => return Err(std::io::Error::other(e.to_string())),
+                        }
+                    }
+                    break;
+                }
+                Ok(IOResult::Done(SeekResult::NotFound)) => return Ok(None),
+                Ok(IOResult::IO(_)) => {
+                    self.pager
+                        .io
+                        .step()
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                }
+                Err(e) => return Err(std::io::Error::other(e.to_string())),
+            }
+        }
+
+        let mut result: Option<Vec<u8>> = None;
+        loop {
+            if !cursor.has_record() {
+                return Ok(result);
+            }
+            let record = loop {
+                match cursor.record() {
+                    Ok(IOResult::Done(r)) => break r,
+                    Ok(IOResult::IO(_)) => {
+                        self.pager
+                            .io
+                            .step()
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    }
+                    Err(e) => return Err(std::io::Error::other(e.to_string())),
+                }
+            };
+            let Some(record) = record else {
+                return Ok(result);
+            };
+            let matches_path = record.get_value_opt(0).is_some_and(|v| match v {
+                crate::types::ValueRef::Text(t) => t.value == path_str.as_str(),
+                _ => false,
+            });
+            if !matches_path {
+                return Ok(result);
+            }
+            let bytes = record.get_value_opt(2).and_then(|v| match v {
+                crate::types::ValueRef::Blob(b) => Some(b.to_vec()),
+                _ => None,
+            });
+            let Some(bytes) = bytes else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed chunk record",
+                ));
+            };
+            result
+                .get_or_insert_with(Vec::new)
+                .extend_from_slice(&bytes);
+            loop {
+                match cursor.next() {
+                    Ok(IOResult::Done(_)) => break,
+                    Ok(IOResult::IO(_)) => {
+                        self.pager
+                            .io
+                            .step()
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    }
+                    Err(e) => return Err(std::io::Error::other(e.to_string())),
+                }
+            }
+        }
+    }
+
+    /// True when this directory's in-memory view of the Tantivy metadata file
+    /// matches what the BTree currently holds. The shared directory cache can
+    /// go stale without any notification — a rolled-back transaction (or
+    /// savepoint) reverts the BTree while the cache keeps the state published
+    /// mid-transaction (issue 7522) — so cursors verify before trusting it.
+    fn is_consistent_with_btree(&self) -> std::io::Result<bool> {
+        let meta_path = Path::new(TANTIVY_META_FILE);
+        let Some(cached_meta) = self.hot_cache.get(meta_path) else {
+            // No in-memory metadata to compare — cannot vouch for the cache.
+            return Ok(false);
+        };
+        let btree_meta = self.read_file_from_btree_uncached(meta_path)?;
+        Ok(btree_meta.as_deref() == Some(&cached_meta[..]))
+    }
+
     /// Add a file to the hot cache.
     fn add_to_hot_cache(&self, path: PathBuf, data: Vec<u8>) {
         self.hot_cache.put(path, data);
@@ -2636,20 +2763,41 @@ impl IndexMethodCursor for FtsCursor {
                     // Open BTree cursor (needed for btree_root_page)
                     self.open_cursor(conn, database_id)?;
 
-                    // Check for cached directory, avoid expensive catalog reload
+                    // Check for cached directory, avoid expensive catalog reload.
+                    // The cache must be verified against the BTree before use:
+                    // a rolled-back transaction (or savepoint) reverts the
+                    // BTree while the cache keeps state published
+                    // mid-transaction, leaving it referencing segment files
+                    // that no longer exist (issue 7522).
                     {
-                        let cache = self.shared_directory_cache.read();
-                        if let Some(ref cached) = *cache {
+                        let mut cached_stale = false;
+                        {
+                            let cache = self.shared_directory_cache.read();
+                            if let Some(ref cached) = *cache {
+                                if cached.directory.is_consistent_with_btree().map_err(|e| {
+                                    LimboError::InternalError(format!(
+                                        "FTS cache validation failed: {e}"
+                                    ))
+                                })? {
+                                    tracing::debug!(
+                                        "FTS open_read: using cached directory (skipping catalog load)"
+                                    );
+                                    // Clone with fresh pending state to ensure this cursor's writes
+                                    // don't affect other cursors or cause Drop to flush after txn commits
+                                    self.hybrid_directory =
+                                        Some(cached.directory.clone_with_fresh_pending());
+                                    // Skip to CreatingIndex to build Index/Reader from cached directory
+                                    self.state = FtsState::CreatingIndex;
+                                    continue;
+                                }
+                                cached_stale = true;
+                            }
+                        }
+                        if cached_stale {
                             tracing::debug!(
-                                "FTS open_read: using cached directory (skipping catalog load)"
+                                "FTS open_read: cached directory is stale (BTree diverged), reloading"
                             );
-                            // Clone with fresh pending state to ensure this cursor's writes
-                            // don't affect other cursors or cause Drop to flush after txn commits
-                            self.hybrid_directory =
-                                Some(cached.directory.clone_with_fresh_pending());
-                            // Skip to CreatingIndex to build Index/Reader from cached directory
-                            self.state = FtsState::CreatingIndex;
-                            continue;
+                            *self.shared_directory_cache.write() = None;
                         }
                     }
 

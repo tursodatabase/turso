@@ -254,6 +254,8 @@ pub struct ProgramBuilder {
     /// The mode in which the query is being executed.
     query_mode: QueryMode,
     pub flags: ProgramBuilderFlags,
+    /// True once any `Insn::Function` has been emitted. See [`Self::may_abort`].
+    emitted_function_call: bool,
     next_free_register: usize,
     next_free_cursor_id: usize,
     next_hash_table_id: usize,
@@ -680,6 +682,7 @@ impl ProgramBuilder {
             current_parent_explain_idx: None,
             reg_result_cols_start: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
+            emitted_function_call: false,
             trigger,
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
@@ -834,6 +837,16 @@ impl ProgramBuilder {
     /// Mark that this statement may throw an ABORT exception (mirrors SQLite's sqlite3MayAbort).
     pub const fn set_may_abort(&mut self, may_abort: bool) {
         self.flags.set_may_abort(may_abort);
+    }
+
+    /// True if this statement may throw an ABORT exception. Combines the
+    /// translate paths' constraint analysis with emission taint: any emitted
+    /// function call can raise at runtime, like SQLite's
+    /// sqlite3VdbeAddFunctionCall() → sqlite3MayAbort(). The taint is a
+    /// separate monotonic bit (not folded into the flag) because the analysis
+    /// assigns the flag mid-translation and would clobber it.
+    pub const fn may_abort(&self) -> bool {
+        self.flags.may_abort() || self.emitted_function_call
     }
 
     pub const fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
@@ -1017,6 +1030,10 @@ impl ProgramBuilder {
         tracing::trace!("");
         self.flags
             .set_readonly(self.flags.readonly() & insn.is_readonly());
+        // Any function can raise at runtime; see Self::may_abort.
+        if matches!(insn, Insn::Function { .. }) {
+            self.emitted_function_call = true;
+        }
         self.insns.push((insn, self.insns.len()));
     }
 
@@ -1963,7 +1980,7 @@ impl ProgramBuilder {
         // (e.g., single-row INSERT) set is_multi_write=false to opt out.
         let needs_stmt_subtransactions = matches!(self.txn_mode, TransactionMode::Write)
             && self.flags.is_multi_write()
-            && self.flags.may_abort();
+            && self.may_abort();
 
         let contains_trigger_subprograms = self
             .insns
