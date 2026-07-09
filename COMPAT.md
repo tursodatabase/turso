@@ -157,7 +157,11 @@ Turso did not open a statement savepoint for it, the transaction becomes
 rollback-only. A later `COMMIT` rolls back the whole transaction and returns an
 error. `ROLLBACK` also clears that state. This prevents a half-finished statement
 from being committed after control returned to the application at an async I/O
-point.
+point. Two caveats until then: statements running later in the same transaction
+can observe the abandoned statement's partial changes (they are undone only when
+the transaction ends), and `ROLLBACK TO` a savepoint does not clear the
+rollback-only marker even if it restored every page the abandoned statement
+touched — only `ROLLBACK` recovers the connection.
 
 In experimental MVCC mode there is an additional known gap: all statements on a
 connection share one MVCC transaction, so a write statement that finishes while
