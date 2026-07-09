@@ -167,19 +167,23 @@ fn step_returning_id(stmt: &mut crate::Statement) -> i64 {
     }
 }
 
+/// Same-connection conflicts surface as `Err(StatementsInProgress)` — a
+/// BUSY-class error that aborts the statement instead of the retryable
+/// `StepResult::Busy`, mirroring SQLite's "SQL statements in progress"
+/// rejections (error-class SQLITE_BUSY that never invokes the busy handler).
 fn expect_step_busy(stmt: &mut crate::Statement, context: &str) {
     match stmt.step() {
-        Ok(crate::StepResult::Busy) | Err(LimboError::Busy) => {}
-        Ok(result) => panic!("expected Busy for {context}, got {result:?}"),
-        Err(err) => panic!("expected Busy for {context}, got {err:?}"),
+        Err(LimboError::StatementsInProgress(_)) => {}
+        Ok(result) => panic!("expected StatementsInProgress for {context}, got {result:?}"),
+        Err(err) => panic!("expected StatementsInProgress for {context}, got {err:?}"),
     }
 }
 
 fn expect_busy(result: Result<()>, context: &str) {
     let err = result.expect_err(context);
     assert!(
-        matches!(err, LimboError::Busy),
-        "expected Busy for {context}, got {err:?}"
+        matches!(err, LimboError::StatementsInProgress(_)),
+        "expected StatementsInProgress for {context}, got {err:?}"
     );
 }
 
@@ -967,10 +971,13 @@ fn test_update_is_busy_while_returning_writer_is_active() {
     let mut updater = env.conn.prepare("UPDATE rows SET v = 'updated'").unwrap();
     expect_step_busy(&mut updater, "UPDATE while RETURNING is active");
 
+    // The rejection aborts the UPDATE at step time, releasing its root
+    // statement slot, so dropping the RETURNING writer commits its own
+    // insert instead of deferring to a rejected sibling that will never run.
     drop(returning);
     drop(updater);
 
-    assert_eq!(env.observer_ids(), vec![10]);
+    assert_eq!(env.observer_ids(), vec![1, 10]);
     assert_eq!(env.observer_value_for_id(10), "original");
 }
 
@@ -988,10 +995,13 @@ fn test_delete_is_busy_while_returning_writer_is_active() {
     let mut deleter = env.conn.prepare("DELETE FROM rows WHERE id = 10").unwrap();
     expect_step_busy(&mut deleter, "DELETE while RETURNING is active");
 
+    // The rejection aborts the DELETE at step time, releasing its root
+    // statement slot, so dropping the RETURNING writer commits its own
+    // insert instead of deferring to a rejected sibling that will never run.
     drop(returning);
     drop(deleter);
 
-    assert_eq!(env.observer_ids(), vec![10]);
+    assert_eq!(env.observer_ids(), vec![1, 10]);
     assert_eq!(env.observer_value_for_id(10), "original");
 }
 
@@ -1089,6 +1099,30 @@ fn test_insert_is_busy_while_delete_returning_writer_is_active() {
     drop(insert);
     drop(delete);
     assert_eq!(env.observer_ids(), Vec::<i64>::new());
+}
+
+/// A same-connection rejection must bypass the busy handler: only the
+/// application finishing or resetting its own statement can resolve it, so
+/// retrying would burn the whole busy_timeout before failing anyway. The
+/// rejection is an error (`StatementsInProgress`), not the retryable
+/// `StepResult::Busy`, so the armed 600s busy_timeout never engages — if the
+/// rejection ever regressed into the retryable path, the step below would
+/// surface as StepResult::IO and expect_step_busy would catch it.
+#[test]
+fn test_second_writer_busy_does_not_invoke_busy_handler() {
+    let env = SameConnectionMvcc::new(":memory:second-writer-skips-busy-handler");
+    env.setup_rows_table();
+    env.conn
+        .set_busy_timeout(std::time::Duration::from_secs(600));
+
+    let mut first = prepare_insert_returning(&env.conn, 1, "one");
+    assert_eq!(step_returning_id(&mut first), 1);
+    let mut second = prepare_insert_returning(&env.conn, 2, "two");
+    expect_step_busy(&mut second, "second writer with busy_timeout set");
+
+    drop(second);
+    drop(first);
+    assert_eq!(env.observer_ids(), vec![1]);
 }
 
 // The two tests below pin known data-loss gaps in the MVCC deferred-commit

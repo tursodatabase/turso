@@ -3549,7 +3549,9 @@ pub fn op_transaction_inner(
                     && !state.is_active_write
                     && active_writers > 0
                 {
-                    return Err(LimboError::Busy);
+                    return Err(LimboError::StatementsInProgress(
+                        "cannot start a write statement",
+                    ));
                 }
 
                 // Fast path: if checkpoint root publication already replaced the
@@ -4131,7 +4133,11 @@ pub fn op_auto_commit(
         if matches!(tx_op, TxOp::Commit | TxOp::Rollback)
             && conn.n_active_writes.load(Ordering::SeqCst) > 0
         {
-            return Err(LimboError::Busy);
+            return Err(LimboError::StatementsInProgress(match tx_op {
+                TxOp::Commit => "cannot commit transaction",
+                TxOp::Rollback => "cannot rollback transaction",
+                TxOp::Begin => unreachable!("guard only matches Commit | Rollback"),
+            }));
         }
 
         match tx_op {

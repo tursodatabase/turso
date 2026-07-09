@@ -152,6 +152,14 @@ writer without risking the second writer's state. Returning `SQLITE_BUSY` keeps
 the connection state simple: finish or reset the active writer first, then start
 the next write statement.
 
+These same-connection `SQLITE_BUSY` rejections are errors ("... - SQL
+statements in progress") that abort the rejected statement: it must be reset
+or re-executed, not merely stepped again, and the busy handler is never
+invoked for them. No amount of waiting can release the conflict, because only
+the application finishing or resetting its own statement can. This matches
+SQLite, which reports its statements-in-progress rejections as error-class
+`SQLITE_BUSY` and reserves the busy handler for lock contention.
+
 If a write statement inside `BEGIN` is reset or dropped before it finishes and
 Turso did not open a statement savepoint for it, the transaction becomes
 rollback-only. A later `COMMIT` rolls back the whole transaction and returns an

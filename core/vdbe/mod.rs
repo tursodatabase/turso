@@ -2579,6 +2579,12 @@ impl Program {
                 Some(LimboError::TableLocked) => {}
                 // Busy errors do not cause a rollback.
                 Some(LimboError::Busy) => {}
+                // Same-connection "SQL statements in progress" rejections do
+                // not cause a rollback either: the rejected operation was
+                // refused before it touched any transaction or savepoint
+                // state, and the in-progress statement it collided with must
+                // keep running unharmed.
+                Some(LimboError::StatementsInProgress(_)) => {}
                 // BusySnapshot errors do not cause a rollback either - user must rollback explicitly.
                 // BusySnapshot is distinct from Busy in that a busy_timeout or handler should not be
                 // used because it will not help - the snapshot is permanently stale and rollback is
