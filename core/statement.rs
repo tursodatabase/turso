@@ -20,6 +20,7 @@ use crate::{
     schema::Trigger,
     stats::refresh_analyze_stats,
     translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
+    turso_assert,
     vdbe::{
         self,
         explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE},
@@ -587,6 +588,10 @@ impl Statement {
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
             let sql = self.program.sql.trim_start().as_bytes();
             if sql.len() >= 7 && sql[..7].eq_ignore_ascii_case(b"ANALYZE") {
+                // The stats refresh runs a SELECT on this same connection. At
+                // this point ANALYZE is already Done, so it must not count as a
+                // sibling root statement for that internal SELECT.
+                self.release_active_root_if_counted();
                 refresh_analyze_stats(&self.program.connection);
             }
         } else {
@@ -1424,10 +1429,15 @@ impl Statement {
         // mid-execution), ensure n_active_writes is decremented before reset
         // clears the flag.
         if self.state.is_active_write {
-            self.program
+            let previous = self
+                .program
                 .connection
                 .n_active_writes
                 .fetch_sub(1, Ordering::SeqCst);
+            turso_assert!(
+                previous == 1,
+                "resetting a writer with {previous} active writer(s)"
+            );
             self.state.is_active_write = false;
         }
         if self.counted_as_active_root && !preserve_active_root_count {

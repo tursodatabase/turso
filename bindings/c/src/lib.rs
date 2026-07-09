@@ -3055,6 +3055,9 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,
         LimboError::Busy => SQLITE_BUSY,
+        // SQLite reports its "SQL statements in progress" rejections as
+        // error-class SQLITE_BUSY (vdbe.c, OP_AutoCommit / OP_Savepoint).
+        LimboError::StatementsInProgress(_) => SQLITE_BUSY,
         LimboError::SchemaUpdated | LimboError::SchemaConflict => SQLITE_SCHEMA,
         _ => SQLITE_ERROR,
     }
