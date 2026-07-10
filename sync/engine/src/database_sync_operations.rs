@@ -2950,11 +2950,30 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
                 sql_over_http_requests.push(step(replay.sql, convert_to_args(replay.values)))
             }
             DatabaseRowTransformResult::Keep => {
-                let replay_info = generator.replay_info(ctx.coro, change).await?;
+                let mut replay_info = generator.replay_info(ctx.coro, change).await?;
                 // for now we try to support DDL statements which "extends" the schema (CREATE INDEX, CREATE TABLE, ALTER TABLE ADD COLUMN) and they have `IF NOT EXISTS` semantic
                 // as ALTER TABLE has no such syntax - we ignore error for such statements from remote for now
                 let is_alter_add_column =
                     replay_info.is_ddl_replay && is_alter_table_add_column(&replay_info.query);
+                if replay_info.is_ddl_replay {
+                    // the remote may already have this schema object because another
+                    // client pushed its own version of the DDL first - replay CREATE
+                    // statements with IF NOT EXISTS so the push stays idempotent.
+                    //
+                    // note that execute_ddl_idempotent() cannot be used here: it
+                    // decides what to execute by introspecting the schema through a
+                    // live local connection (table_columns_info(),
+                    // schema_object_exists()), while this path only assembles a
+                    // static batch of SQL that the remote executes in a single
+                    // /v2/pipeline round trip - there is no way to inspect the
+                    // remote schema before choosing what to send, so rewriting the
+                    // SQL text (or ignoring specific step errors, as done for ALTER
+                    // TABLE ADD COLUMN above) is the only available lever
+                    if let Some(rewritten) = rewrite_create_ddl_as_if_not_exists(&replay_info.query)
+                    {
+                        replay_info.query = rewritten;
+                    }
+                }
                 match &change.change {
                     DatabaseTapeRowChangeType::Delete { before } => {
                         let values = generator.replay_values(
@@ -3535,6 +3554,30 @@ fn is_alter_table_add_column(sql: &str) -> bool {
             }
         ))
     )
+}
+
+/// Rewrite a CREATE statement with `IF NOT EXISTS` so it can be replayed on a
+/// remote which may already have the object (e.g. another client pushed its
+/// own version of the DDL first). Returns None for non-CREATE statements.
+fn rewrite_create_ddl_as_if_not_exists(sql: &str) -> Option<String> {
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+    let Some(Ok(mut ast)) = parser.next() else {
+        return None;
+    };
+    let turso_parser::ast::Cmd::Stmt(stmt) = &mut ast else {
+        return None;
+    };
+    match stmt {
+        turso_parser::ast::Stmt::CreateTable { if_not_exists, .. }
+        | turso_parser::ast::Stmt::CreateIndex { if_not_exists, .. }
+        | turso_parser::ast::Stmt::CreateTrigger { if_not_exists, .. }
+        | turso_parser::ast::Stmt::CreateMaterializedView { if_not_exists, .. }
+        | turso_parser::ast::Stmt::CreateView { if_not_exists, .. } => {
+            *if_not_exists = true;
+            Some(ast.to_string())
+        }
+        _ => None,
+    }
 }
 
 async fn wal_pull_http<IO: SyncEngineIo, Ctx>(
@@ -5349,5 +5392,32 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown pull-updates apply mode"));
+    }
+
+    /// Pushed DDL is replayed verbatim on the remote, where the same object may
+    /// already exist because another client pushed its own version of the DDL
+    /// first. CREATE statements must be rewritten with IF NOT EXISTS so the
+    /// remote replay stays idempotent instead of failing with "already exists".
+    #[test]
+    pub fn test_pushed_create_ddl_is_rewritten_as_if_not_exists() {
+        let rewritten =
+            super::rewrite_create_ddl_as_if_not_exists("CREATE TABLE q (x, y, z)").unwrap();
+        assert!(
+            rewritten.contains("IF NOT EXISTS"),
+            "unexpected rewrite: {rewritten}"
+        );
+        let rewritten =
+            super::rewrite_create_ddl_as_if_not_exists("CREATE INDEX q_x ON q (x)").unwrap();
+        assert!(
+            rewritten.contains("IF NOT EXISTS"),
+            "unexpected rewrite: {rewritten}"
+        );
+    }
+
+    #[test]
+    pub fn test_non_create_ddl_is_not_rewritten() {
+        assert!(super::rewrite_create_ddl_as_if_not_exists("ALTER TABLE q ADD COLUMN w").is_none());
+        assert!(super::rewrite_create_ddl_as_if_not_exists("DROP TABLE q").is_none());
+        assert!(super::rewrite_create_ddl_as_if_not_exists("not valid sql").is_none());
     }
 }
