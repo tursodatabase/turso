@@ -6791,10 +6791,11 @@ fn op_window_step(
         // the rank value untouched, so every peer reads the same rank.
         WindowFunc::Rank => {
             if let Register::Value(Value::Null) = state.registers[acc_reg] {
-                state.registers[acc_reg] = Register::Aggregate(AggContext::Builtin(vec![
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                ]));
+                state.registers[acc_reg] =
+                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
+                        Value::from_i64(0),
+                        Value::from_i64(0),
+                    ]?));
             }
             let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
             else {
