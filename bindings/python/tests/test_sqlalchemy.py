@@ -503,13 +503,13 @@ class TestSyncDialectIntegration:
 class TestTursoDialectMixin:
     """Test the reflection surface after _TursoDialectMixin overrides.
 
-    Index, unique-constraint, and check-constraint reflection is delegated to
-    SQLAlchemy's parent SQLite dialect (Turso supports `PRAGMA index_list`,
-    `index_info`, `index_xinfo`, and returns full DDL via `sqlite_master.sql`).
+    Index, unique-constraint, check-constraint, and foreign-key reflection is
+    delegated to SQLAlchemy's parent SQLite dialect (Turso supports `PRAGMA
+    index_list`, `index_info`, `index_xinfo`, `foreign_key_list`, and returns
+    full DDL via `sqlite_master.sql`).
 
-    Foreign-key and temp-table reflection still return empty stubs because
-    `PRAGMA foreign_key_list` and `sqlite_temp_master` are not implemented in
-    Turso.
+    Temp-table reflection still returns empty stubs because
+    `sqlite_temp_master` is not implemented in Turso.
     """
 
     @pytest.fixture
@@ -522,7 +522,12 @@ class TestTursoDialectMixin:
 
         with engine.connect() as conn:
             conn.execute(text("CREATE TABLE alpha (id INTEGER PRIMARY KEY, name TEXT)"))
-            conn.execute(text("CREATE TABLE beta (id INTEGER PRIMARY KEY, val REAL)"))
+            conn.execute(
+                text(
+                    "CREATE TABLE beta (id INTEGER PRIMARY KEY, val REAL, "
+                    "alpha_id INTEGER REFERENCES alpha(id))"
+                )
+            )
             conn.commit()
 
         return inspect(engine)
@@ -540,18 +545,29 @@ class TestTursoDialectMixin:
         assert "id" in col_names
         assert "name" in col_names
 
-    # ── Foreign keys: still genuinely unsupported ────────────────────
+    # ── Foreign keys: reflected via PRAGMA foreign_key_list ──────────
 
-    def test_get_foreign_keys_returns_empty(self, inspector):
-        """`PRAGMA foreign_key_list` not implemented → stub returns []."""
+    def test_get_foreign_keys_reflects_constraint(self, inspector):
+        """A REFERENCES clause is reflected with constrained/referred columns."""
+        fks = inspector.get_foreign_keys("beta")
+        assert len(fks) == 1
+        fk = fks[0]
+        assert fk["constrained_columns"] == ["alpha_id"]
+        assert fk["referred_table"] == "alpha"
+        assert fk["referred_columns"] == ["id"]
+
+    def test_get_foreign_keys_empty_without_fks(self, inspector):
+        """A table with no foreign keys reflects an empty list."""
         assert inspector.get_foreign_keys("alpha") == []
 
-    def test_multi_foreign_keys_returns_empty(self, inspector):
-        """get_multi_foreign_keys returns empty dict."""
-        dialect = TursoDialect()
-        with inspector.bind.connect() as conn:
-            result = dialect.get_multi_foreign_keys(conn, filter_names=["alpha", "beta"])
-        assert result == {}
+    def test_get_multi_foreign_keys_reflects_constraints(self, inspector):
+        """get_multi_foreign_keys returns per-table FK lists, not empty stubs."""
+        result = inspector.get_multi_foreign_keys(filter_names=["alpha", "beta"])
+        assert result[(None, "alpha")] == []
+        beta_fks = result[(None, "beta")]
+        assert len(beta_fks) == 1
+        assert beta_fks[0]["constrained_columns"] == ["alpha_id"]
+        assert beta_fks[0]["referred_table"] == "alpha"
 
     # ── Indexes ──────────────────────────────────────────────────────
 

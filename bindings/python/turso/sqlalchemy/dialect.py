@@ -20,11 +20,10 @@ from sqlalchemy.connectors.asyncio import (
 from sqlalchemy.dialects.sqlite.aiosqlite import SQLiteDialect_aiosqlite
 from sqlalchemy.dialects.sqlite.pysqlite import SQLiteDialect_pysqlite
 from sqlalchemy.engine import URL
-from sqlalchemy.engine.reflection import ObjectKind
 from sqlalchemy.util.concurrency import await_only
 
 if TYPE_CHECKING:
-    from sqlalchemy.engine.interfaces import ConnectArgsType, ReflectedForeignKeyConstraint
+    from sqlalchemy.engine.interfaces import ConnectArgsType
     from sqlalchemy.pool import Pool
 
 logger = logging.getLogger(__name__)
@@ -33,54 +32,15 @@ logger = logging.getLogger(__name__)
 class _TursoDialectMixin:
     """
     Mixin providing Turso-specific overrides for SQLAlchemy dialect.
-
-    Index, unique-constraint, and check-constraint reflection (single- and
-    multi-table) are inherited from SQLAlchemy's parent SQLite dialect, which
-    issues `PRAGMA index_list` / `PRAGMA index_info` and parses
-    `sqlite_master.sql` — all supported by Turso.
-
-    The methods below override the parent only where Turso still lacks the
-    underlying capability:
-    - PRAGMA foreign_key_list (foreign key reflection)
+    The methods below override the parent where the underlying 
+    capability is not supported by turso:
     - sqlite_temp_master (temp tables/views)
     """
-
-    def get_foreign_keys(
-        self,
-        connection,
-        table_name,
-        schema=None,
-        **kw,
-    ) -> List[ReflectedForeignKeyConstraint]:
-        """
-        Return foreign keys for a table.
-
-        Turso doesn't support PRAGMA foreign_key_list, so we return an empty list.
-        Foreign key constraints are still enforced at write time if defined.
-        """
-        logger.debug(
-            "PRAGMA foreign_key_list not supported; foreign key reflection unavailable for table '%s'",
-            table_name,
-        )
-        return []
-
-    def get_multi_foreign_keys(
-        self,
-        connection,
-        schema=None,
-        filter_names=None,
-        kind=ObjectKind.TABLE,
-        scope=None,
-        **kw,
-    ) -> Dict[Any, List[ReflectedForeignKeyConstraint]]:
-        """Return foreign keys for multiple tables."""
-        logger.debug("PRAGMA foreign_key_list not supported; multi-foreign-key reflection unavailable")
-        return {}
 
     def get_temp_table_names(self, connection, **kw) -> List[str]:
         """Return temporary table names.
 
-        Turso doesn't support sqlite_temp_master, so we return an empty list.
+        Turso doesn't currently support sqlite_temp_master, so we return an empty list.
         """
         logger.debug("sqlite_temp_master not supported; temp table reflection unavailable")
         return []
@@ -88,7 +48,7 @@ class _TursoDialectMixin:
     def get_temp_view_names(self, connection, **kw) -> List[str]:
         """Return temporary view names.
 
-        Turso doesn't support sqlite_temp_master, so we return an empty list.
+        Turso doesn't currently support sqlite_temp_master, so we return an empty list.
         """
         logger.debug("sqlite_temp_master not supported; temp view reflection unavailable")
         return []

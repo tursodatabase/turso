@@ -4,7 +4,7 @@ This document describes the SQLAlchemy dialect implementation for pyturso.
 
 ## Status: Implemented
 
-The SQLAlchemy dialect is fully implemented with three dialects:
+The SQLAlchemy dialect is implemented with three dialects:
 - `sqlite+turso://` - Basic local database connections
 - `sqlite+aioturso://` - Basic local database connections for SQLAlchemy async engines
 - `sqlite+turso_sync://` - Sync-enabled connections with remote database support
@@ -61,8 +61,7 @@ engine = create_engine(
 )
 
 with engine.connect() as conn:
-    # Access sync operations
-    sync = get_sync_connection(conn)
+    sync = get_sync_connection(conn) # get_sync_connection() exposes the underlying sync engine
     sync.pull()  # Pull changes from remote
 
     result = conn.execute(text("SELECT * FROM users"))
@@ -160,7 +159,7 @@ URL validation:
 - Host/port in URL raises `ValueError` (use `remote_url` query param instead)
 - Unrecognized query parameters emit a `UserWarning`
 
-## Sync Operations
+## Sync Operations 
 
 The `get_sync_connection()` helper provides access to sync-specific methods:
 
@@ -251,36 +250,19 @@ All dialects share these overrides via `_TursoDialectMixin` and direct method im
 
 ### Reflection Overrides (via `_TursoDialectMixin`)
 
-Index, unique-constraint, and check-constraint reflection (`get_indexes`,
-`get_unique_constraints`, `get_check_constraints`, and their `get_multi_*`
-counterparts) are inherited from SQLAlchemy's parent SQLite dialect — Turso
-supports `PRAGMA index_list` / `index_info` / `index_xinfo` and returns the
-original DDL via `sqlite_master.sql`.
+Index, unique-constraint, check-constraint, and foreign-key reflection
+(`get_indexes`, `get_unique_constraints`, `get_check_constraints`,
+`get_foreign_keys`, and their `get_multi_*` counterparts) are inherited from
+SQLAlchemy's parent SQLite dialect — Turso supports `PRAGMA index_list` /
+`index_info` / `index_xinfo` / `foreign_key_list` and returns the original DDL
+via `sqlite_master.sql`.
 
-Only the following remain overridden as empty stubs:
+The following are overridden and return empty stubs:
 
-Single-table methods (return empty list):
-- `get_foreign_keys()` - `PRAGMA foreign_key_list` not supported
 - `get_temp_table_names()` / `get_temp_view_names()` - no temp database
-
-Multi-table methods (return empty dict):
-- `get_multi_foreign_keys()`
+  (`sqlite_temp_master` not supported)
 
 ## Limitations
-
-### Table Reflection
-
-Foreign-key reflection is not yet supported because Turso has not implemented
-`PRAGMA foreign_key_list`. As a result:
-- `inspector.get_foreign_keys()` returns an empty list
-- Foreign key constraints still **work** at runtime, they just can't be
-  introspected
-- All other reflection (`get_indexes()`, `get_unique_constraints()`,
-  `get_check_constraints()`, `get_table_names()`, `get_columns()`) works
-  normally
-
-This means Alembic `--autogenerate` will not detect added or dropped foreign
-keys; verify FK changes manually.
 
 ### Native Datetime
 
