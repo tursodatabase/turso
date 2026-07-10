@@ -6106,7 +6106,11 @@ mod ptrmap_tests {
         //  Construct interfaces for the pager
         let pages = initial_db_pages + 10;
         let sz = std::cmp::max(std::cmp::min(pages, 64), pages);
-        let buffer_pool = BufferPool::begin_init(&io, (sz * page_size) as usize);
+        let buffer_pool = BufferPool::begin_init(
+            &io,
+            (sz * page_size) as usize,
+            crate::alloc::DynAllocator::default(),
+        );
 
         let wal_shared = WalFileShared::new_shared(
             io.open_file("test.db-wal", OpenFlags::Create, false)
@@ -6182,7 +6186,7 @@ mod ptrmap_tests {
             io.open_file("fresh-auto-vacuum.db", OpenFlags::Create, true)
                 .unwrap(),
         ));
-        let buffer_pool = BufferPool::begin_init(&io, 65536);
+        let buffer_pool = BufferPool::begin_init(&io, 65536, crate::alloc::DynAllocator::default());
         let pager = Pager::new(
             db_file,
             None,

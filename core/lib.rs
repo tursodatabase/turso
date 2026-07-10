@@ -303,6 +303,38 @@ impl DatabaseOpts {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct MemoryAllocators {
+    pub mv_store_allocator: alloc::DynAllocator,
+    pub buffer_pool_allocator: alloc::DynAllocator,
+}
+
+impl MemoryAllocators {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_mv_store_allocator(mut self, allocator: alloc::DynAllocator) -> Self {
+        self.mv_store_allocator = allocator;
+        self
+    }
+
+    pub fn with_buffer_pool_allocator(mut self, allocator: alloc::DynAllocator) -> Self {
+        self.buffer_pool_allocator = allocator;
+        self
+    }
+}
+
+impl Default for MemoryAllocators {
+    fn default() -> Self {
+        let allocator = alloc::DynAllocator::default();
+        Self {
+            mv_store_allocator: allocator.clone(),
+            buffer_pool_allocator: allocator,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharedWalCoordinationOpenTelemetryMode {
     Exclusive,
@@ -698,7 +730,7 @@ impl Database {
         io: &Arc<dyn IO>,
         db_file: Arc<dyn DatabaseStorage>,
         encryption_opts: Option<EncryptionOpts>,
-        mv_store_allocator: alloc::DynAllocator,
+        memory_allocators: MemoryAllocators,
     ) -> Result<Self> {
         let path = path.into();
         let wal_path = wal_path.into();
@@ -731,7 +763,7 @@ impl Database {
 
         let db = Database {
             mv_store,
-            mv_store_allocator,
+            mv_store_allocator: memory_allocators.mv_store_allocator,
             path,
             wal_path,
             schema: Arc::new(Mutex::new(Arc::new({
@@ -749,7 +781,11 @@ impl Database {
             open_flags: flags,
             init_lock: Arc::new(Mutex::new(())),
             opts,
-            buffer_pool: BufferPool::begin_init(io, arena_size),
+            buffer_pool: BufferPool::begin_init(
+                io,
+                arena_size,
+                memory_allocators.buffer_pool_allocator,
+            ),
             n_connections: AtomicUsize::new(0),
 
             init_page_1: Arc::new(ArcSwapOption::new(init_page_1)),
@@ -1050,7 +1086,7 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<Arc<Database>> {
-        Self::open_with_flags_with_allocator(
+        Self::open_with_flags_with_memory_allocators(
             io,
             path,
             db_file,
@@ -1058,12 +1094,12 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
-            alloc::DynAllocator::default(),
+            MemoryAllocators::default(),
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn open_with_flags_with_allocator(
+    pub fn open_with_flags_with_memory_allocators(
         io: Arc<dyn IO>,
         path: &str,
         db_file: Arc<dyn DatabaseStorage>,
@@ -1071,11 +1107,11 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        allocator: alloc::DynAllocator,
+        memory_allocators: MemoryAllocators,
     ) -> Result<Arc<Database>> {
         let mut state = OpenDbAsyncState::new();
         loop {
-            match Self::open_with_flags_async_with_allocator(
+            match Self::open_with_flags_async_with_memory_allocators(
                 &mut state,
                 io.clone(),
                 path,
@@ -1084,7 +1120,7 @@ impl Database {
                 opts,
                 encryption_opts.clone(),
                 durable_storage.clone(),
-                allocator.clone(),
+                memory_allocators.clone(),
             )? {
                 IOResult::Done(db) => return Ok(db),
                 IOResult::IO(io_completion) => {
@@ -1113,7 +1149,7 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<IOResult<Arc<Database>>> {
-        Self::open_with_flags_async_with_allocator(
+        Self::open_with_flags_async_with_memory_allocators(
             state,
             io,
             path,
@@ -1122,12 +1158,12 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
-            alloc::DynAllocator::default(),
+            MemoryAllocators::default(),
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn open_with_flags_async_with_allocator(
+    pub fn open_with_flags_async_with_memory_allocators(
         state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
         path: &str,
@@ -1136,7 +1172,7 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        allocator: alloc::DynAllocator,
+        memory_allocators: MemoryAllocators,
     ) -> Result<IOResult<Arc<Database>>> {
         let result = Self::open_with_flags_async_internal(
             state,
@@ -1147,7 +1183,7 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
-            allocator,
+            memory_allocators,
         );
         if result.is_err() {
             // On error, remove the Opening sentinel so other callers can proceed.
@@ -1169,7 +1205,7 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        allocator: alloc::DynAllocator,
+        memory_allocators: MemoryAllocators,
     ) -> Result<IOResult<Arc<Database>>> {
         // turso-sync-engine creates 2 databases with different names in the same IO if MemoryIO is used
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
@@ -1220,7 +1256,7 @@ impl Database {
         }
 
         // Open the database asynchronously (no registry lock held).
-        let result = Self::open_with_flags_bypass_registry_async_with_allocator(
+        let result = Self::open_with_flags_bypass_registry_async_with_memory_allocators(
             state,
             io.clone(),
             path,
@@ -1230,7 +1266,7 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
-            allocator,
+            memory_allocators,
         )?;
 
         if let IOResult::Done(ref db) = result {
@@ -1245,7 +1281,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn open_with_flags_bypass_registry_async_with_allocator(
+    fn open_with_flags_bypass_registry_async_with_memory_allocators(
         state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
         path: &str,
@@ -1255,7 +1291,7 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        allocator: alloc::DynAllocator,
+        memory_allocators: MemoryAllocators,
     ) -> Result<IOResult<Arc<Database>>> {
         let result = Self::open_with_flags_bypass_registry_async_internal(
             state,
@@ -1267,7 +1303,7 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
-            allocator,
+            memory_allocators,
         );
         if result.is_err() {
             let _ = state.schema_guard.take();
@@ -1332,7 +1368,7 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
-            alloc::DynAllocator::default(),
+            MemoryAllocators::default(),
         );
         if result.is_err() {
             // schema_guard is set by the open_with_flags_bypass_registry_async_internal - so we release it in case of error
@@ -1353,7 +1389,7 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        allocator: alloc::DynAllocator,
+        memory_allocators: MemoryAllocators,
     ) -> Result<IOResult<Arc<Database>>> {
         loop {
             tracing::debug!(
@@ -1382,7 +1418,7 @@ impl Database {
                         &io,
                         db_file.clone(),
                         encryption_opts.clone(),
-                        allocator.clone(),
+                        memory_allocators.clone(),
                     )?;
                     db.durable_storage.clone_from(&durable_storage);
 

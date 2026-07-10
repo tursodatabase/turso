@@ -6072,7 +6072,11 @@ pub mod test {
 
     fn make_test_wal() -> (Arc<RwLock<WalFileShared>>, WalFile) {
         let io = shared_wal_test_io();
-        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let buffer_pool = BufferPool::begin_init(
+            &io,
+            BufferPool::TEST_ARENA_SIZE,
+            crate::alloc::DynAllocator::default(),
+        );
         let shared = WalFileShared::new_noop();
         let coordination: Arc<dyn WalCoordination> =
             Arc::new(InProcessWalCoordination::new(shared.clone()));
@@ -6082,14 +6086,22 @@ pub mod test {
 
     fn make_test_wal_from_shared(shared: Arc<RwLock<WalFileShared>>) -> WalFile {
         let io = shared_wal_test_io();
-        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let buffer_pool = BufferPool::begin_init(
+            &io,
+            BufferPool::TEST_ARENA_SIZE,
+            crate::alloc::DynAllocator::default(),
+        );
         let snapshot = shared.read().last_checksum_and_max_frame();
         WalFile::new(io, shared, snapshot, buffer_pool)
     }
 
     fn make_initialized_memory_wal(page_size: u32) -> (Arc<dyn IO>, Arc<BufferPool>, WalFile) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let buffer_pool = BufferPool::begin_init(
+            &io,
+            BufferPool::TEST_ARENA_SIZE,
+            crate::alloc::DynAllocator::default(),
+        );
         buffer_pool
             .finalize_with_page_size(page_size as usize)
             .unwrap();
@@ -6441,7 +6453,11 @@ pub mod test {
         )
         .unwrap();
 
-        let buffer_pool = BufferPool::begin_init(io, BufferPool::TEST_ARENA_SIZE);
+        let buffer_pool = BufferPool::begin_init(
+            io,
+            BufferPool::TEST_ARENA_SIZE,
+            crate::alloc::DynAllocator::default(),
+        );
         buffer_pool
             .finalize_with_page_size(wal_header.page_size as usize)
             .unwrap();
@@ -6524,7 +6540,11 @@ pub mod test {
         }
 
         let coordination: Arc<dyn WalCoordination> = Arc::new(make_test_coordination(&shared));
-        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let buffer_pool = BufferPool::begin_init(
+            &io,
+            BufferPool::TEST_ARENA_SIZE,
+            crate::alloc::DynAllocator::default(),
+        );
         buffer_pool
             .finalize_with_page_size(snapshot.page_size as usize)
             .unwrap();
@@ -6598,7 +6618,11 @@ pub mod test {
     #[test]
     fn test_wal_explicit_backend_constructor_does_not_keep_shared_handle() {
         let io = shared_wal_test_io();
-        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let buffer_pool = BufferPool::begin_init(
+            &io,
+            BufferPool::TEST_ARENA_SIZE,
+            crate::alloc::DynAllocator::default(),
+        );
         let shared = WalFileShared::new_noop();
         let coordination: Arc<dyn WalCoordination> =
             Arc::new(InProcessWalCoordination::new(shared.clone()));
@@ -7446,7 +7470,11 @@ pub mod test {
         .unwrap();
         assert!(shared.read().runtime.frame_cache.lock().is_empty());
 
-        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let buffer_pool = BufferPool::begin_init(
+            &io,
+            BufferPool::TEST_ARENA_SIZE,
+            crate::alloc::DynAllocator::default(),
+        );
         buffer_pool.finalize_with_page_size(4096).unwrap();
         let wal = WalFile::new_with_shared_coordination(
             io.clone(),
@@ -7558,7 +7586,11 @@ pub mod test {
         authority.install_snapshot(snapshot);
         authority.record_frame(7, 1);
 
-        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let buffer_pool = BufferPool::begin_init(
+            &io,
+            BufferPool::TEST_ARENA_SIZE,
+            crate::alloc::DynAllocator::default(),
+        );
         buffer_pool.finalize_with_page_size(4096).unwrap();
         let wal =
             WalFile::new_with_shared_coordination(io, shared, authority, ((0, 0), 0), buffer_pool);

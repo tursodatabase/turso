@@ -97,7 +97,7 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
     )
     .unwrap();
     let db_file = StdArc::new(crate::storage::database::DatabaseFile::new(file));
-    let db = crate::Database::open_with_flags_with_allocator(
+    let db = crate::Database::open_with_flags_with_memory_allocators(
         io,
         "open-with-allocator.db",
         db_file,
@@ -105,7 +105,9 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
         crate::DatabaseOpts::new(),
         None,
         None,
-        alloc,
+        crate::MemoryAllocators::new()
+            .with_mv_store_allocator(alloc.clone())
+            .with_buffer_pool_allocator(alloc),
     )
     .unwrap();
     let conn = db.connect().unwrap();
@@ -115,6 +117,21 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
 
     assert!(db.get_mv_store().is_some());
     assert!(allocations.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
+fn buffer_pool_uses_allocator_for_arenas() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let alloc = DynAllocator::new(CountingAlloc {
+        allocations: allocations.clone(),
+    });
+    let io: StdArc<dyn crate::IO> = StdArc::new(crate::MemoryIO::new());
+    let pool = crate::BufferPool::begin_init(&io, crate::BufferPool::TEST_ARENA_SIZE, alloc);
+
+    pool.finalize_with_page_size(crate::BufferPool::DEFAULT_PAGE_SIZE)
+        .unwrap();
+
+    assert!(allocations.load(Ordering::Relaxed) >= 2);
 }
 
 #[test]
