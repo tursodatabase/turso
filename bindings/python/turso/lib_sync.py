@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import urllib.error
 
 # for HTTP IO
@@ -260,8 +261,12 @@ def _process_full_write_item(io_item: PyTursoSyncIoItem, req_kind: Any) -> None:
         # ignore directory creation errors, attempt to write anyway
         pass
 
+    # Write to a temp file and rename it over the target so concurrent readers
+    # (e.g. other connections opening the same replica) never observe a
+    # truncated or partially written file.
+    tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
-        with open(path, "wb") as f:
+        with open(tmp_path, "wb") as f:
             # Write in chunks if content is large
             view = memoryview(content)
             offset = 0
@@ -270,8 +275,13 @@ def _process_full_write_item(io_item: PyTursoSyncIoItem, req_kind: Any) -> None:
                 end = min(offset + _HTTP_CHUNK_SIZE, length)
                 f.write(view[offset:end])
                 offset = end
+        os.replace(tmp_path, path)
         io_item.done()
     except Exception as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
         io_item.poison(f"fs write error: {e}")
 
 
