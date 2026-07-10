@@ -132,8 +132,7 @@ fn checkpoint_yield_key() -> u64 {
     CHECKPOINT_SELECTION_TAG
 }
 
-/// A mutation to the shared `table_id_to_rootpage` map staged by the off-lock write phase and
-/// applied only in the post-commit publish window. See `pending_rootmap_ops`.
+/// Root-map mutation staged during collection; applied in the publish window.
 enum RootMapOp {
     /// Insert a new (checkpointed) root binding for `id` at `root` (STAGED → published).
     Alloc { id: MVTableId, root: u64 },
@@ -151,18 +150,8 @@ pub struct LockStates {
     pager_write_tx: bool,
 }
 
-/// A state machine that performs a complete checkpoint operation on the MVCC store.
-///
-/// The checkpoint process:
-/// 1. Takes a blocking lock on the database so that no other transactions can run during the checkpoint.
-/// 2. Determines which row versions should be written to the B-tree.
-/// 3. Begins a pager transaction
-/// 4. Writes all the selected row versions to the B-tree.
-/// 5. Commits the pager transaction, effectively flushing to the WAL
-/// 6. Immediately does a TRUNCATE checkpoint from the WAL to the DB
-/// 7. Fsync the DB file
-/// 8. Truncate logical log to 0 (salt regenerated in memory), fsync, then truncate WAL
-/// 9. Releases the blocking_checkpoint_lock
+/// Checkpoint state machine. Truncate mode holds `blocking_checkpoint_lock` for the whole pass;
+/// passive mode collects and writes concurrently, then publishes under a brief lock.
 pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
     /// The current state of the state machine
     state: CheckpointState,
@@ -228,17 +217,9 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// Set after `pager.commit_tx` succeeds; the publish window may still be pending (auto passive
     /// retries acquiring the brief write lock without re-committing).
     pager_commit_done: bool,
-    /// Root-map (`table_id_to_rootpage`) mutations staged by this checkpoint's off-lock write
-    /// phase, applied to the shared map ONLY inside the locked publish window (CommitPagerTxn).
-    /// The shared map is concurrently read by live transactions (cursor + RowidAllocator root
-    /// resolution), so mutating it off-lock — or reverting an off-lock mutation on failure —
-    /// races those readers and diverges the durable B-tree from the map. Deferring every
-    /// mutation to the `.write()` window makes them atomic w.r.t. readers, and a failed
-    /// checkpoint simply drops this list, leaving zero trace.
+    /// Root-map ops staged during collection; applied at publish.
     pending_rootmap_ops: Vec<RootMapOp>,
-    /// New positive root pages allocated by this checkpoint's `btree_create`, keyed by id, so the
-    /// write phase can resolve a just-created table/index's root without publishing it to the
-    /// shared map (see [`Self::resolve_checkpoint_root`]). Drained at publish.
+    /// Roots allocated this checkpoint; resolved until publish.
     pending_alloc_roots: std::collections::HashMap<MVTableId, u64>,
     collect_table_cursor: Option<RowID>,
     collect_index_tableid_cursor: Option<MVTableId>,
@@ -246,25 +227,16 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// Async driver for `CheckpointState::CompactSequences`. Lazily set
     /// on first entry to that state; cleared when the driver completes.
     seq_compact: Option<SeqCompactDriver<Clock, A>>,
-    /// Passive-mode sequence rows recorded by `SeqCompactDriver` for deletion.
-    /// Turned into end-stamped deletes (`seqcompact_commit_delete`) in the
-    /// clock-ordered publish window. Empty in blocking mode (it uses the raw
-    /// purge). See `docs/internals/mvcc/sequence-compaction-passive.md`.
+    /// Sequence deletes recorded in passive mode; applied in the publish window.
     pending_seq_deletes: Vec<(RowID, usize)>,
-    /// Upper-bound timestamp for collection (`= mvstore.last_committed_tx_ts` at the
-    /// start of the off-lock prepare phase). Versions inserted after it are deferred and
-    /// tombstones after it are clamped to "live" so concurrent commits never strand a row
-    /// (see `maybe_get_checkpointable_versions`). `u64::MAX` = no bound (collect all).
+    /// Collection upper bound (`last_committed_tx_ts` at snapshot). `u64::MAX` = no bound.
     snapshot_ts: u64,
     build_local_schema_sm: Option<StateMachine<BuildLocalSchemaViewStateMachine<Clock, A>>>,
     build_local_schema_began_read_tx: bool,
     /// Snapshot-consistent schema built at `snapshot_ts`; drives `index_id_to_index` in PASSIVE mode.
     local_schema: Option<Arc<Schema>>,
     owns_checkpoint_in_progress: bool,
-    /// Table/index ids whose root page was allocated this checkpoint (staged with
-    /// `visible_from = u64::MAX`). Drained in the post-`CommitPagerTxn` publish window, where
-    /// each is published with `visible_from = durable_txid_max_new` — only then are the pages
-    /// durable in the WAL and the btree safe for readers.
+    /// Roots allocated this checkpoint; published with `visible_from = durable_txid_max_new`.
     staged_roots: Vec<MVTableId>,
 }
 
@@ -354,13 +326,7 @@ struct SeqCompactDriver<Clock: LogicalClock, A: ConcurrentAllocator = TursoAlloc
     /// MVCC store used to purge version-chain entries paired with each
     /// B-tree delete. See the struct-level comment for the invariant.
     mvstore: Arc<MvStore<Clock, A>>,
-    /// Passive (off-lock) mode: the raw purge contract does not hold (no
-    /// `pager_commit_lock`), so instead of deleting the B-tree row + purging
-    /// the chain in the sweep, the driver only *records* each non-watermark
-    /// `(RowID, num_cols)` here. The publish window turns them into proper
-    /// end-stamped deletes via `seqcompact_commit_delete`; a later checkpoint
-    /// materializes the physical B-tree delete. See
-    /// `docs/internals/mvcc/sequence-compaction-passive.md`.
+    /// Passive mode: record deletes for `seqcompact_commit_delete` instead of purging inline.
     passive: bool,
     /// Rows recorded for deletion in passive mode (drained by the checkpoint
     /// state machine into its publish window).
@@ -558,7 +524,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> SeqCompactDriver<Clock, A> {
                         }
                         Some(k) => {
                             if self.passive {
-                                // Off-lock: don't touch the B-tree or purge the chain here (the
+                                // Passive: don't touch the B-tree or purge the chain here (the
                                 // purge contract needs the lock). Record the row; the publish
                                 // window turns it into a proper end-stamped delete and a later
                                 // checkpoint materializes the physical delete.
@@ -747,7 +713,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 || connection.experimental_mvcc_passive_checkpoint_enabled(),
             "passive checkpoint mode requires experimental_mvcc_passive_checkpoint"
         );
-        // MVCC supports only Passive (off-lock, requires the experimental flag) and
+        // MVCC supports only Passive (no blocking lock, requires the experimental flag) and
         // Truncate (blocking). Full/Restart map to Truncate — the pre-feature baseline
         // always checkpointed via TRUNCATE.
         let mode = match mode {
@@ -835,7 +801,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             collect_index_key_cursor: None,
             seq_compact: None,
             pending_seq_deletes: crate::alloc::vec![],
-            // Set in PrepareCheckpoint once the off-lock snapshot is taken; until
+            // Set in PrepareCheckpoint once the collection snapshot is taken; until
             // then `u64::MAX` disables the upper-bound filter (collect everything).
             snapshot_ts: u64::MAX,
             build_local_schema_sm: None,
@@ -926,7 +892,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
             // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
             // Resolve in-flight TxID begin/end markers to the owning tx's true state
-            // (off-lock collection may not have rewritten the chain to a Timestamp yet).
+            // (concurrent collection may not have rewritten the chain to a Timestamp yet).
             // Only a Committed tx contributes a timestamp; others resolve to None.
             let begin_ts = match version.begin() {
                 Some(TxTimestampOrID::Timestamp(e)) => Some(e),
@@ -948,7 +914,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
                 None => None,
             };
-            // Insert not visible at our snapshot (committed during the off-lock prepare
+            // Insert not visible at our snapshot (committed during the collection
             // phase): defer to the next pass and don't let it affect DB-file existence now.
             if begin_ts.is_some_and(|b| b > self.snapshot_ts) {
                 continue;
@@ -1051,7 +1017,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     /// Resolve the table/index id whose B-tree binding owned `root_page` at the moment of the
     /// drop carried by `version` (a `sqlite_schema` DELETE). Selects the binding that COVERS the
     /// drop timestamp (`begin < drop_ts <= end`) rather than "any live binding at this root":
-    /// under off-lock page reuse a freed root page can already belong to a newer live object, and
+    /// under concurrent page reuse a freed root page can already belong to a newer live object, and
     /// destroying that one would corrupt a live btree. Returns `None` when no binding owned the
     /// page at the drop ts — the object was already destroyed by an earlier checkpoint and this
     /// schema-delete version merely lingered in the store and got recollected.
@@ -1070,10 +1036,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             .map(|entry| *entry.key())
     }
 
-    /// Resolve a table/index root during the off-lock WRITE phase. A root this checkpoint just
-    /// allocated (`btree_create`) is held in `pending_alloc_roots` and NOT yet published to the
-    /// shared map, so the write phase finds it here; everything else resolves from the shared
-    /// map. This is how the write phase proceeds without mutating reader-visible state.
+    /// Resolve a table/index root during collection (`pending_alloc_roots` or shared map).
     fn resolve_checkpoint_root(&self, table_id: MVTableId) -> Option<u64> {
         self.pending_alloc_roots
             .get(&table_id)
@@ -1686,7 +1649,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         Ok(())
     }
 
-    /// The version-store GC floor mark for the off-lock checkpoint: the lowest of the published
+    /// The version-store GC floor mark for the passive checkpoint: the lowest of the published
     /// MVCC readers' marks AND any reader pinned at the pager/WAL level (via `begin_read_tx`) that
     /// has not yet published an MVCC transaction. The latter closes the begin-tx publish window —
     /// without it, a reader that pinned an old WAL frame but is not yet in `txs` is invisible to
@@ -1712,7 +1675,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // Empty-slot removal after dropping the version-chain write lock has a TOCTOU
         // gap — a concurrent writer could `get_or_insert_with` between the emptiness
         // check and `remove()`. It is only safe under the stop-the-world blocking lock,
-        // which the Truncate/Restart path holds. The off-lock passive path runs lazily
+        // which the Truncate/Restart path holds. The passive path runs lazily
         // (slots are reclaimed by a later insert or a future blocking checkpoint), exactly
         // like the inline commit-path GC (`gc_incremental`).
         let remove_empty_slots = self.lock_states.blocking_checkpoint_lock_held;
@@ -1787,7 +1750,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
     fn gc_checkpointed_index_versions(&mut self) -> Option<IOCompletions> {
         // See gc_checkpointed_table_versions: slot removal only under the blocking lock
-        // (Truncate/Restart); the off-lock passive path is lazy.
+        // (Truncate/Restart); the passive path is lazy.
         let remove_empty_slots = self.lock_states.blocking_checkpoint_lock_held;
         let ckpt_max = self.durable_txid_max_new;
         let min_reader_mark = self.gc_floor_reader_mark();
@@ -1919,7 +1882,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     .connection
                     .experimental_mvcc_passive_checkpoint_enabled();
                 if passive {
-                    // The off-lock checkpoint acquires the blocking lock only after
+                    // The passive checkpoint acquires the blocking lock only after
                     // collection, so it needs an explicit single-orchestrator gate. The
                     // blocking (flag-off) path takes the lock up front and gets that
                     // invariant — plus Busy-on-contention — from the lock itself, so it
@@ -2013,7 +1976,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         // Key each index by the binding that owns its root page AT snapshot_ts —
                         // the same id collect_index_rows uses (mvstore.index_rows is keyed by the
                         // owning id). Resolving at the *current* owner (u64::MAX) instead would,
-                        // under off-lock page reuse, key a present index under a different (reused)
+                        // under concurrent page reuse, key a present index under a different (reused)
                         // id, so WriteIndexRow would fail to find its Index struct and drop real
                         // entries ("row N missing from index"). filter_map: an index whose root has
                         // no binding covering the snapshot is not part of this snapshot.
@@ -2060,7 +2023,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     .experimental_mvcc_passive_checkpoint_enabled();
                 if passive {
                     inject_transition_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
-                    // Passive (off-lock) path: collection AND the btree write phase run without the
+                    // Passive path: collection AND the btree write phase run without the
                     // blocking lock. The only serialized point is the brief publish window in
                     // CommitPagerTxn.
                 }
@@ -2213,7 +2176,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_tables.insert(table_id);
-                            // Off-lock destroy: retire the binding (set its `end` to the drop ts)
+                            // Deferred destroy: retire the binding (set its `end` to the drop ts)
                             // but keep it, so a transaction still scanning this table at an older
                             // snapshot resolves the (read-mark-protected) root page. GC'd once
                             // `lwm` passes the drop. Defensively remove if the drop ts is unknown.
@@ -2279,7 +2242,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_indexes.insert(index_id);
-                            // Off-lock destroy: retire the binding (set its `end`) but keep it so
+                            // Deferred destroy: retire the binding (set its `end`) but keep it so
                             // a transaction still scanning this index at an older snapshot resolves
                             // the (read-mark-protected) root page. GC'd once `lwm` passes the drop.
                             if let Some(drop_ts) = drop_ts {
@@ -2890,7 +2853,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 self.mvstore
                     .durable_txid_max
                     .store(self.durable_txid_max_new, Ordering::SeqCst);
-                // Publish the WAL backfill boundary as the off-lock GC floor: a version
+                // Publish the WAL backfill boundary as the passive checkpoint GC floor: a version
                 // materialized at or below it is durable in the DB file, hence reachable by
                 // every snapshot. Un-backfilled ones stay retained for low-frame readers.
                 let (seq, _) = self.pager.wal_pos();

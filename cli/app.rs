@@ -104,7 +104,7 @@ pub struct Opts {
     pub experimental_multiprocess_wal: bool,
     #[clap(
         long,
-        help = "Enable experimental passive (off-lock) MVCC checkpointing (requires journal_mode=mvcc)"
+        help = "Enable experimental passive MVCC checkpointing (requires journal_mode=mvcc)"
     )]
     pub experimental_mvcc_passive_checkpoint: bool,
     #[cfg(feature = "mvcc_repl")]

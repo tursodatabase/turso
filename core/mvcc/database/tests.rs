@@ -526,9 +526,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     );
 }
 
-/// Off-lock passive checkpoint may run btree write-out while a pinned `BEGIN CONCURRENT`
-/// reader is active. The reader must keep a consistent snapshot (dual-gate + version store);
-/// explicit `PRAGMA wal_checkpoint(PASSIVE)` must not corrupt it.
+/// Passive checkpoint may run btree writes while a pinned reader is active.
 #[test]
 fn mvcc_passive_checkpoint_busy_under_pinned_reader_no_corruption() {
     let db = MvccTestDbNoConn::new_with_random_db_passive();
@@ -554,7 +552,7 @@ fn mvcc_passive_checkpoint_busy_under_pinned_reader_no_corruption() {
         "reader must see all 5 committed rows",
     );
 
-    // Off-lock passive checkpoint may complete while the reader is pinned; it must not
+    // Passive checkpoint may complete while the reader is pinned; it must not
     // corrupt the reader's snapshot.
     writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
 
@@ -571,9 +569,7 @@ fn mvcc_passive_checkpoint_busy_under_pinned_reader_no_corruption() {
     );
 }
 
-/// Auto passive checkpoint must not abort when publish contends with a pinned reader: it yields
-/// and retries the brief publish lock (pager commit already done off-lock) until the reader
-/// releases.
+/// Auto passive checkpoint retries publish when a reader holds the checkpoint lock.
 #[test]
 fn mvcc_passive_auto_checkpoint_retries_publish_while_reader_pinned() {
     let db = MvccTestDbNoConn::new_with_random_db_passive();
@@ -1757,8 +1753,6 @@ fn test_journal_mode_switch_from_mvcc_to_wal_without_log_frames() {
     assert_eq!(rows[0][0].to_string().to_lowercase(), "wal");
 }
 
-/// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
-/// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[turso_macros::test(encryption)]
 fn test_recovery_checkpoint_then_more_writes() {
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
@@ -1926,8 +1920,6 @@ fn test_restart_with_trigger_rootpage_zero() {
     }
 }
 
-/// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
-/// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[turso_macros::test(encryption)]
 fn test_btree_resident_recovery_then_checkpoint_delete_stays_deleted() {
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
@@ -2015,8 +2007,7 @@ fn test_recovery_overwrites_torn_tail_on_next_append() {
     }
 }
 
-/// What this test checks: First-time MVCC bootstrap repairs a torn short `.db-log` header before metadata writes commit.
-/// Why this matters: Otherwise a crash after metadata WAL commit can leave an unrecoverable startup state.
+/// First-time MVCC bootstrap repairs a torn short `.db-log` header before metadata writes commit.
 #[test]
 #[ignore = "Needs a dedicated bootstrap harness that can create header=MVCC + missing metadata + torn short log atomically"]
 fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
@@ -2191,21 +2182,7 @@ fn test_checkpoint_truncates_wal_last() {
     );
 }
 
-/// Regression for blocking TRUNCATE leaving a non-empty logical log (and possible
-/// `integrity_check` orphan-page errors) when a sibling commit lands between early
-/// `snapshot_ts` sampling and `AcquireLock`.
-///
-/// Reproduces the old failure mode:
-/// 1. A follow-up INSERT with `mvcc_checkpoint_threshold = 0` auto-checkpoints in
-///    TRUNCATE mode and yields at `BeforeAcquireLock` (blocking lock not yet held).
-/// 2. A sibling connection commits `CREATE TABLE` + `INSERT` while the checkpoint is parked.
-/// 3. On the old path those versions had `begin_ts > snapshot_ts` (snapshot in
-///    `PrepareCheckpoint`), so they were not collected.
-/// 4. Conditional `truncate(durable_txid_max_new)` skipped while WAL truncation still
-///    ran — `.db-log` stayed non-empty after TRUNCATE.
-///
-/// With the fix (`snapshot_ts` after the lock), the logical log must be 0 and
-/// `integrity_check` must pass.
+/// Truncate checkpoint must collect commits that land while waiting for `AcquireLock`, and zero the logical log.
 #[test]
 fn test_blocking_truncate_zeros_log_when_commit_races_acquire_lock() {
     use crate::StepResult;
@@ -2339,8 +2316,6 @@ fn test_checkpoint_allows_index_schema_update_after_rename_column() {
     assert_eq!(rows[0][1].as_int().unwrap(), 2);
 }
 
-/// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
-/// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
 fn test_bootstrap_recovers_committed_wal_without_log_file() {
     // A Passive checkpoint truncates the logical log to 0 but leaves the WAL non-empty,
@@ -2729,8 +2704,7 @@ fn test_meta_recovery_case_1_no_wal_no_log_metadata_present_clean_boot() {
     );
 }
 
-/// What this test checks: With no committed WAL and metadata present, replay includes only frames above `persistent_tx_ts_max`.
-/// Why this matters: This is the core idempotency contract for logical-log replay.
+/// With no committed WAL and metadata present, replay includes only frames above `persistent_tx_ts_max`.
 #[turso_macros::test(encryption)]
 fn test_meta_recovery_case_2_no_wal_replay_above_metadata_boundary() {
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
@@ -2852,8 +2826,7 @@ fn test_mvcc_header_updates_allow_autocommit_statement_tx() {
     assert_eq!(rows[0][0].as_int().unwrap(), 19);
 }
 
-/// What this test checks: Missing/corrupt metadata with logical-log frames and no WAL causes fail-closed startup.
-/// Why this matters: Without metadata boundary recovery cannot choose replay/discard safely.
+/// Missing/corrupt metadata with logical-log frames and no WAL causes fail-closed startup.
 #[test]
 #[cfg_attr(
     feature = "checksum",
@@ -2937,8 +2910,7 @@ fn test_meta_recovery_case_4_committed_wal_reconcile_before_metadata_boundary_re
     assert_eq!(wal_len, 0, "reconciliation must truncate WAL at the end");
 }
 
-/// What this test checks: Committed WAL with missing metadata row fails closed.
-/// Why this matters: Recovery cannot infer authoritative replay boundary from WAL bytes alone.
+/// Committed WAL with missing metadata row fails closed.
 #[test]
 #[cfg_attr(
     feature = "checksum",
@@ -3045,8 +3017,7 @@ fn test_meta_recovery_case_7_metadata_table_shape_violation_fails_closed() {
     }
 }
 
-/// What this test checks: Deletion of metadata row is detected and rejected.
-/// Why this matters: Missing boundary metadata makes replay decision ambiguous.
+/// Deletion of metadata row is detected and rejected.
 #[test]
 #[cfg_attr(
     feature = "checksum",
@@ -3675,107 +3646,6 @@ fn test_checkpoint_resamples_boundary_before_starting() {
     assert_eq!(&integrity[0][0].to_string(), "ok");
 }
 
-/// What this test checks: a checkpoint state machine created before another checkpoint
-/// advances the durable boundary must resample that boundary after taking the checkpoint lock.
-/// Why this matters: otherwise a delayed checkpoint can replay an already-durable unique-index
-/// delete and fail.
-///
-/// SUPERSEDED by the `checkpoint_in_progress` single-orchestrator gate: the interleaving this
-/// test sets up (a second checkpoint advancing the boundary while a first is mid-flight) is now
-/// prevented — the first checkpoint claims the gate in `PrepareCheckpoint` and the second
-/// no-ops. The rewritten version lands with the Task 7 test-infra port. Ignored until then.
-#[ignore = "superseded by checkpoint_in_progress gate; rewritten version lands with test-infra port"]
-#[test]
-fn test_checkpoint_resamples_boundary_before_starting_with_yield_injection() {
-    let db = MvccTestDbNoConn::new_with_random_db();
-    let conn = db.connect();
-    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
-        .unwrap();
-    conn.execute(
-        "CREATE TABLE dry_floor_846 (
-            sour_sand_972 BLOB UNIQUE,
-            sour_river_140 REAL,
-            sweet_wall_518 BLOB,
-            fast_grass_379 TEXT,
-            dark_wave_139 REAL UNIQUE,
-            sad_wind_216 INTEGER UNIQUE PRIMARY KEY
-        )",
-    )
-    .unwrap();
-
-    conn.execute(
-        "INSERT INTO dry_floor_846 (
-            sour_sand_972, sour_river_140, sweet_wall_518,
-            fast_grass_379, dark_wave_139, sad_wind_216
-        ) VALUES (
-            zeroblob(16), 6.85, x'736d6172745f6c6561665f353637',
-            'wild_hill_714', 8.43, 788
-        )",
-    )
-    .unwrap();
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    let mvcc_store = db.get_mvcc_store();
-    let first_boundary = mvcc_store.durable_txid_max.load(Ordering::SeqCst);
-    assert!(first_boundary > 0);
-
-    conn.execute(
-        "UPDATE dry_floor_846
-            SET sour_sand_972 = x'66756c6c5f737461725f333732',
-                sour_river_140 = 5.75,
-                sweet_wall_518 = zeroblob(32),
-                fast_grass_379 = 'old_moon_16',
-                dark_wave_139 = 2.90
-          WHERE sad_wind_216 = 788",
-    )
-    .unwrap();
-    let update_ts = mvcc_store.last_committed_tx_ts.load(Ordering::SeqCst);
-    assert!(update_ts > first_boundary);
-
-    let delayed_conn = db.connect();
-    delayed_conn.set_yield_injector(Some(FixedYieldInjector::new([
-        CheckpointYieldPoint::BeforeAcquireLock.point(),
-    ])));
-    let mut delayed_checkpoint = delayed_conn.prepare("PRAGMA journal_mode = 'wal'").unwrap();
-    assert!(
-        matches!(delayed_checkpoint.step().unwrap(), StepResult::Yield),
-        "first checkpoint should yield before acquiring the checkpoint lock"
-    );
-
-    let interleaving_conn = db.connect();
-    interleaving_conn.set_failure_injector(Some(FixedFailureInjector::new([(
-        CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
-        LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
-    )])));
-    interleaving_conn
-        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        .expect_err("interleaving checkpoint should fail after advancing durable boundary");
-    interleaving_conn.set_failure_injector(None);
-    assert_eq!(
-        mvcc_store.durable_txid_max.load(Ordering::SeqCst),
-        update_ts
-    );
-
-    let journal_mode_rows = delayed_checkpoint.run_collect_rows().unwrap();
-    assert_eq!(journal_mode_rows.len(), 1);
-    assert_eq!(&journal_mode_rows[0][0].to_string(), "wal");
-
-    let rows = get_rows(
-        &conn,
-        "SELECT sad_wind_216, dark_wave_139, hex(sour_sand_972)
-           FROM dry_floor_846
-          WHERE sad_wind_216 = 788",
-    );
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0].as_int().unwrap(), 788);
-    assert_eq!(rows[0][1].to_string(), "2.9");
-    assert_eq!(&rows[0][2].to_string(), "66756C6C5F737461725F333732");
-
-    let integrity = get_rows(&conn, "PRAGMA integrity_check");
-    assert_eq!(integrity.len(), 1);
-    assert_eq!(&integrity[0][0].to_string(), "ok");
-}
-
 #[test]
 fn test_reader_consistent_during_large_indexed_commit_rewrite() {
     use crate::StepResult;
@@ -3979,7 +3849,7 @@ fn test_checkpoint_gc_anchor_loss_update_then_delete_strands_stale_row() {
         false
     };
 
-    // Pause AFTER both off-lock collection scans (row 1 collected live at T_snap) and
+    // Pause AFTER both concurrent collection scans (row 1 collected live at T_snap) and
     // BEFORE the blocking lock.
     assert!(
         step_to_next_yield(&mut checkpoint, 0),
@@ -4031,37 +3901,13 @@ fn test_checkpoint_gc_anchor_loss_update_then_delete_strands_stale_row() {
     );
 }
 
-/// Concurrent stress for the non-blocking MVCC checkpoint: a write-write-conflict abort path
-/// (with a SAVEPOINT/ROLLBACK TO in the middle) racing a conflicting committer that fires a
-/// Passive auto-checkpoint per commit, with a reader continuously validating.
-///
-/// The ONLY failure signal here is `PRAGMA integrity_check != "ok"` — a single consistent
-/// snapshot, the real table/index oracle. Earlier versions of this test also asserted
-/// value-specific invariants (e.g. "pk must still map to u=700+pk", assuming conn1 always
-/// aborts) and a cross-query table-vs-index compare; BOTH were false-positive-prone and were
-/// removed:
-///   - conn1's COMMIT only aborts when conn2 actually commits a conflicting write first; when
-///     conn2's UPDATE hits a WriteWriteConflict and skips, conn1 LEGITIMATELY commits its own
-///     `90000+round` value, so "u must be 700+pk" is simply a stale expectation, not a bug.
-///   - reading `WHERE u=?` (index) and `WHERE pk=?` (table) as two separate auto-commit
-///     statements observes two different snapshots, so a commit landing between them looks like
-///     a divergence that never existed in any single snapshot.
-///
-/// The genuine "row missing from index" inconsistency is reproduced deterministically by the
-/// whopper seeds (testing/concurrent-simulator/mvcc_checkpoint_regression.rs, seeds 1/32) where
-/// integrity_check itself fails. This unit test is a lighter-weight concurrent guard against the
-/// same class of bug; it currently PASSES (integrity_check stays "ok").
+/// Concurrent checkpoint + WWC abort stress; oracle is `integrity_check` only.
 #[test]
 fn test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check() {
     conflict_abort_ckpt_indexed_update_body(MvccTestDbNoConn::new_with_random_db());
 }
 
-/// Same reader/writer workload as the blocking test above, but with the experimental PASSIVE
-/// checkpoint enabled, so the threads race a concurrent checkpoint. Regression guard for the
-/// durable-btree corruption (orphaned page + autoindex entries lost under btree page free/reuse)
-/// that the whopper reproduced deterministically at `SEED=194421257625834`
-/// (scripts/passive_repro.sh `matz`): a passive checkpoint that ran its structural phase
-/// off-lock corrupted the forest; serializing that phase under the checkpoint lock fixes it.
+/// Same workload with passive checkpoint enabled.
 #[test]
 fn test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check_passive() {
     conflict_abort_ckpt_indexed_update_body(MvccTestDbNoConn::new_with_random_db_passive());
@@ -4078,7 +3924,7 @@ fn conflict_abort_ckpt_indexed_update_body(db: MvccTestDbNoConn) {
     }
     // Checkpoint so the seeded index/table values are btree-resident.
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-    // Force a Passive auto-checkpoint on every commit (off-lock path interleaves below).
+    // Passive auto-checkpoint on every commit.
     conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
         .unwrap();
 
@@ -4279,7 +4125,7 @@ fn test_passive_concurrent_transfer_preserves_sum_and_count() {
             .execute(format!("INSERT INTO accounts VALUES ({i}, {INIT})"))
             .unwrap();
     }
-    // Materialize the seed rows, then auto-checkpoint (off-lock) on every commit.
+    // Materialize the seed rows, then passive auto-checkpoint on every commit.
     setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     setup
         .execute("PRAGMA mvcc_checkpoint_threshold = 0")
@@ -4920,8 +4766,7 @@ fn test_checkpoint_post_durable_failure_then_delete_removes_stale_table_row() {
     assert_integrity_ok(&conn);
 }
 
-/// What this test checks: Replay gate uses metadata boundary and never applies frames at or below it.
-/// Why this matters: This enforces exactly-once effects at the DB-file apply boundary.
+/// Replay gate uses metadata boundary and never applies frames at or below it.
 #[test]
 #[cfg_attr(
     feature = "checksum",
@@ -7956,8 +7801,6 @@ fn test_insert_in_middle_commit_of_create_index_returns_err() {
     );
 }
 
-/// What this test checks: MVCC transaction visibility and conflict handling follow the intended isolation behavior.
-/// Why this matters: Concurrency bugs are correctness bugs: they create anomalies users can observe as wrong query results.
 #[test]
 #[ignore]
 fn test_concurrent_writes() {
@@ -8055,8 +7898,7 @@ fn test_concurrent_writes() {
     conn.close().unwrap();
 }
 
-/// What this test checks: The implementation maintains the intended invariant for this scenario.
-/// Why this matters: The invariant protects correctness across commit, replay, and query execution paths.
+/// The implementation maintains the intended invariant for this scenario.
 #[test]
 fn transaction_display() {
     let state = AtomicTransactionState::from(TransactionState::Preparing(20250915));
@@ -8238,8 +8080,7 @@ fn test_select_empty_table() {
     assert!(rows.is_empty());
 }
 
-/// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
-/// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
+/// Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 #[turso_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc() {
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
@@ -8262,8 +8103,7 @@ fn test_cursor_with_btree_and_mvcc() {
     assert_eq!(rows[1], vec![Value::from_i64(2)]);
 }
 
-/// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
-/// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
+/// Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 #[turso_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc_2() {
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
@@ -8290,8 +8130,7 @@ fn test_cursor_with_btree_and_mvcc_2() {
     assert_eq!(rows[2], vec![Value::from_i64(3)]);
 }
 
-/// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
-/// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
+/// Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 #[turso_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc_with_backward_cursor() {
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
@@ -8317,8 +8156,7 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor() {
     assert_eq!(rows[2], vec![Value::from_i64(1)]);
 }
 
-/// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
-/// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
+/// Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 #[turso_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
@@ -8349,8 +8187,7 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
     assert_eq!(rows[3], vec![Value::from_i64(1)]);
 }
 
-/// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
-/// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
+/// Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 #[turso_macros::test(encryption)]
 #[ignore] // FIXME: This fails constantly on main and is really annoying, disabling for now :]
 fn test_cursor_with_btree_and_mvcc_fuzz() {
@@ -9552,8 +9389,7 @@ fn test_gc_rule1_aborted_garbage_removed() {
     assert!(versions.is_empty());
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// Rule 1 removes only aborted garbage, leaving live and superseded versions intact.
 fn test_gc_rule1_aborted_among_live_versions() {
@@ -9577,8 +9413,7 @@ fn test_gc_rule1_aborted_among_live_versions() {
         .all(|rv| rv.begin().is_some() || rv.end().is_some()));
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// A superseded version whose end timestamp is at or below the low-water mark is
 /// invisible to all active readers. When a committed current version exists to
@@ -9601,8 +9436,7 @@ fn test_gc_rule2_superseded_below_lwm_with_current() {
     assert!(versions[0].end().is_none()); // only current remains
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// A superseded version whose end timestamp exceeds the LWM may still be visible
 /// to an active reader. It must be retained regardless of other conditions.
@@ -9620,8 +9454,7 @@ fn test_gc_rule2_superseded_above_lwm_retained() {
     assert_eq!(versions.len(), 2);
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// When a row was deleted but the deletion hasn't been checkpointed to the B-tree
 /// yet (e > ckpt_max), the tombstone is the only thing hiding the stale B-tree
@@ -9644,8 +9477,7 @@ fn test_gc_rule2_tombstone_guard_uncheckpointed() {
     assert_eq!(versions.len(), 1);
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// Once the deletion has been checkpointed (e <= ckpt_max), the B-tree no longer
 /// contains the row, so the tombstone is safe to remove.
@@ -9664,8 +9496,7 @@ fn test_gc_rule2_tombstone_guard_checkpointed() {
     assert!(versions.is_empty());
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// A current version that's been checkpointed to B-tree, with no other versions in
 /// the chain and no active reader needing it, is redundant. The dual cursor will
@@ -9684,8 +9515,7 @@ fn test_gc_rule3_checkpointed_sole_survivor_removed() {
     assert!(versions.is_empty());
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// A current version not yet checkpointed (b > ckpt_max) cannot be removed —
 /// the B-tree doesn't have the data, so fallthrough would return stale results.
@@ -9703,8 +9533,7 @@ fn test_gc_rule3_not_checkpointed_retained() {
     assert_eq!(versions.len(), 1);
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// A current version whose begin timestamp equals the LWM might still be needed
 /// by the oldest active reader. Rule 3 requires strict b < lwm, so it's retained.
@@ -9723,8 +9552,7 @@ fn test_gc_rule3_visible_to_active_tx_retained() {
     assert_eq!(versions.len(), 1);
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// A current version cannot be removed before checkpoint has persisted it.
 fn test_gc_rule3_current_retained_before_first_checkpoint() {
@@ -9740,8 +9568,7 @@ fn test_gc_rule3_current_retained_before_first_checkpoint() {
     assert_eq!(versions.len(), 1);
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// Once checkpoint has persisted a sole current version, it becomes GC-eligible.
 fn test_gc_rule3_current_collected_after_checkpoint() {
@@ -9757,8 +9584,7 @@ fn test_gc_rule3_current_collected_after_checkpoint() {
     assert_eq!(versions.len(), 0);
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// Rule 3 requires the current version to be the sole remaining version in the
 /// chain. When a superseded version is removed first by Rule 2, Rule 3 can then
@@ -9780,8 +9606,7 @@ fn test_gc_rule3_not_sole_survivor() {
     assert!(versions.is_empty());
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// Versions referencing an active transaction (begin=TxID) represent uncommitted
 /// inserts. They don't match any removal rule and must always be retained.
@@ -9799,8 +9624,7 @@ fn test_gc_txid_refs_retained() {
     assert_eq!(versions.len(), 1);
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// Versions with end=TxID represent an uncommitted deletion. Rule 2 only matches
 /// end=Timestamp, so these are never collected until the deleting tx resolves.
@@ -9818,8 +9642,7 @@ fn test_gc_txid_end_retained() {
     assert_eq!(versions.len(), 1);
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// A pending insert (begin=TxID) must NOT count as a "committed current version"
 /// for the tombstone guard. If it rolled back, the tombstone would be the only
@@ -9845,8 +9668,7 @@ fn test_gc_rule2_pending_insert_does_not_disable_tombstone_guard() {
     assert_eq!(versions.len(), 2);
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// When a committed current version exists (begin=Timestamp, end=None), it takes
 /// over MVCC visibility from a non-B-tree superseded version. The tombstone guard
@@ -9929,8 +9751,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
     assert!(versions.is_empty());
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// B-tree tombstones (begin=None, end=e) represent rows that existed in the B-tree
 /// before MVCC was enabled and were then deleted. Before checkpoint writes the
@@ -9963,8 +9784,7 @@ fn test_gc_rule2_btree_tombstone_lifecycle() {
     assert_eq!(versions.len(), 0);
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// Rule 3 must never fire when superseded versions remain in the chain — removing
 /// the current version would leave orphaned superseded versions that "poison" the
@@ -9988,8 +9808,7 @@ fn test_gc_rule3_not_firing_with_unremovable_superseded() {
     assert_eq!(versions.len(), 2);
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// GC on an empty version chain is a no-op. Verifies no panics or off-by-one errors.
 fn test_gc_noop_on_empty() {
@@ -10004,8 +9823,7 @@ fn test_gc_noop_on_empty() {
     assert_eq!(dropped, 0);
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// All three rules fire together: aborted garbage (Rule 1), two superseded versions
 /// below LWM with a committed current (Rule 2), and the sole surviving current
@@ -10030,8 +9848,7 @@ fn test_gc_combined_rules() {
     assert!(versions.is_empty());
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// End-to-end at the MvStore level: insert a row, commit, and run GC. Without a
 /// checkpoint the version is not yet in the B-tree, so Rule 3 doesn't fire and
@@ -10058,8 +9875,7 @@ fn test_gc_integration_insert_commit_gc() {
     assert!(!db.mvcc_store.rows.is_empty());
 }
 
-/// What this test checks: Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
-/// Why this matters: GC mistakes can either lose data (over-collection) or retain stale history forever (under-collection).
+/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// Rolling back a transaction leaves aborted garbage (begin=None, end=None).
 /// GC reclaims the versions. The SkipMap entry stays (lazy removal to avoid
@@ -16333,17 +16149,17 @@ fn test_checkpoint_recovers_after_crash_restart_drop_recreate_index() {
 /// path:
 /// 1. An INSERT commits with `mvcc_checkpoint_threshold = 0` and yields at the
 ///    checkpoint's `BeforeAcquireLock` point, after the checkpoint has captured
-///    its snapshot but before it acquires the blocking lock and collects rows.
+///    the schema but before it has collected rows.
 /// 2. A second connection creates a new index while auto-checkpointing remains
 ///    enabled, making the index schema row durable after the delayed checkpoint's
 ///    schema snapshot.
 /// 3. A later INSERT writes a fresh index row version for that now-durable index.
 /// 4. The background connection observes the new schema through normal SQL, so
 ///    the resumed checkpoint no longer fails early as a stale-schema write.
-/// 5. Resuming the delayed checkpoint acquires the lock, refreshes its durable
-///    watermark and index map, then collects under the lock. The durable CREATE
-///    INDEX schema row is skipped, but the fresh index row is collected and
-///    `WriteIndexRow` can open the index via the refreshed `index_id_to_index`.
+/// 5. Resuming the delayed checkpoint refreshes its durable watermark, skips the
+///    durable CREATE INDEX schema row, but still collects the fresh index row.
+///    The checkpoint-local `index_id_to_index` map must have been refreshed
+///    alongside the durable watermark so `WriteIndexRow` can open the index.
 #[test]
 fn test_auto_checkpoint_refreshes_index_metadata_after_schema_change() {
     let _ = tracing_subscriber::fmt::try_init();

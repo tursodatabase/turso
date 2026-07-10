@@ -3841,19 +3841,7 @@ pub struct RecoverCtx {
     index_infos: HashMap<(MVTableId, IndexOpKind), Arc<IndexInfo>>,
 }
 
-/// A versioned `table_id -> root_page` binding. The root page is `None` while the object is
-/// uncheckpointed (created in the logical log, no B-tree allocated yet) and `Some(page)` once a
-/// checkpoint physically allocates it. `begin`/`end` bound the snapshot range over which the
-/// binding is visible: `begin` is the allocating checkpoint's snapshot ts (`0` for
-/// bootstrap/recovery bindings that predate every transaction) and `end` is the drop tombstone's
-/// commit ts (`u64::MAX` while live). See [`MvStore::table_id_to_rootpage`].
-/// A position in the WAL as `(checkpoint_seq, frame)`. Lexicographic ordering (derived) is exactly
-/// physical reachability: a materialization at WAL position `m` is reachable by a reader whose read
-/// mark is `r` iff `m <= r`. A lower `checkpoint_seq` is an earlier WAL epoch whose frames were
-/// backfilled into the DB file before the epoch bumped (a TRUNCATE/restart backfills everything
-/// first), so it is reachable via the base regardless of frame; within an epoch the frame numbers
-/// compare directly. This mirrors the pager's `find_frame` rule, so the read gate can never claim a
-/// page is readable that a physical read cannot reach.
+/// WAL position `(checkpoint_seq, frame)`. Ordered lexicographically for physical reachability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WalPos {
     pub checkpoint_seq: u32,
@@ -3880,18 +3868,13 @@ impl WalPos {
     }
 }
 
+/// Versioned `table_id -> root_page` binding (`begin`/`end` = snapshot lifetime).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RootEntry {
     pub root_page: Option<u64>,
     pub begin: u64,
     pub end: u64,
-    /// WAL position at which this binding's B-tree pages became durable (the checkpoint
-    /// connection's position right after `CommitPagerTxn`). A transaction may physically read this
-    /// btree only once its own read mark reaches this position (`materialized_at <= tx.read_mark`).
-    /// `begin` is *logical* base-validity (the checkpoint's `c_ts`); `materialized_at` is *physical*
-    /// reachability. [`WalPos::ORIGIN`] for bootstrap/recovery bindings (always in the base);
-    /// [`WalPos::STAGED`] while pages are allocated but not yet committed.
-    /// See [`MvStore::is_btree_readable_at`].
+    /// When this binding's B-tree pages became durable in the WAL (`ORIGIN` = always in base).
     pub materialized_at: WalPos,
 }
 
@@ -3935,15 +3918,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// The value is Option because tables created in an MVCC commit that have not
     /// been checkpointed yet have no real root page assigned yet.
     ///
-    /// Each value is a [`RootEntry`] carrying the binding's physical root page plus its
-    /// versioned lifetime `[begin, end)`. A PASSIVE checkpoint mutates these off-lock — it
-    /// allocates an uncheckpointed object's real root page (`begin` = checkpoint snapshot ts)
-    /// and later drops it (`end` = tombstone commit ts) — while concurrent transactions hold
-    /// older snapshots. The lifetime lets every lookup resolve the binding as seen *at a
-    /// transaction's snapshot* rather than "now", so a tx whose snapshot predates an allocation
-    /// treats the object as version-store-only (never seeking the stale placeholder root), and
-    /// a reader before a drop still resolves the (read-mark-protected) page even after reuse.
-    /// Dropped entries are retained until `end <= lwm` (see `gc_rootpage_entries`).
+    /// Versioned root bindings; passive checkpoints update these at publish, not during collection.
     pub table_id_to_rootpage: SkipMap<MVTableId, RootEntry, BasicComparator, A>,
     /// Unlike table rows which are stored in a single map, we have a separate map for every index
     /// because operations like last() on an index are much easier when we don't have to take the
@@ -4007,7 +3982,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     durable_txid_max: AtomicU64,
     /// The WAL backfill boundary published by the most recent checkpoint: a version materialized at
     /// or below this `WalPos` is durably in the DB file, so reachable by EVERY snapshot (including
-    /// a db-file reader pinned at the boundary). The off-lock GC reclaims a materialized version
+    /// a db-file reader pinned at the boundary). The passive checkpoint GC reclaims a materialized version
     /// only once its `materialized_at <= backfill_floor` — otherwise a low-frame reader that
     /// cannot reach the un-backfilled WAL frame still needs the version-store copy. See
     /// `gc_version_chain` / `gc_floor_reader_mark`. `RwLock<WalPos>` mirrors `global_header`.
@@ -4343,7 +4318,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             },
         );
         // A page has one live owner. Claiming this page means it was freed+reused; retire any
-        // stale prior owner still marked live for it (its drop-time retire raced off-lock),
+        // stale prior owner still marked live for it (drop-time retire raced collection),
         // else two live bindings resolve to one page (integrity_check: referenced twice).
         let stale: Vec<(MVTableId, RootEntry)> = self
             .table_id_to_rootpage
@@ -7777,22 +7752,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    /// PASSIVE-mode sequence compaction (Option B; see
-    /// `docs/internals/mvcc/sequence-compaction-passive.md`). Snapshot-safe alternative to the
-    /// raw off-lock `purge_row_versions_during_checkpoint` + `cursor.delete()`, whose contract
-    /// requires `pager_commit_lock` to be held (only true for the blocking checkpoint).
-    ///
-    /// Instead of clearing the chain and removing the B-tree row off-lock — which lets a
-    /// concurrent transaction observe "row in B-tree, absent from MVCC" and synthesize a phantom
-    /// tombstone — this records a *proper end-stamped delete* and leaves the B-tree row intact.
-    /// A later checkpoint materializes the delete through the normal path. `end_ts` must be a
-    /// freshly allocated commit timestamp (> every concurrent reader's begin and > the durable
-    /// boundary this checkpoint publishes) so concurrent readers see the row live (and conflict on
-    /// delete) rather than missing, and so the next checkpoint still treats the delete as
-    /// uncheckpointed.
-    ///
-    /// Called only from the passive publish window (clock-ordered), so the `end_ts` ordering vs
-    /// concurrent `begin_tx` is well defined.
+    /// Passive sequence compaction: record end-stamped deletes instead of inline B-tree purge.
     pub fn seqcompact_commit_delete(&self, rowid: RowID, num_cols: usize, end_ts: u64) {
         let Ok(row_versions) = self.get_or_create_table_row_versions(rowid.clone()) else {
             return;
@@ -8847,7 +8807,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 if column_count < 5 {
                                     return Err(LimboError::Corrupt(format!(
                                         "sqlite_schema row must have at least 5 columns, got {column_count}",
-
                                     )));
                                 }
                                 let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
@@ -8893,7 +8852,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                             self.table_id_to_rootpage.get(&table_id)
                                         {
                                             if let Some(value) = entry.value().root_page {
-                                                panic!("Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}");
+                                                panic!(
+                                                    "Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}"
+                                                );
                                             }
                                         }
                                         self.insert_table_id_to_rootpage(table_id, None);
@@ -8907,7 +8868,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                             );
                                         };
                                         let Some(value) = entry.value().root_page else {
-                                            panic!("Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map");
+                                            panic!(
+                                                "Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map"
+                                            );
                                         };
                                         turso_assert_eq!(value, root_page as u64, "logical log root page does not match table_id_to_rootpage map", { "root_page": root_page, "map_value": value });
                                     }
@@ -9350,7 +9313,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// - **logical (base validity):** the binding `covers(begin_ts)` — `begin <= begin_ts < end`; and
     /// - **physical reachability:** `materialized_at <= read_mark` — the btree's pages are at-or-below
     ///   this transaction's read mark (same WAL epoch and frame ≤ mark, or an earlier backfilled
-    ///   epoch). Without this a transaction that opened before an off-lock materialization would
+    ///   epoch). Without this a transaction that opened before an checkpoint materialization would
     ///   seek a page its read mark cannot reach (a torn/foreign/zeroed-page read).
     ///
     /// When this is false the transaction stays version-store-only; the GC floor

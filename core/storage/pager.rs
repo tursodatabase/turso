@@ -2895,7 +2895,7 @@ impl Pager {
 
     /// This connection's frozen WAL position `(checkpoint_seq, max_frame)` — the read mark for a
     /// reader, or the post-commit position for a writer. `(u32::MAX, u64::MAX)` when there is no
-    /// WAL (no off-lock materialization hazard). See `Wal::connection_wal_pos`.
+    /// WAL (no WAL materialization hazard). See `Wal::connection_wal_pos`.
     pub fn wal_pos(&self) -> (u32, u64) {
         self.wal
             .as_ref()
@@ -2903,8 +2903,8 @@ impl Pager {
     }
 
     /// Lowest WAL frame any active reader is pinned at, or `None` if none / no WAL. Used as the
-    /// MVCC off-lock checkpoint GC floor (it sees readers pinned via `begin_read_tx` even before
-    /// they publish an MVCC transaction). See `MvStore::rootpage_gc_protected`.
+    /// Passive-checkpoint version-store GC floor (includes readers pinned via `begin_read_tx`
+    /// before they publish an MVCC transaction). See `MvStore::rootpage_gc_protected`.
     pub fn min_pinned_read_frame(&self) -> Option<u64> {
         self.wal
             .as_ref()
@@ -2912,8 +2912,8 @@ impl Pager {
     }
 
     /// The WAL backfill boundary (frames at or below this are durable in the DB file). The MVCC
-    /// off-lock GC floor: a materialized version may be reclaimed from the version store only once
-    /// its materialization frame is backfilled here, so every snapshot can read it from the btree.
+    /// Version-store GC floor for passive checkpoints: a materialized version may be reclaimed only
+    /// once its materialization frame is backfilled here, so every snapshot can read it from the btree.
     pub fn wal_backfill_frame(&self) -> Option<u64> {
         self.wal.as_ref().map(|wal| wal.backfill_frame())
     }

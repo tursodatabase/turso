@@ -1002,12 +1002,11 @@ impl LogicalLog {
         Ok(c)
     }
 
-    /// Truncate the logical log if we've checkpointed up to the last available commit timestamp in logical log.
-    /// If there is another commit after the checkpoint, we don't truncate the log.
+    /// Truncate when `max_appended_commit_ts <= boundary`; passive uses `durable_txid_max_new`,
+    /// truncate mode uses `u64::MAX` (always empty after checkpoint).
     pub fn truncate(&mut self, checkpointed_through_ts: u64) -> Result<Completion> {
         if self.max_appended_commit_ts > checkpointed_through_ts {
-            // Uncheckpointed frames above the boundary remain — keep the whole log
-            // (offset/salt/CRC unchanged) so they survive to the next pass. No-op.
+            // Uncheckpointed frames remain — skip truncation.
             let c = Completion::new_trunc(|_| {});
             c.complete(0);
             return Ok(c);
@@ -1959,12 +1958,7 @@ impl StreamingLogicalLogReader {
         }
 
         let header_bytes = return_if_io!(self.read_exact_at(0, LOG_HDR_SIZE));
-        // An all-zero header is *absence*, not corruption: a fsync'd header carries
-        // LOG_MAGIC and survives crashes, so zeros mean a commit crashed before its fsync
-        // (the un-fsynced header write at offset 0 was lost while a frame page survived) —
-        // not a torn truncate (truncate is atomic). No commits were acknowledged, so treat
-        // it as NoLog and recover from the WAL. A non-zero but invalid header (torn rewrite
-        // of a once-valid one) is genuine corruption and still fails closed.
+        // All-zero header means no durable log header yet (pre-fsync crash), not corruption.
         if header_bytes.iter().all(|&b| b == 0) {
             return Ok(IOResult::Done(HeaderReadResult::NoLog));
         }
@@ -5789,7 +5783,6 @@ mod tests {
     }
 
     /// What this property checks: For arbitrary event sequences, write/read round-trip preserves operation intent.
-    /// Why this matters: Property checks broaden coverage beyond hand-crafted examples.
     #[quickcheck]
     fn prop_logical_log_roundtrip_sequence(events: Vec<(bool, i64, bool)>) -> bool {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
@@ -5853,7 +5846,6 @@ mod tests {
     }
 
     /// What this property checks: Streaming varint decode returns the original value for encoded inputs.
-    /// Why this matters: Varint correctness is required for rowid and payload-length decoding.
     #[quickcheck]
     fn prop_streaming_varint_roundtrip(value: u64) -> bool {
         let mut encoded = [0u8; 9];
@@ -5880,7 +5872,6 @@ mod tests {
     }
 
     /// What this property checks: The streaming varint decoder agrees with the reference decoder on the same bytes.
-    /// Why this matters: Decoder agreement reduces risk of split-brain parsing behavior.
     #[quickcheck]
     fn prop_streaming_varint_matches_read_varint(bytes: Vec<u8>) -> bool {
         let bytes = if bytes.len() > 16 {

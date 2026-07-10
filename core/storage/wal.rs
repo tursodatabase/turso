@@ -763,7 +763,7 @@ pub trait Wal: Debug + Send + Sync {
     fn get_min_frame(&self) -> u64;
     /// The shared backfill boundary: WAL frames at or below this are durably copied into the DB
     /// file, so a version materialized there is reachable by EVERY snapshot (including a db-file
-    /// reader pinned at the boundary). Used as the MVCC off-lock GC floor.
+    /// reader pinned at the boundary). Used as the passive-checkpoint version-store GC floor.
     fn backfill_frame(&self) -> u64;
     fn rollback(&self, rollback_to: Option<RollbackTo>);
     fn abort_checkpoint(&self);

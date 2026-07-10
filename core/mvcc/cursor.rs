@@ -475,7 +475,7 @@ impl<A: ConcurrentAllocator> IndexShadowFinger<A> {
                     // Version present at this key -> resolve the shadow bit now,
                     // on the one key that actually matches a B-tree row.
                     std::cmp::Ordering::Equal => {
-                        return !db.index_chain_invalidates_btree(versions, tx_id)
+                        return !db.index_chain_invalidates_btree(versions, tx_id);
                     }
                     // Finger behind the B-tree (a version-only key); catch up below.
                     std::cmp::Ordering::Less => {}
@@ -555,7 +555,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             "BTreeCursor expected for mvcc cursor"
         );
         // Resolve the root page against this reader's snapshot: a PASSIVE checkpoint may have
-        // dropped (and possibly reused) the page off-lock while we still reference it at an
+        // dropped (and possibly reused) the page during collection while we still reference it at an
         // older snapshot. The WAL read mark keeps the pages readable; this keeps the in-memory
         // root_page -> table_id reverse lookup snapshot-consistent. See `retired_rootpages`.
         let snapshot_ts = db.read_snapshot_ts(tx_id);
@@ -792,9 +792,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     fn is_btree_allocated(&self) -> bool {
         // Dual gate (logical base-validity AND physical visibility): a PASSIVE checkpoint may
-        // materialize this object's btree off-lock. This cursor may read it only if the binding
+        // materialize this object's btree during collection. This cursor may read it only if the binding
         // covers our snapshot AND its pages were already durable when we pinned our read mark
-        // (`visible_from <= observed_boundary`). A cursor that opened before an off-lock
+        // (`visible_from <= observed_boundary`). A cursor that opened before checkpoint publish
         // materialization therefore stays version-store-only for its whole life and never seeks
         // the page its read mark can't see. See `MvStore::is_btree_readable_at`.
         let begin_ts = self.db.read_snapshot_ts(self.tx_id);
