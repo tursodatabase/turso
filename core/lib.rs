@@ -2216,6 +2216,7 @@ impl Database {
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),
             n_active_root_statements: AtomicI32::new(0),
+            destroy_in_progress: AtomicBool::new(false),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
             named_savepoints: RwLock::new(Vec::new()),

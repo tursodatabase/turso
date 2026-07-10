@@ -1,4 +1,176 @@
+use std::sync::Arc;
+
 use crate::common::{ExecRows, TempDatabase};
+use crate::queued_io::QueuedIo;
+use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, StepResult};
+
+fn open_queued_conn(io: Arc<QueuedIo>, path: &str) -> anyhow::Result<Arc<Connection>> {
+    let db =
+        Database::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None)?;
+    Ok(db.connect()?)
+}
+
+fn queued_drop_fixture(io: &Arc<QueuedIo>, path: &str) -> anyhow::Result<Arc<Connection>> {
+    let conn = open_queued_conn(io.clone(), path)?;
+    conn.execute("PRAGMA page_size=512")?;
+    conn.execute("PRAGMA cache_size=9")?;
+    conn.execute("PRAGMA cache_spill=ON")?;
+    conn.execute("PRAGMA journal_mode='wal'")?;
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, b BLOB)")?;
+    for id in 1..=32 {
+        conn.execute(format!("INSERT INTO u VALUES({id}, zeroblob(60))"))?;
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(conn)
+}
+
+fn collect_rows(stmt: &mut turso_core::Statement) -> anyhow::Result<Vec<(i64, i64)>> {
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::IO => stmt._io().step()?,
+            StepResult::Yield => {}
+            StepResult::Row => {
+                let row = stmt.row().expect("row should be available after Row");
+                rows.push((row.get::<i64>(0)?, row.get::<i64>(1)?));
+            }
+            StepResult::Done => return Ok(rows),
+            StepResult::Interrupt | StepResult::Busy => {
+                anyhow::bail!("unexpected non-progress result while draining statement")
+            }
+        }
+    }
+}
+
+#[test]
+fn active_table_seek_after_drop_reuse_must_not_use_recycled_root_page() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let dir = tempfile::TempDir::new()?;
+    let path = dir.path().join("table-interior-drop-reuse.db");
+    let conn = queued_drop_fixture(&io, path.to_str().unwrap())?;
+
+    let mut select = conn.prepare("SELECT id, length(b) FROM u WHERE id = 16")?;
+    match select.step()? {
+        StepResult::IO => select._io().step()?,
+        other => anyhow::bail!("SELECT did not yield at the root-page read: {other:?}"),
+    }
+
+    let err = conn
+        .execute("DROP TABLE u")
+        .expect_err("DROP TABLE must fail while a statement is active on the connection");
+    assert!(
+        matches!(err, turso_core::LimboError::TableLocked),
+        "expected TableLocked, got {err:?}"
+    );
+    let schema_after_failed_drop: Vec<(i64,)> =
+        conn.exec_rows("SELECT count(*) FROM sqlite_schema WHERE name = 'u'");
+    assert_eq!(schema_after_failed_drop, vec![(1,)]);
+    conn.execute("CREATE TABLE reuse(id INTEGER PRIMARY KEY, b BLOB)")?;
+    conn.execute("INSERT INTO reuse VALUES(16, zeroblob(5000))")?;
+
+    let rows = collect_rows(&mut select)?;
+    assert_eq!(rows, vec![(16, 60)]);
+
+    conn.execute("DROP TABLE u")?;
+    let remaining: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name");
+    assert_eq!(remaining, vec![("reuse".to_string(),)]);
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+
+    Ok(())
+}
+
+#[test]
+fn statement_started_during_in_flight_destroy_is_locked_out() -> anyhow::Result<()> {
+    let mut saw_locked = false;
+    let mut park_after = 1usize;
+    loop {
+        let io = Arc::new(QueuedIo::new());
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join(format!("drop-parked-{park_after}.db"));
+        let conn = queued_drop_fixture(&io, path.to_str().unwrap())?;
+
+        let mut drop_stmt = conn.prepare("DROP TABLE u")?;
+        let mut yields = 0usize;
+        let parked = loop {
+            match drop_stmt.step()? {
+                StepResult::IO => {
+                    while io.step_one()?.is_some() {}
+                    yields += 1;
+                    if yields == park_after {
+                        break true;
+                    }
+                }
+                StepResult::Yield | StepResult::Row => {}
+                StepResult::Done => break false,
+                other => anyhow::bail!("unexpected result while driving DROP: {other:?}"),
+            }
+        };
+        if !parked {
+            break;
+        }
+
+        match conn.execute("CREATE TABLE reuse(id INTEGER PRIMARY KEY, b BLOB)") {
+            Ok(_) => {
+                conn.execute("INSERT INTO reuse VALUES(16, zeroblob(5000))")?;
+            }
+            Err(err) => {
+                assert!(
+                    matches!(err, turso_core::LimboError::TableLocked),
+                    "park_after={park_after}: write probe must fail with TableLocked, got {err:?}"
+                );
+                saw_locked = true;
+            }
+        }
+
+        match conn.prepare("SELECT id, length(b) FROM u WHERE id = 16") {
+            Ok(mut probe) => match collect_rows(&mut probe) {
+                Ok(rows) => {
+                    assert_eq!(rows, vec![(16, 60)], "park_after={park_after}");
+                }
+                Err(err) => {
+                    let err = err.downcast::<turso_core::LimboError>()?;
+                    assert!(
+                        matches!(err, turso_core::LimboError::TableLocked),
+                        "park_after={park_after}: probe must fail with TableLocked, got {err:?}"
+                    );
+                    saw_locked = true;
+                }
+            },
+            Err(err) => {
+                assert!(
+                    err.to_string().to_lowercase().contains("no such table"),
+                    "park_after={park_after}: unexpected prepare error {err:?}"
+                );
+            }
+        }
+
+        loop {
+            match drop_stmt.step()? {
+                StepResult::IO => while io.step_one()?.is_some() {},
+                StepResult::Yield | StepResult::Row => {}
+                StepResult::Done => break,
+                other => anyhow::bail!("unexpected result while finishing DROP: {other:?}"),
+            }
+        }
+        drop(drop_stmt);
+
+        let remaining: Vec<(i64,)> =
+            conn.exec_rows("SELECT count(*) FROM sqlite_schema WHERE name = 'u'");
+        assert_eq!(remaining, vec![(0,)], "park_after={park_after}");
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(
+            integrity,
+            vec![("ok".to_string(),)],
+            "park_after={park_after}"
+        );
+
+        park_after += 1;
+    }
+    assert!(saw_locked);
+    Ok(())
+}
 
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
 fn test_fail_drop_indexed_column(tmp_db: TempDatabase) -> anyhow::Result<()> {

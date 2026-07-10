@@ -1987,6 +1987,11 @@ impl ProgramBuilder {
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::Program { .. }));
 
+        let contains_destroy = self
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Destroy { .. }));
+
         let prepared = PreparedProgram {
             max_registers: self.next_free_register,
             insns: self.insns,
@@ -2004,6 +2009,7 @@ impl ProgramBuilder {
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
             contains_trigger_subprograms,
+            contains_destroy,
             resolve_type: self.resolve_type,
             prepare_context,
             write_databases: self.write_databases,

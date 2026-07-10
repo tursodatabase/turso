@@ -475,6 +475,7 @@ pub struct Connection {
     /// (`db->nVdbeActive`) for user statements, excluding internal helpers and
     /// subprogram execution.
     pub(crate) n_active_root_statements: AtomicI32,
+    pub(crate) destroy_in_progress: AtomicBool,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
