@@ -1861,3 +1861,57 @@ async fn test_invalid_transaction_state_on_rows_drop_mvcc() {
     drop(stmt);
     tx.commit().await.unwrap();
 }
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[tokio::test]
+async fn test_multiprocess_wal_second_process_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("multiprocess-second-open.db");
+    let db_path_str = db_path.to_str().unwrap();
+
+    let db = Builder::new_local(db_path_str)
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE test (x INTEGER)", ())
+        .await
+        .unwrap();
+    conn.execute("INSERT INTO test (x) VALUES (1)", ())
+        .await
+        .unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = std::process::Command::new(&current_exe)
+        .arg("multiprocess_wal_second_open_child_process")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    let child_stdout = String::from_utf8_lossy(&child_output.stdout);
+    assert!(
+        child_output.status.success() && child_stdout.contains("1 passed"),
+        "second multiprocess open must succeed in a child process: stdout={child_stdout}; stderr={}",
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[tokio::test]
+async fn multiprocess_wal_second_open_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let db = Builder::new_local(db_path.to_str().unwrap())
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    let mut rows = conn.query("SELECT count(*) FROM test", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get_value(0).unwrap(), Value::Integer(1));
+}
