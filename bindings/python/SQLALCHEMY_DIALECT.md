@@ -124,7 +124,7 @@ sqlite+turso:///db.db?isolation_level=IMMEDIATE
 ```
 
 Query parameters:
-- `isolation_level` - Transaction isolation level (DEFERRED, IMMEDIATE, EXCLUSIVE, AUTOCOMMIT)
+- `isolation_level` - Transaction isolation level: DEFERRED (default), IMMEDIATE, EXCLUSIVE, or AUTOCOMMIT (disables implicit transactions)
 - `experimental_features` - Comma-separated feature flags
 
 ### Async Local Dialect (`sqlite+aioturso://`)
@@ -136,7 +136,7 @@ sqlite+aioturso:///db.db?isolation_level=IMMEDIATE
 ```
 
 Query parameters:
-- `isolation_level` - Transaction isolation level (DEFERRED, IMMEDIATE, EXCLUSIVE, AUTOCOMMIT)
+- `isolation_level` - Transaction isolation level: DEFERRED (default), IMMEDIATE, EXCLUSIVE, or AUTOCOMMIT (disables implicit transactions)
 - `experimental_features` - Comma-separated feature flags
 
 ### Sync Dialect (`sqlite+turso_sync://`)
@@ -151,7 +151,7 @@ Query parameters:
 - `client_name` - Client identifier (default: turso-sqlalchemy)
 - `long_poll_timeout_ms` - Long poll timeout in milliseconds
 - `bootstrap_if_empty` - Bootstrap from remote if local empty (default: true)
-- `isolation_level` - Transaction isolation level
+- `isolation_level` - Transaction isolation level: DEFERRED (default), IMMEDIATE, EXCLUSIVE, or AUTOCOMMIT (disables implicit transactions)
 - `experimental_features` - Comma-separated feature flags
 
 URL validation:
@@ -161,28 +161,12 @@ URL validation:
 
 ## Sync Operations 
 
-The `get_sync_connection()` helper provides access to sync-specific methods:
+The `get_sync_connection()` helper (shown in Quick Start above) exposes the underlying `turso.sync.ConnectionSync` with these sync-specific methods:
 
-```python
-from turso.sqlalchemy import get_sync_connection
-
-with engine.connect() as conn:
-    sync = get_sync_connection(conn)
-
-    # Pull changes from remote (returns True if updates were pulled)
-    if sync.pull():
-        print("Pulled new changes!")
-
-    # Push local changes to remote
-    sync.push()
-
-    # Checkpoint the WAL
-    sync.checkpoint()
-
-    # Get sync statistics
-    stats = sync.stats()
-    print(f"Network received: {stats.network_received_bytes} bytes")
-```
+- `pull()` - Pull changes from remote; returns `True` if updates were pulled
+- `push()` - Push local changes to remote
+- `checkpoint()` - Checkpoint the WAL
+- `stats()` - Sync statistics (e.g. `stats().network_received_bytes`)
 
 `get_sync_connection()` raises `TypeError` if called on a non-sync connection (e.g. a plain `sqlite+turso://` or standard `sqlite://` engine).
 

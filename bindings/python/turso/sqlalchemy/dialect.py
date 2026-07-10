@@ -32,9 +32,11 @@ logger = logging.getLogger(__name__)
 class _TursoDialectMixin:
     """
     Mixin providing Turso-specific overrides for SQLAlchemy dialect.
-    The methods below override the parent where the underlying 
-    capability is not supported by turso:
-    - sqlite_temp_master (temp tables/views)
+    The methods below override the parent where the underlying
+    capability differs in turso:
+    - sqlite_temp_master (temp tables/views) is not supported
+    - create_function (used by pysqlite's REGEXP setup) is not supported
+    - isolation level is set at connect time, not via PRAGMA
     """
 
     def get_temp_table_names(self, connection, **kw) -> List[str]:
@@ -52,6 +54,18 @@ class _TursoDialectMixin:
         """
         logger.debug("sqlite_temp_master not supported; temp view reflection unavailable")
         return []
+
+    def on_connect(self):
+        """Skip pysqlite's REGEXP function setup (turso doesn't support create_function)."""
+        return None
+
+    def get_isolation_level(self, dbapi_connection):
+        """Turso doesn't support PRAGMA read_uncommitted; always report SERIALIZABLE."""
+        return "SERIALIZABLE"
+
+    def set_isolation_level(self, dbapi_connection, level):
+        """No-op: turso sets isolation at connect time via the isolation_level parameter."""
+        logger.debug("set_isolation_level(%r) ignored; isolation is set at connect time", level)
 
 
 class TursoDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
@@ -90,37 +104,6 @@ class TursoDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
         import turso
 
         return turso
-
-    def on_connect(self):
-        """
-        Return a callable to run on each new connection.
-
-        We override this to skip the REGEXP function setup that pysqlite does,
-        since turso doesn't support create_function.
-        """
-        # Skip the parent's on_connect which tries to register REGEXP
-        # Return None to indicate no special connection setup needed
-        return None
-
-    def get_isolation_level(self, dbapi_connection):
-        """
-        Return the current isolation level.
-
-        Turso doesn't support PRAGMA read_uncommitted, so we return
-        SERIALIZABLE as the default (which is what SQLite uses).
-        """
-        return "SERIALIZABLE"
-
-    def set_isolation_level(self, dbapi_connection, level):
-        """
-        Set the isolation level.
-
-        Turso handles isolation through the isolation_level connection parameter,
-        not through PRAGMA statements. This is a no-op since the isolation level
-        is set at connection time.
-        """
-        # No-op: turso handles isolation via connection parameter
-        pass
 
     def create_connect_args(self, url: URL) -> ConnectArgsType:
         """
@@ -280,18 +263,6 @@ class AioTursoDialect(_TursoDialectMixin, SQLiteDialect_aiosqlite):
 
         return AsyncAdapt_turso_dbapi(turso.aio, turso)
 
-    def on_connect(self):
-        """Skip pysqlite REGEXP function setup (unsupported by turso)."""
-        return None
-
-    def get_isolation_level(self, dbapi_connection):
-        """Turso does not use PRAGMA read_uncommitted; always SERIALIZABLE."""
-        return "SERIALIZABLE"
-
-    def set_isolation_level(self, dbapi_connection, level):
-        """No-op: isolation level is set at connect time."""
-        pass
-
     def create_connect_args(self, url: URL) -> ConnectArgsType:
         """
         Create connection arguments from SQLAlchemy URL.
@@ -409,33 +380,6 @@ class TursoSyncDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
         if "sync_url" in cparams and "remote_url" not in cparams:
             cparams["remote_url"] = cparams.pop("sync_url")
         return super().connect(*cargs, **cparams)
-
-    def on_connect(self):
-        """
-        Return a callable to run on each new connection.
-
-        We override this to skip the REGEXP function setup that pysqlite does,
-        since turso doesn't support create_function.
-        """
-        return None
-
-    def get_isolation_level(self, dbapi_connection):
-        """
-        Return the current isolation level.
-
-        Turso doesn't support PRAGMA read_uncommitted, so we return
-        SERIALIZABLE as the default.
-        """
-        return "SERIALIZABLE"
-
-    def set_isolation_level(self, dbapi_connection, level):
-        """
-        Set the isolation level.
-
-        Turso handles isolation through the isolation_level connection parameter.
-        This is a no-op since the isolation level is set at connection time.
-        """
-        pass
 
     @staticmethod
     def _validate_sync_url(opts: Dict[str, Any]) -> None:
