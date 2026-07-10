@@ -150,8 +150,21 @@ pub struct LockStates {
     pager_write_tx: bool,
 }
 
-/// Checkpoint state machine. Truncate mode holds `blocking_checkpoint_lock` for the whole pass;
-/// passive mode collects and writes concurrently, then publishes under a brief lock.
+/// A state machine that performs a complete checkpoint operation on the MVCC store.
+///
+/// The checkpoint process:
+/// 1. Takes a blocking lock on the database so that no other transactions can run during the checkpoint.
+/// 2. Determines which row versions should be written to the B-tree.
+/// 3. Begins a pager transaction
+/// 4. Writes all the selected row versions to the B-tree.
+/// 5. Commits the pager transaction, effectively flushing to the WAL
+/// 6. Immediately does a TRUNCATE checkpoint from the WAL to the DB
+/// 7. Fsync the DB file
+/// 8. Truncate logical log to 0 (salt regenerated in memory), fsync, then truncate WAL
+/// 9. Releases the blocking_checkpoint_lock
+///
+/// Passive mode defers step 1 until publish and runs collection/write concurrently; the durable
+/// outcome (WAL backfill, log truncate, metadata) is the same.
 pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
     /// The current state of the state machine
     state: CheckpointState,
