@@ -679,7 +679,7 @@ pub trait CursorTrait: Any + Send + Sync {
     fn get_index_info(&self) -> &Arc<IndexInfo>;
 
     fn seek_end(&mut self) -> Result<IOResult<()>>;
-    fn seek_to_last(&mut self, always_seek: bool) -> Result<IOResult<()>>;
+    fn seek_to_last(&mut self) -> Result<IOResult<()>>;
 
     /// Returns true if this cursor operates in MVCC mode.
     fn is_mvcc(&self) -> bool {
@@ -1486,24 +1486,22 @@ impl BTreeCursor {
 
     /// Move the cursor to the rightmost record in the btree.
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
-    fn move_to_rightmost(&mut self, always_seek: bool) -> Result<IOResult<bool>> {
+    fn move_to_rightmost(&mut self) -> Result<IOResult<bool>> {
         loop {
             let (move_to_right_state, rightmost_page_id) = &self.move_to_right_state;
             match *move_to_right_state {
                 MoveToRightState::Start => {
-                    if !always_seek {
-                        if let Some(rightmost_page_id) = rightmost_page_id {
-                            // If we know the rightmost page and are already on it, we can skip a seek.
-                            // This optimization is never performed if always_seek = true. always_seek is used
-                            // in cases where we cannot be sure that the btree wasn't modified from under us
-                            // e.g. by a trigger subprogram.
-                            let current_page = self.stack.top_ref();
-                            if current_page.get().id == *rightmost_page_id {
-                                let contents = current_page.get_contents();
-                                let cell_count = contents.cell_count();
-                                self.stack.set_cell_index(cell_count as i32 - 1);
-                                return Ok(IOResult::Done(cell_count > 0));
-                            }
+                    if let Some(rightmost_page_id) = rightmost_page_id {
+                        // If we know the rightmost page and are already on it, we can skip a seek.
+                        // The cache is safe to trust: any modification of this btree — our own
+                        // balancing, or a peer cursor's write (e.g. a trigger subprogram's, via
+                        // the saveAllCursors pass) — invalidates it.
+                        let current_page = self.stack.top_ref();
+                        if current_page.get().id == *rightmost_page_id {
+                            let contents = current_page.get_contents();
+                            let cell_count = contents.cell_count();
+                            self.stack.set_cell_index(cell_count as i32 - 1);
+                            return Ok(IOResult::Done(cell_count > 0));
                         }
                     }
                     let rightmost_page_id = *rightmost_page_id;
@@ -5626,8 +5624,7 @@ impl CursorTrait for BTreeCursor {
             return Ok(IOResult::Done(()));
         }
         self.clear_saved_seek();
-        let always_seek = false;
-        let cursor_has_record = return_if_io!(self.move_to_rightmost(always_seek));
+        let cursor_has_record = return_if_io!(self.move_to_rightmost());
         self.set_has_record(cursor_has_record);
         self.invalidate_record();
         self.read_overflow_state = None;
@@ -6203,6 +6200,10 @@ impl CursorTrait for BTreeCursor {
         if matches!(self.state, CursorState::None) {
             self.pager.invalidate_peer_cursors(self);
             self.invalidate_count_cache();
+            // Every page in this btree is about to be freed, so our own cached
+            // rightmost page id is meaningless too (the id may even be
+            // reallocated to an unrelated page after a refill).
+            self.move_to_right_state.1 = None;
         }
         self.destroy_btree_contents(true)
     }
@@ -6470,6 +6471,13 @@ impl CursorTrait for BTreeCursor {
     /// across an in-flight Insert/Delete — in which case the caller falls back
     /// to invalidate_btree_cache.
     fn try_save_position_for_external_balance(&mut self) -> Result<IOResult<SavePositionResult>> {
+        // The peer is about to modify this btree's structure, so any cached
+        // knowledge of the tree shape goes stale: the rightmost page id
+        // (move_to_rightmost's skip-a-seek optimization) and the memoized
+        // count. Positional state is preserved separately via save_context.
+        // Idempotent, so safe across IO re-entry into this function.
+        self.move_to_right_state.1 = None;
+        self.invalidate_count_cache();
         if self.valid_state != CursorValidState::Valid || !self.has_record() {
             // Nothing to save: cursor has no live position. No invalidation
             // needed either — the stack is already in a state where the next
@@ -6589,11 +6597,11 @@ impl CursorTrait for BTreeCursor {
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
-    fn seek_to_last(&mut self, always_seek: bool) -> Result<IOResult<()>> {
+    fn seek_to_last(&mut self) -> Result<IOResult<()>> {
         loop {
             match self.seek_to_last_state {
                 SeekToLastState::Start => {
-                    let has_record = return_if_io!(self.move_to_rightmost(always_seek));
+                    let has_record = return_if_io!(self.move_to_rightmost());
                     self.invalidate_record();
                     self.set_has_record(has_record);
                     self.read_overflow_state = None;
@@ -12296,6 +12304,64 @@ mod tests {
             ));
             (*cursor).register_with_pager();
             cursor
+        }
+
+        /// A peer's insert must invalidate this cursor's cached rightmost
+        /// page id (move_to_rightmost's skip-a-seek optimization). Once the
+        /// peer's appends split the rightmost leaf, a long-lived cursor's
+        /// last() would otherwise trust the stale cache and return the old
+        /// page's last cell instead of the true maximum.
+        #[test]
+        fn peer_write_invalidates_rightmost_page_cache() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut reader = make_registered_cursor(&pager, root_page, 1);
+
+            // Blob payloads so a handful of appends split the rightmost leaf.
+            for rowid in 1..=8 {
+                insert_record(&mut writer, &pager, rowid, Value::Blob(vec![0u8; 1000])).unwrap();
+            }
+
+            // Positions the reader on the last row and caches the rightmost page id.
+            run_until_done(|| reader.last(), pager.deref()).unwrap();
+            let max1 = run_until_done(|| reader.rowid(), pager.deref()).unwrap();
+            assert_eq!(max1, Some(8));
+
+            // Peer appends: balance_quick allocates a new rightmost leaf.
+            for rowid in 9..=16 {
+                insert_record(&mut writer, &pager, rowid, Value::Blob(vec![0u8; 1000])).unwrap();
+            }
+
+            run_until_done(|| reader.last(), pager.deref()).unwrap();
+            let max2 = run_until_done(|| reader.rowid(), pager.deref()).unwrap();
+            assert_eq!(
+                max2,
+                Some(16),
+                "last() must see the true maximum after a peer split the rightmost leaf"
+            );
+        }
+
+        /// A peer's insert must reset this cursor's memoized count():
+        /// count_state stays at CountState::Finish after a full count, so
+        /// without invalidation every later count() returns the stale value.
+        #[test]
+        fn peer_write_invalidates_count_cache() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut reader = make_registered_cursor(&pager, root_page, 1);
+
+            for rowid in 1..=5 {
+                insert_record(&mut writer, &pager, rowid, Value::from_i64(rowid)).unwrap();
+            }
+            let count1 = run_until_done(|| reader.count(), pager.deref()).unwrap();
+            assert_eq!(count1, 5);
+
+            insert_record(&mut writer, &pager, 6, Value::from_i64(6)).unwrap();
+            let count2 = run_until_done(|| reader.count(), pager.deref()).unwrap();
+            assert_eq!(
+                count2, 6,
+                "count() must not return the memoized pre-write value"
+            );
         }
 
         #[test]

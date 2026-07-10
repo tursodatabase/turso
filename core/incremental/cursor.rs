@@ -1887,7 +1887,7 @@ mod tests {
                 Ok(IOResult::Done(()))
             }
 
-            fn seek_to_last(&mut self, _always_seek: bool) -> Result<IOResult<()>> {
+            fn seek_to_last(&mut self) -> Result<IOResult<()>> {
                 Ok(IOResult::Done(()))
             }
 

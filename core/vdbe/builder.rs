@@ -1982,11 +1982,6 @@ impl ProgramBuilder {
             && self.flags.is_multi_write()
             && self.may_abort();
 
-        let contains_trigger_subprograms = self
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::Program { .. }));
-
         let prepared = PreparedProgram {
             max_registers: self.next_free_register,
             insns: self.insns,
@@ -2003,7 +1998,6 @@ impl ProgramBuilder {
             )),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
-            contains_trigger_subprograms,
             resolve_type: self.resolve_type,
             prepare_context,
             write_databases: self.write_databases,
