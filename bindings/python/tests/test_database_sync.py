@@ -2,6 +2,7 @@ import logging
 import multiprocessing
 import os
 import tempfile
+import threading
 import time
 
 import turso
@@ -217,6 +218,42 @@ def test_bootstrap_concurrency():
 
             assert t1.exitcode == 0, f"t1 exitcode: {t1.exitcode}"
             assert t2.exitcode == 0, f"t2 exitcode: {t2.exitcode}"
+
+
+def test_concurrent_open_existing_replica():
+    # Opening an already-hydrated replica from many threads at once must
+    # always succeed: opens read (and, when the configuration changed, write)
+    # the shared metadata file, and a non-atomic write lets a concurrent
+    # reader observe an empty or truncated file ("meta must be initialized
+    # before open" / "deserialization error").
+    with TursoServer() as server:
+        server.db_sql("CREATE TABLE t(x)")
+        server.db_sql("INSERT INTO t VALUES (42)")
+
+        with tempfile.TemporaryDirectory(prefix="pyturso-") as dir:
+            path = os.path.join(dir, "local.db")
+            conn = turso.sync.connect(path, remote_url=server.db_url())
+            conn.pull()
+            conn.close()
+
+            k = 8
+            errors = []
+
+            def open_and_read():
+                try:
+                    c = turso.sync.connect(path, remote_url=server.db_url())
+                    assert c.execute("SELECT * FROM t").fetchall() == [(42,)]
+                    c.close()
+                except Exception as e:
+                    errors.append(e)
+
+            for _ in range(3):
+                threads = [threading.Thread(target=open_and_read) for _ in range(k)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=120)
+                assert not errors, f"concurrent opens failed: {errors[0]}"
 
 
 def test_configuration_persistence():
