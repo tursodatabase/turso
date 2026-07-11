@@ -729,7 +729,42 @@ pub enum Insn {
         base: usize,
         offset_reg: usize,
     },
-
+    /// Read `registers[amount]` bytes at `registers[offset]` within column `column`
+    /// of the cursor's current table row into `dest` (as a blob), following overflow
+    /// pages. The VDBE backing for sqlite3_blob_read: byte-level payload access
+    /// without materializing the whole value. Stores NULL into `dest` when the
+    /// handle expired (the row was written after the cursor pinned it): expiry is a
+    /// per-operation failure in SQLite (SQLITE_ABORT), not a program abort, so the
+    /// paused blob program and its transaction must stay alive.
+    BlobRead {
+        cursor: CursorID,
+        column: usize,
+        offset: usize,
+        amount: usize,
+        dest: usize,
+    },
+    /// Write the blob in `src` at `registers[offset]` within column `column` of the
+    /// cursor's current table row, in place across the local page and overflow chain.
+    /// The VDBE backing for sqlite3_blob_write; cannot change the value's size.
+    /// Stores 1 into `dest` on success, or NULL when the handle expired (see
+    /// BlobRead) — expiry must not abort the program, because writes made before it
+    /// belong to the paused program's transaction and must survive to commit.
+    BlobWrite {
+        cursor: CursorID,
+        column: usize,
+        offset: usize,
+        src: usize,
+        dest: usize,
+    },
+    /// Store the byte length of column `column` of the cursor's current table row
+    /// into `dest`, erroring unless the value is byte-addressable (TEXT or BLOB).
+    /// The VDBE backing for sqlite3_blob_open's length and type validation, run by
+    /// the same program that holds the row's cursor so the answer cannot go stale.
+    BlobLen {
+        cursor: CursorID,
+        column: usize,
+        dest: usize,
+    },
     /// Concatenate/append/prepend arrays. PostgreSQL-compatible semantics:
     /// - blob || blob → array_cat
     /// - blob || scalar → array_append
@@ -2035,6 +2070,9 @@ impl InsnVariants {
             InsnVariants::UnionTag => execute::op_union_tag,
             InsnVariants::UnionExtract => execute::op_union_extract,
             InsnVariants::RegCopyOffset => execute::op_reg_copy_offset,
+            InsnVariants::BlobRead => execute::op_blob_read,
+            InsnVariants::BlobWrite => execute::op_blob_write,
+            InsnVariants::BlobLen => execute::op_blob_len,
             InsnVariants::ArrayConcat => execute::op_array_concat,
             InsnVariants::ArraySetElement => execute::op_array_set_element,
             InsnVariants::ArraySlice => execute::op_array_slice,
@@ -2192,7 +2230,7 @@ impl Insn {
     // SAFETY: If the enumeration specifies a primitive representation,
     // then the discriminant may be reliably accessed via unsafe pointer casting
     #[inline(always)]
-    const fn discriminant(&self) -> u8 {
+    pub(crate) const fn discriminant(&self) -> u8 {
         unsafe { *(self as *const Self as *const u8) }
     }
 

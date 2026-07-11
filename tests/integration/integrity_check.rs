@@ -1893,3 +1893,60 @@ fn test_freelist_trunk_page_reuse(db: TempDatabase) {
         "Database should pass integrity check after freelist trunk reuse"
     );
 }
+
+/// A corrupt overflow chain behind an incremental-blob value must surface as an
+/// error, never a panic or an out-of-bounds read. We truncate the value's overflow
+/// chain on disk (zero the first overflow page's next-pointer) while the record
+/// still claims a size that needs a later overflow page, then read that far in
+/// through sqlite3_blob_read's engine path.
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_blob_read_corrupt_overflow_chain_no_panic(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, data BLOB);")
+        .unwrap();
+    // ~12000 bytes needs two overflow pages, so the first overflow page has a
+    // non-zero next-pointer we can corrupt.
+    conn.execute("INSERT INTO t VALUES (1, zeroblob(12000));")
+        .unwrap();
+    checkpoint_database(&conn);
+    drop(conn);
+
+    // Fresh-database page layout: page 1 = header/schema, page 2 = table leaf,
+    // page 3 = first overflow page. Zero its 4-byte next-pointer to truncate the
+    // chain a page early.
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db.path)
+            .unwrap();
+        let mut page3 = [0u8; PAGE_SIZE];
+        file.seek(SeekFrom::Start(2 * PAGE_SIZE as u64)).unwrap();
+        file.read_exact(&mut page3).unwrap();
+        // Sanity: an intact intermediate overflow page points somewhere.
+        let next = u32::from_be_bytes([page3[0], page3[1], page3[2], page3[3]]);
+        assert!(
+            next != 0,
+            "expected page 3 to be an intermediate overflow page"
+        );
+        page3[0..4].copy_from_slice(&[0, 0, 0, 0]);
+        file.seek(SeekFrom::Start(2 * PAGE_SIZE as u64)).unwrap();
+        file.write_all(&page3).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut blob = conn.blob_open("t", "data", 1, false).unwrap();
+        let mut buf = [0u8; 64];
+        // Offset 9000 lives on the (now missing) second overflow page.
+        blob.read(9000, &mut buf)
+    }));
+    match result {
+        Ok(Ok(())) => panic!("read of a truncated overflow chain unexpectedly succeeded"),
+        Ok(Err(_)) => {} // graceful error — the desired outcome
+        Err(_) => panic!("corrupt overflow chain caused a panic instead of an error"),
+    }
+}

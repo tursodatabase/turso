@@ -4952,6 +4952,14 @@ impl Pager {
     /// Invalidates entire page cache by removing all dirty and clean pages. Usually used in case
     /// of a rollback or in case we want to invalidate page cache after starting a read transaction
     /// right after new writes happened which would invalidate current page cache.
+    /// Test-only: evict clean, unpinned pages WITHOUT invalidating cursors, so we
+    /// can exercise what happens to a cursor that still holds a `PageRef` to an
+    /// evicted (buffer-taken) page — the exact hazard normal LRU eviction creates.
+    #[cfg(test)]
+    pub fn test_evict_all_unpinned_clean(&self) {
+        self.page_cache.write().test_evict_all_unpinned_clean();
+    }
+
     pub fn clear_page_cache(&self, clear_dirty: bool) {
         self.invalidate_all_cursors();
         let dirty_pages = self.dirty_pages.write();

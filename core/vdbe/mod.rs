@@ -22,6 +22,8 @@ use crate::types::{Extendable, Text, ValueBlob};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
 pub mod affinity;
 pub mod array;
+#[cfg(test)]
+mod blob_io_tests;
 pub mod bloom_filter;
 pub mod builder;
 pub mod execute;

@@ -2389,47 +2389,184 @@ pub unsafe extern "C" fn sqlite3_aggregate_context(
     stub!();
 }
 
+// `unsafe_op_in_unsafe_fn`: opt this FFI entry point out of the legacy rule that an
+// `unsafe fn` body is one big implicit `unsafe` block. Every raw-pointer operation
+// must now sit in its own minimal `unsafe {}` with a SAFETY note, and the compiler
+// rejects any that escapes — so the pointer-validation logic is provably outside the
+// unsafe surface and the unsafe surface stays as small as the hazard.
 #[no_mangle]
+#[deny(unsafe_op_in_unsafe_fn)]
 pub unsafe extern "C" fn sqlite3_blob_open(
-    _db: *mut sqlite3,
-    _db_name: *const ffi::c_char,
-    _table_name: *const ffi::c_char,
-    _column_name: *const ffi::c_char,
-    _rowid: i64,
-    _flags: ffi::c_int,
-    _blob_out: *mut *mut ffi::c_void,
+    db: *mut sqlite3,
+    db_name: *const ffi::c_char,
+    table_name: *const ffi::c_char,
+    column_name: *const ffi::c_char,
+    rowid: i64,
+    flags: ffi::c_int,
+    blob_out: *mut *mut ffi::c_void,
 ) -> ffi::c_int {
-    stub!();
+    if blob_out.is_null() {
+        return SQLITE_MISUSE;
+    }
+    // SQLite documents that *ppBlob is NULL after any failure, and callers rely on
+    // it to unconditionally call sqlite3_blob_close(*ppBlob). Clear it before any
+    // error return so no stack garbage can ever reach Box::from_raw in close.
+    // SAFETY: blob_out is non-null (checked); caller owns the out-pointer.
+    unsafe { *blob_out = std::ptr::null_mut() };
+    if db.is_null() || db_name.is_null() || table_name.is_null() || column_name.is_null() {
+        return SQLITE_MISUSE;
+    }
+    // SAFETY: db checked non-null just above; caller guarantees it points to a live
+    // sqlite3 for the duration of the call.
+    let db: &mut sqlite3 = unsafe { &mut *db };
+    let mut db = db.inner.lock().unwrap();
+    // SAFETY: db_name checked non-null; caller guarantees a valid NUL-terminated C string.
+    let database = match unsafe { CStr::from_ptr(db_name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return SQLITE_MISUSE,
+    };
+    // Only the main database is supported; resolving "temp" or an attached name
+    // against main would silently open the wrong table's bytes for writing.
+    if !database.eq_ignore_ascii_case("main") {
+        // SAFETY: set_db_err only touches the already-valid &mut inner handle.
+        return unsafe {
+            set_db_err(
+                &mut db,
+                turso_core::LimboError::InternalError(format!("no such database: {database}")),
+            )
+        };
+    }
+    // SAFETY: table_name checked non-null; caller guarantees a valid NUL-terminated C string.
+    let table = match unsafe { CStr::from_ptr(table_name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return SQLITE_MISUSE,
+    };
+    // SAFETY: column_name checked non-null; caller guarantees a valid NUL-terminated C string.
+    let column = match unsafe { CStr::from_ptr(column_name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return SQLITE_MISUSE,
+    };
+    match db.conn.blob_open(table, column, rowid, flags != 0) {
+        Ok(blob) => {
+            // SAFETY: blob_out is non-null (checked); we transfer ownership of the box.
+            unsafe { *blob_out = Box::into_raw(Box::new(blob)) as *mut ffi::c_void };
+            SQLITE_OK
+        }
+        // SAFETY: set_db_err only touches the already-valid &mut inner handle.
+        Err(err) => unsafe { set_db_err(&mut db, err) },
+    }
 }
 
 #[no_mangle]
+#[deny(unsafe_op_in_unsafe_fn)]
 pub unsafe extern "C" fn sqlite3_blob_read(
-    _blob: *mut ffi::c_void,
-    _data: *mut ffi::c_void,
-    _n: ffi::c_int,
-    _offset: ffi::c_int,
+    blob: *mut ffi::c_void,
+    data: *mut ffi::c_void,
+    n: ffi::c_int,
+    offset: ffi::c_int,
 ) -> ffi::c_int {
-    stub!();
+    if blob.is_null() {
+        return SQLITE_MISUSE;
+    }
+    // Negative sizes and offsets are SQLITE_ERROR per the sqlite3_blob_read docs
+    // ("If N or iOffset is less than zero, SQLITE_ERROR is returned"), and like any
+    // range error they leave the handle usable.
+    if n < 0 || offset < 0 {
+        return SQLITE_ERROR;
+    }
+    // SAFETY: blob checked non-null; caller guarantees it is a live handle from
+    // sqlite3_blob_open that has not been closed.
+    let blob = unsafe { &mut *(blob as *mut turso_core::Blob) };
+    if n == 0 {
+        // A zero-length read still range-checks the offset and still fails on an
+        // expired handle, but must never manufacture a slice from the data pointer:
+        // slice::from_raw_parts is undefined for NULL even at length 0.
+        return match blob.read(offset as usize, &mut []) {
+            Ok(()) => SQLITE_OK,
+            Err(err) => limbo_err_code(&err),
+        };
+    }
+    if data.is_null() {
+        return SQLITE_MISUSE;
+    }
+    // SAFETY: data checked non-null and n > 0 and non-negative; the caller
+    // guarantees data points to at least n writable, initialized-or-writable bytes.
+    let buf = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, n as usize) };
+    match blob.read(offset as usize, buf) {
+        Ok(()) => SQLITE_OK,
+        Err(err) => limbo_err_code(&err),
+    }
 }
 
 #[no_mangle]
+#[deny(unsafe_op_in_unsafe_fn)]
 pub unsafe extern "C" fn sqlite3_blob_write(
-    _blob: *mut ffi::c_void,
-    _data: *const ffi::c_void,
-    _n: ffi::c_int,
-    _offset: ffi::c_int,
+    blob: *mut ffi::c_void,
+    data: *const ffi::c_void,
+    n: ffi::c_int,
+    offset: ffi::c_int,
 ) -> ffi::c_int {
-    stub!();
+    if blob.is_null() {
+        return SQLITE_MISUSE;
+    }
+    // See sqlite3_blob_read: negative arguments are SQLITE_ERROR, not misuse.
+    if n < 0 || offset < 0 {
+        return SQLITE_ERROR;
+    }
+    // SAFETY: blob checked non-null; caller guarantees it is a live, open handle.
+    let blob = unsafe { &mut *(blob as *mut turso_core::Blob) };
+    if n == 0 {
+        // See sqlite3_blob_read: keep the range/expiry/read-only checks without
+        // touching the possibly-NULL data pointer.
+        return match blob.write(offset as usize, &[]) {
+            Ok(()) => SQLITE_OK,
+            Err(err) => limbo_err_code(&err),
+        };
+    }
+    if data.is_null() {
+        return SQLITE_MISUSE;
+    }
+    // SAFETY: data checked non-null and n > 0 and non-negative; the caller
+    // guarantees data points to at least n readable bytes.
+    let buf = unsafe { std::slice::from_raw_parts(data as *const u8, n as usize) };
+    match blob.write(offset as usize, buf) {
+        Ok(()) => SQLITE_OK,
+        Err(err) => limbo_err_code(&err),
+    }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_blob_bytes(_blob: *mut ffi::c_void) -> ffi::c_int {
-    stub!();
+#[deny(unsafe_op_in_unsafe_fn)]
+pub unsafe extern "C" fn sqlite3_blob_bytes(blob: *mut ffi::c_void) -> ffi::c_int {
+    if blob.is_null() {
+        return 0;
+    }
+    // SAFETY: blob checked non-null; caller guarantees a live, open handle. Shared
+    // (&) borrow only.
+    let blob = unsafe { &*(blob as *const turso_core::Blob) };
+    // A value cannot legitimately exceed SQLite's 2^31-1 length limit; if one
+    // somehow does, abort rather than hand the C caller a truncated length it
+    // would use to size buffers.
+    blob.bytes()
+        .try_into()
+        .expect("blob length exceeds the SQLite length limit")
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_blob_close(_blob: *mut ffi::c_void) -> ffi::c_int {
-    stub!();
+#[deny(unsafe_op_in_unsafe_fn)]
+pub unsafe extern "C" fn sqlite3_blob_close(blob: *mut ffi::c_void) -> ffi::c_int {
+    if blob.is_null() {
+        return SQLITE_OK;
+    }
+    // The handle is freed unconditionally, like SQLite; the return code only
+    // reports whether the final commit of pending writes succeeded.
+    // SAFETY: blob checked non-null; caller guarantees it came from a single
+    // sqlite3_blob_open and is not double-closed, so reclaiming the box is sound.
+    let blob = unsafe { Box::from_raw(blob as *mut turso_core::Blob) };
+    match blob.close() {
+        Ok(()) => SQLITE_OK,
+        Err(err) => limbo_err_code(&err),
+    }
 }
 
 #[no_mangle]
@@ -3055,6 +3192,9 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,
         LimboError::Busy => SQLITE_BUSY,
+        // SQLite reports operations on an expired blob handle (its row's table was
+        // written after sqlite3_blob_open) as SQLITE_ABORT.
+        LimboError::BlobHandleExpired => SQLITE_ABORT,
         // SQLite reports its "SQL statements in progress" rejections as
         // error-class SQLITE_BUSY (vdbe.c, OP_AutoCommit / OP_Savepoint).
         LimboError::StatementsInProgress(_) => SQLITE_BUSY,
@@ -3186,6 +3326,422 @@ mod tests {
             );
             assert_eq!(sqlite3_stmt_status(select_stmt, 9999, 0), 0);
             assert_eq!(sqlite3_finalize(select_stmt), SQLITE_OK);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    /// FFI-level transcription of the sqlite3_blob_open conditions exercised by
+    /// SQLite's e_blobopen.test: misuse handling, the *ppBlob-is-NULL-on-error
+    /// contract, database-name resolution, and error codes/messages.
+    #[test]
+    fn test_blob_open_argument_and_error_contract() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t(id INTEGER PRIMARY KEY, data BLOB, n); \
+                      INSERT INTO t VALUES (1, x'00112233', 42);"
+                        .as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            // NULL out-pointer is misuse.
+            assert_eq!(
+                sqlite3_blob_open(
+                    db,
+                    c"main".as_ptr(),
+                    c"t".as_ptr(),
+                    c"data".as_ptr(),
+                    1,
+                    0,
+                    ptr::null_mut()
+                ),
+                SQLITE_MISUSE
+            );
+
+            // Every failure must leave *ppBlob NULL — callers close it unconditionally.
+            let garbage = std::ptr::dangling_mut::<ffi::c_void>();
+
+            let mut blob = garbage;
+            assert_eq!(
+                sqlite3_blob_open(
+                    db,
+                    c"main".as_ptr(),
+                    ptr::null(),
+                    c"data".as_ptr(),
+                    1,
+                    0,
+                    &mut blob
+                ),
+                SQLITE_MISUSE
+            );
+            assert!(blob.is_null());
+
+            // Only "main" resolves; an attached-style or filename-style name errors.
+            let mut blob = garbage;
+            assert_eq!(
+                sqlite3_blob_open(
+                    db,
+                    c"aux".as_ptr(),
+                    c"t".as_ptr(),
+                    c"data".as_ptr(),
+                    1,
+                    0,
+                    &mut blob
+                ),
+                SQLITE_ERROR
+            );
+            assert!(blob.is_null());
+
+            // No such table / column / rowid: SQLITE_ERROR, NULL handle, errmsg set.
+            let mut blob = garbage;
+            assert_eq!(
+                sqlite3_blob_open(
+                    db,
+                    c"main".as_ptr(),
+                    c"nosuch".as_ptr(),
+                    c"data".as_ptr(),
+                    1,
+                    0,
+                    &mut blob
+                ),
+                SQLITE_ERROR
+            );
+            assert!(blob.is_null());
+            let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_str().unwrap();
+            assert!(msg.contains("no such table"), "errmsg: {msg}");
+
+            let mut blob = garbage;
+            assert_eq!(
+                sqlite3_blob_open(
+                    db,
+                    c"main".as_ptr(),
+                    c"t".as_ptr(),
+                    c"data".as_ptr(),
+                    99,
+                    0,
+                    &mut blob
+                ),
+                SQLITE_ERROR
+            );
+            assert!(blob.is_null());
+            let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_str().unwrap();
+            assert!(msg.contains("no such rowid"), "errmsg: {msg}");
+
+            // A non-TEXT/BLOB value cannot be opened (e_blobopen R-11683-62380).
+            let mut blob = garbage;
+            assert_eq!(
+                sqlite3_blob_open(
+                    db,
+                    c"main".as_ptr(),
+                    c"t".as_ptr(),
+                    c"n".as_ptr(),
+                    1,
+                    0,
+                    &mut blob
+                ),
+                SQLITE_ERROR
+            );
+            assert!(blob.is_null());
+            let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_str().unwrap();
+            assert!(
+                msg.contains("cannot open value of type integer"),
+                "errmsg: {msg}"
+            );
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    /// e_blobopen R-50854-53979 / R-03922-41160: flags==0 means read-only
+    /// (writes fail with SQLITE_READONLY); any non-zero flags value means
+    /// read-write. Also covers R-34146-30782: indexed columns refuse writing.
+    #[test]
+    fn test_blob_open_flags_and_indexed_columns() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t(id INTEGER PRIMARY KEY, data BLOB, ix BLOB); \
+                      CREATE INDEX t_ix ON t(ix); \
+                      INSERT INTO t VALUES (1, x'0011223344556677', x'aa');"
+                        .as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            // Read-only handle: reads work, writes are SQLITE_READONLY.
+            let mut blob = ptr::null_mut();
+            assert_eq!(
+                sqlite3_blob_open(
+                    db,
+                    c"main".as_ptr(),
+                    c"t".as_ptr(),
+                    c"data".as_ptr(),
+                    1,
+                    0,
+                    &mut blob
+                ),
+                SQLITE_OK
+            );
+            let mut buf = [0u8; 4];
+            assert_eq!(
+                sqlite3_blob_read(blob, buf.as_mut_ptr().cast(), 4, 0),
+                SQLITE_OK
+            );
+            assert_eq!(buf, [0x00, 0x11, 0x22, 0x33]);
+            assert_eq!(
+                sqlite3_blob_write(blob, buf.as_ptr().cast(), 4, 0),
+                SQLITE_READONLY
+            );
+            assert_eq!(sqlite3_blob_close(blob), SQLITE_OK);
+
+            // Any non-zero flags value opens read-write.
+            for flags in [1, -1, ffi::c_int::MAX, ffi::c_int::MIN] {
+                let mut blob = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_blob_open(
+                        db,
+                        c"main".as_ptr(),
+                        c"t".as_ptr(),
+                        c"data".as_ptr(),
+                        1,
+                        flags,
+                        &mut blob
+                    ),
+                    SQLITE_OK
+                );
+                let payload = [0xABu8, 0xCD];
+                assert_eq!(
+                    sqlite3_blob_write(blob, payload.as_ptr().cast(), 2, 6),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_blob_close(blob), SQLITE_OK);
+            }
+
+            // Indexed column: read-only open works, read-write open fails.
+            let mut blob = ptr::null_mut();
+            assert_eq!(
+                sqlite3_blob_open(
+                    db,
+                    c"main".as_ptr(),
+                    c"t".as_ptr(),
+                    c"ix".as_ptr(),
+                    1,
+                    0,
+                    &mut blob
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_blob_close(blob), SQLITE_OK);
+            let mut blob = ptr::null_mut();
+            assert_eq!(
+                sqlite3_blob_open(
+                    db,
+                    c"main".as_ptr(),
+                    c"t".as_ptr(),
+                    c"ix".as_ptr(),
+                    1,
+                    1,
+                    &mut blob
+                ),
+                SQLITE_ERROR
+            );
+            assert!(blob.is_null());
+            let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_str().unwrap();
+            assert!(msg.contains("indexed column"), "errmsg: {msg}");
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    /// FFI transcription of e_blobwrite/e_blobread range conditions: negative N or
+    /// offset and out-of-range spans are SQLITE_ERROR (not misuse), every such error
+    /// leaves the handle usable, and zero-length operations never dereference the
+    /// data pointer (NULL is legal for them) while still range-checking the offset.
+    #[test]
+    fn test_blob_read_write_range_contract() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t(id INTEGER PRIMARY KEY, data BLOB); \
+                      INSERT INTO t VALUES (1, zeroblob(8));"
+                        .as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            let mut blob = ptr::null_mut();
+            assert_eq!(
+                sqlite3_blob_open(
+                    db,
+                    c"main".as_ptr(),
+                    c"t".as_ptr(),
+                    c"data".as_ptr(),
+                    1,
+                    1,
+                    &mut blob
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_blob_bytes(blob), 8);
+
+            let mut buf = [0u8; 8];
+            // Out-of-range spans and negative arguments: SQLITE_ERROR.
+            assert_eq!(
+                sqlite3_blob_read(blob, buf.as_mut_ptr().cast(), 4, 5),
+                SQLITE_ERROR
+            );
+            assert_eq!(
+                sqlite3_blob_read(blob, buf.as_mut_ptr().cast(), -1, 0),
+                SQLITE_ERROR
+            );
+            assert_eq!(
+                sqlite3_blob_read(blob, buf.as_mut_ptr().cast(), 4, -1),
+                SQLITE_ERROR
+            );
+            assert_eq!(
+                sqlite3_blob_write(blob, buf.as_ptr().cast(), 4, 5),
+                SQLITE_ERROR
+            );
+            assert_eq!(
+                sqlite3_blob_write(blob, buf.as_ptr().cast(), -1, 0),
+                SQLITE_ERROR
+            );
+            assert_eq!(
+                sqlite3_blob_write(blob, buf.as_ptr().cast(), 4, -1),
+                SQLITE_ERROR
+            );
+
+            // Zero-length operations with a NULL data pointer are legal and still
+            // range-check the offset.
+            assert_eq!(sqlite3_blob_read(blob, ptr::null_mut(), 0, 8), SQLITE_OK);
+            assert_eq!(sqlite3_blob_read(blob, ptr::null_mut(), 0, 9), SQLITE_ERROR);
+            assert_eq!(sqlite3_blob_write(blob, ptr::null(), 0, 8), SQLITE_OK);
+            assert_eq!(sqlite3_blob_write(blob, ptr::null(), 0, 9), SQLITE_ERROR);
+            // A non-zero length with a NULL pointer is misuse.
+            assert_eq!(
+                sqlite3_blob_read(blob, ptr::null_mut(), 4, 0),
+                SQLITE_MISUSE
+            );
+            assert_eq!(sqlite3_blob_write(blob, ptr::null(), 4, 0), SQLITE_MISUSE);
+
+            // All of the above left the handle usable.
+            assert_eq!(
+                sqlite3_blob_read(blob, buf.as_mut_ptr().cast(), 8, 0),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_blob_close(blob), SQLITE_OK);
+
+            // NULL handles: bytes reports 0, close is a no-op, I/O is misuse.
+            assert_eq!(sqlite3_blob_bytes(ptr::null_mut()), 0);
+            assert_eq!(sqlite3_blob_close(ptr::null_mut()), SQLITE_OK);
+            assert_eq!(
+                sqlite3_blob_read(ptr::null_mut(), buf.as_mut_ptr().cast(), 1, 0),
+                SQLITE_MISUSE
+            );
+            assert_eq!(
+                sqlite3_blob_write(ptr::null_mut(), buf.as_ptr().cast(), 1, 0),
+                SQLITE_MISUSE
+            );
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    /// e_blobopen R-50542-62589 at the FFI: writing the handle's row expires it and
+    /// subsequent operations return SQLITE_ABORT; writes to other rows do not.
+    #[test]
+    fn test_blob_expiry_returns_abort() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t(id INTEGER PRIMARY KEY, data BLOB); \
+                      INSERT INTO t VALUES (1, x'00112233'); \
+                      INSERT INTO t VALUES (2, x'ffeeddcc');"
+                        .as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            let mut blob = ptr::null_mut();
+            assert_eq!(
+                sqlite3_blob_open(
+                    db,
+                    c"main".as_ptr(),
+                    c"t".as_ptr(),
+                    c"data".as_ptr(),
+                    1,
+                    0,
+                    &mut blob
+                ),
+                SQLITE_OK
+            );
+            let mut buf = [0u8; 4];
+            assert_eq!(
+                sqlite3_blob_read(blob, buf.as_mut_ptr().cast(), 4, 0),
+                SQLITE_OK
+            );
+
+            // A write to a DIFFERENT row leaves the handle usable.
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"UPDATE t SET data = x'00000000' WHERE id = 2".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_blob_read(blob, buf.as_mut_ptr().cast(), 4, 0),
+                SQLITE_OK
+            );
+            assert_eq!(buf, [0x00, 0x11, 0x22, 0x33]);
+
+            // A write to the handle's own row expires it: SQLITE_ABORT, sticky.
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"UPDATE t SET data = x'99999999' WHERE id = 1".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_blob_read(blob, buf.as_mut_ptr().cast(), 4, 0),
+                SQLITE_ABORT
+            );
+            assert_eq!(
+                sqlite3_blob_read(blob, buf.as_mut_ptr().cast(), 4, 0),
+                SQLITE_ABORT
+            );
+            assert_eq!(sqlite3_blob_close(blob), SQLITE_OK);
 
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
