@@ -1,5 +1,9 @@
 """Tests for the SQLAlchemy dialect."""
 
+import importlib
+import sys
+import types
+
 import pytest
 
 # Skip all tests if SQLAlchemy is not installed
@@ -9,6 +13,41 @@ from sqlalchemy import Column, Integer, String, create_engine, text  # noqa: E40
 from sqlalchemy.engine import URL  # noqa: E402
 from sqlalchemy.orm import Session, declarative_base  # noqa: E402
 from turso.sqlalchemy import TursoDialect, TursoSyncDialect, get_sync_connection  # noqa: E402
+
+
+class TestSQLAlchemyVersionGuard:
+    """The dialects require SQLAlchemy >= 2.0.45 and must fail with a clear error on older versions."""
+
+    @pytest.mark.parametrize(
+        ("version", "asyncio_module_layout"),
+        [
+            # 1.4: sqlalchemy.connectors.asyncio does not exist at all
+            ("1.4.54", "absent"),
+            # 2.0.41: the module exists but does not export AsyncAdapt_dbapi_module
+            ("2.0.41", "missing-name"),
+            # 2.0.44: imports work, but SQLite reflection of multiple CHECK
+            # constraints is broken upstream (fixed in 2.0.45)
+            ("2.0.44", "intact"),
+        ],
+    )
+    def test_old_sqlalchemy_raises_clear_import_error(self, monkeypatch, version, asyncio_module_layout):
+        """Importing turso.sqlalchemy under SQLAlchemy < 2.0.45 must raise the
+        version-guard ImportError, not an error about SQLAlchemy internals.
+        Floors verified empirically: AsyncAdapt_dbapi_module first shipped in
+        2.0.42, multi-CHECK reflection was fixed in 2.0.45. Each parametrized
+        case mirrors its release's actual module layout."""
+        monkeypatch.setattr(sqlalchemy, "__version__", version)
+        if asyncio_module_layout == "absent":
+            # None in sys.modules makes importing the module raise ImportError
+            monkeypatch.setitem(sys.modules, "sqlalchemy.connectors.asyncio", None)
+        elif asyncio_module_layout == "missing-name":
+            empty_module = types.ModuleType("sqlalchemy.connectors.asyncio")
+            monkeypatch.setitem(sys.modules, "sqlalchemy.connectors.asyncio", empty_module)
+        monkeypatch.delitem(sys.modules, "turso.sqlalchemy", raising=False)
+        monkeypatch.delitem(sys.modules, "turso.sqlalchemy.dialect", raising=False)
+
+        with pytest.raises(ImportError, match=r"SQLAlchemy >= 2\.0\.45"):
+            importlib.import_module("turso.sqlalchemy")
 
 
 class TestTursoDialectImport:

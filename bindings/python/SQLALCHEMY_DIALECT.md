@@ -10,9 +10,9 @@ The SQLAlchemy dialect is implemented with three dialects:
 - `sqlite+turso_sync://` - Sync-enabled connections with remote database support
 
 ## Installation
-
+Requires SQLAlchemy ≥ 2.0.45
 ```bash
-pip install pyturso[sqlalchemy]
+pip install pyturso[sqlalchemy] # ensures compatible version of SQLAlchemy is installed
 ```
 
 ## Quick Start
