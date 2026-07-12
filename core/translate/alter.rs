@@ -1,5 +1,5 @@
 use crate::sync::Arc;
-use crate::{schema::BTreeTable, turso_assert_eq, turso_assert_ne};
+use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
@@ -12,7 +12,7 @@ use super::{
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
-    schema::{CheckConstraint, Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
+    schema::{CheckConstraint, Column, ColumnLayout, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
@@ -481,6 +481,12 @@ fn strict_default_type_mismatch(column: &Column) -> Result<bool> {
         return Ok(false);
     };
 
+    // Non-constant defaults cannot be evaluated here; they are only legal on
+    // an empty table (enforced at runtime), where no backfill value is needed.
+    if !is_strict_constant_default(default_expr) {
+        return Ok(false);
+    }
+
     let mut value = eval_constant_default_value(default_expr)?;
     if matches!(value, Value::Null) {
         return Ok(false);
@@ -616,7 +622,7 @@ fn emit_add_virtual_column_validation(
         dest: rowid_reg,
     });
 
-    let layout = resolved_table.column_layout();
+    let layout = resolved_table.column_layout()?;
     let base_dest_reg = program.alloc_registers(layout.column_count());
     for (idx, table_column) in resolved_table.columns().iter().enumerate() {
         if table_column.is_virtual_generated() || table_column.is_rowid_alias() {
@@ -1153,6 +1159,26 @@ pub fn translate_alter_table(
                 ));
             };
 
+            let rewrite_rows = if !original_btree.columns()[dropped_index].is_virtual_generated() {
+                let source_column_by_schema_idx: Vec<Option<usize>> = btree
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(new_idx, column)| {
+                        if column.is_virtual_generated() {
+                            None
+                        } else if new_idx < dropped_index {
+                            Some(new_idx)
+                        } else {
+                            Some(new_idx + 1)
+                        }
+                    })
+                    .collect();
+                Some((source_column_by_schema_idx, btree.column_layout()?))
+            } else {
+                None
+            };
+
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -1160,27 +1186,13 @@ pub fn translate_alter_table(
                 connection,
                 input,
                 |program| {
-                    if !original_btree.columns()[dropped_index].is_virtual_generated() {
-                        let source_column_by_schema_idx = btree
-                            .columns()
-                            .iter()
-                            .enumerate()
-                            .map(|(new_idx, column)| {
-                                if column.is_virtual_generated() {
-                                    None
-                                } else if new_idx < dropped_index {
-                                    Some(new_idx)
-                                } else {
-                                    Some(new_idx + 1)
-                                }
-                            })
-                            .collect();
-
+                    if let Some((source_column_by_schema_idx, layout)) = &rewrite_rows {
                         emit_rewrite_table_rows(
                             program,
                             original_btree.clone(),
                             &btree,
                             source_column_by_schema_idx,
+                            layout,
                             connection,
                             database_id,
                         );
@@ -1220,6 +1232,11 @@ pub fn translate_alter_table(
                     "cannot add a STORED column".to_string(),
                 ));
             }
+            if is_generated && !connection.experimental_generated_columns_enabled() {
+                bail_parse_error!(
+                    "Generated columns require --experimental-generated-columns flag"
+                );
+            }
             if is_generated {
                 for c in &col_def.constraints {
                     if let ast::ColumnConstraint::Generated { expr, .. } = &c.constraint {
@@ -1229,20 +1246,6 @@ pub fn translate_alter_table(
             }
             let constraints = col_def.constraints.clone();
             let mut column = Column::try_from(&col_def)?;
-
-            // SQLite is very strict about what constitutes a "constant" default for
-            // ALTER TABLE ADD COLUMN. It only allows literals and signed literals,
-            // not arbitrary constant expressions like (5 + 3) or COALESCE(NULL, 5).
-            if !is_generated
-                && column
-                    .default
-                    .as_ref()
-                    .is_some_and(|default| !is_strict_constant_default(default))
-            {
-                return Err(LimboError::ParseError(
-                    "Cannot add a column with non-constant default".to_string(),
-                ));
-            }
 
             let new_column_name = column.name.clone().ok_or_else(|| {
                 LimboError::ParseError(
@@ -1451,10 +1454,14 @@ pub fn translate_alter_table(
                 let needs_notnull_check = column.notnull()
                     && effective_default.is_none_or(crate::util::expr_contains_null);
 
-                let needs_nondeterministic_check = column
-                    .default
-                    .as_ref()
-                    .is_some_and(|default| default_requires_empty_table(default));
+                // SQLite is very strict about what constitutes a "constant" default
+                // for ALTER TABLE ADD COLUMN: only literals, signed literals, and
+                // bare identifiers qualify. Anything else — (5 + 3), random(),
+                // CURRENT_TIMESTAMP — is permitted only if the table is empty,
+                // checked at runtime (mirroring SQLite's sqlite3ErrorIfNotEmpty).
+                let needs_nondeterministic_check = column.default.as_ref().is_some_and(|default| {
+                    default_requires_empty_table(default) || !is_strict_constant_default(default)
+                });
 
                 let (needs_empty_table_check, error_message) = if needs_notnull_check {
                     (true, "Cannot add a NOT NULL column with default value NULL")
@@ -1522,8 +1529,8 @@ pub fn translate_alter_table(
                         db: database_id,
                         table: table_name.to_owned(),
                         column: Box::new(column),
-                        check_constraints: btree.check_constraints.clone(),
-                        foreign_keys: btree.foreign_keys.clone(),
+                        check_constraints: btree.check_constraints.to_vec(),
+                        foreign_keys: btree.foreign_keys.to_vec(),
                     });
                 },
             )?
@@ -2198,7 +2205,7 @@ pub fn translate_alter_table(
                 )?;
 
                 let original_columns = original_btree.columns();
-                let source_column_by_schema_idx = rewritten_table
+                let source_column_by_schema_idx: Vec<Option<usize>> = rewritten_table
                     .columns()
                     .iter()
                     .enumerate()
@@ -2224,11 +2231,13 @@ pub fn translate_alter_table(
                         }
                     })
                     .collect();
+                let layout = rewritten_table.column_layout()?;
                 emit_rewrite_table_rows(
                     program,
                     original_btree.clone(),
                     &rewritten_table,
-                    source_column_by_schema_idx,
+                    &source_column_by_schema_idx,
+                    &layout,
                     connection,
                     database_id,
                 );
@@ -2267,7 +2276,8 @@ fn emit_rewrite_table_rows(
     program: &mut ProgramBuilder,
     original_btree: Arc<BTreeTable>,
     rewritten_table: &BTreeTable,
-    source_column_by_schema_idx: Vec<Option<usize>>,
+    source_column_by_schema_idx: &[Option<usize>],
+    layout: &ColumnLayout,
     connection: &Arc<crate::Connection>,
     database_id: usize,
 ) {
@@ -2276,7 +2286,6 @@ fn emit_rewrite_table_rows(
         rewritten_table.columns().len()
     );
 
-    let layout = rewritten_table.column_layout();
     let non_virtual_column_count = layout.num_non_virtual_cols();
     let root_page = rewritten_table.root_page;
     let table_name = rewritten_table.name.clone();

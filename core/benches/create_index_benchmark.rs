@@ -65,7 +65,7 @@ fn run_to_completion(
 ) -> turso_core::Result<()> {
     loop {
         match stmt.step()? {
-            StepResult::IO => db.io.step()?,
+            StepResult::IO | StepResult::Yield => db.io.step()?,
             StepResult::Done => break,
             StepResult::Row => {}
             StepResult::Interrupt | StepResult::Busy => {
@@ -189,6 +189,7 @@ fn should_bench_create_index_turso(row_count: usize) -> bool {
 ///
 /// Indexes the non-monotonic `val` column to force a real sort + B-tree build
 /// rather than the fast-append path that monotonic keys can take.
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_create_index(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -303,6 +304,7 @@ fn bench_create_index(criterion: &mut Criterion) {
 /// Benchmark CREATE INDEX inside an explicit BEGIN/COMMIT, isolating the
 /// commit cost the user is hitting in production.
 #[cfg(feature = "codspeed")]
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_create_index_commit(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");

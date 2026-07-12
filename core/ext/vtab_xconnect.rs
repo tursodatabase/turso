@@ -61,7 +61,9 @@ pub unsafe extern "C" fn execute(
                         ResultCode::OK
                     }
                     Err(err) => match err {
-                        crate::LimboError::Busy => ResultCode::Busy,
+                        crate::LimboError::Busy | crate::LimboError::StatementsInProgress(_) => {
+                            ResultCode::Busy
+                        }
                         crate::LimboError::Interrupt => ResultCode::Interrupt,
                         _ => {
                             tracing::error!("execute: failed to execute query: {:?}", err);
@@ -171,7 +173,7 @@ pub unsafe extern "C" fn stmt_step(stmt: *mut Stmt) -> ResultCode {
             ResultCode::EOF
         }
         Err(LimboError::Interrupt) => ResultCode::Interrupt,
-        Err(LimboError::Busy) => ResultCode::Busy,
+        Err(LimboError::Busy) | Err(LimboError::StatementsInProgress(_)) => ResultCode::Busy,
         Err(_) => ResultCode::Error,
     }
 }

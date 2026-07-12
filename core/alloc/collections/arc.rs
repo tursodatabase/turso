@@ -10,13 +10,3 @@ impl<T> TursoNewExt<T> for Arc<T> {
         arc(value)
     }
 }
-
-#[cfg(all(nightly, not(shuttle)))]
-impl<T: Clone> super::TryClone for Arc<T> {
-    type Error = crate::alloc::AllocError;
-
-    fn try_clone(&self) -> Result<Self, Self::Error> {
-        let alloc = Self::allocator(self).clone();
-        Self::try_clone_from_ref_in(self, alloc)
-    }
-}

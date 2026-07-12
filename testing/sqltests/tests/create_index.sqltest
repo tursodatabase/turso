@@ -223,6 +223,19 @@ test create-index-strftime-now-remains-rejected {
 expect error {
 }
 
+@cross-check-integrity
+test create-index-date-literal {
+    CREATE TABLE logs("created" TEXT NOT NULL);
+    CREATE INDEX idx_logs_date_literal ON logs(date('2020-01-02'));
+    INSERT INTO logs VALUES ('2024-01-01 12:34:56');
+    SELECT name
+    FROM sqlite_schema
+    WHERE type = 'index' AND name = 'idx_logs_date_literal';
+}
+expect {
+    idx_logs_date_literal
+}
+
 # Multiple columns where one is a string literal not matching any column should fail.
 # SQLite error: "no such column: literal"
 @cross-check-integrity

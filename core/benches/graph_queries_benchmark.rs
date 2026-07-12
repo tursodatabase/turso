@@ -31,6 +31,7 @@ fn rusqlite_open(path: &str) -> rusqlite::Connection {
     conn
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_graph_queries(criterion: &mut Criterion) {
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
@@ -66,7 +67,7 @@ fn bench_graph_queries(criterion: &mut Criterion) {
                         turso_core::StepResult::Row => {
                             black_box(stmt.row());
                         }
-                        turso_core::StepResult::IO => {
+                        turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                             db.io.step().unwrap();
                         }
                         turso_core::StepResult::Done => {
@@ -92,7 +93,7 @@ fn bench_graph_queries(criterion: &mut Criterion) {
                             turso_core::StepResult::Row => {
                                 black_box(stmt.row());
                             }
-                            turso_core::StepResult::IO => {
+                            turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                                 db_analyzed.io.step().unwrap();
                             }
                             turso_core::StepResult::Done => {

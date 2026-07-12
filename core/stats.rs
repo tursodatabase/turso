@@ -120,9 +120,11 @@ pub fn refresh_analyze_stats(conn: &Arc<Connection>) {
 
     let mv_tx = conn.get_mv_tx();
     if let Ok(stats) = gather_sqlite_stat1(conn, &schema_snapshot, mv_tx) {
-        conn.with_schema_mut(|schema| {
+        if let Err(e) = conn.with_schema_mut(|schema| {
             schema.analyze_stats = stats;
-        });
+        }) {
+            tracing::warn!("Failed to refresh analyze stats: {e}");
+        }
     }
 }
 
@@ -179,9 +181,11 @@ pub fn refresh_analyze_stats_nonblock(
                     Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                     Ok(IOResult::Done(())) => {
                         let stats = std::mem::take(stats);
-                        conn.with_schema_mut(|schema| {
+                        if let Err(e) = conn.with_schema_mut(|schema| {
                             schema.analyze_stats = stats;
-                        });
+                        }) {
+                            tracing::warn!("Failed to refresh analyze stats: {e}");
+                        }
                         *st = RefreshAnalyzeStatsState::Start;
                         return Ok(IOResult::Done(()));
                     }

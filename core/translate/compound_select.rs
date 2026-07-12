@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
 use crate::translate::collate::get_collseq_from_expr;
@@ -562,7 +563,7 @@ fn create_dedupe_index(
             collation: None,
             expr: None,
         })
-        .collect::<Vec<_>>();
+        .try_collect::<crate::alloc::Vec<_>>()?;
     for (i, column) in dedupe_columns.iter_mut().enumerate() {
         let left_collation = get_collseq_from_expr(
             &left_select.result_columns[i].expr,
@@ -783,7 +784,7 @@ fn create_collection_index(
             collation: None,
             expr: None,
         })
-        .collect::<Vec<_>>();
+        .try_collect::<crate::alloc::Vec<_>>()?;
     for (i, column) in columns.iter_mut().enumerate() {
         let left_collation = get_collseq_from_expr(
             &left_select.result_columns[i].expr,
@@ -844,7 +845,7 @@ fn emit_compound_order_by(
     // We append a sequence number as an extra sort key after the ORDER BY columns
     // to break ties by insertion order, matching SQLite's merge-based compound SELECT
     // which naturally outputs left-arm rows before right-arm rows for equal keys.
-    let mut order_collations_nulls: Vec<(
+    let order_collations_nulls: crate::alloc::Vec<(
         SortOrder,
         Option<crate::translate::collate::CollationSeq>,
         Option<turso_parser::ast::NullsOrder>,
@@ -857,35 +858,37 @@ fn emit_compound_order_by(
                 .and_then(|c| c.collation);
             (*order, collation, *nulls)
         })
-        .collect();
-    // Sequence tie-breaker: preserves insertion order for rows with equal ORDER BY keys
-    order_collations_nulls.push((SortOrder::Asc, None, None));
+        // Sequence tie-breaker: preserves insertion order for rows with equal ORDER BY keys
+        .chain(std::iter::once((SortOrder::Asc, None, None)))
+        .try_collect()?;
 
     // Compute deduplication remappings: which result columns share a sort key slot.
     // The sorter layout is: [order_by_keys..., sequence, non-dedup data cols...]
     let seq_slot = order_by.len();
     let data_start = order_by.len() + 1; // data columns start after ORDER BY keys + sequence
-    let mut remappings: Vec<(usize, bool)> = Vec::with_capacity(num_result_cols);
     let mut non_dedup_count = 0;
-    for col_idx in 0..num_result_cols {
-        if let Some((sort_key_idx, _)) = order_by
-            .iter()
-            .enumerate()
-            .find(|(_, (ob_col, _, _))| *ob_col == col_idx)
-        {
-            // This result column is also a sort key - deduplicate
-            remappings.push((sort_key_idx, true));
-        } else {
-            remappings.push((data_start + non_dedup_count, false));
-            non_dedup_count += 1;
-        }
-    }
+    let remappings: crate::alloc::Vec<(usize, bool)> = (0..num_result_cols)
+        .map(|col_idx| {
+            if let Some((sort_key_idx, _)) = order_by
+                .iter()
+                .enumerate()
+                .find(|(_, (ob_col, _, _))| *ob_col == col_idx)
+            {
+                // This result column is also a sort key - deduplicate.
+                (sort_key_idx, true)
+            } else {
+                let mapping = (data_start + non_dedup_count, false);
+                non_dedup_count += 1;
+                mapping
+            }
+        })
+        .try_collect()?;
     let sorter_column_count = order_by.len() + 1 + non_dedup_count;
 
     let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
     // Resolve custom type comparators for ORDER BY columns (e.g. numeric(10,2) needs
     // NumericLt to sort correctly instead of default blob/text comparison).
-    let mut comparators: Vec<Option<crate::vdbe::insn::SortComparatorType>> = order_by
+    let comparators: crate::alloc::Vec<Option<crate::vdbe::insn::SortComparatorType>> = order_by
         .iter()
         .map(|(col_idx, _, _)| {
             program.result_columns.get(*col_idx).and_then(|rc| {
@@ -896,9 +899,9 @@ fn emit_compound_order_by(
                 )
             })
         })
-        .collect();
-    // No comparator needed for the sequence tie-breaker column
-    comparators.push(None);
+        // No comparator needed for the sequence tie-breaker column
+        .chain(std::iter::once(None))
+        .try_collect()?;
     program.emit_insn(Insn::SorterOpen {
         cursor_id: sort_cursor,
         columns: order_collations_nulls.len(),

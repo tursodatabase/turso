@@ -20,11 +20,11 @@ members = [
     "extensions/fuzzy",
     "macros",
     "testing/simulator",
-    "sqlite3",
+    "bindings/c",
     "testing/stress",
     "testing/sqlite_test_ext",
     "tests",
-    "parser",
+    "sqlite/parser",
     "sync/engine",
     "sync/sdk-kit",
     "sql_generation",
@@ -33,6 +33,7 @@ members = [
     "perf/throughput/rusqlite",
     "perf/encryption",
     "perf/memory",
+    "perf/memory/codspeed",
     "perf/query-batch",
     "tools/dbhash",
     "sdk-kit",
@@ -62,11 +63,11 @@ default-members = [
     "extensions/fuzzy",
     "macros",
     "testing/simulator",
-    "sqlite3",
+    "bindings/c",
     "testing/stress",
     "testing/sqlite_test_ext",
     "tests",
-    "parser",
+    "sqlite/parser",
     "sync/engine",
     "sync/sdk-kit",
     "sql_generation",
@@ -84,24 +85,24 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.7.0-pre.6"
+version = "0.7.0-pre.18"
 authors = ["the Turso authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
-turso = { path = "bindings/rust", version = "0.7.0-pre.6" }
-turso_node = { path = "bindings/javascript", version = "0.7.0-pre.6" }
-turso_sdk_kit = { path = "sdk-kit", version = "0.7.0-pre.6" }
-turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.7.0-pre.6" }
-turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.7.0-pre.6" }
-limbo_completion = { path = "extensions/completion", version = "0.7.0-pre.6" }
-turso_core = { path = "core", version = "0.7.0-pre.6" }
-turso_sync_engine = { path = "sync/engine", version = "0.7.0-pre.6" }
-turso_ext = { path = "extensions/core", version = "0.7.0-pre.6" }
-turso_macros = { path = "macros", version = "0.7.0-pre.6" }
-turso_parser = { path = "parser", version = "0.7.0-pre.6" }
+turso = { path = "bindings/rust", version = "0.7.0-pre.18" }
+turso_node = { path = "bindings/javascript", version = "0.7.0-pre.18" }
+turso_sdk_kit = { path = "sdk-kit", version = "0.7.0-pre.18" }
+turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.7.0-pre.18" }
+turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.7.0-pre.18" }
+limbo_completion = { path = "extensions/completion", version = "0.7.0-pre.18" }
+turso_core = { path = "core", version = "0.7.0-pre.18" }
+turso_sync_engine = { path = "sync/engine", version = "0.7.0-pre.18" }
+turso_ext = { path = "extensions/core", version = "0.7.0-pre.18" }
+turso_macros = { path = "macros", version = "0.7.0-pre.18" }
+turso_parser = { path = "sqlite/parser", version = "0.7.0-pre.18" }
 sql_generation = { path = "sql_generation" }
 turso-dbhash = { path = "tools/dbhash" }
 strum = { version = "0.26", features = ["derive"] }
@@ -137,7 +138,7 @@ divan = { package = "codspeed-divan-compat", version = "4.2.1" }
 
 chrono = { version = "0.4.42", default-features = false }
 hex = "0.4"
-antithesis_sdk = { version = "0.2", default-features = false }
+antithesis_sdk = { version = "0.2.9", default-features = false }
 cfg-if = "1.0.0"
 tracing-appender = "0.2.3"
 env_logger = { version = "0.11.6", default-features = false }
@@ -152,7 +153,6 @@ either = { version = "1.15" }
 # Multi threading testing
 loom = { version = "0.7" }
 shuttle = { version = "0.8.1" }
-
 
 [profile.dev.package.similar]
 opt-level = 3
@@ -206,6 +206,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'c
 unstable_name_collisions = "allow"
 
 [workspace.lints.clippy]
+await_holding_lock = "deny"
 or_fun_call = "deny"
 clear_with_drain = "deny"
 collection_is_never_read = "deny"

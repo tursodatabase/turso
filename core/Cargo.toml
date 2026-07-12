@@ -28,7 +28,8 @@ experimental_win_iocp = []
 time = []
 fuzz = []
 omit_autovacuum = []
-simulator = ["fuzz", "serde", "io_memory_yield"]
+simulator = ["fuzz", "serde", "io_memory_yield", "allocation_metric"]
+allocation_metric = []
 # Test only: exposed to testing/stress and the simulator, never to regular library users.
 io_memory_yield = []
 serde = ["dep:serde"]
@@ -71,6 +72,12 @@ libloading = "0.8.6"
 tantivy = { version = "0.26.0", optional = true }
 
 [dependencies]
+# aristo SDK from crates.io (0.4.x — latest; also carries the aristo::instrument
+# surface behind the `aristo_instrument` feature, for future state-exposure
+# accessors). Was a local sibling path (../../aristo) pre-OSS; the conformance
+# harness resolves aristo + aristo-macros from crates.io, so no vendored mount
+# / path-rewrite is needed.
+aristo = "0.4"
 turso_ext = { workspace = true, features = ["core_only"] }
 cfg_block = "0.1.1"
 fallible-iterator = { workspace = true }
@@ -181,6 +188,10 @@ name = "benchmark"
 harness = false
 
 [[bench]]
+name = "count_benchmark"
+harness = false
+
+[[bench]]
 name = "mvcc_benchmark"
 harness = false
 
@@ -237,4 +248,8 @@ harness = false
 
 [[bench]]
 name = "struct_union_profile"
+harness = false
+
+[[bench]]
+name = "prepare_params_benchmark"
 harness = false

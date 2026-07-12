@@ -22,7 +22,7 @@ use super::{
     trigger_exec::{get_triggers_including_temp, has_triggers_including_temp},
     window::WindowMetadata,
 };
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::instrument;
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
@@ -153,6 +153,11 @@ pub struct Resolver<'a> {
     /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
     /// than redirecting column reads at codegen time.
     pub register_affinities: HashMap<usize, Affinity>,
+    /// Maps register indices to declared column collations, the collation
+    /// counterpart of `register_affinities`: when column references are
+    /// rewritten to Expr::Register (UPSERT DO UPDATE WHERE/SET), comparisons
+    /// must still use the column's implicit collation per SQLite's rule 2.
+    pub register_collations: HashMap<usize, CollationSeq>,
     /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
     /// This lets comparison affinity follow SQLite rules for expressions like
     /// `(SELECT text_col FROM ...) > some_numeric_expr`.
@@ -288,6 +293,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            register_collations: HashMap::default(),
             subquery_affinities: RefCell::new(HashMap::default()),
             self_table_scope: RefCell::new(None),
             enable_custom_types,
@@ -317,6 +323,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            register_collations: HashMap::default(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
@@ -338,6 +345,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_affinities: self.register_affinities.clone(),
+            register_collations: self.register_collations.clone(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
@@ -1065,17 +1073,22 @@ fn build_rowid_column() -> Column {
 pub fn prepare_cdc_if_necessary(
     program: &mut ProgramBuilder,
     schema: &Schema,
-    changed_table_name: &str,
+    changed_table_name: Option<&str>,
 ) -> Result<Option<(usize, Arc<BTreeTable>)>> {
     let mode = program.capture_data_changes_info();
     let cdc_table = mode.table();
     let Some(cdc_table) = cdc_table else {
         return Ok(None);
     };
-    if changed_table_name == cdc_table
-        || changed_table_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
-    {
-        return Ok(None);
+    // Self-exclusion: never capture changes to CDC's own bookkeeping tables. `None` means the
+    // caller has no associated table (e.g. a transaction-boundary COMMIT record) and always
+    // gets the cursor.
+    if let Some(changed_table_name) = changed_table_name {
+        if changed_table_name == cdc_table
+            || changed_table_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
+        {
+            return Ok(None);
+        }
     }
     let Some(turso_cdc_table) = schema.get_table(cdc_table) else {
         crate::bail_parse_error!("no such table: {}", cdc_table);
@@ -1199,6 +1212,61 @@ pub fn emit_cdc_full_record(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Allocate the rowid for a CDC row into `dest_reg`. The CDC table's `change_id`
+/// column is `INTEGER PRIMARY KEY`, so the rowid IS the change id.
+///
+/// In MVCC journal mode the id is drawn from the CDC table's implicit
+/// AUTOINCREMENT sequence. This makes change ids monotonic and never reused after
+/// CDC rows are pruned, and registers each in-flight allocation with the MVCC
+/// store so the sync push loop can call `sequence_watermark_experimental` to
+/// avoid advancing the push watermark past a change id that a concurrent
+/// transaction commits out of change-id order under snapshot isolation. In WAL
+/// mode we keep the cheaper `NewRowid` (max rowid + 1) assignment; the WAL push
+/// loop does not depend on the sequence watermark, so its insert path is
+/// unchanged and pays no per-row sequence cost.
+fn emit_cdc_change_id(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    cdc_cursor_id: usize,
+    dest_reg: usize,
+) -> Result<()> {
+    if !program.is_mvcc_enabled() {
+        program.emit_insn(Insn::NewRowid {
+            cursor: cdc_cursor_id,
+            rowid_reg: dest_reg,
+            prev_largest_reg: 0,
+        });
+        return Ok(());
+    }
+    let Some(cdc_table) = program
+        .capture_data_changes_info()
+        .as_ref()
+        .map(|info| info.table.clone())
+    else {
+        return Err(crate::LimboError::InternalError(
+            "CDC change-id allocation requested without an active CDC config".to_string(),
+        ));
+    };
+    let seq_name = crate::schema::autoincrement_sequence_name(&cdc_table);
+    let seq = resolver
+        .with_schema(crate::MAIN_DB_ID, |s| s.get_sequence(&seq_name).cloned())
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "missing implicit AUTOINCREMENT sequence for CDC table \"{cdc_table}\""
+            ))
+        })?;
+    crate::translate::sequence::emit_disk_read_nextval(
+        program,
+        resolver,
+        crate::MAIN_DB_ID,
+        &seq_name,
+        &seq,
+        dest_reg,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn emit_cdc_insns(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -1225,7 +1293,6 @@ pub fn emit_cdc_insns(
         ),
         Some(crate::CdcVersion::V1) => emit_cdc_insns_v1(
             program,
-            resolver,
             operation_mode,
             cdc_cursor_id,
             rowid_reg,
@@ -1243,7 +1310,6 @@ pub fn emit_cdc_insns(
 #[allow(clippy::too_many_arguments)]
 fn emit_cdc_insns_v1(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     operation_mode: OperationMode,
     cdc_cursor_id: usize,
     rowid_reg: usize,
@@ -1260,11 +1326,8 @@ fn emit_cdc_insns_v1(
     });
     program.mark_last_insn_constant();
 
-    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0)? else {
-        bail_parse_error!("no function {}", "unixepoch");
-    };
     let unixepoch_fn_ctx = crate::function::FuncCtx {
-        func: unixepoch_fn,
+        func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
     };
 
@@ -1354,6 +1417,7 @@ fn emit_cdc_insns_v1(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_cdc_insns_v2(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -1374,11 +1438,8 @@ fn emit_cdc_insns_v2(
     program.mark_last_insn_constant();
 
     // change_time = unixepoch()
-    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0)? else {
-        bail_parse_error!("no function {}", "unixepoch");
-    };
     let unixepoch_fn_ctx = crate::function::FuncCtx {
-        func: unixepoch_fn,
+        func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
     };
     program.emit_insn(Insn::Function {
@@ -1388,19 +1449,14 @@ fn emit_cdc_insns_v2(
         func: unixepoch_fn_ctx,
     });
 
-    // change_txn_id = conn_txn_id(new_rowid)
-    // First generate a candidate rowid, then pass it to conn_txn_id for get-or-set.
+    // change_txn_id = conn_txn_id(change_id)
+    // First allocate the change id (the CDC rowid), then pass it to conn_txn_id
+    // for get-or-set. In MVCC mode this draws from the CDC AUTOINCREMENT sequence
+    // (see `emit_cdc_change_id`); in WAL mode it is a plain NewRowid.
     let candidate_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: cdc_cursor_id,
-        rowid_reg: candidate_reg,
-        prev_largest_reg: 0,
-    });
-    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1)? else {
-        bail_parse_error!("no function {}", "conn_txn_id");
-    };
+    emit_cdc_change_id(program, resolver, cdc_cursor_id, candidate_reg)?;
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
-        func: conn_txn_id_fn,
+        func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
     };
     program.emit_insn(Insn::Function {
@@ -1466,13 +1522,6 @@ fn emit_cdc_insns_v2(
         program.mark_last_insn_constant();
     }
 
-    let rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: cdc_cursor_id,
-        rowid_reg,
-        prev_largest_reg: 0,
-    });
-
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u16(turso_cdc_registers),
@@ -1484,7 +1533,7 @@ fn emit_cdc_insns_v2(
 
     program.emit_insn(Insn::Insert {
         cursor: cdc_cursor_id,
-        key_reg: rowid_reg,
+        key_reg: candidate_reg,
         record_reg,
         flag: InsertFlags::new()
             .skip_last_rowid()
@@ -1554,12 +1603,11 @@ pub fn emit_cdc_commit_insns(
     });
     program.mark_last_insn_constant();
 
+    // Allocate the COMMIT record's change id from the same source as row records
+    // (the CDC AUTOINCREMENT sequence in MVCC mode) so COMMIT and row change ids
+    // stay in one monotonic, never-reused stream.
     let rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: cdc_cursor_id,
-        rowid_reg,
-        prev_largest_reg: 0,
-    });
+    emit_cdc_change_id(program, resolver, cdc_cursor_id, rowid_reg)?;
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
@@ -1620,6 +1668,64 @@ pub fn emit_cdc_autocommit_commit(
         program.preassign_label_to_next_insn(skip_label);
     }
 
+    Ok(())
+}
+
+/// Emit the CDC COMMIT record for an explicit `COMMIT` statement, gated on the transaction
+/// having actually captured a change.
+///
+/// Data-modifying statements always establish a write transaction before reaching their CDC
+/// emission, but an explicit `COMMIT` does not: for an empty or read-only transaction the
+/// connection's `tx_state` is still `None`/`Read`. Emitting the record unconditionally would
+/// then dirty the CDC table page without a write transaction; the commit path neither flushes
+/// nor clears that page, so it leaks into the next transaction and trips the "dirty pages
+/// should be empty for read txn" assertion on a later ROLLBACK
+/// (https://github.com/tursodatabase/turso/issues/7677).
+///
+/// `conn_txn_id(-1)` returns the active CDC transaction id, or -1 when nothing was captured.
+/// When it is set, the transaction already performed a write (the data-change statement
+/// established the write transaction), so inserting the commit record is safe. When it is -1
+/// the transaction made no changes and we skip the record entirely, leaving the transaction
+/// read-only.
+pub fn emit_cdc_explicit_commit_insns(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    resolver: &Resolver,
+) -> Result<()> {
+    let minus_one_reg = program.alloc_register();
+    program.emit_int(-1, minus_one_reg);
+    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1)? else {
+        bail_parse_error!("no function {}", "conn_txn_id");
+    };
+    let txn_id_reg = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: minus_one_reg,
+        dest: txn_id_reg,
+        func: crate::function::FuncCtx {
+            func: conn_txn_id_fn,
+            arg_count: 1,
+        },
+    });
+
+    // Skip the whole record (including the CDC OpenWrite) when no change was captured.
+    // `emit_cdc_commit_insns` recomputes `conn_txn_id(-1)` for the record itself; because the
+    // opcode is an idempotent get-or-set, the second call returns the same value we gated on.
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::Eq {
+        lhs: txn_id_reg,
+        rhs: minus_one_reg,
+        target_pc: skip_label,
+        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        collation: None,
+    });
+
+    // A COMMIT record has no associated table, so pass `None` (no self-exclusion check).
+    if let Some((cdc_cursor_id, _)) = prepare_cdc_if_necessary(program, schema, None)? {
+        emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
+    }
+
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 /// Initialize the limit/offset counters and registers.
@@ -1767,7 +1873,7 @@ pub(crate) fn emit_columns_and_dependencies(
         program.alloc_registers(non_rowid_targets.len())
     };
     let extra_base = {
-        let mut dependencies_not_in_targets: ColumnMask = dependencies.clone();
+        let mut dependencies_not_in_targets: ColumnMask = dependencies.try_clone()?;
         dependencies_not_in_targets -= &target_mask;
 
         let extra_count = table

@@ -552,6 +552,81 @@ expect {
     Date|0
 }
 
+# --- BETWEEN in WHERE:  should keep lhs as left operand for both comparisons to respect SQLite collation precedence ---
+@cross-check-integrity
+test collate_between_where_nocase_lhs_column_bound {
+    CREATE TABLE t(a COLLATE NOCASE, b);
+    INSERT INTO t VALUES ('ABC','abc');
+    SELECT a, b FROM t WHERE a BETWEEN b AND b;
+}
+expect {
+    ABC|abc
+}
+
+# --- BETWEEN in WHERE - BINARY lhs vs NOCASE bound: collation from lhs (BINARY), so 'ABC' is not in ['abc','abc'] ---
+@cross-check-integrity
+test collate_between_where_binary_lhs_nocase_bound {
+    CREATE TABLE t(a COLLATE BINARY, b COLLATE NOCASE);
+    INSERT INTO t VALUES ('ABC','abc');
+    SELECT count(*) FROM t WHERE a BETWEEN b AND b;
+    SELECT a BETWEEN b AND b FROM t;
+}
+expect {
+    0
+    0
+}
+
+# --- BETWEEN in WHERE - NOT BETWEEN lower-bound path: NOCASE lhs equals bound so NOT BETWEEN excludes the row ---
+@cross-check-integrity
+test collate_not_between_where_nocase_lhs {
+    CREATE TABLE t(a COLLATE NOCASE, b);
+    INSERT INTO t VALUES ('ABC','abc');
+    SELECT count(*) FROM t WHERE a NOT BETWEEN b AND b;
+    SELECT a NOT BETWEEN b AND b FROM t;
+}
+expect {
+    0
+    0
+}
+
+# --- BETWEEN in WHERE - NOCASE lhs with distinct start/end cols: 'Banana' matches, 'Apple' falls below 'banana' ---
+@cross-check-integrity
+test collate_between_where_nocase_lhs_range_columns {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, lo TEXT, hi TEXT);
+    INSERT INTO t VALUES ('Banana', 'apple', 'cherry');
+    INSERT INTO t VALUES ('Apple',  'banana', 'cherry');
+    SELECT a FROM t WHERE a BETWEEN lo AND hi ORDER BY rowid;
+}
+expect {
+    Banana
+}
+
+# --- BETWEEN in WHERE - RTRIM lhs ignores trailing spaces in bound: 'abc' is within ['abc   ','abc   '] ---
+@cross-check-integrity
+test collate_between_where_rtrim_lhs_column_bound {
+    CREATE TABLE t(a COLLATE RTRIM, b);
+    INSERT INTO t VALUES ('abc', 'abc   ');
+    SELECT count(*) FROM t WHERE a BETWEEN b AND b;
+    SELECT a BETWEEN b AND b FROM t;
+}
+expect {
+    1
+    1
+}
+
+# --- BETWEEN in WHERE - Explicit COLLATE on lhs overrides column collation: BINARY col matches under ---
+@cross-check-integrity
+test collate_between_where_explicit_collate_lhs {
+    CREATE TABLE t(a COLLATE BINARY, b COLLATE BINARY);
+    INSERT INTO t VALUES ('ABC','abc');
+    SELECT count(*) FROM t WHERE a COLLATE NOCASE BETWEEN b AND b;
+    SELECT count(*) FROM t WHERE a BETWEEN b AND b;
+}
+expect {
+    1
+    0
+}
+
 # --- GROUP BY on NOCASE column + aggregate + scalar comparison ---
 # The GROUP BY should group case-insensitively, and the scalar comparison
 # in the SELECT must still use the column's NOCASE collation.

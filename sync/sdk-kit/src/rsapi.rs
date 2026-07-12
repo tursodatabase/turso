@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use turso_core::{MemoryIO, IO};
-use turso_sdk_kit::rsapi::{str_from_c_str, TursoError};
+use turso_sdk_kit::rsapi::{str_from_c_str, SyncBusyGate, SyncBusyGuard, TursoError};
 use turso_sync_engine::{
     database_sync_engine::{self, DatabaseSyncEngine},
     database_sync_engine_io::SyncEngineIo,
@@ -37,6 +37,10 @@ pub struct TursoDatabaseSyncConfig {
     /// `None` => single-request bootstrap. No-op when partial-sync uses the
     /// query bootstrap strategy.
     pub pull_bytes_threshold: Option<usize>,
+    /// Use the MVCC logical-log stream for incremental V1 pulls. This is
+    /// required when syncing against an MVCC-mode remote; legacy page/WAL sync
+    /// keeps the default `false` value.
+    pub logical_mvcc_pull: bool,
 }
 
 pub type PartialSyncOpts = turso_sync_engine::types::PartialSyncOpts;
@@ -118,6 +122,7 @@ impl TursoDatabaseSyncConfig {
             } else {
                 Some(config.pull_bytes_threshold)
             },
+            logical_mvcc_pull: config.logical_mvcc_pull,
         })
     }
 }
@@ -164,6 +169,7 @@ pub struct TursoDatabaseSync<TBytes: AsRef<[u8]> + Send + Sync + 'static> {
     sync_engine_io_queue: SyncEngineIoStats<SyncEngineIoQueue<TBytes>>,
     sync_engine: Arc<Mutex<Option<DatabaseSyncEngine<SyncEngineIoQueue<TBytes>>>>>,
     db_io: Option<Arc<dyn IO>>,
+    sync_busy: Arc<SyncBusyGate>,
 }
 
 #[allow(unused_variables)]
@@ -230,6 +236,10 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         db_config: turso_sdk_kit::rsapi::TursoDatabaseConfig,
         sync_config: TursoDatabaseSyncConfig,
     ) -> Result<Arc<Self>, turso_sdk_kit::rsapi::TursoError> {
+        // Mirror the database's experimental features onto the connections the
+        // sync engine opens internally (e.g. the revert connection), so they
+        // match the main database opened via TursoDatabase below.
+        let db_opts = db_config.database_opts();
         let sync_engine_opts = turso_sync_engine::database_sync_engine::DatabaseSyncEngineOpts {
             remote_url: sync_config.remote_url.clone(),
             client_name: sync_config.client_name.clone(),
@@ -242,10 +252,12 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             protocol_version_hint: turso_sync_engine::types::DatabaseSyncEngineProtocolVersion::V1,
             bootstrap_if_empty: sync_config.bootstrap_if_empty,
             reserved_bytes: sync_config.reserved_bytes.unwrap_or(0),
+            db_opts,
             partial_sync_opts: sync_config.partial_sync_opts.clone(),
             remote_encryption_key: sync_config.remote_encryption_key.clone(),
             push_operations_threshold: sync_config.push_operations_threshold,
             pull_bytes_threshold: sync_config.pull_bytes_threshold,
+            logical_mvcc_pull: sync_config.logical_mvcc_pull,
         };
         let is_memory = db_config.path == ":memory:";
         let db_io: Option<Arc<dyn IO>> = if is_memory {
@@ -262,6 +274,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             sync_engine_io_queue,
             sync_engine: Arc::new(Mutex::new(None)),
             db_io,
+            sync_busy: Arc::new(SyncBusyGate::default()),
         }))
     }
     /// open the database which must be created earlier (e.g. through [Self::init])
@@ -387,6 +400,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
     pub fn connect(&self) -> Box<TursoDatabaseAsyncOperation> {
         let db_config = self.db_config.clone();
         let sync_engine = self.sync_engine.clone();
+        let sync_busy = self.sync_busy.clone();
         Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
             Box::pin(async move {
                 let sync_engine = sync_engine.lock_arc();
@@ -397,7 +411,11 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                 };
                 let connection = sync_engine.connect_rw(&coro).await?;
                 Ok(Some(TursoAsyncOperationResult::Connection {
-                    connection: turso_sdk_kit::rsapi::TursoConnection::new(&db_config, connection),
+                    connection: turso_sdk_kit::rsapi::TursoConnection::new_with_sync_busy(
+                        &db_config,
+                        connection,
+                        Some(sync_busy),
+                    ),
                 }))
             })
         })))
@@ -422,6 +440,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
     /// checkpoint WAL of synced database
     pub fn checkpoint(&self) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
+        let sync_busy = self.sync_busy.clone();
         Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
             Box::pin(async move {
                 let sync_engine = sync_engine.lock_arc();
@@ -430,6 +449,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                         "sync engine must be initialized".to_string(),
                     ));
                 };
+                let _sync_busy = SyncBusyGuard::new(sync_busy);
                 sync_engine.checkpoint(&coro).await?;
                 Ok(None)
             })
@@ -475,6 +495,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         changes: Box<TursoDatabaseSyncChanges>,
     ) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
+        let sync_busy = self.sync_busy.clone();
         Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
             Box::pin(async move {
                 let sync_engine = sync_engine.lock_arc();
@@ -484,6 +505,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     ));
                 };
                 let changes = changes.changes;
+                let _sync_busy = SyncBusyGuard::new(sync_busy);
                 sync_engine
                     .apply_changes_from_remote(&coro, changes)
                     .await?;

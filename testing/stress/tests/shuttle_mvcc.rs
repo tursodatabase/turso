@@ -1,6 +1,6 @@
 #![cfg(shuttle)]
 
-use shuttle::scheduler::RandomScheduler;
+use shuttle::scheduler::{PctScheduler, RandomScheduler};
 use shuttle::sync::Barrier;
 use turso::Builder;
 use turso_stress::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -646,4 +646,94 @@ fn shuttle_test_speculative_abort_delete_slow() {
     let scheduler = RandomScheduler::new(10);
     let runner = shuttle::Runner::new(scheduler, shuttle_config());
     runner.run(|| shuttle::future::block_on(speculative_abort_delete_scenario(30, 60)));
+}
+
+#[test]
+fn shuttle_test_begin_publish_window_gc_hazard() {
+    let scheduler = PctScheduler::new(5, 10000);
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner.run(|| shuttle::future::block_on(begin_publish_window_gc_scenario(3, 5)));
+}
+
+/// Begin-publish-window GC hazard (regression test for PR #7493).
+///
+/// With aggressive inline GC enabled (`PRAGMA mvcc_gc_threshold = 1`), every
+/// committed write runs `gc_incremental` on the commit path. A reader that has
+/// allocated its begin timestamp but is not yet published into `txs` is invisible
+/// to `compute_lwm`; if a writer commits in that window, inline GC could free the
+/// version the reader still needs. The reader then resumes, reads at its old
+/// snapshot, finds the new version invisible, falls through to an empty B-tree
+/// (nothing is checkpointed at this size), and observes NO ROW.
+///
+/// The fix publishes a transaction into `txs` atomically with its begin
+/// timestamp under the clock lock, so a committing writer always sees the
+/// reader's snapshot (or assigns a strictly newer commit timestamp the reader
+/// will see). Row id=1 is inserted once at setup and never deleted, so every
+/// snapshot MUST observe exactly one row for it; a reader seeing zero rows is
+/// the violation.
+async fn begin_publish_window_gc_scenario(num_readers: usize, rounds: i64) {
+    let (db, _dir) = setup_mvcc_db(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER);
+         INSERT INTO t VALUES(1, 0);",
+    )
+    .await;
+
+    // Make every committed write trigger an inline GC pass.
+    {
+        db.connect()
+            .unwrap()
+            .execute("PRAGMA mvcc_gc_threshold = 1", ())
+            .await
+            .unwrap();
+    }
+
+    let row_disappeared = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::new();
+
+    {
+        let conn = db.connect().unwrap();
+        handles.push(turso_stress::future::spawn(async move {
+            for i in 0..rounds {
+                let _ = conn
+                    .execute(&format!("UPDATE t SET val = {} WHERE id = 1", i + 1), ())
+                    .await;
+            }
+        }));
+    }
+
+    for _ in 0..num_readers {
+        let conn = db.connect().unwrap();
+        let row_disappeared = row_disappeared.clone();
+        handles.push(turso_stress::future::spawn(async move {
+            let mut saw_one = false;
+
+            for _ in 0..rounds {
+                if row_disappeared.load(Ordering::Acquire) {
+                    return;
+                }
+                match conn
+                    .query("SELECT val FROM t WHERE id = 1", ())
+                    .await
+                    .unwrap()
+                    .next()
+                    .await
+                {
+                    Ok(Some(_)) => saw_one = true,
+                    Ok(None) if saw_one => {
+                        row_disappeared.store(true, Ordering::Release);
+                    }
+                    _ => {}
+                }
+            }
+        }));
+    }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    assert!(
+        !row_disappeared.load(Ordering::Acquire),
+        "Observed a row, and then no row. This violates Snapshot Isolation"
+    );
 }

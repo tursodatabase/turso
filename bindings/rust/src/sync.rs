@@ -2,7 +2,7 @@ use std::{
     future::Future,
     io::ErrorKind,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -26,6 +26,8 @@ pub use turso_sync_sdk_kit::rsapi::PartialSyncOpts;
 
 // Constants used across the sync module
 const DEFAULT_CLIENT_NAME: &str = "turso-sync-rust";
+const CHECKPOINT_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+const CHECKPOINT_BUSY_MAX_ATTEMPTS: usize = 100;
 
 /// Future returned by an auth token provider. Resolves to a bearer token string
 /// (without the `Bearer ` prefix — that prefix is added when building the header).
@@ -104,11 +106,22 @@ pub struct Builder {
     remote_encryption_key: Option<String>,
     // Encryption cipher for the Turso Cloud database
     remote_encryption_cipher: Option<RemoteEncryptionCipher>,
-    // Whether to enable the experimental `index_method` engine feature
-    // (e.g. `CREATE INDEX … USING fts (...)`). Mirrors the local Builder's
-    // `experimental_index_method` flag so synced databases can use the
-    // same SQL surface as their local-only counterparts.
-    experimental_index_method: bool,
+    // Use MVCC logical-log incremental pulls instead of page-stream pulls.
+    logical_mvcc_pull: bool,
+    // Experimental engine features to enable on the local synced database.
+    // These mirror the local [`crate::Builder`] flags so synced databases
+    // expose the same SQL surface as their local-only counterparts. Local
+    // at-rest `encryption` is intentionally omitted because the sync engine
+    // does not support local encryption (cloud encryption is configured
+    // separately via `with_remote_encryption`).
+    enable_attach: bool,
+    enable_custom_types: bool,
+    enable_index_method: bool,
+    enable_materialized_views: bool,
+    enable_vacuum: bool,
+    enable_generated_columns: bool,
+    enable_multiprocess_wal: bool,
+    enable_without_rowid: bool,
 }
 
 impl Builder {
@@ -124,8 +137,30 @@ impl Builder {
             partial_sync_config_experimental: None,
             remote_encryption_key: None,
             remote_encryption_cipher: None,
-            experimental_index_method: false,
+            logical_mvcc_pull: false,
+            enable_attach: false,
+            enable_custom_types: false,
+            enable_index_method: false,
+            enable_materialized_views: false,
+            enable_vacuum: false,
+            enable_generated_columns: false,
+            enable_multiprocess_wal: false,
+            enable_without_rowid: false,
         }
+    }
+
+    /// Enable the experimental `attach` engine feature for the synced database.
+    /// Mirrors the local [`crate::Builder::experimental_attach`] method.
+    pub fn experimental_attach(mut self, enable: bool) -> Self {
+        self.enable_attach = enable;
+        self
+    }
+
+    /// Enable the experimental `custom_types` engine feature for the synced
+    /// database. Mirrors the local [`crate::Builder::experimental_custom_types`].
+    pub fn experimental_custom_types(mut self, enable: bool) -> Self {
+        self.enable_custom_types = enable;
+        self
     }
 
     /// Enable the experimental `index_method` engine feature for the synced
@@ -134,7 +169,46 @@ impl Builder {
     /// engine. Mirrors the local [`crate::Builder::experimental_index_method`]
     /// method so callers can use the same SQL surface in synced mode.
     pub fn experimental_index_method(mut self, enable: bool) -> Self {
-        self.experimental_index_method = enable;
+        self.enable_index_method = enable;
+        self
+    }
+
+    /// Enable the experimental materialized `views` engine feature for the
+    /// synced database. Mirrors the local
+    /// [`crate::Builder::experimental_materialized_views`].
+    pub fn experimental_materialized_views(mut self, enable: bool) -> Self {
+        self.enable_materialized_views = enable;
+        self
+    }
+
+    /// Enable the experimental `vacuum` engine feature for the synced database.
+    /// Mirrors the local [`crate::Builder::experimental_vacuum`].
+    pub fn experimental_vacuum(mut self, enable: bool) -> Self {
+        self.enable_vacuum = enable;
+        self
+    }
+
+    /// Enable the experimental `generated_columns` engine feature for the
+    /// synced database. Mirrors the local
+    /// [`crate::Builder::experimental_generated_columns`].
+    pub fn experimental_generated_columns(mut self, enable: bool) -> Self {
+        self.enable_generated_columns = enable;
+        self
+    }
+
+    /// Enable the experimental `multiprocess_wal` engine feature for the synced
+    /// database. Mirrors the local
+    /// [`crate::Builder::experimental_multiprocess_wal`].
+    pub fn experimental_multiprocess_wal(mut self, enable: bool) -> Self {
+        self.enable_multiprocess_wal = enable;
+        self
+    }
+
+    /// Enable the experimental `without_rowid` engine feature for the synced
+    /// database. Mirrors the local
+    /// [`crate::Builder::experimental_without_rowid`].
+    pub fn experimental_without_rowid(mut self, enable: bool) -> Self {
+        self.enable_without_rowid = enable;
         self
     }
 
@@ -217,22 +291,58 @@ impl Builder {
         self
     }
 
+    /// Use MVCC logical-log incremental pulls.
+    ///
+    /// MVCC-mode remotes accept page-stream pulls only for bootstrap; callers
+    /// using legacy WAL/page sync should keep the default `false` value.
+    pub fn with_logical_mvcc_pull(mut self, enable: bool) -> Self {
+        self.logical_mvcc_pull = enable;
+        self
+    }
+
+    /// Compose the `experimental_features` comma-separated string consumed by
+    /// [`turso_sdk_kit::rsapi::TursoDatabaseConfig`] (and ultimately
+    /// `turso_core::DatabaseOpts::with_experimental_feature`) from the boolean
+    /// flags on this Builder. Returns `None` when no feature is enabled. The
+    /// feature tokens must match the names parsed by the core.
+    fn experimental_features_string(&self) -> Option<String> {
+        let mut features: Vec<&str> = Vec::new();
+        if self.enable_attach {
+            features.push("attach");
+        }
+        if self.enable_custom_types {
+            features.push("custom_types");
+        }
+        if self.enable_index_method {
+            features.push("index_method");
+        }
+        if self.enable_materialized_views {
+            features.push("views");
+        }
+        if self.enable_vacuum {
+            features.push("vacuum");
+        }
+        if self.enable_generated_columns {
+            features.push("generated_columns");
+        }
+        if self.enable_multiprocess_wal {
+            features.push("multiprocess_wal");
+        }
+        if self.enable_without_rowid {
+            features.push("without_rowid");
+        }
+        if features.is_empty() {
+            None
+        } else {
+            Some(features.join(","))
+        }
+    }
+
     // Build the synced database object, initialize and open it.
     pub async fn build(self) -> Result<Database> {
-        // Compose the experimental_features comma-separated string from the
-        // boolean flags exposed on this Builder. Today only `index_method`
-        // is wired; future synced-compatible flags can be added here.
-        let experimental_features = {
-            let mut features: Vec<&str> = Vec::new();
-            if self.experimental_index_method {
-                features.push("index_method");
-            }
-            if features.is_empty() {
-                None
-            } else {
-                Some(features.join(","))
-            }
-        };
+        // Compose the experimental_features string from the boolean flags
+        // exposed on this Builder.
+        let experimental_features = self.experimental_features_string();
 
         // Build core database config for the embedded engine.
         let db_config = turso_sdk_kit::rsapi::TursoDatabaseConfig {
@@ -274,6 +384,7 @@ impl Builder {
             remote_encryption_key: self.remote_encryption_key.clone(),
             push_operations_threshold: None,
             pull_bytes_threshold: None,
+            logical_mvcc_pull: self.logical_mvcc_pull,
         };
 
         // Create sync wrapper.
@@ -336,8 +447,19 @@ impl Database {
 
     // Force WAL checkpoint for the main database.
     pub async fn checkpoint(&self) -> Result<()> {
-        let op = self.sync.checkpoint();
-        drive_operation(op, self.io.clone()).await?;
+        for attempt in 0..CHECKPOINT_BUSY_MAX_ATTEMPTS {
+            let op = self.sync.checkpoint();
+            let result = drive_operation(op, self.io.clone()).await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if is_sync_busy_error(&error) && attempt + 1 < CHECKPOINT_BUSY_MAX_ATTEMPTS =>
+                {
+                    tokio::time::sleep(CHECKPOINT_BUSY_RETRY_DELAY).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(())
     }
 
@@ -397,6 +519,14 @@ async fn drive_operation_result(
 ) -> Result<Option<turso_sync_sdk_kit::turso_async_operation::TursoAsyncOperationResult>> {
     let fut = AsyncOpFuture::new(op, io);
     fut.await
+}
+
+fn is_sync_busy_error(error: &Error) -> bool {
+    match error {
+        Error::Busy(_) => true,
+        Error::Error(message) => message.contains("Database is busy"),
+        _ => false,
+    }
 }
 
 // Custom Future that integrates with TursoDatabaseAsyncOperation and our IO worker.
@@ -481,12 +611,6 @@ fn normalize_base_url(input: &str) -> std::result::Result<String, String> {
 // The IO worker owns a dedicated Tokio runtime on a separate thread, and processes
 // the SyncEngine IO queue (HTTP and atomic file operations).
 struct IoWorker {
-    // Reference to the sync database to pull IO items from its queue.
-    sync: Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
-    // Normalized base URL (http/https).
-    base_url: Option<String>,
-    // Optional auth token provider (resolved per request).
-    auth_token: Option<AuthTokenFn>,
     // Channel to wake the worker to process IO.
     tx: mpsc::UnboundedSender<()>,
     // Wakers to notify pending futures when IO makes progress.
@@ -501,17 +625,15 @@ impl IoWorker {
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel::<()>();
         let wakers = Arc::new(Mutex::new(Vec::new()));
+        let weak_sync = Arc::downgrade(&sync);
 
         let worker = Arc::new(Self {
-            sync,
-            base_url,
-            auth_token,
             tx,
             wakers: wakers.clone(),
         });
 
-        // Spin a separate Tokio runtime on its own thread to process IO queue.
-        let worker_clone = worker.clone();
+        // Keep the worker thread independent from the handle so dropping the
+        // last Database releases the sync engine immediately on Windows.
         std::thread::Builder::new()
             .name("turso-sync-io".to_string())
             .spawn(move || {
@@ -521,7 +643,7 @@ impl IoWorker {
                     .expect("failed to build IO runtime");
 
                 rt.block_on(async move {
-                    IoWorker::run_loop(worker_clone, rx, wakers).await;
+                    IoWorker::run_loop(weak_sync, base_url, auth_token, rx, wakers).await
                 });
             })
             .expect("failed to spawn IO worker thread");
@@ -541,7 +663,7 @@ impl IoWorker {
     }
 
     // Called from the IO thread once progress has been made to notify all pending futures.
-    fn notify_progress(wakers: &Arc<Mutex<Vec<Waker>>>) {
+    fn notify_progress(wakers: &Mutex<Vec<Waker>>) {
         let wakers = {
             let mut guard = wakers.lock().unwrap();
             std::mem::take(&mut *guard)
@@ -552,7 +674,9 @@ impl IoWorker {
     }
 
     async fn run_loop(
-        this: Arc<IoWorker>,
+        sync: Weak<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
+        base_url: Option<String>,
+        auth_token: Option<AuthTokenFn>,
         mut rx: mpsc::UnboundedReceiver<()>,
         wakers: Arc<Mutex<Vec<Waker>>>,
     ) {
@@ -569,12 +693,15 @@ impl IoWorker {
             Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https);
 
         while rx.recv().await.is_some() {
+            let Some(sync) = sync.upgrade() else {
+                break;
+            };
             // Process all pending items in the sync IO queue.
             let mut made_progress = false;
             loop {
-                let item = this.sync.take_io_item();
+                let item = sync.take_io_item();
                 let Some(item) = item else {
-                    this.sync.step_io_callbacks();
+                    sync.step_io_callbacks();
                     IoWorker::notify_progress(&wakers);
                     break;
                 };
@@ -590,7 +717,10 @@ impl IoWorker {
                         headers,
                     } => {
                         IoWorker::process_http(
-                            &this,
+                            &sync,
+                            base_url.as_deref(),
+                            auth_token.as_ref(),
+                            &wakers,
                             &client,
                             url.as_deref(),
                             method,
@@ -602,12 +732,8 @@ impl IoWorker {
                         .await;
                     }
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullRead { path } => {
-                        IoWorker::process_full_read(
-                            path,
-                            item.get_completion().clone(),
-                            &this.sync,
-                        )
-                        .await;
+                        IoWorker::process_full_read(path, item.get_completion().clone(), &sync)
+                            .await;
                     }
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullWrite {
                         path,
@@ -617,7 +743,7 @@ impl IoWorker {
                             path,
                             content,
                             item.get_completion().clone(),
-                            &this.sync,
+                            &sync,
                         )
                         .await;
                     }
@@ -627,7 +753,7 @@ impl IoWorker {
             // Run queued IO callbacks and wake all pending ops, yielding control
             // to allow them to make progress before we loop again.
             if made_progress {
-                this.sync.step_io_callbacks();
+                sync.step_io_callbacks();
                 IoWorker::notify_progress(&wakers);
                 // Let waiting tasks run on their executors.
                 tokio::task::yield_now().await;
@@ -637,7 +763,10 @@ impl IoWorker {
 
     #[allow(clippy::too_many_arguments)]
     async fn process_http(
-        this: &Arc<IoWorker>,
+        sync: &turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>,
+        base_url: Option<&str>,
+        auth_token: Option<&AuthTokenFn>,
+        wakers: &Mutex<Vec<Waker>>,
         client: &Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
         url: Option<&str>,
         method: &str,
@@ -656,7 +785,7 @@ impl IoWorker {
             } else {
                 format!("/{path}")
             };
-            let Some(url) = this.base_url.as_deref().or(url) else {
+            let Some(url) = base_url.or(url) else {
                 completion.poison("remote_url is not available".to_string());
                 return;
             };
@@ -666,12 +795,12 @@ impl IoWorker {
         // Resolve auth token (may fail if a dynamic provider returns an error).
         // Resolved here rather than once at spawn so dynamic providers can rotate
         // the token between requests.
-        let auth_token = match &this.auth_token {
+        let auth_token = match auth_token {
             Some(provider) => match provider().await {
                 Ok(token) => Some(token),
                 Err(err) => {
                     completion.poison(format!("failed to resolve auth token: {err}"));
-                    this.sync.step_io_callbacks();
+                    sync.step_io_callbacks();
                     return;
                 }
             },
@@ -707,7 +836,7 @@ impl IoWorker {
             Ok(r) => r,
             Err(err) => {
                 completion.poison(format!("failed to build request: {err}"));
-                this.sync.step_io_callbacks();
+                sync.step_io_callbacks();
                 return;
             }
         };
@@ -716,7 +845,7 @@ impl IoWorker {
             Ok(r) => r,
             Err(err) => {
                 completion.poison(format!("http request failed: {err}"));
-                this.sync.step_io_callbacks();
+                sync.step_io_callbacks();
                 return;
             }
         };
@@ -724,8 +853,8 @@ impl IoWorker {
         // Propagate status
         let status = response.status().as_u16();
         completion.status(status as u32);
-        this.sync.step_io_callbacks();
-        IoWorker::notify_progress(&this.wakers);
+        sync.step_io_callbacks();
+        IoWorker::notify_progress(wakers);
 
         // Stream response body in chunks
         while let Some(frame_res) = response.body_mut().frame().await {
@@ -733,14 +862,14 @@ impl IoWorker {
                 Ok(frame) => {
                     if let Some(chunk) = frame.data_ref() {
                         completion.push_buffer(chunk.clone());
-                        this.sync.step_io_callbacks();
-                        IoWorker::notify_progress(&this.wakers);
+                        sync.step_io_callbacks();
+                        IoWorker::notify_progress(wakers);
                     }
                 }
                 Err(err) => {
                     completion.poison(format!("error reading response body: {err}"));
-                    this.sync.step_io_callbacks();
-                    IoWorker::notify_progress(&this.wakers);
+                    sync.step_io_callbacks();
+                    IoWorker::notify_progress(wakers);
                     return;
                 }
             }
@@ -748,14 +877,14 @@ impl IoWorker {
 
         // Done streaming
         completion.done();
-        this.sync.step_io_callbacks();
-        IoWorker::notify_progress(&this.wakers);
+        sync.step_io_callbacks();
+        IoWorker::notify_progress(wakers);
     }
 
     async fn process_full_read(
         path: &str,
         completion: turso_sync_sdk_kit::sync_engine_io::SyncEngineIoCompletion<Bytes>,
-        sync: &Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
+        sync: &turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>,
     ) {
         match tokio::fs::read(path).await {
             Ok(content) => {
@@ -775,7 +904,7 @@ impl IoWorker {
         path: &str,
         content: &Vec<u8>,
         completion: turso_sync_sdk_kit::sync_engine_io::SyncEngineIoCompletion<Bytes>,
-        sync: &Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
+        sync: &turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>,
     ) {
         // Write the whole content in one go (non-chunked)
         match tokio::fs::write(path, content).await {
@@ -819,6 +948,55 @@ mod tests {
             .take(8)
             .map(char::from)
             .collect()
+    }
+
+    #[test]
+    fn experimental_features_string_composition() {
+        use crate::sync::Builder;
+
+        // No features enabled -> no experimental_features string at all.
+        assert_eq!(
+            Builder::new_remote(":memory:").experimental_features_string(),
+            None
+        );
+
+        // A single feature.
+        assert_eq!(
+            Builder::new_remote(":memory:")
+                .experimental_index_method(true)
+                .experimental_features_string()
+                .as_deref(),
+            Some("index_method")
+        );
+
+        // Multiple features are emitted in a stable, comma-separated order
+        // using the exact tokens the core parser understands.
+        assert_eq!(
+            Builder::new_remote(":memory:")
+                .experimental_attach(true)
+                .experimental_custom_types(true)
+                .experimental_index_method(true)
+                .experimental_materialized_views(true)
+                .experimental_vacuum(true)
+                .experimental_generated_columns(true)
+                .experimental_multiprocess_wal(true)
+                .experimental_without_rowid(true)
+                .experimental_features_string()
+                .as_deref(),
+            Some("attach,custom_types,index_method,views,vacuum,generated_columns,multiprocess_wal,without_rowid")
+        );
+    }
+
+    #[test]
+    fn logical_mvcc_pull_is_opt_in() {
+        use crate::sync::Builder;
+
+        assert!(!Builder::new_remote(":memory:").logical_mvcc_pull);
+        assert!(
+            Builder::new_remote(":memory:")
+                .with_logical_mvcc_pull(true)
+                .logical_mvcc_pull
+        );
     }
 
     async fn handle_response(resp: reqwest::Response) -> Result<()> {
@@ -1886,7 +2064,16 @@ mod tests {
                         Err(crate::Error::Busy(_)) => continue,
                         Err(e) => panic!("reader query failed: {e:?}"),
                     };
-                    let all = all_rows(rows).await.unwrap();
+                    let all = match all_rows(rows).await {
+                        Ok(all) => all,
+                        Err(e)
+                            if e.downcast_ref::<crate::Error>()
+                                .is_some_and(|error| matches!(error, crate::Error::Busy(_))) =>
+                        {
+                            continue;
+                        }
+                        Err(e) => panic!("reader query failed: {e:?}"),
+                    };
                     let Value::Integer(n) = all[0][0] else {
                         panic!("unexpected reader value: {:?}", all[0][0]);
                     };
@@ -1914,7 +2101,15 @@ mod tests {
             total += cnt as i64;
 
             applied_total.store(total, Ordering::Release);
-            db.pull().await.unwrap();
+            loop {
+                match db.pull().await {
+                    Ok(_) => break,
+                    Err(e) if super::is_sync_busy_error(&e) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(e) => panic!("pull failed: {e:?}"),
+                }
+            }
 
             let _ = db.checkpoint().await;
 

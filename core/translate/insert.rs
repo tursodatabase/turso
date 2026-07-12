@@ -318,7 +318,7 @@ pub fn translate_insert(
         ensure_sequence_initialized(program, resolver, &btree_table, database_id)?;
     }
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), table.get_name())?;
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(table.get_name()))?;
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
@@ -865,11 +865,15 @@ pub fn translate_insert(
     //
     // Without this, comparisons like `integer_col < '2'` lose their
     // INTEGER affinity and evaluate under type-ordering rules, producing
-    // wrong index entries.
+    // wrong index entries. Collations likewise: a rewritten reference to a
+    // NOCASE column must keep comparing case-insensitively.
     for cm in &insertion.col_mappings {
         resolver
             .register_affinities
             .insert(cm.register, cm.column.affinity());
+        resolver
+            .register_collations
+            .insert(cm.register, cm.column.collation());
     }
     resolver
         .register_affinities
@@ -897,7 +901,7 @@ pub fn translate_insert(
         // Child-side FK check must run before any writes (IdxInsert / Insert).
         // For immediate FKs this emits a direct Halt, so no index entry is written
         // when the parent is missing — matching SQLite's bytecode order.
-        let fk_layout = btree_table.column_layout();
+        let fk_layout = btree_table.column_layout()?;
         emit_fk_child_insert_checks(
             program,
             &btree_table,
@@ -928,6 +932,7 @@ pub fn translate_insert(
     }
 
     resolver.register_affinities.clear();
+    resolver.register_collations.clear();
 
     let mut insert_flags = InsertFlags::new();
 
@@ -1082,7 +1087,7 @@ pub fn translate_insert(
                 insertion.first_col_register(),
                 insertion.record_register(),
                 insertion.key_register(),
-                &ColumnLayout::from_table(&table),
+                &ColumnLayout::from_table(&table)?,
             ))
         } else {
             None
@@ -1111,7 +1116,7 @@ pub fn translate_insert(
             insertion.first_col_register(),
             insertion.key_register(),
             resolver,
-            &btree_table.column_layout(),
+            &btree_table.column_layout()?,
         )?;
         let result: Result<()> = (|| {
             for subquery in returning_subqueries
@@ -1146,7 +1151,7 @@ pub fn translate_insert(
             insertion.key_register(),
             resolver,
             ctx.returning_buffer.as_ref(),
-            &btree_table.column_layout(),
+            &btree_table.column_layout()?,
         )?;
     }
     program.emit_insn(Insn::Goto {
@@ -1794,6 +1799,20 @@ fn emit_notnulls(
                     resolver,
                     NoConstantOptReason::RegisterReuse,
                 )?;
+
+                // The statement-level Affinity insn already ran on the
+                // original (NULL) value, so the substituted default needs the
+                // column affinity applied here or index keys copied from this
+                // register keep the default's literal type (e.g. text '5' for
+                // an INT column) while MakeRecord converts the table row.
+                let affinity = column_mapping.column.affinity();
+                if !ctx.table.is_strict && affinity != Affinity::Blob {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: column_mapping.register,
+                        count: NonZeroUsize::MIN,
+                        affinities: affinity.aff_mask().to_string(),
+                    });
+                }
 
                 program.preassign_label_to_next_insn(skip_label);
             }
@@ -2510,6 +2529,7 @@ fn build_insertion<'a>(
     let layout = table
         .btree()
         .map(|bt| bt.column_layout())
+        .transpose()?
         .unwrap_or(ColumnLayout::Identity {
             column_count: num_cols,
         });
@@ -4319,7 +4339,7 @@ fn emit_custom_type_encode(
         .iter()
         .map(|m| m.column.clone())
         .collect();
-    let layout = ColumnLayout::from_columns(&columns);
+    let layout = ColumnLayout::from_columns(&columns)?;
     crate::translate::expr::emit_custom_type_encode_columns(
         program,
         resolver,

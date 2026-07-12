@@ -1714,7 +1714,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 if let Some(agg_fun) = Self::parse_aggregate_function(&func_name, 0) {
                     Ok(LogicalExpr::AggregateFunction {
                         fun: agg_fun,
-                        args: vec![],
+                        args: std::vec![],
                         distinct: false,
                     })
                 } else if let Ok(Some(func)) =
@@ -2404,6 +2404,7 @@ impl<'a> LogicalPlanBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::vec;
     use crate::schema::{
         BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
     };
@@ -4086,7 +4087,7 @@ mod tests {
     fn test_strip_alias_scalar_function() {
         let expr = LogicalExpr::ScalarFunction {
             fun: "substr".to_string(),
-            args: vec![
+            args: std::vec![
                 LogicalExpr::Column(Column::new("name")),
                 LogicalExpr::Literal(Value::from_i64(1)),
                 LogicalExpr::Literal(Value::from_i64(4)),
@@ -4122,7 +4123,7 @@ mod tests {
         // Test that two expressions match when one has an alias and one doesn't
         let base_expr = LogicalExpr::ScalarFunction {
             fun: "substr".to_string(),
-            args: vec![
+            args: std::vec![
                 LogicalExpr::Column(Column::new("orderdate")),
                 LogicalExpr::Literal(Value::from_i64(1)),
                 LogicalExpr::Literal(Value::from_i64(4)),
@@ -4157,7 +4158,7 @@ mod tests {
     fn test_strip_alias_aggregate_function() {
         let expr = LogicalExpr::AggregateFunction {
             fun: AggFunc::Sum,
-            args: vec![LogicalExpr::Column(Column::new("amount"))],
+            args: std::vec![LogicalExpr::Column(Column::new("amount"))],
             distinct: false,
         };
         let stripped = strip_alias(&expr);
@@ -4170,7 +4171,7 @@ mod tests {
         let expr1 = LogicalExpr::Column(Column::new("a"));
         let expr2 = LogicalExpr::ScalarFunction {
             fun: "substr".to_string(),
-            args: vec![
+            args: std::vec![
                 LogicalExpr::Column(Column::new("b")),
                 LogicalExpr::Literal(Value::from_i64(1)),
                 LogicalExpr::Literal(Value::from_i64(4)),

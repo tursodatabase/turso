@@ -1,3 +1,4 @@
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZero;
 
 #[derive(Clone, Debug)]
@@ -25,6 +26,16 @@ impl Parameter {
 pub struct Parameters {
     next_index: NonZero<usize>,
     pub list: Vec<Parameter>,
+    /// Every index currently present in `list`. Keeps membership checks
+    /// (`has_index`) O(1) instead of scanning `list`, which otherwise makes
+    /// preparing a statement with N parameters O(N^2) (e.g. a large multi-row
+    /// `INSERT ... VALUES` with bound parameters).
+    present: HashSet<NonZero<usize>>,
+    /// Named-parameter name -> index, for O(1) name dedup/lookup.
+    name_to_index: HashMap<String, NonZero<usize>>,
+    /// Index -> name for indices whose slot is a `Named` parameter. Lets us
+    /// distinguish `Named` from `Indexed` slots (and recover the name) in O(1).
+    index_to_name: HashMap<NonZero<usize>, String>,
 }
 
 impl Default for Parameters {
@@ -38,6 +49,9 @@ impl Parameters {
         Self {
             next_index: 1.try_into().unwrap(),
             list: vec![],
+            present: HashSet::default(),
+            name_to_index: HashMap::default(),
+            index_to_name: HashMap::default(),
         }
     }
 
@@ -50,31 +64,25 @@ impl Parameters {
     }
 
     pub fn has_index(&self, index: NonZero<usize>) -> bool {
-        self.list.iter().any(|p| p.index() == index)
+        self.present.contains(&index)
     }
 
     pub fn is_indexed(&self, index: NonZero<usize>) -> bool {
-        self.list
-            .iter()
-            .any(|p| matches!(p, Parameter::Indexed(i) if *i == index))
+        self.present.contains(&index) && !self.index_to_name.contains_key(&index)
     }
 
     pub fn name(&self, index: NonZero<usize>) -> Option<String> {
-        self.list.iter().find_map(|p| match p {
-            Parameter::Indexed(i) if *i == index => Some(format!("?{i}")),
-            Parameter::Named(name, i) if *i == index => Some(name.to_owned()),
-            _ => None,
-        })
+        if let Some(name) = self.index_to_name.get(&index) {
+            Some(name.clone())
+        } else if self.present.contains(&index) {
+            Some(format!("?{index}"))
+        } else {
+            None
+        }
     }
 
     pub fn index(&self, name: impl AsRef<str>) -> Option<NonZero<usize>> {
-        self.list
-            .iter()
-            .find_map(|p| match p {
-                Parameter::Named(n, index) if n == name.as_ref() => Some(index),
-                _ => None,
-            })
-            .copied()
+        self.name_to_index.get(name.as_ref()).copied()
     }
 
     pub fn next_index(&self) -> NonZero<usize> {
@@ -91,7 +99,7 @@ impl Parameters {
         if index >= self.next_index {
             self.next_index = index.checked_add(1).unwrap();
         }
-        if !self.has_index(index) {
+        if self.present.insert(index) {
             self.list.push(Parameter::Indexed(index));
         }
         tracing::trace!("indexed parameter at {index}");
@@ -108,11 +116,9 @@ impl Parameters {
             self.next_index = index.checked_add(1).unwrap();
         }
 
-        if let Some(Parameter::Named(existing_name, _)) = self
-            .list
-            .iter_mut()
-            .find(|parameter| parameter.index() == index)
-        {
+        // A `Named` slot already exists at this index: keep it (matching the
+        // first name encountered), as the original list-scan did.
+        if let Some(existing_name) = self.index_to_name.get(&index) {
             if existing_name != &name {
                 tracing::trace!(
                     "named parameter alias at {index} as {name}; keeping existing name {existing_name}"
@@ -121,34 +127,32 @@ impl Parameters {
             return index;
         }
 
-        if self.has_index(index) {
+        // An `Indexed` slot occupies this index: replace it with the named one.
+        if self.present.contains(&index) {
             self.list.retain(|parameter| parameter.index() != index);
         }
 
         tracing::trace!("named parameter at {index} as {name}");
+        self.present.insert(index);
+        self.name_to_index.entry(name.clone()).or_insert(index);
+        self.index_to_name.insert(index, name.clone());
         self.list.push(Parameter::Named(name, index));
         index
     }
 
     pub fn push(&mut self, name: impl AsRef<str>) -> NonZero<usize> {
         match name.as_ref() {
-            name if name.starts_with(['$', ':', '@', '#']) => {
-                match self
-                    .list
-                    .iter()
-                    .find(|p| matches!(p, Parameter::Named(n, _) if name == n))
-                {
-                    Some(t) => {
-                        let index = t.index();
-                        tracing::trace!("named parameter at {index} as {name}");
-                        index
-                    }
-                    None => {
-                        let index = self.allocate_new_index();
-                        self.push_named_at(name, index)
-                    }
+            name if name.starts_with(['$', ':', '@', '#']) => match self.name_to_index.get(name) {
+                Some(index) => {
+                    let index = *index;
+                    tracing::trace!("named parameter at {index} as {name}");
+                    index
                 }
-            }
+                None => {
+                    let index = self.allocate_new_index();
+                    self.push_named_at(name, index)
+                }
+            },
             index => {
                 // SAFETY: Guaranteed from parser that the index is bigger than 0.
                 let index: NonZero<usize> = index.parse().unwrap();
@@ -161,6 +165,7 @@ impl Parameters {
 #[cfg(test)]
 mod tests {
     use super::Parameters;
+    use std::num::NonZero;
 
     #[test]
     fn count_and_name_are_stable_with_reused_parameters() {
@@ -200,6 +205,74 @@ mod tests {
 
         assert!(parameters.is_indexed(idx1));
         assert!(!parameters.is_indexed(idx2));
+    }
+
+    #[test]
+    fn many_distinct_named_params_lookup_round_trips() {
+        // Exercises the O(1) name<->index maps with many distinct names,
+        // the case that was previously O(n^2) via a linear list scan.
+        let mut parameters = Parameters::new();
+        let n = 1000usize;
+        for i in 0..n {
+            let idx = parameters.push(format!(":p{i}"));
+            // Distinct names get consecutive indices in encounter order.
+            assert_eq!(idx.get(), i + 1);
+        }
+        assert_eq!(parameters.count(), n);
+        for i in 0..n {
+            let expected: NonZero<usize> = (i + 1).try_into().unwrap();
+            assert_eq!(parameters.index(format!(":p{i}")), Some(expected));
+            assert_eq!(
+                parameters.name(expected).as_deref(),
+                Some(format!(":p{i}").as_str())
+            );
+            assert!(parameters.has_index(expected));
+            assert!(!parameters.is_indexed(expected));
+        }
+        assert_eq!(parameters.list.len(), n, "no duplicate slots");
+    }
+
+    #[test]
+    fn reused_named_param_returns_same_index() {
+        let mut parameters = Parameters::new();
+        let a1 = parameters.push(":a");
+        let b = parameters.push(":b");
+        let a2 = parameters.push(":a");
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+        assert_eq!(parameters.count(), 2);
+        assert_eq!(parameters.list.len(), 2);
+    }
+
+    #[test]
+    fn push_named_at_replaces_existing_indexed_slot() {
+        // push_index then push_named_at at the same index: the slot becomes Named.
+        let mut parameters = Parameters::new();
+        let idx: NonZero<usize> = 1.try_into().unwrap();
+        parameters.push_index(idx);
+        assert!(parameters.is_indexed(idx));
+        parameters.push_named_at(":x", idx);
+        assert!(parameters.has_index(idx));
+        assert!(!parameters.is_indexed(idx));
+        assert_eq!(parameters.name(idx).as_deref(), Some(":x"));
+        assert_eq!(parameters.index(":x"), Some(idx));
+        assert_eq!(
+            parameters.list.len(),
+            1,
+            "indexed slot replaced, not duplicated"
+        );
+    }
+
+    #[test]
+    fn repeated_indexed_param_dedups_to_single_slot() {
+        let mut parameters = Parameters::new();
+        let idx: NonZero<usize> = 5.try_into().unwrap();
+        for _ in 0..100 {
+            assert_eq!(parameters.push_index(idx), idx);
+        }
+        assert_eq!(parameters.list.len(), 1);
+        assert_eq!(parameters.count(), 5);
+        assert!(parameters.has_index(idx));
     }
 
     #[test]

@@ -1234,6 +1234,90 @@ expect {
     c
 }
 
+# array_length(arr, dim) honors the dimension argument. PostgreSQL contract:
+# dim=1 is the outermost length, dim=2 is the next level, etc.
+test array-length-2d-dim {
+    CREATE TABLE md_dim (id INTEGER PRIMARY KEY, matrix INTEGER[][]) STRICT;
+    INSERT INTO md_dim VALUES (1, ARRAY[ARRAY[1,2,3], ARRAY[4,5,6]]);
+    SELECT array_length(matrix, 1) FROM md_dim WHERE id = 1;
+    SELECT array_length(matrix, 2) FROM md_dim WHERE id = 1;
+}
+expect {
+    2
+    3
+}
+
+# 3-D array_length: each dimension reports the count at that depth.
+test array-length-3d-dim {
+    CREATE TABLE md_3d (id INTEGER PRIMARY KEY, cube INTEGER[][][]) STRICT;
+    INSERT INTO md_3d VALUES (1, ARRAY[ARRAY[ARRAY[1,2], ARRAY[3,4]], ARRAY[ARRAY[5,6], ARRAY[7,8]]]);
+    SELECT array_length(cube, 1) FROM md_3d WHERE id = 1;
+    SELECT array_length(cube, 2) FROM md_3d WHERE id = 1;
+    SELECT array_length(cube, 3) FROM md_3d WHERE id = 1;
+}
+expect {
+    2
+    2
+    2
+}
+
+# array_length(arr) without a dim defaults to dim=1, matching PG.
+test array-length-default-dim {
+    CREATE TABLE md_def (id INTEGER PRIMARY KEY, matrix INTEGER[][]) STRICT;
+    INSERT INTO md_def VALUES (1, ARRAY[ARRAY[1,2,3], ARRAY[4,5,6]]);
+    SELECT array_length(matrix) FROM md_def WHERE id = 1;
+    SELECT array_length(matrix, 1) FROM md_def WHERE id = 1;
+}
+expect {
+    2
+    2
+}
+
+# Dimension beyond the actual depth → NULL.
+test array-length-dim-out-of-range {
+    SELECT array_length(ARRAY[ARRAY[1,2], ARRAY[3,4]], 3) IS NULL;
+    SELECT array_length(ARRAY[1,2,3], 2) IS NULL;
+}
+expect {
+    1
+    1
+}
+
+# Invalid dim (zero, negative) → NULL.
+test array-length-invalid-dim {
+    SELECT array_length(ARRAY[1,2,3], 0) IS NULL;
+    SELECT array_length(ARRAY[1,2,3], -1) IS NULL;
+}
+expect {
+    1
+    1
+}
+
+# array_upper(arr, dim) is the PostgreSQL spelling. Turso arrays are
+# always 1-indexed, so the upper bound equals array_length at that dim.
+test array-upper-matches-array-length {
+    CREATE TABLE md_up (id INTEGER PRIMARY KEY, matrix INTEGER[][]) STRICT;
+    INSERT INTO md_up VALUES (1, ARRAY[ARRAY[1,2,3], ARRAY[4,5,6]]);
+    SELECT array_upper(matrix, 1) FROM md_up WHERE id = 1;
+    SELECT array_upper(matrix, 2) FROM md_up WHERE id = 1;
+    SELECT array_upper(ARRAY[10,20,30], 1);
+}
+expect {
+    2
+    3
+    3
+}
+
+# array_upper out-of-range / invalid dim behaves the same as array_length.
+test array-upper-out-of-range {
+    SELECT array_upper(ARRAY[1,2,3], 2) IS NULL;
+    SELECT array_upper(ARRAY[1,2,3], 0) IS NULL;
+}
+expect {
+    1
+    1
+}
+
 test array-compare-equal {
     SELECT ARRAY[1,2,3] = ARRAY[1,2,3];
 }

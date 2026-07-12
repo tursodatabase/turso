@@ -545,7 +545,7 @@ pub(crate) fn vacuum_target_build_step(
                         for (name, td) in &config.source_custom_types {
                             target_schema.type_registry.insert(name.clone(), td.clone());
                         }
-                    });
+                    })?;
                 }
 
                 // Auto-vacuum must be installed before MVCC bootstrap creates
@@ -644,7 +644,7 @@ pub(crate) fn vacuum_target_build_step(
                         state.phase = VacuumTargetBuildPhase::PrepareCreateTable { idx: 0 };
                         continue;
                     }
-                    crate::StepResult::IO => {
+                    crate::StepResult::IO | crate::StepResult::Yield => {
                         let io = schema_stmt
                             .take_io_completions()
                             .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
@@ -705,7 +705,7 @@ pub(crate) fn vacuum_target_build_step(
                     state.phase = VacuumTargetBuildPhase::PrepareCreateTable { idx: idx + 1 };
                     continue;
                 }
-                crate::StepResult::IO => {
+                crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_schema_stmt
                         .take_io_completions()
                         .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
@@ -839,7 +839,7 @@ pub(crate) fn vacuum_target_build_step(
                     };
                     continue;
                 }
-                crate::StepResult::IO => {
+                crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = select_stmt
                         .take_io_completions()
                         .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
@@ -872,7 +872,7 @@ pub(crate) fn vacuum_target_build_step(
                     };
                     continue;
                 }
-                crate::StepResult::IO => {
+                crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_insert_stmt
                         .take_io_completions()
                         .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
@@ -921,7 +921,7 @@ pub(crate) fn vacuum_target_build_step(
                     state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: idx + 1 };
                     continue;
                 }
-                crate::StepResult::IO => {
+                crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_schema_stmt
                         .take_io_completions()
                         .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
@@ -965,7 +965,7 @@ pub(crate) fn vacuum_target_build_step(
                     state.phase = VacuumTargetBuildPhase::PreparePostData { idx: idx + 1 };
                     continue;
                 }
-                crate::StepResult::IO => {
+                crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_schema_stmt
                         .take_io_completions()
                         .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
@@ -1554,12 +1554,7 @@ struct VacuumCommittedImageMeta {
 }
 
 fn replace_shared_schema_after_vacuum(source_db: &Database, schema: Arc<Schema>) {
-    source_db
-        .with_schema_mut(|current| {
-            *current = schema.as_ref().clone();
-            Ok(())
-        })
-        .expect("VACUUM shared schema replacement should be infallible");
+    source_db.replace_schema(schema);
 }
 
 fn install_mvcc_state_after_vacuum_commit(
@@ -2731,7 +2726,7 @@ mod tests {
 
         conn.with_schema_mut(|schema| {
             schema.schema_version = 1;
-        });
+        })?;
         db.with_schema_mut(|schema| {
             schema.schema_version = 1;
             Ok(())
@@ -2767,7 +2762,7 @@ mod tests {
 
         conn.with_schema_mut(|schema| {
             schema.schema_version = 1;
-        });
+        })?;
         db.with_schema_mut(|schema| {
             schema.schema_version = 1;
             Ok(())
@@ -2897,8 +2892,7 @@ mod tests {
 
         let before = io.counts();
         assert_eq!(
-            before.db,
-            0,
+            before.db, 0,
             "target build with synchronous=OFF must not sync the destination db file before finalization"
         );
 

@@ -3,16 +3,22 @@ package turso
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -353,6 +359,64 @@ func TestSyncBootstrap(t *testing.T) {
 		values = append(values, value)
 	}
 	require.Equal(t, values, []string{"hello", "turso", "sync-go"})
+}
+
+// TestSyncRollbackReadTxnAfterCommit reproduces https://github.com/tursodatabase/turso/issues/7677
+// through the sync SDK, using the reporter's setup verbatim: a purely local sync database
+// (no remote server, BootstrapIfEmpty=false). The sync engine enables change-data-capture on
+// every connection, so with CDC v2 a committed transaction emits a CDC commit record. For an
+// empty/read-only transaction that record used to be written without establishing a write
+// transaction, leaking a dirty page that the commit path never cleared; a subsequent
+// read-only transaction that rolled back then panicked in the pager with "dirty pages should
+// be empty for read txn".
+func TestSyncRollbackReadTxnAfterCommit(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	bootstrapIfEmpty := false
+	sdb, err := NewTursoSyncDb(ctx, TursoSyncDbConfig{
+		Path:             path.Join(dir, "shared.db"),
+		BootstrapIfEmpty: &bootstrapIfEmpty,
+	})
+	require.Nil(t, err)
+	db, err := sdb.Connect(ctx)
+	require.Nil(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	// Single connection so the committed and rolled-back transactions share a pager.
+	db.SetMaxOpenConns(1)
+
+	_, err = db.ExecContext(ctx, "CREATE TABLE lists (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)")
+	require.Nil(t, err)
+	_, err = db.ExecContext(ctx, "INSERT INTO lists VALUES (1, 3)")
+	require.Nil(t, err)
+
+	// lookup runs a read-only transaction: it commits when the row exists and rolls back
+	// (mirroring the reporter's `function`) when it does not.
+	lookup := func(id int) (version int, found bool) {
+		tx, err := db.BeginTx(ctx, nil)
+		require.Nil(t, err)
+		err = tx.QueryRowContext(ctx, "SELECT version FROM lists WHERE id = ?", id).Scan(&version)
+		if errors.Is(err, sql.ErrNoRows) {
+			require.Nil(t, tx.Rollback()) // used to panic in the pager
+			return 0, false
+		}
+		require.Nil(t, err)
+		require.Nil(t, tx.Commit())
+		return version, true
+	}
+
+	// First lookup finds the row and commits.
+	version, found := lookup(1)
+	require.True(t, found)
+	require.Equal(t, 3, version)
+
+	// Second lookup finds nothing and rolls back the read-only transaction.
+	_, found = lookup(999)
+	require.False(t, found)
+
+	// The connection is still usable afterwards.
+	_, err = db.ExecContext(ctx, "INSERT INTO lists VALUES (2, 5)")
+	require.Nil(t, err)
 }
 
 func TestSyncConfigPersistence(t *testing.T) {
@@ -755,4 +819,80 @@ func TestSyncLargeSchema(t *testing.T) {
 	require.Nil(t, rows.Scan(&count))
 	require.Equal(t, count, numTables)
 	rows.Close()
+}
+
+// newCountingProxy starts a transparent reverse proxy in front of upstream that
+// counts every POST request whose path ends with pathSuffix. It is used to
+// observe how the sync engine splits its HTTP traffic into batches.
+func newCountingProxy(t *testing.T, upstream, pathSuffix string, counter *atomic.Int64) *httptest.Server {
+	t.Helper()
+	target, err := url.Parse(upstream)
+	require.Nil(t, err)
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	director := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		director(req)
+		// preserve the host the upstream expects (matters for cloud subdomains,
+		// harmless for the local sync server)
+		req.Host = target.Host
+	}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, pathSuffix) {
+			counter.Add(1)
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+}
+
+// TestSyncPullBytesThreshold verifies that the PullBytesThreshold setting is
+// propagated to the sync engine: when set, the bootstrap download is split into
+// multiple /pull-updates HTTP requests instead of a single round-trip.
+func TestSyncPullBytesThreshold(t *testing.T) {
+	server, err := NewTursoServer()
+	require.Nil(t, err)
+	t.Cleanup(func() { server.Close() })
+
+	// Seed a remote with enough data to span many 4KB pages.
+	_, err = server.DbSql("CREATE TABLE big(x INTEGER PRIMARY KEY, y BLOB)")
+	require.Nil(t, err)
+	_, err = server.DbSql("INSERT INTO big SELECT value, randomblob(1024) FROM generate_series(1, 50)")
+	require.Nil(t, err)
+
+	// bootstrap fetches the seeded db into a fresh in-memory client through a
+	// counting proxy and returns how many /pull-updates requests it issued.
+	bootstrap := func(threshold int) int64 {
+		var pullUpdates atomic.Int64
+		proxy := newCountingProxy(t, server.DbUrl, "/pull-updates", &pullUpdates)
+		defer proxy.Close()
+
+		db, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
+			Path:               ":memory:",
+			ClientName:         "turso-sync-go",
+			RemoteUrl:          proxy.URL,
+			PullBytesThreshold: threshold,
+		})
+		require.Nil(t, err)
+
+		// bootstrapped data must be intact regardless of chunking
+		conn, err := db.Connect(context.Background())
+		require.Nil(t, err)
+		rows, err := conn.QueryContext(context.Background(), "SELECT COUNT(*) FROM big")
+		require.Nil(t, err)
+		var count int
+		require.True(t, rows.Next())
+		require.Nil(t, rows.Scan(&count))
+		require.Equal(t, 50, count)
+		rows.Close()
+		conn.Close()
+
+		return pullUpdates.Load()
+	}
+
+	// Default bootstrap is a single round-trip; an 8KB threshold (2 pages per
+	// chunk) over a multi-page db must split into strictly more requests. If the
+	// setting were not propagated both runs would issue the same count.
+	withoutThreshold := bootstrap(0)
+	withThreshold := bootstrap(8192)
+	require.Greater(t, withThreshold, withoutThreshold)
+	require.Greater(t, withThreshold, int64(1))
 }

@@ -74,6 +74,7 @@ fn setup_rusqlite(temp_dir: &TempDir, query: &str) -> rusqlite::Connection {
     sqlite_conn
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_open(criterion: &mut Criterion) {
     // https://github.com/tursodatabase/turso/issues/174
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
@@ -116,6 +117,7 @@ fn bench_open(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_alter(criterion: &mut Criterion) {
     // https://github.com/tursodatabase/turso/issues/174
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
@@ -316,6 +318,7 @@ fn bench_alter(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_prepare_query(criterion: &mut Criterion) {
     // https://github.com/tursodatabase/turso/issues/174
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
@@ -398,6 +401,7 @@ fn bench_prepare_query(criterion: &mut Criterion) {
     }
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_execute_select_rows(criterion: &mut Criterion) {
     // https://github.com/tursodatabase/turso/issues/174
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
@@ -425,7 +429,7 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
                             turso_core::StepResult::Row => {
                                 black_box(stmt.row());
                             }
-                            turso_core::StepResult::IO => {
+                            turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                                 db.io.step().unwrap();
                             }
                             turso_core::StepResult::Done => {
@@ -466,6 +470,7 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_execute_select_1(criterion: &mut Criterion) {
     // https://github.com/tursodatabase/turso/issues/174
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
@@ -486,7 +491,7 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
                     turso_core::StepResult::Row => {
                         black_box(stmt.row());
                     }
-                    turso_core::StepResult::IO => {
+                    turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                         db.io.step().unwrap();
                     }
                     turso_core::StepResult::Done => {
@@ -518,6 +523,7 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_execute_select_count(criterion: &mut Criterion) {
     // https://github.com/tursodatabase/turso/issues/174
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
@@ -538,7 +544,7 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
                     turso_core::StepResult::Row => {
                         black_box(stmt.row());
                     }
-                    turso_core::StepResult::IO => {
+                    turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                         db.io.step().unwrap();
                     }
                     turso_core::StepResult::Done => {
@@ -570,6 +576,7 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_insert_rows(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
@@ -599,7 +606,7 @@ fn bench_insert_rows(criterion: &mut Criterion) {
 
         loop {
             match stmt.step().unwrap() {
-                turso_core::StepResult::IO => {
+                turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                     db.io.step().unwrap();
                 }
                 turso_core::StepResult::Done => {
@@ -626,7 +633,7 @@ fn bench_insert_rows(criterion: &mut Criterion) {
             b.iter(|| {
                 loop {
                     match stmt.step().unwrap() {
-                        turso_core::StepResult::IO => {
+                        turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                             db.io.step().unwrap();
                         }
                         turso_core::StepResult::Done => {
@@ -666,7 +673,7 @@ fn bench_insert_rows(criterion: &mut Criterion) {
             .unwrap();
         loop {
             match stmt.step().unwrap() {
-                turso_core::StepResult::IO => {
+                turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                     mvcc_db.io.step().unwrap();
                 }
                 turso_core::StepResult::Done => {
@@ -693,7 +700,7 @@ fn bench_insert_rows(criterion: &mut Criterion) {
             b.iter(|| {
                 loop {
                     match stmt.step().unwrap() {
-                        turso_core::StepResult::IO => {
+                        turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                             mvcc_db.io.step().unwrap();
                         }
                         turso_core::StepResult::Done => {
@@ -831,7 +838,7 @@ fn bench_limbo(
                 StepResult::Done => {
                     conn.current_statement = None;
                 }
-                StepResult::IO => {
+                StepResult::IO | StepResult::Yield => {
                     // let's skip doing I/O here, we want to perform io only after all the statements are stepped
                 }
                 StepResult::Busy => {
@@ -987,6 +994,7 @@ fn generate_batch_insert(start: i64, num: usize) -> String {
     inserts
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_concurrent_writes(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("Concurrent writes");
 
@@ -1042,6 +1050,7 @@ fn bench_concurrent_writes(criterion: &mut Criterion) {
     });
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_insert_randomblob(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
@@ -1062,7 +1071,7 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
 
         loop {
             match stmt.step().unwrap() {
-                turso_core::StepResult::IO => {
+                turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                     db.io.step().unwrap();
                 }
                 turso_core::StepResult::Done => {
@@ -1086,7 +1095,7 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
             b.iter(|| {
                 loop {
                     match stmt.step().unwrap() {
-                        turso_core::StepResult::IO => {
+                        turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                             db.io.step().unwrap();
                         }
                         turso_core::StepResult::Done => {

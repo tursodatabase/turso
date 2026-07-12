@@ -1001,9 +1001,15 @@ enum CommitState {
     PrepareFrames { db_size: u32 },
     /// All frames prepared, writes are in flight
     WaitWrites,
-    /// Writes are complete, wait for WAL sync to complete
+    /// Wait for the WAL fsync that makes the commit durable. Every commit
+    /// converges here once its writes (if any) have completed. The fsync is
+    /// submitted here, and skipped when the WAL is not dirty (no frames
+    /// appended since the last successful fsync) or sync_mode is not FULL.
+    /// Commits that prepared frames continue to WalCommitDone to publish
+    /// them; otherwise the commit finishes here, since frames written through
+    /// `write_frame_raw` published themselves when they were appended.
     WaitSync,
-    /// Wait for WAL sync to complete and finalize the WAL commit.
+    /// Finalize the WAL commit by publishing the prepared frames.
     /// After this state, the write transaction is durable.
     /// If autocheckpoint is enabled and the autocheckpoint threshold is reached, checkpoint will be attempted.
     WalCommitDone,
@@ -1220,13 +1226,22 @@ pub enum SavepointResult {
     NotFound,
 }
 
+/// A connection's WAL position (max frame, running frame checksum, and the
+/// WAL generation they belong to), captured as one unit for savepoint
+/// rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SavepointWalPos {
+    max_frame: u64,
+    checksum: (u32, u32),
+    checkpoint_seq: u32,
+}
+
 #[derive(Debug, Clone)]
 struct SavepointSnapshot {
     kind: SavepointKind,
     start_offset: u64,
     db_size: u32,
-    wal_max_frame: u64,
-    wal_checksum: (u32, u32),
+    wal_pos: Option<SavepointWalPos>,
     deferred_fk_violations: isize,
 }
 
@@ -1242,11 +1257,12 @@ struct Savepoint {
     /// If the database grows during the savepoint and a rollback to the savepoint is performed,
     /// the pages exceeding the database size at the start of the savepoint will be ignored.
     db_size: AtomicU32,
-    /// We might want to rollback.
-    /// WAL max frame at the start of the savepoint.
-    wal_max_frame: AtomicU64,
-    /// WAL checksum at the start of the savepoint.
-    wal_checksum: RwLock<(u32, u32)>,
+    /// WAL position to rewind to on `ROLLBACK TO`. Captured only under the
+    /// write lock: eagerly if the savepoint is opened inside a write
+    /// transaction, otherwise at write upgrade. `None` while the
+    /// transaction has never held the write lock (no frames to rewind), or
+    /// when the pager has no WAL.
+    wal_pos: RwLock<Option<SavepointWalPos>>,
     /// Deferred FK counter value at the start of this savepoint.
     deferred_fk_violations: AtomicIsize,
 }
@@ -1256,8 +1272,7 @@ impl Savepoint {
         kind: SavepointKind,
         subjournal_offset: u64,
         db_size: u32,
-        wal_max_frame: u64,
-        wal_checksum: (u32, u32),
+        wal_pos: Option<SavepointWalPos>,
         deferred_fk_violations: isize,
     ) -> Self {
         Self {
@@ -1266,8 +1281,7 @@ impl Savepoint {
             write_offset: AtomicU64::new(subjournal_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
             db_size: AtomicU32::new(db_size),
-            wal_max_frame: AtomicU64::new(wal_max_frame),
-            wal_checksum: RwLock::new(wal_checksum),
+            wal_pos: RwLock::new(wal_pos),
             deferred_fk_violations: AtomicIsize::new(deferred_fk_violations),
         }
     }
@@ -1297,8 +1311,7 @@ impl Savepoint {
             kind: self.kind.clone(),
             start_offset: self.start_offset(),
             db_size: self.db_size.load(Ordering::Acquire),
-            wal_max_frame: self.wal_max_frame.load(Ordering::Acquire),
-            wal_checksum: *self.wal_checksum.read(),
+            wal_pos: *self.wal_pos.read(),
             deferred_fk_violations: self.deferred_fk_violations.load(Ordering::Acquire),
         }
     }
@@ -1310,8 +1323,7 @@ impl Savepoint {
             write_offset: AtomicU64::new(snapshot.start_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
             db_size: AtomicU32::new(snapshot.db_size),
-            wal_max_frame: AtomicU64::new(snapshot.wal_max_frame),
-            wal_checksum: RwLock::new(snapshot.wal_checksum),
+            wal_pos: RwLock::new(snapshot.wal_pos),
             deferred_fk_violations: AtomicIsize::new(snapshot.deferred_fk_violations),
         }
     }
@@ -2152,28 +2164,47 @@ impl Pager {
             .last()
             .map(|savepoint| savepoint.write_offset())
             .unwrap_or(0);
-        let (wal_max_frame, wal_checksum) = if let Some(wal) = &self.wal {
-            (wal.get_max_frame(), wal.get_last_checksum())
-        } else {
-            (0, (0, 0))
-        };
+        let wal_pos = self
+            .wal
+            .as_ref()
+            .filter(|wal| wal.holds_write_lock())
+            .map(|wal| SavepointWalPos {
+                max_frame: wal.get_max_frame(),
+                checksum: wal.get_last_checksum(),
+                checkpoint_seq: wal.get_checkpoint_seq(),
+            });
         let savepoint = Savepoint::new(
             kind,
             subjournal_offset,
             db_size,
-            wal_max_frame,
-            wal_checksum,
+            wal_pos,
             deferred_fk_violations,
         );
         self.savepoints.write().push(savepoint);
         Ok(())
     }
 
+    #[aristo::intent(
+        "Rolling back to a savepoint rewinds the database shape and the page bytes to \
+         one consistent snapshot, split at the savepoint's database size. Each page at \
+         or below that size that was modified during the savepoint is restored from its \
+         pre-savepoint image, kept dirty, and re-inserted into the cache. Pages left \
+         untouched during the savepoint keep their existing content. Every page beyond \
+         that size is removed from both the dirty set and the cache. No page reachable \
+         by the restored header page count or by a restored btree pointer is left as an \
+         unwritten zero slot. Restoring the pre-images and discarding the beyond-boundary \
+         pages must happen together; dropping either half leaves a live page pointing at \
+         zeroed bytes, which the next read rejects as an invalid page type.",
+        verify = "neural",
+        id = "savepoint_rollback_shape_and_bytes_consistent"
+    )]
     fn rollback_to_snapshot(
         &self,
         savepoint: &SavepointSnapshot,
         journal_end_offset: u64,
     ) -> Result<()> {
+        self.reset_internal_states();
+
         let subjournal = self.subjournal.read();
         let Some(subjournal) = subjournal.as_ref() else {
             return Ok(());
@@ -2245,14 +2276,17 @@ impl Pager {
             cache.truncate(db_size as usize)?;
         }
 
-        if let Some(wal) = &self.wal {
+        // No WAL position: the transaction never upgraded to a write
+        // transaction, so there are no frames to rewind.
+        if let (Some(wal), Some(wal_pos)) = (&self.wal, savepoint.wal_pos) {
             wal.rollback(Some(RollbackTo {
-                frame: savepoint.wal_max_frame,
-                checksum: savepoint.wal_checksum,
+                frame: wal_pos.max_frame,
+                checksum: wal_pos.checksum,
+                checkpoint_seq: wal_pos.checkpoint_seq,
             }));
             self.page_cache
                 .write()
-                .delete_clean_pages_after_wal_frame(savepoint.wal_max_frame)
+                .delete_clean_pages_after_wal_frame(wal_pos.max_frame)
                 .map_err(|e| {
                     LimboError::InternalError(format!(
                         "failed to invalidate rolled-back WAL pages: {e:?}"
@@ -2914,7 +2948,32 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
         };
-        Ok(IOResult::Done(wal.begin_write_tx(allowed_auto_actions)?))
+        wal.begin_write_tx(allowed_auto_actions)?;
+        // Must run after the upgrade (and any log restart it performed) so
+        // the positions belong to the current WAL generation.
+        self.materialize_savepoint_wal_positions();
+        Ok(IOResult::Done(()))
+    }
+
+    /// Fill in the WAL position of savepoints opened before this write
+    /// transaction, mirroring SQLite's `sqlite3PagerOpenSavepoint` at
+    /// write-transaction begin. Idempotent: only fills unmaterialized
+    /// positions, so upgrade retry loops (Busy/BusySnapshot) are safe.
+    fn materialize_savepoint_wal_positions(&self) {
+        let Some(wal) = self.wal.as_ref() else {
+            return;
+        };
+        let pos = SavepointWalPos {
+            max_frame: wal.get_max_frame(),
+            checksum: wal.get_last_checksum(),
+            checkpoint_seq: wal.get_checkpoint_seq(),
+        };
+        for savepoint in self.savepoints.read().iter() {
+            let mut wal_pos = savepoint.wal_pos.write();
+            if wal_pos.is_none() {
+                *wal_pos = Some(pos);
+            }
+        }
     }
 
     /// Acquire exclusive WAL access + block new transactions (used by VACUUM).
@@ -2963,7 +3022,7 @@ impl Pager {
             if update_transaction_state {
                 connection.set_tx_state(TransactionState::None);
             }
-            self.commit_dirty_pages_end();
+            self.commit_wal_end();
         };
 
         loop {
@@ -2994,7 +3053,7 @@ impl Pager {
                     return Ok(IOResult::Done(()));
                 }
                 _ => {
-                    return_if_io!(self.commit_dirty_pages(
+                    return_if_io!(self.commit_wal(
                         connection.wal_auto_actions(),
                         connection.get_sync_mode(),
                         connection.get_data_sync_retry(),
@@ -3109,8 +3168,6 @@ impl Pager {
             // Clear dirty pages and page cache before releasing the write lock
             self.clear_page_cache(true);
             self.dirty_pages.write().clear();
-            // saveAllCursors at sqlite3BtreeRollback (btree.c:4485).
-            self.invalidate_all_cursors();
             self.reset_internal_states();
             self.set_schema_cookie(None);
             wal.rollback(None);
@@ -3158,6 +3215,7 @@ impl Pager {
             return Ok((page, c));
         }
 
+        page.set_locked();
         let c =
             self.begin_read_disk_page(page_idx as usize, page.clone(), allow_empty_read, &io_ctx)?;
         Ok((page, c))
@@ -3203,11 +3261,26 @@ impl Pager {
                         "attempted to read page but got different page",
                         { "expected_page": page_idx, "actual_page": page.get().id }
                     );
+                    if !page.is_loaded() {
+                        // The page is cache-resident but its read is still in
+                        // flight: `read_page` publishes a page into the shared
+                        // cache (via `cache_insert` below) *before* its disk
+                        // read completes, and `PageCache::get` deliberately
+                        // hands out locked-but-unloaded in-flight pages. We have
+                        // no completion to surface on this path (the disk-read
+                        // completion was consumed by the original caller and the
+                        // `pending_reads` entry has already been removed), so
+                        // returning `Done((page, None))` would hand the caller a
+                        // locked, unloaded page with nothing to wait on: a torn
+                        // / uninitialized read, or a concurrent writer filling
+                        // the buffer underneath the reader.
+                        io_yield_one!(crate::Completion::new_yield());
+                    }
                     return Ok(IOResult::Done((page, None)));
                 }
             }
 
-            tracing::debug!("read_page_nonblock(page_idx = {page_idx}) = reading page from disk");
+            tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
             let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
             self.pending_reads.write().insert(
                 page_idx,
@@ -3252,6 +3325,10 @@ impl Pager {
 
     /// Insert a page into the cache, with spilling support.
     /// This handles cache full conditions by spilling dirty pages and retrying.
+    /// The cache capacity is a soft limit: if nothing can be spilled or
+    /// evicted, the page is admitted over capacity rather than failing the
+    /// read (mirroring SQLite, where `cache_size` may be exceeded while all
+    /// pages are in use); later inserts drain the excess.
     fn cache_insert(&self, page_idx: usize, page: PageRef) -> Result<IOResult<()>> {
         {
             let mut page_cache = self.page_cache.write();
@@ -3269,16 +3346,15 @@ impl Pager {
         }
 
         match self.try_spill_dirty_pages()? {
-            IOResult::Done(true) => {
+            IOResult::Done(()) => {
                 let mut page_cache = self.page_cache.write();
                 let page_key = PageCacheKey::new(page_idx);
-                match page_cache.insert(page_key, page) {
+                match page_cache.force_insert_page(page_key, page) {
                     Ok(_) => Ok(IOResult::Done(())),
                     Err(CacheError::KeyExists) => Ok(IOResult::Done(())),
                     Err(e) => Err(e.into()),
                 }
             }
-            IOResult::Done(false) => Err(LimboError::Busy),
             IOResult::IO(c) => Ok(IOResult::IO(c)),
         }
     }
@@ -3343,8 +3419,12 @@ impl Pager {
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id as u32);
         // Notify cache before marking dirty (page was evictable, now it won't be)
-        // Only notify if page wasn't already dirty
-        if !page.is_dirty() {
+        // Only notify if page wasn't already dirty, or if it was spilled
+        // State before set_dirty():
+        // - clean page: evictable -> set_dirty() makes it dirty and unevictable
+        // - dirty + spilled page: evictable -> set_dirty() clears spilled and makes it unevictable
+        // - dirty + not spilled page: already unevictable -> no cache accounting change
+        if !page.is_dirty() || page.is_spilled() {
             let key = PageCacheKey::new(page.get().id);
             self.page_cache.write().notify_page_dirty(key);
         }
@@ -3366,8 +3446,8 @@ impl Pager {
     }
 
     /// Flush all dirty pages to disk (async/re-entrant).
-    /// Unlike commit_dirty_pages, this function does not commit, checkpoint nor sync the WAL/Database.
-    #[instrument(skip_all, level = Level::INFO)]
+    /// Unlike commit_wal, this function does not commit, checkpoint nor sync the WAL/Database.
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn cacheflush(&self) -> Result<IOResult<Vec<Completion>>> {
         let wal = self
             .wal
@@ -3641,7 +3721,7 @@ impl Pager {
     /// then mark them as spilled so they can be evicted even while dirty.
     /// For ephemeral tables: writes pages directly to the temp database file.
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn try_spill_dirty_pages(&self) -> Result<IOResult<bool>> {
+    fn try_spill_dirty_pages(&self) -> Result<IOResult<()>> {
         loop {
             let state = self.spill_state.read().clone();
             match state {
@@ -3653,17 +3733,17 @@ impl Pager {
                     };
                     match spill_result {
                         SpillResult::NotNeeded | SpillResult::Disabled => {
-                            return Ok(IOResult::Done(false));
+                            return Ok(IOResult::Done(()));
                         }
                         SpillResult::CacheFull => {
                             tracing::debug!(
                                 "try_spill_dirty_pages: cache full, no spillable pages"
                             );
-                            return Ok(IOResult::Done(false));
+                            return Ok(IOResult::Done(()));
                         }
                         SpillResult::PagesToSpill(pages) => {
                             if pages.is_empty() {
-                                return Ok(IOResult::Done(false));
+                                return Ok(IOResult::Done(()));
                             }
                             let page_count = pages.len();
                             tracing::debug!("try_spill_dirty_pages: spilling {} pages", page_count);
@@ -3699,7 +3779,7 @@ impl Pager {
                                 let completions = self.spill_pages_to_disk(&pages)?;
                                 if completions.is_empty() {
                                     self.finish_ephemeral_spill(&pages);
-                                    return Ok(IOResult::Done(true));
+                                    return Ok(IOResult::Done(()));
                                 }
                                 for completion in &completions {
                                     group.add(completion);
@@ -3773,7 +3853,7 @@ impl Pager {
                         spilled_count,
                         pages.len(),
                     );
-                    return Ok(IOResult::Done(true));
+                    return Ok(IOResult::Done(()));
                 }
                 SpillState::WritingToDisk { pages, completions } => {
                     let all_done = completions.iter().all(|c| c.succeeded());
@@ -3791,18 +3871,18 @@ impl Pager {
                         "try_spill_dirty_pages: successfully spilled {} pages to disk",
                         pages.len()
                     );
-                    return Ok(IOResult::Done(true));
+                    return Ok(IOResult::Done(()));
                 }
             }
         }
     }
 
-    /// Append the prepared spill `pages` as WAL frames. Returns
-    /// `Done(true)` if the write completed synchronously, otherwise
-    /// transitions to `SpillState::WritingToWal` and yields the write
-    /// completion. The WAL must already be initialized (callers route
-    /// through `PreparingWal*` first).
-    fn spill_append_frames_to_wal(&self, pages: Vec<PinGuard>) -> Result<IOResult<bool>> {
+    /// Append the prepared spill `pages` as WAL frames. Returns `Done` if
+    /// the write completed synchronously, otherwise transitions to
+    /// `SpillState::WritingToWal` and yields the write completion. The WAL
+    /// must already be initialized (callers route through `PreparingWal*`
+    /// first).
+    fn spill_append_frames_to_wal(&self, pages: Vec<PinGuard>) -> Result<IOResult<()>> {
         let wal = self
             .wal
             .as_ref()
@@ -3833,7 +3913,7 @@ impl Pager {
                 }
             }
             *self.spill_state.write() = SpillState::Idle;
-            return Ok(IOResult::Done(true));
+            return Ok(IOResult::Done(()));
         }
         *self.spill_state.write() = SpillState::WritingToWal {
             pages,
@@ -3851,7 +3931,7 @@ impl Pager {
                 return Ok(IOResult::Done(()));
             }
             match self.try_spill_dirty_pages()? {
-                IOResult::Done(_) => continue,
+                IOResult::Done(()) => continue,
                 IOResult::IO(c) => return Ok(IOResult::IO(c)),
             }
         }
@@ -3888,7 +3968,7 @@ impl Pager {
 
     /// Check if the cache needs spilling and attempt to spill if necessary.
     /// This should be called before inserting new pages into the cache.
-    pub fn ensure_cache_space(&self) -> Result<IOResult<()>> {
+    fn ensure_cache_space(&self) -> Result<IOResult<()>> {
         let needs_spill = {
             let cache = self.page_cache.read();
             cache.needs_spill()
@@ -3896,18 +3976,11 @@ impl Pager {
 
         if needs_spill {
             match self.try_spill_dirty_pages()? {
-                IOResult::Done(spilled) => {
-                    if spilled {
-                        // After spilling, try to evict clean pages to make room in the cache
-                        let mut cache = self.page_cache.write();
-                        if let Err(e) = cache.make_room_for(1, false) {
-                            // Cache is completely full with unevictable pages
-                            tracing::error!(
-                                "ensure_cache_space: {e} cache full, could not make room"
-                            );
-                            return Err(LimboError::CacheError(CacheError::Full));
-                        }
-                    }
+                IOResult::Done(()) => {
+                    // Whether or not anything could be spilled, proceed: the
+                    // capacity is a soft limit, and the upcoming insert
+                    // evicts what it can and admits the page over capacity
+                    // otherwise.
                 }
                 IOResult::IO(completion) => {
                     return Ok(IOResult::IO(completion));
@@ -3917,8 +3990,11 @@ impl Pager {
         Ok(IOResult::Done(()))
     }
 
-    /// Flush all dirty pages to disk.
-    /// In the base case, it will write the dirty pages to the WAL and then fsync the WAL.
+    /// Commit the write transaction to the WAL: write any dirty pages as WAL
+    /// frames, fsync the WAL if it is dirty, and publish the commit. The WAL
+    /// can be dirty without any dirty pages (frames inserted through
+    /// `write_frame_raw` bypass dirty-page tracking), so under
+    /// synchronous=FULL this fsyncs even when there is nothing to write.
     /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
     /// the database file and then fsync the database file.
     ///
@@ -3927,7 +4003,7 @@ impl Pager {
     /// gates the post-commit auto-checkpoint when `should_checkpoint()` is
     /// true.
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn commit_dirty_pages(
+    pub fn commit_wal(
         &self,
         allowed_auto_actions: WalAutoActions,
         sync_mode: SyncMode,
@@ -3945,29 +4021,29 @@ impl Pager {
             return Ok(IOResult::IO(c));
         }
 
-        let result =
-            self.commit_dirty_pages_inner(allowed_auto_actions, sync_mode, data_sync_retry);
+        let result = self.commit_wal_inner(allowed_auto_actions, sync_mode, data_sync_retry);
         if result.is_err() {
             self.commit_info.write().reset();
         }
         result
     }
 
-    pub fn commit_dirty_pages_end(&self) {
+    pub fn commit_wal_end(&self) {
         self.commit_info.write().reset();
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn commit_dirty_pages_inner(
+    #[aristo::intent("A commit frame must reach stable storage via fsync before the transaction is reported as durable\n", id = "aristos:wal_commit_requires_fsync", verify = "full", parent = "wal_protocol_correctness")]
+    fn commit_wal_inner(
         &self,
         allowed_auto_actions: WalAutoActions,
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<()>> {
         let Some(wal) = self.wal.as_ref() else {
-            turso_soft_unreachable!("commit_dirty_pages() called without WAL");
+            turso_soft_unreachable!("commit_wal() called without WAL");
             return Err(LimboError::InternalError(
-                "commit_dirty_pages() called without WAL".into(),
+                "commit_wal() called without WAL".into(),
             ));
         };
 
@@ -4006,7 +4082,14 @@ impl Pager {
                     let dirty_pages = self.dirty_pages.read();
 
                     if dirty_pages.is_empty() {
-                        return Ok(IOResult::Done(()));
+                        // No dirty pages to flush, but that does not mean the
+                        // WAL is clean: frames written through
+                        // write_frame_raw() bypass dirty-page tracking, and
+                        // callers (e.g. the sync engine ending a raw-insert
+                        // session) treat this commit as their durability
+                        // barrier. WaitSync fsyncs if the WAL is dirty.
+                        commit_info.state = CommitState::WaitSync;
+                        continue;
                     }
                     commit_info.initialize(dirty_pages.len() as usize);
                     let mut cache = self.page_cache.write();
@@ -4108,6 +4191,11 @@ impl Pager {
                                 page.get().id
                             )));
                         }
+                        turso_assert!(
+                            page.get().overflow_cells.is_empty(),
+                            "dirty page still has overflow cells at commit time",
+                            { "page_id": page.get().id }
+                        );
                         commit_info.page_source_cursor += 1;
                         commit_info.collected_pages.push(page);
 
@@ -4170,16 +4258,9 @@ impl Pager {
                     }
                     commit_info.completions.clear();
                     commit_info.completion_group = None;
-                    // Writes done, submit fsync if needed.
-                    // NORMAL mode skips fsync on WAL commit (but still fsyncs on checkpoint and wal restart).
-                    if sync_mode == SyncMode::Full {
-                        let sync_c = wal.sync(self.get_sync_type())?;
-                        // Reuse the existing Vec instead of allocating a new one
-                        commit_info.completions.push(sync_c);
-                        commit_info.state = CommitState::WaitSync;
-                    } else {
-                        commit_info.state = CommitState::WalCommitDone;
-                    }
+                    // All writes complete; WaitSync submits the WAL fsync if
+                    // one is owed.
+                    commit_info.state = CommitState::WaitSync;
                 }
                 // To protect against partial writes, we MUST ensure that all write Completions
                 // finish before submitting the fsync. It is possible that a partial write will
@@ -4189,29 +4270,60 @@ impl Pager {
                 // to ensure durability in the case of partial writes is to ensure the pwritev
                 // completes before the fsync is submitted.
                 CommitState::WaitSync => {
-                    let sync_c = self.commit_info.read().completions[0].clone();
-                    // Wait for fsync to complete
-                    if !sync_c.finished() {
-                        io_yield_one!(sync_c);
-                    }
-                    // Check for fsync error as we might need to panic on data_sync_retry=off
-                    let mut commit_info = self.commit_info.write();
-                    if !sync_c.succeeded() {
-                        commit_info.completions.clear();
-                        commit_info.prepared_frames.clear();
-
-                        if !data_sync_retry {
-                            panic!(
-                                "fsync error (data_sync_retry=off): {:?}",
-                                sync_c.get_error()
-                            );
+                    // A pending completion means a previous entry into this
+                    // state already submitted the fsync; wait on it instead
+                    // of submitting a second one. At most one fsync is ever in
+                    // flight, so completions holds either the pending fsync or
+                    // nothing.
+                    assert!(
+                        self.commit_info.read().completions.len() <= 1,
+                        "WaitSync expects at most one in-flight fsync completion"
+                    );
+                    let pending = self.commit_info.read().completions.first().cloned();
+                    let sync_c = match pending {
+                        Some(c) => Some(c),
+                        // Skip the fsync when the WAL is not dirty (no frames
+                        // appended since the last successful fsync).
+                        // NORMAL mode skips fsync on WAL commit (but still
+                        // fsyncs on checkpoint and wal restart).
+                        None if sync_mode == SyncMode::Full && wal.is_dirty() => {
+                            let sync_c = wal.sync(self.get_sync_type())?;
+                            self.commit_info.write().completions.push(sync_c.clone());
+                            Some(sync_c)
                         }
-                        return Err(LimboError::CompletionError(CompletionError::IOError(
-                            std::io::ErrorKind::Other,
-                            "sync",
-                        )));
+                        None => None,
+                    };
+                    if let Some(sync_c) = sync_c {
+                        // Wait for fsync to complete
+                        if !sync_c.finished() {
+                            io_yield_one!(sync_c);
+                        }
+                        // Check for fsync error as we might need to panic on data_sync_retry=off
+                        let mut commit_info = self.commit_info.write();
+                        if !sync_c.succeeded() {
+                            commit_info.completions.clear();
+                            commit_info.prepared_frames.clear();
+
+                            if !data_sync_retry {
+                                panic!(
+                                    "fsync error (data_sync_retry=off): {:?}",
+                                    sync_c.get_error()
+                                );
+                            }
+                            return Err(LimboError::CompletionError(CompletionError::IOError(
+                                std::io::ErrorKind::Other,
+                                "sync",
+                            )));
+                        }
+                        commit_info.completions.clear();
                     }
-                    commit_info.completions.clear();
+                    let mut commit_info = self.commit_info.write();
+                    if commit_info.prepared_frames.is_empty() {
+                        // Nothing to publish: the frames this fsync covered
+                        // published themselves via finish_append_frames_commit()
+                        // when they were appended.
+                        return Ok(IOResult::Done(()));
+                    }
                     commit_info.state = CommitState::WalCommitDone;
                 }
                 CommitState::WalCommitDone => {
@@ -4446,6 +4558,7 @@ impl Pager {
         )
     }
 
+    #[aristo::intent("The nbackfills counter advances after frames are durable, so recovery never replays already-checkpointed frames\n", id = "aristos:wal_nbackfills_orders_with_recovery", verify = "full", parent = "wal_protocol_correctness")]
     fn checkpoint_inner(
         &self,
         mode: CheckpointMode,
@@ -4686,6 +4799,36 @@ impl Pager {
                     clear_page_cache,
                     max_frame,
                 } => {
+                    {
+                        let state = self.checkpoint_state.read();
+                        let result = state.result.as_ref().expect("result should be set");
+                        turso_assert!(
+                            result.wal_checkpoint_backfilled > 0,
+                            "PublishBackfill phase requires frames backfilled during checkpoint",
+                            {
+                                "publish_backfill": max_frame,
+                                "wal_max_frame": result.wal_max_frame,
+                                "wal_total_backfilled": result.wal_total_backfilled,
+                                "wal_checkpoint_backfilled": result.wal_checkpoint_backfilled
+                            }
+                        );
+                        turso_assert!(
+                            max_frame == result.wal_total_backfilled,
+                            "PublishBackfill target must match checkpoint result",
+                            {
+                                "publish_backfill": max_frame,
+                                "wal_total_backfilled": result.wal_total_backfilled
+                            }
+                        );
+                        turso_assert!(
+                            result.wal_total_backfilled <= result.wal_max_frame,
+                            "checkpoint result cannot backfill beyond WAL max frame",
+                            {
+                                "wal_total_backfilled": result.wal_total_backfilled,
+                                "wal_max_frame": result.wal_max_frame
+                            }
+                        );
+                    }
                     wal.publish_backfill(max_frame);
                     let next_phase = {
                         let state = self.checkpoint_state.read();
@@ -4736,6 +4879,7 @@ impl Pager {
 
                     // Clear page cache only if requested (explicit checkpoints do this, auto-checkpoint does not)
                     if clear_page_cache {
+                        self.invalidate_all_cursors();
                         self.page_cache.write().clear(false).map_err(|e| {
                             res.release_guard();
                             LimboError::InternalError(format!("Failed to clear page cache: {e:?}"))
@@ -4784,6 +4928,7 @@ impl Pager {
     /// of a rollback or in case we want to invalidate page cache after starting a read transaction
     /// right after new writes happened which would invalidate current page cache.
     pub fn clear_page_cache(&self, clear_dirty: bool) {
+        self.invalidate_all_cursors();
         let dirty_pages = self.dirty_pages.write();
         let mut cache = self.page_cache.write();
         for page_id in dirty_pages.iter() {
@@ -4876,7 +5021,7 @@ impl Pager {
         // Number of reserved slots in trunk header (next pointer + leaf count)
         const RESERVED_SLOTS: usize = 2;
 
-        let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
+        let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
 
         let mut state = self.free_page_state.write();
@@ -4890,16 +5035,20 @@ impl Pager {
                         )));
                     }
 
-                    // The non-blocking read fork here is safe: if the caller
-                    // passes `Some(page)`, no IO occurs and the mutations
-                    // below run synchronously. If the caller passes `None`
-                    // and `read_page_nonblock` yields for spill, we leave
-                    // `state` at `Start` so re-entry re-takes either branch
-                    // (the pager's `pending_reads` memoization returns the
-                    // same `PageRef` the next time). Crucially, the
-                    // non-idempotent mutations (`freelist_pages` increment,
-                    // `page.pin()`, state advance) all happen AFTER both
-                    // branches converge.
+                    // The first yield point is the `HeaderRefMut::from_pager`
+                    // acquisition above the loop, not this read fork: if it
+                    // yields for the page-1 read, re-entry re-runs that prefix
+                    // (it is idempotent — the pager cache returns the same
+                    // header page) before reaching `Start` again, where `state`
+                    // is still `Start`. The read fork below is likewise safe:
+                    // if the caller passes `Some(page)`, no IO occurs and the
+                    // mutations below run synchronously. If the caller passes
+                    // `None` and `read_page` yields for spill, we leave `state`
+                    // at `Start` so re-entry re-takes either branch (the
+                    // pager's `pending_reads` memoization returns the same
+                    // `PageRef` the next time). Crucially, the non-idempotent
+                    // mutations (`freelist_pages` increment, `page.pin()`,
+                    // state advance) all happen AFTER both branches converge.
                     let (page, c) = match page.take() {
                         Some(page) => {
                             turso_assert_eq!(
@@ -4908,14 +5057,11 @@ impl Pager {
                                 "free_page page id mismatch",
                                 { "expected": page_id, "actual": page.get().id }
                             );
-                            if page.is_loaded() {
-                                let page_contents = page.get_contents();
-                                page_contents.overflow_cells.clear();
-                            }
                             (page, None)
                         }
                         None => return_if_io!(self.read_page(page_id as i64)),
                     };
+                    page.get().overflow_cells.clear();
                     header.freelist_pages = (header.freelist_pages.get() + 1).into();
 
                     let trunk_page_id = header.freelist_trunk_page.get();
@@ -5105,7 +5251,7 @@ impl Pager {
         // Ensure cache has room before allocating (we may spill dirty pages first)
         return_if_io!(self.ensure_cache_space());
 
-        let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
+        let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
 
         loop {
@@ -5147,8 +5293,7 @@ impl Pager {
                             if !already_present {
                                 let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
                                 self.add_dirty(&page)?;
-                                let mut cache = self.page_cache.write();
-                                cache.insert(page_key, page)?;
+                                self.page_cache.write().force_insert_page(page_key, page)?;
                             }
                         }
                     }
@@ -5311,10 +5456,9 @@ impl Pager {
                             allocate_new_page(new_db_size as i64, &self.buffer_pool);
                         self.add_dirty(&richard_hipp_special_page)?;
                         let page_key = PageCacheKey::new(richard_hipp_special_page.get().id);
-                        {
-                            let mut cache = self.page_cache.write();
-                            cache.insert(page_key, richard_hipp_special_page).unwrap();
-                        }
+                        self.page_cache
+                            .write()
+                            .force_insert_page(page_key, richard_hipp_special_page)?;
                         // HIPP special page is assumed to zeroed and should never be read or written to by the BTREE
                         new_db_size += 1;
                     }
@@ -5334,11 +5478,9 @@ impl Pager {
                         self.add_dirty(&page)?;
 
                         let page_key = PageCacheKey::new(page.get().id as usize);
-                        {
-                            // Run in separate block to avoid deadlock on page cache write lock
-                            let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page.clone())?;
-                        }
+                        self.page_cache
+                            .write()
+                            .force_insert_page(page_key, page.clone())?;
                         header.database_size = new_db_size.into();
                         *state = AllocatePageState::Start;
                         return Ok(IOResult::Done(page));
@@ -5361,11 +5503,15 @@ impl Pager {
         if dirty_page_must_exist {
             turso_assert!(page.is_dirty(), "page must be dirty for upsert", { "page_id": id });
         }
-        cache.upsert_page(page_key, page.clone()).map_err(|e| {
-            LimboError::InternalError(format!(
-                "Failed to insert loaded page {id} into cache: {e:?}"
-            ))
-        })?;
+        // The page carries writes that must stay cache-resident, so admit it
+        // over capacity when nothing is evictable.
+        cache
+            .force_upsert_page(page_key, page.clone())
+            .map_err(|e| {
+                LimboError::InternalError(format!(
+                    "Failed to insert loaded page {id} into cache: {e:?}"
+                ))
+            })?;
         page.set_loaded();
         page.clear_wal_tag();
         Ok(())
@@ -5407,8 +5553,6 @@ impl Pager {
             // since we only need to clear the dirty pages that were modified by the write transaction.
             self.clear_page_cache(clear_dirty);
             self.dirty_pages.write().clear();
-            // saveAllCursors at sqlite3BtreeRollback (btree.c:4485).
-            self.invalidate_all_cursors();
         } else {
             turso_assert!(
                 self.dirty_pages.read().is_empty(),
@@ -5429,6 +5573,7 @@ impl Pager {
     }
 
     fn reset_internal_states(&self) {
+        self.pending_reads.write().clear();
         *self.checkpoint_state.write() = CheckpointState::default();
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().reset();
@@ -5779,9 +5924,124 @@ mod tests {
 
     use crate::sync::RwLock;
 
+    use crate::io::{MemoryIO, OpenFlags, IO};
+    use crate::storage::buffer_pool::BufferPool;
+    use crate::storage::database::DatabaseFile;
     use crate::storage::page_cache::{PageCache, PageCacheKey};
+    use crate::storage::wal::{Wal, WalFile, WalFileShared};
+    use crate::util::IOExt;
+    use arc_swap::ArcSwapOption;
 
-    use super::Page;
+    use super::{default_page1, Page, PageRef, Pager};
+
+    fn pager_with_cache_capacity(cache_capacity: usize, database_pages: u32) -> Arc<Pager> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = BufferPool::begin_init(&io, 4096 * 128);
+
+        let db_file = Arc::new(DatabaseFile::new(
+            io.open_file(":memory:", OpenFlags::Create, false).unwrap(),
+        ));
+
+        let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
+        let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
+        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
+        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
+            io.clone(),
+            wal_shared,
+            last_checksum_and_max_frame,
+            buffer_pool.clone(),
+        ));
+
+        let init_page_1 = Arc::new(ArcSwapOption::new(Some(default_page1(None))));
+        let pager = Arc::new(
+            Pager::new(
+                db_file,
+                Some(wal),
+                io,
+                PageCache::new(cache_capacity),
+                buffer_pool,
+                Arc::new(crate::sync::Mutex::new(())),
+                init_page_1,
+            )
+            .unwrap(),
+        );
+
+        pager.io.step().unwrap();
+        pager.io.block(|| pager.allocate_page1()).unwrap();
+        for _ in 0..(database_pages - 1) {
+            pager.io.block(|| pager.allocate_page()).unwrap();
+        }
+        pager
+    }
+
+    /// The page cache capacity is a soft limit, as in SQLite: when every
+    /// resident page is unevictable (held by cursors, dirty and unspillable),
+    /// a read must still succeed by admitting the page over capacity instead
+    /// of failing with Busy. The excess drains once pages become evictable.
+    #[test]
+    fn read_page_exceeds_capacity_when_cache_unevictable() {
+        const CAP: usize = 5;
+        let pager = pager_with_cache_capacity(CAP, 6);
+
+        // Allocating 6 pages against a 5-page cache forces a spill and evicts
+        // at least one spilled page; find one that is no longer resident.
+        let missing = (2..=6)
+            .find(|&id| !pager.page_cache.read().contains_key(&PageCacheKey::new(id)))
+            .expect("allocating 6 pages with a 5-page cache must evict at least one page")
+            as i64;
+
+        // Hold strong references to every resident page so none can be
+        // evicted or spilled.
+        let held: Vec<PageRef> = (1..=6)
+            .filter_map(|id| pager.cache_get(id).unwrap())
+            .collect();
+        assert_eq!(held.len(), CAP, "cache should be at capacity");
+
+        let (page, c) = pager.io.block(|| pager.read_page(missing)).unwrap();
+        if let Some(c) = c {
+            pager.io.wait_for_completion(c).unwrap();
+        }
+        while page.is_locked() {
+            pager.io.step().unwrap();
+        }
+        assert_eq!(page.get().id as i64, missing);
+        assert!(
+            pager.page_cache.read().len() > CAP,
+            "page must have been admitted over capacity"
+        );
+
+        // Once the strong references are gone, the next insert drains the
+        // excess back under capacity.
+        drop(held);
+        drop(page);
+        pager.io.block(|| pager.allocate_page()).unwrap();
+        assert!(
+            pager.page_cache.read().len() <= CAP,
+            "excess over capacity must drain once pages become evictable"
+        );
+    }
+
+    /// Same soft-limit guarantee for the write path: allocating a new page
+    /// while the cache is full of unevictable pages must not fail.
+    #[test]
+    fn allocate_page_exceeds_capacity_when_cache_unevictable() {
+        const CAP: usize = 5;
+        let pager = pager_with_cache_capacity(CAP, 5);
+
+        // Hold strong references to all resident pages: dirty pages with
+        // outstanding references can neither be spilled nor evicted.
+        let held: Vec<PageRef> = (1..=5)
+            .filter_map(|id| pager.cache_get(id).unwrap())
+            .collect();
+        assert_eq!(held.len(), CAP, "cache should be at capacity");
+
+        let page = pager.io.block(|| pager.allocate_page()).unwrap();
+        assert_eq!(page.get().id, 6);
+        assert!(
+            pager.page_cache.read().len() > CAP,
+            "page must have been admitted over capacity"
+        );
+    }
 
     #[test]
     fn test_shared_cache() {
@@ -6150,6 +6410,61 @@ mod ptrmap_tests {
             pager.pending_reads.read().get(&target_idx).is_none(),
             "pending_reads entry must be cleared once read_page_nonblock returns Done"
         );
+    }
+
+    /// Concurrency contract: a page can be cache-resident while its disk read
+    /// is still in flight (locked, not loaded) — `read_page` inserts into the
+    /// shared cache before the read completes, and `PageCache::get` hands out
+    /// such in-flight pages. A second reader hitting the cache-hit fast path
+    /// must NOT receive that unloaded page with `None` (no completion to wait
+    /// on); it must yield and re-enter until the read completes. Otherwise the
+    /// caller reads a torn / uninitialized buffer, or races a writer filling
+    /// the buffer underneath it.
+    #[test]
+    fn read_page_nonblock_inflight_cache_hit_yields_not_done() {
+        let pager = test_pager_setup(4096, 10);
+
+        let target_idx: i64 = 9999;
+        assert!(
+            pager.cache_get(target_idx as usize).unwrap().is_none(),
+            "test precondition: target page must not be in cache"
+        );
+
+        // Synthesize an in-flight read that has already been published to the
+        // shared cache: locked (a read is outstanding) but not loaded (the
+        // buffer hasn't been filled yet). This is exactly the state a page is
+        // in between `cache_insert` and the disk-read completion firing.
+        let inflight: PageRef = Arc::new(Page::new(target_idx));
+        inflight.set_locked();
+        assert!(!inflight.is_loaded());
+        pager
+            .page_cache
+            .write()
+            .insert(PageCacheKey::new(target_idx as usize), inflight.clone())
+            .unwrap();
+
+        // The fast path finds the page in cache but must refuse to return it
+        // without a completion, because it is not yet loaded.
+        match pager.read_page(target_idx).unwrap() {
+            IOResult::IO(_) => {}
+            IOResult::Done((page, c)) => panic!(
+                "read_page handed out an in-flight (locked, unloaded) page on the \
+                 cache-hit fast path: loaded={}, completion={}",
+                page.is_loaded(),
+                c.is_some()
+            ),
+        }
+
+        // Once the read completes (page becomes loaded), the same cache-hit
+        // fast path returns Done with no completion, as before.
+        inflight.set_loaded();
+        match pager.read_page(target_idx).unwrap() {
+            IOResult::Done((page, c)) => {
+                assert!(Arc::ptr_eq(&page, &inflight));
+                assert!(c.is_none(), "loaded cache hit must not return a completion");
+            }
+            IOResult::IO(_) => panic!("loaded cache hit must not yield"),
+        }
     }
 }
 

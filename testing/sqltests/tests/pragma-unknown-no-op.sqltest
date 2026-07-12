@@ -1,0 +1,33 @@
+@database :memory:
+
+# Regression test for #7645: unknown PRAGMA names are silently ignored (SQLite behavior).
+test unknown-pragma-recursive-triggers {
+    PRAGMA recursive_triggers=OFF;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test unknown-pragma-reverse-unordered-selects {
+    PRAGMA reverse_unordered_selects=ON;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test unknown-pragma-legacy-alter-table {
+    PRAGMA legacy_alter_table=OFF;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test known-pragma-still-works {
+    PRAGMA foreign_keys;
+}
+expect {
+    0
+}

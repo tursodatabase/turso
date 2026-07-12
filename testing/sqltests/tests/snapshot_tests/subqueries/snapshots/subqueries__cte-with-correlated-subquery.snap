@@ -31,9 +31,9 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode                      p1  p2  p3  p4              p5  comment
-   0            Init               0  77   0                   0  Start at 77
+   0            Init               0  76   0                   0  Start at 76
    1            OpenRead           0   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
-   2            Rewind             0  76   0                   0  Rewind table employees
+   2            Rewind             0  75   0                   0  Rewind table employees
    3              BeginSubrtn      5   0   0                   0  r[5]=NULL
    4              Null             0   1   0                   0  r[1]=NULL
    5              OpenEphemeral    1   0   0                   0  cursor=1 is_table=false
@@ -84,29 +84,28 @@ addr  opcode                      p1  p2  p3  p4              p5  comment
   50        Integer                0  11   0                   0  r[11]=0
   51      Return                  19   0   0                   0
   52      Integer                  1  27   0                   0  r[27]=1; LIMIT counter
-  53      IfNot                   27  65   0                   0  if !r[27] goto 65
+  53      IfNot                   27  64   0                   0  if !r[27] goto 64
   54      Column                   0   3  28                   0  r[28]=employees.department
-  55      IsNull                  28  65   0                   0  if (r[28]==NULL) goto 65
-  56      Affinity                28   1   0                   0  r[28..29] = B
-  57      SeekGE                   1  65  28                   0  key=[28..28]
-  58        IdxGT                  1  65  28                   0  key=[28..28]
-  59        Column                 1   0   6                   0  r[6]=ephemeral(ephemeral_subquery_t6).department
-  60        Column                 1   1   7                   0  r[7]=ephemeral(ephemeral_subquery_t6).avg_salary
-  61        Column                 1   1  26                   0  r[26]=ephemeral(ephemeral_subquery_t6).avg_salary
-  62        Copy                  26   1   0                   0  r[1]=r[26]
-  63        DecrJumpZero          27  65   0                   0  if (--r[27]==0) goto 65
-  64      Next                     1  58   0                   0
-  65    Return                     5   0   1                   0
-  66    Column                     0   4  30                   0  r[30]=employees.salary
-  67    RealAffinity              30   0   0                   0
-  68    Copy                       1  31   0                   0  r[31]=r[1]
-  69    Le                        30  31  75  Binary           0  if r[30]<=r[31] goto 75
-  70    Column                     0   1   2                   0  r[2]=employees.name
-  71    Column                     0   3   3                   0  r[3]=employees.department
-  72    Column                     0   4   4                   0  r[4]=employees.salary
-  73    RealAffinity               4   0   0                   0
-  74    ResultRow                  2   3   0                   0  output=r[2..4]
-  75  Next                         0   3   0                   0
-  76  Halt                         0   0   0                   0
-  77  Transaction                  0   1  11                   0  iDb=0 tx_mode=Read
-  78  Goto                         0   1   0                   0
+  55      IsNull                  28  64   0                   0  if (r[28]==NULL) goto 64
+  56      SeekGE                   1  64  28                   0  key=[28..28]
+  57        IdxGT                  1  64  28                   0  key=[28..28]
+  58        Column                 1   0   6                   0  r[6]=ephemeral(ephemeral_subquery_t6).department
+  59        Column                 1   1   7                   0  r[7]=ephemeral(ephemeral_subquery_t6).avg_salary
+  60        Column                 1   1  26                   0  r[26]=ephemeral(ephemeral_subquery_t6).avg_salary
+  61        Copy                  26   1   0                   0  r[1]=r[26]
+  62        DecrJumpZero          27  64   0                   0  if (--r[27]==0) goto 64
+  63      Next                     1  57   0                   0
+  64    Return                     5   0   1                   0
+  65    Column                     0   4  30                   0  r[30]=employees.salary
+  66    RealAffinity              30   0   0                   0
+  67    Copy                       1  31   0                   0  r[31]=r[1]
+  68    Le                        30  31  74  Binary           0  if r[30]<=r[31] goto 74
+  69    Column                     0   1   2                   0  r[2]=employees.name
+  70    Column                     0   3   3                   0  r[3]=employees.department
+  71    Column                     0   4   4                   0  r[4]=employees.salary
+  72    RealAffinity               4   0   0                   0
+  73    ResultRow                  2   3   0                   0  output=r[2..4]
+  74  Next                         0   3   0                   0
+  75  Halt                         0   0   0                   0
+  76  Transaction                  0   1  11                   0  iDb=0 tx_mode=Read
+  77  Goto                         0   1   0                   0

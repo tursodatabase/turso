@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import urllib.error
 
 # for HTTP IO
@@ -260,8 +261,12 @@ def _process_full_write_item(io_item: PyTursoSyncIoItem, req_kind: Any) -> None:
         # ignore directory creation errors, attempt to write anyway
         pass
 
+    # Write to a temp file and rename it over the target so concurrent readers
+    # (e.g. other connections opening the same replica) never observe a
+    # truncated or partially written file.
+    tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
-        with open(path, "wb") as f:
+        with open(tmp_path, "wb") as f:
             # Write in chunks if content is large
             view = memoryview(content)
             offset = 0
@@ -270,8 +275,13 @@ def _process_full_write_item(io_item: PyTursoSyncIoItem, req_kind: Any) -> None:
                 end = min(offset + _HTTP_CHUNK_SIZE, length)
                 f.write(view[offset:end])
                 offset = end
+        os.replace(tmp_path, path)
         io_item.done()
     except Exception as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
         io_item.poison(f"fs write error: {e}")
 
 
@@ -420,6 +430,8 @@ def connect_sync(
     isolation_level: Optional[str] = "DEFERRED",
     remote_encryption_key: Optional[str] = None,
     remote_encryption_cipher: Optional[RemoteEncryptionCipher] = None,
+    push_operations_threshold: Optional[int] = None,
+    pull_bytes_threshold: Optional[int] = None,
 ) -> ConnectionSync:
     """
     Create and open a synchronized database connection.
@@ -434,6 +446,13 @@ def connect_sync(
     - experimental_features, isolation_level: passed to underlying connection
     - remote_encryption_key: base64-encoded encryption key for encrypted Turso Cloud databases
     - remote_encryption_cipher: encryption cipher for the remote database (used to calculate reserved_bytes)
+    - push_operations_threshold: optional cap on the number of CDC operations packed into a single
+      push HTTP batch; push splits on transaction boundaries once the current batch accumulated at
+      least this many operations (a single transaction is never split). None (default) sends the
+      entire change set in one batch
+    - pull_bytes_threshold: optional hint, in bytes, that splits the bootstrap download into multiple
+      pull-updates HTTP requests of >= this many bytes each. None (default) bootstraps in a single
+      round-trip; no-op when partial sync uses the query bootstrap strategy
     """
     # Resolve client name
     cname = client_name or "turso-sync-py"
@@ -476,6 +495,8 @@ def connect_sync(
         else None,
         remote_encryption_key=remote_encryption_key,
         remote_encryption_cipher=remote_encryption_cipher,
+        push_operations_threshold=push_operations_threshold,
+        pull_bytes_threshold=pull_bytes_threshold,
     )
 
     # Create sync database holder

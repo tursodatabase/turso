@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 
@@ -72,10 +72,25 @@ pub struct DbSyncStatus {
     pub max_frame_no: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbChangesStreamKind {
+    LegacyPages,
+    Pages,
+    Logical,
+    ReplaceBasePages,
+}
+
 pub struct DbChangesStatus {
     pub time: turso_core::WallClockInstant,
     pub revision: DatabasePullRevision,
     pub file_slot: Option<MutexSlot<Arc<dyn turso_core::File>>>,
+    pub stream_kind: DbChangesStreamKind,
+}
+
+impl DbChangesStatus {
+    pub fn is_empty(&self) -> bool {
+        self.file_slot.is_none()
+    }
 }
 
 impl std::fmt::Debug for DbChangesStatus {
@@ -84,6 +99,7 @@ impl std::fmt::Debug for DbChangesStatus {
             .field("time", &self.time)
             .field("revision", &self.revision)
             .field("file_slot.is_some()", &self.file_slot.is_some())
+            .field("stream_kind", &self.stream_kind)
             .finish()
     }
 }
@@ -126,7 +142,15 @@ pub struct DatabaseMetadata {
     pub last_push_unix_time: Option<i64>,
     pub last_pushed_pull_gen_hint: i64,
     pub last_pushed_change_id_hint: i64,
+    #[serde(default)]
+    pub last_pushed_replay_floor_change_id_hint: i64,
     pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
+    #[serde(default)]
+    pub fresh_bootstrap_pending_cdc_ack: bool,
+    #[serde(default)]
+    pub logical_mvcc_pull_active: bool,
+    #[serde(default)]
+    pub logical_table_names_by_stable_id: BTreeMap<u64, String>,
     /// optional saved configuration
     /// this will be used by sync engine if some parameters were omitted
     pub saved_configuration: Option<DatabaseSavedConfiguration>,
@@ -189,18 +213,27 @@ impl DatabaseMetadata {
             self.saved_configuration = Some(configuration);
             return true;
         };
+        // Only report a change when a value actually differs: every open calls
+        // this, and a spurious `true` makes every open rewrite the metadata
+        // file, racing with concurrent opens reading it.
         let mut changed = false;
         if let Some(remote_url) = configuration.remote_url {
-            saved_configuration.remote_url = Some(remote_url);
-            changed |= true;
+            if saved_configuration.remote_url.as_ref() != Some(&remote_url) {
+                saved_configuration.remote_url = Some(remote_url);
+                changed = true;
+            }
         }
         if let Some(partial_sync_prefetch) = configuration.partial_sync_prefetch {
-            saved_configuration.partial_sync_prefetch = Some(partial_sync_prefetch);
-            changed |= true;
+            if saved_configuration.partial_sync_prefetch != Some(partial_sync_prefetch) {
+                saved_configuration.partial_sync_prefetch = Some(partial_sync_prefetch);
+                changed = true;
+            }
         }
         if let Some(partial_sync_segment_size) = configuration.partial_sync_segment_size {
-            saved_configuration.partial_sync_segment_size = Some(partial_sync_segment_size);
-            changed |= true;
+            if saved_configuration.partial_sync_segment_size != Some(partial_sync_segment_size) {
+                saved_configuration.partial_sync_segment_size = Some(partial_sync_segment_size);
+                changed = true;
+            }
         }
         changed
     }
@@ -406,8 +439,16 @@ impl DatabaseChange {
         let change_id = get_core_value_i64(row, 0)?;
         let change_time = get_core_value_i64(row, 1)? as u64;
         let change_txn_id = get_core_value_i64_or_null(row, 2)?;
-        let change_type = get_core_value_i64(row, 3)?;
-        let change_type = parse_change_type(change_type)?;
+        let change_type = match get_core_value_i64_or_null(row, 3)? {
+            Some(change_type) => parse_change_type(change_type)?,
+            None if is_null_cdc_v2_commit_payload(row) => DatabaseChangeType::Commit,
+            None => {
+                return Err(Error::DatabaseTapeError(
+                    "column 3 type mismatch: expected integer for non-COMMIT CDC row, got NULL"
+                        .to_string(),
+                ))
+            }
+        };
         // COMMIT records have NULL for table_name and id
         let table_name = get_core_value_text_or_null(row, 4)?.unwrap_or_default();
         let id = get_core_value_i64_or_null(row, 5)?.unwrap_or(0);
@@ -433,6 +474,10 @@ impl DatabaseChange {
             turso_core::CdcVersion::V1 => Self::from_row_v1(row),
         }
     }
+}
+
+fn is_null_cdc_v2_commit_payload(row: &turso_core::Row) -> bool {
+    (4..=8).all(|index| matches!(row.get_value(index), turso_core::Value::Null))
 }
 
 pub struct DatabaseRowMutation {
@@ -461,15 +506,15 @@ pub enum DatabaseRowTransformResult {
 #[derive(Clone)]
 pub enum DatabaseTapeRowChangeType {
     Delete {
-        before: Vec<turso_core::Value>,
+        before: crate::alloc::Vec<turso_core::Value>,
     },
     Update {
-        before: Vec<turso_core::Value>,
-        after: Vec<turso_core::Value>,
-        updates: Option<Vec<turso_core::Value>>,
+        before: crate::alloc::Vec<turso_core::Value>,
+        after: crate::alloc::Vec<turso_core::Value>,
+        updates: Option<crate::alloc::Vec<turso_core::Value>>,
     },
     Insert {
-        after: Vec<turso_core::Value>,
+        after: crate::alloc::Vec<turso_core::Value>,
     },
 }
 
@@ -490,8 +535,36 @@ impl From<&DatabaseTapeRowChangeType> for DatabaseChangeType {
 #[derive(Debug)]
 pub enum DatabaseTapeOperation {
     StmtReplay(DatabaseStatementReplay),
+    SchemaReplay(DatabaseSchemaReplay),
     RowChange(DatabaseTapeRowChange),
     Commit,
+}
+
+#[derive(Debug)]
+pub enum DatabaseSchemaReplay {
+    Create {
+        sql: String,
+    },
+    Drop {
+        kind: DatabaseSchemaKind,
+        name: String,
+    },
+    Refresh {
+        kind: DatabaseSchemaKind,
+        name: String,
+        sql: String,
+    },
+    Alter {
+        sql: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseSchemaKind {
+    Table,
+    Index,
+    Trigger,
+    View,
 }
 
 /// [DatabaseTapeRowChange] is the specific operation over single row which can be performed on database
@@ -582,7 +655,9 @@ pub enum SyncEngineIoResult {
     IO,
 }
 
-pub fn parse_bin_record(bin_record: impl AsRef<[u8]>) -> Result<Vec<turso_core::Value>> {
+pub fn parse_bin_record(
+    bin_record: impl AsRef<[u8]>,
+) -> Result<crate::alloc::Vec<turso_core::Value>> {
     match turso_core::types::ImmutableRecordRef::from_bin_record(bin_record.as_ref())
         .get_values_owned()
     {
@@ -590,5 +665,75 @@ pub fn parse_bin_record(bin_record: impl AsRef<[u8]>) -> Result<Vec<turso_core::
         Err(err) => Err(Error::DatabaseTapeError(format!(
             "unable to parse bin record: {err}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DatabaseMetadata, DatabaseSavedConfiguration};
+
+    #[test]
+    fn update_configuration_reports_change_only_when_values_differ() {
+        let mut meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": null,
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+        let configuration = DatabaseSavedConfiguration {
+            remote_url: Some("http://remote".to_string()),
+            partial_sync_prefetch: Some(true),
+            partial_sync_segment_size: Some(4096),
+        };
+
+        assert!(meta.update_configuration(configuration.clone()));
+        assert_eq!(meta.saved_configuration, Some(configuration.clone()));
+
+        // Re-applying the identical configuration (what every open of an
+        // existing replica does) must not report a change, otherwise every
+        // open rewrites the metadata file.
+        assert!(!meta.update_configuration(configuration.clone()));
+
+        let updated = DatabaseSavedConfiguration {
+            remote_url: Some("http://other-remote".to_string()),
+            ..configuration
+        };
+        assert!(meta.update_configuration(updated.clone()));
+        assert_eq!(meta.saved_configuration, Some(updated));
+    }
+
+    #[test]
+    fn metadata_load_defaults_missing_logical_table_map() {
+        let meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": null,
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(meta.last_pushed_replay_floor_change_id_hint, 0);
+        assert!(!meta.fresh_bootstrap_pending_cdc_ack);
+        assert!(!meta.logical_mvcc_pull_active);
+        assert!(meta.logical_table_names_by_stable_id.is_empty());
     }
 }

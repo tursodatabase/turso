@@ -53,13 +53,80 @@ function toBindArgs(params) {
   return [params];
 }
 
+/**
+ * Locking mode for `Database.batch(stmts, options)`.
+ */
+export type BatchMode = "write" | "read" | "deferred" | "immediate" | "exclusive" | "concurrent" | string;
+
+export interface BatchOptions {
+  mode?: BatchMode;
+  raw?: boolean;
+}
+
+export type BatchRow = Record<string, any> | any[];
 
 /**
- * Locking mode for `Database.batch(stmts, mode)` and the variants of
- * `Database.transaction(...)`. When passed to `batch()`, the statements are
- * wrapped in `BEGIN <mode>` / `COMMIT` (with `ROLLBACK` on failure).
+ * The result of executing a single statement within `batch()`, matching the
+ * libSQL client's `ResultSet` shape.
  */
-export type BatchMode = "deferred" | "immediate" | "exclusive" | "concurrent";
+export interface ResultSet {
+  /** Column names of the result, empty for statements that return no rows. */
+  columns: Array<string>;
+  /** Declared column types, parallel to `columns`. */
+  columnTypes: Array<string>;
+  /** Result rows; empty for non-SELECT statements. */
+  rows: Array<BatchRow>;
+  /** Number of rows changed by the statement (0 for SELECT). */
+  rowsAffected: number;
+}
+
+function normalizeBatchMode(mode: BatchMode): string {
+  switch (String(mode).toLowerCase()) {
+    case "write":
+      return "IMMEDIATE";
+    case "read":
+    case "deferred":
+      return "DEFERRED";
+    case "immediate":
+      return "IMMEDIATE";
+    case "exclusive":
+      return "EXCLUSIVE";
+    case "concurrent":
+      return "CONCURRENT";
+    default:
+      return String(mode).toUpperCase();
+  }
+}
+
+function normalizeBatchOptions(options?: BatchMode | BatchOptions): { mode?: BatchMode; raw: boolean } {
+  if (options != null && typeof options === "object") {
+    return {
+      mode: options.mode,
+      raw: options.raw === true,
+    };
+  }
+  return {
+    mode: options as BatchMode | undefined,
+    raw: false,
+  };
+}
+
+/**
+ * Builds a libSQL-style `ResultSet` for a single statement in a `batch()`.
+ */
+function makeResultSet(
+  columns: string[],
+  columnTypes: string[],
+  rows: any[],
+  rowsAffected: number,
+): ResultSet {
+  return {
+    columns,
+    columnTypes,
+    rows,
+    rowsAffected,
+  };
+}
 
 /**
  * A wrapped transaction function. Calling it runs the wrapped function inside a
@@ -91,7 +158,12 @@ class Database {
 
   private db: NativeDatabase;
   private ioStep: () => Promise<void>;
-  private execLock: AsyncLock;
+  // Serializes native calls on this connection. Subclasses that also drive
+  // the same underlying core database from async worker tasks (the sync
+  // engine on wasm) must hold this lock around those windows too: on
+  // browser wasm the main thread cannot block on a contended core lock, so
+  // main-thread native calls must never overlap an in-flight worker task.
+  protected execLock: AsyncLock;
   protected connected: boolean = false;
 
   constructor(db: NativeDatabase, ioStep?: () => Promise<void>) {
@@ -206,8 +278,9 @@ class Database {
    * @param mode - When set, wraps the batch in `BEGIN <mode>` / `COMMIT`
    *   (with `ROLLBACK` on failure). Ignored when already inside a
    *   transaction.
-   * @returns An object with `rowsAffected` (sum of affected rows) and
-   *   `lastInsertRowid` (rowid of the last successful insert).
+   * @returns An array of `ResultSet`s — one per input statement, in order —
+   *   matching the libsql-js batch contract. Each `ResultSet` carries that
+   *   statement's `columns`, `columnTypes`, `rows`, and `rowsAffected`.
    *
    * @example
    * // Plain SQL strings (non-atomic).
@@ -240,8 +313,8 @@ class Database {
    */
   async batch(
     statements: Array<string | { sql: string; args?: any[] | Record<string, any> }>,
-    mode?: BatchMode,
-  ): Promise<{ rowsAffected: number; lastInsertRowid: number | bigint | undefined }> {
+    options?: BatchMode | BatchOptions,
+  ): Promise<ResultSet[]> {
     if (!Array.isArray(statements)) {
       throw new TypeError("Expected first argument to be an array of statements");
     }
@@ -275,13 +348,13 @@ class Database {
         }
       };
 
-      const wrap = mode !== undefined && !this.db.inTransaction();
+      const { mode, raw } = normalizeBatchOptions(options);
+      const wrap = mode != null && !this.db.inTransaction();
       if (wrap) {
-        await runRawSql(`BEGIN ${mode!.toUpperCase()}`);
+        await runRawSql(`BEGIN ${normalizeBatchMode(mode!)}`);
       }
 
-      let rowsAffected = 0;
-      let lastInsertRowid: number | bigint | undefined;
+      const results: ResultSet[] = [];
       try {
         for (const statement of statements) {
           const sql = typeof statement === "string" ? statement : statement.sql;
@@ -297,8 +370,15 @@ class Database {
             if (args !== undefined) {
               bindParams(nativeStmt, [args]);
             }
+            const cols = nativeStmt.columns();
+            const columnNames = cols.map((c) => c.name);
+            const columnTypes = cols.map((c) => c.type ?? "");
+            if (columnNames.length > 0) {
+              nativeStmt.raw(raw);
+            }
+
             const totalChangesBefore = this.db.totalChanges();
-            const lastInsertRowidBefore = this.db.lastInsertRowid();
+            const rows: any[] = [];
             try {
               while (true) {
                 const stepResult = await nativeStmt.stepSync();
@@ -309,21 +389,14 @@ class Database {
                 if (stepResult === STEP_DONE) {
                   break;
                 }
-                // STEP_ROW results are discarded; batch() does not
-                // surface rows.
+                rows.push(nativeStmt.row());
               }
-              if (this.db.totalChanges() !== totalChangesBefore) {
-                rowsAffected += this.db.changes();
-              }
-              // SQLite keeps last_insert_rowid() sticky across
-              // non-INSERT statements, so just checking the value is
-              // not enough — UPDATE/DELETE would inherit a stale
-              // rowid. Use the delta as the per-statement INSERT
-              // signal.
-              const lastInsertRowidAfter = this.db.lastInsertRowid();
-              if (lastInsertRowidAfter !== lastInsertRowidBefore) {
-                lastInsertRowid = lastInsertRowidAfter;
-              }
+              const rowsAffected = columnNames.length > 0
+                ? 0
+                : this.db.totalChanges() !== totalChangesBefore ? this.db.changes() : 0;
+              results.push(
+                makeResultSet(columnNames, columnTypes, rows, rowsAffected),
+              );
             } finally {
               nativeStmt.reset();
             }
@@ -341,7 +414,7 @@ class Database {
         }
         throw err;
       }
-      return { rowsAffected, lastInsertRowid };
+      return results;
     } finally {
       this.execLock.release();
     }

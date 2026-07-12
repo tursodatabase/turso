@@ -40,25 +40,24 @@ jobs:
           prefix-key: "v1-rust"
           cache-on-failure: true
 
-      - uses: "./.github/shared/setup-sccache"
 
       - name: Build Turso C bindings
         run: cargo build -p turso_sqlite3 --features capi --locked
 
       - name: Run C compat tests from Rust
-        working-directory: sqlite3
+        working-directory: bindings/c
         run: cargo test --locked
 
       - name: Run C compat C tests linking against real SQLite
-        working-directory: sqlite3/tests
+        working-directory: bindings/c/tests
         run: |
           make clean
           make LIBS="-lsqlite3"
           ./sqlite3-tests
 
       - name: Run C compat C tests linking against Turso
-        working-directory: sqlite3/tests
+        working-directory: bindings/c/tests
         run: |
           make clean
-          make LIBS="-L../../target/debug -lturso_sqlite3"
-          LD_LIBRARY_PATH=../../target/debug ./sqlite3-tests
+          make LIBS="-L../../../target/debug -lturso_sqlite3"
+          LD_LIBRARY_PATH=../../../target/debug ./sqlite3-tests

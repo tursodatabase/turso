@@ -112,7 +112,7 @@
 //!
 //! What happens here? If the map implementation frees the memory
 //! belonging to a value when it is
-//! removed, then a user-after-free occurs, resulting in memory corruption.
+//! removed, then a use-after-free occurs, resulting in memory corruption.
 //!
 //! To solve the above, this crate uses the _epoch-based memory reclamation_ mechanism
 //! implemented in [`crossbeam-epoch`]. Simplified, a value removed from the map
@@ -229,22 +229,31 @@
 //! ```
 //!
 //! # Provenance
-//! Vendored from the `crossbeam-skiplist` crate, version 0.1.3
+//! Vendored from the `crossbeam-skiplist` crate, `main` branch at commit
+//! `05f9478b333ead58c0bf8e5a37d9ef9bd3b5bf17`
 //! (<https://github.com/crossbeam-rs/crossbeam>), licensed under MIT OR
 //! Apache-2.0 (see `licenses/core/`). Local modifications are kept minimal;
 //! prefer upstreaming fixes.
+//!
+//! Notable local modifications: node allocation is parameterized over a
+//! [`SkiplistAllocator`] (defaulting to Turso's allocator), and `try_`-prefixed
+//! insert methods surface allocation failure instead of aborting.
 
 #![warn(missing_docs, unsafe_op_in_unsafe_fn)]
 
 pub mod base;
+
 #[doc(inline)]
-pub use base::SkipList;
+pub use base::{SkipList, SkiplistAllocator};
 
 pub mod map;
 pub mod set;
 
 #[doc(inline)]
 pub use self::{map::SkipMap, set::SkipSet};
+
+pub mod comparator;
+pub mod equivalent;
 
 #[cfg(test)]
 mod base_tests;

@@ -490,7 +490,7 @@ pub fn emit_upsert(
         target_pc: ctx.loop_labels.row_done,
     });
     let num_cols = ctx.table.columns().len();
-    let layout = ctx.table.column_layout();
+    let layout = ctx.table.column_layout()?;
 
     let table_ref_id = table_references
         .joined_tables()
@@ -595,6 +595,38 @@ pub fn emit_upsert(
     // For WHERE and SET, use decoded_current_start if available (STRICT with custom types),
     // otherwise fall back to current_start (already decoded or non-custom-type).
     let expr_current_start = decoded_current_start.unwrap_or(current_start);
+
+    // rewrite_expr_to_registers turns column references into bare
+    // Expr::Register nodes, which lose the column's affinity and implicit
+    // collation. Comparisons in the WHERE/SET expressions must still apply
+    // them (`int_col < '2'` compares numerically, a NOCASE column compares
+    // case-insensitively), so record both per register for the conflicting
+    // row image and its rowid. The excluded (insertion) registers are
+    // already recorded by the enclosing INSERT translation, except for the
+    // decoded copies made for STRICT custom-type tables. Cleared wholesale
+    // at the end of the enclosing INSERT translation.
+    for (idx, col) in table.columns().iter().enumerate() {
+        if col.is_rowid_alias() {
+            // The rewrite maps rowid-alias references to conflict_rowid_reg;
+            // the image register for the alias column is never referenced.
+            continue;
+        }
+        let reg = layout.to_register(expr_current_start, idx);
+        resolver.register_affinities.insert(reg, col.affinity());
+        resolver.register_collations.insert(reg, col.collation());
+        if let Some(decoded_start) = excluded_decoded_start {
+            let excluded_reg = layout.to_register(decoded_start, idx);
+            resolver
+                .register_affinities
+                .insert(excluded_reg, col.affinity());
+            resolver
+                .register_collations
+                .insert(excluded_reg, col.collation());
+        }
+    }
+    resolver
+        .register_affinities
+        .insert(ctx.conflict_rowid_reg, Affinity::Integer);
 
     // WHERE on target row
     if let Some(pred) = where_clause.as_mut() {

@@ -1058,14 +1058,14 @@ pub enum Insn {
         cursor_id: CursorID, // P1
         columns: usize,      // P2
         /// Combined order, collation, and nulls ordering per column.
-        order_collations_nulls: Vec<(
+        order_collations_nulls: crate::alloc::Vec<(
             SortOrder,
             Option<CollationSeq>,
             Option<turso_parser::ast::NullsOrder>,
         )>,
         /// Per-column custom type comparators for ORDER BY sorting.
         /// When present, the comparator is used instead of standard value comparison.
-        comparators: Vec<Option<SortComparatorType>>,
+        comparators: crate::alloc::Vec<Option<SortComparatorType>>,
     },
 
     /// Insert a row into the sorter.
@@ -1454,6 +1454,28 @@ pub enum Insn {
     SetSequenceCurrval {
         seq_name_reg: usize,
         value_reg: usize,
+    },
+    /// Publish sequence allocation metadata for sync watermarks after a
+    /// successful sequence RMW commit.
+    SequenceTrackAllocation {
+        db: usize,
+        seq_name_reg: usize,
+        value_reg: usize,
+    },
+    /// Register an in-flight sequence allocation against the *outer*
+    /// transaction *before* the inner-tx RMW commit publishes the new
+    /// boundary. Emitted ahead of `SequenceCommitInnerTx` so the active
+    /// allocation is visible to `sequence_watermark_experimental()` the
+    /// instant another connection can observe (and advance past) this
+    /// value. See `op_sequence_register_allocation` for the race this
+    /// closes.
+    SequenceRegisterAllocation {
+        db: usize,
+        seq_name_reg: usize,
+        value_reg: usize,
+        /// Register holding the encoded saved outer mv_tx (the blob written
+        /// by `SequenceBeginInnerTx`). Empty blob means "no outer tx".
+        saved_outer_reg: usize,
     },
     /// Add a custom type to the in-memory schema by parsing its CREATE TYPE SQL
     AddType {
@@ -2089,6 +2111,8 @@ impl InsnVariants {
             InsnVariants::DropSequence => execute::op_drop_sequence,
             InsnVariants::SequenceComputeNext => execute::op_sequence_compute_next,
             InsnVariants::SetSequenceCurrval => execute::op_set_sequence_currval,
+            InsnVariants::SequenceTrackAllocation => execute::op_sequence_track_allocation,
+            InsnVariants::SequenceRegisterAllocation => execute::op_sequence_register_allocation,
             InsnVariants::SequenceBeginInnerTx => execute::op_sequence_begin_inner_tx,
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
@@ -2208,6 +2232,8 @@ impl Insn {
             | Self::DropSequence { .. }
             | Self::SequenceComputeNext { .. }
             | Self::SetSequenceCurrval { .. }
+            | Self::SequenceTrackAllocation { .. }
+            | Self::SequenceRegisterAllocation { .. }
             | Self::SequenceBeginInnerTx { .. }
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }

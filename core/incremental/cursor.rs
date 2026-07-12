@@ -157,8 +157,10 @@ impl MaterializedViewCursor {
             )));
         }
 
+        // TODO: std boundary conversion; adjust once incremental uses the
+        // allocator with fallible allocations everywhere.
         Ok(IOResult::Done(vec![(
-            HashableRow::new(rowid, btree_values),
+            HashableRow::new(rowid, btree_values.into_iter().collect()),
             weight,
         )]))
     }
@@ -1885,7 +1887,7 @@ mod tests {
                 Ok(IOResult::Done(()))
             }
 
-            fn seek_to_last(&mut self, _always_seek: bool) -> Result<IOResult<()>> {
+            fn seek_to_last(&mut self) -> Result<IOResult<()>> {
                 Ok(IOResult::Done(()))
             }
 

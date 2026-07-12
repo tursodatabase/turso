@@ -219,9 +219,28 @@ export function runner(opts: RunOpts, io: ProtocolIo, engine: any): Runner {
     }
 }
 
-export async function run(runner: Runner, generator: any): Promise<any> {
+export async function run(runner: Runner, generator: any, lock?: AsyncLock): Promise<any> {
+    // When `lock` is provided, hold it while a native call is in flight:
+    // `resumeAsync` and the io loop inside `runner.wait()` execute sync-engine
+    // core work on the napi async worker, and on browser wasm the main thread
+    // panics if one of its own native calls contends on a core lock meanwhile.
+    // Callers pass the connection's exec lock so statement execution and
+    // sync-engine steps interleave without ever overlapping. The lock is
+    // released between steps, so waiting on a long-poll does not starve
+    // main-thread statement execution.
     while (true) {
-        const { type, ...rest }: GeneratorResponse = await generator.resumeAsync(null);
+        if (lock != null) {
+            await lock.acquire();
+        }
+        let response: GeneratorResponse;
+        try {
+            response = await generator.resumeAsync(null);
+        } finally {
+            if (lock != null) {
+                lock.release();
+            }
+        }
+        const { type, ...rest } = response;
         if (type == 'Done') {
             return null;
         }
@@ -232,7 +251,16 @@ export async function run(runner: Runner, generator: any): Promise<any> {
             //@ts-ignore
             return rest.changes;
         }
-        await runner.wait();
+        if (lock != null) {
+            await lock.acquire();
+        }
+        try {
+            await runner.wait();
+        } finally {
+            if (lock != null) {
+                lock.release();
+            }
+        }
     }
 }
 

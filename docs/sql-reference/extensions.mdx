@@ -143,43 +143,62 @@ LIMIT 5;
 
 The time extension is compatible with [sqlean-time](https://github.com/nalgeon/sqlean/blob/main/docs/time.md) and provides advanced time manipulation functions.
 
+<Info>
+A **time value** (`t` in the tables below) is an opaque 13-byte **BLOB**, not an integer — this matches sqlean-time byte-for-byte (`version(1) + seconds(8) + nanoseconds(4)`, with seconds counted from year 0001). Any function that produces a time (`time_now`, `time_date`, `time_add`, …) returns a BLOB, and `typeof(time_now())` is `blob`. Use `time_to_unix` / `time_to_nano` to get an INTEGER, and the `time_fmt_*` functions to get TEXT.
+
+To store a time value in a `STRICT` table, use a `BLOB` column, or convert it first:
+
+```sql
+CREATE TABLE X (t BLOB) STRICT;
+INSERT INTO X (t) VALUES (time_now());
+
+-- Or store a Unix integer:
+CREATE TABLE Y (t INTEGER) STRICT;
+INSERT INTO Y (t) VALUES (time_to_nano(time_now()));
+```
+</Info>
+
 ### Key Functions
 
 | Function | Parameters | Return Type | Description |
 |----------|-----------|-------------|-------------|
-| `time_now()` | none | INTEGER | Current time as Unix nanoseconds |
-| `time_date(y,m,d,...)` | INTEGER... | INTEGER | Create time from components |
-| `time_unix(sec)` | INTEGER | INTEGER | Create time from Unix seconds |
-| `time_milli(ms)` | INTEGER | INTEGER | Create time from milliseconds |
-| `time_micro(us)` | INTEGER | INTEGER | Create time from microseconds |
-| `time_nano(ns)` | INTEGER | INTEGER | Create time from nanoseconds |
-| `time_to_unix(t)` | INTEGER | INTEGER | Convert to Unix seconds |
-| `time_to_milli(t)` | INTEGER | INTEGER | Convert to milliseconds |
-| `time_to_micro(t)` | INTEGER | INTEGER | Convert to microseconds |
-| `time_to_nano(t)` | INTEGER | INTEGER | Convert to nanoseconds |
-| `time_get_year(t)` | INTEGER | INTEGER | Extract year |
-| `time_get_month(t)` | INTEGER | INTEGER | Extract month (1-12) |
-| `time_get_day(t)` | INTEGER | INTEGER | Extract day (1-31) |
-| `time_get_hour(t)` | INTEGER | INTEGER | Extract hour (0-23) |
-| `time_get_minute(t)` | INTEGER | INTEGER | Extract minute (0-59) |
-| `time_get_second(t)` | INTEGER | INTEGER | Extract second (0-59) |
-| `time_get_weekday(t)` | INTEGER | INTEGER | Day of week (0=Sunday) |
-| `time_get(t, field)` | INTEGER, TEXT | INTEGER | Extract named field |
-| `time_add(t, d)` | INTEGER, INTEGER | INTEGER | Add duration |
-| `time_add_date(t, y, m, d)` | INTEGER... | INTEGER | Add years/months/days |
-| `time_sub(t, u)` | INTEGER, INTEGER | INTEGER | Difference between times |
-| `time_since(t)` | INTEGER | INTEGER | Duration since time |
-| `time_until(t)` | INTEGER | INTEGER | Duration until time |
-| `time_trunc(t, field)` | INTEGER, TEXT | INTEGER | Truncate to field |
-| `time_after(t, u)` | INTEGER, INTEGER | INTEGER | 1 if t is after u |
-| `time_before(t, u)` | INTEGER, INTEGER | INTEGER | 1 if t is before u |
-| `time_compare(t, u)` | INTEGER, INTEGER | INTEGER | -1, 0, or 1 |
-| `time_equal(t, u)` | INTEGER, INTEGER | INTEGER | 1 if equal |
-| `time_fmt_iso(t)` | INTEGER | TEXT | Format as ISO 8601 |
-| `time_fmt_datetime(t)` | INTEGER | TEXT | Format as datetime |
-| `time_fmt_date(t)` | INTEGER | TEXT | Format as date |
-| `time_fmt_time(t)` | INTEGER | TEXT | Format as time |
-| `time_parse(s)` | TEXT | INTEGER | Parse time string |
+| `time_now()` | none | BLOB | Current time |
+| `time_date(y,m,d,...)` | INTEGER... | BLOB | Create time from components |
+| `make_date(y,m,d)` | INTEGER... | BLOB | Create time from a date |
+| `make_timestamp(...)` | INTEGER... | BLOB | Create time from a timestamp |
+| `time_unix(sec)` | INTEGER | BLOB | Create time from Unix seconds |
+| `to_timestamp(sec)` | INTEGER | BLOB | Create time from Unix seconds |
+| `time_milli(ms)` | INTEGER | BLOB | Create time from milliseconds |
+| `time_micro(us)` | INTEGER | BLOB | Create time from microseconds |
+| `time_nano(ns)` | INTEGER | BLOB | Create time from nanoseconds |
+| `time_to_unix(t)` | BLOB | INTEGER | Convert to Unix seconds |
+| `time_to_milli(t)` | BLOB | INTEGER | Convert to milliseconds |
+| `time_to_micro(t)` | BLOB | INTEGER | Convert to microseconds |
+| `time_to_nano(t)` | BLOB | INTEGER | Convert to nanoseconds |
+| `time_get_year(t)` | BLOB | INTEGER | Extract year |
+| `time_get_month(t)` | BLOB | INTEGER | Extract month (1-12) |
+| `time_get_day(t)` | BLOB | INTEGER | Extract day (1-31) |
+| `time_get_hour(t)` | BLOB | INTEGER | Extract hour (0-23) |
+| `time_get_minute(t)` | BLOB | INTEGER | Extract minute (0-59) |
+| `time_get_second(t)` | BLOB | INTEGER | Extract second (0-59) |
+| `time_get_weekday(t)` | BLOB | INTEGER | Day of week (0=Sunday) |
+| `time_get(t, field)` | BLOB, TEXT | INTEGER | Extract named field |
+| `time_add(t, d)` | BLOB, INTEGER | BLOB | Add duration |
+| `time_add_date(t, y, m, d)` | BLOB, INTEGER... | BLOB | Add years/months/days |
+| `time_sub(t, u)` | BLOB, BLOB | INTEGER | Difference between times (duration) |
+| `time_since(t)` | BLOB | INTEGER | Duration since time |
+| `time_until(t)` | BLOB | INTEGER | Duration until time |
+| `time_trunc(t, field)` | BLOB, TEXT | BLOB | Truncate to field |
+| `time_round(t, d)` | BLOB, INTEGER | BLOB | Round to nearest duration |
+| `time_after(t, u)` | BLOB, BLOB | INTEGER | 1 if t is after u |
+| `time_before(t, u)` | BLOB, BLOB | INTEGER | 1 if t is before u |
+| `time_compare(t, u)` | BLOB, BLOB | INTEGER | -1, 0, or 1 |
+| `time_equal(t, u)` | BLOB, BLOB | INTEGER | 1 if equal |
+| `time_fmt_iso(t)` | BLOB | TEXT | Format as ISO 8601 |
+| `time_fmt_datetime(t)` | BLOB | TEXT | Format as datetime |
+| `time_fmt_date(t)` | BLOB | TEXT | Format as date |
+| `time_fmt_time(t)` | BLOB | TEXT | Format as time |
+| `time_parse(s)` | TEXT | BLOB | Parse time string |
 
 #### Duration Constants
 

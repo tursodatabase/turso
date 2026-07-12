@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
     ops::Deref,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, Once, RwLock, Weak,
     },
     task::Waker,
@@ -32,6 +32,38 @@ use crate::{
 
 assert_send!(TursoDatabase, TursoConnection, TursoStatement);
 assert_sync!(TursoDatabase);
+
+#[derive(Default)]
+pub struct SyncBusyGate {
+    active: AtomicBool,
+}
+
+impl SyncBusyGate {
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Release);
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+pub struct SyncBusyGuard {
+    gate: Arc<SyncBusyGate>,
+}
+
+impl SyncBusyGuard {
+    pub fn new(gate: Arc<SyncBusyGate>) -> Self {
+        gate.set_active(true);
+        Self { gate }
+    }
+}
+
+impl Drop for SyncBusyGuard {
+    fn drop(&mut self) {
+        self.gate.set_active(false);
+    }
+}
 
 pub use turso_core::types::FromValue;
 pub use turso_ext::{
@@ -147,6 +179,38 @@ pub struct TursoDatabaseConfig {
     /// optional custom DatabaseStorage provided by the caller
     /// if provided, caller must guarantee that IO used by the TursoDatabase will be consistent with underlying DatabaseStorage IO
     pub db_file: Option<Arc<dyn DatabaseStorage>>,
+}
+
+impl TursoDatabaseConfig {
+    /// Build the typed [`turso_core::DatabaseOpts`] from the comma-separated
+    /// [`Self::experimental_features`] string. The feature-name tokens are the
+    /// SDK/CLI-facing names; unknown names are ignored and `"strict"` is a
+    /// no-op (strict tables are always enabled). This keeps the
+    /// string -> typed-options translation in the SDK layer where the string
+    /// representation lives, instead of in `turso_core`.
+    pub fn database_opts(&self) -> DatabaseOpts {
+        let mut opts = DatabaseOpts::new();
+        let Some(experimental_features) = &self.experimental_features else {
+            return opts;
+        };
+        for feature in experimental_features.split(',').map(|s| s.trim()) {
+            opts = match feature {
+                "views" => opts.with_views(true),
+                "index_method" => opts.with_index_method(true),
+                "custom_types" => opts.with_custom_types(true),
+                "autovacuum" => opts.with_autovacuum(true),
+                "vacuum" => opts.with_vacuum(true),
+                "encryption" => opts.with_encryption(true),
+                "attach" => opts.with_attach(true),
+                "generated_columns" => opts.with_generated_columns(true),
+                "multiprocess_wal" => opts.with_multiprocess_wal(true),
+                "without_rowid" => opts.with_without_rowid(true),
+                // "strict" is always enabled, kept for backwards compatibility
+                _ => opts,
+            };
+        }
+        opts
+    }
 }
 
 pub fn turso_slice_from_bytes(bytes: &[u8]) -> capi::c::turso_slice_ref_t {
@@ -314,6 +378,7 @@ pub struct TursoDatabaseOpenState {
     io: Option<Arc<dyn IO>>,
     db_file: Option<Arc<dyn DatabaseStorage>>,
     opts: Option<DatabaseOpts>,
+    open_flags: OpenFlags,
     open_db_state: OpenDbAsyncState,
 }
 
@@ -330,6 +395,7 @@ impl TursoDatabaseOpenState {
             io: None,
             db_file: None,
             opts: None,
+            open_flags: OpenFlags::default(),
             open_db_state: OpenDbAsyncState::new(),
         }
     }
@@ -446,6 +512,9 @@ impl From<LimboError> for TursoError {
             LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),
             LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
             LimboError::Busy => TursoError::Busy("database is locked".to_string()),
+            // Same-connection rejections carry SQLITE_BUSY semantics, but the
+            // caller must finish/reset its own statement rather than wait.
+            err @ LimboError::StatementsInProgress(_) => TursoError::Busy(err.to_string()),
             LimboError::BusySnapshot => TursoError::BusySnapshot(
                 "database snapshot is stale, rollback and retry the transaction".to_string(),
             ),
@@ -454,6 +523,32 @@ impl From<LimboError> for TursoError {
             }
             _ => TursoError::Error(value.to_string()),
         }
+    }
+}
+
+fn sync_busy_error() -> TursoError {
+    TursoError::Busy("database is locked".to_string())
+}
+
+fn sync_operation_active(sync_busy: Option<&Arc<SyncBusyGate>>) -> bool {
+    sync_busy.is_some_and(|gate| gate.is_active())
+}
+
+fn map_sync_transient_error(
+    sync_busy: Option<&Arc<SyncBusyGate>>,
+    error: TursoError,
+) -> TursoError {
+    if sync_busy.is_none() {
+        return error;
+    }
+    match error {
+        TursoError::Error(message)
+            if message == "Database schema changed"
+                || message.starts_with("I/O error: short read on page") =>
+        {
+            sync_busy_error()
+        }
+        other => other,
     }
 }
 
@@ -656,25 +751,7 @@ impl TursoDatabase {
                     // OpenFlags::NoLock when multiprocess WAL is enabled — taking
                     // the OS-level fcntl lock here would block every other
                     // multiprocess process from opening the same file.
-                    let mut opts = DatabaseOpts::new();
-                    if let Some(experimental_features) = &self.config.experimental_features {
-                        for features in experimental_features.split(",").map(|s| s.trim()) {
-                            opts = match features {
-                                "views" => opts.with_views(true),
-                                "index_method" => opts.with_index_method(true),
-                                "strict" => opts, // strict is always enabled, kept for backwards compatibility
-                                "custom_types" => opts.with_custom_types(true),
-                                "autovacuum" => opts.with_autovacuum(true),
-                                "vacuum" => opts.with_vacuum(true),
-                                "encryption" => opts.with_encryption(true),
-                                "attach" => opts.with_attach(true),
-                                "generated_columns" => opts.with_generated_columns(true),
-                                "multiprocess_wal" => opts.with_multiprocess_wal(true),
-                                "without_rowid" => opts.with_without_rowid(true),
-                                _ => opts,
-                            };
-                        }
-                    }
+                    let opts = self.config.database_opts();
 
                     if self.config.encryption.is_some() && !opts.enable_encryption {
                         return Err(TursoError::Error(
@@ -696,6 +773,7 @@ impl TursoDatabase {
                     state.io = Some(io);
                     state.db_file = Some(db_file);
                     state.opts = Some(opts);
+                    state.open_flags = open_flags;
                     state.phase = TursoDatabaseOpenPhase::Opening;
                 }
 
@@ -711,13 +789,14 @@ impl TursoDatabase {
                         .expect("db_file must be initialized in Init phase")
                         .clone();
                     let opts = state.opts.expect("opts must be initialized in Init phase");
+                    let open_flags = state.open_flags;
 
                     match Database::open_with_flags_async(
                         &mut state.open_db_state,
                         io.clone(),
                         &self.config.path,
                         db_file,
-                        OpenFlags::default(),
+                        open_flags,
                         opts,
                         self.config.encryption.clone(),
                         None,
@@ -811,6 +890,7 @@ pub struct TursoConnection {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
     connection: Arc<Connection>,
+    sync_busy: Option<Arc<SyncBusyGate>>,
     cached_statements: Arc<Mutex<HashMap<String, Arc<CachedStatement>>>>,
     /// Weak refs to every statement handle created by this connection, keyed
     /// by a monotonic ID. Statements remove themselves on drop, so this map
@@ -822,18 +902,51 @@ pub struct TursoConnection {
 
 impl TursoConnection {
     pub fn new(config: &TursoDatabaseConfig, connection: Arc<Connection>) -> Arc<Self> {
+        Self::new_with_sync_busy(config, connection, None)
+    }
+
+    pub fn new_with_sync_busy(
+        config: &TursoDatabaseConfig,
+        connection: Arc<Connection>,
+        sync_busy: Option<Arc<SyncBusyGate>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             async_io: config.async_io,
             connection,
+            sync_busy,
             concurrent_guard: Arc::new(ConcurrentGuard::new()),
             cached_statements: Arc::new(Mutex::new(HashMap::new())),
             stmts: Arc::new(Mutex::new(HashMap::new())),
             next_stmt_id: Arc::new(AtomicUsize::new(0)),
         })
     }
+
+    fn sync_operation_active(&self) -> bool {
+        sync_operation_active(self.sync_busy.as_ref())
+    }
+
+    fn map_sync_transient_error(&self, error: TursoError) -> TursoError {
+        map_sync_transient_error(self.sync_busy.as_ref(), error)
+    }
     /// Set busy timeout for the connection
     pub fn set_busy_timeout(&self, duration: Duration) {
         self.connection.set_busy_timeout(duration);
+    }
+    /// Request interruption of the statement currently running on this connection.
+    /// Mirrors `sqlite3_interrupt`: the in-flight `step`/`execute` aborts with an
+    /// `Interrupt` error. Safe to call from another thread. If no statement is
+    /// active the request is ignored.
+    pub fn interrupt(&self) {
+        self.connection.interrupt();
+    }
+    /// Set the maximum wall-clock duration a single statement is allowed to run
+    /// before it is interrupted. `Duration::ZERO` disables the timeout.
+    pub fn set_query_timeout(&self, duration: Duration) {
+        self.connection.set_query_timeout(duration);
+    }
+    /// Get the current per-statement query timeout (`Duration::ZERO` when disabled).
+    pub fn get_query_timeout(&self) -> Duration {
+        self.connection.get_query_timeout()
     }
     pub fn get_auto_commit(&self) -> bool {
         self.connection.get_auto_commit()
@@ -951,12 +1064,20 @@ impl TursoConnection {
 
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
-        let statement = self.connection.prepare(sql)?;
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
+        let statement = self
+            .connection
+            .prepare(sql)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))?;
         let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
         let stmt_id = self.track_stmt(&handle);
         Ok(Box::new(TursoStatement {
             concurrent_guard: self.concurrent_guard.clone(),
             async_io: self.async_io,
+            sync_busy: self.sync_busy.clone(),
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
@@ -965,6 +1086,9 @@ impl TursoConnection {
 
     /// Prepare a statement from the provided SQL string and cache it for future use.
     pub fn prepare_cached(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
         let sql_str = sql.as_ref();
 
         // Check if we have a cached version
@@ -981,6 +1105,7 @@ impl TursoConnection {
                 return Ok(Box::new(TursoStatement {
                     concurrent_guard: self.concurrent_guard.clone(),
                     async_io: self.async_io,
+                    sync_busy: self.sync_busy.clone(),
                     handle,
                     stmt_id,
                     stmts: self.stmts.clone(),
@@ -989,7 +1114,11 @@ impl TursoConnection {
         }
 
         // Not cached, prepare it fresh
-        let statement = self.connection.prepare(sql_str)?;
+        let statement = self
+            .connection
+            .prepare(sql_str)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))?;
 
         // Cache it for future use
         let cached = Arc::new(CachedStatement {
@@ -1006,6 +1135,7 @@ impl TursoConnection {
         Ok(Box::new(TursoStatement {
             concurrent_guard: self.concurrent_guard.clone(),
             async_io: self.async_io,
+            sync_busy: self.sync_busy.clone(),
             handle,
             stmt_id,
             stmts: self.stmts.clone(),
@@ -1018,7 +1148,15 @@ impl TursoConnection {
         &self,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Box<TursoStatement>, usize)>, TursoError> {
-        match self.connection.consume_stmt(sql)? {
+        if self.sync_operation_active() {
+            return Err(sync_busy_error());
+        }
+        match self
+            .connection
+            .consume_stmt(sql)
+            .map_err(TursoError::from)
+            .map_err(|error| self.map_sync_transient_error(error))?
+        {
             Some((statement, position)) => {
                 let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
                 let stmt_id = self.track_stmt(&handle);
@@ -1026,6 +1164,7 @@ impl TursoConnection {
                     Box::new(TursoStatement {
                         async_io: self.async_io,
                         concurrent_guard: Arc::new(ConcurrentGuard::new()),
+                        sync_busy: self.sync_busy.clone(),
                         handle,
                         stmt_id,
                         stmts: self.stmts.clone(),
@@ -1135,7 +1274,7 @@ fn step_inner(
             StepResult::Row => Ok(TursoStatusCode::Row),
             StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
             StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 if async_io {
                     Ok(TursoStatusCode::Io)
                 } else {
@@ -1150,6 +1289,7 @@ fn step_inner(
 pub struct TursoStatement {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
+    sync_busy: Option<Arc<SyncBusyGate>>,
     pub(crate) handle: StatementHandle,
     stmt_id: usize,
     stmts: StmtRegistry,
@@ -1251,6 +1391,9 @@ impl TursoStatement {
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     #[inline]
     pub fn step(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
+        if sync_operation_active(self.sync_busy.as_ref()) {
+            return Err(sync_busy_error());
+        }
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
         let mut handle = self.handle.lock().unwrap();
@@ -1258,12 +1401,16 @@ impl TursoStatement {
             .as_mut()
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
         step_inner(stmt, self.async_io, waker)
+            .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))
     }
 
     /// execute statement to completion
     /// method returns [TursoStatusCode::Done] if execution completed
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     pub fn execute(&mut self, waker: Option<&Waker>) -> Result<TursoExecutionResult, TursoError> {
+        if sync_operation_active(self.sync_busy.as_ref()) {
+            return Err(sync_busy_error());
+        }
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
         let mut handle = self.handle.lock().unwrap();
@@ -1272,7 +1419,8 @@ impl TursoStatement {
             .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
 
         loop {
-            let status = step_inner(stmt, self.async_io, waker)?;
+            let status = step_inner(stmt, self.async_io, waker)
+                .map_err(|error| map_sync_transient_error(self.sync_busy.as_ref(), error))?;
             if status == TursoStatusCode::Row {
                 continue;
             } else if status == TursoStatusCode::Io {
@@ -1303,6 +1451,9 @@ impl TursoStatement {
     /// get row value as an owned Value
     #[inline]
     pub fn row_value(&self, index: usize) -> Result<turso_core::Value, TursoError> {
+        if sync_operation_active(self.sync_busy.as_ref()) {
+            return Err(sync_busy_error());
+        }
         let handle = self.handle.lock().unwrap();
         let stmt = handle
             .as_ref()
@@ -1344,6 +1495,24 @@ impl TursoStatement {
             return None;
         }
         stmt.get_column_decltype(index)
+    }
+
+    /// Returns rich type information for the column at `index`.
+    ///
+    /// Wraps [`turso_core::Statement::get_column_type_info`]. Returns `None`
+    /// when the statement has been finalized, when the index is out of
+    /// bounds, when the connection does not have the experimental custom-
+    /// types feature enabled (the underlying call errors and we surface that
+    /// as "no info"; the C ABI has no error channel), when the statement is
+    /// in EXPLAIN mode, or when the expression behind the column has no
+    /// determined affinity.
+    pub fn column_type_info(&self, index: usize) -> Option<turso_core::ColumnTypeInfo> {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle.as_ref()?;
+        if index >= stmt.num_columns() {
+            return None;
+        }
+        stmt.get_column_type_info(index).ok().flatten()
     }
     /// finalize statement execution
     /// this method must be called in the end of statement execution (either successfull or not)
@@ -1411,6 +1580,51 @@ mod tests {
         TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR,
     };
     use turso_core::Value;
+
+    fn config_with_features(features: Option<&str>) -> TursoDatabaseConfig {
+        TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: features.map(str::to_string),
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        }
+    }
+
+    #[test]
+    pub fn database_opts_maps_experimental_features() {
+        // No features -> all defaults.
+        assert_eq!(
+            config_with_features(None).database_opts(),
+            turso_core::DatabaseOpts::new()
+        );
+
+        // Each token toggles its corresponding flag.
+        let opts = config_with_features(Some(
+            "views,index_method,custom_types,autovacuum,vacuum,encryption,attach,generated_columns,multiprocess_wal,without_rowid",
+        ))
+        .database_opts();
+        assert!(opts.enable_views);
+        assert!(opts.enable_index_method);
+        assert!(opts.enable_custom_types);
+        assert!(opts.enable_autovacuum);
+        assert!(opts.enable_vacuum);
+        assert!(opts.enable_encryption);
+        assert!(opts.enable_attach);
+        assert!(opts.enable_generated_columns);
+        assert!(opts.enable_multiprocess_wal);
+        assert!(opts.enable_without_rowid);
+
+        // Whitespace is trimmed; `strict` and unknown names are ignored.
+        let opts = config_with_features(Some(" views , strict , unknown_one ")).database_opts();
+        assert!(opts.enable_views);
+        assert_eq!(
+            config_with_features(Some("strict,unknown")).database_opts(),
+            turso_core::DatabaseOpts::new()
+        );
+    }
 
     #[test]
     pub fn test_db_concurrent_use() {

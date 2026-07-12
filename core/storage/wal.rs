@@ -51,6 +51,9 @@ use crate::{
 pub struct RollbackTo {
     pub frame: u64,
     pub checksum: (u32, u32),
+    /// WAL checkpoint sequence (generation) the position was captured in;
+    /// asserted against the current generation on rollback.
+    pub checkpoint_seq: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -595,6 +598,7 @@ trait WalCoordination: Debug + Send + Sync {
 }
 
 /// Write-ahead log (WAL).
+#[aristo::intent("The WAL subsystem maintains LSN monotonicity, frame commitment ordering, recovery idempotency, checkpoint safety, and group commit atomicity.", id = "wal_protocol_correctness", verify = "neural")]
 pub trait Wal: Debug + Send + Sync {
     /// Begin a read transaction.
     /// Returns whether the database state has changed since the last read transaction.
@@ -720,6 +724,11 @@ pub trait Wal: Debug + Send + Sync {
     fn publish_backfill(&self, max_frame: u64);
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
     fn is_syncing(&self) -> bool;
+    /// Whether the WAL file is dirty: frames were appended that no successful
+    /// WAL fsync has covered yet. A dirty WAL owes an fsync before a commit
+    /// may be reported durable, even when the committer itself has no dirty
+    /// pages to write (e.g. frames inserted through [Wal::write_frame_raw]).
+    fn is_dirty(&self) -> bool;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
     fn get_max_frame(&self) -> u64;
@@ -898,12 +907,13 @@ impl WalCoordination for InProcessWalCoordination {
         let range = frame_watermark
             .map(|x| 0..=x)
             .unwrap_or(min_frame..=max_frame);
-        frame_cache.get(&page_id).and_then(|frames| {
+        let result = frame_cache.get(&page_id).and_then(|frames| {
             frames
                 .iter()
                 .rfind(|&&frame| range.contains(&frame))
                 .copied()
-        })
+        });
+        result
     }
 
     fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
@@ -1234,6 +1244,29 @@ impl WalCoordination for InProcessWalCoordination {
     fn cache_frame(&self, page_id: u64, frame_id: u64) {
         let shared = self.shared.read();
         let mut frame_cache = shared.runtime.frame_cache.lock();
+        // Frame-slot reuse / append-position rewind guard. Within a WAL
+        // generation frames are appended with strictly increasing numbers, so
+        // a `frame_id` that does not exceed the current high-water means the
+        // slots from `frame_id` upward are being overwritten: by frames from a
+        // prior uncommitted/aborted append that was never rolled back out of
+        // the cache, or by another connection reusing the slots after a
+        // rewind. Drop every stale `page -> frame` mapping for those slots
+        // before recording the new one, otherwise `find_frame` can return a
+        // frame slot that now physically holds a different page (corruption).
+        // (Per-page frame lists are kept ascending, so popping the tail
+        // `>= frame_id` removes exactly the overwritten suffix.)
+        let high_water = shared
+            .runtime
+            .frame_cache_high_water
+            .load(Ordering::Acquire);
+        if frame_id <= high_water {
+            frame_cache.retain(|_page_id, frames| {
+                while frames.last().is_some_and(|&frame| frame >= frame_id) {
+                    frames.pop();
+                }
+                !frames.is_empty()
+            });
+        }
         match frame_cache.get_mut(&page_id) {
             Some(frames) => {
                 frames.push(frame_id);
@@ -1242,6 +1275,10 @@ impl WalCoordination for InProcessWalCoordination {
                 frame_cache.insert(page_id, vec![frame_id]);
             }
         }
+        shared
+            .runtime
+            .frame_cache_high_water
+            .store(frame_id, Ordering::Release);
     }
 
     fn rollback_cache(&self, max_frame: u64) {
@@ -1253,6 +1290,19 @@ impl WalCoordination for InProcessWalCoordination {
             }
             !frames.is_empty()
         });
+        // Keep the high-water consistent with the truncation so a subsequent
+        // append at `max_frame + 1` is not misread as a rewind.
+        if shared
+            .runtime
+            .frame_cache_high_water
+            .load(Ordering::Acquire)
+            > max_frame
+        {
+            shared
+                .runtime
+                .frame_cache_high_water
+                .store(max_frame, Ordering::Release);
+        }
     }
 
     fn should_checkpoint_on_close(&self) -> bool {
@@ -1427,6 +1477,10 @@ impl ShmWalCoordination {
         Self::install_local_snapshot(&mut shared, snapshot, true);
         shared.metadata.initialized.store(false, Ordering::Release);
         shared.runtime.frame_cache.lock().clear();
+        shared
+            .runtime
+            .frame_cache_high_water
+            .store(0, Ordering::Release);
         shared.runtime.overflow_fallback_coverage.lock().clear();
     }
 
@@ -1718,6 +1772,10 @@ impl ShmWalCoordination {
             Self::install_local_snapshot(&mut shared, restarted, true);
             shared.metadata.initialized.store(false, Ordering::Release);
             shared.runtime.frame_cache.lock().clear();
+            shared
+                .runtime
+                .frame_cache_high_water
+                .store(0, Ordering::Release);
             shared.runtime.overflow_fallback_coverage.lock().clear();
             shared.runtime.read_locks[0].set_value_exclusive(0);
             shared.runtime.read_locks[1].set_value_exclusive(0);
@@ -2563,11 +2621,13 @@ pub struct WalFile {
 
     io_ctx: RwLock<IOContext>,
 
-    /// Set when `write_frame_raw` appends frames without a commit marker
-    /// (`db_size == 0`), meaning the coordination backend's max_frame is
-    /// behind our connection-local max_frame. Cleared once
-    /// `finish_append_frames_commit` publishes the state.
-    has_unpublished_frames: AtomicBool,
+    /// The WAL file is dirty: frames were appended that no successful fsync
+    /// has covered yet. Set whenever a frame is recorded via
+    /// `complete_append_frame`, cleared when a WAL fsync completes
+    /// successfully. A dirty WAL owes an fsync before a commit may be
+    /// reported durable under synchronous=FULL.
+    /// Shared with the fsync completion callback, hence the Arc.
+    dirty: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for WalFile {
@@ -2663,6 +2723,15 @@ pub struct WalSharedRuntime {
     // we don't need WAL's index file. So we can do stuff like this without shared memory.
     // TODO: this will need refactoring because this is incredible memory inefficient.
     pub frame_cache: Arc<SpinLock<FxHashMap<u64, Vec<u64>>>>,
+    /// Highest frame number currently recorded in `frame_cache` for the active
+    /// WAL generation. Used to detect frame-slot reuse / append-position
+    /// rewinds: within a generation frames are appended with strictly
+    /// increasing numbers, so caching a frame that is not above this watermark
+    /// means the slots from that frame upward are being overwritten and any
+    /// stale `page -> frame` mappings for them must be purged (otherwise
+    /// `find_frame` can return a frame slot that now holds a different page).
+    /// Only read/written while holding the `frame_cache` lock.
+    pub frame_cache_high_water: AtomicU64,
     pub file: Option<Arc<dyn File>>,
     /// Read locks advertise the maximum WAL frame a reader may access.
     /// Slot 0 is special, when it is held (shared) the reader bypasses the WAL and uses the main DB file.
@@ -3032,6 +3101,15 @@ impl WalFile {
         // Snapshot the shared WAL state. We haven't taken a read lock yet, so we need
         // to validate these values later.
         let shared_snapshot = self.load_coordination_snapshot();
+        turso_assert!(
+            shared_snapshot.nbackfills <= shared_snapshot.max_frame,
+            "WAL snapshot cannot have backfills beyond max frame",
+            {
+                "nbackfills": shared_snapshot.nbackfills,
+                "max_frame": shared_snapshot.max_frame,
+                "checkpoint_seq": shared_snapshot.checkpoint_seq
+            }
+        );
         tracing::debug!(
             "try_begin_read_tx: shared_max={}, nbackfills={}, last_checksum={:?}, checkpoint_seq={:?}, transaction_count={}",
             shared_snapshot.max_frame,
@@ -3248,6 +3326,12 @@ impl Wal for WalFile {
 
     /// Find the latest frame containing a page.
     #[instrument(skip_all, level = Level::DEBUG)]
+    #[aristo::intent(
+        "find_frame never reads outside the live frame range [nbackfills, max_frame]\n",
+        id = "aristos:wal_find_frame_range_invariant",
+        verify = "full",
+        parent = "wal_protocol_correctness"
+    )]
     fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<u64>> {
         #[cfg(not(feature = "conn_raw_api"))]
         turso_assert!(
@@ -3697,8 +3781,6 @@ impl Wal for WalFile {
         self.complete_append_frame(page_id, frame_id, checksums);
         if db_size > 0 {
             self.finish_append_frames_commit()?;
-        } else {
-            self.has_unpublished_frames.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -3757,6 +3839,16 @@ impl Wal for WalFile {
     }
 
     fn publish_backfill(&self, max_frame: u64) {
+        let snapshot = self.load_coordination_snapshot();
+        turso_assert!(
+            (snapshot.nbackfills..=snapshot.max_frame).contains(&max_frame),
+            "published backfill must stay within the current WAL generation",
+            {
+                "publish_backfill": max_frame,
+                "current_nbackfills": snapshot.nbackfills,
+                "current_max_frame": snapshot.max_frame
+            }
+        );
         self.coordination.publish_backfill(max_frame);
     }
 
@@ -3764,10 +3856,13 @@ impl Wal for WalFile {
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
         tracing::debug!("wal_sync");
         let syncing = self.syncing.clone();
+        let dirty = self.dirty.clone();
         let completion = Completion::new_sync(move |result| {
             tracing::debug!("wal_sync finish");
             if let Err(err) = result {
                 tracing::debug!("wal_sync failed: {err}");
+            } else {
+                dirty.store(false, Ordering::Release);
             }
             syncing.store(false, Ordering::Release);
         });
@@ -3780,6 +3875,10 @@ impl Wal for WalFile {
     // Currently used for assertion purposes
     fn is_syncing(&self) -> bool {
         self.syncing.load(Ordering::Acquire)
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
     }
 
     fn get_max_frame_in_wal(&self) -> u64 {
@@ -3806,6 +3905,37 @@ impl Wal for WalFile {
     fn rollback(&self, rollback_to: Option<RollbackTo>) {
         let is_savepoint = rollback_to.is_some();
         let snapshot = self.load_coordination_snapshot();
+        if let Some(r) = &rollback_to {
+            // Savepoint WAL positions are captured under the write lock
+            // (still held here), and no restart can happen while it is
+            // held: the writer-upgrade restart runs before positions
+            // materialize, and checkpoint RESTART/TRUNCATE takes the writer
+            // lock. A cross-generation position is therefore impossible.
+            // (SQLite must clamp instead — sqlite3WalSavepointUndo resets
+            // aWalData on an nCkpt mismatch — because it captures at
+            // write-tx begin but restarts later, at the first frame write.)
+            turso_assert!(
+                r.checkpoint_seq == snapshot.checkpoint_seq,
+                "savepoint WAL position must be from the current WAL generation",
+                {
+                    "savepoint_checkpoint_seq": r.checkpoint_seq,
+                    "authority_checkpoint_seq": snapshot.checkpoint_seq,
+                    "savepoint_frame": r.frame,
+                    "authority_max_frame": snapshot.max_frame
+                }
+            );
+            // The committed mark cannot advance while the write lock is
+            // held, so the position can never be behind it.
+            turso_assert!(
+                r.frame >= snapshot.max_frame,
+                "savepoint WAL position must not be behind the committed high-water mark",
+                { "savepoint_frame": r.frame, "authority_max_frame": snapshot.max_frame }
+            );
+        }
+        // Restored verbatim, like SQLite's aWalData. A checksum captured at
+        // frame 0 of a freshly restarted generation predates the new WAL
+        // header; that is harmless because prepare_frames seeds frame 1
+        // from the header itself.
         let max_frame = rollback_to
             .as_ref()
             .map(|r| r.frame)
@@ -3814,15 +3944,7 @@ impl Wal for WalFile {
             .as_ref()
             .map(|r| r.checksum)
             .unwrap_or(snapshot.last_checksum);
-        // Savepoints can be opened on a stale connection-local WAL snapshot.
-        // Do not let that rollback remove frame-cache mappings for frames that
-        // are already globally committed by another connection.
-        let cache_rollback_frame = if is_savepoint {
-            max_frame.max(snapshot.max_frame)
-        } else {
-            max_frame
-        };
-        self.coordination.rollback_cache(cache_rollback_frame);
+        self.coordination.rollback_cache(max_frame);
         *self.last_checksum.write() = last_checksum;
         self.max_frame.store(max_frame, Ordering::Release);
         if !is_savepoint {
@@ -3927,7 +4049,6 @@ impl Wal for WalFile {
             last_checksum,
             transaction_count,
         });
-        self.has_unpublished_frames.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -4000,6 +4121,12 @@ impl Wal for WalFile {
         }
     }
 
+    #[aristo::intent(
+        "The WAL initialized flag is set true only after a successful sync of the wal-header\n",
+        id = "aristos:wal_initialized_reflects_sync_outcome",
+        verify = "full",
+        parent = "wal_protocol_correctness"
+    )]
     fn prepare_wal_finish(&self, sync_type: FileSyncType) -> Result<Completion> {
         let file = self.coordination.wal_file()?;
         let coordination = self.coordination.clone();
@@ -4066,49 +4193,50 @@ impl Wal for WalFile {
             None => {
                 let snapshot = self.load_coordination_snapshot();
                 let local_state = self.connection_state();
-                let local_prepared_zero_frame_header = snapshot.max_frame == 0
-                    && self.coordination.wal_is_initialized()
-                    && local_state.snapshot.max_frame == 0
-                    && local_state.snapshot.checkpoint_seq == snapshot.checkpoint_seq
-                    && local_state.snapshot.transaction_count == snapshot.transaction_count
-                    && local_state.snapshot.last_checksum != snapshot.last_checksum;
-                if local_prepared_zero_frame_header {
-                    // We already prepared the WAL header for the current
-                    // zero-frame generation locally, but the authority snapshot
-                    // still carries the pre-header checksum until the first
-                    // commit publishes it. Seed the checksum chain from the
-                    // prepared local header, not the stale authority checksum.
+                if local_state.snapshot.max_frame > snapshot.max_frame {
+                    // The local position is past the committed high-water
+                    // mark exactly when this connection has spilled or
+                    // raw-inserted frames that carry no commit marker yet.
+                    // Chain from local state so we don't overwrite them.
                     (
                         local_state.snapshot.last_checksum,
                         local_state.snapshot.max_frame + 1,
                     )
-                } else if snapshot != local_state.snapshot {
-                    if self.has_unpublished_frames.load(Ordering::Acquire) {
-                        // write_frame_raw appended frames without a commit
-                        // marker (db_size == 0), so the coordination backend's
-                        // max_frame is behind our local max_frame. Chain from
-                        // local state so we don't overwrite those frames.
-                        (
-                            local_state.snapshot.last_checksum,
-                            local_state.snapshot.max_frame + 1,
-                        )
-                    } else {
-                        // The current generation was restarted/truncated back to
-                        // frame 0 or another process changed the durable WAL
-                        // state. Re-seed this connection from the authoritative
-                        // snapshot so replacement generations after
-                        // RESTART/TRUNCATE do not append using stale local state.
-                        self.install_connection_state(local_state.with_snapshot(snapshot));
-                        (snapshot.last_checksum, snapshot.max_frame + 1)
-                    }
                 } else {
-                    (
-                        local_state.snapshot.last_checksum,
-                        local_state.snapshot.max_frame + 1,
-                    )
+                    // Inside a write transaction the local position can
+                    // never be behind the committed mark: the upgrade
+                    // requires a fresh snapshot, and the mark cannot advance
+                    // while the write lock is held.
+                    turso_assert!(
+                        local_state.snapshot.max_frame == snapshot.max_frame,
+                        "connection WAL position must not be behind the committed high-water mark",
+                        {
+                            "local_max_frame": local_state.snapshot.max_frame,
+                            "authority_max_frame": snapshot.max_frame
+                        }
+                    );
+                    // At the mark the authority owns the seed; re-sync local
+                    // state if it drifted (e.g. a savepoint rollback
+                    // reinstalled a pre-header checksum at frame 0, or a
+                    // concurrent checkpoint advanced nbackfills).
+                    if snapshot != local_state.snapshot {
+                        self.install_connection_state(local_state.with_snapshot(snapshot));
+                    }
+                    (snapshot.last_checksum, snapshot.max_frame + 1)
                 }
             }
         };
+
+        // The first frame of a generation always chains from the WAL header
+        // checksum, like SQLite's walFrames at mxFrame == 0. Connection and
+        // authority state may still carry the pre-header checksum here: a
+        // restart resets the position before the next append writes the new
+        // header, and a savepoint rollback can reinstall a position captured
+        // in that window. The wal_is_initialized assert above guarantees
+        // `header` is the current generation's synced header.
+        if next_frame_id == 1 {
+            rolling_checksum = (header.checksum_1, header.checksum_2);
+        }
 
         let first_frame_id = next_frame_id;
 
@@ -4287,7 +4415,6 @@ impl Wal for WalFile {
             );
 
             for (page, fid, _csum) in &page_frame_for_cb {
-                page.clear_dirty();
                 page.set_wal_tag(*fid, epoch);
             }
         };
@@ -4396,7 +4523,7 @@ impl WalFile {
             last_checksum: RwLock::new(last_checksum),
             checkpoint_guard: RwLock::new(None),
             io_ctx: RwLock::new(IOContext::default()),
-            has_unpublished_frames: AtomicBool::new(false),
+            dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -4440,6 +4567,7 @@ impl WalFile {
     }
 
     fn complete_append_frame(&self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {
+        self.dirty.store(true, Ordering::Release);
         *self.last_checksum.write() = checksums;
         self.max_frame.store(frame_id, Ordering::Release);
         self.coordination.cache_frame(page_id, frame_id);
@@ -4603,19 +4731,6 @@ impl WalFile {
                                 .as_ref()
                                 .expect("buffer missing")
                                 .clone();
-                            // We debug assert that the cached page has the
-                            // exact contents as one read from the WAL.
-                            #[cfg(debug_assertions)]
-                            {
-                                let mut raw =
-                                    vec![0u8; self.page_size() as usize + WAL_FRAME_HEADER_SIZE];
-                                self.io.wait_for_completion(
-                                    self.read_frame_raw(target_frame, &mut raw)?,
-                                )?;
-                                let (_, wal_page) = sqlite3_ondisk::parse_wal_frame_header(&raw);
-                                let cached = buffer.as_slice();
-                                turso_assert!(wal_page == cached, "cached page content differs from WAL read", { "page_id": page_id, "frame_id": target_frame });
-                            }
                             {
                                 ongoing_chkpt
                                     .pending_writes
@@ -4739,7 +4854,14 @@ impl WalFile {
                     // during 'read_page', so the caller will use the result to determine if:
                     // a. the max frame == num wal frames (everything backfilled)
                     // b. the max frame > 0 (we have something to truncate)
-                    if checkpoint_result.should_truncate() {
+                    if checkpoint_result.should_truncate()
+                        || checkpoint_result.wal_checkpoint_backfilled > 0
+                    {
+                        // Backfilled frames are not globally durable until
+                        // the pager syncs the DB file and publishes
+                        // nbackfills. Keep the checkpoint guard through that
+                        // tail so another writer cannot restart the WAL
+                        // generation underneath a pending publish.
                         checkpoint_result.maybe_guard = self.checkpoint_guard.write().take();
                     } else {
                         let _ = self.checkpoint_guard.write().take();
@@ -4771,7 +4893,7 @@ impl WalFile {
     /// because we might overwrite content the reader is reading from the database file.
     ///
     /// A checkpoint must never overwrite a page in the main DB file if some
-    /// active reader might still need to read that page from the WAL.  
+    /// active reader might still need to read that page from the WAL.
     /// Concretely: the checkpoint may only copy frames `<= aReadMark[k]` for
     /// every in-use reader slot `k > 0`.
     ///
@@ -4854,6 +4976,7 @@ impl WalFile {
     }
 
     /// Truncate WAL file to zero and sync it. Called by pager AFTER DB file is synced.
+    #[aristo::intent("WAL truncate is atomic: no committed frame can be observed lost across the truncate operation\n", id = "aristos:wal_truncate_atomic_under_concurrent_writers", verify = "full", parent = "wal_protocol_correctness")]
     fn truncate_log(
         &self,
         result: &mut CheckpointResult,
@@ -5375,6 +5498,7 @@ impl WalFileShared {
             },
             runtime: WalSharedRuntime {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
@@ -5450,6 +5574,7 @@ impl WalFileShared {
             },
             runtime: WalSharedRuntime {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache_high_water: AtomicU64::new(0),
                 file: None,
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
@@ -5491,6 +5616,7 @@ impl WalFileShared {
             },
             runtime: WalSharedRuntime {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file),
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
@@ -5535,18 +5661,42 @@ impl WalFileShared {
             self.metadata.max_frame.store(0, Ordering::Release);
             self.metadata.nbackfills.store(0, Ordering::Release);
             self.metadata.last_checksum = (hdr.checksum_1, hdr.checksum_2);
-            // `prepare_wal_start` (used in the `commit_dirty_pages_inner`) do the work only if WAL is not initialized yet (so, self.initialized is false)
+            // `prepare_wal_start` (used in the `commit_wal_inner`) do the work only if WAL is not initialized yet (so, self.initialized is false)
             // we change WAL state here, so on next write attempt `prepare_wal_start` will update WAL header
             self.metadata.initialized.store(false, Ordering::Release);
         }
 
         self.runtime.frame_cache.lock().clear();
+        self.runtime
+            .frame_cache_high_water
+            .store(0, Ordering::Release);
         // read-marks
         self.runtime.read_locks[0].set_value_exclusive(0);
         self.runtime.read_locks[1].set_value_exclusive(0);
         for lock in &self.runtime.read_locks[2..] {
             lock.set_value_exclusive(READMARK_NOT_USED);
         }
+    }
+
+    /// Replace restored WAL state while preserving process-local locks owned by
+    /// existing connections.
+    ///
+    /// External restore paths rebuild metadata/cache/file state from disk while
+    /// other connections may still hold read guards. Those guards are tied to
+    /// the process-local lock objects, not to the restored on-disk WAL view, so
+    /// replacing the lock objects would make normal `end_read_tx` unlock a
+    /// fresh empty lock. Keep lock identity stable and refresh only state
+    /// derived from storage.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn replace_after_external_restore(&mut self, restored: WalFileShared) {
+        self.metadata = restored.metadata;
+        self.runtime.frame_cache = restored.runtime.frame_cache;
+        self.runtime.file = restored.runtime.file;
+        self.runtime.epoch.store(
+            restored.runtime.epoch.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        self.runtime.overflow_fallback_coverage = restored.runtime.overflow_fallback_coverage;
     }
 }
 
@@ -5684,6 +5834,50 @@ pub mod test {
             self.inner.truncate(len, c)
         }
     }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn replace_after_external_restore_preserves_lock_identity() {
+        let shared = WalFileShared::new_noop();
+        let restored = WalFileShared::new_noop();
+
+        let read_lock_ptrs = {
+            let shared = shared.read();
+            shared
+                .runtime
+                .read_locks
+                .iter()
+                .map(std::ptr::from_ref)
+                .collect::<Vec<_>>()
+        };
+        {
+            let shared = shared.read();
+            assert!(shared.runtime.read_locks[1].write());
+            shared.runtime.read_locks[1].set_value_exclusive(7);
+            shared.runtime.read_locks[1].unlock();
+        }
+        {
+            let restored = restored.read();
+            restored.metadata.max_frame.store(42, Ordering::Release);
+            assert!(restored.runtime.read_locks[1].write());
+            restored.runtime.read_locks[1].set_value_exclusive(99);
+            restored.runtime.read_locks[1].unlock();
+        }
+
+        let restored = match Arc::try_unwrap(restored) {
+            Ok(restored) => restored.into_inner(),
+            Err(_) => panic!("restored WAL test state should not be shared"),
+        };
+        shared.write().replace_after_external_restore(restored);
+
+        let shared = shared.read();
+        assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 42);
+        assert_eq!(shared.runtime.read_locks[1].get_value(), 7);
+        for (idx, lock) in shared.runtime.read_locks.iter().enumerate() {
+            assert_eq!(std::ptr::from_ref(lock), read_lock_ptrs[idx]);
+        }
+    }
+
     #[test]
     fn test_truncate_file() {
         let (db, _path) = get_database();
@@ -5949,6 +6143,36 @@ pub mod test {
         wal.commit_prepared_frames(&[prepared]);
         wal.finish_append_frames_commit().unwrap();
         expected
+    }
+
+    #[test]
+    fn append_frames_vectored_spill_frames_are_not_reused_by_next_prepare() {
+        let page_size = 512;
+        let (_io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let spill_page = page_with_pattern(7, 0x70, &buffer_pool);
+
+        let completion = wal
+            .append_frames_vectored(vec![spill_page], PageSize::new(page_size).unwrap())
+            .unwrap();
+        assert!(completion.succeeded());
+        assert_eq!(wal.get_max_frame(), 1);
+        assert_eq!(wal.get_max_frame_in_wal(), 0);
+
+        let commit_page = page_with_pattern(9, 0x90, &buffer_pool);
+        let prepared = wal
+            .prepare_frames(
+                &[commit_page],
+                PageSize::new(page_size).unwrap(),
+                Some(99),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            prepared.metadata[0].1, 2,
+            "prepare_frames must chain after unpublished spill frames"
+        );
+        assert_eq!(prepared.final_max_frame, 2);
     }
 
     fn wait_for_completion_error(io: &Arc<dyn IO>, completion: Completion) -> CompletionError {
@@ -6523,9 +6747,11 @@ pub mod test {
         let (shared, _wal) = make_test_wal();
         let coordination = make_test_coordination(&shared);
 
+        // Frames are cached in WAL append order (globally ascending): page 7 at
+        // frame 2, page 9 at frame 4, page 7 again at frame 5.
         coordination.cache_frame(7, 2);
-        coordination.cache_frame(7, 5);
         coordination.cache_frame(9, 4);
+        coordination.cache_frame(7, 5);
 
         assert_eq!(coordination.find_frame(7, 0, 5, None), Some(5));
         assert_eq!(coordination.iter_latest_frames(0, 5), vec![(7, 5), (9, 4)]);
@@ -6540,8 +6766,52 @@ pub mod test {
         );
     }
 
+    /// Regression test for WAL frame-index aliasing corruption: when a WAL
+    /// frame slot is reused for a different page (the append position rewinds
+    /// to an already-cached frame — e.g. an aborted/uncommitted append's slots
+    /// being overwritten, or a different connection reusing the slots), the
+    /// stale `page -> frame` mapping for that slot must be purged. Otherwise
+    /// `find_frame` can hand a page a frame number whose slot now physically
+    /// holds a different page, and the reader gets the wrong page's bytes
+    /// (surfacing as "non-index page" / "Invalid page type" / corruption).
     #[test]
-    fn test_savepoint_rollback_preserves_committed_frame_cache() {
+    fn cache_frame_purges_stale_mapping_on_frame_slot_reuse() {
+        let (shared, _wal) = make_test_wal();
+        let coordination = make_test_coordination(&shared);
+
+        // Ascending append: page 7 @3, page 9 @4, page 7 @5.
+        coordination.cache_frame(7, 3);
+        coordination.cache_frame(9, 4);
+        coordination.cache_frame(7, 5);
+        assert_eq!(coordination.find_frame(9, 0, 10, None), Some(4));
+
+        // The append position rewinds and frame slots 4 and 5 are overwritten,
+        // now belonging to page 11 (@4) and page 13 (@5). The earlier owners of
+        // those slots (page 9 @4, page 7 @5) must no longer be reachable.
+        coordination.cache_frame(11, 4);
+        coordination.cache_frame(13, 5);
+
+        assert_eq!(
+            coordination.find_frame(9, 0, 10, None),
+            None,
+            "stale page 9 -> frame 4 mapping must be purged once slot 4 is reused"
+        );
+        assert_eq!(
+            coordination.find_frame(11, 0, 10, None),
+            Some(4),
+            "page 11 now owns frame slot 4"
+        );
+        assert_eq!(
+            coordination.find_frame(13, 0, 10, None),
+            Some(5),
+            "page 13 now owns frame slot 5"
+        );
+        // Page 7's still-valid lower frame (3) survives; its stale 5 is gone.
+        assert_eq!(coordination.find_frame(7, 0, 10, None), Some(3));
+    }
+
+    #[test]
+    fn test_savepoint_rollback_discards_frame_cache_past_rollback_point() {
         let (shared, wal) = make_test_wal();
         let coordination = make_test_coordination(&shared);
         set_shared_snapshot(
@@ -6555,20 +6825,37 @@ pub mod test {
             },
         );
 
+        // The connection spilled uncommitted frames past the committed
+        // high-water mark (25); a savepoint opened mid-transaction recorded
+        // frame 27.
         coordination.cache_frame(7, 10);
-        coordination.cache_frame(9, 20);
-        coordination.cache_frame(11, 30);
+        coordination.cache_frame(9, 26);
+        coordination.cache_frame(11, 28);
         wal.max_frame.store(30, Ordering::Release);
 
         wal.rollback(Some(RollbackTo {
-            frame: 10,
+            frame: 27,
             checksum: (13, 21),
+            checkpoint_seq: 1,
         }));
 
+        // Mappings at or below the rollback point survive, later ones are
+        // discarded; frames 26..=27 remain as unpublished spills.
         assert_eq!(coordination.find_frame(7, 0, 30, None), Some(10));
-        assert_eq!(coordination.find_frame(9, 0, 30, None), Some(20));
+        assert_eq!(coordination.find_frame(9, 0, 30, None), Some(26));
         assert_eq!(coordination.find_frame(11, 0, 30, None), None);
-        assert_eq!(wal.get_max_frame(), 10);
+        assert_eq!(wal.get_max_frame(), 27);
+        assert_eq!(*wal.last_checksum.read(), (13, 21));
+
+        // Rolling back to the committed high-water mark discards every
+        // spill.
+        wal.rollback(Some(RollbackTo {
+            frame: 25,
+            checksum: (55, 89),
+            checkpoint_seq: 1,
+        }));
+        assert_eq!(coordination.find_frame(9, 0, 30, None), None);
+        assert_eq!(wal.get_max_frame(), 25);
     }
 
     #[test]

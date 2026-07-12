@@ -15,8 +15,16 @@ instead of parsing stderr log text.
 ## Location
 
 - Benchmark crate: `perf/memory/`
+- CodSpeed bench crate: `perf/memory/codspeed/` (CI allocation regression tracking)
 - Analysis script: `perf/memory/analyze-dhat.py`
 - dhat output: `dhat-heap.json` (written to CWD after each run)
+
+The crate is split into a library and binaries. The workload engine lives in
+`memory_benchmark::workload` (`run_workload`, `WorkloadConfig`,
+`WorkloadObserver`, the `JournalMode`/`WorkloadProfile` enums and
+`create_profile`); the `memory-benchmark` bin is a thin CLI over it that adds
+dhat/RSS measurement. Randomized profiles (`read-heavy`, `mixed`) use a fixed
+RNG seed (`profile::WORKLOAD_RNG_SEED`) so workloads are identical across runs.
 
 ## Running Stack Reports
 
@@ -92,18 +100,30 @@ cargo run --release -p memory-benchmark -- --mode mvcc --workload mixed -i 100 -
 # Run a final checkpoint after the workload
 cargo run --release -p memory-benchmark -- --mode wal --workload read-heavy --checkpoint
 
+# Guarantee automatic MVCC checkpoints during the run by lowering the
+# logical-log threshold (default is ~4 MB, more than small workloads write)
+cargo run --release -p memory-benchmark -- --mode mvcc --workload insert-heavy --mvcc-checkpoint-threshold 16384
+
 # All CLI options
 cargo run --release -p memory-benchmark -- \
   --mode wal|mvcc \
-  --workload insert-heavy|read-heavy|mixed|scan-heavy|series-blob \
+  --workload insert-heavy|read-heavy|mixed|scan-heavy|series-blob|update-churn \
   -i <iterations> \
   -b <batch-size> \
   --connections <N> \
   --checkpoint \
   --timeout <ms> \
   --cache-size <pages> \
+  --mvcc-checkpoint-threshold <bytes>   # MVCC only; -1 disables auto-checkpoint
+  --mvcc-gc-threshold <versions>        # MVCC only; -1 disables inline GC
   --format human|json|csv
 ```
+
+The two `--mvcc-*-threshold` flags set the corresponding PRAGMAs on the shared
+mv_store before the run. They are the knobs for isolating MVCC GC behavior:
+disable the checkpoint (`--mvcc-checkpoint-threshold=-1`) so the only
+reclamation is inline GC, then A/B the GC threshold (e.g. `-1` off vs `16384`
+default vs a smaller, more aggressive value) on the `update-churn` workload.
 
 Every run produces a `dhat-heap.json` in the current directory. This file contains per-allocation-site data for the entire run.
 
@@ -116,6 +136,7 @@ Every run produces a `dhat-heap.json` in the current directory. This file contai
 | `mixed` | 50% SELECT / 50% INSERT | Seeds 10k rows |
 | `scan-heavy` | Full table scans with LIKE | Seeds 10k rows |
 | `series-blob` | `INSERT INTO bench(data) SELECT zeroblob(2048) FROM generate_series(1, ?)` | Creates `bench`; `batch-size` is the series length |
+| `update-churn` | Repeated UPDATEs to a fixed 10k-row set (key space partitioned per connection to avoid write-write conflicts) | Seeds 10k rows. Generates superseded versions — the MVCC GC accumulation case. |
 
 Profiles implement the `Profile` trait in `perf/memory/src/profile/`. To add a new workload, create a new file implementing the trait and wire it into the `WorkloadProfile` enum in `main.rs`.
 
@@ -220,12 +241,55 @@ When `--connections > 1`:
 - WAL mode uses `BEGIN`, MVCC uses `BEGIN CONCURRENT`
 - The `Profile` trait's `next_batch(connections)` returns one batch per connection with non-overlapping row IDs
 
+## CodSpeed Allocation Tracking in CI
+
+`.github/workflows/codspeed-memory.yml` runs every workload profile under both
+journal modes with CodSpeed's memory instrument (eBPF-based malloc tracking:
+peak memory, total allocated, allocation count) so allocation regressions show
+up on PRs. The bench harness is the separate crate `perf/memory/codspeed/`
+(criterion benchmarks named `<mode>/<workload>/<total-ops>`, e.g.
+`mvcc/insert-heavy/2000`, with much smaller iteration counts than the CLI
+defaults). Each (mode, workload) pair runs at 1x/2x/4x scale — same batch
+size, more iterations — so comparing the sizes shows how memory grows with
+workload volume, plus an 8x `<ops>-checkpoint` variant that guarantees
+checkpointing is part of the measurement: it lowers
+`mvcc_checkpoint_threshold` to 16 KiB so MVCC auto-checkpoints fire mid-run
+(WAL's 1000-frame threshold is hardcoded in `core/storage/wal.rs`) and ends
+with an explicit `PRAGMA wal_checkpoint(TRUNCATE)`. The workflow builds
+the bench binary once, then fans out one CI job per workload profile, each
+filtering benchmarks by name — the sharding pattern from CodSpeed's
+sharded-benchmarks docs.
+
+The bench crate must stay free of `[[bin]]` targets: cargo builds a package's
+bins (panic=abort under the release profile) alongside its benches
+(panic=unwind), and the duplicated `turso_sdk_kit` cdylib/staticlib units then
+collide on unhashed output filenames and break the build. That is why the
+bench does not live in `perf/memory` itself.
+
+Run locally:
+
+```bash
+# Quick correctness pass (runs each benchmark once)
+cargo bench -p memory-benchmark-codspeed --bench memory_profiles -- --test
+
+# What CI runs (requires cargo-codspeed; uninstrumented outside the CodSpeed runner)
+cargo codspeed build -m memory -p memory-benchmark-codspeed --features codspeed
+cargo codspeed run -m memory -p memory-benchmark-codspeed --bench memory_profiles "insert-heavy"
+```
+
+Do NOT run plain `cargo bench -p memory-benchmark-codspeed` without `-- --test`
+unless you want full criterion sampling — each sample executes an entire
+workload.
+
 ## Adding a New Profile
 
 1. Create `perf/memory/src/profile/your_profile.rs` implementing the `Profile` trait
 2. Add `pub mod your_profile;` to `perf/memory/src/profile/mod.rs`
-3. Add a variant to `WorkloadProfile` enum in `main.rs`
-4. Wire it into `create_profile()` in `main.rs`
+3. Add a variant to `WorkloadProfile` enum in `src/workload.rs`
+4. Wire it into `create_profile()` in `src/workload.rs`
+5. Add it to `WORKLOADS` (and `base_workload_size`) in
+   `perf/memory/codspeed/benches/memory_profiles.rs` and to the `workload`
+   matrix in `.github/workflows/codspeed-memory.yml` so CI tracks it
 
 The `Profile` trait:
 ```rust

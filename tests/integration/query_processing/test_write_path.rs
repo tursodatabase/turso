@@ -970,6 +970,13 @@ pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
                     *stmt_opt = None;
                     oks += 1;
                 }
+                Err(LimboError::StatementsInProgress(_)) => {
+                    // Only one write statement may run at a time on a
+                    // connection; the rejection aborts this statement, so
+                    // reset it and retry on a later round once the active
+                    // writer has finished.
+                    stmt.reset().unwrap();
+                }
                 Err(err) => {
                     println!("err: {err:?}");
                     *stmt_opt = None;
@@ -982,8 +989,9 @@ pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
     }
     println!("errors: {errors}, oks: {oks}");
 
-    // all statement will be executed successfully - because turso return Busy error for all except one running statement
-    // and later retry operation for the failed statements
+    // Every statement completes: blocked writers are rejected with
+    // StatementsInProgress and succeed when retried after the active
+    // writer finishes.
     assert_eq!((oks, errors), (COUNT, 0));
 }
 
@@ -1071,20 +1079,22 @@ pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) 
     loop {
         match stmt1.step().unwrap() {
             StepResult::Row => {
+                // COMMIT while a write statement is in progress is an
+                // error-class BUSY rejection, mirroring SQLite's "cannot
+                // commit transaction - SQL statements in progress". The
+                // transaction stays open and unharmed.
                 let mut stmt2 = conn1.prepare("COMMIT").unwrap();
-                let mut busy = false;
-                loop {
+                let err = loop {
                     match stmt2.step() {
-                        Ok(StepResult::Done) => break,
                         Ok(StepResult::IO) => stmt2._io().step().unwrap(),
-                        Ok(StepResult::Busy) => {
-                            busy = true;
-                            break;
-                        }
+                        Err(err) => break err,
                         r => panic!("unexpected step result: {r:?}"),
                     }
-                }
-                assert!(busy);
+                };
+                assert!(
+                    matches!(err, LimboError::StatementsInProgress(_)),
+                    "expected StatementsInProgress, got {err:?}"
+                );
             }
             StepResult::Done => break,
             StepResult::IO => stmt1._io().step().unwrap(),
@@ -1111,20 +1121,22 @@ pub fn concurrent_rollback_and_insert_over_single_connection(limbo: TempDatabase
     loop {
         match stmt1.step().unwrap() {
             StepResult::Row => {
+                // ROLLBACK while a write statement is in progress is an
+                // error-class BUSY rejection: Turso cannot abort the
+                // suspended writer the way SQLite does, so the rollback is
+                // refused and the transaction stays open.
                 let mut stmt2 = conn1.prepare("ROLLBACK").unwrap();
-                let mut busy = false;
-                loop {
+                let err = loop {
                     match stmt2.step() {
-                        Ok(StepResult::Done) => break,
                         Ok(StepResult::IO) => stmt2._io().step().unwrap(),
-                        Ok(StepResult::Busy) => {
-                            busy = true;
-                            break;
-                        }
+                        Err(err) => break err,
                         r => panic!("unexpected step result: {r:?}"),
                     }
-                }
-                assert!(busy);
+                };
+                assert!(
+                    matches!(err, LimboError::StatementsInProgress(_)),
+                    "expected StatementsInProgress, got {err:?}"
+                );
             }
             StepResult::Done => break,
             StepResult::IO => stmt1._io().step().unwrap(),

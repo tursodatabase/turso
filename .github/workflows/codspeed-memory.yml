@@ -1,0 +1,116 @@
+# Memory benchmarks measured with CodSpeed's memory instrument (eBPF
+# allocation tracking: peak memory, total allocated, allocation count).
+#
+# The bench binary is built once, then each workload profile runs in its own
+# sharded job for speed, following the pattern used by astral-sh/ruff and
+# webpack (see https://codspeed.io/docs and their sharded-benchmarks docs).
+# CodSpeed aggregates shards that run within the same workflow.
+name: CodSpeed Memory
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  id-token: write # required for OIDC authentication with CodSpeed
+
+jobs:
+  build:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-codspeed-memory"
+          cache-on-failure: true
+
+
+      - name: Install cargo-codspeed
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed
+
+      - name: Mount benchmark binary sticky disk
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: codspeed-memory-binary-${{ github.run_id }}
+          path: target/codspeed
+
+      - name: Build memory benchmarks
+        run: cargo codspeed build -m memory -p memory-benchmark-codspeed --features codspeed
+
+  run:
+    name: "memory benchmarks (${{ matrix.workload }})"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs: build
+    timeout-minutes: 30
+    # Allow this job to fail without failing the entire CI run
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        # One shard per workload profile; each shard runs the WAL and MVCC
+        # variants of that workload (benchmarks are named "<mode>/<workload>"
+        # and the filter is a regex over benchmark names).
+        workload:
+          - insert-heavy
+          - read-heavy
+          - mixed
+          - scan-heavy
+          - series-blob
+          - update-churn
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Install cargo-codspeed
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed
+
+      - name: Wait for sticky disk snapshot propagation
+        # The build job commits the sticky disk from the action's post step.
+        # Give Blacksmith time to expose that snapshot to dependent jobs before
+        # these shards mount the read-only copy.
+        run: sleep 90
+
+      - name: Mount benchmark binary sticky disk
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: codspeed-memory-binary-${{ github.run_id }}
+          path: target/codspeed
+          commit: false
+
+      - name: Restore binary permissions
+        # Sticky disks preserve file contents but the CodSpeed runner expects
+        # every benchmark binary to be executable.
+        run: find target/codspeed -type f -exec chmod +x {} +
+
+      - name: Run memory benchmarks
+        uses: CodSpeedHQ/action@v4.17.0
+        with:
+          mode: memory
+          run: cargo codspeed run -m memory -p memory-benchmark-codspeed --bench memory_profiles "${{ matrix.workload }}"
+
+  cleanup:
+    name: Delete temporary benchmark sticky disk
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs:
+      - build
+      - run
+    if: ${{ always() }}
+    steps:
+      - name: Delete benchmark binary sticky disk
+        uses: useblacksmith/stickydisk-delete@v1
+        with:
+          delete-key: codspeed-memory-binary-${{ github.run_id }}

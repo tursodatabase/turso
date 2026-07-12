@@ -1660,6 +1660,17 @@ impl IntoIterator for ColumnMask {
     }
 }
 
+impl alloc::TryClone for ColumnMask {
+    type Error = alloc::TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            bitset: self.bitset.try_clone()?,
+            has_rowid_sentinel: self.has_rowid_sentinel,
+        })
+    }
+}
+
 /// Dense bitset optimized for the common case where all elements ≤64, with heap-allocated overflow.
 ///
 /// *WARNING*: This bitset occupies `O(max_num)` space when `max_num > 64`,
@@ -1679,6 +1690,18 @@ impl<T> Default for BitSet<T> {
             overflow: None,
             _phantom: PhantomData,
         }
+    }
+}
+
+impl<T> alloc::TryClone for BitSet<T> {
+    type Error = alloc::TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            inline: self.inline,
+            overflow: self.overflow.try_clone()?,
+            _phantom: PhantomData,
+        })
     }
 }
 
@@ -1758,7 +1781,7 @@ where
         } else {
             let overflow_idx = (index - Self::INLINE_BITS) / 64;
             let bit = (index - Self::INLINE_BITS) % 64;
-            let overflow = self.overflow.get_or_insert_with(alloc::Vec::new);
+            let overflow = self.overflow.get_or_insert_with(|| alloc::vec![]);
             if overflow_idx >= overflow.len() {
                 overflow.try_reserve(overflow_idx + 1 - overflow.len())?;
                 overflow.resize(overflow_idx + 1, 0);
@@ -1865,7 +1888,7 @@ where
     pub fn union_with(&mut self, other: &Self) -> Result<(), alloc::TryReserveError> {
         self.inline |= other.inline;
         if let Some(other_ov) = &other.overflow {
-            let self_ov = self.overflow.get_or_insert_with(alloc::Vec::new);
+            let self_ov = self.overflow.get_or_insert_with(|| alloc::vec![]);
             if self_ov.len() < other_ov.len() {
                 self_ov.try_reserve(other_ov.len() - self_ov.len())?;
                 self_ov.resize(other_ov.len(), 0);
@@ -1988,8 +2011,6 @@ impl<T> TryFrom<u128> for BitSet<T> {
     type Error = alloc::TryReserveError;
 
     fn try_from(from: u128) -> Result<Self, Self::Error> {
-        use crate::alloc::*;
-
         let high = (from >> 64) as u64;
         let overflow = match high != 0 {
             true => Some(alloc::try_vec![high]?),
@@ -2288,7 +2309,7 @@ impl JoinedTable {
                     ColDef::default(),
                 )
             })
-            .collect::<Vec<_>>();
+            .try_collect::<alloc::Vec<_>>()?;
 
         for (i, column) in columns.iter_mut().enumerate() {
             if super::expr::expr_is_array(
@@ -2401,7 +2422,7 @@ impl JoinedTable {
                     ColDef::default(),
                 )
             })
-            .collect::<Vec<_>>();
+            .try_collect::<alloc::Vec<_>>()?;
 
         for (i, column) in columns.iter_mut().enumerate() {
             if super::expr::expr_is_array(&result_columns[i].expr, Some(table_references)) {

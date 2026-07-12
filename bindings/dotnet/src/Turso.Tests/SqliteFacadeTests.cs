@@ -21,12 +21,16 @@ public class SqliteFacadeTests
     [Test]
     public void ConnectionStringBuilderParsesSqliteAliasesAndEnums()
     {
-        var builder = new SqliteConnectionStringBuilder("Filename=:memory:;Mode=Memory;Cache=Shared;Command Timeout=7");
+        var builder = new SqliteConnectionStringBuilder("Filename=:memory:;Mode=Memory;Cache=Shared;Command Timeout=7;DateTimeKind=Utc;DateTimeFormat=Ticks;BinaryGUID=False;Version=3");
 
         builder.DataSource.Should().Be(":memory:");
         builder.Mode.Should().Be(SqliteOpenMode.Memory);
         builder.Cache.Should().Be(SqliteCacheMode.Shared);
         builder.DefaultTimeout.Should().Be(7);
+        builder.DateTimeKind.Should().Be(DateTimeKind.Utc);
+        builder.DateTimeFormat.Should().Be("Ticks");
+        builder.BinaryGUID.Should().BeFalse();
+        builder.Version.Should().Be(3);
         builder["DataSource"].Should().Be(":memory:");
     }
 
@@ -57,6 +61,121 @@ public class SqliteFacadeTests
         reader.Read().Should().BeFalse();
         reader.Dispose();
         connection.State.Should().Be(ConnectionState.Closed);
+    }
+
+    [Test]
+    public async Task AsyncMethodsHonorPreCanceledToken()
+    {
+        using var cancellation = new CancellationTokenSource();
+        await cancellation.CancelAsync();
+        using var connection = new SqliteConnection("Data Source=:memory:");
+
+        Assert.ThrowsAsync<OperationCanceledException>(() => connection.OpenAsync(cancellation.Token))!
+            .CancellationToken.Should().Be(cancellation.Token);
+
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 1;";
+
+        Assert.ThrowsAsync<OperationCanceledException>(() => command.ExecuteScalarAsync(cancellation.Token))!
+            .CancellationToken.Should().Be(cancellation.Token);
+    }
+
+    [Test]
+    public void SchemaCollectionsReportTablesAndColumns()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery("""
+            CREATE TABLE Customers(
+                Id INTEGER PRIMARY KEY,
+                Name TEXT NOT NULL DEFAULT ''
+            );
+            CREATE VIEW CustomerNames AS SELECT Name FROM Customers;
+            """);
+
+        var collections = connection.GetSchema();
+        collections.Rows.Cast<DataRow>().Select(row => row[DbMetaDataColumnNames.CollectionName])
+            .Should().Contain(["Tables", "Columns"]);
+
+        var tables = connection.GetSchema("Tables");
+        tables.Rows.Cast<DataRow>().Select(row => row["TABLE_NAME"])
+            .Should().Contain(["Customers", "CustomerNames"]);
+
+        var columns = connection.GetSchema("Columns", [null, null, "Customers"]);
+        columns.Rows.Cast<DataRow>().Select(row => row["COLUMN_NAME"])
+            .Should().Equal("Id", "Name");
+        columns.Rows.Cast<DataRow>().Single(row => (string)row["COLUMN_NAME"] == "Name")["IS_NULLABLE"]
+            .Should().Be(false);
+    }
+
+    [Test]
+    public void TypedGettersConvertTextBackedValues()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+
+        using var reader = connection.ExecuteReader("SELECT '42', '1', 'true', 42, 3.5;");
+        reader.Read().Should().BeTrue();
+        reader.GetInt64(0).Should().Be(42);
+        reader.GetBoolean(1).Should().BeTrue();
+        reader.GetBoolean(2).Should().BeTrue();
+        reader.GetString(3).Should().Be("42");
+        reader.GetString(4).Should().Be("3.5");
+    }
+
+    [Test]
+    public void ExecuteNonQueryReportsRowsAffectedForCteDmlAndReturning()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE Data(Id INTEGER PRIMARY KEY, Value TEXT); INSERT INTO Data VALUES (1, 'a');");
+
+        connection.ExecuteNonQuery("WITH Target AS (SELECT 1 AS Id) UPDATE Data SET Value = 'b' WHERE Id = (SELECT Id FROM Target);")
+            .Should().Be(1);
+        connection.ExecuteNonQuery("UPDATE Data SET Value = 'c' WHERE Id = 1 RETURNING Id;")
+            .Should().Be(1);
+    }
+
+    [Test]
+    public void ReadOnlyConnectionRejectsCteDml()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "readonly-cte.db");
+        using (var connection = new SqliteConnection($"Data Source={path}"))
+        {
+            connection.Open();
+            connection.ExecuteNonQuery("CREATE TABLE Data(Id INTEGER PRIMARY KEY, Value TEXT); INSERT INTO Data VALUES (1, 'a');");
+        }
+
+        using var readOnly = new SqliteConnection($"Data Source={path};Mode=ReadOnly");
+        readOnly.Open();
+
+        var exception = Assert.Throws<SqliteException>(() => readOnly.ExecuteNonQuery("""
+            WITH Target AS (SELECT 1 AS Id)
+            UPDATE Data SET Value = 'b' WHERE Id = (SELECT Id FROM Target);
+            """));
+        exception!.SqliteErrorCode.Should().Be(8);
+    }
+
+    [Test]
+    public void ReadOnlyConnectionRejectsWriteAfterReadInBatch()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "readonly-batch.db");
+        using (var connection = new SqliteConnection($"Data Source={path}"))
+        {
+            connection.Open();
+            connection.ExecuteNonQuery("CREATE TABLE Data(Value TEXT);");
+        }
+
+        using var readOnly = new SqliteConnection($"Data Source={path};Mode=ReadOnly");
+        readOnly.Open();
+
+        var exception = Assert.Throws<SqliteException>(() => readOnly.ExecuteNonQuery("""
+            SELECT 1;
+            INSERT INTO Data VALUES ('blocked');
+            """));
+        exception!.SqliteErrorCode.Should().Be(8);
     }
 
     [Test]
@@ -419,6 +538,44 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void ScalarFunctionPreservesDecimalPrecision()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        const decimal expected = 1234567890123456789012345678m;
+
+        connection.CreateFunction("test", () => expected);
+
+        using var reader = connection.ExecuteReader("SELECT test();");
+        reader.Read().Should().BeTrue();
+        reader.GetDecimal(0).Should().Be(expected);
+    }
+
+    [Test]
+    public void DbTypeDecimalParametersPreservePrecision()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE Data(Value TEXT);");
+        const decimal expected = 1234567890123456789012345678m;
+
+        using (var insert = connection.CreateCommand())
+        {
+            insert.CommandText = "INSERT INTO Data VALUES ($value);";
+            var parameter = insert.CreateParameter();
+            parameter.ParameterName = "$value";
+            parameter.DbType = DbType.Decimal;
+            parameter.Value = expected;
+            insert.Parameters.Add(parameter);
+            insert.ExecuteNonQuery();
+        }
+
+        using var reader = connection.ExecuteReader("SELECT Value FROM Data;");
+        reader.Read().Should().BeTrue();
+        reader.GetDecimal(0).Should().Be(expected);
+    }
+
+    [Test]
     public void ScalarFunctionPropagatesSqliteExceptionCode()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -710,6 +867,41 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void GetValueMaterializesDeclaredGuidColumns()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            """
+            CREATE TABLE ValuesWithGuids (
+                TextGuid GUID,
+                BlobGuid UNIQUEIDENTIFIER,
+                RawBlob BLOB
+            );
+            INSERT INTO ValuesWithGuids VALUES (
+                'dc0d7e0e-365d-4948-ab9b-8ca8056bf93a',
+                X'0E7E0DDC5D364849AB9B8CA8056BF93A',
+                X'0E7E0DDC5D364849AB9B8CA8056BF93A'
+            );
+            """);
+
+        using var reader = connection.ExecuteReader("SELECT TextGuid, BlobGuid, RawBlob FROM ValuesWithGuids;");
+        reader.Read().Should().BeTrue();
+
+        var expected = new Guid("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+        reader.GetFieldType(0).Should().Be(typeof(Guid));
+        reader.GetFieldType(1).Should().Be(typeof(Guid));
+        reader.GetValue(0).Should().Be(expected);
+        reader.GetValue(1).Should().Be(expected);
+        reader.GetValue(2).Should().BeOfType<byte[]>();
+
+        var schema = reader.GetSchemaTable();
+        schema.Rows[0][SchemaTableColumn.DataType].Should().Be(typeof(Guid));
+        schema.Rows[1][SchemaTableColumn.DataType].Should().Be(typeof(Guid));
+        schema.Rows[2][SchemaTableColumn.DataType].Should().Be(typeof(byte[]));
+    }
+
+    [Test]
     public void GetFieldValueThrowsForNullTypedValues()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -720,6 +912,25 @@ public class SqliteFacadeTests
 
         Assert.Throws<InvalidOperationException>(() => reader.GetFieldValue<byte[]>(0))!
             .Message.Should().Be(Data.Sqlite.Properties.Resources.CalledOnNullValue(0));
+    }
+
+    [Test]
+    public void PrepareDoesNotRejectMultiStatementBatches()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            PRAGMA read_uncommitted = 1;
+            CREATE TABLE t(value INTEGER);
+            INSERT INTO t VALUES (1);
+            SELECT value FROM t;
+            """;
+
+        command.Prepare();
+        command.ExecuteScalar().Should().Be(1L);
     }
 
     [Test]

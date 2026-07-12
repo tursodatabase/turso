@@ -101,6 +101,17 @@ pub struct PyTursoSyncDatabaseConfig {
     pub remote_encryption_key: Option<String>,
     // encryption cipher for the remote database (used to calculate reserved_bytes)
     pub remote_encryption_cipher: Option<PyRemoteEncryptionCipher>,
+    // optional cap on the number of CDC operations packed into a single push HTTP batch.
+    // when set, push splits on transaction boundaries once the current batch has accumulated
+    // at least this many operations. a single user transaction is never split across batches.
+    // None (default) sends the entire change set in one batch.
+    pub push_operations_threshold: Option<usize>,
+    // optional hint, in bytes, that splits the bootstrap download into multiple
+    // /pull-updates HTTP requests of >= this many bytes each. None (default) bootstraps
+    // in a single round-trip. no-op when partial-sync uses the query bootstrap strategy.
+    pub pull_bytes_threshold: Option<usize>,
+    // use MVCC logical-log stream for incremental V1 pulls
+    pub logical_mvcc_pull: bool,
 }
 
 #[pymethods]
@@ -116,6 +127,9 @@ impl PyTursoSyncDatabaseConfig {
         partial_sync=None,
         remote_encryption_key=None,
         remote_encryption_cipher=None,
+        push_operations_threshold=None,
+        pull_bytes_threshold=None,
+        logical_mvcc_pull=false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -128,6 +142,9 @@ impl PyTursoSyncDatabaseConfig {
         partial_sync: Option<&PyTursoPartialSyncOpts>,
         remote_encryption_key: Option<String>,
         remote_encryption_cipher: Option<PyRemoteEncryptionCipher>,
+        push_operations_threshold: Option<usize>,
+        pull_bytes_threshold: Option<usize>,
+        logical_mvcc_pull: bool,
     ) -> Self {
         Self {
             path,
@@ -139,6 +156,9 @@ impl PyTursoSyncDatabaseConfig {
             partial_sync: partial_sync.cloned(),
             remote_encryption_key,
             remote_encryption_cipher,
+            push_operations_threshold,
+            pull_bytes_threshold,
+            logical_mvcc_pull,
         }
     }
 }
@@ -194,8 +214,9 @@ pub fn py_turso_sync_new(
             None => None,
         },
         remote_encryption_key: sync_config.remote_encryption_key.clone(),
-        push_operations_threshold: None,
-        pull_bytes_threshold: None,
+        push_operations_threshold: sync_config.push_operations_threshold,
+        pull_bytes_threshold: sync_config.pull_bytes_threshold,
+        logical_mvcc_pull: sync_config.logical_mvcc_pull,
     };
     let database =
         TursoDatabaseSync::<Vec<u8>>::new(db_config, sync_config).map_err(turso_error_to_py_err)?;

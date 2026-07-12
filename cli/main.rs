@@ -50,8 +50,9 @@ fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
 fn run_sync_server(app: app::Limbo) -> anyhow::Result<()> {
     let address = app.opts.sync_server_address.clone().unwrap();
     let conn = app.get_connection();
+    let db_path = app.opts.db_file.clone();
     let interrupt_count = app.get_interrupt_count();
-    let sync_server = TursoSyncServer::new(address, conn, interrupt_count);
+    let sync_server = TursoSyncServer::new(address, db_path, conn, interrupt_count)?;
 
     sync_server.run()
 }

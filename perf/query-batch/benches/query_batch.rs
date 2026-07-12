@@ -121,6 +121,7 @@ fn text_value(row: &turso::Row, idx: usize) -> String {
     }
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("query_batch");

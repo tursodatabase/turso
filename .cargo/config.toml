@@ -31,7 +31,7 @@ rustflags = [
   "link-args=-Wl,-z,nodelete",
 ]
 
-# To be able to run unit tests on Windows, support compilation to 'x86_64-pc-windows-msvc'.
+# To be able to run unit tests on Windows, support compilation to MSVC targets.
 [target.'cfg(target_env = "msvc")']
 rustflags = [
   "--cfg=tokio_unstable",

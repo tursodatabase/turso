@@ -146,6 +146,7 @@ pub fn limbo_error_to_kind(err: &LimboError) -> &'static str {
         LimboError::ParseError(_) => "ParseError",
         LimboError::TxError(_) => "TxError",
         LimboError::DatabaseFull(_) => "DatabaseFull",
+        LimboError::OutOfMemory => "OutOfMemory",
         _ => "Other",
     }
 }
@@ -171,6 +172,7 @@ fn error_kind_to_limbo_error(kind: &str, message: &str) -> LimboError {
         "ParseError" => LimboError::ParseError(message.to_string()),
         "TxError" => LimboError::TxError(message.to_string()),
         "DatabaseFull" => LimboError::DatabaseFull(message.to_string()),
+        "OutOfMemory" => LimboError::OutOfMemory,
         _ => LimboError::InternalError(format!("{kind}: {message}")),
     }
 }
@@ -205,6 +207,9 @@ mod tests {
                 |e| matches!(e, LimboError::DatabaseFull(m) if m.starts_with("nextval: reached ")),
             ),
             (LimboError::Busy, |e| matches!(e, LimboError::Busy)),
+            (LimboError::OutOfMemory, |e| {
+                matches!(e, LimboError::OutOfMemory)
+            }),
             (LimboError::WriteWriteConflict, |e| {
                 matches!(e, LimboError::WriteWriteConflict)
             }),

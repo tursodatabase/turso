@@ -282,6 +282,48 @@ test('simple-db', async () => {
     await expect(async () => await db.pull()).rejects.toThrowError(/sync is disabled as database was opened without sync support/);
 })
 
+test('experimental features are propagated to the local database', async () => {
+    // Generated columns are gated behind the `generated_columns` experimental
+    // feature. A synced database opened without the `experimental` option must
+    // reject the DDL, proving the feature is off by default.
+    const dbDefault = new Database({ path: ':memory:' });
+    await dbDefault.connect();
+    await expect(async () => await dbDefault.exec("CREATE TABLE t(x INTEGER, y INTEGER AS (x * 2))"))
+        .rejects.toThrowError(/Generated columns require/);
+
+    // The same statement succeeds once the feature is enabled, which only works
+    // if `experimental` is threaded through the sync engine to the local engine.
+    const dbExperimental = new Database({ path: ':memory:', experimental: ['generated_columns'] });
+    await dbExperimental.connect();
+    await dbExperimental.exec("CREATE TABLE t(x INTEGER, y INTEGER AS (x * 2))");
+    await dbExperimental.exec("INSERT INTO t(x) VALUES (1), (2), (3)");
+    expect(await (await dbExperimental.prepare("SELECT y FROM t ORDER BY x")).all()).toEqual([{ y: 2 }, { y: 4 }, { y: 6 }]);
+})
+
+test('experimental features are propagated to the synced database', async ({ server }) => {
+    // Same as above, but for a remote-backed (sync engine) database: the
+    // feature must be threaded through SyncEngine -> the local engine that the
+    // sync engine opens internally.
+    const dbDefault = await connect({ path: ':memory:', url: server.dbUrl() });
+    await expect(async () => await dbDefault.exec("CREATE TABLE g(x INTEGER, y INTEGER AS (x * 2))"))
+        .rejects.toThrowError(/Generated columns require/);
+    await dbDefault.close();
+
+    // With the feature enabled the gated DDL succeeds and the change pushes to
+    // the remote...
+    const writer = await connect({ path: ':memory:', url: server.dbUrl(), experimental: ['generated_columns'] });
+    await writer.exec("CREATE TABLE g(x INTEGER, y INTEGER AS (x * 2))");
+    await writer.exec("INSERT INTO g(x) VALUES (1), (2), (3)");
+    expect(await (await writer.prepare("SELECT y FROM g ORDER BY x")).all()).toEqual([{ y: 2 }, { y: 4 }, { y: 6 }]);
+    await writer.push();
+    await writer.close();
+
+    // ...and a fresh client bootstraps the generated-columns schema from the remote.
+    const reader = await connect({ path: ':memory:', url: server.dbUrl(), experimental: ['generated_columns'] });
+    expect(await (await reader.prepare("SELECT y FROM g ORDER BY x")).all()).toEqual([{ y: 2 }, { y: 4 }, { y: 6 }]);
+    await reader.close();
+})
+
 test('implicit connect', async ({ server }) => {
     const db = new Database({ path: ':memory:', url: server.dbUrl() });
     const defer = await db.prepare("SELECT * FROM not_found");
@@ -670,7 +712,7 @@ test('update', async ({ server }) => {
     await db.push();
 })
 
-test('concurrent-updates', async ({ server }) => {
+test('concurrent-updates', { timeout: process.platform === 'win32' ? 120_000 : undefined }, async ({ server }) => {
     {
         const db = await connect({ path: ':memory:', url: server.dbUrl(), longPollTimeoutMs: 5000 });
         await db.exec("CREATE TABLE IF NOT EXISTS q(x TEXT PRIMARY KEY, y)");

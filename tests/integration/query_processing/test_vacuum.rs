@@ -687,7 +687,7 @@ fn test_vacuum_into_rejects_active_select_on_same_connection(
                 }
             }
             StepResult::Done => break,
-            StepResult::IO => select_stmt.get_pager().io.step()?,
+            StepResult::IO | StepResult::Yield => select_stmt.get_pager().io.step()?,
             StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
             StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
         }
@@ -747,7 +747,7 @@ fn test_vacuum_into_rejects_reprepared_active_select_on_same_connection(
                 }
             }
             StepResult::Done => break,
-            StepResult::IO => select_stmt.get_pager().io.step()?,
+            StepResult::IO | StepResult::Yield => select_stmt.get_pager().io.step()?,
             StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
             StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
         }
@@ -789,7 +789,7 @@ fn test_same_connection_select_then_write_then_continue_select(
                 }
             }
             StepResult::Done => break,
-            StepResult::IO => select_stmt.get_pager().io.step()?,
+            StepResult::IO | StepResult::Yield => select_stmt.get_pager().io.step()?,
             StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
             StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
         }
@@ -6111,7 +6111,7 @@ fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_
             StepResult::Busy | StepResult::Interrupt => {
                 anyhow::bail!("unexpected non-IO result while staging checkpoint cleanup test")
             }
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 while let Some(event) = io.step_one()? {
                     if event.path == source_wal_path && event.kind == QueuedIoOpKind::Pwritev {
                         saw_source_wal_batch_write = true;

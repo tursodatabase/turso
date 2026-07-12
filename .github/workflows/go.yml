@@ -51,7 +51,6 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - uses: "./.github/shared/setup-sccache"
 
       - name: Setup Go
         uses: actions/setup-go@v5

@@ -178,6 +178,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["mvcc_checkpoint_threshold"],
         ),
+        PragmaName::MvccGcThreshold => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["mvcc_gc_threshold"],
+        ),
         ForeignKeys => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["foreign_keys"],

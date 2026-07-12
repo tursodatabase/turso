@@ -231,11 +231,12 @@
 //! Frame-level atomicity only: torn tails are discarded; partially written frames are not salvaged.
 #![allow(dead_code)]
 
-use crate::io::FileSyncType;
+use crate::io::{FileSyncType, SharedBufferData};
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::turso_assert;
 use crate::{
+    alloc::{ConcurrentAllocator, TursoAllocator},
     io::{CompletionGroup, ReadComplete},
     io_yield_one,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
@@ -255,9 +256,10 @@ use crate::File;
 /// Default to the size of 1000 SQLite WAL frames; disable by setting a negative value.
 pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = 4120 * 1000;
 
-/// Optional callback invoked after serialization with a zero-copy reference to
-/// the serialized frame bytes and the running CRC, before the disk write.
-pub type OnSerializationComplete<'a> = Option<&'a dyn Fn(&[u8], u32) -> crate::Result<()>>;
+/// Optional callback invoked after serialization with shared ownership of the
+/// serialized frame bytes and the running CRC, before the disk write.
+pub type OnSerializationComplete<'a> =
+    Option<&'a dyn Fn(SharedBufferData, u32) -> crate::Result<()>>;
 
 const LOG_MAGIC: u32 = 0x4C4D4C32; // "LML2" in LE
 const LOG_VERSION_V2: u8 = 2;
@@ -629,7 +631,7 @@ impl LogicalLog {
         let payload_size_u64 = payload_size as u64;
 
         #[cfg(feature = "conn_raw_api")]
-        let has_portable_changes = !tx.portable_changes.is_empty();
+        let has_portable_changes = tx.portable_changes_required || !tx.portable_changes.is_empty();
         #[cfg(not(feature = "conn_raw_api"))]
         let has_portable_changes = false;
         #[cfg(feature = "conn_raw_api")]
@@ -818,28 +820,29 @@ impl LogicalLog {
 
         // 5. Fill the LOG_HDR slot (first-write only). Non-first-write
         // commits leave it as zeros; those bytes never reach disk because
-        // we wrap the buffer with `new_with_start(..., LOG_HDR_SIZE)` below.
+        // the shared view exposes only `data[LOG_HDR_SIZE..]` below.
         if is_first_write {
             let header_bytes = self.header.as_ref().unwrap().encode();
             tx.buf[..LOG_HDR_SIZE].copy_from_slice(&header_bytes);
         }
 
-        // 6. Observer hook: gets a zero-copy reference into the on-disk bytes.
-        let on_disk_start = if is_first_write { 0 } else { LOG_HDR_SIZE };
+        // 6. Observer hook: gets shared ownership of a zero-copy view into the
+        // on-disk bytes.
+        let raw = Arc::new(tx.buf.into_boxed_slice());
+        let shared = if is_first_write {
+            SharedBufferData::new(raw)
+        } else {
+            SharedBufferData::new_view(raw, LOG_HDR_SIZE)
+        };
         if let Some(cb) = on_serialization_complete {
-            cb(&tx.buf[on_disk_start..], crc)?;
+            cb(shared.clone(), crc)?;
         }
 
         // 7. Hand off `tx.buf` to the I/O layer without copying. For
         // non-first-write commits, the Buffer wrapper exposes only
         // `data[LOG_HDR_SIZE..]` so the unused 56-byte prefix never reaches
-        // disk — a single pwrite, no shift.
-        let raw = tx.buf;
-        let buffer = if is_first_write {
-            Arc::new(Buffer::new(raw))
-        } else {
-            Arc::new(Buffer::new_with_start(raw, LOG_HDR_SIZE))
-        };
+        // disk: a single pwrite, no shift.
+        let buffer = Arc::new(Buffer::new_shared_data(shared));
         let buffer_len = buffer.len();
         let c = Completion::new_write(move |res: Result<i32, CompletionError>| {
             let Ok(bytes_written) = res else {
@@ -902,8 +905,8 @@ impl LogicalLog {
     /// Returns `(completion, bytes_written)`. The caller must call
     /// `advance_offset_after_success(bytes)` after confirming the commit succeeded.
     ///
-    /// If `on_serialization_complete` is provided, it is called with a zero-copy
-    /// reference to the framed bytes and the running CRC after framing but
+    /// If `on_serialization_complete` is provided, it is called with shared
+    /// ownership of the framed bytes and the running CRC after framing but
     /// before the disk write.
     pub fn log_tx_deferred_offset(
         &mut self,
@@ -1036,7 +1039,7 @@ pub(crate) fn serialize_op_entry(
     row_version: &RowVersion,
     portable_extension: Option<&[u8]>,
 ) -> Result<()> {
-    let is_delete = row_version.end.is_some();
+    let is_delete = row_version.end().is_some();
 
     let mut flags = 0u8;
     if row_version.btree_resident {
@@ -3469,6 +3472,15 @@ impl StreamingLogicalLogReader {
         parsed_op: ParsedOp,
         get_index_info: &mut impl FnMut(MVTableId, IndexOpKind) -> Result<Arc<IndexInfo>>,
     ) -> Result<StreamingResult> {
+        self.parsed_op_to_streaming_in(parsed_op, get_index_info, TursoAllocator)
+    }
+
+    pub(crate) fn parsed_op_to_streaming_in<A: ConcurrentAllocator>(
+        &self,
+        parsed_op: ParsedOp,
+        get_index_info: &mut impl FnMut(MVTableId, IndexOpKind) -> Result<Arc<IndexInfo>>,
+        alloc: A,
+    ) -> Result<StreamingResult> {
         match parsed_op {
             ParsedOp::UpsertTable {
                 table_id,
@@ -3479,12 +3491,17 @@ impl StreamingLogicalLogReader {
             } => {
                 // Compute column_count from the serialized record so recovered rows keep
                 // the same shape metadata as non-recovered rows.
+                // Decode shape metadata by reference; ownership is only needed for the row payload.
                 let column_count =
                     crate::types::ImmutableRecordRef::from_bin_record(&record_bytes).column_count();
-                let row = Row::new_table_row(
-                    RowID::new(table_id, rowid.row_id.clone()),
-                    record_bytes,
-                    column_count,
+                let row = crate::with_mv_store_allocation_site!(
+                    RowPayload,
+                    Row::new_table_row_in(
+                        RowID::new(table_id, rowid.row_id.clone()),
+                        &record_bytes,
+                        column_count,
+                        alloc,
+                    )?
                 );
                 Ok(StreamingResult::UpsertTableRow {
                     row,
@@ -3513,7 +3530,7 @@ impl StreamingLogicalLogReader {
                 let key_record = crate::types::ImmutableRecord::from_bin_record(payload);
                 let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Upsert)?;
-                let key = SortableIndexKey::new_from_record(key_record, index_info);
+                let key = Arc::new(SortableIndexKey::new_from_record(key_record, index_info));
                 let rowid = RowID::new(table_id, RowKey::Record(key));
                 let row = Row::new_index_row(rowid.clone(), column_count);
                 Ok(StreamingResult::UpsertIndexRow {
@@ -3532,7 +3549,7 @@ impl StreamingLogicalLogReader {
                 let key_record = crate::types::ImmutableRecord::from_bin_record(payload);
                 let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Delete)?;
-                let key = SortableIndexKey::new_from_record(key_record, index_info);
+                let key = Arc::new(SortableIndexKey::new_from_record(key_record, index_info));
                 let rowid = RowID::new(table_id, RowKey::Record(key));
                 let row = Row::new_index_row(rowid.clone(), column_count);
                 Ok(StreamingResult::DeleteIndexRow {
@@ -3900,6 +3917,7 @@ pub(crate) enum IndexOpKind {
 mod tests {
     use crate::types::IOResult;
     use crate::util::IOExt as _;
+    use std::cell::RefCell;
     use std::collections::BTreeSet;
     use std::sync::Once;
 
@@ -3922,7 +3940,7 @@ mod tests {
             read_varint, read_varint_partial, varint_len, write_varint, DatabaseHeader,
         },
         types::{ImmutableRecord, ImmutableRecordRef, IndexInfo, Text},
-        Buffer, Completion, Value, ValueRef,
+        Buffer, Completion, SharedBufferData, Value, ValueRef,
     };
 
     use super::{
@@ -3961,8 +3979,10 @@ mod tests {
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row: row.clone(),
             btree_resident: false,
         };
@@ -4032,6 +4052,20 @@ mod tests {
         ops
     }
 
+    fn read_file_range_bytes(
+        file: &Arc<dyn crate::File>,
+        io: &Arc<dyn crate::IO>,
+        pos: u64,
+        len: usize,
+    ) -> Vec<u8> {
+        let buf = Arc::new(Buffer::new_temporary(len));
+        let c = file
+            .pread(pos, Completion::new_read(buf.clone(), |_| None))
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        buf.as_slice().to_vec()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn append_single_table_op_tx(
         log: &mut LogicalLog,
@@ -4046,12 +4080,14 @@ mod tests {
         let row = generate_simple_string_row(table_id, rowid, payload_text);
         let row_version = crate::mvcc::database::RowVersion {
             id: commit_ts,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: if is_delete {
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(if is_delete {
                 Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
             } else {
                 None
-            },
+            }),
             row,
             btree_resident,
         };
@@ -4173,8 +4209,10 @@ mod tests {
     ) -> crate::mvcc::database::RowVersion {
         crate::mvcc::database::RowVersion {
             id: commit_ts,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row: generate_simple_string_row(table_id, rowid, data),
             btree_resident: false,
         }
@@ -4394,9 +4432,10 @@ mod tests {
                     tx_id,
                     Row::new_table_row(
                         RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob().to_vec(),
+                        data.as_blob(),
                         5,
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             // now insert a row into table -2
@@ -4466,9 +4505,10 @@ mod tests {
                     tx_id,
                     Row::new_table_row(
                         RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob().to_vec(),
+                        data.as_blob(),
                         5,
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -4580,9 +4620,10 @@ mod tests {
                     tx_id,
                     Row::new_table_row(
                         RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob().to_vec(),
+                        data.as_blob(),
                         5,
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -4720,7 +4761,7 @@ mod tests {
             )
             .unwrap();
             let sortable_key = SortableIndexKey::new_from_record(key_record, index_info.clone());
-            let index_rowid = RowID::new(index_id, RowKey::Record(sortable_key));
+            let index_rowid = RowID::new(index_id, RowKey::Record(Arc::new(sortable_key)));
 
             // Use read_from_table_or_index to read the index row
             // This verifies that index rows were properly serialized and deserialized from the logical log
@@ -4780,8 +4821,10 @@ mod tests {
         let mut tx1 = crate::mvcc::database::LogRecord::new(10);
         tx1.push_row_version_for_test(&crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(10)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(10),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row: row.clone(),
             btree_resident: false,
         });
@@ -4791,8 +4834,10 @@ mod tests {
         let mut tx2 = crate::mvcc::database::LogRecord::new(20);
         tx2.push_row_version_for_test(&crate::mvcc::database::RowVersion {
             id: 2,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(20)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(20),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
         });
@@ -4944,8 +4989,10 @@ mod tests {
             3,
             &[crate::mvcc::database::RowVersion {
                 id: 3,
-                begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(3)),
-                end: None,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(3),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
                 row: row3,
                 btree_resident: false,
             }],
@@ -4981,6 +5028,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_on_serialization_complete_gets_shared_write_bytes() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file(
+                "serialization-callback-shared.db-log",
+                OpenFlags::Create,
+                false,
+            )
+            .unwrap();
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+        let captured = RefCell::new(Vec::<(SharedBufferData, u32)>::new());
+        let callback = |bytes: SharedBufferData, crc: u32| {
+            captured.borrow_mut().push((bytes, crc));
+            Ok(())
+        };
+
+        let tx1 = crate::mvcc::database::LogRecord::for_test(
+            1,
+            &[crate::mvcc::database::RowVersion {
+                id: 1,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(1),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
+                row: generate_simple_string_row((-2).into(), 1, "first"),
+                btree_resident: false,
+            }],
+            None,
+        );
+        let (c, first_len) = log.log_tx_deferred_offset(tx1, Some(&callback)).unwrap();
+        io.wait_for_completion(c).unwrap();
+        log.advance_offset_after_success(first_len);
+
+        let tx2 = crate::mvcc::database::LogRecord::for_test(
+            2,
+            &[crate::mvcc::database::RowVersion {
+                id: 2,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(2),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
+                row: generate_simple_string_row((-2).into(), 2, "second"),
+                btree_resident: false,
+            }],
+            None,
+        );
+        let (c, second_len) = log.log_tx_deferred_offset(tx2, Some(&callback)).unwrap();
+        io.wait_for_completion(c).unwrap();
+        log.advance_offset_after_success(second_len);
+
+        let captured = captured.borrow();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].0.len(), first_len as usize);
+        assert_eq!(captured[1].0.len(), second_len as usize);
+        assert!(matches!(&captured[0].0, SharedBufferData::Full(_)));
+        assert!(matches!(&captured[1].0, SharedBufferData::View(_)));
+
+        let first_on_disk = read_file_range_bytes(&file, &io, 0, first_len as usize);
+        let second_on_disk = read_file_range_bytes(&file, &io, first_len, second_len as usize);
+        assert_eq!(captured[0].0.as_slice(), first_on_disk.as_slice());
+        assert_eq!(captured[1].0.as_slice(), second_on_disk.as_slice());
+        assert_eq!(
+            captured[0].1,
+            u32::from_le_bytes(
+                captured[0].0.as_slice()[captured[0].0.len() - TX_TRAILER_SIZE
+                    ..captured[0].0.len() - TX_TRAILER_SIZE + 4]
+                    .try_into()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            captured[1].1,
+            u32::from_le_bytes(
+                captured[1].0.as_slice()[captured[1].0.len() - TX_TRAILER_SIZE
+                    ..captured[1].0.len() - TX_TRAILER_SIZE + 4]
+                    .try_into()
+                    .unwrap()
+            )
+        );
+    }
+
     /// What this test checks: A payload bit flip in a fully present tail frame is ignored as invalid tail.
     /// Why this matters: Availability-focused recovery keeps the valid prefix even when newest tail bytes are bad.
     #[test]
@@ -4996,8 +5126,10 @@ mod tests {
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(123)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(123),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
         };
@@ -5468,8 +5600,10 @@ mod tests {
         let mut tx = crate::mvcc::database::LogRecord::new(300);
         tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(300)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(300),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row: generate_simple_string_row((-2).into(), 42, "flip"),
             btree_resident: false,
         });
@@ -5543,15 +5677,16 @@ mod tests {
                 if is_delete {
                     tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
                         id: 0,
-                        begin: None,
-                        end: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(
-                            tx.tx_timestamp,
+                        begin: crate::mvcc::database::PackedTs::pack(None),
+                        end: crate::mvcc::database::PackedTs::pack(Some(
+                            crate::mvcc::database::TxTimestampOrID::Timestamp(tx.tx_timestamp),
                         )),
                         row: Row::new_table_row(
                             RowID::new((-2).into(), RowKey::Int(rowid)),
-                            Vec::new(),
+                            &[],
                             0,
-                        ),
+                        )
+                        .unwrap(),
                         btree_resident,
                     });
                     expected.push(ExpectedTableOp::Delete {
@@ -5564,10 +5699,10 @@ mod tests {
                     let row = generate_simple_string_row((-2).into(), rowid, &payload);
                     tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
                         id: 0,
-                        begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(
-                            tx.tx_timestamp,
+                        begin: crate::mvcc::database::PackedTs::pack(Some(
+                            crate::mvcc::database::TxTimestampOrID::Timestamp(tx.tx_timestamp),
                         )),
-                        end: None,
+                        end: crate::mvcc::database::PackedTs::pack(None),
                         row: row.clone(),
                         btree_resident,
                     });
@@ -5599,10 +5734,10 @@ mod tests {
             });
             large_tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
                 id: rowid as u64,
-                begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(
-                    large_commit_ts,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(large_commit_ts),
                 )),
-                end: None,
+                end: crate::mvcc::database::PackedTs::pack(None),
                 row,
                 btree_resident: false,
             });
@@ -5636,12 +5771,14 @@ mod tests {
             let row = generate_simple_string_row((-2).into(), rowid, &payload_text);
             let row_version = crate::mvcc::database::RowVersion {
                 id: commit_ts,
-                begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-                end: if is_delete {
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(if is_delete {
                     Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
                 } else {
                     None
-                },
+                }),
                 row: row.clone(),
                 btree_resident,
             };
@@ -5743,8 +5880,10 @@ mod tests {
         row.id.table_id = (-2).into();
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(55)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(55),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: true,
         };
@@ -5802,8 +5941,10 @@ mod tests {
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         let version = crate::mvcc::database::RowVersion {
             id: 1,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(10)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(10),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
         };
@@ -6094,8 +6235,10 @@ mod tests {
         let row = generate_simple_string_row(table_id, rowid, value);
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
         }
@@ -6115,33 +6258,41 @@ mod tests {
             2,
         )
         .unwrap();
-        let sortable_key = SortableIndexKey::new_from_record(
-            key_record,
-            Arc::new(IndexInfo {
-                has_rowid: true,
-                num_cols: 2,
-                is_unique: false,
-                ..Default::default()
-            }),
-        );
-        let row_id = RowID::new(table_id, RowKey::Record(sortable_key));
+        let sortable_key = SortableIndexKey::new_from_record(key_record, test_index_info());
+        let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
         let row = Row::new_index_row(row_id, 2);
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
-            begin: Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts)),
-            end: None,
+            begin: crate::mvcc::database::PackedTs::pack(Some(
+                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+            )),
+            end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
         }
     }
 
     fn test_index_info() -> Arc<IndexInfo> {
-        Arc::new(IndexInfo {
-            has_rowid: true,
-            num_cols: 2,
-            is_unique: false,
-            ..Default::default()
-        })
+        Arc::new(
+            IndexInfo::new(
+                [
+                    crate::types::KeyInfo {
+                        sort_order: turso_parser::ast::SortOrder::Asc,
+                        collation: crate::translate::collate::CollationSeq::Binary,
+                        nulls_order: None,
+                    },
+                    crate::types::KeyInfo {
+                        sort_order: turso_parser::ast::SortOrder::Asc,
+                        collation: crate::translate::collate::CollationSeq::Binary,
+                        nulls_order: None,
+                    },
+                ],
+                true,
+                2,
+                false,
+            )
+            .unwrap(),
+        )
     }
 
     fn make_test_raw_table_row_version(
@@ -6151,19 +6302,20 @@ mod tests {
         commit_ts: u64,
         is_delete: bool,
     ) -> crate::mvcc::database::RowVersion {
-        let row = Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), record_bytes, 1);
+        let row =
+            Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), &record_bytes, 1).unwrap();
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
-            begin: if is_delete {
+            begin: crate::mvcc::database::PackedTs::pack(if is_delete {
                 None
             } else {
                 Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
-            },
-            end: if is_delete {
+            }),
+            end: crate::mvcc::database::PackedTs::pack(if is_delete {
                 Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
             } else {
                 None
-            },
+            }),
             row,
             btree_resident: false,
         }
@@ -6177,20 +6329,20 @@ mod tests {
         is_delete: bool,
     ) -> crate::mvcc::database::RowVersion {
         let sortable_key = SortableIndexKey::new_from_bytes(payload_bytes, test_index_info());
-        let row_id = RowID::new(table_id, RowKey::Record(sortable_key));
+        let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
         let row = Row::new_index_row(row_id, 2);
         crate::mvcc::database::RowVersion {
             id: rowid as u64,
-            begin: if is_delete {
+            begin: crate::mvcc::database::PackedTs::pack(if is_delete {
                 None
             } else {
                 Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
-            },
-            end: if is_delete {
+            }),
+            end: crate::mvcc::database::PackedTs::pack(if is_delete {
                 Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
             } else {
                 None
-            },
+            }),
             row,
             btree_resident: false,
         }

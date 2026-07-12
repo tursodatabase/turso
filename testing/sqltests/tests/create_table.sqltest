@@ -242,3 +242,37 @@ expect {
     test
     ok
 }
+
+# A COLLATE clause on a PRIMARY KEY or UNIQUE table-constraint column applies
+# to the implied unique index, exactly like CREATE INDEX ... (a COLLATE x).
+@cross-check-integrity
+test create_table_primary_key_collate_nocase_uniqueness {
+    CREATE TABLE t_pkc(a, PRIMARY KEY(a COLLATE NOCASE));
+    INSERT INTO t_pkc VALUES ('x');
+    INSERT INTO t_pkc VALUES ('X');
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+@cross-check-integrity
+test create_table_unique_collate_nocase_uniqueness {
+    CREATE TABLE t_uqc(a, UNIQUE(a COLLATE NOCASE));
+    INSERT INTO t_uqc VALUES ('x');
+    INSERT INTO t_uqc VALUES ('X');
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+@cross-check-integrity
+test create_table_primary_key_collate_desc_accepts_distinct_values {
+    CREATE TABLE t_pkd(a, PRIMARY KEY(a COLLATE NOCASE DESC));
+    INSERT INTO t_pkd VALUES ('b'), ('A'), ('C');
+    SELECT a FROM t_pkd ORDER BY a COLLATE NOCASE;
+}
+expect {
+    A
+    b
+    C
+}

@@ -1,8 +1,10 @@
-use divan::{black_box, AllocProfiler, Bencher};
+#![cfg_attr(nightly, feature(allocator_api))]
+
+use divan::{black_box, black_box_drop, AllocProfiler, Bencher};
 use mimalloc::MiMalloc;
 use rustc_hash::FxBuildHasher;
 use turso_core::alloc::{
-    self, TursoBinaryHeapExt, TursoFromIterator, TursoHashMapExt, TursoHashSetExt,
+    self, TryClone, TursoBinaryHeapExt, TursoFromIterator, TursoHashMapExt, TursoHashSetExt,
     TursoIteratorExt, TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt,
 };
 
@@ -28,6 +30,15 @@ struct NonCopyValue {
     payload: [usize; 4],
 }
 
+impl turso_core::alloc::TryClone for NonCopyValue {
+    type Error = std::convert::Infallible;
+
+    #[inline(always)]
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(self.clone())
+    }
+}
+
 impl NonCopyValue {
     fn new(id: usize) -> Self {
         Self {
@@ -42,11 +53,62 @@ impl NonCopyValue {
     }
 }
 
+fn copy_values_turso(len: usize) -> alloc::Vec<usize> {
+    (0..len).try_collect().unwrap()
+}
+
+fn copy_values_std(len: usize) -> std::vec::Vec<usize> {
+    (0..len).collect()
+}
+
+fn non_copy_values_turso(len: usize) -> alloc::Vec<NonCopyValue> {
+    (0..len).map(NonCopyValue::new).try_collect().unwrap()
+}
+
+fn non_copy_values_std(len: usize) -> std::vec::Vec<NonCopyValue> {
+    (0..len).map(NonCopyValue::new).collect()
+}
+
+/// Element type whose `TryClone` does real fallible work: owns an
+/// allocator-backed vec, like `schema::UniqueSet`. Exercises the
+/// element-wise `TryClone` path of `Vec::try_clone`.
+#[derive(Clone)]
+struct FallibleValue {
+    inner: alloc::Vec<usize>,
+}
+
+impl turso_core::alloc::TryClone for FallibleValue {
+    type Error = turso_core::alloc::TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            inner: self.inner.try_clone()?,
+        })
+    }
+}
+
+fn fallible_values_turso(len: usize) -> alloc::Vec<FallibleValue> {
+    (0..len)
+        .map(|id| FallibleValue {
+            inner: (id..id + 4).try_collect().unwrap(),
+        })
+        .try_collect()
+        .unwrap()
+}
+
+fn string_values_turso(len: usize) -> alloc::Vec<alloc::String> {
+    (0..len)
+        .map(|id| format!("value-{id:08}"))
+        .try_collect()
+        .unwrap()
+}
+
 struct LowerBoundOnly<I> {
     iter: I,
 }
 
 impl<I> LowerBoundOnly<I> {
+    #[inline(always)]
     fn new(iter: I) -> Self {
         Self { iter }
     }
@@ -58,17 +120,19 @@ where
 {
     type Item = I::Item;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         self.iter.next()
     }
 
+    #[inline(always)]
     fn size_hint(&self) -> (usize, Option<usize>) {
         let (lower, _) = self.iter.size_hint();
         (lower, None)
     }
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_push_turso(bencher: Bencher, len: usize) {
     bencher
         .with_inputs(|| {
@@ -82,7 +146,7 @@ fn vec_push_turso(bencher: Bencher, len: usize) {
         });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_push_std(bencher: Bencher, len: usize) {
     bencher
         .with_inputs(|| std::vec::Vec::with_capacity(len))
@@ -94,7 +158,7 @@ fn vec_push_std(bencher: Bencher, len: usize) {
         });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_collect_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -105,7 +169,7 @@ fn vec_collect_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_collect_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len).map(black_box).collect::<std::vec::Vec<_>>();
@@ -113,7 +177,7 @@ fn vec_collect_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_extend_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -123,7 +187,7 @@ fn vec_extend_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_extend_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::vec::Vec::with_capacity(len);
@@ -132,7 +196,30 @@ fn vec_extend_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_clone_std(bencher: Bencher, len: usize) {
+    #[expect(clippy::redundant_clone)]
+    bencher
+        .with_inputs(|| copy_values_std(len))
+        .bench_local_values(|values| black_box(values).clone());
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_clone_turso(bencher: Bencher, len: usize) {
+    #[expect(clippy::redundant_clone)]
+    bencher
+        .with_inputs(|| copy_values_turso(len))
+        .bench_local_values(|values| black_box(values).clone());
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_try_clone_turso(bencher: Bencher, len: usize) {
+    bencher
+        .with_inputs(|| copy_values_turso(len))
+        .bench_local_values(|values| black_box(values).try_clone().unwrap());
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_push_back_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -145,7 +232,7 @@ fn vec_deque_push_back_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_push_back_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::VecDeque::with_capacity(len);
@@ -156,7 +243,7 @@ fn vec_deque_push_back_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_collect_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -167,7 +254,7 @@ fn vec_deque_collect_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_collect_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -177,7 +264,7 @@ fn vec_deque_collect_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_extend_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -188,7 +275,7 @@ fn vec_deque_extend_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_extend_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::VecDeque::with_capacity(len);
@@ -197,7 +284,7 @@ fn vec_deque_extend_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_push_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -210,7 +297,7 @@ fn binary_heap_push_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_push_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::BinaryHeap::with_capacity(len);
@@ -221,7 +308,7 @@ fn binary_heap_push_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_collect_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -232,7 +319,7 @@ fn binary_heap_collect_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_collect_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -242,7 +329,7 @@ fn binary_heap_collect_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_extend_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -253,7 +340,7 @@ fn binary_heap_extend_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_extend_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::BinaryHeap::with_capacity(len);
@@ -262,7 +349,7 @@ fn binary_heap_extend_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_insert_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -277,7 +364,7 @@ fn hash_set_insert_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_insert_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::HashSet::with_capacity_and_hasher(len, FxBuildHasher);
@@ -288,7 +375,7 @@ fn hash_set_insert_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_collect_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -299,7 +386,7 @@ fn hash_set_collect_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_collect_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -309,7 +396,7 @@ fn hash_set_collect_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_extend_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -322,7 +409,7 @@ fn hash_set_extend_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_extend_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::HashSet::with_capacity_and_hasher(len, FxBuildHasher);
@@ -331,7 +418,7 @@ fn hash_set_extend_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_insert_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -346,7 +433,7 @@ fn hash_map_insert_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_collect_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -357,7 +444,7 @@ fn hash_map_collect_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_collect_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -367,7 +454,7 @@ fn hash_map_collect_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_extend_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -384,7 +471,7 @@ fn hash_map_extend_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_extend_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::HashMap::with_capacity_and_hasher(len, FxBuildHasher);
@@ -393,7 +480,7 @@ fn hash_map_extend_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_insert_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::HashMap::with_capacity_and_hasher(len, FxBuildHasher);
@@ -404,7 +491,7 @@ fn hash_map_insert_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_collect_unknown_upper_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = LowerBoundOnly::new((0..len).map(black_box)).collect::<std::vec::Vec<_>>();
@@ -412,7 +499,7 @@ fn vec_collect_unknown_upper_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = LowerBoundOnly::new((0..len).map(black_box))
@@ -422,7 +509,18 @@ fn vec_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[cfg(nightly)]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_collect_unknown_upper_global_turso_traits(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let values = LowerBoundOnly::new((0..len).map(black_box))
+            .try_collect_in::<alloc::Vec<_, alloc::Global>, _>(alloc::Global)
+            .unwrap();
+        black_box(values)
+    });
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_extend_unknown_upper_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::vec::Vec::with_capacity(len);
@@ -431,7 +529,7 @@ fn vec_extend_unknown_upper_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -442,7 +540,18 @@ fn vec_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[cfg(nightly)]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_extend_unknown_upper_global_turso_traits(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let mut values = alloc::Vec::with_capacity_in(len, alloc::Global);
+        TursoFromIterator::try_extend(&mut values, LowerBoundOnly::new((0..len).map(black_box)))
+            .unwrap();
+        black_box(values)
+    });
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_collect_unknown_upper_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values =
@@ -451,7 +560,7 @@ fn vec_deque_collect_unknown_upper_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = LowerBoundOnly::new((0..len).map(black_box))
@@ -461,7 +570,7 @@ fn vec_deque_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_extend_unknown_upper_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::VecDeque::with_capacity(len);
@@ -470,7 +579,7 @@ fn vec_deque_extend_unknown_upper_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -482,7 +591,7 @@ fn vec_deque_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_collect_unknown_upper_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = LowerBoundOnly::new((0..len).map(black_box))
@@ -491,7 +600,7 @@ fn binary_heap_collect_unknown_upper_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = LowerBoundOnly::new((0..len).map(black_box))
@@ -501,7 +610,7 @@ fn binary_heap_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_extend_unknown_upper_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::BinaryHeap::with_capacity(len);
@@ -510,7 +619,7 @@ fn binary_heap_extend_unknown_upper_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -522,7 +631,7 @@ fn binary_heap_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_collect_unknown_upper_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = LowerBoundOnly::new((0..len).map(black_box))
@@ -531,7 +640,7 @@ fn hash_set_collect_unknown_upper_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = LowerBoundOnly::new((0..len).map(black_box))
@@ -541,7 +650,7 @@ fn hash_set_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_extend_unknown_upper_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::HashSet::with_capacity_and_hasher(len, FxBuildHasher);
@@ -550,7 +659,7 @@ fn hash_set_extend_unknown_upper_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -564,7 +673,7 @@ fn hash_set_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_collect_unknown_upper_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values =
@@ -574,7 +683,7 @@ fn hash_map_collect_unknown_upper_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values =
@@ -585,7 +694,7 @@ fn hash_map_collect_unknown_upper_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_extend_unknown_upper_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::HashMap::with_capacity_and_hasher(len, FxBuildHasher);
@@ -596,7 +705,7 @@ fn hash_map_extend_unknown_upper_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -613,7 +722,7 @@ fn hash_map_extend_unknown_upper_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_non_copy_push_std(bencher: Bencher, len: usize) {
     bencher
         .with_inputs(|| std::vec::Vec::with_capacity(len))
@@ -625,7 +734,7 @@ fn vec_non_copy_push_std(bencher: Bencher, len: usize) {
         });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_non_copy_push_turso(bencher: Bencher, len: usize) {
     bencher
         .with_inputs(|| {
@@ -642,7 +751,7 @@ fn vec_non_copy_push_turso(bencher: Bencher, len: usize) {
         });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_non_copy_collect_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -652,7 +761,7 @@ fn vec_non_copy_collect_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_non_copy_collect_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -663,7 +772,7 @@ fn vec_non_copy_collect_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_non_copy_extend_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::vec::Vec::with_capacity(len);
@@ -672,7 +781,7 @@ fn vec_non_copy_extend_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_non_copy_extend_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -687,7 +796,68 @@ fn vec_non_copy_extend_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_non_copy_clone_std(bencher: Bencher, len: usize) {
+    bencher
+        .with_inputs(|| non_copy_values_std(len))
+        .bench_local_values(|values| {
+            let values = black_box(values);
+            let cloned = values.clone();
+            black_box(values.len());
+            black_box_drop(cloned);
+        });
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_non_copy_clone_turso(bencher: Bencher, len: usize) {
+    bencher
+        .with_inputs(|| non_copy_values_turso(len))
+        .bench_local_values(|values| {
+            let values = black_box(values);
+            let cloned = values.clone();
+            black_box(values.len());
+            black_box_drop(cloned);
+        });
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_non_copy_try_clone_turso(bencher: Bencher, len: usize) {
+    bencher
+        .with_inputs(|| non_copy_values_turso(len))
+        .bench_local_values(|values| black_box(values).try_clone().unwrap());
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_string_clone_turso(bencher: Bencher, len: usize) {
+    #[expect(clippy::redundant_clone)]
+    bencher
+        .with_inputs(|| string_values_turso(len))
+        .bench_local_values(|values| black_box(values).clone());
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_string_try_clone_turso(bencher: Bencher, len: usize) {
+    bencher
+        .with_inputs(|| string_values_turso(len))
+        .bench_local_values(|values| black_box(values).try_clone().unwrap());
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_fallible_clone_turso(bencher: Bencher, len: usize) {
+    #[expect(clippy::redundant_clone)]
+    bencher
+        .with_inputs(|| fallible_values_turso(len))
+        .bench_local_values(|values| black_box(values).clone());
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_fallible_try_clone_turso(bencher: Bencher, len: usize) {
+    bencher
+        .with_inputs(|| fallible_values_turso(len))
+        .bench_local_values(|values| black_box(values).try_clone().unwrap());
+}
+
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_non_copy_push_back_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::VecDeque::with_capacity(len);
@@ -698,7 +868,7 @@ fn vec_deque_non_copy_push_back_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_non_copy_push_back_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -713,7 +883,7 @@ fn vec_deque_non_copy_push_back_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_non_copy_collect_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -723,7 +893,7 @@ fn vec_deque_non_copy_collect_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_non_copy_collect_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -734,7 +904,7 @@ fn vec_deque_non_copy_collect_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_non_copy_extend_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::VecDeque::with_capacity(len);
@@ -743,7 +913,7 @@ fn vec_deque_non_copy_extend_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_deque_non_copy_extend_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -758,7 +928,7 @@ fn vec_deque_non_copy_extend_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_non_copy_push_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::BinaryHeap::with_capacity(len);
@@ -769,7 +939,7 @@ fn binary_heap_non_copy_push_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_non_copy_push_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -786,7 +956,7 @@ fn binary_heap_non_copy_push_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_non_copy_collect_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -796,7 +966,7 @@ fn binary_heap_non_copy_collect_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_non_copy_collect_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -807,7 +977,7 @@ fn binary_heap_non_copy_collect_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_non_copy_extend_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::BinaryHeap::with_capacity(len);
@@ -816,7 +986,7 @@ fn binary_heap_non_copy_extend_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn binary_heap_non_copy_extend_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -833,7 +1003,7 @@ fn binary_heap_non_copy_extend_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_non_copy_insert_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::HashSet::with_capacity_and_hasher(len, FxBuildHasher);
@@ -844,7 +1014,7 @@ fn hash_set_non_copy_insert_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_non_copy_insert_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -859,7 +1029,7 @@ fn hash_set_non_copy_insert_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_non_copy_collect_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -869,7 +1039,7 @@ fn hash_set_non_copy_collect_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_non_copy_collect_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -880,7 +1050,7 @@ fn hash_set_non_copy_collect_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_non_copy_extend_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::HashSet::with_capacity_and_hasher(len, FxBuildHasher);
@@ -889,7 +1059,7 @@ fn hash_set_non_copy_extend_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_set_non_copy_extend_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -906,7 +1076,7 @@ fn hash_set_non_copy_extend_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_non_copy_insert_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::HashMap::with_capacity_and_hasher(len, FxBuildHasher);
@@ -920,7 +1090,7 @@ fn hash_map_non_copy_insert_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_non_copy_insert_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =
@@ -940,7 +1110,7 @@ fn hash_map_non_copy_insert_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_non_copy_collect_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -955,7 +1125,7 @@ fn hash_map_non_copy_collect_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_non_copy_collect_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let values = (0..len)
@@ -971,7 +1141,7 @@ fn hash_map_non_copy_collect_turso(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_non_copy_extend_std(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values = std::collections::HashMap::with_capacity_and_hasher(len, FxBuildHasher);
@@ -985,7 +1155,7 @@ fn hash_map_non_copy_extend_std(bencher: Bencher, len: usize) {
     });
 }
 
-#[divan::bench(args = [64, 1_024, 16_384])]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn hash_map_non_copy_extend_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {
         let mut values =

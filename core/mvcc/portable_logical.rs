@@ -1,4 +1,4 @@
-use crate::types::{ImmutableRecord, Value};
+use crate::types::{ImmutableRecordRef, ValueRef};
 use crate::{LimboError, Numeric, Result};
 use std::collections::{HashMap, HashSet};
 
@@ -72,38 +72,53 @@ pub(crate) struct PortableSchemaRow {
 }
 
 pub(crate) fn portable_schema_row_from_record(record_bytes: &[u8]) -> Result<PortableSchemaRow> {
-    let values = ImmutableRecord::from_bin_record(record_bytes.to_vec()).get_values_owned()?;
-    if values.len() < 5 {
+    let record = ImmutableRecordRef::from_bin_record(record_bytes);
+    let column_count = record.column_count();
+    if column_count < 5 {
         return Err(LimboError::Corrupt(format!(
-            "sqlite_schema record must have at least 5 columns, got {}",
-            values.len()
+            "sqlite_schema record must have at least 5 columns, got {column_count}",
         )));
     }
-    let text = |value: &Value, field: &str| -> Result<String> {
+
+    let text = |value: ValueRef<'_>, field: &str| -> Result<String> {
         match value {
-            Value::Text(text) => Ok(text.as_str().to_string()),
+            ValueRef::Text(text) => Ok(text.as_str().to_string()),
             other => Err(LimboError::Corrupt(format!(
                 "{field} must be text in sqlite_schema record, got {other:?}"
             ))),
         }
     };
-    let integer = |value: &Value, field: &str| -> Result<i64> {
+    let integer = |value: ValueRef<'_>, field: &str| -> Result<i64> {
         match value {
-            Value::Numeric(Numeric::Integer(value)) => Ok(*value),
+            ValueRef::Numeric(Numeric::Integer(value)) => Ok(value),
             other => Err(LimboError::Corrupt(format!(
                 "{field} must be integer in sqlite_schema record, got {other:?}"
             ))),
         }
     };
+    let (row_type, name, rootpage) = record.get_three_values(0, 1, 3)?;
+    let (row_type, name, rootpage) = (
+        text(row_type, "sqlite_schema.type")?,
+        text(name, "sqlite_schema.name")?,
+        integer(rootpage, "sqlite_schema.rootpage")?,
+    );
     Ok(PortableSchemaRow {
-        row_type: text(&values[0], "sqlite_schema.type")?,
-        name: text(&values[1], "sqlite_schema.name")?,
-        rootpage: integer(&values[3], "sqlite_schema.rootpage")?,
+        row_type,
+        name,
+        rootpage,
     })
 }
 
 pub(crate) fn is_portable_table_schema_row(row: &PortableSchemaRow) -> bool {
-    row.rootpage != 0 && row.row_type.eq_ignore_ascii_case("table")
+    row.rootpage != 0 && row.row_type.eq_ignore_ascii_case("table") && is_portable_schema_row(row)
+}
+
+pub(crate) fn is_portable_schema_row(row: &PortableSchemaRow) -> bool {
+    is_portable_logical_name(&row.name)
+        && (row.row_type.eq_ignore_ascii_case("table")
+            || row.row_type.eq_ignore_ascii_case("index")
+            || row.row_type.eq_ignore_ascii_case("trigger")
+            || row.row_type.eq_ignore_ascii_case("view"))
 }
 
 #[derive(Default)]

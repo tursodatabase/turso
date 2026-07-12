@@ -225,9 +225,9 @@ pub fn translate_pragma(
         return Ok(());
     }
 
-    let pragma = match PragmaName::from_str(name.name.as_str()) {
-        Ok(pragma) => pragma,
-        Err(_) => bail_parse_error!("Not a valid pragma name"),
+    let Ok(pragma) = PragmaName::from_str(name.name.as_str()) else {
+        // SQLite silently ignores unknown PRAGMA names.
+        return Ok(());
     };
 
     let database_id = resolver.resolve_database_id(name)?;
@@ -591,9 +591,6 @@ fn update_pragma(
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
             let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
-            if opts.is_some() && connection.mvcc_enabled() {
-                bail_parse_error!("CDC is not supported in MVCC mode");
-            }
             // InitCdcVersion handles everything at execution time:
             // - For enable: creates CDC table + version table, records version,
             //   reads back actual version, defers CDC state to Halt
@@ -684,6 +681,21 @@ fn update_pragma(
             };
 
             connection.set_mvcc_checkpoint_threshold(threshold)?;
+            Ok(TransactionMode::None)
+        }
+        PragmaName::MvccGcThreshold => {
+            // 0 is rejected: it would run an inline GC pass on every commit even
+            // with zero new versions (`should_gc` compares growth `>= threshold`),
+            // which is pure overhead. Use -1 to disable, or a positive growth
+            // threshold.
+            let threshold = match parse_signed_number(&value)? {
+                Value::Numeric(Numeric::Integer(size)) if size == -1 || size >= 1 => size,
+                _ => bail_parse_error!(
+                    "mvcc_gc_threshold must be -1 (disabled) or a positive integer"
+                ),
+            };
+
+            connection.set_mvcc_gc_threshold(threshold)?;
             Ok(TransactionMode::None)
         }
         PragmaName::ForeignKeys => {
@@ -1514,6 +1526,14 @@ fn query_pragma(
         }
         PragmaName::MvccCheckpointThreshold => {
             let threshold = connection.mvcc_checkpoint_threshold()?;
+            let register = program.alloc_register();
+            program.emit_int(threshold, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::MvccGcThreshold => {
+            let threshold = connection.mvcc_gc_threshold()?;
             let register = program.alloc_register();
             program.emit_int(threshold, register);
             program.emit_result_row(register, 1);

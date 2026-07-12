@@ -59,7 +59,7 @@ class Database extends DatabasePromise {
     #db: any;
     constructor(opts: DatabaseOpts) {
         if (opts.url == null) {
-            const db = new NativeDatabase(opts.path, { tracing: opts.tracing }) as any;
+            const db = new NativeDatabase(opts.path, { tracing: opts.tracing, experimental: opts.experimental }) as any;
             super(
                 db,
                 () => ioNotifier.waitForCompletion(),
@@ -96,6 +96,7 @@ class Database extends DatabasePromise {
             longPollTimeoutMs: opts.longPollTimeoutMs,
             tracing: opts.tracing,
             bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
+            experimental: opts.experimental,
             remoteEncryption: opts.remoteEncryption?.cipher,
             partialSyncOpts: partialSyncOpts,
             pushOperationsThreshold: opts.pushOperationsThreshold,
@@ -178,7 +179,7 @@ class Database extends DatabasePromise {
                     registerFileAtWorker(this.#worker, `${this.name}-changes`),
                 ]);
             }
-            await run(this.#runner, this.#engine.connect());
+            await run(this.#runner, this.#engine.connect(), this.execLock);
         }
         this.connected = true;
     }
@@ -191,11 +192,11 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        const changes = await this.#guards.wait(async () => await run(this.#runner, this.#engine.wait()));
+        const changes = await this.#guards.wait(async () => await run(this.#runner, this.#engine.wait(), this.execLock));
         if (changes.empty()) {
             return false;
         }
-        await this.#guards.apply(async () => await run(this.#runner, this.#engine.apply(changes)));
+        await this.#guards.apply(async () => await run(this.#runner, this.#engine.apply(changes), this.execLock));
         return true;
     }
     /**
@@ -206,7 +207,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        await this.#guards.push(async () => await run(this.#runner, this.#engine.push()));
+        await this.#guards.push(async () => await run(this.#runner, this.#engine.push(), this.execLock));
     }
     /**
      * checkpoint WAL for local database
@@ -215,7 +216,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        await this.#guards.checkpoint(async () => await run(this.#runner, this.#engine.checkpoint()));
+        await this.#guards.checkpoint(async () => await run(this.#runner, this.#engine.checkpoint(), this.execLock));
     }
     /**
      * @returns statistic of current local database
@@ -224,7 +225,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        return (await run(this.#runner, this.#engine.stats()));
+        return (await run(this.#runner, this.#engine.stats(), this.execLock));
     }
 
     /**

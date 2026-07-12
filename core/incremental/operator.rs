@@ -46,7 +46,7 @@ pub fn create_dbsp_state_index(root_page: i64) -> Index {
         name: "dbsp_state_pk".to_string(),
         table_name: "dbsp_state".to_string(),
         root_page,
-        columns: vec![
+        columns: crate::alloc::vec![
             IndexColumn {
                 name: "operator_id".to_string(),
                 order: turso_parser::ast::SortOrder::Asc,
@@ -331,7 +331,7 @@ mod tests {
             .unwrap()
             .to_owned();
 
-            let values: Vec<Value> = record.get_values_owned().unwrap();
+            let values = record.get_values_owned().unwrap();
 
             // Parse the 5-column structure: operator_id, zset_id, element_id, value, weight
             if let Some(Value::Numeric(Numeric::Integer(op_id))) = values.first() {

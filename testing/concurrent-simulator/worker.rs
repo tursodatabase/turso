@@ -362,7 +362,7 @@ fn execute_sql_inner(conn: &Arc<Connection>, sql: &str) -> WorkerResponse {
                         message: "Interrupted".to_string(),
                     };
                 }
-                Ok(StepResult::IO) => {
+                Ok(StepResult::IO | StepResult::Yield) => {
                     io_count += 1;
                     stmt.get_pager()
                         .io
@@ -384,6 +384,7 @@ fn execute_sql_inner(conn: &Arc<Connection>, sql: &str) -> WorkerResponse {
                             | turso_core::LimboError::BusySnapshot
                             | turso_core::LimboError::WriteWriteConflict
                             | turso_core::LimboError::CommitDependencyAborted
+                            | turso_core::LimboError::OutOfMemory
                     ) {
                         rollback_autocommit = true;
                     }

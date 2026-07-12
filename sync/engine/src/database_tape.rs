@@ -10,8 +10,8 @@ use crate::{
     database_sync_operations::WAL_FRAME_HEADER,
     errors::Error,
     types::{
-        Coro, DatabaseChange, DatabaseChangeType, DatabaseTapeOperation, DatabaseTapeRowChangeType,
-        SyncEngineIoResult,
+        Coro, DatabaseChange, DatabaseChangeType, DatabaseSchemaKind, DatabaseSchemaReplay,
+        DatabaseTapeOperation, DatabaseTapeRowChangeType, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -39,13 +39,42 @@ pub struct DatabaseTapeOpts {
     pub disable_auto_checkpoint: bool,
 }
 
+/// Async, coro-threaded counterpart to
+/// [`turso_core::Connection::try_wal_watermark_read_page`]. It drives the
+/// begin / wait-for-completion / end sequence in one place so the Windows-IOCP
+/// `UnexpectedEof -> absent page` handling cannot drift across the watermark
+/// read call sites. Returns `Ok(false)` when the page is absent at
+/// `frame_watermark` (i.e. allocated only in the WAL portion past it).
+pub(crate) async fn try_wal_watermark_read_page<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &turso_core::Connection,
+    page_idx: u32,
+    page: &mut [u8],
+    frame_watermark: Option<u64>,
+) -> Result<bool> {
+    let Some((page_ref, c)) = conn.try_wal_watermark_read_page_begin(page_idx, frame_watermark)?
+    else {
+        return Ok(false);
+    };
+    while !c.finished() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    if let Some(err) = c.get_error() {
+        if turso_core::Connection::wal_watermark_read_error_is_absent_page(&err) {
+            return Ok(false);
+        }
+        return Err(LimboError::CompletionError(err).into());
+    }
+    Ok(conn.try_wal_watermark_read_page_end(page, page_ref)?)
+}
+
 pub(crate) async fn run_stmt_once<'a, Ctx>(
     coro: &'_ Coro<Ctx>,
     stmt: &'a mut turso_core::Statement,
 ) -> Result<Option<&'a turso_core::Row>> {
     loop {
         match stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 coro.yield_(SyncEngineIoResult::IO).await?;
             }
             StepResult::Done => {
@@ -92,7 +121,7 @@ pub(crate) async fn exec_stmt<Ctx>(
 ) -> Result<()> {
     loop {
         match stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 coro.yield_(SyncEngineIoResult::IO).await?;
             }
             StepResult::Done => {
@@ -187,6 +216,11 @@ impl DatabaseTape {
     }
 
     /// Builds an iterator which emits [DatabaseTapeOperation] by extracting data from CDC table
+    /// Name of the CDC table this tape reads/writes (default `turso_cdc`).
+    pub fn cdc_table(&self) -> &str {
+        &self.cdc_table
+    }
+
     pub fn iterate_changes(
         &self,
         opts: DatabaseChangesIteratorOpts,
@@ -214,6 +248,7 @@ impl DatabaseTape {
             mode: opts.mode,
             batch_size: opts.batch_size,
             ignore_schema_changes: opts.ignore_schema_changes,
+            max_change_id_exclusive: opts.max_change_id_exclusive,
         })
     }
     /// Start raw WAL edit session which can append or rollback pages directly in the current WAL
@@ -310,17 +345,14 @@ impl DatabaseWalSession {
 
         let conn = self.wal_session.conn();
         let mut frame = vec![0u8; WAL_FRAME_HEADER + self.page_size];
-        let begin_read_result =
-            conn.try_wal_watermark_read_page_begin(page_no, Some(frame_watermark))?;
-        let end_read_result = match begin_read_result {
-            Some((page_ref, c)) => {
-                while !c.succeeded() {
-                    let _ = coro.yield_(SyncEngineIoResult::IO).await;
-                }
-                conn.try_wal_watermark_read_page_end(&mut frame[WAL_FRAME_HEADER..], page_ref)?
-            }
-            None => false,
-        };
+        let end_read_result = try_wal_watermark_read_page(
+            coro,
+            conn,
+            page_no,
+            &mut frame[WAL_FRAME_HEADER..],
+            Some(frame_watermark),
+        )
+        .await?;
         if end_read_result {
             tracing::trace!("rollback page {}", page_no);
             self.prepared_frame = Some((page_no, frame));
@@ -347,15 +379,6 @@ impl DatabaseWalSession {
             self.rollback_page(coro, page_no, frame_watermark).await?;
         }
         Ok(pages_cnt)
-    }
-
-    pub fn db_size(&self) -> Result<u32> {
-        let frames_count = self.frames_count()?;
-        let conn = self.wal_session.conn();
-        let mut page = vec![0u8; self.page_size];
-        assert!(conn.try_wal_watermark_read_page(1, &mut page, Some(frames_count))?);
-        let db_size = u32::from_be_bytes(page[28..32].try_into().unwrap());
-        Ok(db_size)
     }
 
     pub fn commit(&mut self, db_size: u32) -> Result<()> {
@@ -390,13 +413,22 @@ pub enum DatabaseChangesIteratorMode {
 }
 
 impl DatabaseChangesIteratorMode {
-    pub fn query(&self, table_name: &str, limit: usize) -> String {
+    pub fn query(&self, table_name: &str, limit: usize, bounded_above: bool) -> String {
         let (operation, order) = match self {
             DatabaseChangesIteratorMode::Apply => (">=", "ASC"),
             DatabaseChangesIteratorMode::Revert => ("<=", "DESC"),
         };
+        // `change_id < ?` (bound param 2) restricts the scan to change ids the
+        // caller has deemed safe to consume — used by the sync push loop to stop
+        // at `sequence_watermark_experimental` so it never reads a change id that
+        // a concurrent MVCC transaction may still commit below the current max.
+        let upper_bound = if bounded_above {
+            " AND change_id < ?"
+        } else {
+            ""
+        };
         format!(
-            "SELECT * FROM {table_name} WHERE change_id {operation} ? ORDER BY change_id {order} LIMIT {limit}",
+            "SELECT * FROM {table_name} WHERE change_id {operation} ?{upper_bound} ORDER BY change_id {order} LIMIT {limit}",
         )
     }
     pub fn first_id(&self) -> i64 {
@@ -419,6 +451,11 @@ pub struct DatabaseChangesIteratorOpts {
     pub batch_size: usize,
     pub mode: DatabaseChangesIteratorMode,
     pub ignore_schema_changes: bool,
+    /// Exclusive upper bound on `change_id`: only rows with `change_id < bound`
+    /// are returned. `None` means unbounded. The sync push loop sets this to the
+    /// CDC sequence watermark so snapshot-isolation reordering cannot make it skip
+    /// a not-yet-committed lower change id.
+    pub max_change_id_exclusive: Option<i64>,
 }
 
 impl Default for DatabaseChangesIteratorOpts {
@@ -428,6 +465,7 @@ impl Default for DatabaseChangesIteratorOpts {
             batch_size: DEFAULT_CHANGES_BATCH_SIZE,
             mode: DatabaseChangesIteratorMode::Apply,
             ignore_schema_changes: true,
+            max_change_id_exclusive: None,
         }
     }
 }
@@ -443,6 +481,7 @@ pub struct DatabaseChangesIterator {
     mode: DatabaseChangesIteratorMode,
     batch_size: usize,
     ignore_schema_changes: bool,
+    max_change_id_exclusive: Option<i64>,
 }
 
 const SQLITE_SCHEMA_TABLE: &str = "sqlite_schema";
@@ -474,7 +513,11 @@ impl DatabaseChangesIterator {
     }
     async fn refill<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<()> {
         if self.query_stmt.is_none() {
-            let query = self.mode.query(&self.cdc_table, self.batch_size);
+            let query = self.mode.query(
+                &self.cdc_table,
+                self.batch_size,
+                self.max_change_id_exclusive.is_some(),
+            );
             let stmt = match self.conn.prepare(&query) {
                 Ok(stmt) => stmt,
                 Err(LimboError::ParseError(err)) if err.contains("no such table") => return Ok(()),
@@ -490,6 +533,12 @@ impl DatabaseChangesIterator {
             1.try_into().unwrap(),
             turso_core::Value::from_i64(change_id_filter),
         )?;
+        if let Some(max_change_id_exclusive) = self.max_change_id_exclusive {
+            query_stmt.bind_at(
+                2.try_into().unwrap(),
+                turso_core::Value::from_i64(max_change_id_exclusive),
+            )?;
+        }
 
         let mut last_change_id = None;
         while let Some(row) = run_stmt_once(coro, query_stmt).await? {
@@ -543,7 +592,7 @@ pub struct DatabaseReplaySession {
 async fn replay_stmt<Ctx>(
     coro: &Coro<Ctx>,
     stmt: &mut turso_core::Statement,
-    values: Vec<turso_core::Value>,
+    values: impl IntoIterator<Item = turso_core::Value>,
 ) -> Result<()> {
     stmt.reset()?;
     for (i, value) in values.into_iter().enumerate() {
@@ -551,6 +600,24 @@ async fn replay_stmt<Ctx>(
     }
     exec_stmt(coro, stmt).await?;
     Ok(())
+}
+
+impl DatabaseReplaySession {
+    fn clear_cached_statements(&mut self) {
+        self.cached_delete_stmt.clear();
+        self.cached_insert_stmt.clear();
+        self.cached_update_stmt.clear();
+    }
+
+    fn schema_drop_sql(kind: DatabaseSchemaKind, name: &str) -> String {
+        let object = match kind {
+            DatabaseSchemaKind::Table => "TABLE",
+            DatabaseSchemaKind::Index => "INDEX",
+            DatabaseSchemaKind::Trigger => "TRIGGER",
+            DatabaseSchemaKind::View => "VIEW",
+        };
+        format!("DROP {object} IF EXISTS {}", quote_ident(name))
+    }
 }
 
 impl DatabaseReplaySession {
@@ -571,8 +638,43 @@ impl DatabaseReplaySession {
                 }
             }
             DatabaseTapeOperation::StmtReplay(replay) => {
+                self.clear_cached_statements();
                 let mut stmt = self.conn.prepare(&replay.sql)?;
                 replay_stmt(coro, &mut stmt, replay.values).await?;
+                self.clear_cached_statements();
+                return Ok(());
+            }
+            DatabaseTapeOperation::SchemaReplay(replay) => {
+                self.clear_cached_statements();
+                match replay {
+                    DatabaseSchemaReplay::Create { sql } | DatabaseSchemaReplay::Alter { sql } => {
+                        self.generator
+                            .execute_ddl_idempotent(coro, &sql)
+                            .await
+                            .map_err(|err| {
+                                Error::DatabaseTapeError(format!(
+                                    "failed to replay schema DDL `{sql}`: {err}"
+                                ))
+                            })?;
+                    }
+                    DatabaseSchemaReplay::Refresh { kind, name, sql } => {
+                        if kind != DatabaseSchemaKind::Table {
+                            self.conn.execute(Self::schema_drop_sql(kind, &name))?;
+                        }
+                        self.generator
+                            .execute_ddl_idempotent(coro, &sql)
+                            .await
+                            .map_err(|err| {
+                                Error::DatabaseTapeError(format!(
+                                    "failed to replay schema refresh DDL `{sql}`: {err}"
+                                ))
+                            })?;
+                    }
+                    DatabaseSchemaReplay::Drop { kind, name } => {
+                        self.conn.execute(Self::schema_drop_sql(kind, &name))?;
+                    }
+                }
+                self.clear_cached_statements();
                 return Ok(());
             }
             DatabaseTapeOperation::RowChange(change) => {
@@ -586,7 +688,12 @@ impl DatabaseReplaySession {
 
                 if table == SQLITE_SCHEMA_TABLE {
                     let replay_info = self.generator.replay_info(coro, &change).await?;
-                    if replay_info.change_type == DatabaseChangeType::Update {
+                    if replay_info.is_ddl_replay
+                        && matches!(
+                            replay_info.change_type,
+                            DatabaseChangeType::Insert | DatabaseChangeType::Update
+                        )
+                    {
                         self.generator
                             .execute_ddl_idempotent(coro, &replay_info.query)
                             .await?;
@@ -757,6 +864,10 @@ impl DatabaseReplaySession {
     }
 }
 
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -767,7 +878,10 @@ mod tests {
         database_tape::{
             run_stmt_once, DatabaseChangesIteratorOpts, DatabaseReplaySessionOpts, DatabaseTape,
         },
-        types::{Coro, DatabaseTapeOperation, DatabaseTapeRowChange, DatabaseTapeRowChangeType},
+        types::{
+            Coro, DatabaseSchemaKind, DatabaseSchemaReplay, DatabaseStatementReplay,
+            DatabaseTapeOperation, DatabaseTapeRowChange, DatabaseTapeRowChangeType,
+        },
     };
 
     #[test]
@@ -798,6 +912,261 @@ mod tests {
             }
         };
         assert_eq!(rows, vec![] as Vec<Vec<turso_core::Value>>);
+    }
+
+    #[test]
+    pub fn test_database_tape_stmt_replay_allows_zero_bind_dml() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(io.clone(), db_path).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE t(x)").unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db.start_replay_session(&coro, opts).await.unwrap();
+                    session
+                        .replay(
+                            &coro,
+                            DatabaseTapeOperation::StmtReplay(DatabaseStatementReplay {
+                                sql: "INSERT INTO t VALUES (42)".to_string(),
+                                values: Vec::new(),
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    session
+                        .replay(&coro, DatabaseTapeOperation::Commit)
+                        .await
+                        .unwrap();
+                }
+                let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                rows
+            }
+        });
+        let rows = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+        assert_eq!(rows, vec![vec![turso_core::Value::from_i64(42)]]);
+    }
+
+    #[test]
+    pub fn test_schema_refresh_create_table_is_idempotent() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(io.clone(), db_path).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)")
+                    .unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db.start_replay_session(&coro, opts).await.unwrap();
+                    session
+                        .replay(
+                            &coro,
+                            DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Refresh {
+                                kind: DatabaseSchemaKind::Table,
+                                name: "t".to_string(),
+                                sql: "CREATE TABLE t(x INTEGER PRIMARY KEY, note TEXT)".to_string(),
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    session
+                        .replay(
+                            &coro,
+                            DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Create {
+                                sql: "CREATE INDEX t_note_idx ON t(note)".to_string(),
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    session
+                        .replay(&coro, DatabaseTapeOperation::Commit)
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        while let genawaiter::GeneratorState::Yielded(..) = gen.resume_with(Ok(())) {
+            io.step().unwrap()
+        }
+    }
+
+    #[test]
+    pub fn test_implicit_rowid_replay_upserts_primary_key_rows() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(io.clone(), db_path).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+                    .unwrap();
+                conn.execute("INSERT INTO t(id, value) VALUES (1, 'old')")
+                    .unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: true,
+                    };
+                    let mut session = db.start_replay_session(&coro, opts).await.unwrap();
+                    session
+                        .replay(
+                            &coro,
+                            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                                change_id: 1,
+                                change_time: 1,
+                                table_name: "t".to_string(),
+                                id: 1,
+                                change: DatabaseTapeRowChangeType::Insert {
+                                    after: crate::alloc::vec![
+                                        turso_core::Value::Null,
+                                        turso_core::Value::build_text("new"),
+                                    ],
+                                },
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    session
+                        .replay(&coro, DatabaseTapeOperation::Commit)
+                        .await
+                        .unwrap();
+                }
+                let mut stmt = conn.prepare("SELECT id, value FROM t ORDER BY id").unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                rows
+            }
+        });
+        let rows = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                turso_core::Value::from_i64(1),
+                turso_core::Value::build_text("new")
+            ]]
+        );
+    }
+
+    #[test]
+    pub fn test_implicit_rowid_replay_prefers_explicit_primary_key() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(io.clone(), db_path).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE t(x TEXT PRIMARY KEY, value TEXT)")
+                    .unwrap();
+                conn.execute("INSERT INTO t(rowid, x, value) VALUES (4, 'remote', 'kept')")
+                    .unwrap();
+                conn.execute("INSERT INTO t(rowid, x, value) VALUES (5, 'local', 'old')")
+                    .unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: true,
+                    };
+                    let mut session = db.start_replay_session(&coro, opts).await.unwrap();
+                    session
+                        .replay(
+                            &coro,
+                            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                                change_id: 1,
+                                change_time: 1,
+                                table_name: "t".to_string(),
+                                id: 4,
+                                change: DatabaseTapeRowChangeType::Insert {
+                                    after: crate::alloc::vec![
+                                        turso_core::Value::build_text("local"),
+                                        turso_core::Value::build_text("new"),
+                                    ],
+                                },
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    session
+                        .replay(&coro, DatabaseTapeOperation::Commit)
+                        .await
+                        .unwrap();
+                }
+                let mut stmt = conn
+                    .prepare("SELECT rowid, x, value FROM t ORDER BY x")
+                    .unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                rows
+            }
+        });
+        let rows = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    turso_core::Value::from_i64(5),
+                    turso_core::Value::build_text("local"),
+                    turso_core::Value::build_text("new")
+                ],
+                vec![
+                    turso_core::Value::from_i64(4),
+                    turso_core::Value::build_text("remote"),
+                    turso_core::Value::build_text("kept")
+                ],
+            ]
+        );
     }
 
     #[test]
@@ -866,6 +1235,177 @@ mod tests {
             }) if table_name == "t"
         ));
         assert!(matches!(changes[4], DatabaseTapeOperation::Commit));
+    }
+
+    #[test]
+    pub fn test_database_tape_iterate_changes_in_mvcc_mode() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        db1.connect()
+            .unwrap()
+            .execute("PRAGMA journal_mode = 'mvcc'")
+            .unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db1 = db1.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db1.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE t(x)").unwrap();
+                conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+                let opts = Default::default();
+                let mut iterator = db1.iterate_changes(opts).unwrap();
+                let mut changes = Vec::new();
+                while let Some(change) = iterator.next(&coro).await.unwrap() {
+                    changes.push(change);
+                }
+                changes
+            }
+        });
+        let changes = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+        tracing::info!("changes: {:?}", changes);
+        assert_eq!(changes.len(), 5);
+        assert!(matches!(changes[0], DatabaseTapeOperation::Commit));
+        assert!(matches!(
+            changes[1],
+            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                change_id: 3,
+                id: 1,
+                ref table_name,
+                change: DatabaseTapeRowChangeType::Insert { .. },
+                ..
+            }) if table_name == "t"
+        ));
+        assert!(matches!(
+            changes[2],
+            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                change_id: 4,
+                id: 2,
+                ref table_name,
+                change: DatabaseTapeRowChangeType::Insert { .. },
+                ..
+            }) if table_name == "t"
+        ));
+        assert!(matches!(
+            changes[3],
+            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                change_id: 5,
+                id: 3,
+                ref table_name,
+                change: DatabaseTapeRowChangeType::Insert { .. },
+                ..
+            }) if table_name == "t"
+        ));
+        assert!(matches!(changes[4], DatabaseTapeOperation::Commit));
+    }
+
+    /// in MVCC mode the CDC `change_id` is drawn from the CDC
+    /// table's AUTOINCREMENT sequence, so ids are never reused after CDC rows are
+    /// pruned, and `read_cdc_sequence_watermark` reports the exclusive safe upper
+    /// bound the push loop scans up to. Bounding the scan by that watermark is
+    /// what stops the push loop from skipping a change id a concurrent
+    /// transaction commits below the current max under snapshot isolation.
+    #[test]
+    pub fn test_mvcc_cdc_change_id_sequence_backed_and_watermark_bounds_scan() {
+        fn row_change_ids(changes: &[DatabaseTapeOperation]) -> Vec<i64> {
+            changes
+                .iter()
+                .filter_map(|change| match change {
+                    DatabaseTapeOperation::RowChange(change) => Some(change.change_id),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        db1.connect()
+            .unwrap()
+            .execute("PRAGMA journal_mode = 'mvcc'")
+            .unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db1 = db1.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db1.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE t(x)").unwrap();
+                conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+                // No in-flight allocations: watermark == max(change_id) + 1.
+                let watermark = crate::database_sync_operations::read_cdc_sequence_watermark(
+                    &coro,
+                    &conn,
+                    db1.cdc_table(),
+                )
+                .await
+                .unwrap();
+
+                let mut opts = DatabaseChangesIteratorOpts {
+                    ignore_schema_changes: false,
+                    ..Default::default()
+                };
+                let mut unbounded = Vec::new();
+                let mut iterator = db1.iterate_changes(opts.clone()).unwrap();
+                while let Some(change) = iterator.next(&coro).await.unwrap() {
+                    unbounded.push(change);
+                }
+
+                // Bounded scan stops strictly below the bound.
+                opts.max_change_id_exclusive = Some(4);
+                let mut bounded = Vec::new();
+                let mut iterator = db1.iterate_changes(opts).unwrap();
+                while let Some(change) = iterator.next(&coro).await.unwrap() {
+                    bounded.push(change);
+                }
+
+                // Prune the CDC table, then write again: the new change id must
+                // continue past the old high-water mark, not reuse a low id.
+                conn.execute("DELETE FROM turso_cdc").unwrap();
+                conn.execute("INSERT INTO t VALUES (4)").unwrap();
+                let mut after_prune = Vec::new();
+                let mut iterator = db1
+                    .iterate_changes(DatabaseChangesIteratorOpts {
+                        ignore_schema_changes: false,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                while let Some(change) = iterator.next(&coro).await.unwrap() {
+                    after_prune.push(change);
+                }
+
+                (watermark, unbounded, bounded, after_prune)
+            }
+        });
+        let (watermark, unbounded, bounded, after_prune) = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+
+        // CREATE TABLE row (change_id 1) + COMMIT (2) + three inserts (3,4,5) +
+        // COMMIT (6). Watermark is the first unallocated id: 7.
+        assert_eq!(watermark, Some(7));
+        assert_eq!(row_change_ids(&unbounded), vec![1, 3, 4, 5]);
+        // Bound of 4 keeps only change ids < 4 (the schema row 1 and insert 3).
+        assert_eq!(row_change_ids(&bounded), vec![1, 3]);
+        // After pruning, the reinserted row's change id continues at 7 (the old
+        // watermark), never reusing an id at or below the previously pushed max.
+        assert_eq!(row_change_ids(&after_prune), vec![7]);
     }
 
     #[test]
@@ -1303,10 +1843,86 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
                             turso_core::Value::from_i64(9),
                             turso_core::Value::Text(turso_core::types::Text::new(
-                                "CREATE INDEX IF NOT EXISTS t_idx ON t (y)"
+                                "CREATE INDEX t_idx ON t (y)"
                             )),
                         ]
                     ]
+                );
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    pub fn test_database_tape_replay_quoted_create_index_idempotent() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(io.clone(), db_path).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
+                    .unwrap();
+
+                let opts = DatabaseReplaySessionOpts {
+                    use_implicit_rowid: false,
+                };
+                let mut session = db.start_replay_session(&coro, opts).await.unwrap();
+                let sql = "CREATE INDEX \"t remote mixed idx 93136628163651980\" ON t(payload)";
+                session
+                    .replay(
+                        &coro,
+                        DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Create {
+                            sql: sql.to_string(),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                session
+                    .replay(
+                        &coro,
+                        DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Create {
+                            sql: sql.to_string(),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                session
+                    .replay(&coro, DatabaseTapeOperation::Commit)
+                    .await
+                    .unwrap();
+
+                let mut stmt = conn
+                    .prepare("SELECT type, name, sql FROM sqlite_schema ORDER BY type, name")
+                    .unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                assert!(
+                    rows.iter().any(|row| row
+                        == &vec![
+                        turso_core::Value::build_text("index"),
+                        turso_core::Value::build_text("t remote mixed idx 93136628163651980"),
+                        turso_core::Value::build_text(
+                            "CREATE INDEX \"t remote mixed idx 93136628163651980\" ON t (payload)"
+                        ),
+                    ]),
+                    "quoted index schema row missing; rows={rows:?}"
                 );
                 crate::Result::Ok(())
             }

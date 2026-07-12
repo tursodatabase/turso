@@ -99,7 +99,7 @@ addr  opcode              p1  p2  p3  p4            p5  comment
   52    Yield              1  67   0                 0
   53    Copy              11  30   0                 0  r[30]=r[11]
   54    IsNull            30  66   0                 0  if (r[30]==NULL) goto 66
-  55    Affinity          30   1   0                 0  r[30..31] = D
+  55    Affinity          30   1   0                 0  r[30..31] = C
   56    SeekGE             3  66  30                 0  key=[30..30]
   57      IdxGT            3  66  30                 0  key=[30..30]
   58      Column           3   1  14                 0  r[14]=ephemeral(ephemeral_subquery_t8).id

@@ -32,11 +32,14 @@ pub mod insn;
 pub mod metrics;
 pub mod rowset;
 pub mod sorter;
+#[cfg(test)]
+mod statement_lifecycle_tests;
 pub mod vacuum;
 pub mod value;
 // for benchmarks
 pub use crate::translate::collate::CollationSeq;
 use crate::{
+    alloc::DynAllocator,
     error::LimboError,
     function::FuncCtx,
     mvcc::{database::CommitStateMachine, MvccClock},
@@ -48,10 +51,11 @@ use crate::{
     types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
-            OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState,
-            OpIdxInsertState, OpInitCdcVersionState, OpInsertState, OpInsertSubState,
-            OpJournalModeState, OpNewRowidState, OpNoConflictState, OpParseSchemaState,
-            OpProgramState, OpRowIdState, OpSeekState, OpTransactionState, VacuumIntoOpContext,
+            OpAttachState, OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState,
+            OpDestroyState, OpIdxInsertState, OpInitCdcVersionState, OpInsertState,
+            OpInsertSubState, OpJournalModeState, OpNewRowidState, OpNoConflictState,
+            OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
+            VacuumIntoOpContext,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -97,6 +101,8 @@ use std::{
     task::Waker,
 };
 use tracing::{instrument, Level};
+
+type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
 
 /// State machine for committing view deltas with I/O handling
 #[derive(Debug, Clone)]
@@ -166,6 +172,11 @@ pub enum StepResult {
     Row,
     Interrupt,
     Busy,
+    /// The statement explicitly yielded control back to the caller without any pending I/O.
+    /// Stepping again immediately (even in a tight loop) is fine; blocking callers should
+    /// still drive the event loop (`io.step()`) between steps so progress that depends on
+    /// other threads' I/O is not starved.
+    Yield,
 }
 
 #[derive(Debug)]
@@ -182,11 +193,11 @@ enum CommitState {
     /// Committing attached database pagers after main pager commit is done.
     CommittingAttached,
     CommittingMvcc {
-        state_machine: StateMachine<Box<CommitStateMachine<MvccClock>>>,
+        state_machine: StateMachine<Box<MvccCommitStateMachine>>,
     },
     /// Committing MVCC transactions on attached databases after main MVCC commit is done.
     CommittingAttachedMvcc {
-        state_machine: StateMachine<Box<CommitStateMachine<MvccClock>>>,
+        state_machine: StateMachine<Box<MvccCommitStateMachine>>,
         db_id: usize,
         mv_store: Arc<MvStore>,
     },
@@ -410,11 +421,11 @@ impl ProgramExecutionState {
 
 /// Re-entrant state for [Insn::HashBuild].
 /// Allows HashBuild to resume cleanly after async I/O without re-reading the row.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OpHashBuildState {
-    pub key_values: Vec<Value>,
+    pub key_values: crate::alloc::Vec<Value>,
     pub key_idx: usize,
-    pub payload_values: Vec<Value>,
+    pub payload_values: crate::alloc::Vec<Value>,
     pub payload_idx: usize,
     pub rowid: Option<i64>,
     pub cursor_id: CursorID,
@@ -425,10 +436,10 @@ pub struct OpHashBuildState {
 
 /// Re-entrant state for [Insn::HashProbe].
 /// Allows HashProbe to resume cleanly after async probe-row buffering I/O.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OpHashProbeState {
     /// Cached probe key values to avoid re-reading from registers
-    pub probe_keys: Vec<Value>,
+    pub probe_keys: crate::alloc::Vec<Value>,
     /// Hash table register being probed
     pub hash_table_id: usize,
     /// Partition index being loaded (if any)
@@ -453,6 +464,7 @@ enum ActiveOpState {
     Column(OpColumnState),
     RowId(OpRowIdState),
     Transaction(OpTransactionState),
+    Attach(OpAttachState),
     JournalMode(OpJournalModeState),
     ParseSchema(OpParseSchemaState),
     HashBuild(Option<OpHashBuildState>),
@@ -478,6 +490,7 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::Column(_) => "Column",
             ActiveOpState::RowId(_) => "RowId",
             ActiveOpState::Transaction(_) => "Transaction",
+            ActiveOpState::Attach(_) => "Attach",
             ActiveOpState::JournalMode(_) => "JournalMode",
             ActiveOpState::ParseSchema(_) => "ParseSchema",
             ActiveOpState::HashBuild(_) => "HashBuild",
@@ -593,6 +606,7 @@ impl ActiveOpStateSlot {
         OpTransactionState,
         OpTransactionState::Start
     );
+    active_state_accessor!(attach, Attach, OpAttachState, OpAttachState::default());
     active_state_accessor!(
         journal_mode,
         JournalMode,
@@ -608,6 +622,19 @@ impl ActiveOpStateSlot {
         OpInitCdcVersionState,
         None
     );
+
+    /// Take the ParseSchema op state if it is the active one, without
+    /// touching (or panicking on) any other live op state. Used by abort
+    /// cleanup, which runs regardless of which opcode was executing.
+    fn take_parse_schema_if_active(&mut self) -> execute::OpParseSchemaState {
+        if let ActiveOpState::ParseSchema(inner) = &mut self.state {
+            let taken = inner.take();
+            self.state = ActiveOpState::None;
+            taken
+        } else {
+            None
+        }
+    }
 
     fn program_ref(&self) -> Option<&OpProgramState> {
         match &self.state {
@@ -685,7 +712,7 @@ pub struct ProgramState {
     /// entry and drives it one step per opcode call, yielding
     /// `InsnFunctionStepResult::IO` between steps. Cleared on terminal
     /// outcome (Done / Conflict / Err) and on statement reset.
-    pub sequence_inner_commit: Option<StateMachine<Box<CommitStateMachine<MvccClock>>>>,
+    pub sequence_inner_commit: Option<StateMachine<Box<MvccCommitStateMachine>>>,
     /// State for a pending sequence inner-tx wrap, set by
     /// `Insn::SequenceBeginInnerTx` (Wrapped path only) and cleared
     /// by `Insn::SequenceCommitInnerTx` on any terminal outcome.
@@ -970,12 +997,41 @@ impl ProgramState {
         self.n_total_change.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Whether this statement owns the implicit autocommit transaction it is
-    /// about to finish, including re-entry while its commit is in progress.
+    /// Whether this statement may finish the implicit autocommit transaction
+    /// now, including re-entry while its commit is in progress.
     #[inline]
-    pub(crate) fn owns_auto_txn(&self) -> bool {
-        self.auto_txn_cleanup == TxnCleanup::RollbackTxn
-            || !matches!(self.commit_state, CommitState::Ready)
+    pub(crate) fn can_autocommit_now(&self, connection: &Connection) -> bool {
+        let is_already_committing = !matches!(self.commit_state, CommitState::Ready);
+        if is_already_committing {
+            return true;
+        }
+        if self.auto_txn_cleanup != TxnCleanup::RollbackTxn {
+            return false;
+        }
+        let active_writers = connection.n_active_writes.load(Ordering::SeqCst);
+        turso_assert!(
+            active_writers <= 1,
+            "n_active_writes must be 0 or 1, got {active_writers}"
+        );
+        if self.is_active_write {
+            turso_assert!(
+                active_writers == 1,
+                "active writer state without an active writer count"
+            );
+        }
+        if connection.mv_store().is_some() {
+            // MVCC keeps one tx id on the connection. A writer waits for
+            // sibling readers, and a reader waits for sibling readers/writers.
+            return connection.n_active_root_statements.load(Ordering::SeqCst) == 1
+                && (self.is_active_write || active_writers == 0);
+        }
+        if self.is_active_write {
+            // Pager/WAL writers can finish while sibling readers remain active.
+            // The readers keep their cursors and release them when they finish.
+            return true;
+        }
+        // Pager/WAL readers do not wait for sibling readers.
+        active_writers == 0
     }
 
     #[inline]
@@ -1101,7 +1157,11 @@ impl ProgramState {
         end_statement: EndStatement,
     ) -> Result<()> {
         if self.is_active_write {
-            connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
+            let previous = connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
+            turso_assert!(
+                previous == 1,
+                "ending a writer with {previous} active writer(s)"
+            );
             self.is_active_write = false;
         }
         // If begin_statement was never called, no savepoint/FK cleanup needed.
@@ -1357,8 +1417,6 @@ pub struct PreparedProgram {
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
     pub is_subprogram: bool,
-    /// Whether the program contains any trigger subprograms.
-    pub contains_trigger_subprograms: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
     /// Set of attached database indices that need write transactions.
@@ -1766,7 +1824,7 @@ impl Program {
                         // contended lock). Don't store in io_completions —
                         // yields aren't pending I/O, so the instruction will
                         // simply re-execute on the next step.
-                        return Ok(StepResult::IO);
+                        return Ok(StepResult::Yield);
                     }
                     let finished = io.finished();
                     state.io_completions = Some(io);
@@ -2289,7 +2347,7 @@ impl Program {
                     // Commit dirty pages to WAL, then end write+read transactions.
                     // We disable auto-checkpoint and avoid pager.commit_tx() since
                     // the checkpoint logic can leave read locks held.
-                    match attached_pager.commit_dirty_pages(
+                    match attached_pager.commit_wal(
                         WalAutoActions::empty(),
                         SyncMode::Normal,
                         false,
@@ -2297,7 +2355,7 @@ impl Program {
                         Ok(IOResult::Done(_)) => {}
                         Ok(IOResult::IO(io)) => {
                             // IO pending — return so the caller can yield and re-enter.
-                            // commit_dirty_pages tracks its own internal state, so calling
+                            // commit_wal tracks its own internal state, so calling
                             // it again on re-entry will resume correctly.
                             return Ok(IOResult::IO(io));
                         }
@@ -2308,7 +2366,7 @@ impl Program {
                     connection.publish_database_schema(db_id);
                     attached_pager.end_write_tx();
                     attached_pager.end_read_tx();
-                    attached_pager.commit_dirty_pages_end();
+                    attached_pager.commit_wal_end();
                 } else {
                     // Discard any local schema changes on rollback
                     connection.database_schemas().write().remove(&db_id);
@@ -2341,7 +2399,7 @@ impl Program {
     #[instrument(skip(self, commit_state, mv_store), level = Level::DEBUG)]
     fn step_end_mvcc_txn(
         &self,
-        commit_state: &mut StateMachine<Box<CommitStateMachine<MvccClock>>>,
+        commit_state: &mut StateMachine<Box<MvccCommitStateMachine>>,
         mv_store: &Arc<MvStore>,
     ) -> Result<IOResult<()>> {
         commit_state.step(mv_store)
@@ -2386,6 +2444,22 @@ impl Program {
         state
             .commit_state
             .cleanup_abandoned_mvcc_commit(&self.connection);
+
+        // ParseSchema owns a nested helper statement on this connection and
+        // stores `auto_commit=false` for its duration. If the program aborts
+        // while that state is live (error mid-schema-row), release it here:
+        // restore the saved auto_commit and drop the inner statement so its
+        // nested guard is released BEFORE the `is_nested_stmt()` check below.
+        // Otherwise this top-level statement misclassifies itself as nested,
+        // skips transaction rollback, and leaks the DDL's exclusive MVCC tx
+        // (and the cleared auto_commit) into subsequent statements — which
+        // then appear to succeed without ever committing.
+        if let Some(inner) = state.active_op_state.take_parse_schema_if_active() {
+            self.connection
+                .auto_commit
+                .store(inner.previous_auto_commit(), Ordering::SeqCst);
+            drop(inner);
+        }
 
         // VACUUM (and VACUUM INTO) state can own internal helper statements whose drop path
         // releases nested guards. Clean it before checking whether this program
@@ -2440,7 +2514,41 @@ impl Program {
         }
         // Errors from nested statements are handled by the parent statement.
         if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
-            let owns_auto_txn = state.owns_auto_txn();
+            let unfinished_statement_reset_or_drop =
+                err.is_none() && state.execution_state.is_running();
+            let inside_explicit_transaction = !self.connection.get_auto_commit();
+            let unfinished_writer = state.is_active_write;
+            let can_rollback_just_this_statement =
+                state.auto_txn_cleanup == TxnCleanup::RollbackSavepoint;
+
+            let poison_tx = unfinished_statement_reset_or_drop
+                && inside_explicit_transaction
+                && unfinished_writer
+                && !can_rollback_just_this_statement;
+            if poison_tx {
+                // Example: BEGIN; UPDATE rows SET ... writes one row, then
+                // returns IO before reaching Done. If the caller drops that
+                // statement, we cannot pretend COMMIT is still safe: there is
+                // no statement savepoint to undo only the partial UPDATE.
+                self.connection.mark_tx_poisoned();
+            }
+
+            let can_autocommit_now = state.can_autocommit_now(&self.connection);
+            let is_mvcc = self.connection.mv_store().is_some();
+            let changed_shared_mvcc_auto_txn = !can_autocommit_now
+                && state.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                && state.n_change.load(Ordering::SeqCst) > 0;
+            if changed_shared_mvcc_auto_txn {
+                turso_assert!(
+                    is_mvcc,
+                    "shared autocommit transaction needed full rollback outside MVCC"
+                );
+                // A writer changed rows in an MVCC autocommit transaction, but
+                // a sibling reader is still holding that transaction open. The
+                // writer had no statement savepoint, so the only safe cleanup
+                // is rolling back the whole MVCC transaction.
+            }
+            let must_rollback_tx_if_needed = can_autocommit_now || changed_shared_mvcc_auto_txn;
             if err.is_some() && !pager.is_checkpointing() {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
@@ -2469,6 +2577,12 @@ impl Program {
                 Some(LimboError::TableLocked) => {}
                 // Busy errors do not cause a rollback.
                 Some(LimboError::Busy) => {}
+                // Same-connection "SQL statements in progress" rejections do
+                // not cause a rollback either: the rejected operation was
+                // refused before it touched any transaction or savepoint
+                // state, and the in-progress statement it collided with must
+                // keep running unharmed.
+                Some(LimboError::StatementsInProgress(_)) => {}
                 // BusySnapshot errors do not cause a rollback either - user must rollback explicitly.
                 // BusySnapshot is distinct from Busy in that a busy_timeout or handler should not be
                 // used because it will not help - the snapshot is permanently stale and rollback is
@@ -2488,7 +2602,7 @@ impl Program {
                 // FK errors always behave like ABORT: rollback statement,
                 // rollback transaction in autocommit mode.
                 Some(LimboError::ForeignKeyConstraint(_)) => {
-                    if owns_auto_txn {
+                    if must_rollback_tx_if_needed {
                         self.rollback_current_txn(pager);
                     }
                     self.connection.set_changes(0);
@@ -2524,7 +2638,7 @@ impl Program {
                                     "Failed to release statement savepoint during abort",
                                 );
                             }
-                            if owns_auto_txn {
+                            if can_autocommit_now {
                                 // Autocommit FAIL: commit partial changes.
                                 // This matches halt()'s FAIL+autocommit path.
                                 let mv_store = self.connection.mv_store();
@@ -2573,7 +2687,7 @@ impl Program {
                             }
                         }
                         _ => {
-                            if owns_auto_txn {
+                            if must_rollback_tx_if_needed {
                                 self.rollback_current_txn(pager);
                             }
                         }
@@ -2595,10 +2709,12 @@ impl Program {
                 }
                 _ => match state.auto_txn_cleanup {
                     TxnCleanup::RollbackTxn => {
-                        self.rollback_current_txn(pager);
+                        if must_rollback_tx_if_needed {
+                            self.rollback_current_txn(pager);
+                        }
                     }
                     TxnCleanup::RollbackSavepoint => {
-                        if owns_auto_txn {
+                        if can_autocommit_now {
                             self.rollback_current_txn(pager);
                         } else if err.is_none() && !pager.is_checkpointing() {
                             if let Err(end_stmt_err) = state.end_statement(
@@ -2615,7 +2731,9 @@ impl Program {
                         }
                     }
                     TxnCleanup::None => {
-                        if owns_auto_txn || (!self.connection.get_auto_commit() && err.is_some()) {
+                        if can_autocommit_now
+                            || (!self.connection.get_auto_commit() && err.is_some())
+                        {
                             self.rollback_current_txn(pager);
                         }
                     }

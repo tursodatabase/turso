@@ -784,6 +784,7 @@ pub enum ScalarFunc {
     StatGet,
     ConnTxnId,
     IsAutocommit,
+    SequenceWatermark,
     // Test type functions (for custom type system testing)
     TestUintEncode,
     TestUintDecode,
@@ -799,6 +800,12 @@ pub enum ScalarFunc {
     #[cfg(feature = "test_helper")]
     TestNondetCounter,
     StringReverse,
+    // SQL-standard string and math extensions (PG/MySQL/Oracle compatible)
+    Gcd,
+    Lcm,
+    Repeat,
+    Lpad,
+    Rpad,
     // Built-in type support functions
     BooleanToInt,
     IntToBoolean,
@@ -910,6 +917,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::StatGet => false,  // internal ANALYZE function
             ScalarFunc::ConnTxnId => false, // depends on connection state
             ScalarFunc::IsAutocommit => false, // depends on connection state
+            ScalarFunc::SequenceWatermark => false, // depends on active MVCC transactions
             ScalarFunc::TestUintEncode
             | ScalarFunc::TestUintDecode
             | ScalarFunc::TestUintAdd
@@ -919,6 +927,11 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::TestUintLt
             | ScalarFunc::TestUintEq
             | ScalarFunc::StringReverse => true,
+            ScalarFunc::Gcd
+            | ScalarFunc::Lcm
+            | ScalarFunc::Repeat
+            | ScalarFunc::Lpad
+            | ScalarFunc::Rpad => true,
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter => false,
             ScalarFunc::BooleanToInt
@@ -1049,6 +1062,7 @@ impl Display for ScalarFunc {
             Self::StatGet => "stat_get",
             Self::ConnTxnId => "conn_txn_id",
             Self::IsAutocommit => "is_autocommit",
+            Self::SequenceWatermark => "sequence_watermark_experimental",
             Self::TestUintEncode => "test_uint_encode",
             Self::TestUintDecode => "test_uint_decode",
             Self::TestUintAdd => "test_uint_add",
@@ -1060,6 +1074,11 @@ impl Display for ScalarFunc {
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => "test_nondet_counter",
             Self::StringReverse => "string_reverse",
+            Self::Gcd => "gcd",
+            Self::Lcm => "lcm",
+            Self::Repeat => "repeat",
+            Self::Lpad => "lpad",
+            Self::Rpad => "rpad",
             Self::BooleanToInt => "boolean_to_int",
             Self::IntToBoolean => "int_to_boolean",
             Self::ValidateIpAddr => "validate_ipaddr",
@@ -1152,7 +1171,8 @@ impl ScalarFunc {
             | Self::Upper
             | Self::ZeroBlob
             | Self::Likely
-            | Self::Unlikely => &[1],
+            | Self::Unlikely
+            | Self::SequenceWatermark => &[1],
             // 2-arg
             Self::Glob
             | Self::Instr
@@ -1194,6 +1214,9 @@ impl ScalarFunc {
             | Self::IsAutocommit => &[0],
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],
+            // SQL-standard string and math extensions
+            Self::Gcd | Self::Lcm | Self::Repeat => &[2],
+            Self::Lpad | Self::Rpad => &[2, 3],
             // Test functions for custom types (1-arg encode/decode, 2-arg operators)
             Self::TestUintEncode | Self::TestUintDecode | Self::StringReverse => &[1],
             Self::TestUintAdd
@@ -1594,7 +1617,7 @@ impl Func {
             "jsonb_group_object" => Ok(Some(Self::Agg(AggFunc::JsonbGroupObject))),
             #[cfg(feature = "json")]
             "json_group_object" => Ok(Some(Self::Agg(AggFunc::JsonGroupObject))),
-            "char" => Ok(Some(Self::Scalar(ScalarFunc::Char))),
+            "char" | "chr" => Ok(Some(Self::Scalar(ScalarFunc::Char))),
             "coalesce" => Ok(Some(Self::Scalar(ScalarFunc::Coalesce))),
             "concat" => {
                 if arg_count == 0 {
@@ -1613,18 +1636,20 @@ impl Func {
             "glob" => Ok(Some(Self::Scalar(ScalarFunc::Glob))),
             "ifnull" => Ok(Some(Self::Scalar(ScalarFunc::IfNull))),
             "if" | "iif" => Ok(Some(Self::Scalar(ScalarFunc::Iif))),
-            "instr" => Ok(Some(Self::Scalar(ScalarFunc::Instr))),
+            "instr" | "strpos" => Ok(Some(Self::Scalar(ScalarFunc::Instr))),
             "like" => Ok(Some(Self::Scalar(ScalarFunc::Like))),
             "abs" => Ok(Some(Self::Scalar(ScalarFunc::Abs))),
             "upper" => Ok(Some(Self::Scalar(ScalarFunc::Upper))),
             "lower" => Ok(Some(Self::Scalar(ScalarFunc::Lower))),
             "random" => Ok(Some(Self::Scalar(ScalarFunc::Random))),
             "randomblob" => Ok(Some(Self::Scalar(ScalarFunc::RandomBlob))),
-            "trim" => Ok(Some(Self::Scalar(ScalarFunc::Trim))),
+            "trim" | "btrim" => Ok(Some(Self::Scalar(ScalarFunc::Trim))),
             "ltrim" => Ok(Some(Self::Scalar(ScalarFunc::LTrim))),
             "rtrim" => Ok(Some(Self::Scalar(ScalarFunc::RTrim))),
             "round" => Ok(Some(Self::Scalar(ScalarFunc::Round))),
-            "length" => Ok(Some(Self::Scalar(ScalarFunc::Length))),
+            "length" | "char_length" | "character_length" => {
+                Ok(Some(Self::Scalar(ScalarFunc::Length)))
+            }
             "octet_length" => Ok(Some(Self::Scalar(ScalarFunc::OctetLength))),
             "sign" => Ok(Some(Self::Scalar(ScalarFunc::Sign))),
             "substr" => {
@@ -1682,6 +1707,8 @@ impl Func {
             #[cfg(feature = "json")]
             "json_patch" => Ok(Some(Self::Json(JsonFunc::JsonPatch))),
             #[cfg(feature = "json")]
+            "jsonb_patch" => Ok(Some(Self::Json(JsonFunc::JsonbPatch))),
+            #[cfg(feature = "json")]
             "json_remove" => Ok(Some(Self::Json(JsonFunc::JsonRemove))),
             #[cfg(feature = "json")]
             "jsonb_remove" => Ok(Some(Self::Json(JsonFunc::JsonbRemove))),
@@ -1711,6 +1738,9 @@ impl Func {
             "bin_record_json_object" => Ok(Some(Self::Scalar(ScalarFunc::BinRecordJsonObject))),
             "conn_txn_id" => Ok(Some(Self::Scalar(ScalarFunc::ConnTxnId))),
             "is_autocommit" => Ok(Some(Self::Scalar(ScalarFunc::IsAutocommit))),
+            "sequence_watermark_experimental" => {
+                Ok(Some(Self::Scalar(ScalarFunc::SequenceWatermark)))
+            }
             "acos" => Ok(Some(Self::Math(MathFunc::Acos))),
             "acosh" => Ok(Some(Self::Math(MathFunc::Acosh))),
             "asin" => Ok(Some(Self::Math(MathFunc::Asin))),
@@ -1776,7 +1806,12 @@ impl Func {
             "test_uint_eq" => Ok(Some(Self::Scalar(ScalarFunc::TestUintEq))),
             #[cfg(feature = "test_helper")]
             "test_nondet_counter" => Ok(Some(Self::Scalar(ScalarFunc::TestNondetCounter))),
-            "string_reverse" => Ok(Some(Self::Scalar(ScalarFunc::StringReverse))),
+            "string_reverse" | "reverse" => Ok(Some(Self::Scalar(ScalarFunc::StringReverse))),
+            "gcd" => Ok(Some(Self::Scalar(ScalarFunc::Gcd))),
+            "lcm" => Ok(Some(Self::Scalar(ScalarFunc::Lcm))),
+            "repeat" => Ok(Some(Self::Scalar(ScalarFunc::Repeat))),
+            "lpad" => Ok(Some(Self::Scalar(ScalarFunc::Lpad))),
+            "rpad" => Ok(Some(Self::Scalar(ScalarFunc::Rpad))),
             // Built-in type support functions
             "boolean_to_int" => Ok(Some(Self::Scalar(ScalarFunc::BooleanToInt))),
             "int_to_boolean" => Ok(Some(Self::Scalar(ScalarFunc::IntToBoolean))),
@@ -1794,7 +1829,7 @@ impl Func {
             "array_element" => Ok(Some(Self::Scalar(ScalarFunc::ArrayElement))),
             "array_set_element" => Ok(Some(Self::Scalar(ScalarFunc::ArraySetElement))),
             // Array functions
-            "array_length" => Ok(Some(Self::Scalar(ScalarFunc::ArrayLength))),
+            "array_length" | "array_upper" => Ok(Some(Self::Scalar(ScalarFunc::ArrayLength))),
             "array_append" => Ok(Some(Self::Scalar(ScalarFunc::ArrayAppend))),
             "array_prepend" => Ok(Some(Self::Scalar(ScalarFunc::ArrayPrepend))),
             "array_cat" => Ok(Some(Self::Scalar(ScalarFunc::ArrayCat))),

@@ -1607,6 +1607,106 @@ fn test_wal_savepoint_rollback_on_constraint_violation() {
     assert_eq!(row[0], Value::from_i64(1001));
 }
 
+/// Regression test for savepoint rollback across a WAL restart.
+///
+/// A savepoint opened before the transaction's first write predates the
+/// WAL restart that the write upgrade performs when the log is fully
+/// backfilled (new generation: frames renumbered from zero, fresh salts
+/// and checksum chain). `ROLLBACK TO` must rewind to a position in the
+/// new generation: installing a pre-restart position would make the next
+/// spill/commit append at the old generation's offset with the old
+/// checksum chain — rolled-back frames stay visible to readers and the
+/// commit's frames fail recovery validation (integrity_check errors,
+/// committed data lost after recovery).
+#[test]
+fn test_savepoint_rollback_across_wal_restart() {
+    let tmp_db = TempDatabase::new("savepoint_wal_restart.db");
+    let conn = tmp_db.connect_limbo();
+
+    // Small page cache so the big transaction below spills to the WAL
+    // mid-transaction (uncommitted frames).
+    conn.execute("PRAGMA cache_size = 200").unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+
+    let padding = "x".repeat(2000);
+    conn.execute("BEGIN").unwrap();
+    for i in 1..=300 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, '{padding}')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    // Fully backfill the WAL so the next write transaction restarts the log.
+    conn.execute("PRAGMA wal_checkpoint(FULL)").unwrap();
+
+    // Open the savepoint before the transaction's first write, so it
+    // predates the WAL restart.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT sp").unwrap();
+    // The first INSERT upgrades to a write transaction, which restarts the
+    // WAL; the rest of the inserts overflow the page cache and spill
+    // uncommitted frames into the new WAL generation.
+    for i in 301..=900 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, '{padding}')"))
+            .unwrap();
+    }
+    conn.execute("ROLLBACK TO sp").unwrap();
+    for i in 901..=910 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, '{padding}')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    // A fresh connection must see a consistent database: only the first
+    // batch and the post-rollback inserts.
+    let conn2 = tmp_db.connect_limbo();
+    let stmt = conn2.query("PRAGMA integrity_check").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(
+        row[0],
+        Value::Text("ok".into()),
+        "integrity check must pass after savepoint rollback across a WAL restart"
+    );
+    let stmt = conn2.query("SELECT COUNT(*) FROM t").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row[0], Value::from_i64(310));
+
+    // The committed transaction must also survive WAL recovery from disk.
+    // With the append position corrupted, the commit's frames fail salt or
+    // checksum validation and recovery silently drops them. This check must
+    // run before any checkpoint: backfilling would launder the corrupted WAL
+    // into the database file and mask the recovery failure.
+    let rusqlite_conn = rusqlite::Connection::open(tmp_db.path.clone()).unwrap();
+    let result: String = rusqlite_conn
+        .pragma_query_value(None, "integrity_check", |row| row.get(0))
+        .unwrap();
+    assert_eq!(result, "ok");
+    let count: i64 = rusqlite_conn
+        .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 310,
+        "committed rows must survive WAL recovery after savepoint rollback across a WAL restart"
+    );
+    drop(rusqlite_conn);
+
+    // Checkpointing must not backfill rolled-back or stale-generation frames
+    // into the database file.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let stmt = conn2.query("PRAGMA integrity_check").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(
+        row[0],
+        Value::Text("ok".into()),
+        "integrity check must pass after checkpointing"
+    );
+    let stmt = conn2.query("SELECT COUNT(*) FROM t").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row[0], Value::from_i64(310));
+}
+
 #[turso_macros::test]
 /// INSERT OR FAIL should keep changes made by the statement before the error.
 /// Unlike ABORT (the default), FAIL does not roll back successful inserts within the same statement.

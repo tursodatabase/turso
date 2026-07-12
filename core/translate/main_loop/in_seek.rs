@@ -27,14 +27,14 @@ pub(super) fn open_in_seek_source_cursor(
                 name: String::new(),
                 table_name: String::new(),
                 root_page: 0,
-                columns: vec![IndexColumn {
+                columns: crate::alloc::try_vec![IndexColumn {
                     name: String::new(),
                     order: SortOrder::Asc,
                     pos_in_table: 0,
                     collation,
                     default: None,
                     expr: None,
-                }],
+                }]?,
                 unique: true,
                 ephemeral: true,
                 has_rowid: false,

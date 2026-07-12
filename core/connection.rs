@@ -1,3 +1,4 @@
+use crate::alloc::TryClone;
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
@@ -25,9 +26,9 @@ use crate::{
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
     BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
-    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
-    Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
-    Trigger, Value, VirtualTable, WalAutoActions,
+    EncryptionKey, EncryptionOpts, IOResult, IndexMethod, LimboError, MvStore, OpenFlags, PageSize,
+    Pager, Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode,
+    TransactionMode, Trigger, Value, VirtualTable, WalAutoActions,
 };
 use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
@@ -206,13 +207,20 @@ enum ReparsePhase {
     PopulateSequences {
         /// `(backing_table_name, seq_name)` worklist; `None` until lazily
         /// computed. Left empty when preserved sequences are grafted.
-        pending: Option<Vec<(String, String)>>,
+        pending: Option<crate::alloc::Vec<(String, String)>>,
         /// Index of the backing table currently being read.
         idx: usize,
         /// In-flight descriptor `SELECT`, created lazily per backing table.
         stmt: Option<Box<Statement>>,
         /// Descriptor row `(start, inc, min, max, cycle)` captured from `stmt`.
         meta: Option<(i64, i64, i64, i64, bool)>,
+        /// Sequence reconstructed from `meta`, retained while the watermark
+        /// query yields IO.
+        seq: Option<crate::schema::Sequence>,
+        /// In-flight watermark `SELECT`, created after `seq` is known.
+        watermark_stmt: Option<Box<Statement>>,
+        /// Watermark row `(value, is_called)` captured from `watermark_stmt`.
+        watermark_row: Option<(i64, bool)>,
     },
     /// Loading custom type definitions from the internal types table.
     LoadTypes {
@@ -225,6 +233,48 @@ enum ReparsePhase {
     },
 }
 
+#[cfg(not(feature = "fs"))]
+#[derive(Default)]
+pub(crate) enum AttachDatabaseState {
+    #[default]
+    Start,
+}
+
+#[cfg(feature = "fs")]
+#[derive(Default)]
+pub(crate) enum AttachDatabaseState {
+    #[default]
+    Start,
+    Init(Box<AttachDatabaseInitState>),
+    Bootstrap(Box<AttachDatabaseBootstrapState>),
+    Publish {
+        alias: String,
+        db: Arc<Database>,
+        pager: Arc<Pager>,
+    },
+    Done,
+}
+
+#[cfg(feature = "fs")]
+pub(crate) struct AttachDatabaseInitState {
+    alias: String,
+    reserved_space: Option<u8>,
+    db: Arc<Database>,
+    attached_is_fresh: bool,
+    encryption_key: Option<EncryptionKey>,
+    init_st: crate::InitState,
+}
+
+#[cfg(feature = "fs")]
+pub(crate) struct AttachDatabaseBootstrapState {
+    alias: String,
+    db: Arc<Database>,
+    pager: Arc<Pager>,
+    encryption_key: Option<EncryptionKey>,
+    bootstrap_conn: Option<Arc<Connection>>,
+    bootstrap_st: crate::mvcc::database::BootstrapState,
+}
+
 /// Re-entrant driver state for
 /// [`Connection::load_sequence_descriptors_via_sql_nonblock`]. Walks every
 /// `__turso_internal_seq_*` backing table and registers its descriptor,
@@ -235,13 +285,20 @@ pub enum LoadSequenceDescriptorsState {
     Start,
     Reading {
         /// `(backing_table_name, seq_name)` worklist captured from the schema.
-        pending: Vec<(String, String)>,
+        pending: crate::alloc::Vec<(String, String)>,
         /// Index of the backing table currently being read.
         idx: usize,
         /// In-flight descriptor `SELECT`, created lazily per backing table.
         stmt: Option<Box<Statement>>,
         /// Descriptor row `(start, inc, min, max, cycle)` captured from `stmt`.
         meta: Option<(i64, i64, i64, i64, bool)>,
+        /// Sequence reconstructed from `meta`, retained while the watermark
+        /// query yields IO.
+        seq: Option<crate::schema::Sequence>,
+        /// In-flight watermark `SELECT`, created after `seq` is known.
+        watermark_stmt: Option<Box<Statement>>,
+        /// Watermark row `(value, is_called)` captured from `watermark_stmt`.
+        watermark_row: Option<(i64, bool)>,
     },
 }
 
@@ -295,6 +352,10 @@ pub struct Connection {
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
     pub(super) transaction_state: AtomicTransactionState,
+    /// True when an unfinished write statement inside an explicit transaction
+    /// was reset or dropped and there was no statement savepoint to undo only
+    /// that statement. COMMIT must roll back the whole transaction.
+    pub(crate) poisoned_tx: AtomicBool,
     pub(super) last_insert_rowid: AtomicI64,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
@@ -404,7 +465,10 @@ pub struct Connection {
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
-    /// Number of active write statements on this connection.
+    /// Number of active top-level write statements on this connection.
+    ///
+    /// This is currently only 0 or 1. We return Busy instead of allowing a
+    /// second same-connection writer to start.
     pub(crate) n_active_writes: AtomicI32,
     /// Number of active root statements currently executing on this connection.
     /// This is Turso's equivalent of SQLite's top-level active-VDBE count
@@ -886,7 +950,7 @@ impl Connection {
         self.prepare_with_origin(sql, StatementOrigin::InternalHelper)
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self.prepare_with_origin(sql, StatementOrigin::Root)
     }
@@ -1027,6 +1091,7 @@ impl Connection {
         if self.get_tx_state() != TransactionState::None {
             return Ok(());
         }
+        let had_main_mv_tx = self.get_mv_tx().is_some();
 
         if self.db.shared_wal_coordination()?.is_some() {
             // Cross-process schema changes can leave page 1 and sqlite_schema
@@ -1095,12 +1160,85 @@ impl Connection {
         if previous == TransactionState::Read {
             pager.end_read_tx();
         }
+        if !had_main_mv_tx {
+            self.clear_internal_main_mvcc_tx(&pager);
+        }
 
         reparse_result?;
 
         let schema = self.schema.read().clone();
         self.db.update_schema_if_newer(schema);
         Ok(())
+    }
+
+    /// Parse schema from scratch even if the schema cookie did not change.
+    ///
+    /// Sync replace-base can install a page snapshot outside ordinary SQL DDL.
+    /// The replacement may reuse the same schema cookie while changing root
+    /// pages, so cookie-based refresh would keep stale btree metadata.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn force_reparse_schema(self: &Arc<Connection>) -> Result<()> {
+        self.force_reparse_schema_inner(true)
+    }
+
+    /// Like [`Self::force_reparse_schema`], but refreshes only this connection's
+    /// own schema snapshot without publishing it to the shared database cache.
+    ///
+    /// Use this when the caller must further mutate the schema before it becomes
+    /// visible to other connections.
+    pub fn force_reparse_schema_without_publish(self: &Arc<Connection>) -> Result<()> {
+        self.force_reparse_schema_inner(false)
+    }
+
+    fn force_reparse_schema_inner(self: &Arc<Connection>, publish: bool) -> Result<()> {
+        if self.get_tx_state() != TransactionState::None {
+            return Err(LimboError::Busy);
+        }
+        if self.get_mv_tx().is_some() || self.next_attached_mv_tx().is_some() {
+            return Err(LimboError::Busy);
+        }
+
+        let pager = self.pager.load().clone();
+        pager.clear_page_cache(false);
+        pager.set_schema_cookie(None);
+        pager.begin_read_tx()?;
+        self.set_tx_state(TransactionState::Read);
+
+        let reparse_result = self.reparse_schema();
+
+        let previous = self.transaction_state.swap(TransactionState::None);
+        turso_assert!(
+            matches!(previous, TransactionState::None | TransactionState::Read),
+            "unexpected end transaction state"
+        );
+        if previous == TransactionState::Read {
+            pager.end_read_tx();
+        }
+        self.clear_internal_main_mvcc_tx(&pager);
+
+        reparse_result?;
+
+        if publish {
+            let schema = self.schema.read().clone();
+            self.db.update_schema_if_newer(schema);
+        }
+        Ok(())
+    }
+
+    fn clear_internal_main_mvcc_tx(&self, pager: &Arc<Pager>) {
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return;
+        };
+        if let Some(mv_store) = self.mv_store().as_ref() {
+            if mv_store.is_tx_rollbackable(tx_id) {
+                mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+            } else {
+                self.set_mv_tx(None);
+            }
+        } else {
+            self.set_mv_tx(None);
+        }
+        pager.cleanup_read_tx();
     }
 
     /// Blocking shim: drives [`Self::reparse_schema_nonblock`] to completion.
@@ -1203,8 +1341,9 @@ impl Connection {
         // But in this occasion it will always reprepare, and we get an error. So we trick the statement by swapping our schema
         // with a new clean schema that has the same header cookie.
         self.with_schema_mut(|schema| {
-            *schema = fresh.clone();
-        });
+            *schema = fresh.try_clone()?;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
 
         let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
 
@@ -1267,6 +1406,9 @@ impl Connection {
                         idx: 0,
                         stmt: None,
                         meta: None,
+                        seq: None,
+                        watermark_stmt: None,
+                        watermark_row: None,
                     };
                 }
                 ReparsePhase::PopulateSequences {
@@ -1274,6 +1416,9 @@ impl Connection {
                     idx,
                     stmt,
                     meta,
+                    seq,
+                    watermark_stmt,
+                    watermark_row,
                 } => {
                     // Lazy init: graft the VACUUM-preserved descriptor map, or
                     // compute the worklist of backing tables to read from disk.
@@ -1282,13 +1427,14 @@ impl Connection {
                     if pending.is_none() {
                         if let Some(sequences) = inner.preserved_sequences.take() {
                             inner.fresh.sequences = sequences;
-                            *pending = Some(Vec::new());
+                            *pending = Some(crate::alloc::vec![]);
                         } else {
                             let work = inner.fresh.sequence_backing_table_names();
                             if !work.is_empty() {
                                 self.with_schema_mut(|schema| {
-                                    *schema = inner.fresh.clone();
-                                });
+                                    *schema = inner.fresh.try_clone()?;
+                                    Ok::<_, crate::alloc::TryReserveError>(())
+                                })??;
                             }
                             *pending = Some(work);
                         }
@@ -1312,22 +1458,49 @@ impl Connection {
                         if inner.fresh.sequences.contains_key(&normalized) {
                             *idx += 1;
                             *stmt = None;
+                            *meta = None;
+                            *seq = None;
+                            *watermark_stmt = None;
+                            *watermark_row = None;
                             continue;
                         }
-                        crate::return_if_io!(self.read_seq_descriptor_row_nonblock(
+                        if seq.is_none() {
+                            crate::return_if_io!(self.read_seq_descriptor_row_nonblock(
+                                &backing_table_name,
+                                &seq_name,
+                                stmt,
+                                meta,
+                            ));
+                            *seq = Some(Self::sequence_from_descriptor_meta(
+                                &seq_name,
+                                &backing_table_name,
+                                *meta,
+                            )?);
+                            *stmt = None;
+                            *meta = None;
+                        }
+                        let sequence = seq.as_ref().expect("sequence set above");
+                        crate::return_if_io!(self.read_sequence_watermark_row_nonblock(
                             &backing_table_name,
-                            &seq_name,
-                            stmt,
-                            meta,
+                            sequence,
+                            watermark_stmt,
+                            watermark_row,
                         ));
-                        let seq = Self::sequence_from_descriptor_meta(
-                            &seq_name,
+                        let watermark = Self::sequence_watermark_from_row(
                             &backing_table_name,
-                            *meta,
+                            sequence,
+                            *watermark_row,
                         )?;
-                        inner.fresh.sequences.insert(normalized, Arc::new(seq));
+                        if let Some(mv_store) = self.db.get_mv_store().as_ref() {
+                            mv_store.set_sequence_watermark(&normalized, watermark);
+                        }
+                        let sequence = seq.take().expect("sequence set above");
+                        inner.fresh.sequences.insert(normalized, Arc::new(sequence));
                         *idx += 1;
                         *stmt = None;
+                        *meta = None;
+                        *watermark_stmt = None;
+                        *watermark_row = None;
                     }
 
                     // Decide whether to load custom types next.
@@ -1339,8 +1512,9 @@ impl Connection {
                     {
                         // Temporarily install the schema so we can query against it.
                         self.with_schema_mut(|schema| {
-                            *schema = inner.fresh.clone();
-                        });
+                            *schema = inner.fresh.try_clone()?;
+                            Ok::<_, crate::alloc::TryReserveError>(())
+                        })??;
                         let stmt = self.prepare_internal(format!(
                             "SELECT name, sql FROM {}",
                             crate::schema::TURSO_TYPES_TABLE_NAME
@@ -1400,7 +1574,7 @@ impl Connection {
                     );
                     self.with_schema_mut(|schema| {
                         *schema = fresh;
-                    });
+                    })?;
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -1439,7 +1613,7 @@ impl Connection {
         }
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn prepare_execute_batch(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1463,7 +1637,7 @@ impl Connection {
         Ok(())
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn query(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Option<Statement>> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1482,7 +1656,7 @@ impl Connection {
         }
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub(crate) fn run_cmd(
         self: &Arc<Connection>,
         cmd: Cmd,
@@ -1502,7 +1676,7 @@ impl Connection {
 
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
     /// TODO: make this api async
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     #[turso_macros::trace_stack]
     pub fn execute(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         if self.is_closed() {
@@ -1524,7 +1698,7 @@ impl Connection {
         Ok(())
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
+    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn consume_stmt(
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
@@ -1774,13 +1948,15 @@ impl Connection {
                     header.schema_cookie.get() < version,
                     "cookie can't go back in time"
                 );
-                self.set_tx_state(TransactionState::Write {
-                    schema_did_change: true,
-                });
-                self.with_schema_mut(|schema| schema.schema_version = version);
-                header.schema_cookie = version.into();
+                self.with_schema_mut(|schema| schema.schema_version = version)
+                    .map(|()| {
+                        self.set_tx_state(TransactionState::Write {
+                            schema_did_change: true,
+                        });
+                        header.schema_cookie = version.into();
+                    })
             })
-        })?;
+        })??;
         self.reparse_schema()?;
         Ok(())
     }
@@ -1800,11 +1976,9 @@ impl Connection {
             return Ok(false);
         };
         match self.get_pager().io.wait_for_completion(c) {
-            #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
-            Err(LimboError::CompletionError(crate::error::CompletionError::IOError(
-                std::io::ErrorKind::UnexpectedEof,
-                _,
-            ))) => {
+            Err(LimboError::CompletionError(err))
+                if Self::wal_watermark_read_error_is_absent_page(&err) =>
+            {
                 return Ok(false);
             }
             Err(e) => return Err(e),
@@ -1812,6 +1986,28 @@ impl Connection {
         }
 
         self.try_wal_watermark_read_page_end(page, page_ref)
+    }
+
+    /// Classify a completion error raised while reading a page at a fixed WAL
+    /// watermark. On Windows under `experimental_win_iocp`, an absent /
+    /// zero-length page read surfaces as `UnexpectedEof` (see
+    /// `core/io/win_iocp.rs`); every watermark-read site must treat that as
+    /// "page absent" (size 0) rather than a hard error. Centralized here so the
+    /// platform handling cannot drift across the (now four) call sites.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn wal_watermark_read_error_is_absent_page(err: &crate::error::CompletionError) -> bool {
+        #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+        {
+            matches!(
+                err,
+                crate::error::CompletionError::IOError(std::io::ErrorKind::UnexpectedEof, _)
+            )
+        }
+        #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+        {
+            let _ = err;
+            false
+        }
     }
 
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -1927,12 +2123,12 @@ impl Connection {
                 pager
                     .io
                     .block(|| {
-                        return_if_io!(pager.commit_dirty_pages(
+                        return_if_io!(pager.commit_wal(
                             WalAutoActions::empty(),
                             self.get_sync_mode(),
                             self.get_data_sync_retry(),
                         ));
-                        pager.commit_dirty_pages_end();
+                        pager.commit_wal_end();
                         Ok(IOResult::Done(()))
                     })
                     .err()
@@ -2076,6 +2272,92 @@ impl Connection {
             return WalAutoActions::empty();
         }
         WalAutoActions::from_bits_truncate(self.wal_auto_actions.load(Ordering::SeqCst))
+    }
+
+    /// Publish the connection's current schema snapshot to the shared database
+    /// cache after a successful commit so other live connections can refresh.
+    pub fn publish_schema_if_newer(&self) {
+        let schema = self.schema.read().clone();
+        self.db.update_schema_if_newer(schema);
+    }
+
+    /// Publish the connection's current schema snapshot after pages were
+    /// replaced outside normal SQL commit ordering.
+    ///
+    /// External restore paths can move the schema cookie backwards. In that
+    /// case the shared schema cache must be replaced rather than updated
+    /// monotonically, otherwise new connections can re-adopt stale metadata.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn publish_schema_after_external_restore(&self) -> Result<()> {
+        if self.get_tx_state() != TransactionState::None {
+            return Err(LimboError::Busy);
+        }
+        if self.get_mv_tx().is_some() || self.next_attached_mv_tx().is_some() {
+            return Err(LimboError::Busy);
+        }
+
+        let schema = self.schema.read().clone();
+        self.db.with_schema_mut(|current| {
+            *current = schema.as_ref().try_clone()?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Roll back the main-database MVCC transaction while keeping the
+    /// surrounding raw WAL-insert session open.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn reset_main_mvcc_tx_for_wal_session(&self) {
+        let mv_store = self.mv_store();
+        let Some(mv_store) = mv_store.as_ref() else {
+            return;
+        };
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return;
+        };
+        let pager = self.pager.load();
+        mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+    }
+
+    /// Discard the main-db MVCC transaction left by a sync raw-WAL session
+    /// before reparsing state after external file replacement.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn discard_main_mvcc_tx_after_external_restore(&self) {
+        let pager = self.pager.load();
+        self.clear_internal_main_mvcc_tx(&pager);
+    }
+
+    /// Returns whether the main database currently has a live MVCC transaction.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn has_main_mvcc_tx_for_wal_session(&self) -> bool {
+        self.get_mv_tx_id().is_some()
+    }
+
+    /// Commit the main-database MVCC transaction while keeping the surrounding
+    /// raw WAL-insert session open.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn commit_main_mvcc_tx_for_wal_session(self: &Arc<Self>) -> Result<()> {
+        let mv_store_handle = self.mv_store();
+        let Some(mv_store) = mv_store_handle.as_ref() else {
+            return Ok(());
+        };
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return Ok(());
+        };
+
+        let mut state_machine = mv_store.commit_tx(tx_id, self, MAIN_DB_ID)?;
+        while let IOResult::IO(io) = state_machine.step(mv_store)? {
+            io.wait(self.db.io.as_ref())?;
+        }
+        assert!(state_machine.is_finalized());
+        self.set_mv_tx(None);
+        self.publish_schema_if_newer();
+        Ok(())
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn reload_wal_after_external_restore(&self) -> Result<()> {
+        self.db.reload_wal_after_external_restore()
     }
 
     /// Enable or disable writing portable logical-change metadata into MVCC
@@ -2327,6 +2609,24 @@ impl Connection {
         self.auto_commit.load(Ordering::SeqCst)
     }
 
+    /// Mark the active explicit transaction poisoned so COMMIT rolls it back.
+    ///
+    /// This is used when a write statement under BEGIN is abandoned before it
+    /// reaches Halt/Done and that statement did not open a statement savepoint.
+    pub(crate) fn mark_tx_poisoned(&self) {
+        self.poisoned_tx.store(true, Ordering::SeqCst);
+    }
+
+    /// Return whether the active explicit transaction must roll back at COMMIT.
+    pub(crate) fn tx_is_poisoned(&self) -> bool {
+        self.poisoned_tx.load(Ordering::SeqCst)
+    }
+
+    /// Clear the poison marker after BEGIN, COMMIT, or ROLLBACK.
+    pub(crate) fn clear_tx_poison(&self) {
+        self.poisoned_tx.store(false, Ordering::SeqCst);
+    }
+
     pub fn set_load_extension_enabled(&self, enabled: bool) {
         self.enable_load_extension.store(enabled, Ordering::Release);
     }
@@ -2365,7 +2665,7 @@ impl Connection {
             // tables/indices/views from initial parse. We only need to pick up
             // entries that previously failed (e.g. virtual tables whose module
             // wasn't loaded yet). "Already exists" errors are expected and skipped.
-            let mut from_sql_indexes = Vec::new();
+            let mut from_sql_indexes = crate::alloc::vec![];
             let mut automatic_indices = HashMap::default();
             let mut dbsp_state_roots = HashMap::default();
             let mut dbsp_state_index_roots = HashMap::default();
@@ -2417,7 +2717,7 @@ impl Connection {
                 Err(e) => return Err(e),
             }
             Ok(())
-        })
+        })?
     }
 
     // Clearly there is something to improve here, Vec<Vec<Value>> isn't a couple of tea
@@ -2596,10 +2896,10 @@ impl Connection {
     }
 
     #[inline]
-    pub fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> T) -> T {
+    pub fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> T) -> Result<T> {
         let mut schema_ref = self.schema.write();
-        let schema = Arc::make_mut(&mut *schema_ref);
-        f(schema)
+        let schema = Schema::try_make_mut(&mut schema_ref)?;
+        Ok(f(schema))
     }
 
     /// Mutate the schema for a specific database (main or attached).
@@ -2607,7 +2907,7 @@ impl Connection {
         &self,
         database_id: usize,
         f: impl FnOnce(&mut Schema) -> T,
-    ) -> T {
+    ) -> Result<T> {
         match database_id {
             crate::MAIN_DB_ID => self.with_schema_mut(f),
             crate::TEMP_DB_ID => {
@@ -2619,10 +2919,10 @@ impl Connection {
                     .as_ref()
                     .expect("temp database should be initialized before schema mutation");
                 let mut schema_guard = temp_db.db.schema.lock();
-                let schema = Arc::make_mut(&mut schema_guard);
+                let schema = Schema::try_make_mut(&mut schema_guard)?;
                 let result = f(schema);
                 self.bump_prepare_context_generation();
-                result
+                Ok(result)
             }
             _ => {
                 // For attached databases, update a connection-local copy of the schema.
@@ -2639,10 +2939,10 @@ impl Connection {
                     let schema = db.schema.lock().clone();
                     schema
                 });
-                let schema = Arc::make_mut(schema_arc);
+                let schema = Schema::try_make_mut(schema_arc)?;
                 let result = f(schema);
                 self.bump_prepare_context_generation();
-                result
+                Ok(result)
             }
         }
     }
@@ -2867,10 +3167,15 @@ impl Connection {
 
     /// Attach a database file with the given alias name
     #[cfg(not(feature = "fs"))]
-    pub(crate) fn attach_database(&self, _path: &str, _alias: &str) -> Result<()> {
-        return Err(LimboError::InvalidArgument(format!(
-            "attach not available in this build (no-fs)"
-        )));
+    pub(crate) fn attach_database(
+        &self,
+        _path: &str,
+        _alias: &str,
+        _state: &mut AttachDatabaseState,
+    ) -> Result<IOResult<()>> {
+        Err(LimboError::InvalidArgument(
+            "attach not available in this build (no-fs)".to_string(),
+        ))
     }
 
     #[cfg(not(feature = "fs"))]
@@ -2879,16 +3184,22 @@ impl Connection {
         _path: &str,
         _alias: &str,
         _reserved_space: Option<u8>,
-    ) -> Result<()> {
+        _state: &mut AttachDatabaseState,
+    ) -> Result<IOResult<()>> {
         // File-backed ATTACH is unavailable without `fs`, so pre-initialization
         // page-layout overrides are also unsupported in this build.
-        self.attach_database(_path, _alias)
+        self.attach_database(_path, _alias, _state)
     }
 
     /// Attach a database file with the given alias name
     #[cfg(feature = "fs")]
-    pub(crate) fn attach_database(&self, path: &str, alias: &str) -> Result<()> {
-        self.attach_database_inner(path, alias, None)
+    pub(crate) fn attach_database(
+        &self,
+        path: &str,
+        alias: &str,
+        state: &mut AttachDatabaseState,
+    ) -> Result<IOResult<()>> {
+        self.attach_database_with_config(path, alias, None, state)
     }
 
     /// Attach a database file with an optional pre-initialization reserved-space override.
@@ -2899,102 +3210,176 @@ impl Connection {
         path: &str,
         alias: &str,
         reserved_space: Option<u8>,
-    ) -> Result<()> {
-        self.attach_database_inner(path, alias, reserved_space)
-    }
+        state: &mut AttachDatabaseState,
+    ) -> Result<IOResult<()>> {
+        loop {
+            match state {
+                AttachDatabaseState::Start => {
+                    if self.is_closed() {
+                        return Err(LimboError::InternalError("Connection closed".to_string()));
+                    }
 
-    #[cfg(feature = "fs")]
-    fn attach_database_inner(
-        &self,
-        path: &str,
-        alias: &str,
-        reserved_space: Option<u8>,
-    ) -> Result<()> {
-        if self.is_closed() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
+                    if self.is_attached(alias) {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "database {alias} is already in use"
+                        )));
+                    }
+
+                    if alias.eq_ignore_ascii_case("main") || alias.eq_ignore_ascii_case("temp") {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "reserved name {alias} is already in use"
+                        )));
+                    }
+
+                    let db_opts = DatabaseOpts::new()
+                        .with_views(self.db.experimental_views_enabled())
+                        .with_custom_types(self.db.experimental_custom_types_enabled())
+                        .with_index_method(self.db.experimental_index_method_enabled())
+                        .with_vacuum(self.db.experimental_vacuum_enabled())
+                        .with_generated_columns(self.db.experimental_generated_columns_enabled())
+                        .with_without_rowid(self.db.experimental_without_rowid_enabled());
+                    let is_memory_db = is_memory_like(path);
+                    let io: Arc<dyn IO> = if is_memory_db {
+                        Arc::new(MemoryIO::new())
+                    } else if self.db.is_in_memory_db() {
+                        Database::io_for_path(path)?
+                    } else {
+                        self.db.io.clone()
+                    };
+                    let main_db_flags = self.db.open_flags;
+                    let (db, encryption_opts) =
+                        Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
+                    let attached_is_fresh = !db.initialized();
+                    if !is_memory_db {
+                        Self::validate_attach_target(&db, attached_is_fresh, alias)?;
+                    }
+                    self.reject_unsupported_fresh_mvcc_attach_durable_storage(
+                        alias,
+                        &db,
+                        attached_is_fresh,
+                    )?;
+
+                    let encryption_key = if let Some(ref enc) = encryption_opts {
+                        Some(EncryptionKey::from_hex_string(&enc.hexkey)?)
+                    } else {
+                        None
+                    };
+
+                    *state = AttachDatabaseState::Init(Box::new(AttachDatabaseInitState {
+                        alias: alias.to_string(),
+                        reserved_space,
+                        db,
+                        attached_is_fresh,
+                        encryption_key,
+                        init_st: crate::InitState::default(),
+                    }));
+                }
+                AttachDatabaseState::Init(init) => {
+                    let mut pager = Arc::new(crate::return_if_io!(init
+                        .db
+                        ._init_nonblock(&mut init.init_st, init.encryption_key.as_ref(),)));
+
+                    if !init.attached_is_fresh {
+                        self.reject_initialized_attach_mismatches(&init.alias, &init.db, &pager)?;
+                        *state = AttachDatabaseState::Publish {
+                            alias: init.alias.clone(),
+                            db: init.db.clone(),
+                            pager,
+                        };
+                        continue;
+                    }
+
+                    self.apply_page_layout_to_fresh_attach_db(
+                        &init.alias,
+                        &pager,
+                        init.reserved_space,
+                    )?;
+
+                    if self.mvcc_enabled() && !init.db.mvcc_enabled() {
+                        Self::set_mvcc_journal_mode_fresh_db(&pager)?;
+                        Self::install_database_wal_on_pager(&init.db, &mut pager);
+                        let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
+                        let mv_store = journal_mode::open_mv_store(
+                            init.db.io.clone(),
+                            &init.db.path,
+                            init.db.open_flags,
+                            init.db.durable_storage.clone(),
+                            enc_ctx,
+                            init.db.mv_store_allocator.clone(),
+                        )?;
+                        init.db.mv_store.store(Some(mv_store));
+                        *state = AttachDatabaseState::Bootstrap(Box::new(
+                            AttachDatabaseBootstrapState {
+                                alias: init.alias.clone(),
+                                db: init.db.clone(),
+                                pager,
+                                encryption_key: init.encryption_key.take(),
+                                bootstrap_conn: None,
+                                bootstrap_st: crate::mvcc::database::BootstrapState::default(),
+                            },
+                        ));
+                    } else {
+                        *state = AttachDatabaseState::Publish {
+                            alias: init.alias.clone(),
+                            db: init.db.clone(),
+                            pager,
+                        };
+                    }
+                }
+                AttachDatabaseState::Bootstrap(bootstrap) => {
+                    if bootstrap.bootstrap_conn.is_none() {
+                        let default_cache_size = match bootstrap
+                            .pager
+                            .with_header(|header| header.default_page_cache_size)
+                        {
+                            Ok(IOResult::Done(default_cache_size)) => default_cache_size.get(),
+                            Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                            Err(_) => 0,
+                        };
+                        bootstrap.bootstrap_conn =
+                            Some(bootstrap.db._connect_with_pager_and_default_cache_size(
+                                true,
+                                bootstrap.pager.clone(),
+                                bootstrap.encryption_key.take(),
+                                default_cache_size,
+                            )?);
+                    }
+
+                    let mv_store_guard = bootstrap.db.get_mv_store();
+                    let Some(mv_store) = mv_store_guard.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "fresh MVCC attach missing MV store".to_string(),
+                        ));
+                    };
+                    crate::return_if_io!(mv_store.bootstrap_nonblock(
+                        bootstrap
+                            .bootstrap_conn
+                            .as_ref()
+                            .expect("bootstrap connection initialized above"),
+                        &mut bootstrap.bootstrap_st,
+                    ));
+
+                    *state = AttachDatabaseState::Publish {
+                        alias: bootstrap.alias.clone(),
+                        db: bootstrap.db.clone(),
+                        pager: bootstrap.pager.clone(),
+                    };
+                }
+                AttachDatabaseState::Publish { alias, db, pager } => {
+                    self.attached_databases
+                        .write()
+                        .insert(alias.as_str(), (db.clone(), pager.clone()));
+                    self.bump_prepare_context_generation();
+                    *state = AttachDatabaseState::Done;
+                    return Ok(IOResult::Done(()));
+                }
+                AttachDatabaseState::Done => {
+                    return Err(LimboError::InternalError(
+                        "attach_database called after completion".to_string(),
+                    ));
+                }
+            }
         }
-
-        if self.is_attached(alias) {
-            return Err(LimboError::InvalidArgument(format!(
-                "database {alias} is already in use"
-            )));
-        }
-
-        // Check for reserved database names
-        if alias.eq_ignore_ascii_case("main") || alias.eq_ignore_ascii_case("temp") {
-            return Err(LimboError::InvalidArgument(format!(
-                "reserved name {alias} is already in use"
-            )));
-        }
-
-        let db_opts = DatabaseOpts::new()
-            .with_views(self.db.experimental_views_enabled())
-            .with_custom_types(self.db.experimental_custom_types_enabled())
-            .with_index_method(self.db.experimental_index_method_enabled())
-            .with_vacuum(self.db.experimental_vacuum_enabled())
-            .with_generated_columns(self.db.experimental_generated_columns_enabled())
-            .with_without_rowid(self.db.experimental_without_rowid_enabled());
-        // Select the IO layer for the attached database:
-        // - :memory: databases always get a fresh MemoryIO
-        // - File-based databases reuse the parent's IO when the parent is also
-        //   file-based (important for simulator fault injection and WAL coordination)
-        // - If the parent is :memory: (MemoryIO) but the attached DB is file-based,
-        //   we need a file-capable IO layer since MemoryIO can't read real files
-        let is_memory_db = is_memory_like(path);
-        let io: Arc<dyn IO> = if is_memory_db {
-            Arc::new(MemoryIO::new())
-        } else if self.db.is_in_memory_db() {
-            Database::io_for_path(path)?
-        } else {
-            self.db.io.clone()
-        };
-        let main_db_flags = self.db.open_flags;
-        let (db, encryption_opts) = Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
-        let attached_is_fresh = !db.initialized();
-        if !is_memory_db {
-            Self::validate_attach_target(&db, attached_is_fresh, alias)?;
-        }
-        self.reject_unsupported_fresh_mvcc_attach_durable_storage(alias, &db, attached_is_fresh)?;
-
-        // Build encryption key from URI opts to pass to _init for decrypting page 1.
-        let encryption_key = if let Some(ref enc) = encryption_opts {
-            Some(EncryptionKey::from_hex_string(&enc.hexkey)?)
-        } else {
-            None
-        };
-        let mut pager = Arc::new(db._init(encryption_key.as_ref())?);
-
-        if !attached_is_fresh {
-            self.reject_initialized_attach_mismatches(alias, &db, &pager)?;
-            self.attached_databases.write().insert(alias, (db, pager));
-            self.bump_prepare_context_generation();
-            return Ok(());
-        }
-
-        self.apply_page_layout_to_fresh_attach_db(alias, &pager, reserved_space)?;
-
-        // Fresh attached databases inherit the main connection's journal mode.
-        // The header must be normalized before page 1 allocation so the first
-        // write and MVCC bootstrap agree on the target mode.
-        if self.mvcc_enabled() && !db.mvcc_enabled() {
-            Self::set_mvcc_journal_mode_fresh_db(&pager)?;
-            Self::install_database_wal_on_pager(&db, &mut pager);
-            let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
-            let mv_store = journal_mode::open_mv_store(
-                db.io.clone(),
-                &db.path,
-                db.open_flags,
-                db.durable_storage.clone(),
-                enc_ctx,
-            )?;
-            db.mv_store.store(Some(mv_store.clone()));
-            let bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;
-            mv_store.bootstrap(bootstrap_conn)?;
-        }
-        self.attached_databases.write().insert(alias, (db, pager));
-        self.bump_prepare_context_generation();
-
-        Ok(())
     }
 
     // Detach a database by alias name
@@ -3404,6 +3789,9 @@ impl Connection {
                         idx: 0,
                         stmt: None,
                         meta: None,
+                        seq: None,
+                        watermark_stmt: None,
+                        watermark_row: None,
                     };
                 }
                 LoadSequenceDescriptorsState::Reading {
@@ -3411,6 +3799,9 @@ impl Connection {
                     idx,
                     stmt,
                     meta,
+                    seq,
+                    watermark_stmt,
+                    watermark_row,
                 } => loop {
                     let entry = {
                         if *idx >= pending.len() {
@@ -3425,21 +3816,53 @@ impl Connection {
                     if already_present {
                         *idx += 1;
                         *stmt = None;
+                        *meta = None;
+                        *seq = None;
+                        *watermark_stmt = None;
+                        *watermark_row = None;
                         continue;
                     }
-                    crate::return_if_io!(self.read_seq_descriptor_row_nonblock(
+                    if seq.is_none() {
+                        crate::return_if_io!(self.read_seq_descriptor_row_nonblock(
+                            &backing_table_name,
+                            &seq_name,
+                            stmt,
+                            meta,
+                        ));
+                        *seq = Some(Self::sequence_from_descriptor_meta(
+                            &seq_name,
+                            &backing_table_name,
+                            *meta,
+                        )?);
+                        *stmt = None;
+                        *meta = None;
+                    }
+                    let sequence = seq.as_ref().expect("sequence set above");
+                    crate::return_if_io!(self.read_sequence_watermark_row_nonblock(
                         &backing_table_name,
-                        &seq_name,
-                        stmt,
-                        meta,
+                        sequence,
+                        watermark_stmt,
+                        watermark_row,
                     ));
-                    let seq =
-                        Self::sequence_from_descriptor_meta(&seq_name, &backing_table_name, *meta)?;
+                    let watermark = Self::sequence_watermark_from_row(
+                        &backing_table_name,
+                        sequence,
+                        *watermark_row,
+                    )?;
+                    if let Some(mv_store) = self.db.get_mv_store().as_ref() {
+                        mv_store.set_sequence_watermark(&normalized, watermark);
+                    }
+                    let sequence = seq.take().expect("sequence set above");
                     self.with_database_schema_mut(MAIN_DB_ID, |schema| {
-                        schema.sequences.insert(normalized.clone(), Arc::new(seq));
-                    });
+                        schema
+                            .sequences
+                            .insert(normalized.clone(), Arc::new(sequence));
+                    })?;
                     *idx += 1;
                     *stmt = None;
+                    *meta = None;
+                    *watermark_stmt = None;
+                    *watermark_row = None;
                 },
             }
         }
@@ -3524,6 +3947,68 @@ impl Connection {
                  \"{seq_name}\" descriptor is invalid: {err}"
             ))
         })
+    }
+
+    /// Drive one backing-table watermark read to completion (re-entrant).
+    ///
+    /// The returned row is converted by [`Self::sequence_watermark_from_row`]
+    /// into the exclusive upper bound used by `sequence_watermark_experimental()`.
+    fn read_sequence_watermark_row_nonblock(
+        self: &Arc<Connection>,
+        backing_table_name: &str,
+        seq: &crate::schema::Sequence,
+        stmt: &mut Option<Box<Statement>>,
+        row: &mut Option<(i64, bool)>,
+    ) -> Result<crate::types::IOResult<()>> {
+        use crate::types::IOResult;
+        if stmt.is_none() {
+            let escaped = backing_table_name.replace('"', "\"\"");
+            let direction = if seq.increment_by >= 0 { "DESC" } else { "ASC" };
+            let sql = format!(
+                "SELECT value, is_called FROM \"{escaped}\" ORDER BY value {direction} LIMIT 1"
+            );
+            let prepared = self.prepare_internal(sql).map_err(|err| {
+                LimboError::Corrupt(format!(
+                    "internal sequence backing table \"{backing_table_name}\" for sequence \
+                     \"{}\": cannot prepare watermark SELECT: {err}",
+                    seq.name
+                ))
+            })?;
+            *stmt = Some(Box::new(prepared));
+            *row = None;
+        }
+        let s = stmt.as_mut().expect("stmt set above");
+        match s.run_with_row_callback_nonblock(|r| {
+            let value = r.get::<i64>(0)?;
+            let is_called = r.get::<i64>(1)? != 0;
+            *row = Some((value, is_called));
+            Ok(())
+        }) {
+            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+            Ok(IOResult::Done(())) => Ok(IOResult::Done(())),
+            Err(err) => Err(LimboError::Corrupt(format!(
+                "internal sequence backing table \"{backing_table_name}\" for sequence \
+                 \"{}\": watermark row read failed: {err}",
+                seq.name
+            ))),
+        }
+    }
+
+    fn sequence_watermark_from_row(
+        backing_table_name: &str,
+        seq: &crate::schema::Sequence,
+        row: Option<(i64, bool)>,
+    ) -> Result<i64> {
+        let (value, is_called) = row.ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "internal sequence backing table \"{backing_table_name}\" for sequence \
+                 \"{}\" is empty; cannot derive sequence watermark",
+                seq.name
+            ))
+        })?;
+        Ok(crate::mvcc::database::first_unsafe_sequence_watermark(
+            seq, value, is_called,
+        ))
     }
 
     /// Sync AUTOINCREMENT backing-table watermarks from `sqlite_sequence`.
@@ -3667,6 +4152,14 @@ impl Connection {
                         }
                         SyncRowStep::Upsert { stmt } => {
                             crate::return_if_io!(stmt.run_with_row_callback_nonblock(|_| Ok(())));
+                            if let Some(mv_store) = self.db.get_mv_store().as_ref() {
+                                let watermark = rows[*idx].1;
+                                let first_unsafe = watermark.checked_add(1).unwrap_or(watermark);
+                                mv_store.set_sequence_watermark(
+                                    &autoincrement_sequence_name(&rows[*idx].0),
+                                    first_unsafe,
+                                );
+                            }
                             *idx += 1;
                             *sub = SyncRowStep::Start;
                         }
@@ -4212,6 +4705,7 @@ impl Connection {
         }
         self.rollback_attached_wal_txns();
         self.set_tx_state(TransactionState::None);
+        self.clear_tx_poison();
     }
 
     /// Roll back transaction state for helpers that start a manual `BEGIN`
@@ -4242,6 +4736,7 @@ impl Connection {
         }
 
         self.rollback_temp_schema();
+        self.clear_tx_poison();
         self.set_cdc_transaction_id(-1);
         self.clear_named_savepoints();
         self.clear_deferred_foreign_key_violations();
@@ -4299,6 +4794,31 @@ impl Connection {
         match self.db.get_mv_store().as_ref() {
             Some(mv_store) => Ok(mv_store.checkpoint_threshold()),
             None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn set_mvcc_gc_threshold(&self, threshold: i64) -> Result<()> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => {
+                mv_store.set_gc_threshold(threshold);
+                self.bump_prepare_context_generation();
+                Ok(())
+            }
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn mvcc_gc_threshold(&self) -> Result<i64> {
+        match self.db.get_mv_store().as_ref() {
+            Some(mv_store) => Ok(mv_store.gc_threshold()),
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn mvcc_tx_should_abort(&self) -> bool {
+        match (self.db.get_mv_store().clone(), self.get_mv_tx_id()) {
+            (Some(mv_store), Some(tx_id)) => mv_store.tx_should_abort(tx_id),
+            _ => false,
         }
     }
 }
@@ -4421,6 +4941,31 @@ mod tests {
         open_connection_with_opts(path, DatabaseOpts::new())
     }
 
+    fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) -> Result<()> {
+        let mut state = AttachDatabaseState::default();
+        loop {
+            match conn.attach_database(path, alias, &mut state)? {
+                IOResult::Done(()) => return Ok(()),
+                IOResult::IO(io) => io.wait(conn.db.io.as_ref())?,
+            }
+        }
+    }
+
+    fn drive_attach_with_config(
+        conn: &Arc<Connection>,
+        path: &str,
+        alias: &str,
+        reserved_space: Option<u8>,
+    ) -> Result<()> {
+        let mut state = AttachDatabaseState::default();
+        loop {
+            match conn.attach_database_with_config(path, alias, reserved_space, &mut state)? {
+                IOResult::Done(()) => return Ok(()),
+                IOResult::IO(io) => io.wait(conn.db.io.as_ref())?,
+            }
+        }
+    }
+
     fn query_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
         let mut stmt = conn.prepare(sql).unwrap();
         match stmt.step().unwrap() {
@@ -4538,8 +5083,7 @@ mod tests {
         let aux_path = temp_dir.path().join("aux.db");
         let conn = open_connection(&main_path);
 
-        conn.attach_database_with_config(aux_path.to_str().unwrap(), "aux", Some(48))
-            .unwrap();
+        drive_attach_with_config(&conn, aux_path.to_str().unwrap(), "aux", Some(48)).unwrap();
 
         let (attached_db, pager) = attached_entry(&conn, "aux");
         assert!(!attached_db.initialized());
@@ -4555,8 +5099,7 @@ mod tests {
         let aux_path = temp_dir.path().join("aux.db");
         let conn = open_connection(&main_path);
 
-        let err = conn
-            .attach_database_with_config(aux_path.to_str().unwrap(), "aux", Some(0))
+        let err = drive_attach_with_config(&conn, aux_path.to_str().unwrap(), "aux", Some(0))
             .unwrap_err()
             .to_string();
         assert_eq!(
@@ -4575,8 +5118,7 @@ mod tests {
         let conn = open_connection(&main_path);
 
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        conn.attach_database(aux_path.to_str().unwrap(), "aux")
-            .unwrap();
+        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
 
         let (attached_db, pager) = attached_entry(&conn, "aux");
         assert!(attached_db.get_mv_store().as_ref().is_some());
@@ -4595,8 +5137,7 @@ mod tests {
         let conn = open_connection(&main_path);
 
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        conn.attach_database(aux_path.to_str().unwrap(), "aux")
-            .unwrap();
+        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
         conn.execute("CREATE TABLE aux.t(x INTEGER)").unwrap();
         conn.execute("INSERT INTO aux.t VALUES(1)").unwrap();
 

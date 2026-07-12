@@ -77,8 +77,11 @@ test.serial('batch() method executes multiple statements', async t => {
     'INSERT INTO test_products (name, price) VALUES ("Tool", 29.99)'
   ]);
   
-  t.is(batchResult.rowsAffected, 3);
-  
+  // batch() returns one ResultSet per statement, in order.
+  t.is(batchResult.length, 4);
+  const insertedRows = batchResult.slice(1).reduce((sum, rs) => sum + rs.rowsAffected, 0);
+  t.is(insertedRows, 3);
+
   const queryResult = await client.execute('SELECT COUNT(*) as count FROM test_products');
   t.is(queryResult.rows[0][0], 3);
 });

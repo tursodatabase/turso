@@ -11,6 +11,11 @@ use super::{
         write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
     },
 };
+#[cfg(test)]
+use crate::alloc::TursoIteratorExt;
+#[cfg(any(test, injected_yields))]
+use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
+use crate::mvcc::yield_points::inject_io_yield;
 use crate::{
     io::CompletionGroup,
     io_yield_one,
@@ -340,6 +345,25 @@ enum WriteState {
     Finish,
 }
 
+#[cfg(any(test, injected_yields))]
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+pub(crate) enum BTreeWriteYieldPoint {
+    AfterInsertOverflowCellBeforeBalance,
+}
+
+#[cfg(any(test, injected_yields))]
+const BTREE_WRITE_YIELD_FAMILY: u64 = 0x4254_5245_5752_4954;
+
+#[cfg(any(test, injected_yields))]
+impl YieldPointMarker for BTreeWriteYieldPoint {
+    const POINT_COUNT: u8 = 1;
+
+    fn ordinal(self) -> u8 {
+        self as u8
+    }
+}
+
 struct ReadPayloadOverflow {
     payload: Vec<u8>,
     next_page: u32,
@@ -490,11 +514,10 @@ enum OverflowState {
         next_page: PageRef,
     },
     /// Transitional state used to make `OverflowState::ProcessPage`
-    /// re-entry-safe across spill yields. Once `free_page` has returned
-    /// `Done` for the current page, we move to this state so that a
-    /// subsequent spill yield on the read of the next page does NOT cause
-    /// `free_page` to be invoked a second time on a page that is already in
-    /// the freelist.
+    /// re-entry-safe across yields. Once `free_page` has returned `Done` for
+    /// the current page, we move to this state before validating or reading
+    /// the next page so `free_page` cannot be invoked a second time on a page
+    /// that is already in the freelist.
     ReadNext {
         next: u32,
     },
@@ -656,7 +679,7 @@ pub trait CursorTrait: Any + Send + Sync {
     fn get_index_info(&self) -> &Arc<IndexInfo>;
 
     fn seek_end(&mut self) -> Result<IOResult<()>>;
-    fn seek_to_last(&mut self, always_seek: bool) -> Result<IOResult<()>>;
+    fn seek_to_last(&mut self) -> Result<IOResult<()>>;
 
     /// Returns true if this cursor operates in MVCC mode.
     fn is_mvcc(&self) -> bool {
@@ -776,6 +799,10 @@ pub struct BTreeCursor {
     /// itself into the registry). Direct BTreeCursor::new callers (tests,
     /// internal utilities) bypass that path; their Drop skips unregister.
     did_register: crate::sync::atomic::AtomicBool,
+    #[cfg(any(test, injected_yields))]
+    yield_injector: Option<Arc<dyn crate::mvcc::yield_points::YieldInjector>>,
+    #[cfg(any(test, injected_yields))]
+    yield_instance_id: u64,
 }
 
 /// Records the in-flight descent for `iteration_pending_descent`. The direction
@@ -855,7 +882,17 @@ impl BTreeCursor {
             pending_peer_save: None,
             has_peers: crate::sync::atomic::AtomicBool::new(false),
             did_register: crate::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, injected_yields))]
+            yield_injector: None,
+            #[cfg(any(test, injected_yields))]
+            yield_instance_id: 0,
         }
+    }
+
+    #[cfg(any(test, injected_yields))]
+    pub(crate) fn install_yield_context(&mut self, connection: &crate::Connection) {
+        self.yield_injector = connection.yield_injector();
+        self.yield_instance_id = connection.next_yield_instance_id();
     }
 
     pub fn new_table(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
@@ -869,26 +906,20 @@ impl BTreeCursor {
         num_columns: usize,
     ) -> Self {
         let mut cursor = Self::new(pager, root_page, num_columns);
-        let key_info = table
-            .primary_key_columns
-            .iter()
-            .map(|(col_name, order)| {
-                let (_, column) = table
-                    .get_column(col_name)
-                    .expect("WITHOUT ROWID primary key column should exist");
-                crate::types::KeyInfo {
-                    sort_order: *order,
-                    collation: column.collation_opt().unwrap_or_default(),
-                    nulls_order: None,
-                }
-            })
-            .collect::<Vec<_>>();
-        cursor.index_info = Some(Arc::new(IndexInfo {
-            key_info,
-            has_rowid: false,
-            num_cols: table.primary_key_columns.len(),
-            is_unique: true,
-        }));
+        let key_info = table.primary_key_columns.iter().map(|(col_name, order)| {
+            let (_, column) = table
+                .get_column(col_name)
+                .expect("WITHOUT ROWID primary key column should exist");
+            crate::types::KeyInfo {
+                sort_order: *order,
+                collation: column.collation_opt().unwrap_or_default(),
+                nulls_order: None,
+            }
+        });
+        cursor.index_info = Some(Arc::new(
+            IndexInfo::new(key_info, false, table.primary_key_columns.len(), true)
+                .expect(crate::alloc::ALLOC_ERR_MSG),
+        ));
         cursor
     }
 
@@ -1455,24 +1486,22 @@ impl BTreeCursor {
 
     /// Move the cursor to the rightmost record in the btree.
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
-    fn move_to_rightmost(&mut self, always_seek: bool) -> Result<IOResult<bool>> {
+    fn move_to_rightmost(&mut self) -> Result<IOResult<bool>> {
         loop {
             let (move_to_right_state, rightmost_page_id) = &self.move_to_right_state;
             match *move_to_right_state {
                 MoveToRightState::Start => {
-                    if !always_seek {
-                        if let Some(rightmost_page_id) = rightmost_page_id {
-                            // If we know the rightmost page and are already on it, we can skip a seek.
-                            // This optimization is never performed if always_seek = true. always_seek is used
-                            // in cases where we cannot be sure that the btree wasn't modified from under us
-                            // e.g. by a trigger subprogram.
-                            let current_page = self.stack.top_ref();
-                            if current_page.get().id == *rightmost_page_id {
-                                let contents = current_page.get_contents();
-                                let cell_count = contents.cell_count();
-                                self.stack.set_cell_index(cell_count as i32 - 1);
-                                return Ok(IOResult::Done(cell_count > 0));
-                            }
+                    if let Some(rightmost_page_id) = rightmost_page_id {
+                        // If we know the rightmost page and are already on it, we can skip a seek.
+                        // The cache is safe to trust: any modification of this btree — our own
+                        // balancing, or a peer cursor's write (e.g. a trigger subprogram's, via
+                        // the saveAllCursors pass) — invalidates it.
+                        let current_page = self.stack.top_ref();
+                        if current_page.get().id == *rightmost_page_id {
+                            let contents = current_page.get_contents();
+                            let cell_count = contents.cell_count();
+                            self.stack.set_cell_index(cell_count as i32 - 1);
+                            return Ok(IOResult::Done(cell_count > 0));
                         }
                     }
                     let rightmost_page_id = *rightmost_page_id;
@@ -2673,6 +2702,10 @@ impl BTreeCursor {
                         turso_assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "no balancing operation should be in progress during insert", { "state": self.state, "sub_state": self.balance_state.sub_state });
                         // If we balance, we must save the cursor position and seek to it later.
                         self.save_context(CursorContext::seek_eq_only(bkey));
+                        inject_io_yield!(
+                            self,
+                            BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance
+                        );
                     } else {
                         *write_state = WriteState::Finish;
                     }
@@ -3013,7 +3046,9 @@ impl BTreeCursor {
                         if matches!(page_type, PageType::IndexInterior) {
                             turso_assert!(parent_contents.overflow_cells.len() == 1, "index interior page must have no more than 1 overflow cell, as a result of InteriorNodeReplacement");
                         } else {
-                            turso_assert!(false, "page type must have no overflow cells", { "page_type": page_type });
+                            turso_assert!(false, "page type must have no overflow cells", {
+                                "page_type": page_type
+                            });
                         }
                         let overflow_cell = parent_contents.overflow_cells.first().unwrap();
                         let parent_page_cell_idx = self.stack.current_cell_index() as usize;
@@ -4827,6 +4862,10 @@ impl BTreeCursor {
     /// resumed from last point after IO interruption
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn clear_overflow_pages(&mut self, cell: &BTreeCell) -> Result<IOResult<()>> {
+        // `database_size` is invariant for the duration of this invocation, so
+        // read the page-1 header at most once and reuse it for every overflow
+        // page validation below instead of re-reading it per `ReadNext`.
+        let mut database_size: Option<u32> = None;
         loop {
             match self.overflow_state.clone() {
                 OverflowState::Start => {
@@ -4840,17 +4879,9 @@ impl BTreeCursor {
                     };
 
                     if let Some(next_page) = first_overflow_page {
-                        if unlikely(
-                            next_page < 2
-                                || next_page
-                                    > self
-                                        .pager
-                                        .io
-                                        .block(|| {
-                                            self.pager.with_header(|header| header.database_size)
-                                        })?
-                                        .get(),
-                        ) {
+                        let database_size =
+                            return_if_io!(self.overflow_database_size(&mut database_size));
+                        if unlikely(!Self::valid_overflow_page_id(next_page, database_size)) {
                             self.overflow_state = OverflowState::Start;
                             return Err(LimboError::Corrupt("Invalid overflow page number".into()));
                         }
@@ -4875,31 +4906,21 @@ impl BTreeCursor {
                     return_if_io!(self.pager.free_page(Some(page), next_page_id));
 
                     // free_page returned `Done` — commit `next` to state
-                    // BEFORE the next read so that a spill yield from the
-                    // read does not cause re-entry into `ProcessPage` with
-                    // the now-freed page, which would re-invoke `free_page`
-                    // and corrupt the freelist.
+                    // BEFORE any fallible IO so re-entry cannot invoke
+                    // `free_page` again on the now-freed page.
                     if next != 0 {
-                        if unlikely(
-                            next < 2
-                                || next
-                                    > self
-                                        .pager
-                                        .io
-                                        .block(|| {
-                                            self.pager.with_header(|header| header.database_size)
-                                        })?
-                                        .get(),
-                        ) {
-                            self.overflow_state = OverflowState::Start;
-                            return Err(LimboError::Corrupt("Invalid overflow page number".into()));
-                        }
                         self.overflow_state = OverflowState::ReadNext { next };
                     } else {
                         self.overflow_state = OverflowState::Done;
                     }
                 }
                 OverflowState::ReadNext { next } => {
+                    let database_size =
+                        return_if_io!(self.overflow_database_size(&mut database_size));
+                    if unlikely(!Self::valid_overflow_page_id(next, database_size)) {
+                        self.overflow_state = OverflowState::Start;
+                        return Err(LimboError::Corrupt("Invalid overflow page number".into()));
+                    }
                     let (page, c) = return_if_io!(self.pager.read_page(next as i64));
                     self.overflow_state = OverflowState::ProcessPage { next_page: page };
                     if let Some(c) = c {
@@ -4912,6 +4933,22 @@ impl BTreeCursor {
                 }
             };
         }
+    }
+
+    /// Read `database_size` from the page-1 header at most once per
+    /// `clear_overflow_pages` invocation, memoizing it in `cache`.
+    fn overflow_database_size(&self, cache: &mut Option<u32>) -> Result<IOResult<u32>> {
+        if let Some(database_size) = cache {
+            return Ok(IOResult::Done(*database_size));
+        }
+        let database_size =
+            return_if_io!(self.pager.with_header(|header| header.database_size)).get();
+        *cache = Some(database_size);
+        Ok(IOResult::Done(database_size))
+    }
+
+    fn valid_overflow_page_id(page_id: u32, database_size: u32) -> bool {
+        page_id >= 2 && page_id <= database_size
     }
 
     /// Deletes all contents of the B-tree by freeing all its pages in an iterative depth-first order.
@@ -5303,6 +5340,20 @@ impl BTreeCursor {
         matches!(self.state, CursorState::Write(_))
     }
 
+    /// True iff the cursor sits on a valid record that is NOT the first cell of
+    /// its page. Used by the MVCC checkpoint's sequential-write optimization:
+    /// only at such a position is "insert the next adjacent rowid here, without
+    /// re-seeking" provably within the page's divider bounds (the previous,
+    /// strictly smaller rowid is in this same page, and so is a strictly larger
+    /// one). At cell 0 the cursor has just crossed a leaf boundary, and the
+    /// adjacent rowid may belong on the LEFT side of the parent divider — a
+    /// divider whose row was deleted keeps its key, so the divider can
+    /// be >= the rowid being inserted — in which case the caller must re-seek
+    /// from the root.
+    pub fn is_positioned_past_page_start(&self) -> bool {
+        self.has_record() && self.stack.current_cell_index() > 0
+    }
+
     /// saveAllCursors pass for this cursor's insert/delete entry. Iteration
     /// state lives in `pending_peer_save` so we can resume across IO yields
     /// from per-peer overflow-chain reads.
@@ -5430,8 +5481,89 @@ impl BTreeCursor {
     }
 }
 
+#[cfg(any(test, injected_yields))]
+impl ProvidesYieldContext for BTreeCursor {
+    fn yield_context(&self) -> YieldContext {
+        YieldContext::new(
+            self.yield_injector.clone(),
+            None,
+            self.yield_instance_id,
+            BTREE_WRITE_YIELD_FAMILY ^ self.root_page as u64,
+        )
+    }
+}
+
+impl BTreeCursor {
+    fn clear_transient_overflow_cells(&mut self) {
+        // Overflow cells are page-local scratch for the cursor's in-flight balance.
+        // If the cursor is abandoned after queueing them, cached pages may outlive
+        // the cursor and must not carry that scratch into later writes.
+        if matches!(self.state, CursorState::None)
+            && matches!(self.balance_state.sub_state, BalanceSubState::Start)
+        {
+            turso_assert!(
+                self.balance_state.balance_info.is_none(),
+                "idle cursor has balance info"
+            );
+            // No write or balance operation is in progress, so this cursor has no
+            // transient overflow cells to clean up.
+            return;
+        }
+
+        for page in self.stack.stack.iter().flatten() {
+            page.get().overflow_cells.clear();
+        }
+
+        // Insert/overwrite can stage overflow cells before balance_info is populated.
+        // If the cursor is dropped in that window, this page handle is the only owner
+        // of that transient state.
+        match &self.state {
+            CursorState::Write(WriteState::Insert { page, .. })
+            | CursorState::Write(WriteState::Overwrite { page, .. }) => {
+                page.get().overflow_cells.clear();
+            }
+            CursorState::Write(WriteState::Start)
+            | CursorState::Write(WriteState::Balancing)
+            | CursorState::Write(WriteState::Finish)
+            | CursorState::Destroy(_)
+            | CursorState::Delete(_)
+            | CursorState::None => {}
+        }
+
+        if let Some(balance_info) = &self.balance_state.balance_info {
+            for page in balance_info.pages_to_balance.iter().flatten() {
+                page.get().overflow_cells.clear();
+            }
+        }
+
+        // Newly allocated/reused sibling pages are tracked only by BalanceContext until
+        // non-root balancing finishes. If the cursor is dropped before then, clear any
+        // overflow scratch from those pages explicitly.
+        match &self.balance_state.sub_state {
+            BalanceSubState::NonRootDoBalancingAllocate {
+                context: Some(context),
+                ..
+            }
+            | BalanceSubState::NonRootDoBalancingFinish { context } => {
+                for page in context.pages_to_balance_new.iter().flatten() {
+                    page.get().overflow_cells.clear();
+                }
+            }
+            BalanceSubState::Start
+            | BalanceSubState::BalanceRoot
+            | BalanceSubState::Decide
+            | BalanceSubState::Quick
+            | BalanceSubState::NonRootPickSiblings
+            | BalanceSubState::NonRootDoBalancing
+            | BalanceSubState::NonRootDoBalancingAllocate { context: None, .. }
+            | BalanceSubState::FreePages { .. } => {}
+        }
+    }
+}
+
 impl Drop for BTreeCursor {
     fn drop(&mut self) {
+        self.clear_transient_overflow_cells();
         if !self
             .did_register
             .load(crate::sync::atomic::Ordering::Relaxed)
@@ -5492,8 +5624,7 @@ impl CursorTrait for BTreeCursor {
             return Ok(IOResult::Done(()));
         }
         self.clear_saved_seek();
-        let always_seek = false;
-        let cursor_has_record = return_if_io!(self.move_to_rightmost(always_seek));
+        let cursor_has_record = return_if_io!(self.move_to_rightmost());
         self.set_has_record(cursor_has_record);
         self.invalidate_record();
         self.read_overflow_state = None;
@@ -6069,6 +6200,10 @@ impl CursorTrait for BTreeCursor {
         if matches!(self.state, CursorState::None) {
             self.pager.invalidate_peer_cursors(self);
             self.invalidate_count_cache();
+            // Every page in this btree is about to be freed, so our own cached
+            // rightmost page id is meaningless too (the id may even be
+            // reallocated to an unrelated page after a refill).
+            self.move_to_right_state.1 = None;
         }
         self.destroy_btree_contents(true)
     }
@@ -6309,10 +6444,7 @@ impl CursorTrait for BTreeCursor {
     /// valid_state stays Valid — only rewind/seek-style entry points are safe
     /// next; next/prev land on `current_page == -1` and return Done(false).
     fn invalidate_btree_cache(&mut self) {
-        for slot in self.stack.stack.iter_mut() {
-            *slot = None;
-        }
-        self.stack.current_page = -1;
+        self.stack.clear();
         self.has_record = false;
         self.move_to_right_state.1 = None;
         self.invalidate_count_cache();
@@ -6339,6 +6471,13 @@ impl CursorTrait for BTreeCursor {
     /// across an in-flight Insert/Delete — in which case the caller falls back
     /// to invalidate_btree_cache.
     fn try_save_position_for_external_balance(&mut self) -> Result<IOResult<SavePositionResult>> {
+        // The peer is about to modify this btree's structure, so any cached
+        // knowledge of the tree shape goes stale: the rightmost page id
+        // (move_to_rightmost's skip-a-seek optimization) and the memoized
+        // count. Positional state is preserved separately via save_context.
+        // Idempotent, so safe across IO re-entry into this function.
+        self.move_to_right_state.1 = None;
+        self.invalidate_count_cache();
         if self.valid_state != CursorValidState::Valid || !self.has_record() {
             // Nothing to save: cursor has no live position. No invalidation
             // needed either — the stack is already in a state where the next
@@ -6458,11 +6597,11 @@ impl CursorTrait for BTreeCursor {
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
-    fn seek_to_last(&mut self, always_seek: bool) -> Result<IOResult<()>> {
+    fn seek_to_last(&mut self) -> Result<IOResult<()>> {
         loop {
             match self.seek_to_last_state {
                 SeekToLastState::Start => {
-                    let has_record = return_if_io!(self.move_to_rightmost(always_seek));
+                    let has_record = return_if_io!(self.move_to_rightmost());
                     self.invalidate_record();
                     self.set_has_record(has_record);
                     self.read_overflow_state = None;
@@ -7558,6 +7697,7 @@ fn find_free_slot(
 pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usable_space: usize) {
     // setup btree page
     let contents = page.get_contents();
+    contents.overflow_cells.clear();
     tracing::debug!(
         "btree_init_page(id={}, offset={}, usable_space={})",
         page.get().id,
@@ -8483,7 +8623,7 @@ fn _insert_into_cell(
         #[cfg(debug_assertions)]
         {
             if let Some(overflow_cell) = page.overflow_cells.last() {
-                turso_assert!(overflow_cell.index + 1 == cell_idx, "multiple overflow cells can only occur when a parent overflows during balancing as divider cells are inserted into it. those cells should always be in-order and sequential");
+                turso_assert!(overflow_cell.index + 1 == cell_idx, "multiple overflow cells can only occur when a parent overflows during balancing as divider cells are inserted into it. those cells should always be in-order and sequential", { "page_id": page.id, "last_overflow_index": overflow_cell.index, "cell_idx": cell_idx, "cell_count": page.cell_count(), "overflow_count": page.overflow_cells.len() });
             }
         }
         page.overflow_cells.push(OverflowCell {
@@ -8956,6 +9096,10 @@ mod tests {
     use super::*;
     use crate::{
         io::{Buffer, MemoryIO, OpenFlags, IO},
+        mvcc::{
+            yield_hooks::YieldPointMarker,
+            yield_points::{YieldInjector, YieldPoint},
+        },
         schema::IndexColumn,
         storage::{
             database::DatabaseFile, page_cache::PageCache, pager::default_page1,
@@ -8967,7 +9111,14 @@ mod tests {
         WalFileShared,
     };
     use arc_swap::ArcSwapOption;
-    use std::{mem::transmute, ops::Deref, sync::Arc};
+    use std::{
+        mem::transmute,
+        ops::Deref,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
 
     use tempfile::TempDir;
 
@@ -8981,6 +9132,55 @@ mod tests {
     };
 
     use super::{btree_init_page, defragment_page, drop_cell, insert_into_cell};
+
+    #[derive(Debug)]
+    struct TargetedYieldInjector {
+        point: YieldPoint,
+        selection_key: u64,
+        fired: AtomicBool,
+    }
+
+    impl TargetedYieldInjector {
+        fn new(point: YieldPoint, selection_key: u64) -> Arc<Self> {
+            Arc::new(Self {
+                point,
+                selection_key,
+                fired: AtomicBool::new(false),
+            })
+        }
+
+        fn fired(&self) -> bool {
+            self.fired.load(Ordering::Acquire)
+        }
+    }
+
+    impl YieldInjector for TargetedYieldInjector {
+        fn should_yield(&self, _instance_id: u64, selection_key: u64, point: YieldPoint) -> bool {
+            point == self.point
+                && selection_key == self.selection_key
+                && !self.fired.swap(true, Ordering::AcqRel)
+        }
+    }
+
+    fn btree_write_selection_key(root_page: i64) -> u64 {
+        BTREE_WRITE_YIELD_FAMILY ^ root_page as u64
+    }
+
+    fn query_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
+        let mut stmt = conn.prepare(sql).unwrap();
+        match stmt.step().unwrap() {
+            StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
+            other => panic!("expected a row, got {other:?}"),
+        }
+    }
+
+    fn query_single_text(conn: &Arc<Connection>, sql: &str) -> String {
+        let mut stmt = conn.prepare(sql).unwrap();
+        match stmt.step().unwrap() {
+            StepResult::Row => stmt.row().unwrap().get::<String>(0).unwrap(),
+            other => panic!("expected a row, got {other:?}"),
+        }
+    }
 
     #[allow(clippy::arc_with_non_send_sync)]
     fn get_page(id: usize) -> PageRef {
@@ -9010,6 +9210,201 @@ mod tests {
         let db = Database::open_file(io.clone(), path.to_str().unwrap()).unwrap();
 
         db
+    }
+
+    #[test]
+    fn wal_reuses_freelist_leaf_after_abandoned_overflowing_insert() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, "freelist-stale-overflow.db").unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("PRAGMA journal_mode = WAL").unwrap();
+        conn.execute(
+            "CREATE TABLE red_rain_308 (
+                slow_desk_238 INTEGER NOT NULL,
+                quiet_tree_398 TEXT NOT NULL,
+                smart_dog_422 REAL UNIQUE,
+                new_hill_140 TEXT,
+                light_door_957 REAL,
+                wild_dog_803 TEXT NOT NULL,
+                new_flower_28 BLOB,
+                old_fish_931 TEXT PRIMARY KEY
+            )",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE full_fish_194 (
+                brave_star_722 TEXT PRIMARY KEY,
+                hot_star_957 NUMERIC,
+                empty_chair_834 REAL
+            )",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO red_rain_308 (
+                slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
+                light_door_957, wild_dog_803, new_flower_28, old_fish_931
+            ) VALUES (
+                1, 'seed', 0.24, 'seed', 1.0, 'seed', zeroblob(3600), 'existing_unique'
+            )",
+        )
+        .unwrap();
+        for id in 2..260 {
+            conn.execute(format!(
+                "INSERT INTO red_rain_308 (
+                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
+                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
+                ) VALUES (
+                    {id}, 'quiet_tree_{id}', {id}.0, 'new_hill_{id}',
+                    1.5, 'wild_dog_{id}', zeroblob(3600), 'seed_{id}'
+                )"
+            ))
+            .unwrap();
+        }
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("DELETE FROM red_rain_308 WHERE old_fish_931 = 'seed_2'")
+            .unwrap();
+        conn.execute("SAVEPOINT sp_91").unwrap();
+        conn.execute(
+            "INSERT INTO full_fish_194 (brave_star_722, hot_star_957, empty_chair_834)
+             VALUES ('sweet_fish_597', 328, 7.71)",
+        )
+        .unwrap();
+
+        let red_rain_root_page = query_single_i64(
+            &conn,
+            "SELECT rootpage FROM sqlite_schema
+             WHERE type = 'table' AND name = 'red_rain_308'",
+        );
+        let injector = TargetedYieldInjector::new(
+            BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance.point(),
+            btree_write_selection_key(red_rain_root_page),
+        );
+        conn.set_yield_injector(Some(injector.clone()));
+        let mut abandoned = conn
+            .prepare(
+                "INSERT INTO red_rain_308 (
+                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
+                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
+                ) VALUES (
+                    926, 'dry_hill_411', 9.24, 'blue_hill_65',
+                    7.50, 'happy_moon_474', zeroblob(7200), 'smart_rock_113'
+                )",
+            )
+            .unwrap();
+        assert!(matches!(abandoned.step().unwrap(), StepResult::Yield));
+        assert!(injector.fired());
+        abandoned.reset().unwrap();
+        drop(abandoned);
+        conn.set_yield_injector(None);
+
+        conn.execute("DELETE FROM red_rain_308 WHERE slow_desk_238 BETWEEN 2 AND 240")
+            .unwrap();
+        conn.execute("RELEASE sp_91").unwrap();
+
+        assert!(conn
+            .execute(
+                "INSERT INTO red_rain_308 (
+                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
+                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
+                ) VALUES (
+                    927, 'dry_hill_412', 0.24, 'blue_hill_66',
+                    7.50, 'happy_moon_475', x'736f66745f73746f6e655f313732', 'smart_rock_114'
+                )"
+            )
+            .is_err());
+
+        for id in 300..420 {
+            conn.execute(format!(
+                "INSERT INTO red_rain_308 (
+                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
+                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
+                ) VALUES (
+                    {id}, 'quiet_tree_{id}', {id}.0, 'new_hill_{id}',
+                    1.5, 'wild_dog_{id}', zeroblob(3600), 'reuse_{id}'
+                )"
+            ))
+            .unwrap();
+        }
+
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(query_single_text(&conn, "PRAGMA integrity_check"), "ok");
+    }
+
+    #[test]
+    fn wal_overflowing_insert_resumes_after_yield_before_balance() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, "resume-overflow-yield.db").unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("PRAGMA journal_mode = WAL").unwrap();
+        conn.execute(
+            "CREATE TABLE red_rain_308 (
+                slow_desk_238 INTEGER NOT NULL,
+                quiet_tree_398 TEXT NOT NULL,
+                smart_dog_422 REAL UNIQUE,
+                new_hill_140 TEXT,
+                light_door_957 REAL,
+                wild_dog_803 TEXT NOT NULL,
+                new_flower_28 BLOB,
+                old_fish_931 TEXT PRIMARY KEY
+            )",
+        )
+        .unwrap();
+
+        for id in 1..260 {
+            conn.execute(format!(
+                "INSERT INTO red_rain_308 (
+                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
+                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
+                ) VALUES (
+                    {id}, 'quiet_tree_{id}', {id}.0, 'new_hill_{id}',
+                    1.5, 'wild_dog_{id}', zeroblob(3600), 'seed_{id}'
+                )"
+            ))
+            .unwrap();
+        }
+
+        let red_rain_root_page = query_single_i64(
+            &conn,
+            "SELECT rootpage FROM sqlite_schema
+             WHERE type = 'table' AND name = 'red_rain_308'",
+        );
+        let injector = TargetedYieldInjector::new(
+            BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance.point(),
+            btree_write_selection_key(red_rain_root_page),
+        );
+        conn.set_yield_injector(Some(injector.clone()));
+        let mut stmt = conn
+            .prepare(
+                "INSERT INTO red_rain_308 (
+                    slow_desk_238, quiet_tree_398, smart_dog_422, new_hill_140,
+                    light_door_957, wild_dog_803, new_flower_28, old_fish_931
+                ) VALUES (
+                    926, 'dry_hill_411', 9.24, 'blue_hill_65',
+                    7.50, 'happy_moon_474', zeroblob(7200), 'smart_rock_113'
+                )",
+            )
+            .unwrap();
+
+        assert!(matches!(stmt.step().unwrap(), StepResult::Yield));
+        assert!(injector.fired());
+        assert!(matches!(stmt.step().unwrap(), StepResult::Done));
+        drop(stmt);
+        conn.set_yield_injector(None);
+
+        assert_eq!(
+            query_single_i64(
+                &conn,
+                "SELECT COUNT(*) FROM red_rain_308 WHERE old_fish_931 = 'smart_rock_113'",
+            ),
+            1
+        );
+        assert_eq!(query_single_text(&conn, "PRAGMA integrity_check"), "ok");
     }
 
     fn ensure_cell(page: &mut PageContent, cell_idx: usize, payload: &Vec<u8>) {
@@ -9739,7 +10134,8 @@ mod tests {
                         default: None,
                         expr: None,
                     })
-                    .collect(),
+                    .try_collect()
+                    .unwrap(),
                 table_name: "test".to_string(),
                 root_page: index_root_page,
                 unique: false,
@@ -9910,7 +10306,7 @@ mod tests {
             let index_def = Index {
                 name: "testindex".to_string(),
                 where_clause: None,
-                columns: vec![IndexColumn {
+                columns: crate::alloc::vec![IndexColumn {
                     name: "testcol".to_string(),
                     order: SortOrder::Asc,
                     collation: None,
@@ -11908,6 +12304,64 @@ mod tests {
             ));
             (*cursor).register_with_pager();
             cursor
+        }
+
+        /// A peer's insert must invalidate this cursor's cached rightmost
+        /// page id (move_to_rightmost's skip-a-seek optimization). Once the
+        /// peer's appends split the rightmost leaf, a long-lived cursor's
+        /// last() would otherwise trust the stale cache and return the old
+        /// page's last cell instead of the true maximum.
+        #[test]
+        fn peer_write_invalidates_rightmost_page_cache() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut reader = make_registered_cursor(&pager, root_page, 1);
+
+            // Blob payloads so a handful of appends split the rightmost leaf.
+            for rowid in 1..=8 {
+                insert_record(&mut writer, &pager, rowid, Value::Blob(vec![0u8; 1000])).unwrap();
+            }
+
+            // Positions the reader on the last row and caches the rightmost page id.
+            run_until_done(|| reader.last(), pager.deref()).unwrap();
+            let max1 = run_until_done(|| reader.rowid(), pager.deref()).unwrap();
+            assert_eq!(max1, Some(8));
+
+            // Peer appends: balance_quick allocates a new rightmost leaf.
+            for rowid in 9..=16 {
+                insert_record(&mut writer, &pager, rowid, Value::Blob(vec![0u8; 1000])).unwrap();
+            }
+
+            run_until_done(|| reader.last(), pager.deref()).unwrap();
+            let max2 = run_until_done(|| reader.rowid(), pager.deref()).unwrap();
+            assert_eq!(
+                max2,
+                Some(16),
+                "last() must see the true maximum after a peer split the rightmost leaf"
+            );
+        }
+
+        /// A peer's insert must reset this cursor's memoized count():
+        /// count_state stays at CountState::Finish after a full count, so
+        /// without invalidation every later count() returns the stale value.
+        #[test]
+        fn peer_write_invalidates_count_cache() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut reader = make_registered_cursor(&pager, root_page, 1);
+
+            for rowid in 1..=5 {
+                insert_record(&mut writer, &pager, rowid, Value::from_i64(rowid)).unwrap();
+            }
+            let count1 = run_until_done(|| reader.count(), pager.deref()).unwrap();
+            assert_eq!(count1, 5);
+
+            insert_record(&mut writer, &pager, 6, Value::from_i64(6)).unwrap();
+            let count2 = run_until_done(|| reader.count(), pager.deref()).unwrap();
+            assert_eq!(
+                count2, 6,
+                "count() must not return the memoized pre-write value"
+            );
         }
 
         #[test]

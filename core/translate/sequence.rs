@@ -358,6 +358,18 @@ pub fn emit_disk_read_nextval(
         target_register,
     )?;
 
+    // Register the active allocation against the outer tx *before* the inner
+    // tx commits and makes this value observable to other connections. This
+    // closes the race where another allocator could advance the watermark past
+    // a value whose row the outer tx still holds uncommitted. See
+    // `op_sequence_register_allocation`.
+    program.emit_insn(Insn::SequenceRegisterAllocation {
+        db: database_id,
+        seq_name_reg,
+        value_reg: target_register,
+        saved_outer_reg,
+    });
+
     program.emit_insn(Insn::SequenceCommitInnerTx {
         db: database_id,
         path_kind_reg,
@@ -380,6 +392,12 @@ pub fn emit_disk_read_nextval(
         target_pc: retry_top_label,
     });
     program.preassign_label_to_next_insn(after_retry_label);
+
+    program.emit_insn(Insn::SequenceTrackAllocation {
+        db: database_id,
+        seq_name_reg,
+        value_reg: target_register,
+    });
 
     program.emit_insn(Insn::SetSequenceCurrval {
         seq_name_reg,

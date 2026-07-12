@@ -1,0 +1,97 @@
+<Project>
+  <PropertyGroup>
+    <_TursoDataSqlitePackageRoot>$(MSBuildThisFileDirectory)..\</_TursoDataSqlitePackageRoot>
+    <_TursoDataSqliteTargetPlatform>$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)'))</_TursoDataSqliteTargetPlatform>
+    <_TursoDataSqliteStaticNativeEnabled Condition="'$(PublishAot)' == 'true' and '$(TursoUseStaticNativeLibrary)' == 'true'">true</_TursoDataSqliteStaticNativeEnabled>
+    <_TursoDataSqliteStaticNativeSupportedRid Condition="'$(RuntimeIdentifier)' == 'win-x64' or '$(RuntimeIdentifier)' == 'win-arm64' or '$(RuntimeIdentifier)' == 'linux-x64' or '$(RuntimeIdentifier)' == 'linux-arm64' or '$(RuntimeIdentifier)' == 'osx-x64' or '$(RuntimeIdentifier)' == 'osx-arm64'">true</_TursoDataSqliteStaticNativeSupportedRid>
+    <_TursoDataSqliteStaticNativePackageId>Turso.Data.Sqlite.NativeAot.$(RuntimeIdentifier)</_TursoDataSqliteStaticNativePackageId>
+  </PropertyGroup>
+
+  <Target Name="ConfigureTursoStaticNativeLibrary"
+          BeforeTargets="SetupOSSpecificProps"
+          Condition="'$(_TursoDataSqliteStaticNativeEnabled)' == 'true'">
+    <Error Condition="'$(RuntimeIdentifier)' == ''"
+           Text="TursoUseStaticNativeLibrary requires a RuntimeIdentifier, for example win-x64, linux-x64, or osx-arm64." />
+    <Error Condition="'$(RuntimeIdentifier)' != '' and '$(_TursoDataSqliteStaticNativeSupportedRid)' != 'true'"
+           Text="TursoUseStaticNativeLibrary does not support RuntimeIdentifier '$(RuntimeIdentifier)'." />
+    <Error Condition="'$(_TursoDataSqliteStaticNativeSupportedRid)' == 'true' and '$(_TursoDataSqliteStaticNativeLibrary)' == ''"
+           Text="TursoUseStaticNativeLibrary for $(RuntimeIdentifier) requires a PackageReference to $(_TursoDataSqliteStaticNativePackageId) with the same version as Turso.Data.Sqlite." />
+    <Error Condition="'$(_TursoDataSqliteStaticNativeLibrary)' != '' and !Exists('$(_TursoDataSqliteStaticNativeLibrary)')"
+           Text="Missing Turso static native library '$(_TursoDataSqliteStaticNativeLibrary)'." />
+
+    <ItemGroup>
+      <DirectPInvoke Include="turso_sdk_kit" />
+      <NativeLibrary Include="$(_TursoDataSqliteStaticNativeLibrary)"
+                     Condition="'$(_TursoDataSqliteStaticNativeLibrary)' != ''" />
+      <_TursoDataSqliteWindowsStaticNativeDependencies Include="$(_TursoDataSqliteStaticNativeDependencyDirectory)windows*.lib"
+                                                      Condition="'$(_TursoDataSqliteStaticNativeDependencyDirectory)' != ''" />
+    </ItemGroup>
+
+    <Error Condition="('$(RuntimeIdentifier)' == 'win-x64' or '$(RuntimeIdentifier)' == 'win-arm64') and '@(_TursoDataSqliteWindowsStaticNativeDependencies)' == ''"
+           Text="Missing Turso Windows static native dependency libraries from $(_TursoDataSqliteStaticNativePackageId)." />
+
+    <ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x64' or '$(RuntimeIdentifier)' == 'win-arm64'">
+      <LinkerArg Include="/NODEFAULTLIB:MSVCRT" />
+      <NativeLibrary Include="@(_TursoDataSqliteWindowsStaticNativeDependencies)" />
+      <NativeLibrary Include="bcrypt.lib" />
+      <NativeLibrary Include="advapi32.lib" />
+      <NativeLibrary Include="kernel32.lib" />
+      <NativeLibrary Include="ntdll.lib" />
+      <NativeLibrary Include="userenv.lib" />
+      <NativeLibrary Include="ws2_32.lib" />
+      <NativeLibrary Include="dbghelp.lib" />
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(RuntimeIdentifier)' == 'linux-x64' or '$(RuntimeIdentifier)' == 'linux-arm64'">
+      <NativeSystemLibrary Include="util" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="RemoveTursoDynamicNativeLibraryForStaticLink"
+          AfterTargets="ResolvePackageAssets"
+          BeforeTargets="CopyFilesToOutputDirectory;ComputeFilesToPublish"
+          Condition="'$(_TursoDataSqliteStaticNativeEnabled)' == 'true'">
+    <ItemGroup>
+      <NativeCopyLocalItems Remove="@(NativeCopyLocalItems)"
+                            Condition="'%(NativeCopyLocalItems.FileName)%(NativeCopyLocalItems.Extension)' == 'turso_sdk_kit.dll' or '%(NativeCopyLocalItems.FileName)%(NativeCopyLocalItems.Extension)' == 'libturso_sdk_kit.so' or '%(NativeCopyLocalItems.FileName)%(NativeCopyLocalItems.Extension)' == 'libturso_sdk_kit.dylib'" />
+    </ItemGroup>
+  </Target>
+
+  <ItemGroup Condition="'$(_TursoDataSqliteTargetPlatform)' == 'android' and ($(AndroidSupportedAbis.Contains('armeabi-v7a')) or $(RuntimeIdentifiers.Contains('android-arm')) or '$(RuntimeIdentifier)' == 'android-arm')">
+    <AndroidNativeLibrary Include="$(_TursoDataSqlitePackageRoot)runtimes\android-arm\native\libturso_sdk_kit.so"
+                          Condition="Exists('$(_TursoDataSqlitePackageRoot)runtimes\android-arm\native\libturso_sdk_kit.so')">
+      <Link>%(Filename)%(Extension)</Link>
+      <Abi>armeabi-v7a</Abi>
+    </AndroidNativeLibrary>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(_TursoDataSqliteTargetPlatform)' == 'android' and ($(AndroidSupportedAbis.Contains('arm64-v8a')) or $(RuntimeIdentifiers.Contains('android-arm64')) or '$(RuntimeIdentifier)' == 'android-arm64')">
+    <AndroidNativeLibrary Include="$(_TursoDataSqlitePackageRoot)runtimes\android-arm64\native\libturso_sdk_kit.so"
+                          Condition="Exists('$(_TursoDataSqlitePackageRoot)runtimes\android-arm64\native\libturso_sdk_kit.so')">
+      <Link>%(Filename)%(Extension)</Link>
+      <Abi>arm64-v8a</Abi>
+    </AndroidNativeLibrary>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(_TursoDataSqliteTargetPlatform)' == 'android' and ($(AndroidSupportedAbis.Contains('x86')) or $(RuntimeIdentifiers.Contains('android-x86')) or '$(RuntimeIdentifier)' == 'android-x86')">
+    <AndroidNativeLibrary Include="$(_TursoDataSqlitePackageRoot)runtimes\android-x86\native\libturso_sdk_kit.so"
+                          Condition="Exists('$(_TursoDataSqlitePackageRoot)runtimes\android-x86\native\libturso_sdk_kit.so')">
+      <Link>%(Filename)%(Extension)</Link>
+      <Abi>x86</Abi>
+    </AndroidNativeLibrary>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(_TursoDataSqliteTargetPlatform)' == 'android' and ($(AndroidSupportedAbis.Contains('x86_64')) or $(RuntimeIdentifiers.Contains('android-x64')) or '$(RuntimeIdentifier)' == 'android-x64')">
+    <AndroidNativeLibrary Include="$(_TursoDataSqlitePackageRoot)runtimes\android-x64\native\libturso_sdk_kit.so"
+                          Condition="Exists('$(_TursoDataSqlitePackageRoot)runtimes\android-x64\native\libturso_sdk_kit.so')">
+      <Link>%(Filename)%(Extension)</Link>
+      <Abi>x86_64</Abi>
+    </AndroidNativeLibrary>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(_TursoDataSqliteTargetPlatform)' == 'ios'">
+    <NativeReference Include="$(_TursoDataSqlitePackageRoot)runtimes\ios-universal\native\libturso_sdk_kit.xcframework"
+                     Condition="Exists('$(_TursoDataSqlitePackageRoot)runtimes\ios-universal\native\libturso_sdk_kit.xcframework')"
+                     Kind="Framework" />
+  </ItemGroup>
+</Project>

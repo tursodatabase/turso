@@ -41,9 +41,11 @@ fn validate_materialized(
         bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
     }
 
-    // Check if view already exists
+    // Check if view already exists (including broken sqlite_schema rows,
+    // which must be dropped before the name can be reused)
     if resolver.with_schema(database_id, |s| {
         s.get_materialized_view(normalized_view_name).is_some()
+            || s.broken_views.contains(normalized_view_name)
     }) {
         return Err(crate::LimboError::ParseError(format!(
             "View {normalized_view_name} already exists"
@@ -56,6 +58,7 @@ pub fn translate_create_materialized_view(
     view_name: &ast::QualifiedName,
     resolver: &Resolver,
     select_stmt: &ast::Select,
+    if_not_exists: bool,
     connection: Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
@@ -63,6 +66,16 @@ pub fn translate_create_materialized_view(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
+
+    if if_not_exists
+        && resolver.with_schema(database_id, |s| {
+            s.get_view(&normalized_view_name).is_some()
+                || s.is_materialized_view(&normalized_view_name)
+                || s.broken_views.contains(&normalized_view_name)
+        })
+    {
+        return Ok(());
+    }
 
     // Validate the view can be created and extract its columns
     // This validation happens before updating sqlite_master to prevent
@@ -104,12 +117,12 @@ pub fn translate_create_materialized_view(
     let view_table = Arc::new(BTreeTable::new(
         0, // root_page, will be set to actual root page after creation
         normalized_view_name.clone(),
-        vec![], // primary_key_columns — materialized views use implicit rowid
+        crate::alloc::vec![], // primary_key_columns — materialized views use implicit rowid
         view_columns,
         BTreeCharacteristics::HAS_ROWID,
-        vec![],
-        vec![],
-        vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     ));
 
@@ -271,9 +284,13 @@ fn validate_create_view(
     database_id: usize,
     normalized_view_name: &str,
 ) -> Result<()> {
-    // Check if view already exists
+    // Check if view already exists. A broken view (unparseable sqlite_schema
+    // row) also counts: creating over it would produce a duplicate row, so
+    // the user must DROP VIEW it first.
     if resolver.with_schema(database_id, |s| {
-        s.get_view(normalized_view_name).is_some() || s.is_materialized_view(normalized_view_name)
+        s.get_view(normalized_view_name).is_some()
+            || s.is_materialized_view(normalized_view_name)
+            || s.broken_views.contains(normalized_view_name)
     }) {
         return Err(crate::LimboError::ParseError(format!(
             "View {normalized_view_name} already exists"
@@ -293,6 +310,7 @@ pub fn translate_create_view(
     resolver: &Resolver,
     select_stmt: &ast::Select,
     columns: &[ast::IndexedColumn],
+    if_not_exists: bool,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(view_name)?;
@@ -300,12 +318,32 @@ pub fn translate_create_view(
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
+    if if_not_exists
+        && resolver.with_schema(database_id, |s| {
+            s.get_view(&normalized_view_name).is_some()
+                || s.is_materialized_view(&normalized_view_name)
+                || s.broken_views.contains(&normalized_view_name)
+        })
+    {
+        return Ok(());
+    }
+
     validate_create_view(resolver, database_id, &normalized_view_name)?;
 
     // Check for name conflicts with existing schema objects
     if let Some(object_type) =
         resolver.with_schema(database_id, |s| s.get_object_type(&normalized_view_name))
     {
+        // IF NOT EXISTS suppresses errors for table/view conflicts, matching
+        // CREATE TABLE IF NOT EXISTS behavior
+        if if_not_exists
+            && matches!(
+                object_type,
+                SchemaObjectType::Table | SchemaObjectType::View
+            )
+        {
+            return Ok(());
+        }
         let type_str = match object_type {
             SchemaObjectType::Table => "table",
             SchemaObjectType::View => "view",
@@ -368,8 +406,8 @@ fn create_view_to_str(
 ) -> String {
     let columns_str = columns
         .iter()
-        .map(|col| col.col_name.as_str())
-        .collect::<Vec<&str>>()
+        .map(|col| col.col_name.as_ident())
+        .collect::<Vec<String>>()
         .join(", ");
     if !columns_str.is_empty() {
         return format!("CREATE VIEW {view_name} ({columns_str}) AS {select_stmt}");
@@ -388,14 +426,19 @@ pub fn translate_drop_view(
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
-    // Check if view exists (either regular or materialized)
-    let (is_regular_view, is_materialized_view) = resolver.with_schema(database_id, |s| {
-        (
-            s.get_view(&normalized_view_name).is_some(),
-            s.is_materialized_view(&normalized_view_name),
-        )
-    });
-    let view_exists = is_regular_view || is_materialized_view;
+    // Check if view exists: regular, materialized, or a broken sqlite_schema
+    // row whose stored SQL failed to parse at load time. Broken views have no
+    // in-memory representation, but DROP VIEW must still delete their row so
+    // affected databases can be cleaned up.
+    let (is_regular_view, is_materialized_view, is_broken_view) =
+        resolver.with_schema(database_id, |s| {
+            (
+                s.get_view(&normalized_view_name).is_some(),
+                s.is_materialized_view(&normalized_view_name),
+                s.broken_views.contains(&normalized_view_name),
+            )
+        });
+    let view_exists = is_regular_view || is_materialized_view || is_broken_view;
 
     if !view_exists && !if_exists {
         return Err(crate::LimboError::ParseError(format!(

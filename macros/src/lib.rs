@@ -82,6 +82,7 @@
 
 extern crate proc_macro;
 mod atomic_enum;
+mod codspeed;
 mod ext;
 mod test;
 
@@ -185,6 +186,16 @@ pub fn derive_description_from_doc(item: TokenStream) -> TokenStream {
         }
     }
     generate_get_description(enum_name, &variant_description_map, enum_variants)
+}
+
+#[proc_macro_attribute]
+pub fn codspeed_criterion_benchmark(attr: TokenStream, input: TokenStream) -> TokenStream {
+    codspeed::criterion_benchmark_attribute(attr, input)
+}
+
+#[proc_macro_attribute]
+pub fn divan_bench(attr: TokenStream, input: TokenStream) -> TokenStream {
+    codspeed::divan_bench_attribute(attr, input)
 }
 
 /// Processes a Rust docs to extract the description string.
@@ -699,6 +710,24 @@ pub fn trace_stack(attr: TokenStream, input: TokenStream) -> TokenStream {
     trace_stack_impl::trace_stack_attribute(attr, input)
 }
 
+/// Wrap a function body in an allocation-site scope.
+///
+/// The argument must be an expression that converts into
+/// `crate::alloc::AllocationSite`.
+#[proc_macro_attribute]
+pub fn allocation_site(attr: TokenStream, input: TokenStream) -> TokenStream {
+    let site: proc_macro2::TokenStream = attr.into();
+    let mut function = parse_macro_input!(input as syn::ItemFn);
+    let body = function.block;
+    function.block = Box::new(syn::parse_quote!({
+        #[cfg(feature = "allocation_metric")]
+        let _turso_allocation_site_guard =
+            crate::alloc::enter_allocation_site(#site);
+        #body
+    }));
+    TokenStream::from(quote!(#function))
+}
+
 /// Controls the `#[cfg(not(antithesis))]` fallback in "always" comparison macros.
 #[allow(clippy::enum_variant_names)]
 enum ComparisonFallback {
@@ -1172,22 +1201,19 @@ pub fn turso_assert_all(input: TokenStream) -> TokenStream {
     emit_boolean_guidance(&file_path, input, BooleanCombinator::All).into()
 }
 
-/// Asserts that a code path is reached **at least once** during Antithesis testing.
-///
-/// # Behavior
-///
-/// **Currently a no-op in all builds.** This macro is disabled pending better SQL
-/// generation in `turso-stress`. When enabled, it will tell Antithesis that this code
-/// path should be exercised at least once across the entire test campaign.
+/// Asserts that a code path is reached **at least once** during Antithesis testing. No-op in
+/// non-antithesis builds.
 ///
 /// # Parameters
 ///
-/// - `"message"` — human-readable description of the code path.
+/// - `"message"` — human-readable description of the code path (required).
+/// - `{ "key": value, ... }` *(optional)* — structured details for Antithesis.
 ///
 /// # Usage
 ///
 /// ```ignore
 /// turso_assert_reachable!("opcode: Init");
+/// turso_assert_reachable!("checkpoint", { "frames": frame_count });
 /// ```
 ///
 /// # Examples
@@ -1200,11 +1226,26 @@ pub fn turso_assert_all(input: TokenStream) -> TokenStream {
 /// # When to use
 ///
 /// Place at code paths that should be exercised by the fuzzer.
-//TODO enable this when turso-stress has better SQL generation
 #[proc_macro]
-pub fn turso_assert_reachable(_input: TokenStream) -> TokenStream {
+pub fn turso_assert_reachable(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as MessageAssertInput);
+    let prefixed = prefix_message(&file_path, &input.message);
+    let details = details_json(&input.details);
+    let debug_check = details_debug_check(&input.details);
+
+    let env_check = antithesis_env_check();
     quote! {
         {
+            #[cfg(antithesis)]
+            {
+                #env_check
+                antithesis_sdk::assert_reachable!(#prefixed, #details);
+            }
+            #[cfg(not(antithesis))]
+            {
+                #debug_check
+            }
         }
     }
     .into()

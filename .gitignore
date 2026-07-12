@@ -45,7 +45,12 @@ perf/mobibench/plot/uv.lock
 # Javascript
 **/node_modules/
 
+# .NET build outputs
+examples/dotnet/obj/
+
 # testing
+testing/stress/git.diff
+testing/stress/targeted_coverage.json
 testing/limbo_output.txt
 **/limbo_output.txt
 testing/*.log
@@ -82,3 +87,19 @@ CLAUDE.md
 bindings/python/dev.py
 bindings/python/implementation-test/
 dhat-heap.json
+
+# Aristo runtime, cache, and per-user state: never commit these.
+# Durable state (.aristo/proofs/*.proof, .aristo/specs/, .aristo/feedback/,
+# .aristo/expectations.toml, .aristo/canon-matches.toml, aristo.toml) is
+# committed and intentionally not listed here.
+.aristo/index.toml
+# Per-annotation docs: normally committed, but excluded from this PR to keep the
+# diff small. Regenerate with `aristo doc` (see CONTRIBUTING.md -> Aristo).
+.aristo/doc/
+.aristo/sessions/
+.aristo/nudge-state.toml
+.aristo/verify-queue/
+.aristo/critique-queue/
+.aristo/critiques/
+.aristo/proofs/*.proof.bak
+.aristo/archive/

@@ -1,35 +1,44 @@
 use std::{
+    collections::BTreeMap,
     ops::Deref,
     sync::{Arc, Mutex},
 };
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use prost::Message;
 use roaring::RoaringBitmap;
 use turso_core::{
     io::FileSyncType,
+    storage::sqlite3_ondisk::read_varint as read_sqlite_varint,
     types::{Text, WalFrameInfo},
     Buffer, Completion, LimboError, OpenFlags, Value,
 };
 
 use crate::{
+    client_proto::{
+        LogicalOp, LogicalOpType, LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData,
+    },
     database_replay_generator::DatabaseReplayGenerator,
     database_sync_engine::{DataStats, DatabaseSyncEngineOpts},
     database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
     database_tape::{
-        run_stmt_expect_one_row, run_stmt_ignore_rows, DatabaseChangesIteratorMode,
-        DatabaseChangesIteratorOpts, DatabaseReplaySessionOpts, DatabaseTape, DatabaseWalSession,
+        run_stmt_expect_one_row, run_stmt_ignore_rows, run_stmt_once, DatabaseChangesIteratorMode,
+        DatabaseChangesIteratorOpts, DatabaseReplaySession, DatabaseReplaySessionOpts,
+        DatabaseTape, DatabaseWalSession,
     },
     errors::Error,
     io_operations::IoOperations,
     server_proto::{
         self, Batch, BatchCond, BatchStep, BatchStreamReq, PageData, PageUpdatesEncodingReq,
-        PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, Stmt, StmtResult, StreamRequest,
+        PullUpdatesApplyMode, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
+        PullUpdatesStreamKind, Stmt, StmtResult, StreamRequest,
     },
     types::{
-        Coro, DatabasePullRevision, DatabaseRowTransformResult, DatabaseSyncEngineProtocolVersion,
-        DatabaseTapeOperation, DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo,
-        DbSyncStatus, PartialBootstrapStrategy, PartialSyncOpts, SyncEngineIoResult,
+        parse_bin_record, Coro, DatabasePullRevision, DatabaseRowTransformResult,
+        DatabaseSchemaKind, DatabaseSchemaReplay, DatabaseStatementReplay,
+        DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation, DatabaseTapeRowChange,
+        DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus, PartialBootstrapStrategy,
+        PartialSyncOpts, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -39,6 +48,641 @@ pub const WAL_HEADER: usize = 32;
 pub const WAL_FRAME_HEADER: usize = 24;
 pub const PAGE_SIZE: usize = 4096;
 pub const WAL_FRAME_SIZE: usize = WAL_FRAME_HEADER + PAGE_SIZE;
+const MVCC_LOG_MAGIC: u32 = 0x4C4D4C32;
+const MVCC_LOG_VERSION: u8 = 3;
+const MVCC_LOG_HEADER_SIZE: usize = 56;
+const MVCC_TX_FRAME_MAGIC: u32 = 0x5854564D;
+const MVCC_TX_EXT_FRAME_MAGIC: u32 = 0x5845564D;
+const MVCC_TX_END_MAGIC: u32 = 0x4554564D;
+const MVCC_TX_HEADER_SIZE: usize = 24;
+const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
+const MVCC_TX_TRAILER_SIZE: usize = 8;
+const MVCC_TX_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
+const MVCC_EXTENSION_RECORD_HEADER_SIZE: usize = 8;
+const MVCC_EXTENSION_TYPE_PORTABLE_CHANGES: u16 = 1;
+const MVCC_LOG_HEADER_SALT_START: usize = 8;
+const MVCC_LOG_HEADER_SALT_END: usize = 16;
+const MVCC_LOG_HEADER_RESERVED_START: usize = 16;
+const MVCC_LOG_HEADER_CRC_START: usize = 52;
+const MVCC_OP_UPSERT_TABLE: u8 = 0;
+const MVCC_OP_DELETE_TABLE: u8 = 1;
+const MVCC_OP_UPSERT_INDEX: u8 = 2;
+const MVCC_OP_DELETE_INDEX: u8 = 3;
+const MVCC_OP_UPDATE_HEADER: u8 = 4;
+const MVCC_OP_FLAG_PORTABLE_EXTENSION: u8 = 1 << 1;
+const MVCC_SQLITE_SCHEMA_TABLE_ID: i64 = -1;
+const MVCC_DELETE_EXT_IDENTITY_RECORD_FIELD: u64 = 1;
+const PORTABLE_TXN_META_CLIENT_KEY: &str = "client";
+const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
+const SQLITE_SCHEMA_TABLE: &str = "sqlite_schema";
+const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
+const TURSO_CDC_TABLE_NAME: &str = "turso_cdc";
+const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
+
+#[derive(prost::Message, Clone, PartialEq, Eq)]
+struct PortableLogicalTxn {
+    #[prost(uint64, tag = "1")]
+    end_offset: u64,
+    #[prost(uint64, tag = "2")]
+    commit_ts: u64,
+    #[prost(bytes = "bytes", repeated, tag = "12")]
+    string_table: Vec<Bytes>,
+    #[prost(message, repeated, tag = "13")]
+    object_map: Vec<PortableObjectMap>,
+    #[prost(message, repeated, tag = "14")]
+    meta: Vec<PortableMeta>,
+}
+
+#[derive(prost::Message, Clone, PartialEq, Eq)]
+struct PortableObjectMap {
+    #[prost(sint64, tag = "1")]
+    mv_table_id: i64,
+    #[prost(uint64, tag = "2")]
+    name_ref: u64,
+}
+
+#[derive(prost::Message, Clone, PartialEq, Eq)]
+struct PortableMeta {
+    #[prost(uint64, tag = "1")]
+    key_ref: u64,
+    #[prost(uint64, tag = "2")]
+    value_ref: u64,
+}
+
+fn pull_updates_stream_kind(header: &PullUpdatesRespProtoBody) -> Result<PullUpdatesStreamKind> {
+    PullUpdatesStreamKind::try_from(header.stream_kind).map_err(|_| {
+        Error::DatabaseSyncEngineError(format!(
+            "unknown pull-updates stream kind: {}",
+            header.stream_kind
+        ))
+    })
+}
+
+fn pull_updates_apply_mode(header: &PullUpdatesRespProtoBody) -> Result<PullUpdatesApplyMode> {
+    PullUpdatesApplyMode::try_from(header.apply_mode).map_err(|_| {
+        Error::DatabaseSyncEngineError(format!(
+            "unknown pull-updates apply mode: {}",
+            header.apply_mode
+        ))
+    })
+}
+
+fn ensure_page_stream(header: &PullUpdatesRespProtoBody, context: &str) -> Result<()> {
+    let stream_kind = pull_updates_stream_kind(header)?;
+    let _apply_mode = pull_updates_apply_mode(header)?;
+    match stream_kind {
+        PullUpdatesStreamKind::Pages => Ok(()),
+        PullUpdatesStreamKind::MvccLogicalLog => Err(Error::DatabaseSyncEngineError(format!(
+            "{context} does not support raw MVCC logical-log pull-updates streams yet"
+        ))),
+    }
+}
+
+fn ensure_incremental_page_stream(header: &PullUpdatesRespProtoBody, context: &str) -> Result<()> {
+    ensure_page_stream(header, context)?;
+    match pull_updates_apply_mode(header)? {
+        PullUpdatesApplyMode::Incremental => Ok(()),
+        PullUpdatesApplyMode::ReplaceBase => Err(Error::DatabaseSyncEngineError(format!(
+            "{context} does not support replace-base page streams yet"
+        ))),
+    }
+}
+
+fn logical_op_to_tape_operations(
+    op: LogicalOp,
+    commit_ts: u64,
+) -> Result<Vec<DatabaseTapeOperation>> {
+    let op_type = LogicalOpType::try_from(op.op_type).map_err(|_| {
+        Error::DatabaseSyncEngineError(format!("unknown logical op type: {}", op.op_type))
+    })?;
+    match op_type {
+        LogicalOpType::Unspecified => Err(Error::DatabaseSyncEngineError(
+            "logical op type must not be unspecified".to_string(),
+        )),
+        LogicalOpType::UpsertRow => {
+            if op.table_name.is_empty() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "logical upsert_row must include table_name".to_string(),
+                ));
+            }
+            if op.record.is_empty() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "logical upsert_row must include record bytes".to_string(),
+                ));
+            }
+            Ok(vec![DatabaseTapeOperation::RowChange(
+                DatabaseTapeRowChange {
+                    change_id: 0,
+                    change_time: commit_ts,
+                    change: DatabaseTapeRowChangeType::Insert {
+                        after: parse_bin_record(&op.record)?,
+                    },
+                    table_name: op.table_name,
+                    id: op.rowid,
+                },
+            )])
+        }
+        LogicalOpType::DeleteRow => {
+            if op.table_name.is_empty() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "logical delete_row must include table_name".to_string(),
+                ));
+            }
+            Ok(vec![DatabaseTapeOperation::RowChange(
+                DatabaseTapeRowChange {
+                    change_id: 0,
+                    change_time: commit_ts,
+                    change: DatabaseTapeRowChangeType::Delete {
+                        before: turso_core::alloc::vec![],
+                    },
+                    table_name: op.table_name,
+                    id: op.rowid,
+                },
+            )])
+        }
+        LogicalOpType::Schema => {
+            if op.schema_name.is_empty() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "logical schema op must include schema_name".to_string(),
+                ));
+            }
+            if !is_logically_replayable_table(&op.schema_name) {
+                return Ok(Vec::new());
+            }
+            let schema_action =
+                LogicalSchemaAction::try_from(op.schema_action.ok_or_else(|| {
+                    Error::DatabaseSyncEngineError(
+                        "logical schema op must include schema_action".to_string(),
+                    )
+                })?)
+                .map_err(|_| {
+                    Error::DatabaseSyncEngineError(format!(
+                        "unknown logical schema action: {:?}",
+                        op.schema_action
+                    ))
+                })?;
+            let schema_kind = logical_schema_kind(op.schema_kind.ok_or_else(|| {
+                Error::DatabaseSyncEngineError(
+                    "logical schema op must include schema_kind".to_string(),
+                )
+            })?)?;
+            let operation = match schema_action {
+                LogicalSchemaAction::Unspecified => {
+                    return Err(Error::DatabaseSyncEngineError(
+                        "logical schema action must not be unspecified".to_string(),
+                    ));
+                }
+                LogicalSchemaAction::Create => {
+                    if op.sql.is_empty() {
+                        return Err(Error::DatabaseSyncEngineError(
+                            "logical schema create must include sql".to_string(),
+                        ));
+                    }
+                    DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Create {
+                        sql: op.sql,
+                    })
+                }
+                LogicalSchemaAction::Drop => {
+                    if !op.sql.is_empty() {
+                        return Err(Error::DatabaseSyncEngineError(
+                            "logical schema drop must not include sql".to_string(),
+                        ));
+                    }
+                    DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Drop {
+                        kind: schema_kind,
+                        name: op.schema_name,
+                    })
+                }
+                LogicalSchemaAction::Refresh => {
+                    if op.sql.is_empty() {
+                        return Err(Error::DatabaseSyncEngineError(
+                            "logical schema refresh must include sql".to_string(),
+                        ));
+                    }
+                    DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Refresh {
+                        kind: schema_kind,
+                        name: op.schema_name,
+                        sql: op.sql,
+                    })
+                }
+                LogicalSchemaAction::Alter => {
+                    if op.sql.is_empty() {
+                        return Err(Error::DatabaseSyncEngineError(
+                            "logical schema alter must include sql".to_string(),
+                        ));
+                    }
+                    DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Alter { sql: op.sql })
+                }
+            };
+            Ok(vec![operation])
+        }
+        LogicalOpType::UpdateHeader => {
+            let mut operations = Vec::with_capacity(2);
+            if let Some(user_version) = op.user_version {
+                operations.push(DatabaseTapeOperation::StmtReplay(DatabaseStatementReplay {
+                    sql: format!("PRAGMA user_version = {user_version}"),
+                    values: Vec::new(),
+                }));
+            }
+            if let Some(application_id) = op.application_id {
+                operations.push(DatabaseTapeOperation::StmtReplay(DatabaseStatementReplay {
+                    sql: format!("PRAGMA application_id = {application_id}"),
+                    values: Vec::new(),
+                }));
+            }
+            if operations.is_empty() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "logical update_header must include at least one field".to_string(),
+                ));
+            }
+            Ok(operations)
+        }
+    }
+}
+
+pub(crate) fn is_logically_replayable_table(name: &str) -> bool {
+    !name.starts_with(SQLITE_INTERNAL_PREFIX)
+        && !name.starts_with(TURSO_INTERNAL_PREFIX)
+        && name != TURSO_SYNC_TABLE_NAME
+        && name != TURSO_CDC_TABLE_NAME
+        && name != TURSO_CDC_VERSION_TABLE_NAME
+}
+
+fn sqlite_schema_change_name(change: &DatabaseTapeRowChange) -> Result<Option<String>> {
+    if change.table_name != SQLITE_SCHEMA_TABLE {
+        return Ok(None);
+    }
+    let values = match &change.change {
+        DatabaseTapeRowChangeType::Delete { before } => before,
+        DatabaseTapeRowChangeType::Insert { after } => after,
+        DatabaseTapeRowChangeType::Update { after, .. } => after,
+    };
+    match values.get(1) {
+        Some(Value::Text(name)) => Ok(Some(name.as_str().to_string())),
+        Some(Value::Null) | None => Ok(None),
+        Some(other) => Err(Error::DatabaseSyncEngineError(format!(
+            "sqlite_schema.name must be text while filtering push changes, got {other:?}"
+        ))),
+    }
+}
+
+fn sqlite_schema_change_updates_sql(change: &DatabaseTapeRowChange) -> Result<bool> {
+    if change.table_name != SQLITE_SCHEMA_TABLE {
+        return Ok(true);
+    }
+    let DatabaseTapeRowChangeType::Update { updates, .. } = &change.change else {
+        return Ok(true);
+    };
+    let Some(updates) = updates else {
+        return Err(Error::DatabaseSyncEngineError(
+            "sqlite_schema update must include update flags while filtering changes".to_string(),
+        ));
+    };
+    if updates.len() != 10 {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "sqlite_schema update must contain 5 update flags and 5 values, got {} values",
+            updates.len()
+        )));
+    }
+    match updates.get(4) {
+        Some(Value::Numeric(turso_core::Numeric::Integer(0))) => Ok(false),
+        Some(Value::Numeric(turso_core::Numeric::Integer(1))) => Ok(true),
+        Some(other) => Err(Error::DatabaseSyncEngineError(format!(
+            "sqlite_schema.sql update flag must be integer 0 or 1 while filtering changes, got {other:?}"
+        ))),
+        None => unreachable!("sqlite_schema update length was validated"),
+    }
+}
+
+fn should_push_change(
+    change: &DatabaseTapeRowChange,
+    opts: &DatabaseSyncEngineOpts,
+) -> Result<bool> {
+    if change.table_name == TURSO_SYNC_TABLE_NAME {
+        return Ok(false);
+    }
+    if opts.tables_ignore.iter().any(|x| &change.table_name == x) {
+        return Ok(false);
+    }
+    if change.table_name == SQLITE_SCHEMA_TABLE {
+        if !sqlite_schema_change_updates_sql(change)? {
+            return Ok(false);
+        }
+        return Ok(sqlite_schema_change_name(change)?
+            .as_deref()
+            .is_some_and(is_logically_replayable_table));
+    }
+    Ok(is_logically_replayable_table(&change.table_name))
+}
+
+pub(crate) fn should_replay_local_change(change: &DatabaseTapeRowChange) -> Result<bool> {
+    if change.table_name == TURSO_SYNC_TABLE_NAME {
+        return Ok(false);
+    }
+    if change.table_name == SQLITE_SCHEMA_TABLE {
+        if !sqlite_schema_change_updates_sql(change)? {
+            return Ok(false);
+        }
+        return Ok(sqlite_schema_change_name(change)?
+            .as_deref()
+            .is_some_and(is_logically_replayable_table));
+    }
+    Ok(is_logically_replayable_table(&change.table_name))
+}
+
+fn logical_schema_kind(kind: i32) -> Result<DatabaseSchemaKind> {
+    let kind = LogicalSchemaKind::try_from(kind).map_err(|_| {
+        Error::DatabaseSyncEngineError(format!("unknown logical schema kind: {kind}"))
+    })?;
+    Ok(match kind {
+        LogicalSchemaKind::Unspecified => {
+            return Err(Error::DatabaseSyncEngineError(
+                "logical schema kind must not be unspecified".to_string(),
+            ));
+        }
+        LogicalSchemaKind::Table => DatabaseSchemaKind::Table,
+        LogicalSchemaKind::Index => DatabaseSchemaKind::Index,
+        LogicalSchemaKind::Trigger => DatabaseSchemaKind::Trigger,
+        LogicalSchemaKind::View => DatabaseSchemaKind::View,
+    })
+}
+
+#[derive(Clone, Default)]
+struct LogicalReplayTableMap {
+    names_by_stable_id: BTreeMap<u64, String>,
+}
+
+impl LogicalReplayTableMap {
+    fn from_persisted(names_by_stable_id: BTreeMap<u64, String>) -> Self {
+        Self { names_by_stable_id }
+    }
+
+    fn into_persisted(self) -> BTreeMap<u64, String> {
+        self.names_by_stable_id
+    }
+
+    fn resolve_row_table_name(&self, op: &LogicalOp) -> Result<String> {
+        if !op.table_name.is_empty() {
+            return Ok(op.table_name.clone());
+        }
+        if op.stable_table_id == 0 {
+            return Err(Error::DatabaseSyncEngineError(
+                "logical row op must include table_name or stable_table_id".to_string(),
+            ));
+        }
+        self.names_by_stable_id
+            .get(&op.stable_table_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::DatabaseSyncEngineError(format!(
+                    "logical row op references unknown stable_table_id {}",
+                    op.stable_table_id
+                ))
+            })
+    }
+
+    fn observe_schema_op(
+        &mut self,
+        stable_table_id: u64,
+        schema_name: &str,
+        schema_kind: DatabaseSchemaKind,
+        schema_action: LogicalSchemaAction,
+    ) {
+        if stable_table_id == 0 || schema_kind != DatabaseSchemaKind::Table {
+            return;
+        }
+        match schema_action {
+            LogicalSchemaAction::Unspecified => {}
+            LogicalSchemaAction::Create
+            | LogicalSchemaAction::Refresh
+            | LogicalSchemaAction::Alter => {
+                self.names_by_stable_id
+                    .insert(stable_table_id, schema_name.to_string());
+            }
+            LogicalSchemaAction::Drop => {
+                self.names_by_stable_id.remove(&stable_table_id);
+            }
+        }
+    }
+}
+
+pub fn logical_txn_to_tape_operations(txn: &LogicalTxnData) -> Result<Vec<DatabaseTapeOperation>> {
+    let mut table_map = LogicalReplayTableMap::default();
+    logical_txn_to_tape_operations_with_table_map(txn, &mut table_map)
+}
+
+fn logical_txn_to_tape_operations_with_table_map(
+    txn: &LogicalTxnData,
+    table_map: &mut LogicalReplayTableMap,
+) -> Result<Vec<DatabaseTapeOperation>> {
+    let mut operations = Vec::new();
+    for op in txn.ops.iter().cloned() {
+        let op_type = LogicalOpType::try_from(op.op_type).map_err(|_| {
+            Error::DatabaseSyncEngineError(format!("unknown logical op type: {}", op.op_type))
+        })?;
+        match op_type {
+            LogicalOpType::Unspecified => {
+                return Err(Error::DatabaseSyncEngineError(
+                    "logical op type must not be unspecified".to_string(),
+                ));
+            }
+            LogicalOpType::UpsertRow | LogicalOpType::DeleteRow => {
+                let table_name = table_map.resolve_row_table_name(&op)?;
+                if !is_logically_replayable_table(&table_name) {
+                    continue;
+                }
+                let mut op = op;
+                op.table_name = table_name;
+                operations.extend(logical_op_to_tape_operations(op, txn.commit_ts)?);
+            }
+            LogicalOpType::Schema => {
+                if !is_logically_replayable_table(&op.schema_name) {
+                    continue;
+                }
+                let schema_action =
+                    LogicalSchemaAction::try_from(op.schema_action.ok_or_else(|| {
+                        Error::DatabaseSyncEngineError(
+                            "logical schema op must include schema_action".to_string(),
+                        )
+                    })?)
+                    .map_err(|_| {
+                        Error::DatabaseSyncEngineError(format!(
+                            "unknown logical schema action: {:?}",
+                            op.schema_action
+                        ))
+                    })?;
+                let schema_kind = logical_schema_kind(op.schema_kind.ok_or_else(|| {
+                    Error::DatabaseSyncEngineError(
+                        "logical schema op must include schema_kind".to_string(),
+                    )
+                })?)?;
+                table_map.observe_schema_op(
+                    op.stable_table_id,
+                    &op.schema_name,
+                    schema_kind,
+                    schema_action,
+                );
+                operations.extend(logical_op_to_tape_operations(op, txn.commit_ts)?);
+            }
+            LogicalOpType::UpdateHeader => {
+                operations.extend(logical_op_to_tape_operations(op, txn.commit_ts)?);
+            }
+        }
+    }
+    Ok(operations)
+}
+
+#[derive(Debug, Default)]
+pub struct LogicalReplayApplyStats {
+    pub touched_rows: std::collections::BTreeSet<(String, i64)>,
+}
+
+fn logical_operations_touched_rows(
+    operations: &[DatabaseTapeOperation],
+) -> std::collections::BTreeSet<(String, i64)> {
+    operations
+        .iter()
+        .filter_map(|operation| match operation {
+            DatabaseTapeOperation::RowChange(change)
+                if is_logically_replayable_table(&change.table_name) =>
+            {
+                Some((change.table_name.clone(), change.id))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn logical_txn_acknowledges_client(txn: &LogicalTxnData, client_id: &str) -> Result<bool> {
+    if txn.origin_client_id == client_id {
+        return Ok(true);
+    }
+
+    for op in &txn.ops {
+        if LogicalOpType::try_from(op.op_type) != Ok(LogicalOpType::UpsertRow) {
+            continue;
+        }
+        if op.table_name != TURSO_SYNC_TABLE_NAME {
+            continue;
+        }
+        let values = parse_bin_record(&op.record)?;
+        if values
+            .first()
+            .and_then(|value| value.to_text())
+            .is_some_and(|value| value == client_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn read_proto_file_chunk<Ctx>(
+    coro: &Coro<Ctx>,
+    file: &Arc<dyn turso_core::File>,
+    size: u64,
+    file_offset: &mut u64,
+    bytes: &mut BytesMut,
+) -> Result<()> {
+    if *file_offset >= size {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        return Err(Error::DatabaseSyncEngineError(
+            "unexpected end of protobuf message in file".to_string(),
+        ));
+    }
+
+    let to_read = (size - *file_offset).min(64 * 1024) as usize;
+    let buffer = Arc::new(Buffer::new_temporary(to_read));
+    let read_len = Arc::new(Mutex::new(Ok(0usize)));
+    let c = Completion::new_read(buffer.clone(), {
+        let read_len = read_len.clone();
+        move |result| {
+            *read_len.lock().unwrap() = result
+                .map(|(_, len)| len as usize)
+                .map_err(|err| Error::IoError(err.to_string()));
+            None
+        }
+    });
+    let c = file.pread(*file_offset, c)?;
+    while !c.succeeded() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    let read_len = read_len.lock().unwrap().clone()?;
+    if read_len == 0 {
+        return Err(Error::DatabaseSyncEngineError(
+            "unexpected EOF while reading protobuf messages from file".to_string(),
+        ));
+    }
+    *file_offset += read_len as u64;
+    bytes.extend_from_slice(&buffer.as_slice()[..read_len]);
+    Ok(())
+}
+
+async fn replay_logical_transactions_from_file<Ctx>(
+    coro: &Coro<Ctx>,
+    replay: &mut DatabaseReplaySession,
+    txns_file: &Arc<dyn turso_core::File>,
+    excluded_client_id: Option<&str>,
+    table_names_by_stable_id: &mut BTreeMap<u64, String>,
+) -> Result<LogicalReplayApplyStats> {
+    let size = txns_file.size()?;
+    let mut file_offset = 0u64;
+    let mut bytes = BytesMut::new();
+    let mut stats = LogicalReplayApplyStats::default();
+    let mut table_map =
+        LogicalReplayTableMap::from_persisted(std::mem::take(table_names_by_stable_id));
+    loop {
+        while let Some(txn) = take_proto_message_from_bytes::<LogicalTxnData>(&mut bytes)? {
+            let mut decoded_table_map = table_map.clone();
+            let operations =
+                logical_txn_to_tape_operations_with_table_map(&txn, &mut decoded_table_map)?;
+            if let Some(excluded_client_id) = excluded_client_id {
+                if logical_txn_acknowledges_client(&txn, excluded_client_id)? {
+                    continue;
+                }
+            }
+            table_map = decoded_table_map;
+            for operation in operations {
+                for row in logical_operations_touched_rows(std::slice::from_ref(&operation)) {
+                    stats.touched_rows.insert(row);
+                }
+                replay.replay(coro, operation).await?;
+            }
+        }
+        if file_offset >= size {
+            if bytes.is_empty() {
+                break;
+            }
+            return Err(Error::DatabaseSyncEngineError(
+                "unexpected end of protobuf message in file".to_string(),
+            ));
+        }
+        read_proto_file_chunk(coro, txns_file, size, &mut file_offset, &mut bytes).await?;
+    }
+    *table_names_by_stable_id = table_map.into_persisted();
+    Ok(stats)
+}
+
+pub async fn apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats<
+    Ctx,
+>(
+    coro: &Coro<Ctx>,
+    replay: &mut DatabaseReplaySession,
+    txns_file: &Arc<dyn turso_core::File>,
+    excluded_client_id: &str,
+    table_names_by_stable_id: &mut BTreeMap<u64, String>,
+) -> Result<LogicalReplayApplyStats> {
+    replay_logical_transactions_from_file(
+        coro,
+        replay,
+        txns_file,
+        Some(excluded_client_id),
+        table_names_by_stable_id,
+    )
+    .await
+}
 
 pub struct MutexSlot<T: Clone> {
     pub value: T,
@@ -104,6 +748,12 @@ pub enum WalPushResult {
     NeedCheckpoint,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullUpdatesV1Result {
+    Pages { replace_base: bool },
+    Logical { txns: usize, ops: usize },
+}
+
 pub fn connect_untracked(tape: &DatabaseTape) -> Result<Arc<turso_core::Connection>> {
     let conn = tape.connect_untracked()?;
     assert_eq!(
@@ -161,6 +811,879 @@ impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
     }
 }
 
+async fn truncate_file<Ctx>(coro: &Coro<Ctx>, file: &Arc<dyn turso_core::File>) -> Result<()> {
+    let c = Completion::new_trunc(move |result| {
+        let Ok(rc) = result else {
+            return;
+        };
+        assert_eq!(rc, 0);
+    });
+    let c = file.truncate(0, c)?;
+    while !c.succeeded() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    Ok(())
+}
+
+async fn append_file_bytes<Ctx>(
+    coro: &Coro<Ctx>,
+    file: &Arc<dyn turso_core::File>,
+    offset: &mut u64,
+    data: &[u8],
+) -> Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let buffer = Arc::new(Buffer::new(data.to_vec()));
+    let len = data.len();
+    let c = Completion::new_write(move |result| {
+        let Ok(size) = result else {
+            return;
+        };
+        assert_eq!(size as usize, len);
+    });
+    let c = file.pwrite(*offset, buffer, c)?;
+    while !c.succeeded() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    *offset += len as u64;
+    Ok(())
+}
+
+fn read_u32_le(buf: &[u8], offset: usize) -> Result<u32> {
+    let bytes = buf.get(offset..offset + 4).ok_or_else(|| {
+        Error::DatabaseSyncEngineError("truncated MVCC logical-log frame".to_string())
+    })?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn read_u16_le(buf: &[u8], offset: usize) -> Result<u16> {
+    let bytes = buf.get(offset..offset + 2).ok_or_else(|| {
+        Error::DatabaseSyncEngineError("truncated MVCC logical-log frame".to_string())
+    })?;
+    Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn read_u64_le(buf: &[u8], offset: usize) -> Result<u64> {
+    let bytes = buf.get(offset..offset + 8).ok_or_else(|| {
+        Error::DatabaseSyncEngineError("truncated MVCC logical-log frame".to_string())
+    })?;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn find_mvcc_extension_payload(
+    extension_block: &[u8],
+    extension_record_count: u32,
+    wanted_type: u16,
+) -> Result<Vec<u8>> {
+    let mut offset = 0usize;
+    let mut payload = Vec::new();
+    for _ in 0..extension_record_count {
+        let header_end = offset
+            .checked_add(MVCC_EXTENSION_RECORD_HEADER_SIZE)
+            .ok_or_else(|| {
+                Error::DatabaseSyncEngineError(
+                    "MVCC logical-log extension record offset overflow".to_string(),
+                )
+            })?;
+        if header_end > extension_block.len() {
+            return Err(Error::DatabaseSyncEngineError(
+                "MVCC logical-log extension record header is truncated".to_string(),
+            ));
+        }
+        let extension_type = read_u16_le(extension_block, offset)?;
+        let extension_flags = read_u16_le(extension_block, offset + 2)?;
+        if extension_flags != 0 {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "unsupported MVCC logical-log extension flags for type {extension_type}: {extension_flags:#x}"
+            )));
+        }
+        let extension_len = read_u32_le(extension_block, offset + 4)? as usize;
+        let payload_start = header_end;
+        let payload_end = payload_start.checked_add(extension_len).ok_or_else(|| {
+            Error::DatabaseSyncEngineError(
+                "MVCC logical-log extension record payload offset overflow".to_string(),
+            )
+        })?;
+        if payload_end > extension_block.len() {
+            return Err(Error::DatabaseSyncEngineError(
+                "MVCC logical-log extension record payload is truncated".to_string(),
+            ));
+        }
+        if extension_type == wanted_type {
+            payload.extend_from_slice(&extension_block[payload_start..payload_end]);
+        }
+        offset = payload_end;
+    }
+    if offset != extension_block.len() {
+        return Err(Error::DatabaseSyncEngineError(
+            "MVCC logical-log extension block has trailing bytes".to_string(),
+        ));
+    }
+    Ok(payload)
+}
+
+fn validate_mvcc_log_header(buf: &[u8]) -> Result<u32> {
+    if buf.len() < MVCC_LOG_HEADER_SIZE {
+        return Err(Error::DatabaseSyncEngineError(
+            "truncated MVCC logical-log header".to_string(),
+        ));
+    }
+    if read_u32_le(buf, 0)? != MVCC_LOG_MAGIC {
+        return Err(Error::DatabaseSyncEngineError(
+            "invalid MVCC logical-log header magic".to_string(),
+        ));
+    }
+    if buf[4] != MVCC_LOG_VERSION {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "unsupported MVCC logical-log version {}",
+            buf[4]
+        )));
+    }
+    if buf[5] & 0b1111_1110 != 0 {
+        return Err(Error::DatabaseSyncEngineError(
+            "invalid MVCC logical-log header flags".to_string(),
+        ));
+    }
+    let hdr_len = u16::from_le_bytes([buf[6], buf[7]]) as usize;
+    if hdr_len != MVCC_LOG_HEADER_SIZE {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "invalid MVCC logical-log header length {hdr_len}"
+        )));
+    }
+    let stored_crc = read_u32_le(buf, MVCC_LOG_HEADER_CRC_START)?;
+    let mut crc_buf = [0u8; MVCC_LOG_HEADER_SIZE];
+    crc_buf.copy_from_slice(&buf[..MVCC_LOG_HEADER_SIZE]);
+    crc_buf[MVCC_LOG_HEADER_CRC_START..MVCC_LOG_HEADER_SIZE].fill(0);
+    if crc32c::crc32c(&crc_buf) != stored_crc {
+        return Err(Error::DatabaseSyncEngineError(
+            "MVCC logical-log header checksum mismatch".to_string(),
+        ));
+    }
+    if buf[MVCC_LOG_HEADER_RESERVED_START..MVCC_LOG_HEADER_CRC_START]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(Error::DatabaseSyncEngineError(
+            "MVCC logical-log header reserved bytes must be zero".to_string(),
+        ));
+    }
+    let salt = u64::from_le_bytes(
+        buf[MVCC_LOG_HEADER_SALT_START..MVCC_LOG_HEADER_SALT_END]
+            .try_into()
+            .expect("fixed-size salt slice"),
+    );
+    Ok(crc32c::crc32c(&salt.to_le_bytes()))
+}
+
+fn decode_mvcc_log_crc_seed(seed: &[u8]) -> Result<u32> {
+    if seed.len() != std::mem::size_of::<u32>() {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "invalid MVCC logical-log CRC seed length {}",
+            seed.len()
+        )));
+    }
+    Ok(u32::from_le_bytes(
+        seed.try_into().expect("validated CRC seed length"),
+    ))
+}
+
+fn read_mvcc_proto_varint(buf: &[u8], cursor: &mut usize) -> Result<u64> {
+    let mut value = 0u64;
+    let mut shift = 0;
+    while *cursor < buf.len() {
+        let byte = buf[*cursor];
+        *cursor += 1;
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(Error::DatabaseSyncEngineError(
+                "MVCC logical-log varint overflows u64".to_string(),
+            ));
+        }
+    }
+    Err(Error::DatabaseSyncEngineError(
+        "truncated MVCC logical-log varint".to_string(),
+    ))
+}
+
+fn read_mvcc_sqlite_varint(buf: &[u8], cursor: &mut usize) -> Result<u64> {
+    let (value, len) = read_sqlite_varint(&buf[*cursor..]).map_err(|err| {
+        Error::DatabaseSyncEngineError(format!("invalid MVCC logical-log SQLite varint: {err}"))
+    })?;
+    *cursor = cursor.checked_add(len).ok_or_else(|| {
+        Error::DatabaseSyncEngineError("MVCC logical-log SQLite varint offset overflow".to_string())
+    })?;
+    Ok(value)
+}
+
+fn skip_mvcc_proto_field(buf: &[u8], cursor: &mut usize, wire_type: u64) -> Result<()> {
+    match wire_type {
+        0 => {
+            let _ = read_mvcc_proto_varint(buf, cursor)?;
+        }
+        2 => {
+            let len = usize::try_from(read_mvcc_proto_varint(buf, cursor)?).map_err(|_| {
+                Error::DatabaseSyncEngineError(
+                    "MVCC logical-log protobuf length overflows usize".to_string(),
+                )
+            })?;
+            let end = cursor.checked_add(len).ok_or_else(|| {
+                Error::DatabaseSyncEngineError(
+                    "MVCC logical-log protobuf length overflow".to_string(),
+                )
+            })?;
+            if end > buf.len() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "truncated MVCC logical-log protobuf field".to_string(),
+                ));
+            }
+            *cursor = end;
+        }
+        other => {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "unsupported MVCC logical-log protobuf wire type {other}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn decode_mvcc_delete_identity_record(extension: &[u8]) -> Result<Vec<u8>> {
+    let mut cursor = 0usize;
+    let mut identity_record = Vec::new();
+    while cursor < extension.len() {
+        let key = read_mvcc_proto_varint(extension, &mut cursor)?;
+        let field = key >> 3;
+        let wire_type = key & 7;
+        if field == MVCC_DELETE_EXT_IDENTITY_RECORD_FIELD && wire_type == 2 {
+            let len =
+                usize::try_from(read_mvcc_proto_varint(extension, &mut cursor)?).map_err(|_| {
+                    Error::DatabaseSyncEngineError(
+                        "MVCC delete identity record length overflows usize".to_string(),
+                    )
+                })?;
+            let end = cursor.checked_add(len).ok_or_else(|| {
+                Error::DatabaseSyncEngineError(
+                    "MVCC delete identity record length overflow".to_string(),
+                )
+            })?;
+            if end > extension.len() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "truncated MVCC delete identity record".to_string(),
+                ));
+            }
+            identity_record = extension[cursor..end].to_vec();
+            cursor = end;
+        } else {
+            skip_mvcc_proto_field(extension, &mut cursor, wire_type)?;
+        }
+    }
+    Ok(identity_record)
+}
+
+fn portable_string(strings: &[String], idx: u64, context: &str) -> Result<String> {
+    let idx = usize::try_from(idx).map_err(|_| {
+        Error::DatabaseSyncEngineError(format!("{context} string ref overflows usize"))
+    })?;
+    strings.get(idx).cloned().ok_or_else(|| {
+        Error::DatabaseSyncEngineError(format!("{context} references missing string {idx}"))
+    })
+}
+
+fn portable_txn_strings(txn: &PortableLogicalTxn) -> Result<Vec<String>> {
+    txn.string_table
+        .iter()
+        .map(|bytes| {
+            String::from_utf8(bytes.to_vec()).map_err(|err| {
+                Error::DatabaseSyncEngineError(format!(
+                    "portable MVCC logical-log string is not UTF-8: {err}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn portable_object_names(txn: &PortableLogicalTxn) -> Result<BTreeMap<i64, String>> {
+    let strings = portable_txn_strings(txn)?;
+    let mut names = BTreeMap::new();
+    for object in &txn.object_map {
+        names.insert(
+            object.mv_table_id,
+            portable_string(&strings, object.name_ref, "portable object map")?,
+        );
+    }
+    Ok(names)
+}
+
+fn portable_origin_client_id(txn: &PortableLogicalTxn) -> Result<String> {
+    let strings = portable_txn_strings(txn)?;
+    for meta in &txn.meta {
+        let key = portable_string(&strings, meta.key_ref, "portable metadata key")?;
+        if key == PORTABLE_TXN_META_CLIENT_KEY {
+            return portable_string(&strings, meta.value_ref, "portable metadata value");
+        }
+    }
+    Ok(String::new())
+}
+
+#[derive(Clone)]
+struct DecodedSchemaRow {
+    row_type: String,
+    name: String,
+    sql: String,
+}
+
+#[derive(Default)]
+struct SchemaRowDelta {
+    old: Option<DecodedSchemaRow>,
+    new: Option<DecodedSchemaRow>,
+}
+
+fn schema_text_value(value: &Value, field: &str) -> Result<String> {
+    match value {
+        Value::Text(text) => Ok(text.as_str().to_string()),
+        Value::Null => Ok(String::new()),
+        other => Err(Error::DatabaseSyncEngineError(format!(
+            "sqlite_schema.{field} must be text, got {other:?}"
+        ))),
+    }
+}
+
+fn schema_integer_value(value: &Value, field: &str) -> Result<i64> {
+    match value.as_int() {
+        Some(value) => Ok(value),
+        None => Err(Error::DatabaseSyncEngineError(format!(
+            "sqlite_schema.{field} must be integer, got {value:?}"
+        ))),
+    }
+}
+
+fn decode_schema_row(record: &[u8]) -> Result<DecodedSchemaRow> {
+    let values = parse_bin_record(record)?;
+    if values.len() < 5 {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "sqlite_schema record must have at least 5 columns, got {}",
+            values.len()
+        )));
+    }
+    Ok(DecodedSchemaRow {
+        row_type: schema_text_value(&values[0], "type")?,
+        name: schema_text_value(&values[1], "name")?,
+        sql: {
+            let _rootpage = schema_integer_value(&values[3], "rootpage")?;
+            schema_text_value(&values[4], "sql")?
+        },
+    })
+}
+
+fn logical_schema_kind_from_row(row: &DecodedSchemaRow) -> Result<LogicalSchemaKind> {
+    if row.row_type.eq_ignore_ascii_case("table") {
+        Ok(LogicalSchemaKind::Table)
+    } else if row.row_type.eq_ignore_ascii_case("index") {
+        Ok(LogicalSchemaKind::Index)
+    } else if row.row_type.eq_ignore_ascii_case("trigger") {
+        Ok(LogicalSchemaKind::Trigger)
+    } else if row.row_type.eq_ignore_ascii_case("view") {
+        Ok(LogicalSchemaKind::View)
+    } else {
+        Err(Error::DatabaseSyncEngineError(format!(
+            "unsupported sqlite_schema object type {}",
+            row.row_type
+        )))
+    }
+}
+
+fn schema_logical_op(row: &DecodedSchemaRow, action: LogicalSchemaAction) -> Result<LogicalOp> {
+    Ok(LogicalOp {
+        op_type: LogicalOpType::Schema as i32,
+        table_name: String::new(),
+        rowid: 0,
+        record: Bytes::new(),
+        sql: if action == LogicalSchemaAction::Drop {
+            String::new()
+        } else {
+            row.sql.clone()
+        },
+        user_version: None,
+        application_id: None,
+        schema_action: Some(action as i32),
+        schema_kind: Some(logical_schema_kind_from_row(row)? as i32),
+        schema_name: row.name.clone(),
+        stable_table_id: 0,
+    })
+}
+
+fn append_schema_ops(
+    deltas: BTreeMap<i64, SchemaRowDelta>,
+    ops: &mut Vec<LogicalOp>,
+) -> Result<()> {
+    for delta in deltas.into_values() {
+        match (delta.old, delta.new) {
+            (Some(old), Some(new)) => {
+                if is_logically_replayable_table(&old.name) {
+                    ops.push(schema_logical_op(&new, LogicalSchemaAction::Refresh)?);
+                }
+            }
+            (None, Some(new)) => {
+                if is_logically_replayable_table(&new.name) {
+                    ops.push(schema_logical_op(&new, LogicalSchemaAction::Create)?);
+                }
+            }
+            (Some(old), None) => {
+                if is_logically_replayable_table(&old.name) {
+                    ops.push(schema_logical_op(&old, LogicalSchemaAction::Drop)?);
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
+}
+
+fn decode_update_header_op(payload: &[u8]) -> Result<LogicalOp> {
+    if payload.len() < 72 || &payload[..16] != b"SQLite format 3\0" {
+        return Err(Error::DatabaseSyncEngineError(
+            "invalid MVCC UPDATE_HEADER payload".to_string(),
+        ));
+    }
+    Ok(LogicalOp {
+        op_type: LogicalOpType::UpdateHeader as i32,
+        table_name: String::new(),
+        rowid: 0,
+        record: Bytes::new(),
+        sql: String::new(),
+        user_version: Some(u32::from_be_bytes(payload[60..64].try_into().unwrap())),
+        application_id: Some(u32::from_be_bytes(payload[68..72].try_into().unwrap())),
+        schema_action: None,
+        schema_kind: None,
+        schema_name: String::new(),
+        stable_table_id: 0,
+    })
+}
+
+fn decode_recovery_ops_to_logical_txn(
+    portable_txn: PortableLogicalTxn,
+    recovery_payload: &[u8],
+    op_count: u32,
+) -> Result<LogicalTxnData> {
+    let object_names = portable_object_names(&portable_txn)?;
+    let origin_client_id = portable_origin_client_id(&portable_txn)?;
+    let mut cursor = 0usize;
+    let mut schema_deltas = BTreeMap::<i64, SchemaRowDelta>::new();
+    let mut row_ops = Vec::new();
+    let mut header_ops = Vec::new();
+
+    for _ in 0..op_count {
+        if recovery_payload.len().saturating_sub(cursor) < 6 {
+            return Err(Error::DatabaseSyncEngineError(
+                "truncated MVCC logical-log recovery op".to_string(),
+            ));
+        }
+        let tag = recovery_payload[cursor];
+        let flags = recovery_payload[cursor + 1];
+        let table_id =
+            i32::from_le_bytes(recovery_payload[cursor + 2..cursor + 6].try_into().unwrap()) as i64;
+        cursor += 6;
+        let payload_len = usize::try_from(read_mvcc_sqlite_varint(recovery_payload, &mut cursor)?)
+            .map_err(|_| {
+                Error::DatabaseSyncEngineError(
+                    "MVCC logical-log op payload length overflows usize".to_string(),
+                )
+            })?;
+        let payload_end = cursor.checked_add(payload_len).ok_or_else(|| {
+            Error::DatabaseSyncEngineError("MVCC logical-log op payload overflow".to_string())
+        })?;
+        if payload_end > recovery_payload.len() {
+            return Err(Error::DatabaseSyncEngineError(
+                "truncated MVCC logical-log op payload".to_string(),
+            ));
+        }
+        let payload = &recovery_payload[cursor..payload_end];
+        cursor = payload_end;
+        let portable_extension = if flags & MVCC_OP_FLAG_PORTABLE_EXTENSION == 0 {
+            &[][..]
+        } else {
+            let extension_len =
+                usize::try_from(read_mvcc_sqlite_varint(recovery_payload, &mut cursor)?).map_err(
+                    |_| {
+                        Error::DatabaseSyncEngineError(
+                            "MVCC logical-log op extension length overflows usize".to_string(),
+                        )
+                    },
+                )?;
+            let extension_end = cursor.checked_add(extension_len).ok_or_else(|| {
+                Error::DatabaseSyncEngineError(
+                    "MVCC logical-log op extension length overflow".to_string(),
+                )
+            })?;
+            if extension_end > recovery_payload.len() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "truncated MVCC logical-log op extension".to_string(),
+                ));
+            }
+            let extension = &recovery_payload[cursor..extension_end];
+            cursor = extension_end;
+            extension
+        };
+
+        match tag {
+            MVCC_OP_UPSERT_TABLE => {
+                let mut payload_cursor = 0usize;
+                let rowid = read_mvcc_sqlite_varint(payload, &mut payload_cursor)? as i64;
+                let record = &payload[payload_cursor..];
+                if table_id == MVCC_SQLITE_SCHEMA_TABLE_ID {
+                    schema_deltas.entry(rowid).or_default().new = Some(decode_schema_row(record)?);
+                } else if let Some(table_name) = object_names.get(&table_id) {
+                    row_ops.push(LogicalOp {
+                        op_type: LogicalOpType::UpsertRow as i32,
+                        table_name: table_name.clone(),
+                        rowid,
+                        record: Bytes::copy_from_slice(record),
+                        sql: String::new(),
+                        user_version: None,
+                        application_id: None,
+                        schema_action: None,
+                        schema_kind: None,
+                        schema_name: String::new(),
+                        stable_table_id: 0,
+                    });
+                }
+            }
+            MVCC_OP_DELETE_TABLE => {
+                let mut payload_cursor = 0usize;
+                let rowid = read_mvcc_sqlite_varint(payload, &mut payload_cursor)? as i64;
+                if table_id == MVCC_SQLITE_SCHEMA_TABLE_ID {
+                    let identity_record = decode_mvcc_delete_identity_record(portable_extension)?;
+                    if identity_record.is_empty() {
+                        return Err(Error::DatabaseSyncEngineError(
+                            "MVCC sqlite_schema delete is missing portable identity record"
+                                .to_string(),
+                        ));
+                    }
+                    schema_deltas.entry(rowid).or_default().old =
+                        Some(decode_schema_row(&identity_record)?);
+                } else if let Some(table_name) = object_names.get(&table_id) {
+                    row_ops.push(LogicalOp {
+                        op_type: LogicalOpType::DeleteRow as i32,
+                        table_name: table_name.clone(),
+                        rowid,
+                        record: Bytes::new(),
+                        sql: String::new(),
+                        user_version: None,
+                        application_id: None,
+                        schema_action: None,
+                        schema_kind: None,
+                        schema_name: String::new(),
+                        stable_table_id: 0,
+                    });
+                }
+            }
+            MVCC_OP_UPSERT_INDEX | MVCC_OP_DELETE_INDEX => {}
+            MVCC_OP_UPDATE_HEADER => {
+                header_ops.push(decode_update_header_op(payload)?);
+            }
+            other => {
+                return Err(Error::DatabaseSyncEngineError(format!(
+                    "unknown MVCC logical-log recovery op tag {other}"
+                )));
+            }
+        }
+    }
+    if cursor != recovery_payload.len() {
+        return Err(Error::DatabaseSyncEngineError(
+            "MVCC logical-log recovery payload has trailing bytes".to_string(),
+        ));
+    }
+
+    let mut ops = header_ops;
+    append_schema_ops(schema_deltas, &mut ops)?;
+    ops.extend(row_ops);
+
+    Ok(LogicalTxnData {
+        end_offset: portable_txn.end_offset,
+        commit_ts: portable_txn.commit_ts,
+        ops,
+        origin_client_id,
+    })
+}
+
+fn take_proto_message_from_bytes<T: prost::Message + Default>(
+    bytes: &mut BytesMut,
+) -> Result<Option<T>> {
+    let Some((message_length, prefix_length)) = read_varint(bytes)? else {
+        return Ok(None);
+    };
+    if message_length + prefix_length > bytes.len() {
+        return Ok(None);
+    }
+    let message = T::decode_length_delimited(&**bytes).map_err(|e| {
+        Error::DatabaseSyncEngineError(format!(
+            "unable to deserialize protobuf message from file: {e}"
+        ))
+    })?;
+    let _ = bytes.split_to(message_length + prefix_length);
+    Ok(Some(message))
+}
+
+async fn append_decoded_mvcc_frame_to_txns_file<Ctx>(
+    coro: &Coro<Ctx>,
+    txns_file: &Arc<dyn turso_core::File>,
+    txns_offset: &mut u64,
+    portable_payload: &[u8],
+    recovery_payload: &[u8],
+    op_count: u32,
+) -> Result<(usize, usize)> {
+    let mut payload_bytes = BytesMut::from(portable_payload);
+    let mut txns = 0usize;
+    let mut ops = 0usize;
+    while let Some(portable_txn) =
+        take_proto_message_from_bytes::<PortableLogicalTxn>(&mut payload_bytes)?
+    {
+        let txn = decode_recovery_ops_to_logical_txn(portable_txn, recovery_payload, op_count)?;
+        if txn.ops.is_empty() {
+            continue;
+        }
+        ops += txn.ops.len();
+        txns += 1;
+        append_file_bytes(
+            coro,
+            txns_file,
+            txns_offset,
+            &txn.encode_length_delimited_to_vec(),
+        )
+        .await?;
+    }
+    if !payload_bytes.is_empty() {
+        return Err(Error::DatabaseSyncEngineError(
+            "MVCC logical-log portable payload has trailing partial protobuf message".to_string(),
+        ));
+    }
+    Ok((txns, ops))
+}
+
+pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
+    coro: &Coro<Ctx>,
+    txns_file: &Arc<dyn turso_core::File>,
+    body: &[u8],
+    header: &PullUpdatesRespProtoBody,
+) -> Result<(usize, usize)> {
+    let Some(metadata) = header.mvcc_log.as_ref() else {
+        if body.is_empty() {
+            truncate_file(coro, txns_file).await?;
+            return Ok((0, 0));
+        }
+        return Err(Error::DatabaseSyncEngineError(
+            "raw MVCC logical-log stream is missing metadata".to_string(),
+        ));
+    };
+    if metadata.format != "lml3" {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "unsupported MVCC logical-log format {}",
+            metadata.format
+        )));
+    }
+    if metadata.ranges.is_empty() {
+        return Err(Error::DatabaseSyncEngineError(
+            "raw MVCC logical-log stream has no ranges".to_string(),
+        ));
+    }
+
+    truncate_file(coro, txns_file).await?;
+    let mut body_offset = 0usize;
+    let mut txns_offset = 0u64;
+    let mut txns = 0usize;
+    let mut ops = 0usize;
+    let mut running_crc: Option<u32> = None;
+    let mut previous_range_boundary: Option<(u64, u64)> = None;
+
+    for range in &metadata.ranges {
+        if previous_range_boundary != Some((range.generation, range.start_offset)) {
+            running_crc = None;
+        }
+        let range_len = usize::try_from(
+            range
+                .end_offset
+                .checked_sub(range.start_offset)
+                .ok_or_else(|| {
+                    Error::DatabaseSyncEngineError(format!(
+                        "invalid MVCC logical-log range {}..{}",
+                        range.start_offset, range.end_offset
+                    ))
+                })?,
+        )
+        .map_err(|_| {
+            Error::DatabaseSyncEngineError(
+                "MVCC logical-log range length overflows usize".to_string(),
+            )
+        })?;
+        let range_end = body_offset.checked_add(range_len).ok_or_else(|| {
+            Error::DatabaseSyncEngineError("MVCC logical-log range length overflow".to_string())
+        })?;
+        let range_body = body.get(body_offset..range_end).ok_or_else(|| {
+            Error::DatabaseSyncEngineError(format!(
+                "raw MVCC logical-log body is shorter than advertised range {}..{}",
+                range.start_offset, range.end_offset
+            ))
+        })?;
+        body_offset = range_end;
+
+        let mut pos = 0usize;
+        if range.starts_with_header {
+            running_crc = Some(validate_mvcc_log_header(range_body)?);
+            pos = MVCC_LOG_HEADER_SIZE;
+        } else if let Some(seed) = range.crc_seed.as_deref() {
+            running_crc = Some(decode_mvcc_log_crc_seed(seed)?);
+        } else if running_crc.is_none() {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "raw MVCC logical-log range {}..{} is missing CRC seed",
+                range.start_offset, range.end_offset
+            )));
+        }
+
+        while pos < range_body.len() {
+            let frame_start = pos;
+            if range_body.len() - pos < MVCC_TX_HEADER_SIZE + MVCC_TX_TRAILER_SIZE {
+                return Err(Error::DatabaseSyncEngineError(
+                    "truncated MVCC logical-log transaction frame".to_string(),
+                ));
+            }
+            let frame_magic = read_u32_le(range_body, pos)?;
+            let has_extension_header = frame_magic == MVCC_TX_EXT_FRAME_MAGIC;
+            if frame_magic != MVCC_TX_FRAME_MAGIC && !has_extension_header {
+                return Err(Error::DatabaseSyncEngineError(format!(
+                    "invalid MVCC logical-log transaction frame magic at range offset {frame_start}"
+                )));
+            }
+            let header_size = if has_extension_header {
+                if range_body.len() - pos < MVCC_TX_EXT_HEADER_SIZE + MVCC_TX_TRAILER_SIZE {
+                    return Err(Error::DatabaseSyncEngineError(
+                        "truncated MVCC logical-log transaction frame".to_string(),
+                    ));
+                }
+                MVCC_TX_EXT_HEADER_SIZE
+            } else {
+                MVCC_TX_HEADER_SIZE
+            };
+            let payload_size =
+                usize::try_from(read_u64_le(range_body, pos + 4)?).map_err(|_| {
+                    Error::DatabaseSyncEngineError(
+                        "MVCC logical-log recovery payload size overflows usize".to_string(),
+                    )
+                })?;
+            let op_count = read_u32_le(range_body, pos + 12)?;
+            let (extension_size, extension_record_count) = if has_extension_header {
+                let extension_size =
+                    usize::try_from(read_u64_le(range_body, pos + 24)?).map_err(|_| {
+                        Error::DatabaseSyncEngineError(
+                            "MVCC logical-log extension size overflows usize".to_string(),
+                        )
+                    })?;
+                let extension_record_count = read_u32_le(range_body, pos + 32)?;
+                let frame_flags = read_u32_le(range_body, pos + 36)?;
+                if frame_flags & !MVCC_TX_FLAG_HAS_EXTENSION_BLOCK != 0 {
+                    return Err(Error::DatabaseSyncEngineError(format!(
+                        "unsupported MVCC logical-log transaction flags {frame_flags:#x}"
+                    )));
+                }
+                if extension_size == 0 && extension_record_count != 0 {
+                    return Err(Error::DatabaseSyncEngineError(
+                        "MVCC logical-log frame has extension record count without extension block"
+                            .to_string(),
+                    ));
+                }
+                if extension_size > 0 && frame_flags & MVCC_TX_FLAG_HAS_EXTENSION_BLOCK == 0 {
+                    return Err(Error::DatabaseSyncEngineError(
+                        "MVCC logical-log frame has extension block without extension flag"
+                            .to_string(),
+                    ));
+                }
+                (extension_size, extension_record_count)
+            } else {
+                (0, 0)
+            };
+
+            let extension_start = pos.checked_add(header_size).ok_or_else(|| {
+                Error::DatabaseSyncEngineError("MVCC logical-log frame offset overflow".to_string())
+            })?;
+            let recovery_start = extension_start.checked_add(extension_size).ok_or_else(|| {
+                Error::DatabaseSyncEngineError("MVCC logical-log frame offset overflow".to_string())
+            })?;
+            let trailer_start = recovery_start.checked_add(payload_size).ok_or_else(|| {
+                Error::DatabaseSyncEngineError("MVCC logical-log frame offset overflow".to_string())
+            })?;
+            let frame_end = trailer_start
+                .checked_add(MVCC_TX_TRAILER_SIZE)
+                .ok_or_else(|| {
+                    Error::DatabaseSyncEngineError(
+                        "MVCC logical-log frame offset overflow".to_string(),
+                    )
+                })?;
+            if frame_end > range_body.len() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "truncated MVCC logical-log transaction frame".to_string(),
+                ));
+            }
+            if read_u32_le(range_body, trailer_start + 4)? != MVCC_TX_END_MAGIC {
+                return Err(Error::DatabaseSyncEngineError(
+                    "invalid MVCC logical-log transaction trailer magic".to_string(),
+                ));
+            }
+            if let Some(prev_crc) = running_crc {
+                let expected_crc =
+                    crc32c::crc32c_append(prev_crc, &range_body[frame_start..trailer_start]);
+                let stored_crc = read_u32_le(range_body, trailer_start)?;
+                if expected_crc != stored_crc {
+                    return Err(Error::DatabaseSyncEngineError(format!(
+                        "MVCC logical-log transaction checksum mismatch at range offset {frame_start}"
+                    )));
+                }
+                running_crc = Some(stored_crc);
+            }
+
+            if extension_size == 0 {
+                pos = frame_end;
+                continue;
+            }
+            let extension_block = &range_body[extension_start..recovery_start];
+            let recovery_payload = &range_body[recovery_start..trailer_start];
+            let portable_payload = find_mvcc_extension_payload(
+                extension_block,
+                extension_record_count,
+                MVCC_EXTENSION_TYPE_PORTABLE_CHANGES,
+            )?;
+            if portable_payload.is_empty() {
+                pos = frame_end;
+                continue;
+            }
+            let (frame_txns, frame_ops) = append_decoded_mvcc_frame_to_txns_file(
+                coro,
+                txns_file,
+                &mut txns_offset,
+                &portable_payload,
+                recovery_payload,
+                op_count,
+            )
+            .await?;
+            txns += frame_txns;
+            ops += frame_ops;
+            pos = frame_end;
+        }
+        previous_range_boundary = Some((range.generation, range.end_offset));
+    }
+
+    if body_offset != body.len() {
+        return Err(Error::DatabaseSyncEngineError(
+            "raw MVCC logical-log body has trailing bytes after advertised ranges".to_string(),
+        ));
+    }
+    sync_file(coro, txns_file).await?;
+    Ok((txns, ops))
+}
+
 /// Bootstrap multiple DB files from latest generation from remote
 pub async fn db_bootstrap<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
@@ -201,14 +1724,8 @@ pub async fn db_bootstrap<IO: SyncEngineIo, Ctx>(
         ctx.coro.yield_(SyncEngineIoResult::IO).await?;
     }
 
-    // sync files in the end
-    let c = Completion::new_sync(move |_| {
-        // todo(sivukhin): we need to error out in case of failed sync
-    });
-    let c = db.sync(c, FileSyncType::Fsync)?;
-    while !c.succeeded() {
-        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    // sync file in the end
+    sync_file(ctx.coro, &db).await?;
 
     let elapsed = std::time::Instant::now().duration_since(start_time);
     tracing::info!("db_bootstrap: finished: bytes={pos}, elapsed={:?}", elapsed);
@@ -289,6 +1806,181 @@ pub async fn wal_pull_to_file<IO: SyncEngineIo, Ctx>(
     }
 }
 
+/// Pulls V1 updates as either page frames or raw MVCC logical-log bytes.
+///
+/// Existing WAL sync calls this with `logical_updates=false`, which keeps the
+/// request and scratch-file format page-based. Logical callers opt in
+/// explicitly and receive decoded `LogicalTxnData` messages in `frames_file`.
+pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
+    frames_file: &Arc<dyn turso_core::File>,
+    revision: &str,
+    long_poll_timeout: Option<std::time::Duration>,
+    logical_updates: bool,
+) -> Result<(DatabasePullRevision, PullUpdatesV1Result)> {
+    tracing::info!(
+        "pull_updates_v1: remote_url={:?} revision={} logical_updates={} long_poll_timeout_ms={}",
+        ctx.remote_url,
+        revision,
+        logical_updates,
+        long_poll_timeout.map(|x| x.as_millis()).unwrap_or(0)
+    );
+    if logical_updates && ctx.remote_encryption_key.is_some() {
+        return Err(Error::DatabaseSyncEngineError(
+            "MVCC logical pull is not supported with encrypted remote databases".to_string(),
+        ));
+    }
+    let mut bytes = BytesMut::new();
+
+    let request = PullUpdatesReqProtoBody {
+        encoding: PageUpdatesEncodingReq::Raw as i32,
+        stream_kind: if logical_updates {
+            PullUpdatesStreamKind::MvccLogicalLog as i32
+        } else {
+            PullUpdatesStreamKind::Pages as i32
+        },
+        server_revision: String::new(),
+        client_revision: revision.to_string(),
+        long_poll_timeout_ms: long_poll_timeout.map(|x| x.as_millis() as u32).unwrap_or(0),
+        server_pages_selector: BytesMut::new().into(),
+        server_query_selector: String::new(),
+        client_pages: BytesMut::new().into(),
+    };
+    let request = request.encode_to_vec();
+    ctx.io.network_stats.write(request.len());
+    let completion = ctx.http(
+        "POST",
+        "/pull-updates",
+        Some(request),
+        &[
+            ("content-type", "application/protobuf"),
+            ("accept-encoding", "application/protobuf"),
+        ],
+    )?;
+    let Some(header) = wait_proto_message::<Ctx, PullUpdatesRespProtoBody>(
+        ctx.coro,
+        &completion,
+        &ctx.io.network_stats,
+        &mut bytes,
+    )
+    .await?
+    else {
+        return Err(Error::DatabaseSyncEngineError(
+            "no header returned in the pull-updates protobuf call".to_string(),
+        ));
+    };
+    tracing::info!(
+        "pull_updates_v1: got header: remote_url={:?} server_revision={} stream_kind={} apply_mode={} db_size={} raw_encoding={:?} zstd_encoding={:?} mvcc_log={:?}",
+        ctx.remote_url,
+        header.server_revision,
+        header.stream_kind,
+        header.apply_mode,
+        header.db_size,
+        header.raw_encoding,
+        header.zstd_encoding,
+        header.mvcc_log
+    );
+
+    let next_revision = DatabasePullRevision::V1 {
+        revision: header.server_revision.clone(),
+    };
+    let apply_mode = pull_updates_apply_mode(&header)?;
+    match pull_updates_stream_kind(&header)? {
+        PullUpdatesStreamKind::Pages => {
+            let replace_base = matches!(apply_mode, PullUpdatesApplyMode::ReplaceBase);
+            truncate_file(ctx.coro, frames_file).await?;
+
+            let mut offset = 0;
+            #[allow(clippy::arc_with_non_send_sync)]
+            let buffer = Arc::new(Buffer::new_temporary(WAL_FRAME_SIZE));
+
+            let mut page_data_opt = wait_proto_message::<Ctx, PageData>(
+                ctx.coro,
+                &completion,
+                &ctx.io.network_stats,
+                &mut bytes,
+            )
+            .await?;
+            while let Some(page_data) = page_data_opt.take() {
+                let page_id = page_data.page_id;
+                tracing::debug!("received page {}", page_id);
+                let page = decode_page(&header, page_data)?;
+                if page.len() != PAGE_SIZE {
+                    return Err(Error::DatabaseSyncEngineError(format!(
+                        "page has unexpected size: {} != {}",
+                        page.len(),
+                        PAGE_SIZE
+                    )));
+                }
+                buffer.as_mut_slice()[WAL_FRAME_HEADER..].copy_from_slice(&page);
+                page_data_opt =
+                    wait_proto_message(ctx.coro, &completion, &ctx.io.network_stats, &mut bytes)
+                        .await?;
+                let mut frame_info = WalFrameInfo {
+                    db_size: 0,
+                    page_no: page_id as u32 + 1,
+                };
+                if page_data_opt.is_none() {
+                    frame_info.db_size = header.db_size as u32;
+                }
+                tracing::debug!("page_data_opt: {}", page_data_opt.is_some());
+                frame_info.put_to_frame_header(buffer.as_mut_slice());
+
+                let c = Completion::new_write(move |result| {
+                    let Ok(size) = result else {
+                        return;
+                    };
+                    assert!(size as usize == WAL_FRAME_SIZE);
+                });
+
+                let c = frames_file.pwrite(offset, buffer.clone(), c)?;
+                while !c.succeeded() {
+                    ctx.coro.yield_(SyncEngineIoResult::IO).await?;
+                }
+                offset += WAL_FRAME_SIZE as u64;
+            }
+
+            sync_file(ctx.coro, frames_file).await?;
+
+            tracing::info!(
+                "pull_updates_v1: completed page stream: remote_url={:?} next_revision={:?} replace_base={}",
+                ctx.remote_url,
+                next_revision,
+                replace_base
+            );
+            Ok((next_revision, PullUpdatesV1Result::Pages { replace_base }))
+        }
+        PullUpdatesStreamKind::MvccLogicalLog => {
+            if matches!(apply_mode, PullUpdatesApplyMode::ReplaceBase) {
+                return Err(Error::DatabaseSyncEngineError(
+                    "server returned replace_base apply mode with raw MVCC logical-log stream"
+                        .to_string(),
+                ));
+            }
+            if !logical_updates {
+                return Err(Error::DatabaseSyncEngineError(
+                    "server returned a raw MVCC logical-log stream but logical_updates was not requested"
+                        .to_string(),
+                ));
+            }
+            let mut body = bytes.split().to_vec();
+            body.extend_from_slice(
+                &wait_all_results(ctx.coro, &completion, Some(&ctx.io.network_stats)).await?,
+            );
+            let (txns, ops) =
+                decode_raw_mvcc_logical_log_to_file(ctx.coro, frames_file, &body, &header).await?;
+            tracing::info!(
+                "pull_updates_v1: completed raw MVCC logical-log stream: remote_url={:?} next_revision={:?} txns={} ops={}",
+                ctx.remote_url,
+                next_revision,
+                txns,
+                ops
+            );
+            Ok((next_revision, PullUpdatesV1Result::Logical { txns, ops }))
+        }
+    }
+}
+
 /// Pull updates from remote to the separate file
 pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
@@ -301,6 +1993,7 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
 
     let request = PullUpdatesReqProtoBody {
         encoding: PageUpdatesEncodingReq::Raw as i32,
+        stream_kind: PullUpdatesStreamKind::Pages as i32,
         server_revision: String::new(),
         client_revision: revision.to_string(),
         long_poll_timeout_ms: long_poll_timeout.map(|x| x.as_millis() as u32).unwrap_or(0),
@@ -332,6 +2025,7 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
         ));
     };
     tracing::info!("wal_pull_to_file: got header={:?}", header);
+    ensure_incremental_page_stream(&header, "wal_pull_to_file_v1")?;
 
     let mut offset = 0;
     #[allow(clippy::arc_with_non_send_sync)]
@@ -383,13 +2077,7 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
         offset += WAL_FRAME_SIZE as u64;
     }
 
-    let c = Completion::new_sync(move |_| {
-        // todo(sivukhin): we need to error out in case of failed sync
-    });
-    let c = frames_file.sync(c, FileSyncType::Fsync)?;
-    while !c.succeeded() {
-        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    sync_file(ctx.coro, frames_file).await?;
 
     Ok(DatabasePullRevision::V1 {
         revision: header.server_revision,
@@ -430,6 +2118,7 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
 
     let request = PullUpdatesReqProtoBody {
         encoding: PageUpdatesEncodingReq::Raw as i32,
+        stream_kind: PullUpdatesStreamKind::Pages as i32,
         server_revision: server_revision.to_string(),
         client_revision: String::new(),
         long_poll_timeout_ms: 0,
@@ -461,6 +2150,7 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
         ));
     };
     tracing::info!("pull_pages_v1: got header={:?}", header);
+    ensure_page_stream(&header, "pull_pages_v1")?;
 
     let mut pages = Vec::with_capacity(pages.len());
 
@@ -602,13 +2292,7 @@ pub async fn wal_pull_to_file_legacy<IO: SyncEngineIo, Ctx>(
         ctx.coro.yield_(SyncEngineIoResult::IO).await?;
     }
 
-    let c = Completion::new_sync(move |_| {
-        // todo(sivukhin): we need to error out in case of failed sync
-    });
-    let c = frames_file.sync(c, FileSyncType::Fsync)?;
-    while !c.succeeded() {
-        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    sync_file(ctx.coro, frames_file).await?;
 
     Ok(revision)
 }
@@ -677,7 +2361,9 @@ pub const TURSO_SYNC_UPDATE_LAST_CHANGE_ID: &str =
 const TURSO_SYNC_SELECT_LAST_CHANGE_ID: &str =
     "SELECT pull_gen, change_id FROM turso_sync_last_change_id WHERE client_id = ?";
 
-fn convert_to_args(values: Vec<turso_core::Value>) -> Vec<server_proto::Value> {
+fn convert_to_args(
+    values: impl IntoIterator<Item = turso_core::Value>,
+) -> Vec<server_proto::Value> {
     values
         .into_iter()
         .map(|value| match value {
@@ -736,6 +2422,90 @@ pub async fn count_local_changes<Ctx>(
     Ok(count)
 }
 
+/// Rebuilds the portable logical-replay table identity map from the current
+/// local schema. This is used after page-based apply paths, where no logical
+/// schema identity operations are decoded but future logical pulls may depend
+/// on an existing map.
+pub async fn read_logical_replay_table_map<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+) -> Result<BTreeMap<u64, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT rootpage, name FROM sqlite_schema WHERE type = 'table' AND rootpage != 0",
+    )?;
+    let mut map = BTreeMap::new();
+    while let Some(row) = run_stmt_once(coro, &mut stmt).await? {
+        let rootpage = row.get_value(0).as_int().ok_or_else(|| {
+            Error::DatabaseSyncEngineError(format!(
+                "unexpected sqlite_schema.rootpage type while rebuilding logical table map: {:?}",
+                row.get_value(0)
+            ))
+        })?;
+        let name = match row.get_value(1) {
+            Value::Text(text) => text.as_str().to_string(),
+            other => {
+                return Err(Error::DatabaseSyncEngineError(format!(
+                    "unexpected sqlite_schema.name type while rebuilding logical table map: {other:?}"
+                )));
+            }
+        };
+        if rootpage != 0 && is_logically_replayable_table(&name) {
+            map.insert(rootpage.unsigned_abs(), name);
+        }
+    }
+    Ok(map)
+}
+
+pub async fn max_local_change_id<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+) -> Result<Option<i64>> {
+    let mut stmt = match conn.prepare("SELECT MAX(change_id) FROM turso_cdc") {
+        Ok(stmt) => stmt,
+        Err(LimboError::ParseError(err)) if err.contains("no such table") => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    let value = match run_stmt_expect_one_row(coro, &mut stmt).await? {
+        Some(row) => row[0].clone(),
+        None => return Ok(None),
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Numeric(turso_core::Numeric::Integer(value)) => Ok(Some(value)),
+        other => Err(Error::DatabaseSyncEngineError(format!(
+            "unexpected MAX(change_id) column type: {other:?}"
+        ))),
+    }
+}
+
+/// Read the CDC change-id sequence watermark: the first change id that is NOT
+/// yet safe for the push loop to consume.
+pub async fn read_cdc_sequence_watermark<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+    cdc_table: &str,
+) -> Result<Option<i64>> {
+    let seq_name = turso_core::schema::autoincrement_sequence_name(cdc_table);
+    let mut stmt = conn.prepare("SELECT sequence_watermark_experimental(?)")?;
+    stmt.bind_at(
+        1.try_into().unwrap(),
+        turso_core::Value::build_text(seq_name),
+    )?;
+
+    let value = match run_stmt_expect_one_row(coro, &mut stmt).await? {
+        Some(row) => row[0].clone(),
+        None => return Ok(None),
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Numeric(turso_core::Numeric::Integer(value)) => Ok(Some(value)),
+        other => Err(Error::DatabaseSyncEngineError(format!(
+            "unexpected sequence_watermark_experimental column type: {other:?}"
+        ))),
+    }
+}
+
 pub async fn update_last_change_id<Ctx>(
     coro: &Coro<Ctx>,
     conn: &Arc<turso_core::Connection>,
@@ -746,8 +2516,10 @@ pub async fn update_last_change_id<Ctx>(
     tracing::info!(
         "update_last_change_id(client_id={client_id}): pull_gen={pull_gen}, change_id={change_id}"
     );
-    conn.execute(TURSO_SYNC_CREATE_TABLE)?;
-    tracing::info!("update_last_change_id(client_id={client_id}): initialized table");
+    if !has_table(coro, conn, TURSO_SYNC_TABLE_NAME).await? {
+        ensure_sync_last_change_id_table(coro, conn, client_id).await?;
+        tracing::info!("update_last_change_id(client_id={client_id}): initialized table");
+    }
     let mut select_stmt = conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID)?;
     select_stmt.bind_at(
         1.try_into().unwrap(),
@@ -787,6 +2559,75 @@ pub async fn update_last_change_id<Ctx>(
     }
 
     Ok(())
+}
+
+/// Ensures the local high-water mark table exists and publishes schema changes.
+pub async fn ensure_sync_last_change_id_table<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+    client_id: &str,
+) -> Result<()> {
+    for attempt in 0..=2 {
+        match conn.execute(TURSO_SYNC_CREATE_TABLE) {
+            Ok(()) => {
+                conn.publish_schema_if_newer();
+                return Ok(());
+            }
+            Err(LimboError::ParseError(err)) if err.contains("already exists") => {
+                tracing::debug!(
+                    "update_last_change_id(client_id={client_id}): sync table already exists while initializing; refreshing schema"
+                );
+                conn.publish_schema_if_newer();
+                return Ok(());
+            }
+            Err(LimboError::SchemaUpdated) => {
+                tracing::debug!(
+                    "update_last_change_id(client_id={client_id}): schema updated while initializing sync table; refreshing schema"
+                );
+                force_reparse_schema_with_retry(conn)?;
+                publish_schema_after_external_restore(
+                    conn,
+                    "sync high-water mark table initialization",
+                )?;
+                if attempt == 2 {
+                    return Ok(());
+                }
+                match has_table(coro, conn, TURSO_SYNC_TABLE_NAME).await {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => continue,
+                    Err(Error::TursoError(LimboError::SchemaUpdated)) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(Error::DatabaseSyncEngineError(format!(
+        "failed to initialize sync high-water mark table after schema refresh: client_id={client_id}"
+    )))
+}
+
+fn force_reparse_schema_with_retry(conn: &Arc<turso_core::Connection>) -> Result<()> {
+    for attempt in 0..=2 {
+        match conn.force_reparse_schema() {
+            Ok(()) => return Ok(()),
+            Err(LimboError::SchemaUpdated) if attempt < 2 => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn publish_schema_after_external_restore(
+    conn: &Arc<turso_core::Connection>,
+    context: &str,
+) -> Result<()> {
+    conn.publish_schema_after_external_restore()
+        .map_err(|error| {
+            Error::DatabaseSyncEngineError(format!(
+                "failed to publish schema after {context}: {error}",
+            ))
+        })
 }
 
 pub async fn read_last_change_id<Ctx>(
@@ -917,14 +2758,30 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     source: &DatabaseTape,
     client_id: &str,
     opts: &DatabaseSyncEngineOpts,
-) -> Result<(i64, i64)> {
+) -> Result<(i64, i64, i64)> {
     tracing::info!("push_logical_changes: client_id={client_id}");
     let source_conn = connect_untracked(source)?;
 
     let (source_pull_gen, mut last_change_id) =
         fetch_last_change_id(ctx, &source_conn, client_id).await?;
+    let replay_floor_change_id = last_change_id.unwrap_or(0);
 
     tracing::debug!("push_logical_changes: last_change_id={:?}", last_change_id);
+
+    // In MVCC mode, bound the scan by the CDC sequence watermark so snapshot
+    // isolation cannot make us skip a change id that a concurrent transaction
+    // commits below the current max after we advance the push watermark. WAL mode
+    // keeps its unbounded scan (change ids there come from NewRowid, and the WAL
+    // push loop does not rely on the sequence watermark).
+    let max_change_id_exclusive = if source_conn.mvcc_enabled() {
+        let watermark =
+            read_cdc_sequence_watermark(ctx.coro, &source_conn, source.cdc_table()).await?;
+        tracing::debug!("push_logical_changes: cdc sequence watermark={watermark:?}");
+        watermark
+    } else {
+        None
+    };
+
     let replay_opts = DatabaseReplaySessionOpts {
         use_implicit_rowid: false,
     };
@@ -935,6 +2792,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         first_change_id: last_change_id.map(|x| x + 1),
         mode: DatabaseChangesIteratorMode::Apply,
         ignore_schema_changes: false,
+        max_change_id_exclusive,
         ..Default::default()
     };
 
@@ -955,14 +2813,11 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         }
 
         match operation {
-            DatabaseTapeOperation::StmtReplay(_) => {
-                panic!("changes iterator must not use StmtReplay option")
+            DatabaseTapeOperation::StmtReplay(_) | DatabaseTapeOperation::SchemaReplay(_) => {
+                panic!("changes iterator must not use replay-only operations")
             }
             DatabaseTapeOperation::RowChange(change) => {
-                if change.table_name == TURSO_SYNC_TABLE_NAME {
-                    continue;
-                }
-                if opts.tables_ignore.iter().any(|x| &change.table_name == x) {
+                if !should_push_change(&change, opts)? {
                     continue;
                 }
                 batch.push(change);
@@ -1000,7 +2855,11 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         "push_logical_changes: rows_changed={total_rows_changed}, last_change_id={:?}",
         last_change_id
     );
-    Ok((source_pull_gen, last_change_id.unwrap_or(0)))
+    Ok((
+        source_pull_gen,
+        replay_floor_change_id,
+        last_change_id.unwrap_or(0),
+    ))
 }
 
 /// Build and send a single push batch over HTTP. The caller owns the
@@ -1091,11 +2950,30 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
                 sql_over_http_requests.push(step(replay.sql, convert_to_args(replay.values)))
             }
             DatabaseRowTransformResult::Keep => {
-                let replay_info = generator.replay_info(ctx.coro, change).await?;
+                let mut replay_info = generator.replay_info(ctx.coro, change).await?;
                 // for now we try to support DDL statements which "extends" the schema (CREATE INDEX, CREATE TABLE, ALTER TABLE ADD COLUMN) and they have `IF NOT EXISTS` semantic
                 // as ALTER TABLE has no such syntax - we ignore error for such statements from remote for now
                 let is_alter_add_column =
                     replay_info.is_ddl_replay && is_alter_table_add_column(&replay_info.query);
+                if replay_info.is_ddl_replay {
+                    // the remote may already have this schema object because another
+                    // client pushed its own version of the DDL first - replay CREATE
+                    // statements with IF NOT EXISTS so the push stays idempotent.
+                    //
+                    // note that execute_ddl_idempotent() cannot be used here: it
+                    // decides what to execute by introspecting the schema through a
+                    // live local connection (table_columns_info(),
+                    // schema_object_exists()), while this path only assembles a
+                    // static batch of SQL that the remote executes in a single
+                    // /v2/pipeline round trip - there is no way to inspect the
+                    // remote schema before choosing what to send, so rewriting the
+                    // SQL text (or ignoring specific step errors, as done for ALTER
+                    // TABLE ADD COLUMN above) is the only available lever
+                    if let Some(rewritten) = rewrite_create_ddl_as_if_not_exists(&replay_info.query)
+                    {
+                        replay_info.query = rewritten;
+                    }
+                }
                 match &change.change {
                     DatabaseTapeRowChangeType::Delete { before } => {
                         let values = generator.replay_values(
@@ -1252,7 +3130,10 @@ pub async fn checkpoint_wal_file<Ctx>(
     let mut checkpoint_stmt = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
     loop {
         match checkpoint_stmt.step()? {
-            turso_core::StepResult::IO => coro.yield_(SyncEngineIoResult::IO).await?,
+            turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                // todo(sivukhin): introduce Yield result in the sync engine
+                coro.yield_(SyncEngineIoResult::IO).await?
+            }
             turso_core::StepResult::Done => break,
             turso_core::StepResult::Row => continue,
             r => {
@@ -1318,6 +3199,7 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
 ) -> Result<PullUpdatesRespProtoBody> {
     let request = PullUpdatesReqProtoBody {
         encoding: PageUpdatesEncodingReq::Raw as i32,
+        stream_kind: PullUpdatesStreamKind::Pages as i32,
         server_revision: server_revision.to_string(),
         client_revision: String::new(),
         long_poll_timeout_ms: 0,
@@ -1350,6 +3232,7 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
         ));
     };
     tracing::info!("bootstrap_db_file: got header={:?}", header);
+    ensure_page_stream(&header, "pull_chunk_into_file")?;
     if truncate_on_first_response {
         let c = Completion::new_trunc(move |result| {
             let Ok(rc) = result else {
@@ -1491,6 +3374,11 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
         }
     }
 
+    // Persist the bootstrapped DB file before the caller records this revision
+    // as durable in the metadata; otherwise a crash could leave the DB file
+    // with unflushed pages while the metadata claims a completed bootstrap.
+    sync_file(ctx.coro, &file).await?;
+
     Ok(DatabasePullRevision::V1 {
         revision: header.server_revision,
     })
@@ -1530,7 +3418,10 @@ pub async fn bootstrap_db_file_legacy<IO: SyncEngineIo, Ctx>(
         io.truncate(ctx.coro, file, 0).await?;
     }
     if let Some(file) = io.try_open(&format!("{main_db_path}-wal"))? {
-        io.truncate(ctx.coro, file, 0).await?;
+        io.truncate(ctx.coro, file.clone(), 0).await?;
+        // Make the WAL reset durable so a stale WAL can't reappear next to the
+        // freshly bootstrapped DB after a crash and get replayed onto it.
+        sync_file(ctx.coro, &file).await?;
     }
 
     let file = io.create(main_db_path)?;
@@ -1547,6 +3438,18 @@ pub async fn bootstrap_db_file_legacy<IO: SyncEngineIo, Ctx>(
         generation: db_info.current_generation,
         synced_frame_no: None,
     })
+}
+
+/// fsync the given file, yielding on the coro until the sync completion finishes.
+pub async fn sync_file<Ctx>(coro: &Coro<Ctx>, file: &Arc<dyn turso_core::File>) -> Result<()> {
+    let c = Completion::new_sync(|_| {
+        // todo(sivukhin): we need to error out in case of failed sync
+    });
+    let c = file.sync(c, FileSyncType::Fsync)?;
+    while !c.succeeded() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    Ok(())
 }
 
 pub async fn reset_wal_file<Ctx>(
@@ -1571,6 +3474,10 @@ pub async fn reset_wal_file<Ctx>(
     while !c.succeeded() {
         coro.yield_(SyncEngineIoResult::IO).await?;
     }
+    // Persist the truncation: without fsync a crash could leave stale revert
+    // frames on disk while the metadata already records the new revert
+    // watermark, which would corrupt the next rollback.
+    sync_file(coro, &wal).await?;
     Ok(())
 }
 
@@ -1647,6 +3554,30 @@ fn is_alter_table_add_column(sql: &str) -> bool {
             }
         ))
     )
+}
+
+/// Rewrite a CREATE statement with `IF NOT EXISTS` so it can be replayed on a
+/// remote which may already have the object (e.g. another client pushed its
+/// own version of the DDL first). Returns None for non-CREATE statements.
+fn rewrite_create_ddl_as_if_not_exists(sql: &str) -> Option<String> {
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+    let Some(Ok(mut ast)) = parser.next() else {
+        return None;
+    };
+    let turso_parser::ast::Cmd::Stmt(stmt) = &mut ast else {
+        return None;
+    };
+    match stmt {
+        turso_parser::ast::Stmt::CreateTable { if_not_exists, .. }
+        | turso_parser::ast::Stmt::CreateIndex { if_not_exists, .. }
+        | turso_parser::ast::Stmt::CreateTrigger { if_not_exists, .. }
+        | turso_parser::ast::Stmt::CreateMaterializedView { if_not_exists, .. }
+        | turso_parser::ast::Stmt::CreateView { if_not_exists, .. } => {
+            *if_not_exists = true;
+            Some(ast.to_string())
+        }
+        _ => None,
+    }
 }
 
 async fn wal_pull_http<IO: SyncEngineIo, Ctx>(
@@ -1849,17 +3780,41 @@ pub async fn wait_all_results<Ctx, T: Clone>(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::{
+        cell::RefCell,
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
 
     use bytes::{Bytes, BytesMut};
     use prost::Message;
+    use tempfile::NamedTempFile;
 
     use crate::{
+        client_proto::{
+            LogicalOp, LogicalOpType, LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData,
+        },
         database_sync_engine::DataStats,
-        database_sync_engine_io::{DataCompletion, DataPollResult},
-        database_sync_operations::wait_proto_message,
-        server_proto::PageData,
-        types::Coro,
+        database_sync_engine::DatabaseSyncEngineOpts,
+        database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
+        database_sync_operations::{
+            apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats,
+            ensure_incremental_page_stream, ensure_page_stream, is_logically_replayable_table,
+            logical_txn_to_tape_operations, pull_pages_v1, pull_updates_v1, should_push_change,
+            should_replay_local_change, wait_proto_message, wal_pull_to_file_v1,
+            PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
+        },
+        database_tape::{run_stmt_once, DatabaseReplaySessionOpts, DatabaseTape},
+        server_proto,
+        server_proto::{
+            PageData, PageSetRawEncodingProto, PullUpdatesApplyMode, PullUpdatesReqProtoBody,
+            PullUpdatesRespProtoBody, PullUpdatesStreamKind,
+        },
+        types::{
+            parse_bin_record, Coro, DatabasePullRevision, DatabaseRowMutation,
+            DatabaseRowTransformResult, DatabaseSchemaReplay, DatabaseTapeOperation,
+            DatabaseTapeRowChange, DatabaseTapeRowChangeType,
+        },
         Result,
     };
 
@@ -1898,6 +3853,87 @@ mod tests {
         fn is_done(&self) -> crate::Result<bool> {
             Ok(self.data.borrow().is_empty())
         }
+    }
+
+    struct TestTransformPollResult(Vec<DatabaseRowTransformResult>);
+
+    impl DataPollResult<DatabaseRowTransformResult> for TestTransformPollResult {
+        fn data(&self) -> &[DatabaseRowTransformResult] {
+            &self.0
+        }
+    }
+
+    struct TestTransformCompletion;
+
+    impl DataCompletion<DatabaseRowTransformResult> for TestTransformCompletion {
+        type DataPollResult = TestTransformPollResult;
+
+        fn status(&self) -> crate::Result<Option<u16>> {
+            Ok(Some(200))
+        }
+
+        fn poll_data(&self) -> crate::Result<Option<Self::DataPollResult>> {
+            Ok(None)
+        }
+
+        fn is_done(&self) -> crate::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[derive(Default)]
+    struct TestHttpIo {
+        response: Vec<u8>,
+        chunk: usize,
+        request: Mutex<Option<(String, String, Vec<u8>)>>,
+        headers: Mutex<Vec<(String, String)>>,
+    }
+
+    impl SyncEngineIo for TestHttpIo {
+        type DataCompletionBytes = TestCompletion;
+        type DataCompletionTransform = TestTransformCompletion;
+
+        fn full_read(&self, _path: &str) -> Result<Self::DataCompletionBytes> {
+            panic!("full_read is not used in this test")
+        }
+
+        fn full_write(&self, _path: &str, _content: Vec<u8>) -> Result<Self::DataCompletionBytes> {
+            panic!("full_write is not used in this test")
+        }
+
+        fn transform(
+            &self,
+            _mutations: Vec<DatabaseRowMutation>,
+        ) -> Result<Self::DataCompletionTransform> {
+            panic!("transform is not used in this test")
+        }
+
+        fn http(
+            &self,
+            _url: Option<&str>,
+            method: &str,
+            path: &str,
+            body: Option<Vec<u8>>,
+            headers: &[(&str, &str)],
+        ) -> Result<Self::DataCompletionBytes> {
+            self.request.lock().unwrap().replace((
+                method.to_string(),
+                path.to_string(),
+                body.unwrap_or_default(),
+            ));
+            *self.headers.lock().unwrap() = headers
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect();
+            Ok(TestCompletion {
+                data: RefCell::new(self.response.clone().into()),
+                chunk: self.chunk,
+            })
+        }
+
+        fn add_io_callback(&self, _callback: Box<dyn FnMut() -> bool + Send>) {}
+
+        fn step_io_callbacks(&self) {}
     }
 
     #[test]
@@ -1948,5 +3984,1440 @@ mod tests {
     fn test_remote_encryption_key_header_constant() {
         use super::ENCRYPTION_KEY_HEADER;
         assert_eq!(ENCRYPTION_KEY_HEADER, "x-turso-encryption-key");
+    }
+
+    /// `reset_wal_file` resets the revert WAL and then records the new revert
+    /// watermark durably in the metadata. If the truncation isn't fsynced, a
+    /// crash could leave stale revert frames on disk, so the function must issue
+    /// an fsync after truncating.
+    #[test]
+    fn test_reset_wal_file_fsyncs_truncation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        use tempfile::NamedTempFile;
+        use turso_core::{io::FileSyncType, Buffer, Completion, File, OpenFlags, IO};
+
+        use crate::database_sync_operations::reset_wal_file;
+
+        struct CountingFile {
+            inner: Arc<dyn File>,
+            syncs: Arc<AtomicUsize>,
+            truncates: Arc<AtomicUsize>,
+        }
+
+        impl File for CountingFile {
+            fn lock_file(&self, exclusive: bool) -> turso_core::Result<()> {
+                self.inner.lock_file(exclusive)
+            }
+            fn unlock_file(&self) -> turso_core::Result<()> {
+                self.inner.unlock_file()
+            }
+            fn pread(&self, pos: u64, c: Completion) -> turso_core::Result<Completion> {
+                self.inner.pread(pos, c)
+            }
+            fn pwrite(
+                &self,
+                pos: u64,
+                buffer: Arc<Buffer>,
+                c: Completion,
+            ) -> turso_core::Result<Completion> {
+                self.inner.pwrite(pos, buffer, c)
+            }
+            fn sync(
+                &self,
+                c: Completion,
+                sync_type: FileSyncType,
+            ) -> turso_core::Result<Completion> {
+                self.syncs.fetch_add(1, Ordering::SeqCst);
+                self.inner.sync(c, sync_type)
+            }
+            fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
+                self.truncates.fetch_add(1, Ordering::SeqCst);
+                self.inner.truncate(len, c)
+            }
+            fn size(&self) -> turso_core::Result<u64> {
+                self.inner.size()
+            }
+        }
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let inner = io.open_file(path, OpenFlags::Create, false).unwrap();
+
+        // make the WAL non-empty so the truncation actually has frames to drop
+        let buffer = Arc::new(Buffer::new_temporary(4096));
+        let c = inner
+            .pwrite(0, buffer.clone(), Completion::new_write(|_| {}))
+            .unwrap();
+        while !c.succeeded() {
+            io.step().unwrap();
+        }
+        assert!(inner.size().unwrap() > 0);
+
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let truncates = Arc::new(AtomicUsize::new(0));
+        let counting: Arc<dyn File> = Arc::new(CountingFile {
+            inner: inner.clone(),
+            syncs: syncs.clone(),
+            truncates: truncates.clone(),
+        });
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let counting = counting.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                reset_wal_file(&coro, counting, 0).await
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(truncates.load(Ordering::SeqCst), 1, "wal must be truncated");
+        assert!(
+            syncs.load(Ordering::SeqCst) >= 1,
+            "reset_wal_file must fsync the truncation"
+        );
+        assert_eq!(counting.size().unwrap(), 0, "wal must be truncated to zero");
+    }
+
+    fn record(values: &[turso_core::Value]) -> Bytes {
+        Bytes::from(
+            turso_core::types::ImmutableRecord::from_values(values, values.len())
+                .unwrap()
+                .into_payload(),
+        )
+    }
+
+    fn encoded_logical_txns(txns: &[LogicalTxnData]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for txn in txns {
+            bytes.extend_from_slice(&txn.encode_length_delimited_to_vec());
+        }
+        bytes
+    }
+
+    fn logical_schema_op(
+        action: LogicalSchemaAction,
+        kind: LogicalSchemaKind,
+        name: &str,
+        sql: Option<&str>,
+        stable_table_id: u64,
+    ) -> LogicalOp {
+        LogicalOp {
+            op_type: LogicalOpType::Schema as i32,
+            table_name: String::new(),
+            rowid: 0,
+            record: Bytes::new(),
+            sql: sql.unwrap_or_default().to_string(),
+            user_version: None,
+            application_id: None,
+            schema_action: Some(action as i32),
+            schema_kind: Some(kind as i32),
+            schema_name: name.to_string(),
+            stable_table_id,
+        }
+    }
+
+    fn logical_upsert_op(
+        table_name: &str,
+        stable_table_id: u64,
+        rowid: i64,
+        value: &str,
+    ) -> LogicalOp {
+        LogicalOp {
+            op_type: LogicalOpType::UpsertRow as i32,
+            table_name: table_name.to_string(),
+            rowid,
+            record: record(&[turso_core::Value::Text(turso_core::types::Text::new(
+                value.to_string(),
+            ))]),
+            sql: String::new(),
+            user_version: None,
+            application_id: None,
+            schema_action: None,
+            schema_kind: None,
+            schema_name: String::new(),
+            stable_table_id,
+        }
+    }
+
+    #[test]
+    fn max_local_change_id_reads_cdc_high_water_mark() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(io.clone(), temp_file.path().to_str().unwrap())
+            .unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                assert_eq!(
+                    super::max_local_change_id(&coro, &conn).await.unwrap(),
+                    None
+                );
+                conn.execute("CREATE TABLE t(x)").unwrap();
+                conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+                let max_change_id = super::max_local_change_id(&coro, &conn).await.unwrap();
+                assert!(max_change_id.is_some_and(|change_id| change_id > 0));
+            }
+        });
+        while let genawaiter::GeneratorState::Yielded(..) = gen.resume_with(Ok(())) {
+            io.step().unwrap()
+        }
+    }
+
+    fn write_test_varint(value: u64, out: &mut Vec<u8>) {
+        turso_core::storage::sqlite3_ondisk::write_varint_to_vec(value, out);
+    }
+
+    fn test_schema_record(op: &LogicalOp) -> Bytes {
+        let kind = LogicalSchemaKind::try_from(op.schema_kind.unwrap()).unwrap();
+        let row_type = match kind {
+            LogicalSchemaKind::Unspecified => panic!("test schema kind must be specified"),
+            LogicalSchemaKind::Table => "table",
+            LogicalSchemaKind::Index => "index",
+            LogicalSchemaKind::Trigger => "trigger",
+            LogicalSchemaKind::View => "view",
+        };
+        let rootpage = if op.stable_table_id == 0 {
+            2
+        } else {
+            op.stable_table_id as i64
+        };
+        record(&[
+            turso_core::Value::build_text(row_type),
+            turso_core::Value::Text(turso_core::types::Text::new(op.schema_name.clone())),
+            turso_core::Value::Text(turso_core::types::Text::new(op.schema_name.clone())),
+            turso_core::Value::from_i64(rootpage),
+            turso_core::Value::Text(turso_core::types::Text::new(op.sql.clone())),
+        ])
+    }
+
+    fn append_test_table_upsert(
+        recovery_payload: &mut Vec<u8>,
+        table_id: i64,
+        rowid: i64,
+        record: &[u8],
+    ) {
+        let mut payload = Vec::new();
+        write_test_varint(rowid as u64, &mut payload);
+        payload.extend_from_slice(record);
+        recovery_payload.push(super::MVCC_OP_UPSERT_TABLE);
+        recovery_payload.push(0);
+        recovery_payload.extend_from_slice(&(table_id as i32).to_le_bytes());
+        write_test_varint(payload.len() as u64, recovery_payload);
+        recovery_payload.extend_from_slice(&payload);
+    }
+
+    fn raw_mvcc_log_frame_from_payloads(
+        commit_ts: u64,
+        portable_payload: &[u8],
+        recovery_payload: &[u8],
+        op_count: u32,
+    ) -> Vec<u8> {
+        let mut extension_block = Vec::new();
+        extension_block
+            .extend_from_slice(&super::MVCC_EXTENSION_TYPE_PORTABLE_CHANGES.to_le_bytes());
+        extension_block.extend_from_slice(&0u16.to_le_bytes());
+        extension_block.extend_from_slice(&(portable_payload.len() as u32).to_le_bytes());
+        extension_block.extend_from_slice(portable_payload);
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&super::MVCC_TX_EXT_FRAME_MAGIC.to_le_bytes());
+        frame.extend_from_slice(&(recovery_payload.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&op_count.to_le_bytes());
+        frame.extend_from_slice(&commit_ts.to_le_bytes());
+        frame.extend_from_slice(&(extension_block.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&1u32.to_le_bytes());
+        frame.extend_from_slice(&super::MVCC_TX_FLAG_HAS_EXTENSION_BLOCK.to_le_bytes());
+        frame.extend_from_slice(&extension_block);
+        frame.extend_from_slice(recovery_payload);
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.extend_from_slice(&super::MVCC_TX_END_MAGIC.to_le_bytes());
+        frame
+    }
+
+    fn raw_mvcc_log_header(salt: u64) -> Vec<u8> {
+        let mut header = vec![0u8; super::MVCC_LOG_HEADER_SIZE];
+        header[0..4].copy_from_slice(&super::MVCC_LOG_MAGIC.to_le_bytes());
+        header[4] = super::MVCC_LOG_VERSION;
+        header[6..8].copy_from_slice(&(super::MVCC_LOG_HEADER_SIZE as u16).to_le_bytes());
+        header[8..16].copy_from_slice(&salt.to_le_bytes());
+        let crc = crc32c::crc32c(&header);
+        header[super::MVCC_LOG_HEADER_CRC_START..super::MVCC_LOG_HEADER_SIZE]
+            .copy_from_slice(&crc.to_le_bytes());
+        header
+    }
+
+    fn raw_mvcc_log_frame_with_crc(
+        commit_ts: u64,
+        portable_payload: &[u8],
+        recovery_payload: &[u8],
+        op_count: u32,
+        previous_crc: u32,
+    ) -> (Vec<u8>, u32) {
+        let mut frame = raw_mvcc_log_frame_from_payloads(
+            commit_ts,
+            portable_payload,
+            recovery_payload,
+            op_count,
+        );
+        let trailer_start = frame.len() - super::MVCC_TX_TRAILER_SIZE;
+        let crc = crc32c::crc32c_append(previous_crc, &frame[..trailer_start]);
+        frame[trailer_start..trailer_start + 4].copy_from_slice(&crc.to_le_bytes());
+        (frame, crc)
+    }
+
+    fn decode_raw_mvcc_log_for_test(
+        header: PullUpdatesRespProtoBody,
+        body: Vec<u8>,
+    ) -> Result<Vec<LogicalTxnData>> {
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_owned();
+        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let file = core_io
+            .open_file(path.to_str().unwrap(), turso_core::OpenFlags::Create, false)
+            .unwrap();
+        let mut gen = genawaiter::sync::Gen::new({
+            let file = file.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                super::decode_raw_mvcc_logical_log_to_file(&coro, &file, &body, &header).await?;
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => {
+                    result?;
+                    break;
+                }
+            }
+        }
+
+        let mut bytes = BytesMut::from(std::fs::read(path).unwrap().as_slice());
+        let mut txns = Vec::new();
+        while let Some(txn) = super::take_proto_message_from_bytes::<LogicalTxnData>(&mut bytes)? {
+            txns.push(txn);
+        }
+        Ok(txns)
+    }
+
+    fn read_logical_txns_from_path(path: &std::path::Path) -> Result<Vec<LogicalTxnData>> {
+        let mut bytes = BytesMut::from(std::fs::read(path).unwrap().as_slice());
+        let mut txns = Vec::new();
+        while let Some(txn) = super::take_proto_message_from_bytes::<LogicalTxnData>(&mut bytes)? {
+            txns.push(txn);
+        }
+        Ok(txns)
+    }
+
+    #[test]
+    fn raw_mvcc_log_decoder_decodes_portable_schema_and_row_ops() {
+        let table_id = -42;
+        let schema = logical_schema_op(
+            LogicalSchemaAction::Create,
+            LogicalSchemaKind::Table,
+            "t",
+            Some("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)"),
+            0,
+        );
+        let schema_record = test_schema_record(&schema);
+        let row_record = record(&[
+            turso_core::Value::from_i64(1),
+            turso_core::Value::build_text("one"),
+        ]);
+        let portable_txn = super::PortableLogicalTxn {
+            end_offset: 104,
+            commit_ts: 77,
+            string_table: vec![
+                Bytes::from_static(b"t"),
+                Bytes::from_static(super::PORTABLE_TXN_META_CLIENT_KEY.as_bytes()),
+                Bytes::from_static(b"client-a"),
+            ],
+            object_map: vec![super::PortableObjectMap {
+                mv_table_id: table_id,
+                name_ref: 0,
+            }],
+            meta: vec![super::PortableMeta {
+                key_ref: 1,
+                value_ref: 2,
+            }],
+        };
+        let portable_payload = portable_txn.encode_length_delimited_to_vec();
+        let mut recovery_payload = Vec::new();
+        append_test_table_upsert(
+            &mut recovery_payload,
+            super::MVCC_SQLITE_SCHEMA_TABLE_ID,
+            1,
+            &schema_record,
+        );
+        append_test_table_upsert(&mut recovery_payload, table_id, 1, &row_record);
+
+        let salt = 0x0123_4567_89ab_cdefu64;
+        let log_header = raw_mvcc_log_header(salt);
+        let initial_crc = crc32c::crc32c(&salt.to_le_bytes());
+        let (frame, _) =
+            raw_mvcc_log_frame_with_crc(77, &portable_payload, &recovery_payload, 2, initial_crc);
+        let end_offset = (log_header.len() + frame.len()) as u64;
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g1:o{end_offset}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: 0,
+                    end_offset,
+                    starts_with_header: true,
+                    crc_seed: None,
+                }],
+            }),
+        };
+        let mut body = log_header;
+        body.extend_from_slice(&frame);
+
+        let txns = decode_raw_mvcc_log_for_test(header, body).unwrap();
+        assert_eq!(txns.len(), 1);
+        assert_eq!(txns[0].end_offset, 104);
+        assert_eq!(txns[0].commit_ts, 77);
+        assert_eq!(txns[0].origin_client_id, "client-a");
+        assert_eq!(txns[0].ops.len(), 2);
+        assert_eq!(txns[0].ops[0].op_type, LogicalOpType::Schema as i32);
+        assert_eq!(txns[0].ops[0].schema_name, "t");
+        assert_eq!(txns[0].ops[0].stable_table_id, 0);
+        assert_eq!(txns[0].ops[1].op_type, LogicalOpType::UpsertRow as i32);
+        assert_eq!(txns[0].ops[1].table_name, "t");
+        assert_eq!(txns[0].ops[1].rowid, 1);
+        assert_eq!(txns[0].ops[1].record, row_record);
+    }
+
+    #[test]
+    fn pull_updates_v1_decodes_raw_mvcc_log_stream() {
+        let table_id = -42;
+        let record = record(&[turso_core::Value::build_text("logical")]);
+        let expected_txn = LogicalTxnData {
+            end_offset: 104,
+            commit_ts: 77,
+            origin_client_id: String::new(),
+            ops: vec![LogicalOp {
+                op_type: LogicalOpType::UpsertRow as i32,
+                table_name: "t".to_string(),
+                rowid: 7,
+                record: record.clone(),
+                sql: String::new(),
+                user_version: None,
+                application_id: None,
+                schema_action: None,
+                schema_kind: None,
+                schema_name: String::new(),
+                stable_table_id: 0,
+            }],
+        };
+        let portable_txn = super::PortableLogicalTxn {
+            end_offset: expected_txn.end_offset,
+            commit_ts: expected_txn.commit_ts,
+            string_table: vec![Bytes::from_static(b"t")],
+            object_map: vec![super::PortableObjectMap {
+                mv_table_id: table_id,
+                name_ref: 0,
+            }],
+            meta: Vec::new(),
+        };
+        let portable_payload = portable_txn.encode_length_delimited_to_vec();
+        let mut recovery_payload = Vec::new();
+        append_test_table_upsert(&mut recovery_payload, table_id, 7, &record);
+        let crc_seed = crc32c::crc32c(&1234u64.to_le_bytes());
+        let (raw_frame, _) =
+            raw_mvcc_log_frame_with_crc(77, &portable_payload, &recovery_payload, 1, crc_seed);
+        let range_start = super::MVCC_LOG_HEADER_SIZE as u64;
+        let range_end = range_start + raw_frame.len() as u64;
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g1:o{range_end}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: range_start,
+                    end_offset: range_end,
+                    starts_with_header: false,
+                    crc_seed: Some(crc_seed.to_le_bytes().to_vec()),
+                }],
+            }),
+        };
+        let mut response = Vec::new();
+        response.extend_from_slice(&header.encode_length_delimited_to_vec());
+        response.extend_from_slice(&raw_frame);
+
+        let io = Arc::new(TestHttpIo {
+            response,
+            chunk: 7,
+            request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
+        });
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_owned();
+        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let file = core_io
+            .open_file(path.to_str().unwrap(), turso_core::OpenFlags::Create, false)
+            .unwrap();
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let file = file.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let stats = SyncEngineIoStats::new(io.clone());
+                let ctx = SyncOperationCtx::new(
+                    &coro,
+                    &stats,
+                    Some("https://example.com".to_string()),
+                    None,
+                );
+                let (revision, result) = pull_updates_v1(&ctx, &file, "g1:o56", None, true).await?;
+                let DatabasePullRevision::V1 { revision } = revision else {
+                    panic!("expected V1 revision");
+                };
+                assert_eq!(revision, format!("g1:o{range_end}"));
+                assert_eq!(result, PullUpdatesV1Result::Logical { txns: 1, ops: 1 });
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            read_logical_txns_from_path(&path).unwrap(),
+            vec![expected_txn]
+        );
+        let request = io.request.lock().unwrap().clone().unwrap();
+        let req = PullUpdatesReqProtoBody::decode(request.2.as_slice()).unwrap();
+        assert_eq!(
+            req.stream_kind,
+            PullUpdatesStreamKind::MvccLogicalLog as i32
+        );
+    }
+
+    #[test]
+    fn pull_updates_v1_accepts_page_stream_when_logical_pull_is_requested() {
+        let page = vec![7u8; super::PAGE_SIZE];
+        let header = PullUpdatesRespProtoBody {
+            server_revision: "g1:o45".to_string(),
+            db_size: 1,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: None,
+        };
+        let page_data = PageData {
+            page_id: 0,
+            encoded_page: page.clone().into(),
+        };
+        let mut response = Vec::new();
+        response.extend_from_slice(&header.encode_length_delimited_to_vec());
+        response.extend_from_slice(&page_data.encode_length_delimited_to_vec());
+
+        let io = Arc::new(TestHttpIo {
+            response,
+            chunk: 11,
+            request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
+        });
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_owned();
+        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let file = core_io
+            .open_file(path.to_str().unwrap(), turso_core::OpenFlags::Create, false)
+            .unwrap();
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let file = file.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let stats = SyncEngineIoStats::new(io.clone());
+                let ctx = SyncOperationCtx::new(
+                    &coro,
+                    &stats,
+                    Some("https://example.com".to_string()),
+                    None,
+                );
+                let (revision, result) = pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
+                let DatabasePullRevision::V1 { revision } = revision else {
+                    panic!("expected V1 revision");
+                };
+                assert_eq!(revision, "g1:o45");
+                assert_eq!(
+                    result,
+                    PullUpdatesV1Result::Pages {
+                        replace_base: false
+                    }
+                );
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes.len(), super::WAL_FRAME_SIZE);
+        let info =
+            turso_core::types::WalFrameInfo::from_frame_header(&bytes[..super::WAL_FRAME_HEADER]);
+        assert_eq!(info.page_no, 1);
+        assert_eq!(info.db_size, 1);
+        assert_eq!(&bytes[super::WAL_FRAME_HEADER..], page.as_slice());
+        let request = io.request.lock().unwrap().clone().unwrap();
+        let req = PullUpdatesReqProtoBody::decode(request.2.as_slice()).unwrap();
+        assert_eq!(
+            req.stream_kind,
+            PullUpdatesStreamKind::MvccLogicalLog as i32
+        );
+    }
+
+    #[test]
+    fn pull_updates_v1_preserves_replace_base_page_fallback() {
+        let page = vec![9u8; super::PAGE_SIZE];
+        let header = PullUpdatesRespProtoBody {
+            server_revision: "g1:o80".to_string(),
+            db_size: 1,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+            apply_mode: PullUpdatesApplyMode::ReplaceBase as i32,
+            mvcc_log: None,
+        };
+        let page_data = PageData {
+            page_id: 0,
+            encoded_page: page.clone().into(),
+        };
+        let mut response = Vec::new();
+        response.extend_from_slice(&header.encode_length_delimited_to_vec());
+        response.extend_from_slice(&page_data.encode_length_delimited_to_vec());
+
+        let io = Arc::new(TestHttpIo {
+            response,
+            chunk: 13,
+            request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
+        });
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_owned();
+        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let file = core_io
+            .open_file(path.to_str().unwrap(), turso_core::OpenFlags::Create, false)
+            .unwrap();
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let file = file.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let stats = SyncEngineIoStats::new(io.clone());
+                let ctx = SyncOperationCtx::new(
+                    &coro,
+                    &stats,
+                    Some("https://example.com".to_string()),
+                    None,
+                );
+                let (revision, result) = pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
+                let DatabasePullRevision::V1 { revision } = revision else {
+                    panic!("expected V1 revision");
+                };
+                assert_eq!(revision, "g1:o80");
+                assert_eq!(result, PullUpdatesV1Result::Pages { replace_base: true });
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes.len(), super::WAL_FRAME_SIZE);
+        let info =
+            turso_core::types::WalFrameInfo::from_frame_header(&bytes[..super::WAL_FRAME_HEADER]);
+        assert_eq!(info.page_no, 1);
+        assert_eq!(info.db_size, 1);
+        assert_eq!(&bytes[super::WAL_FRAME_HEADER..], page.as_slice());
+    }
+
+    #[test]
+    fn wal_pull_to_file_v1_rejects_replace_base_page_stream() {
+        let header = PullUpdatesRespProtoBody {
+            server_revision: "g1:o80".to_string(),
+            db_size: 1,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+            apply_mode: PullUpdatesApplyMode::ReplaceBase as i32,
+            mvcc_log: None,
+        };
+        let response = header.encode_length_delimited_to_vec();
+
+        let io = Arc::new(TestHttpIo {
+            response,
+            chunk: 13,
+            request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
+        });
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_owned();
+        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let file = core_io
+            .open_file(path.to_str().unwrap(), turso_core::OpenFlags::Create, false)
+            .unwrap();
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let file = file.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let stats = SyncEngineIoStats::new(io.clone());
+                let ctx = SyncOperationCtx::new(
+                    &coro,
+                    &stats,
+                    Some("https://example.com".to_string()),
+                    None,
+                );
+                let err = wal_pull_to_file_v1(&ctx, &file, "g1:o40", None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    err.to_string().contains("replace-base page streams"),
+                    "unexpected error: {err:?}"
+                );
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(file.size().unwrap(), 0);
+        let request = io.request.lock().unwrap().clone().unwrap();
+        let req = PullUpdatesReqProtoBody::decode(request.2.as_slice()).unwrap();
+        assert_eq!(req.stream_kind, PullUpdatesStreamKind::Pages as i32);
+    }
+
+    #[test]
+    fn pull_pages_v1_accepts_replace_base_page_stream_for_revision_pinned_reads() {
+        let page = vec![11u8; super::PAGE_SIZE];
+        let header = PullUpdatesRespProtoBody {
+            server_revision: "g1:o80".to_string(),
+            db_size: 3,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+            apply_mode: PullUpdatesApplyMode::ReplaceBase as i32,
+            mvcc_log: None,
+        };
+        let page_data = PageData {
+            page_id: 2,
+            encoded_page: page.clone().into(),
+        };
+        let mut response = Vec::new();
+        response.extend_from_slice(&header.encode_length_delimited_to_vec());
+        response.extend_from_slice(&page_data.encode_length_delimited_to_vec());
+
+        let io = Arc::new(TestHttpIo {
+            response,
+            chunk: 13,
+            request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
+        });
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let stats = SyncEngineIoStats::new(io.clone());
+                let ctx = SyncOperationCtx::new(
+                    &coro,
+                    &stats,
+                    Some("https://example.com".to_string()),
+                    None,
+                );
+                let loaded = pull_pages_v1(&ctx, "g1:o40", &[2]).await?;
+                assert_eq!(loaded.db_pages, 3);
+                assert_eq!(loaded.pages.len(), 1);
+                assert_eq!(loaded.pages[0].page_id, 2);
+                assert_eq!(loaded.pages[0].page, page);
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+
+        let request = io.request.lock().unwrap().clone().unwrap();
+        let req = PullUpdatesReqProtoBody::decode(request.2.as_slice()).unwrap();
+        assert_eq!(request.0, "POST");
+        assert_eq!(request.1, "/pull-updates");
+        assert_eq!(req.stream_kind, PullUpdatesStreamKind::Pages as i32);
+        assert_eq!(req.server_revision, "g1:o40");
+        assert_eq!(req.client_revision, "");
+    }
+
+    #[test]
+    fn pull_updates_v1_rejects_remote_encryption_for_logical_pull() {
+        let io = Arc::new(TestHttpIo {
+            response: Vec::new(),
+            chunk: 32,
+            request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
+        });
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_owned();
+        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let file = core_io
+            .open_file(path.to_str().unwrap(), turso_core::OpenFlags::Create, false)
+            .unwrap();
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let file = file.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let stats = SyncEngineIoStats::new(io.clone());
+                let ctx = SyncOperationCtx::new(
+                    &coro,
+                    &stats,
+                    Some("https://example.com".to_string()),
+                    Some("dGVzdC1lbmNyeXB0aW9uLWtleQ=="),
+                );
+                let err = pull_updates_v1(&ctx, &file, "g1:o40", None, true)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    err.to_string()
+                        .contains("not supported with encrypted remote databases"),
+                    "unexpected error: {err:?}"
+                );
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+
+        assert!(io.request.lock().unwrap().is_none());
+        assert!(io.headers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn raw_mvcc_log_decoder_requires_crc_seed_for_mid_log_range() {
+        let portable_txn = super::PortableLogicalTxn {
+            end_offset: 104,
+            commit_ts: 77,
+            string_table: Vec::new(),
+            object_map: Vec::new(),
+            meta: Vec::new(),
+        };
+        let portable_payload = portable_txn.encode_length_delimited_to_vec();
+        let crc_seed = crc32c::crc32c(&1234u64.to_le_bytes());
+        let (frame, _) = raw_mvcc_log_frame_with_crc(77, &portable_payload, &[], 0, crc_seed);
+        let range_start = super::MVCC_LOG_HEADER_SIZE as u64;
+        let range_end = range_start + frame.len() as u64;
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g1:o{range_end}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: range_start,
+                    end_offset: range_end,
+                    starts_with_header: false,
+                    crc_seed: None,
+                }],
+            }),
+        };
+
+        let err = decode_raw_mvcc_log_for_test(header, frame).unwrap_err();
+        assert!(
+            err.to_string().contains("missing CRC seed"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn raw_mvcc_log_decoder_validates_header_and_frame_crc() {
+        let portable_txn = super::PortableLogicalTxn {
+            end_offset: 104,
+            commit_ts: 77,
+            string_table: Vec::new(),
+            object_map: Vec::new(),
+            meta: Vec::new(),
+        };
+        let portable_payload = portable_txn.encode_length_delimited_to_vec();
+        let salt = 0x1020_3040_5060_7080u64;
+        let mut log_header = raw_mvcc_log_header(salt);
+        let initial_crc = crc32c::crc32c(&salt.to_le_bytes());
+        let (frame, _) = raw_mvcc_log_frame_with_crc(77, &portable_payload, &[], 0, initial_crc);
+        log_header[super::MVCC_LOG_HEADER_CRC_START] ^= 0x01;
+        let end_offset = (log_header.len() + frame.len()) as u64;
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g1:o{end_offset}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: 0,
+                    end_offset,
+                    starts_with_header: true,
+                    crc_seed: None,
+                }],
+            }),
+        };
+        let mut body = log_header;
+        body.extend_from_slice(&frame);
+
+        let err = decode_raw_mvcc_log_for_test(header, body).unwrap_err();
+        assert!(
+            err.to_string().contains("header checksum mismatch"),
+            "unexpected error: {err:?}"
+        );
+
+        let log_header = raw_mvcc_log_header(salt);
+        let initial_crc = crc32c::crc32c(&salt.to_le_bytes());
+        let (mut frame, _) =
+            raw_mvcc_log_frame_with_crc(77, &portable_payload, &[], 0, initial_crc);
+        frame[super::MVCC_TX_EXT_HEADER_SIZE + super::MVCC_EXTENSION_RECORD_HEADER_SIZE] ^= 0x01;
+        let end_offset = (log_header.len() + frame.len()) as u64;
+        let header = PullUpdatesRespProtoBody {
+            server_revision: format!("g1:o{end_offset}"),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".to_string(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: 0,
+                    end_offset,
+                    starts_with_header: true,
+                    crc_seed: None,
+                }],
+            }),
+        };
+        let mut body = log_header;
+        body.extend_from_slice(&frame);
+
+        let err = decode_raw_mvcc_log_for_test(header, body).unwrap_err();
+        assert!(
+            err.to_string().contains("transaction checksum mismatch"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn logical_txn_acknowledges_client_from_origin_or_sync_metadata_row() {
+        let origin_txn = LogicalTxnData {
+            end_offset: 1,
+            commit_ts: 1,
+            origin_client_id: "client-a".to_string(),
+            ops: Vec::new(),
+        };
+        assert!(super::logical_txn_acknowledges_client(&origin_txn, "client-a").unwrap());
+        assert!(!super::logical_txn_acknowledges_client(&origin_txn, "client-b").unwrap());
+
+        let metadata_txn = LogicalTxnData {
+            end_offset: 2,
+            commit_ts: 2,
+            origin_client_id: String::new(),
+            ops: vec![LogicalOp {
+                op_type: LogicalOpType::UpsertRow as i32,
+                table_name: super::TURSO_SYNC_TABLE_NAME.to_string(),
+                rowid: 1,
+                record: record(&[
+                    turso_core::Value::Text(turso_core::types::Text::new("client-b".to_string())),
+                    turso_core::Value::from_i64(42),
+                ]),
+                sql: String::new(),
+                user_version: None,
+                application_id: None,
+                schema_action: None,
+                schema_kind: None,
+                schema_name: String::new(),
+                stable_table_id: 0,
+            }],
+        };
+        assert!(super::logical_txn_acknowledges_client(&metadata_txn, "client-b").unwrap());
+        assert!(!super::logical_txn_acknowledges_client(&metadata_txn, "client-a").unwrap());
+    }
+
+    #[test]
+    fn file_backed_logical_replay_skips_self_origin_and_keeps_table_map() {
+        let db_temp = NamedTempFile::new().unwrap();
+        let txns_temp = NamedTempFile::new().unwrap();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let txns = vec![
+            LogicalTxnData {
+                end_offset: 1,
+                commit_ts: 1,
+                origin_client_id: "client-a".to_string(),
+                ops: vec![logical_schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "local_only",
+                    Some("CREATE TABLE local_only(x TEXT)"),
+                    99,
+                )],
+            },
+            LogicalTxnData {
+                end_offset: 2,
+                commit_ts: 2,
+                origin_client_id: "remote".to_string(),
+                ops: vec![logical_schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "items",
+                    Some("CREATE TABLE items(x TEXT)"),
+                    7,
+                )],
+            },
+            LogicalTxnData {
+                end_offset: 3,
+                commit_ts: 3,
+                origin_client_id: "client-a".to_string(),
+                ops: vec![logical_upsert_op("items", 0, 1, "local")],
+            },
+            LogicalTxnData {
+                end_offset: 4,
+                commit_ts: 4,
+                origin_client_id: "remote".to_string(),
+                ops: vec![logical_upsert_op("", 7, 2, "remote")],
+            },
+            LogicalTxnData {
+                end_offset: 5,
+                commit_ts: 5,
+                origin_client_id: "client-a".to_string(),
+                ops: vec![logical_upsert_op("", 7, 2, "local-overwrite")],
+            },
+        ];
+        std::fs::write(txns_temp.path(), encoded_logical_txns(&txns)).unwrap();
+
+        let db =
+            turso_core::Database::open_file(io.clone(), db_temp.path().to_str().unwrap()).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+        let txns_file = io
+            .open_file(
+                txns_temp.path().to_str().unwrap(),
+                turso_core::OpenFlags::None,
+                false,
+            )
+            .unwrap();
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            let txns_file = txns_file.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let opts = DatabaseReplaySessionOpts {
+                    use_implicit_rowid: true,
+                };
+                let mut replay = db.start_replay_session(&coro, opts).await.unwrap();
+                let mut table_names_by_stable_id = BTreeMap::new();
+                let stats =
+                    apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
+                        &coro,
+                        &mut replay,
+                        &txns_file,
+                        "client-a",
+                        &mut table_names_by_stable_id,
+                    )
+                    .await
+                    .unwrap();
+                replay
+                    .replay(&coro, DatabaseTapeOperation::Commit)
+                    .await
+                    .unwrap();
+
+                let conn = db.connect(&coro).await.unwrap();
+                let mut stmt = conn.prepare("SELECT rowid, x FROM items").unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                (stats.touched_rows, table_names_by_stable_id, rows)
+            }
+        });
+        let (touched_rows, table_names_by_stable_id, rows) = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+
+        assert_eq!(table_names_by_stable_id.get(&7).unwrap(), "items");
+        assert!(!table_names_by_stable_id.contains_key(&99));
+        assert!(touched_rows.contains(&("items".to_string(), 2)));
+        assert!(!touched_rows.contains(&("items".to_string(), 1)));
+        assert_eq!(
+            rows,
+            vec![vec![
+                turso_core::Value::from_i64(2),
+                turso_core::Value::Text(turso_core::types::Text::new("remote".to_string())),
+            ]]
+        );
+    }
+
+    #[test]
+    fn logical_txn_to_tape_operations_maps_schema_and_stable_table_rows() {
+        let txn = LogicalTxnData {
+            end_offset: 128,
+            commit_ts: 77,
+            origin_client_id: String::new(),
+            ops: vec![
+                logical_schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "items",
+                    Some("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)"),
+                    9,
+                ),
+                LogicalOp {
+                    op_type: LogicalOpType::UpsertRow as i32,
+                    table_name: String::new(),
+                    rowid: 1,
+                    record: record(&[
+                        turso_core::Value::from_i64(1),
+                        turso_core::Value::build_text("alpha"),
+                    ]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                    schema_action: None,
+                    schema_kind: None,
+                    schema_name: String::new(),
+                    stable_table_id: 9,
+                },
+            ],
+        };
+
+        let operations = logical_txn_to_tape_operations(&txn).unwrap();
+        assert_eq!(operations.len(), 2);
+        assert!(matches!(
+            &operations[0],
+            DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Create { sql })
+                if sql.contains("CREATE TABLE items")
+        ));
+        match &operations[1] {
+            DatabaseTapeOperation::RowChange(change) => {
+                assert_eq!(change.table_name, "items");
+                assert_eq!(change.id, 1);
+                assert_eq!(change.change_time, 77);
+                assert!(matches!(
+                    change.change,
+                    DatabaseTapeRowChangeType::Insert { .. }
+                ));
+            }
+            other => panic!("expected row change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logical_txn_to_tape_operations_filters_internal_tables() {
+        assert!(!is_logically_replayable_table("turso_sync_last_change_id"));
+        assert!(!is_logically_replayable_table("turso_cdc"));
+        assert!(!is_logically_replayable_table("sqlite_sequence"));
+        assert!(!is_logically_replayable_table("__turso_internal_mvcc_meta"));
+
+        let txn = LogicalTxnData {
+            end_offset: 128,
+            commit_ts: 77,
+            origin_client_id: String::new(),
+            ops: vec![logical_schema_op(
+                LogicalSchemaAction::Create,
+                LogicalSchemaKind::Table,
+                "turso_sync_last_change_id",
+                Some("CREATE TABLE turso_sync_last_change_id(client_id TEXT PRIMARY KEY)"),
+                1,
+            )],
+        };
+
+        let operations = logical_txn_to_tape_operations(&txn).unwrap();
+        assert!(operations.is_empty());
+    }
+
+    #[test]
+    fn push_change_filter_skips_internal_sqlite_schema_objects() {
+        let opts = DatabaseSyncEngineOpts {
+            remote_url: None,
+            client_name: "test-client".to_string(),
+            tables_ignore: Vec::new(),
+            use_transform: false,
+            wal_pull_batch_size: 0,
+            long_poll_timeout: None,
+            protocol_version_hint: crate::types::DatabaseSyncEngineProtocolVersion::V1,
+            bootstrap_if_empty: false,
+            reserved_bytes: 0,
+            db_opts: turso_core::DatabaseOpts::default(),
+            partial_sync_opts: None,
+            remote_encryption_key: None,
+            push_operations_threshold: None,
+            pull_bytes_threshold: None,
+            logical_mvcc_pull: true,
+        };
+        let internal_schema_change = DatabaseTapeRowChange {
+            change_id: 1,
+            change_time: 77,
+            table_name: "sqlite_schema".to_string(),
+            id: 1,
+            change: DatabaseTapeRowChangeType::Insert {
+                after: parse_bin_record(record(&[
+                    turso_core::Value::build_text("table"),
+                    turso_core::Value::build_text("__turso_internal_mvcc_meta"),
+                    turso_core::Value::build_text("__turso_internal_mvcc_meta"),
+                    turso_core::Value::from_i64(42),
+                    turso_core::Value::build_text(
+                        "CREATE TABLE __turso_internal_mvcc_meta(k TEXT, v INTEGER)",
+                    ),
+                ]))
+                .unwrap(),
+            },
+        };
+        let user_schema_change = DatabaseTapeRowChange {
+            change_id: 2,
+            change_time: 77,
+            table_name: "sqlite_schema".to_string(),
+            id: 2,
+            change: DatabaseTapeRowChangeType::Insert {
+                after: parse_bin_record(record(&[
+                    turso_core::Value::build_text("table"),
+                    turso_core::Value::build_text("items"),
+                    turso_core::Value::build_text("items"),
+                    turso_core::Value::from_i64(43),
+                    turso_core::Value::build_text("CREATE TABLE items(id INTEGER PRIMARY KEY)"),
+                ]))
+                .unwrap(),
+            },
+        };
+
+        assert!(!should_push_change(&internal_schema_change, &opts).unwrap());
+        assert!(should_push_change(&user_schema_change, &opts).unwrap());
+        assert!(!should_replay_local_change(&internal_schema_change).unwrap());
+        assert!(should_replay_local_change(&user_schema_change).unwrap());
+
+        let rootpage_only_schema_update = DatabaseTapeRowChange {
+            change_id: 3,
+            change_time: 77,
+            table_name: "sqlite_schema".to_string(),
+            id: 2,
+            change: DatabaseTapeRowChangeType::Update {
+                before: Vec::new(),
+                after: parse_bin_record(record(&[
+                    turso_core::Value::build_text("table"),
+                    turso_core::Value::build_text("items"),
+                    turso_core::Value::build_text("items"),
+                    turso_core::Value::from_i64(44),
+                    turso_core::Value::build_text("CREATE TABLE items(id INTEGER PRIMARY KEY)"),
+                ]))
+                .unwrap(),
+                updates: Some(
+                    parse_bin_record(record(&[
+                        turso_core::Value::from_i64(0),
+                        turso_core::Value::from_i64(0),
+                        turso_core::Value::from_i64(0),
+                        turso_core::Value::from_i64(1),
+                        turso_core::Value::from_i64(0),
+                        turso_core::Value::Null,
+                        turso_core::Value::Null,
+                        turso_core::Value::Null,
+                        turso_core::Value::from_i64(44),
+                        turso_core::Value::Null,
+                    ]))
+                    .unwrap(),
+                ),
+            },
+        };
+
+        assert!(!should_push_change(&rootpage_only_schema_update, &opts).unwrap());
+        assert!(!should_replay_local_change(&rootpage_only_schema_update).unwrap());
+    }
+
+    fn page_header(stream_kind: i32, apply_mode: i32) -> PullUpdatesRespProtoBody {
+        PullUpdatesRespProtoBody {
+            server_revision: "rev".to_string(),
+            db_size: 1,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind,
+            apply_mode,
+            mvcc_log: None,
+        }
+    }
+
+    #[test]
+    fn ensure_page_stream_accepts_default_page_header() {
+        ensure_page_stream(
+            &page_header(
+                PullUpdatesStreamKind::Pages as i32,
+                PullUpdatesApplyMode::Incremental as i32,
+            ),
+            "test",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn ensure_incremental_page_stream_rejects_replace_base() {
+        ensure_page_stream(
+            &page_header(
+                PullUpdatesStreamKind::Pages as i32,
+                PullUpdatesApplyMode::ReplaceBase as i32,
+            ),
+            "test",
+        )
+        .unwrap();
+        let err = ensure_incremental_page_stream(
+            &page_header(
+                PullUpdatesStreamKind::Pages as i32,
+                PullUpdatesApplyMode::ReplaceBase as i32,
+            ),
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("replace-base page streams"));
+    }
+
+    #[test]
+    fn ensure_page_stream_rejects_logical_log_header() {
+        let err = ensure_page_stream(
+            &page_header(
+                PullUpdatesStreamKind::MvccLogicalLog as i32,
+                PullUpdatesApplyMode::Incremental as i32,
+            ),
+            "test",
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not support raw MVCC logical-log"));
+    }
+
+    #[test]
+    fn ensure_page_stream_rejects_unknown_enums() {
+        let err = ensure_page_stream(
+            &page_header(99, PullUpdatesApplyMode::Incremental as i32),
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown pull-updates stream kind"));
+
+        let err = ensure_page_stream(
+            &page_header(PullUpdatesStreamKind::Pages as i32, 99),
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown pull-updates apply mode"));
+    }
+
+    /// Pushed DDL is replayed verbatim on the remote, where the same object may
+    /// already exist because another client pushed its own version of the DDL
+    /// first. CREATE statements must be rewritten with IF NOT EXISTS so the
+    /// remote replay stays idempotent instead of failing with "already exists".
+    #[test]
+    pub fn test_pushed_create_ddl_is_rewritten_as_if_not_exists() {
+        let rewritten =
+            super::rewrite_create_ddl_as_if_not_exists("CREATE TABLE q (x, y, z)").unwrap();
+        assert!(
+            rewritten.contains("IF NOT EXISTS"),
+            "unexpected rewrite: {rewritten}"
+        );
+        let rewritten =
+            super::rewrite_create_ddl_as_if_not_exists("CREATE INDEX q_x ON q (x)").unwrap();
+        assert!(
+            rewritten.contains("IF NOT EXISTS"),
+            "unexpected rewrite: {rewritten}"
+        );
+    }
+
+    #[test]
+    pub fn test_non_create_ddl_is_not_rewritten() {
+        assert!(super::rewrite_create_ddl_as_if_not_exists("ALTER TABLE q ADD COLUMN w").is_none());
+        assert!(super::rewrite_create_ddl_as_if_not_exists("DROP TABLE q").is_none());
+        assert!(super::rewrite_create_ddl_as_if_not_exists("not valid sql").is_none());
     }
 }

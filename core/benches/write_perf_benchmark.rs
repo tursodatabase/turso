@@ -51,7 +51,7 @@ fn run_to_completion(
 ) -> turso_core::Result<()> {
     loop {
         match stmt.step()? {
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 db.io.step()?;
             }
             StepResult::Done => break,
@@ -112,6 +112,7 @@ fn setup_rusqlite(temp_dir: &TempDir, schema: &str) -> rusqlite::Connection {
 /// 1. Seek operations for uniqueness checks
 /// 2. Additional B-tree insertions
 /// 3. Page splits on index pages
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_index_impact(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -209,6 +210,7 @@ fn bench_index_impact(criterion: &mut Criterion) {
 ///
 /// Measures how the number of rows per transaction affects throughput.
 /// Larger transactions amortize commit overhead but increase memory pressure.
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_transaction_size(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -298,6 +300,7 @@ fn bench_transaction_size(criterion: &mut Criterion) {
 /// 1. Balance quick path can be used (appending to rightmost leaf)
 /// 2. Better cache locality
 /// 3. Fewer page splits
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_key_pattern(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -437,6 +440,7 @@ fn bench_key_pattern(criterion: &mut Criterion) {
 /// 1. Required seek to find existing row
 /// 2. Potential in-place update vs delete+insert
 /// 3. Index maintenance on modified columns
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_update_performance(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -514,6 +518,7 @@ fn bench_update_performance(criterion: &mut Criterion) {
 /// Benchmark: DELETE performance
 ///
 /// Measures DELETE throughput with different patterns
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_delete_performance(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -602,7 +607,8 @@ fn bench_delete_performance(criterion: &mut Criterion) {
 
 /// Benchmark: Large transaction commit (many dirty pages)
 ///
-/// Specifically targets the commit_dirty_pages path with many pages
+/// Specifically targets the commit_wal path with many pages
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_large_transaction_commit(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
@@ -703,6 +709,7 @@ fn bench_large_transaction_commit(criterion: &mut Criterion) {
 /// Benchmark: Fsync overhead isolation
 ///
 /// Compares INSERT performance with sync=FULL vs sync=OFF to isolate fsync cost
+#[turso_macros::codspeed_criterion_benchmark]
 fn bench_fsync_overhead(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");

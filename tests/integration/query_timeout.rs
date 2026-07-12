@@ -6,7 +6,7 @@ fn run_until_terminal(stmt: &mut turso_core::Statement) -> turso_core::Result<St
     loop {
         match stmt.step()? {
             StepResult::IO => stmt._io().step()?,
-            StepResult::Row => continue,
+            StepResult::Row | StepResult::Yield => continue,
             result => return Ok(result),
         }
     }

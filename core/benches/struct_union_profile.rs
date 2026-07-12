@@ -24,7 +24,7 @@ fn execute(db: &Database, conn: &Arc<turso_core::Connection>, sql: &str) {
     loop {
         match stmt.step().unwrap() {
             StepResult::Row => {}
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 db.io.step().unwrap();
             }
             StepResult::Done => break,
@@ -39,7 +39,7 @@ fn run_scan(db: &Database, stmt: &mut turso_core::Statement) {
             StepResult::Row => {
                 std::hint::black_box(stmt.row());
             }
-            StepResult::IO => {
+            StepResult::IO | StepResult::Yield => {
                 db.io.step().unwrap();
             }
             StepResult::Done => break,
