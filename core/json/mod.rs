@@ -78,8 +78,8 @@ pub fn jsonb(json_value: &Value, cache: &JsonCacheCell) -> crate::Result<Value> 
     }
 }
 
-pub fn convert_dbtype_to_raw_jsonb(data: &Value) -> crate::Result<Vec<u8>> {
-    let json = convert_dbtype_to_jsonb(data, Conv::NotStrict)?;
+pub fn convert_dbtype_to_raw_jsonb(data: &Value, strict: Conv) -> crate::Result<Vec<u8>> {
+    let json = convert_dbtype_to_jsonb(data, strict)?;
     Ok(json.data())
 }
 
@@ -189,6 +189,11 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
         ValueRef::Null => Ok(Jsonb::from_raw_data(
             JsonbHeader::make_null().into_bytes().as_bytes(),
         )),
+        ValueRef::Numeric(numeric) if matches!(strict, Conv::ToString) => {
+            let text = Value::from(numeric).to_string();
+            Jsonb::from_str_with_mode(&text, strict)
+                .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+        }
         ValueRef::Numeric(Numeric::Float(float)) => {
             let float: f64 = float.into();
             // Handle infinity for JSON compatibility with SQLite (#4196)
