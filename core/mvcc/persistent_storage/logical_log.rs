@@ -264,10 +264,29 @@ use serializer::{
 /// Default to the size of 1000 SQLite WAL frames; disable by setting a negative value.
 pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = 4120 * 1000;
 
+/// Chain state of a serialized logical-log frame, delivered to
+/// [`OnSerializationComplete`] observers.
+///
+/// `start_crc32c` is the committed running CRC immediately before this frame
+/// (the chain seed for the frame), and `end_crc32c` is the running CRC after
+/// it. For a deferred write these describe the *pending* chain position: the
+/// log's own running CRC only advances to `end_crc32c` once the commit is
+/// accepted via `advance_offset_after_success`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogTxFrameInfo {
+    /// Writer offset of the frame's first byte (the log's `offset` before this
+    /// write; includes the 56-byte log-header region for the first write).
+    pub logical_start_offset: u64,
+    /// Committed running CRC immediately before this frame.
+    pub start_crc32c: u32,
+    /// Running CRC after this frame (equals the frame's trailer CRC).
+    pub end_crc32c: u32,
+}
+
 /// Optional callback invoked after serialization with shared ownership of the
-/// serialized frame bytes and the running CRC, before the disk write.
+/// serialized frame bytes and the frame's chain state, before the disk write.
 pub type OnSerializationComplete<'a> =
-    Option<&'a dyn Fn(SharedBufferData, u32) -> crate::Result<()>>;
+    Option<&'a dyn Fn(SharedBufferData, LogTxFrameInfo) -> crate::Result<()>>;
 
 const LOG_MAGIC: u32 = 0x4C4D4C32; // "LML2" in LE
 const LOG_VERSION_V2: u8 = 2;
@@ -808,7 +827,17 @@ impl LogicalLog {
             SharedBufferData::new_view(raw, LOG_HDR_SIZE)
         };
         if let Some(cb) = on_serialization_complete {
-            cb(shared.clone(), crc)?;
+            // `self.running_crc` has not been touched yet in this write: it is
+            // still the committed pre-frame chain value (seeded from the salt
+            // above on first write), so it is the frame's start CRC.
+            cb(
+                shared.clone(),
+                LogTxFrameInfo {
+                    logical_start_offset: self.offset,
+                    start_crc32c: self.running_crc,
+                    end_crc32c: crc,
+                },
+            )?;
         }
 
         // 7. Hand off `tx.buf` to the I/O layer without copying. For
@@ -879,8 +908,8 @@ impl LogicalLog {
     /// `advance_offset_after_success(bytes)` after confirming the commit succeeded.
     ///
     /// If `on_serialization_complete` is provided, it is called with shared
-    /// ownership of the framed bytes and the running CRC after framing but
-    /// before the disk write.
+    /// ownership of the framed bytes and the frame's [`LogTxFrameInfo`] chain
+    /// state after framing but before the disk write.
     pub fn log_tx_deferred_offset(
         &mut self,
         tx: LogRecord,
@@ -3705,12 +3734,13 @@ mod tests {
     };
 
     use super::{
-        build_encrypted_chunk_aad, encrypted_chunk_blob_size, encrypted_chunk_plaintext_len,
-        encrypted_payload_blob_size, encrypted_payload_chunk_count, HeaderReadResult, LogHeader,
-        LogSerializer, LogicalLog, ParseResult, ParsedOp, StreamingLogicalLogReader,
-        ENCRYPTED_CHUNK_AAD_SIZE, ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, EXT_FRAME_MAGIC,
-        FRAME_MAGIC, LOG_HDR_CRC_START, LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION,
-        LOG_VERSION_V2, TX_EXT_HEADER_SIZE, TX_HEADER_SIZE, TX_HEADER_SIZE_V2, TX_TRAILER_SIZE,
+        build_encrypted_chunk_aad, derive_initial_crc, encrypted_chunk_blob_size,
+        encrypted_chunk_plaintext_len, encrypted_payload_blob_size, encrypted_payload_chunk_count,
+        HeaderReadResult, LogHeader, LogSerializer, LogTxFrameInfo, LogicalLog, ParseResult,
+        ParsedOp, StreamingLogicalLogReader, ENCRYPTED_CHUNK_AAD_SIZE,
+        ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, EXT_FRAME_MAGIC, FRAME_MAGIC, LOG_HDR_CRC_START,
+        LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION, LOG_VERSION_V2, TX_EXT_HEADER_SIZE,
+        TX_HEADER_SIZE, TX_HEADER_SIZE_V2, TX_TRAILER_SIZE,
     };
     #[cfg(feature = "conn_raw_api")]
     use super::{EXTENSION_RECORD_HEADER_SIZE, EXTENSION_TYPE_PORTABLE_CHANGES, OP_UPSERT_TABLE};
@@ -4813,9 +4843,9 @@ mod tests {
             )
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
-        let captured = RefCell::new(Vec::<(SharedBufferData, u32)>::new());
-        let callback = |bytes: SharedBufferData, crc: u32| {
-            captured.borrow_mut().push((bytes, crc));
+        let captured = RefCell::new(Vec::<(SharedBufferData, LogTxFrameInfo)>::new());
+        let callback = |bytes: SharedBufferData, info: LogTxFrameInfo| {
+            captured.borrow_mut().push((bytes, info));
             Ok(())
         };
 
@@ -4867,7 +4897,7 @@ mod tests {
         assert_eq!(captured[0].0.as_slice(), first_on_disk.as_slice());
         assert_eq!(captured[1].0.as_slice(), second_on_disk.as_slice());
         assert_eq!(
-            captured[0].1,
+            captured[0].1.end_crc32c,
             u32::from_le_bytes(
                 captured[0].0.as_slice()[captured[0].0.len() - TX_TRAILER_SIZE
                     ..captured[0].0.len() - TX_TRAILER_SIZE + 4]
@@ -4876,7 +4906,7 @@ mod tests {
             )
         );
         assert_eq!(
-            captured[1].1,
+            captured[1].1.end_crc32c,
             u32::from_le_bytes(
                 captured[1].0.as_slice()[captured[1].0.len() - TX_TRAILER_SIZE
                     ..captured[1].0.len() - TX_TRAILER_SIZE + 4]
@@ -4884,6 +4914,19 @@ mod tests {
                     .unwrap()
             )
         );
+
+        // Frame chain state: frame 1 starts at offset 0 seeded from the salt,
+        // frame 2 starts where frame 1 ended and chains from its end CRC.
+        assert_eq!(captured[0].1.logical_start_offset, 0);
+        assert_eq!(captured[1].1.logical_start_offset, first_len);
+        let salt = log
+            .header
+            .as_ref()
+            .expect("header created on first write")
+            .salt;
+        assert_eq!(captured[0].1.start_crc32c, derive_initial_crc(salt));
+        assert_eq!(captured[1].1.start_crc32c, captured[0].1.end_crc32c);
+        assert_eq!(log.running_crc, captured[1].1.end_crc32c);
     }
 
     /// What this test checks: A payload bit flip in a fully present tail frame is ignored as invalid tail.
