@@ -650,8 +650,8 @@ pub enum Insn {
         col_name: Arc<str>,
     },
 
-    /// Convert a native record-format BLOB back to JSON text for display.
-    /// Input: reg = record-format BLOB. Output: reg = JSON text '[1,2,3]'.
+    /// Convert a native record-format BLOB back to PostgreSQL-style array text for display.
+    /// Input: reg = record-format BLOB. Output: reg = PG array text like '{1,2,3}'.
     ArrayDecode {
         reg: usize,
     },
