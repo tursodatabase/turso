@@ -1719,7 +1719,7 @@ impl Func {
             #[cfg(feature = "json")]
             "jsonb_insert" => Ok(Some(Self::Json(JsonFunc::JsonbInsert))),
             #[cfg(feature = "json")]
-            "jsonb_replace" => Ok(Some(Self::Json(JsonFunc::JsonReplace))),
+            "jsonb_replace" => Ok(Some(Self::Json(JsonFunc::JsonbReplace))),
             #[cfg(feature = "json")]
             "json_pretty" => Ok(Some(Self::Json(JsonFunc::JsonPretty))),
             #[cfg(feature = "json")]
