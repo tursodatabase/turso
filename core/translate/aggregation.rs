@@ -560,7 +560,7 @@ pub fn translate_aggregation_step(
             });
             target_register
         }
-        AggFunc::Mode => {
+        AggFunc::Mode { .. } => {
             // Planner rewrites `mode() WITHIN GROUP (ORDER BY x)` to a single arg `[x]`.
             if num_args != 1 {
                 crate::bail_parse_error!("mode bad number of arguments");
@@ -573,7 +573,9 @@ pub fn translate_aggregation_step(
                 acc_reg: target_register,
                 col: value_reg,
                 delimiter: 0,
-                func: AccumulatorFunc::Agg(AggFunc::Mode),
+                // Preserve `sorted`, decided by GROUP BY emission: whether this
+                // aggregate's WITHIN GROUP input is guaranteed pre-sorted.
+                func: AccumulatorFunc::Agg(func.clone()),
                 comparator: None,
             });
             target_register

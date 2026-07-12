@@ -242,7 +242,7 @@ pub fn resolve_window_and_aggregate_functions(
 
                 // Ordered-set aggregates are only meaningful with WITHIN GROUP. mode() in
                 // particular has no plain-aggregate form, so reject it early with a clear error.
-                if matches!(ordered_set_func, Some(AggFunc::Mode)) {
+                if matches!(ordered_set_func, Some(AggFunc::Mode { .. })) {
                     crate::bail_parse_error!(
                         "mode() requires a WITHIN GROUP (ORDER BY ...) clause"
                     );
@@ -537,7 +537,7 @@ fn add_aggregate_if_not_exists(
 /// Ordered-set aggregates are written `f(direct_args) WITHIN GROUP (ORDER BY x)`.
 fn ordered_set_agg_func(normalized_name: &str) -> Option<AggFunc> {
     match normalized_name {
-        "mode" => Some(AggFunc::Mode),
+        "mode" => Some(AggFunc::Mode { sorted: false }),
         "percentile_cont" => Some(AggFunc::PercentileCont),
         "percentile_disc" => Some(AggFunc::PercentileDisc),
         _ => None,
@@ -601,7 +601,7 @@ fn build_ordered_set_aggregate(
         );
     }
     let expected_direct_args = match func {
-        AggFunc::Mode => 0,
+        AggFunc::Mode { .. } => 0,
         _ => 1, // percentile_cont / percentile_disc take the fraction
     };
     if args.len() != expected_direct_args {

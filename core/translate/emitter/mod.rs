@@ -947,13 +947,15 @@ pub struct TranslateCtx<'a> {
     /// whether the expression should be included in the output for each group.
     ///
     /// Each entry is a tuple:
-    /// - `&'ast Expr`: the expression itself
+    /// - `Cow<'ast, Expr>`: the expression itself. Almost always borrowed from the
+    ///   plan; owned only for synthetic sort-key columns that don't correspond to
+    ///   a plan expression (e.g. an ordered-set aggregate's WITHIN GROUP expr).
     /// - `bool`: `true` if the expression should be included in the output for each group, `false` otherwise.
     ///
     /// The order of expressions is **significant**:
     /// - First: all `GROUP BY` expressions, in the order they appear in the `GROUP BY` clause.
     /// - Then: remaining non-aggregate expressions that are not part of `GROUP BY`.
-    pub non_aggregate_expressions: Vec<(&'a Expr, bool)>,
+    pub non_aggregate_expressions: Vec<(std::borrow::Cow<'a, Expr>, bool)>,
     /// Unique leaf column expressions extracted from aggregate function arguments.
     /// Only populated when GROUP BY uses a sorter, enabling deferred expression
     /// evaluation: the sorter stores raw columns instead of pre-computed expressions,

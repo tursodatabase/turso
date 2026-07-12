@@ -1,6 +1,7 @@
 use crate::{
     alloc::{TursoFromIterator, TursoIteratorExt},
     emit_explain,
+    function::AggFunc,
     schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
     translate::{
@@ -148,6 +149,34 @@ pub fn emit_query<'a>(
         .group_by
         .as_ref()
         .is_some_and(|gb| !gb.exprs.is_empty());
+
+    if has_group_by_exprs {
+        // mode() WITHIN GROUP can be computed in O(1) space by tracking a running
+        // value/count pair instead of buffering every row, but only if the GROUP BY
+        // sorter can deliver rows already ordered by the WITHIN GROUP expression.
+        // A single sorter only gives one row order, so this is only safe when every
+        // mode() call in the query shares the same WITHIN GROUP expression.
+        let mut distinct_mode_expr: Option<Expr> = None;
+        let mut conflicting_mode_exprs = false;
+        for agg in plan.aggregates.iter() {
+            if matches!(agg.func, AggFunc::Mode { .. }) {
+                match &distinct_mode_expr {
+                    None => distinct_mode_expr = Some(agg.args[0].clone()),
+                    Some(e) if !crate::util::exprs_are_equivalent(e, &agg.args[0]) => {
+                        conflicting_mode_exprs = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !conflicting_mode_exprs && distinct_mode_expr.is_some() {
+            for agg in plan.aggregates.iter_mut() {
+                if let AggFunc::Mode { sorted } = &mut agg.func {
+                    *sorted = true;
+                }
+            }
+        }
+    }
 
     // Initialize cursors and other resources needed for query execution
     if !plan.order_by.is_empty() {
