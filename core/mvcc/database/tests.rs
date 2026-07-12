@@ -9751,6 +9751,44 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
     assert!(versions.is_empty());
 }
 
+/// A superseded version whose insert was checkpointed (begin <= ckpt_max) is
+/// physically in the B-tree even when its `btree_resident` flag is unset (the
+/// flag is only seeded by the dual cursor, not by checkpoint). Until its
+/// overwrite/delete is checkpointed (end > ckpt_max), it must be retained even
+/// with a committed current replacement: the checkpointer derives DB-file
+/// existence from begin/end timestamps against the durable boundary, so
+/// removing this version would make a later delete skip the B-tree write and
+/// resurrect the row (issue #7638).
+#[test]
+fn test_gc_rule2_checkpointed_insert_with_current_retained_until_checkpoint() {
+    // begin=2 <= ckpt_max=2 (insert checkpointed), end=5 > ckpt_max (overwrite not).
+    let checkpointed_btree_row = make_rv(ts(2), ts(5));
+    let current = make_rv(ts(5), None);
+    let mut versions = crate::alloc::vec![checkpointed_btree_row, current];
+
+    let dropped = MvStore::<MvccClock>::gc_version_chain(
+        &mut versions,
+        10,
+        2,
+        false,
+        crate::mvcc::database::WalPos::STAGED,
+    );
+    assert_eq!(dropped, 0);
+    assert_eq!(versions.len(), 2);
+
+    // Once the overwrite is checkpointed (end <= ckpt_max), both versions are
+    // reclaimable (rule 2 for the superseded, rule 3 for the current).
+    let dropped = MvStore::<MvccClock>::gc_version_chain(
+        &mut versions,
+        10,
+        5,
+        false,
+        crate::mvcc::database::WalPos::STAGED,
+    );
+    assert_eq!(dropped, 2);
+    assert!(versions.is_empty());
+}
+
 /// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
 /// B-tree tombstones (begin=None, end=e) represent rows that existed in the B-tree
