@@ -4404,7 +4404,15 @@ impl Wal for WalFile {
         // single completion for the whole batch
         let total_len: i32 = iovecs.iter().map(|b| b.len() as i32).sum();
         let page_frame_for_cb = page_frame_and_checksum.clone();
-        let cmp = move |res: Result<i32, CompletionError>| {
+        // Make the frames readable only once the write is durable. `find_frame`
+        // (reads) and `iter_latest_frames` (checkpoint) resolve a page->frame
+        // only through the frame cache, so populating it here — from the write
+        // completion callback — is what publishes the frames. Doing it before
+        // durability would let a reader or a checkpoint pick up a frame whose
+        // bytes are not on disk yet. On write failure `res` is `Err`, so we
+        // publish nothing.
+        let coordination = self.coordination.clone();
+        let on_complete = move |res: Result<i32, CompletionError>| {
             let Ok(bytes_written) = res else {
                 return;
             };
@@ -4416,18 +4424,38 @@ impl Wal for WalFile {
 
             for (page, fid, _csum) in &page_frame_for_cb {
                 page.set_wal_tag(*fid, epoch);
+                coordination.cache_frame(page.get().id as u64, *fid);
             }
         };
 
-        let c = Completion::new_write(cmp);
+        let c = Completion::new_write(on_complete);
 
         let file = self.coordination.wal_file()?;
         let c = file.pwritev(start_off, iovecs, c)?;
 
-        self.io.drain_completions(std::slice::from_ref(&c))?;
-
-        for (page, fid, csum) in &page_frame_and_checksum {
-            self.complete_append_frame(page.get().id as u64, *fid, *csum);
+        // Advance the connection-private write cursor (max_frame / rolling
+        // checksum / dirty) synchronously so a following batch in the same
+        // flush chains onto the correct frame ids and checksum.
+        //
+        // These are optimistic in-memory bookkeeping fields, not durable state,
+        // and they do not make the frame visible (visibility is the frame
+        // cache, published from the completion callback above only after the
+        // write succeeds). So advancing them before the write lands is safe:
+        // if the write fails the transaction unwinds and `rollback()` restores
+        // max_frame / last_checksum from the committed watermark and drops
+        // cached frames above it; nothing is durable until a commit frame is
+        // fsynced, and crash recovery rebuilds max_frame by scanning only
+        // committed, checksum-valid frames. `dirty` is conservative — it only
+        // forces an fsync before the next commit is reported durable.
+        //
+        // Must NOT block for durability here: the returned completion is awaited
+        // by the caller's state machine (spill: `SpillState::WritingToWal`;
+        // cacheflush: the collected completions). A synchronous drain would
+        // deadlock a caller that drives I/O from a single-threaded event loop.
+        if let Some((_, last_frame_id, last_checksum)) = page_frame_and_checksum.last() {
+            self.dirty.store(true, Ordering::Release);
+            *self.last_checksum.write() = *last_checksum;
+            self.max_frame.store(*last_frame_id, Ordering::Release);
         }
 
         Ok(c)
@@ -6107,6 +6135,89 @@ pub mod test {
         io.wait_for_completion(c).unwrap();
 
         (io, buffer_pool, wal)
+    }
+
+    /// Like `make_initialized_memory_wal`, but backed by `MemoryYieldIO`, which
+    /// writes bytes synchronously yet defers every I/O *completion* until the
+    /// next `io.step()`. That makes the "write submitted but not yet durable"
+    /// window observable in a single-threaded test.
+    #[cfg(feature = "io_memory_yield")]
+    fn make_initialized_memory_yield_wal(
+        page_size: u32,
+    ) -> (Arc<dyn IO>, Arc<BufferPool>, WalFile) {
+        let io: Arc<dyn IO> = Arc::new(crate::io::MemoryYieldIO::new());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(page_size as usize)
+            .unwrap();
+        let file = io
+            .open_file("spill-visibility.db-wal", OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let wal = WalFile::new(io.clone(), shared, ((0, 0), 0), buffer_pool.clone());
+        let page_size = PageSize::new(page_size).unwrap();
+
+        if let Some(c) = wal.prepare_wal_start(page_size).unwrap() {
+            io.wait_for_completion(c).unwrap();
+        }
+        let c = wal.prepare_wal_finish(FileSyncType::Fsync).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        (io, buffer_pool, wal)
+    }
+
+    /// Regression test for the cache-spill WAL append path: a frame appended via
+    /// `append_frames_vectored` must not become resolvable by `find_frame`
+    /// (reads) or `iter_latest_frames` (checkpoint) until its write is durable.
+    ///
+    /// An earlier version of the async spill fix published the page->frame
+    /// mapping (`cache_frame`) synchronously at submission, before the write
+    /// landed on disk — so a reader or a concurrent checkpoint could resolve a
+    /// frame whose bytes were not yet written. `MemoryYieldIO` defers the write
+    /// completion until `io.step()`, so this test can observe the frame while
+    /// the write is still in flight: the mapping must not be visible yet.
+    #[cfg(feature = "io_memory_yield")]
+    #[test]
+    fn append_frames_vectored_frame_hidden_until_write_is_durable() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_yield_wal(page_size);
+        let page = page_with_pattern(7, 0x70, &buffer_pool);
+
+        let completion = wal
+            .append_frames_vectored(vec![page], PageSize::new(page_size).unwrap())
+            .unwrap();
+
+        // The write cursor advances synchronously (so a following batch chains
+        // correctly), but the completion has not fired: the write is not durable.
+        assert!(
+            !completion.succeeded(),
+            "MemoryYieldIO must defer the write completion until io.step()"
+        );
+        assert_eq!(
+            wal.get_max_frame(),
+            1,
+            "write cursor advances synchronously"
+        );
+
+        // The frame must NOT be resolvable before the write is durable. The
+        // buggy version cached the mapping at submission and returned Some(1)
+        // here, exposing bytes that were not on disk yet.
+        assert_eq!(
+            wal.find_frame(7, None).unwrap(),
+            None,
+            "frame must not be visible to readers before its write is durable"
+        );
+
+        // Drive the deferred completion: the write is now durable and the
+        // completion callback publishes the page->frame mapping.
+        io.step().unwrap();
+        assert!(completion.succeeded());
+
+        assert_eq!(
+            wal.find_frame(7, None).unwrap(),
+            Some(1),
+            "frame must be visible once its write is durable"
+        );
     }
 
     fn page_with_pattern(page_id: i64, seed: u8, buffer_pool: &Arc<BufferPool>) -> PageRef {
