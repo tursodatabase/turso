@@ -311,6 +311,49 @@ fn database_open_with_experimental_multiprocess_wal_rejects_unsupported_io_backe
 }
 
 #[test]
+fn multiprocess_wal_rejects_journal_mode_mvcc_pragma() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("multiprocess-rejects-mvcc-pragma.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    let err = conn
+        .execute("PRAGMA journal_mode = mvcc")
+        .expect_err("switching a multiprocess-coordinated database to MVCC must be rejected");
+    assert!(
+        matches!(err, LimboError::InvalidArgument(ref message) if message.contains("multiprocess")),
+        "expected InvalidArgument about multiprocess WAL, got {err:?}"
+    );
+}
+
+#[test]
+fn multiprocess_wal_rejects_opening_mvcc_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("multiprocess-rejects-mvcc-open.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    {
+        let db = Database::open_file(io.clone(), db_path_str).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = mvcc").unwrap();
+        conn.execute("insert into test(value) values ('mvcc-row')")
+            .unwrap();
+    }
+
+    let err = open_multiprocess_db(io, db_path_str)
+        .expect_err("opening an MVCC-marked database with multiprocess WAL must be rejected");
+    assert!(
+        matches!(err, LimboError::InvalidArgument(ref message) if message.contains("MVCC")),
+        "expected InvalidArgument about MVCC, got {err:?}"
+    );
+}
+
+#[test]
 fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_file() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("readonly-multiprocess-no-tshm.db");
