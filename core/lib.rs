@@ -1854,6 +1854,18 @@ impl Database {
                     // MVCC is controlled only by the database header (set via PRAGMA journal_mode)
                     let open_mv_store = matches!(read_version, Version::Mvcc);
 
+                    // MVCC has no cross-process coordination: commit
+                    // serialization, the logical-log append offset, and
+                    // checkpoint exclusion are all process-local, so
+                    // concurrent multiprocess access silently loses committed
+                    // transactions and corrupts live views.
+                    if open_mv_store && self.opts.enable_multiprocess_wal {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "cannot open MVCC database '{}' with experimental multiprocess WAL: MVCC does not support multiprocess access",
+                            self.path
+                        )));
+                    }
+
                     // Now check the Header Version to see which mode the DB file really is on
                     // Track if header was modified so we can write it to disk
                     let header_modified = match read_version {
