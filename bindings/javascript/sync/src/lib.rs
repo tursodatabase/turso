@@ -219,7 +219,10 @@ impl SyncEngine {
         let io: Arc<dyn turso_core::IO> = if is_memory {
             Arc::new(turso_core::MemoryIO::new())
         } else {
-            #[cfg(all(target_os = "linux", not(feature = "browser")))]
+            #[cfg(all(
+                any(target_os = "linux", target_os = "macos"),
+                not(feature = "browser")
+            ))]
             {
                 if opts.partial_sync_opts.is_none() {
                     Arc::new(turso_core::PlatformIO::new().map_err(|e| {
@@ -229,18 +232,39 @@ impl SyncEngine {
                         )
                     })?)
                 } else {
-                    use turso_sync_engine::sparse_io::SparseLinuxIo;
-
-                    Arc::new(SparseLinuxIo::new().map_err(|e| {
+                    let sparse_io_error = |e| {
                         napi::Error::new(
                             napi::Status::GenericFailure,
                             format!("Failed to create sparse IO: {e}"),
                         )
-                    })?)
+                    };
+                    #[cfg(target_os = "linux")]
+                    {
+                        use turso_sync_engine::sparse_io::SparseLinuxIo;
+                        Arc::new(SparseLinuxIo::new().map_err(sparse_io_error)?)
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        use turso_sync_engine::sparse_io::SparseBitmapIo;
+                        Arc::new(SparseBitmapIo::new(&opts.path).map_err(sparse_io_error)?)
+                    }
                 }
             }
-            #[cfg(all(not(target_os = "linux"), not(feature = "browser")))]
+            #[cfg(all(
+                not(any(target_os = "linux", target_os = "macos")),
+                not(feature = "browser")
+            ))]
             {
+                if opts.partial_sync_opts.is_some() {
+                    // Partial sync stores lazily fetched pages in a sparse file
+                    // and probes them with `File::has_hole`, which `PlatformIO`
+                    // does not implement. Fail here instead of panicking later
+                    // in the lazy storage path.
+                    return Err(napi::Error::new(
+                        napi::Status::GenericFailure,
+                        "partial sync requires sparse-file IO, which is not supported on this platform",
+                    ));
+                }
                 Arc::new(turso_core::PlatformIO::new().map_err(|e| {
                     napi::Error::new(
                         napi::Status::GenericFailure,
@@ -250,6 +274,15 @@ impl SyncEngine {
             }
             #[cfg(feature = "browser")]
             {
+                if opts.partial_sync_opts.is_some() {
+                    // OPFS files implement neither `has_hole` nor
+                    // `punch_hole`; partial sync would panic in the lazy
+                    // storage path. Fail at configuration time instead.
+                    return Err(napi::Error::new(
+                        napi::Status::GenericFailure,
+                        "partial sync requires sparse-file IO, which is not supported in the browser",
+                    ));
+                }
                 turso_node::browser::opfs()
             }
         };
