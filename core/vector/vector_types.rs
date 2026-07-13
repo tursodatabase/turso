@@ -1,5 +1,5 @@
 use crate::{
-    alloc::{TursoVecExt, Vec},
+    alloc::{TryReserveError, TursoTryWithCapacityExt, Vec},
     turso_debug_assert,
     types::value_blob_from_slice,
     LimboError, Result, ValueBlob,
@@ -145,7 +145,12 @@ impl<'a> Vector<'a> {
             refer: None,
         }
     }
-    pub fn from_f32_sparse(dims: usize, mut values_f32: Vec<f32>, mut idx_u32: Vec<u32>) -> Self {
+    #[turso_macros::allocation_site(crate::alloc::VectorAllocationSite::SparseConstruction)]
+    pub fn from_f32_sparse(
+        dims: usize,
+        mut values_f32: Vec<f32>,
+        mut idx_u32: Vec<u32>,
+    ) -> std::result::Result<Self, TryReserveError> {
         #[cfg(not(nightly))]
         let mut values = unsafe {
             ValueBlob::from_raw_parts(
@@ -184,13 +189,14 @@ impl<'a> Vector<'a> {
         };
         std::mem::forget(idx_u32);
 
+        values.try_reserve(idx.len())?;
         values.extend_from_slice(&idx);
-        Self {
+        Ok(Self {
             vector_type: VectorType::Float32Sparse,
             dims,
             owned: Some(values),
             refer: None,
-        }
+        })
     }
     fn align4(n: usize) -> usize {
         n.div_ceil(4) * 4
@@ -206,20 +212,26 @@ impl<'a> Vector<'a> {
         }
     }
 
-    pub fn from_f8(dims: usize, quantized: ValueBlob, alpha: f32, shift: f32) -> Self {
+    #[turso_macros::allocation_site(crate::alloc::VectorAllocationSite::Float8Construction)]
+    pub fn from_f8(
+        dims: usize,
+        quantized: ValueBlob,
+        alpha: f32,
+        shift: f32,
+    ) -> std::result::Result<Self, TryReserveError> {
         let aligned = Self::align4(dims);
-        let mut data = <ValueBlob as TursoVecExt<u8>>::with_capacity(aligned + 8);
+        let mut data = <ValueBlob as TursoTryWithCapacityExt>::try_with_capacity_ext(aligned + 8)?;
         data.extend_from_slice(&quantized);
         data.resize(aligned, 0); // alignment padding
         data.extend_from_slice(&alpha.to_le_bytes());
         data.extend_from_slice(&shift.to_le_bytes());
         debug_assert!(data.len() == aligned + 8);
-        Self {
+        Ok(Self {
             vector_type: VectorType::Float8,
             dims,
             owned: Some(data),
             refer: None,
-        }
+        })
     }
 
     pub fn from_vec(mut blob: ValueBlob) -> Result<Self> {
@@ -227,6 +239,12 @@ impl<'a> Vector<'a> {
         blob.truncate(len);
         Self::from_data_with_dims(vector_type, Some(blob), None, explicit_dims)
     }
+
+    #[turso_macros::allocation_site(crate::alloc::VectorAllocationSite::IndexPayloadCopy)]
+    pub fn from_slice_owned(blob: &[u8]) -> Result<Vector<'static>> {
+        Vector::from_vec(value_blob_from_slice(blob)?)
+    }
+
     pub fn from_slice(blob: &'a [u8]) -> Result<Self> {
         let (vector_type, len, explicit_dims) = Self::vector_type(blob)?;
         Self::from_data_with_dims(vector_type, None, Some(&blob[..len]), explicit_dims)
@@ -365,13 +383,14 @@ impl<'a> Vector<'a> {
             .expect("Vector invariant: exactly one of owned or refer must be Some")
     }
 
-    pub fn bin_eject(self) -> ValueBlob {
-        self.owned.unwrap_or_else(|| {
-            value_blob_from_slice(
+    pub fn bin_eject(self) -> std::result::Result<ValueBlob, TryReserveError> {
+        match self.owned {
+            Some(owned) => Ok(owned),
+            None => value_blob_from_slice(
                 self.refer
                     .expect("Vector invariant: exactly one of owned or refer must be Some"),
-            )
-        })
+            ),
+        }
     }
 
     /// # Safety
@@ -480,7 +499,7 @@ impl<'a> Vector<'a> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::alloc::{TursoIteratorExt, ALLOC_ERR_MSG};
+    use crate::alloc::{TursoIteratorExt, TursoVecExt, ALLOC_ERR_MSG};
     use crate::vector::operations;
 
     use super::*;
@@ -540,14 +559,11 @@ pub(crate) mod tests {
     }
 
     /// Convert an ArbitraryVector to a Vector.
-    impl<const DIMS: usize> From<ArbitraryVector<DIMS>> for Vector<'static> {
-        fn from(v: ArbitraryVector<DIMS>) -> Self {
-            Vector {
-                vector_type: v.vector_type,
-                dims: DIMS,
-                owned: Some(value_blob_from_slice(&v.data)),
-                refer: None,
-            }
+    impl<const DIMS: usize> TryFrom<ArbitraryVector<DIMS>> for Vector<'static> {
+        type Error = LimboError;
+
+        fn try_from(v: ArbitraryVector<DIMS>) -> Result<Self> {
+            Vector::from_data_with_dims(v.vector_type, Some(v.data), None, DIMS)
         }
     }
 
@@ -626,33 +642,33 @@ pub(crate) mod tests {
 
     #[quickcheck]
     fn prop_vector_type_identification_2d(v: ArbitraryVector<2>) -> bool {
-        test_vector_type::<2>(v.into())
+        test_vector_type::<2>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_type_identification_3d(v: ArbitraryVector<3>) -> bool {
-        test_vector_type::<3>(v.into())
+        test_vector_type::<3>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_type_identification_4d(v: ArbitraryVector<4>) -> bool {
-        test_vector_type::<4>(v.into())
+        test_vector_type::<4>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_type_identification_100d(v: ArbitraryVector<100>) -> bool {
-        test_vector_type::<100>(v.into())
+        test_vector_type::<100>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_type_identification_1536d(v: ArbitraryVector<1536>) -> bool {
-        test_vector_type::<1536>(v.into())
+        test_vector_type::<1536>(v.try_into().expect("generated vector must be valid"))
     }
 
     /// Test if the vector type identification is correct for a given vector.
     fn test_vector_type<const DIMS: usize>(v: Vector) -> bool {
         let vtype = v.vector_type;
-        let value = operations::serialize::vector_serialize(v);
+        let value = operations::serialize::vector_serialize(v).unwrap();
         let blob = value.to_blob().unwrap().to_vec();
         match Vector::vector_type(&blob) {
             Ok((detected_type, _, _)) => detected_type == vtype,
@@ -662,27 +678,27 @@ pub(crate) mod tests {
 
     #[quickcheck]
     fn prop_slice_conversion_safety_2d(v: ArbitraryVector<2>) -> bool {
-        test_slice_conversion::<2>(v.into())
+        test_slice_conversion::<2>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_slice_conversion_safety_3d(v: ArbitraryVector<3>) -> bool {
-        test_slice_conversion::<3>(v.into())
+        test_slice_conversion::<3>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_slice_conversion_safety_4d(v: ArbitraryVector<4>) -> bool {
-        test_slice_conversion::<4>(v.into())
+        test_slice_conversion::<4>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_slice_conversion_safety_100d(v: ArbitraryVector<100>) -> bool {
-        test_slice_conversion::<100>(v.into())
+        test_slice_conversion::<100>(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_slice_conversion_safety_1536d(v: ArbitraryVector<1536>) -> bool {
-        test_slice_conversion::<1536>(v.into())
+        test_slice_conversion::<1536>(v.try_into().expect("generated vector must be valid"))
     }
 
     /// Test if the slice conversion is safe for a given vector:
@@ -712,17 +728,26 @@ pub(crate) mod tests {
 
     #[quickcheck]
     fn prop_vector_distance_safety_2d(v1: ArbitraryVector<2>, v2: ArbitraryVector<2>) -> bool {
-        test_vector_distance::<2>(&v1.into(), &v2.into())
+        test_vector_distance::<2>(
+            &v1.try_into().expect("generated vector must be valid"),
+            &v2.try_into().expect("generated vector must be valid"),
+        )
     }
 
     #[quickcheck]
     fn prop_vector_distance_safety_3d(v1: ArbitraryVector<3>, v2: ArbitraryVector<3>) -> bool {
-        test_vector_distance::<3>(&v1.into(), &v2.into())
+        test_vector_distance::<3>(
+            &v1.try_into().expect("generated vector must be valid"),
+            &v2.try_into().expect("generated vector must be valid"),
+        )
     }
 
     #[quickcheck]
     fn prop_vector_distance_safety_4d(v1: ArbitraryVector<4>, v2: ArbitraryVector<4>) -> bool {
-        test_vector_distance::<4>(&v1.into(), &v2.into())
+        test_vector_distance::<4>(
+            &v1.try_into().expect("generated vector must be valid"),
+            &v2.try_into().expect("generated vector must be valid"),
+        )
     }
 
     #[quickcheck]
@@ -730,7 +755,10 @@ pub(crate) mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        test_vector_distance::<100>(&v1.into(), &v2.into())
+        test_vector_distance::<100>(
+            &v1.try_into().expect("generated vector must be valid"),
+            &v2.try_into().expect("generated vector must be valid"),
+        )
     }
 
     #[quickcheck]
@@ -738,7 +766,10 @@ pub(crate) mod tests {
         v1: ArbitraryVector<1536>,
         v2: ArbitraryVector<1536>,
     ) -> bool {
-        test_vector_distance::<1536>(&v1.into(), &v2.into())
+        test_vector_distance::<1536>(
+            &v1.try_into().expect("generated vector must be valid"),
+            &v2.try_into().expect("generated vector must be valid"),
+        )
     }
 
     /// Test if the vector distance calculation is correct for a given pair of vectors:
@@ -820,27 +851,27 @@ pub(crate) mod tests {
 
     #[quickcheck]
     fn prop_vector_text_roundtrip_2d(v: ArbitraryVector<2>) -> bool {
-        test_vector_text_roundtrip(v.into())
+        test_vector_text_roundtrip(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_text_roundtrip_3d(v: ArbitraryVector<3>) -> bool {
-        test_vector_text_roundtrip(v.into())
+        test_vector_text_roundtrip(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_text_roundtrip_4d(v: ArbitraryVector<4>) -> bool {
-        test_vector_text_roundtrip(v.into())
+        test_vector_text_roundtrip(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_text_roundtrip_100d(v: ArbitraryVector<100>) -> bool {
-        test_vector_text_roundtrip(v.into())
+        test_vector_text_roundtrip(v.try_into().expect("generated vector must be valid"))
     }
 
     #[quickcheck]
     fn prop_vector_text_roundtrip_1536d(v: ArbitraryVector<1536>) -> bool {
-        test_vector_text_roundtrip(v.into())
+        test_vector_text_roundtrip(v.try_into().expect("generated vector must be valid"))
     }
 
     /// Test that a vector can be converted to text and back without loss of precision

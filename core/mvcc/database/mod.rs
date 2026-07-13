@@ -8218,7 +8218,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub(crate) fn build_schema_from_rows(
         &self,
         connection: &Arc<Connection>,
-        schema_rows: &HashMap<i64, ImmutableRecord>,
+        schema_rows: &HashMap<i64, ImmutableRecordRef<'static>>,
         preserved_table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
     ) -> Result<Arc<Schema>> {
         let pager = connection.pager.load().clone();
@@ -8657,7 +8657,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             schema_rows_after.insert(
                                 rowid.row_id.to_int_or_panic(),
                                 ImmutableRecord::from_bin_record(
-                                    crate::types::value_blob_from_slice(record_bytes),
+                                    crate::types::value_blob_from_slice(record_bytes)?,
                                 ),
                             );
                         });
@@ -8886,7 +8886,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     schema_rows.insert(
                                         rowid_int,
                                         ImmutableRecord::from_bin_record(
-                                            crate::types::value_blob_from_slice(row.payload()),
+                                            crate::types::value_blob_from_slice(row.payload())?,
                                         ),
                                     );
                                 });

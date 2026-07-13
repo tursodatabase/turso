@@ -10261,7 +10261,7 @@ mod tests {
                     .get_values()
                     .unwrap()
                     .iter()
-                    .map(ValueRef::to_owned)
+                    .map(|value| value.to_owned().expect(crate::alloc::ALLOC_ERR_MSG))
                     .collect::<Vec<_>>();
                 if let Some(prev) = prev {
                     if prev >= cur {
@@ -10366,7 +10366,9 @@ mod tests {
                     }
                     expected_keys.push(key.clone());
 
-                    let regs = vec![Register::Value(Value::from_slice(&key))];
+                    let regs = vec![Register::Value(
+                        Value::from_slice(&key).expect(crate::alloc::ALLOC_ERR_MSG),
+                    )];
                     let value = ImmutableRecord::from_registers(&regs, regs.len()).unwrap();
 
                     let seek_result = run_until_done(
@@ -10397,7 +10399,9 @@ mod tests {
                             tracing::info!("delete {}/{}, seed: {seed}", i + 1, operations);
                         }
 
-                        let regs = vec![Register::Value(Value::from_slice(&key_to_delete))];
+                        let regs = vec![Register::Value(
+                            Value::from_slice(&key_to_delete).expect(crate::alloc::ALLOC_ERR_MSG),
+                        )];
                         let record = ImmutableRecord::from_registers(&regs, regs.len()).unwrap();
 
                         // Seek to the key to delete
@@ -10457,7 +10461,9 @@ mod tests {
             );
             let exists = run_until_done(
                 || {
-                    let regs = vec![Register::Value(Value::from_slice(key))];
+                    let regs = vec![Register::Value(
+                        Value::from_slice(key).expect(crate::alloc::ALLOC_ERR_MSG),
+                    )];
                     cursor.seek(
                         SeekKey::IndexKey(
                             &ImmutableRecord::from_registers(&regs, regs.len()).unwrap(),

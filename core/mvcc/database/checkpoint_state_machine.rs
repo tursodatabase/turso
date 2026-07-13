@@ -2987,7 +2987,7 @@ pub struct BuildLocalSchemaViewStateMachine<
     connection: Arc<Connection>,
     snapshot_ts: u64,
     state: BuildLocalSchemaViewState,
-    rows: HashMap<i64, ImmutableRecord>,
+    rows: HashMap<i64, ImmutableRecordRef<'static>>,
     finalized: bool,
 }
 
@@ -3042,10 +3042,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> BuildLocalSchemaViewStateMachi
                         .data
                         .as_ref()
                         .expect("present schema version must carry row data at snapshot_ts");
-                    self.rows.insert(
-                        rowid,
-                        ImmutableRecord::from_bin_record(crate::types::value_blob_from_slice(data)),
-                    );
+                    self.rows
+                        .insert(rowid, ImmutableRecordRef::from_shared_record(data.clone()));
                 }
                 None => {
                     let existed_and_gone = versions.iter().any(|version| {
@@ -3105,7 +3103,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
                     IOResult::Done(None) => None,
                 };
                 if let Some(record) = record {
-                    self.rows.insert(rowid, record);
+                    self.rows
+                        .insert(rowid, ImmutableRecordRef::from_owned_record(record));
                 }
                 self.state = BuildLocalSchemaViewState::Advance;
                 Ok(TransitionResult::Continue)
@@ -3185,6 +3184,18 @@ mod tests {
             btree_resident: false,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
+    }
+
+    #[test]
+    fn local_schema_record_shares_mvcc_payload() {
+        let version = sqlite_schema_row_version(2, "table", "t", "t", -2, Some(1), None);
+        let payload = version.row.data.as_ref().unwrap();
+        let payload_ptr = payload.as_ptr();
+
+        let record = ImmutableRecordRef::from_shared_record(payload.clone());
+
+        assert_eq!(record.get_payload().as_ptr(), payload_ptr);
+        assert_eq!(record.column_count(), SQLITE_SCHEMA_COLUMN_COUNT);
     }
 
     #[test]

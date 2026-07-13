@@ -31,7 +31,7 @@ use crate::{
         insn::{to_u16, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
-    LimboError, Numeric, Result, Value,
+    LimboError, Numeric, Result, Value, ValueRef,
 };
 use either::Either;
 use rustc_hash::FxHashSet as HashSet;
@@ -471,7 +471,10 @@ pub(crate) fn eval_constant_default_value(expr: &ast::Expr) -> Result<Value> {
 fn apply_affinity_to_value(value: &mut Value, affinity: Affinity) {
     if let Some(converted) = affinity.convert(value) {
         *value = match converted {
-            Either::Left(val_ref) => val_ref.to_owned(),
+            Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
+            Either::Left(_) => {
+                unreachable!("affinity conversion returned an unexpected borrowed value")
+            }
             Either::Right(val) => val,
         };
     }

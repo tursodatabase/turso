@@ -1,4 +1,4 @@
-use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result};
+use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
 use tracing::{instrument, Level};
@@ -1940,7 +1940,10 @@ impl ProgramBuilder {
             };
             if let Some(converted) = affinity.convert(&value) {
                 value = match converted {
-                    either::Either::Left(val_ref) => val_ref.to_owned(),
+                    either::Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
+                    either::Either::Left(_) => {
+                        unreachable!("affinity conversion returned an unexpected borrowed value")
+                    }
                     either::Either::Right(val) => val,
                 };
             }

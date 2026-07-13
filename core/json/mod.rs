@@ -5,6 +5,7 @@ mod ops;
 pub(crate) mod path;
 pub(crate) mod vtab;
 
+use crate::alloc::TryReserveError;
 use crate::json::error::Error as JsonError;
 pub use crate::json::ops::{
     json_insert, json_patch, json_remove, json_replace, jsonb_insert, jsonb_patch, jsonb_remove,
@@ -84,7 +85,7 @@ pub fn convert_dbtype_to_raw_jsonb(data: &Value, strict: Conv) -> crate::Result<
 }
 
 pub fn json_from_raw_bytes_agg(data: &[u8], raw: bool) -> crate::Result<Value> {
-    let mut json = Jsonb::from_raw_data(data);
+    let mut json = Jsonb::from_raw_data(data)?;
     let el_type = json.element_type()?;
     json.finalize_unsafe(el_type)?;
     if raw {
@@ -107,24 +108,26 @@ fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
     Jsonb::from_str_with_mode(str, mode).map_err(Into::into)
 }
 
-fn is_jsonb_blob(slice: &[u8]) -> bool {
+fn is_jsonb_blob(slice: &[u8]) -> Result<bool, TryReserveError> {
     let Ok((header, header_offset)) = JsonbHeader::from_slice(0, slice) else {
-        return false;
+        return Ok(false);
     };
     let payload_size = header.payload_size();
     let Some(total_expected) = header_offset.checked_add(payload_size) else {
-        return false;
+        return Ok(false);
     };
     if total_expected != slice.len() {
-        return false;
+        return Ok(false);
     }
 
-    let jsonb = Jsonb::from_raw_data(slice);
-    if header.is_scalar() || payload_size <= JSONB_AMBIGUOUS_PAYLOAD_MAX {
-        jsonb.is_valid()
-    } else {
-        jsonb.element_type().is_ok()
-    }
+    let jsonb = Jsonb::from_raw_data(slice)?;
+    Ok(
+        if header.is_scalar() || payload_size <= JSONB_AMBIGUOUS_PAYLOAD_MAX {
+            jsonb.is_valid()
+        } else {
+            jsonb.element_type().is_ok()
+        },
+    )
 }
 
 pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Result<Jsonb> {
@@ -167,7 +170,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                         if total_expected != slice.len() {
                             parse_as_json_text(slice, strict)?
                         } else {
-                            let jsonb = Jsonb::from_raw_data(slice);
+                            let jsonb = Jsonb::from_raw_data(slice)?;
                             let is_valid_json = if payload_size <= 7 {
                                 jsonb.is_valid()
                             } else {
@@ -188,7 +191,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
         }
         ValueRef::Null => Ok(Jsonb::from_raw_data(
             JsonbHeader::make_null().into_bytes().as_bytes(),
-        )),
+        )?),
         ValueRef::Numeric(numeric) if matches!(strict, Conv::ToString) => {
             let text = Value::from(numeric).to_string();
             Jsonb::from_str_with_mode(&text, strict)
@@ -532,7 +535,7 @@ where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
 {
-    let null = Jsonb::from_raw_data(JsonbHeader::make_null().into_bytes().as_bytes());
+    let null = Jsonb::from_raw_data(JsonbHeader::make_null().into_bytes().as_bytes())?;
     if paths.len() == 1 {
         let first_path = paths.next().ok_or_else(|| {
             crate::LimboError::InternalError("paths should have one element".to_string())
@@ -838,9 +841,9 @@ where
 
 /// Tries to convert the value to jsonb. Returns Value::from_i64(1) if the conversion
 /// succeeded, and Value::from_i64(0) if it didn't.
-pub fn is_json_valid(json_value: impl AsValueRef) -> Value {
+pub fn is_json_valid(json_value: impl AsValueRef) -> Result<Value, TryReserveError> {
     let json_value = json_value.as_value_ref();
-    match json_value {
+    Ok(match json_value {
         ValueRef::Null => Value::Null,
         ValueRef::Blob(blob) => {
             let index = blob
@@ -848,18 +851,22 @@ pub fn is_json_valid(json_value: impl AsValueRef) -> Value {
                 .position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
                 .unwrap_or(blob.len());
             let slice = &blob[index..];
-            if is_jsonb_blob(slice) {
+            if is_jsonb_blob(slice)? {
                 Value::from_i64(0)
             } else {
-                parse_as_json_text(slice, Conv::Strict)
-                    .map(|_| Value::from_i64(1))
-                    .unwrap_or_else(|_| Value::from_i64(0))
+                match parse_as_json_text(slice, Conv::Strict) {
+                    Ok(_) => Value::from_i64(1),
+                    Err(LimboError::OutOfMemory) => return Err(TryReserveError),
+                    Err(_) => Value::from_i64(0),
+                }
             }
         }
-        _ => convert_dbtype_to_jsonb(json_value, Conv::Strict)
-            .map(|_| Value::from_i64(1))
-            .unwrap_or_else(|_| Value::from_i64(0)),
-    }
+        _ => match convert_dbtype_to_jsonb(json_value, Conv::Strict) {
+            Ok(_) => Value::from_i64(1),
+            Err(LimboError::OutOfMemory) => return Err(TryReserveError),
+            Err(_) => Value::from_i64(0),
+        },
+    })
 }
 
 pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
@@ -870,7 +877,7 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
             // then this function is a no-op
             if t.subtype == TextSubtype::Json {
                 // Should just return the json value with no quotes
-                return Ok(value.to_owned());
+                return Ok(value.to_owned()?);
             }
 
             let mut escaped_value = String::with_capacity(t.value.len() + 4);
@@ -1123,7 +1130,7 @@ mod tests {
 
     #[test]
     fn test_json_array_blob_invalid() {
-        let blob = Value::from_slice(b"1");
+        let blob = Value::from_slice(b"1").expect(crate::alloc::ALLOC_ERR_MSG);
 
         let input = [blob];
 
@@ -1877,6 +1884,6 @@ mod tests {
     fn test_is_jsonb_blob_rejects_scalar_like_overlap_header() {
         let overlapping_scalar = b"|1234567";
         assert_eq!(overlapping_scalar.len(), JSONB_AMBIGUOUS_PAYLOAD_MAX + 1);
-        assert!(!is_jsonb_blob(overlapping_scalar));
+        assert!(!is_jsonb_blob(overlapping_scalar).expect(crate::alloc::ALLOC_ERR_MSG));
     }
 }

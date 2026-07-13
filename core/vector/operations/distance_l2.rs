@@ -240,8 +240,16 @@ mod tests {
         // Dense uses simsimd, sparse uses rust impl. These can differ by up to 1e-4
         // (as demonstrated by prop_vector_distance_l2_rust_vs_simsimd_f32).
         let tolerance = 1e-4;
-        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
         let d1 = vector_distance_l2(&v1, &v2).unwrap();
 
         let sparse1 = vector_convert(v1, VectorType::Float32Sparse).unwrap();
@@ -256,8 +264,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
         let d1 = vector_f32_distance_l2_rust(v1.as_f32_slice(), v2.as_f32_slice());
         let d2 = vector_f32_distance_l2_simsimd(v1.as_f32_slice(), v2.as_f32_slice());
         (d1.is_nan() && d2.is_nan()) || (d1 - d2).abs() < 1e-4
@@ -268,8 +284,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float64Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float64Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float64Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float64Dense,
+        )
+        .unwrap();
         let d1 = vector_f64_distance_l2_rust(v1.as_f64_slice(), v2.as_f64_slice());
         let d2 = vector_f64_distance_l2_simsimd(v1.as_f64_slice(), v2.as_f64_slice());
         (d1.is_nan() && d2.is_nan()) || (d1 - d2).abs() < 1e-6
@@ -281,8 +305,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
         let v1_f8 = vector_convert(v1, VectorType::Float8).unwrap();
         let v2_f8 = vector_convert(v2, VectorType::Float8).unwrap();
         let d_f8 = vector_distance_l2(&v1_f8, &v2_f8).unwrap();

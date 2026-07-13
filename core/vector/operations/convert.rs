@@ -1,9 +1,10 @@
 use crate::{
-    alloc::{TursoAllocExt, TursoIteratorExt, TursoVecExt, Vec},
+    alloc::{TursoAllocExt, TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt, Vec},
     vector::vector_types::{Vector, VectorType},
     Result, ValueBlob,
 };
 
+#[turso_macros::allocation_site(crate::alloc::VectorAllocationSite::Convert)]
 pub fn vector_convert(v: Vector, target_type: VectorType) -> Result<Vector> {
     if v.vector_type == target_type {
         return Ok(v);
@@ -22,10 +23,10 @@ pub fn vector_convert(v: Vector, target_type: VectorType) -> Result<Vector> {
                 if value == 0.0 {
                     continue;
                 }
-                idx.push(i as u32);
-                values.push(value);
+                idx.try_push(i as u32)?;
+                values.try_push(value)?;
             }
-            Ok(Vector::from_f32_sparse(v.dims, values, idx))
+            Ok(Vector::from_f32_sparse(v.dims, values, idx)?)
         }
         (VectorType::Float64Dense, VectorType::Float32Sparse) => {
             let mut idx: Vec<u32> = TursoAllocExt::new();
@@ -34,14 +35,14 @@ pub fn vector_convert(v: Vector, target_type: VectorType) -> Result<Vector> {
                 if value == 0.0 {
                     continue;
                 }
-                idx.push(i as u32);
-                values.push(value as f32);
+                idx.try_push(i as u32)?;
+                values.try_push(value as f32)?;
             }
-            Ok(Vector::from_f32_sparse(v.dims, values, idx))
+            Ok(Vector::from_f32_sparse(v.dims, values, idx)?)
         }
         (VectorType::Float32Sparse, VectorType::Float32Dense) => {
             let sparse = v.as_f32_sparse();
-            let mut data = crate::alloc::vec![0f32; v.dims];
+            let mut data = crate::alloc::try_vec![0f32; v.dims]?;
             for (&i, &value) in sparse.idx.iter().zip(sparse.values.iter()) {
                 data[i as usize] = value;
             }
@@ -49,7 +50,7 @@ pub fn vector_convert(v: Vector, target_type: VectorType) -> Result<Vector> {
         }
         (VectorType::Float32Sparse, VectorType::Float64Dense) => {
             let sparse = v.as_f32_sparse();
-            let mut data = crate::alloc::vec![0f64; v.dims];
+            let mut data = crate::alloc::try_vec![0f64; v.dims]?;
             for (&i, &value) in sparse.idx.iter().zip(sparse.values.iter()) {
                 data[i as usize] = value as f64;
             }
@@ -59,7 +60,7 @@ pub fn vector_convert(v: Vector, target_type: VectorType) -> Result<Vector> {
         (VectorType::Float32Dense, VectorType::Float1Bit) => {
             let dims = v.dims;
             let byte_count = dims.div_ceil(8);
-            let mut bits = crate::alloc::vec![0u8; byte_count];
+            let mut bits = crate::alloc::try_vec![0u8; byte_count]?;
             for (i, &val) in v.as_f32_slice().iter().enumerate() {
                 if val > 0.0 {
                     bits[i / 8] |= 1 << (i & 7);
@@ -70,7 +71,7 @@ pub fn vector_convert(v: Vector, target_type: VectorType) -> Result<Vector> {
         (VectorType::Float64Dense, VectorType::Float1Bit) => {
             let dims = v.dims;
             let byte_count = dims.div_ceil(8);
-            let mut bits = crate::alloc::vec![0u8; byte_count];
+            let mut bits = crate::alloc::try_vec![0u8; byte_count]?;
             for (i, &val) in v.as_f64_slice().iter().enumerate() {
                 if val > 0.0 {
                     bits[i / 8] |= 1 << (i & 7);
@@ -155,7 +156,7 @@ fn convert_floats_to_f8(
     dims: usize,
 ) -> Result<Vector<'static>> {
     if dims == 0 {
-        return Ok(Vector::from_f8(0, crate::alloc::vec![], 0.0, 0.0));
+        return Ok(Vector::from_f8(0, crate::alloc::vec![], 0.0, 0.0)?);
     }
     let mut min_val = f32::INFINITY;
     let mut max_val = f32::NEG_INFINITY;
@@ -169,7 +170,7 @@ fn convert_floats_to_f8(
     }
     let alpha = (max_val - min_val) / 255.0;
     let shift = min_val;
-    let mut quantized = <ValueBlob as TursoVecExt<u8>>::with_capacity(dims);
+    let mut quantized = <ValueBlob as TursoTryWithCapacityExt>::try_with_capacity_ext(dims)?;
     for val in values {
         let q = if alpha == 0.0 {
             0u8
@@ -179,7 +180,7 @@ fn convert_floats_to_f8(
         };
         quantized.push(q);
     }
-    Ok(Vector::from_f8(dims, quantized, alpha, shift))
+    Ok(Vector::from_f8(dims, quantized, alpha, shift)?)
 }
 
 #[cfg(test)]
@@ -213,7 +214,7 @@ mod tests {
         Vector {
             vector_type: v.vector_type,
             dims: v.dims,
-            owned: Some(value_blob_from_slice(v.bin_data())),
+            owned: Some(value_blob_from_slice(v.bin_data()).expect(ALLOC_ERR_MSG)),
             refer: None,
         }
     }
@@ -323,7 +324,11 @@ mod tests {
     /// Float1Bit roundtrip preserves sign information: positive → 1, non-positive → -1.
     #[quickcheck]
     fn prop_vector_convert_1bit_roundtrip(v: ArbitraryVector<100>) -> bool {
-        let v_f32 = vector_convert(v.into(), VectorType::Float32Dense).unwrap();
+        let v_f32 = vector_convert(
+            v.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
         let orig_slice = v_f32.as_f32_slice().to_vec();
         let v_1bit = vector_convert(v_f32, VectorType::Float1Bit).unwrap();
         let v_back = vector_convert(v_1bit, VectorType::Float32Dense).unwrap();
@@ -341,7 +346,11 @@ mod tests {
     /// Float8 roundtrip approximately preserves values within one quantization step.
     #[quickcheck]
     fn prop_vector_convert_f8_roundtrip(v: ArbitraryVector<100>) -> bool {
-        let v_f32 = vector_convert(v.into(), VectorType::Float32Dense).unwrap();
+        let v_f32 = vector_convert(
+            v.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
         let orig_slice = v_f32.as_f32_slice().to_vec();
         let v_f8 = vector_convert(v_f32, VectorType::Float8).unwrap();
         let v_back = vector_convert(v_f8, VectorType::Float32Dense).unwrap();
@@ -363,7 +372,7 @@ mod tests {
     /// All type-pair conversions succeed for arbitrary vectors.
     #[quickcheck]
     fn prop_vector_convert_all_pairs(v: ArbitraryVector<16>) -> bool {
-        let v: Vector = v.into();
+        let v: Vector = v.try_into().expect("generated vector must be valid");
         let all_types = [
             VectorType::Float32Dense,
             VectorType::Float64Dense,
@@ -394,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_vector_convert_empty_f8_to_f32() {
-        let empty_f8 = Vector::from_f8(0, crate::alloc::vec![], 0.0, 0.0);
+        let empty_f8 = Vector::from_f8(0, crate::alloc::vec![], 0.0, 0.0).unwrap();
         let f32_vec = vector_convert(empty_f8, VectorType::Float32Dense).unwrap();
         assert_eq!(f32_vec.dims, 0);
         assert!(f32_vec.as_f32_slice().is_empty());

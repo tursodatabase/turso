@@ -3083,7 +3083,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 ))));
             }
             // BLOB (n >= 12 && n & 1 == 0)
-            n if n >= 12 && n & 1 == 0 => {
+            n if n >= 12 && n & 1 == 0 => crate::with_value_blob_allocation_site!(RecordDecode, {
                 let content_size = ((n - 12) / 2) as usize;
                 if unlikely(data.len() < content_size) {
                     return Some(Err(LimboError::Corrupt("Invalid Blob value".into())));
@@ -3097,14 +3097,16 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                         }
                     }
                     _ => {
-                        if let Err(err) =
-                            dest.set_blob(crate::types::value_blob_from_slice(blob_data))
-                        {
+                        let blob = match crate::types::value_blob_from_slice(blob_data) {
+                            Ok(blob) => blob,
+                            Err(err) => return Some(Err(err.into())),
+                        };
+                        if let Err(err) = dest.set_blob(blob) {
                             return Some(Err(err));
                         }
                     }
                 }
-            }
+            }),
             // TEXT (n >= 13 && n & 1 == 1)
             n if n >= 13 && n & 1 == 1 => {
                 let content_size = ((n - 13) / 2) as usize;

@@ -1896,11 +1896,14 @@ mod tests {
     #[test]
     fn test_blob_nul_truncation() {
         // Bug 9: %s on blobs truncates at first NUL byte
-        let blob_val = Register::Value(Value::from_slice(&[0x48, 0x00, 0x4C])); // H\0L
+        let blob_val = Register::Value(
+            Value::from_slice(&[0x48, 0x00, 0x4C]).expect(crate::alloc::ALLOC_ERR_MSG),
+        ); // H\0L
         let result = exec_printf(&[text("%s"), blob_val]).unwrap();
         assert_eq!(result, *text("H").get_value());
 
-        let blob_hello = Register::Value(Value::from_slice(b"Hello"));
+        let blob_hello =
+            Register::Value(Value::from_slice(b"Hello").expect(crate::alloc::ALLOC_ERR_MSG));
         assert_eq!(
             exec_printf(&[text("%s"), blob_hello]).unwrap(),
             *text("Hello").get_value()

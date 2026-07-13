@@ -235,8 +235,8 @@ fn make_sort_comparator(
                     (_, ValueRef::Null) => Ordering::Greater,
                     _ => {
                         // Decode from ValueRef to Value for value_to_bigdecimal
-                        let a_val = a.to_owned();
-                        let b_val = b.to_owned();
+                        let a_val = a.to_owned()?;
+                        let b_val = b.to_owned()?;
                         match (value_to_bigdecimal(&a_val), value_to_bigdecimal(&b_val)) {
                             (Ok(a_dec), Ok(b_dec)) => a_dec.cmp(&b_dec),
                             _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
@@ -1063,15 +1063,15 @@ pub fn op_comparison(
 
     match (new_lhs, new_rhs) {
         (Some(new_lhs), None) => {
-            state.registers[lhs].set_value(new_lhs.as_value_ref().to_owned());
+            state.registers[lhs].set_value(new_lhs.as_value_ref().to_owned()?);
         }
         (None, Some(new_rhs)) => {
-            state.registers[rhs].set_value(new_rhs.as_value_ref().to_owned());
+            state.registers[rhs].set_value(new_rhs.as_value_ref().to_owned()?);
         }
         (Some(new_lhs), Some(new_rhs)) => {
             let (new_lhs, new_rhs) = (
-                new_lhs.as_value_ref().to_owned(),
-                new_rhs.as_value_ref().to_owned(),
+                new_lhs.as_value_ref().to_owned()?,
+                new_rhs.as_value_ref().to_owned()?,
             );
             state.registers[lhs].set_value(new_lhs);
             state.registers[rhs].set_value(new_rhs);
@@ -1932,7 +1932,7 @@ pub fn op_column(
                         };
                         if let Some(record) = record {
                             state.registers[*dest].set_value(match record.get_value_opt(*column) {
-                                Some(val) => val.to_owned(),
+                                Some(val) => val.to_owned()?,
                                 None => default.clone().unwrap_or(Value::Null),
                             });
                         } else {
@@ -2296,6 +2296,7 @@ pub fn op_array_element(
                     }
                     vref.to_owned()
                 })
+                .transpose()?
                 .unwrap_or(Value::Null),
             Err(_) => Value::Null,
         },
@@ -5406,7 +5407,7 @@ pub fn seek_internal(
                         let new_val = apply_numeric_affinity(temp_value.as_value_ref(), false);
                         let converted = new_val.is_some();
                         if let Some(new_val) = new_val {
-                            temp_value = new_val.to_owned();
+                            temp_value = new_val.to_owned()?;
                         }
                         converted
                     } else {
@@ -7462,7 +7463,7 @@ pub fn op_function(
             }
             JsonFunc::JsonValid => {
                 let json_value = &state.registers[*start_reg];
-                state.registers[*dest].set_value(is_json_valid(json_value.get_value()));
+                state.registers[*dest].set_value(is_json_valid(json_value.get_value())?);
             }
             JsonFunc::JsonPatch => {
                 assert_eq!(arg_count, 2);
@@ -7625,7 +7626,7 @@ pub fn op_function(
                 };
                 let result = reg_value_argument
                     .get_value()
-                    .exec_cast(reg_value_type.as_str());
+                    .exec_cast(reg_value_type.as_str())?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Changes => {
@@ -7669,7 +7670,7 @@ pub fn op_function(
                 } else {
                     let pattern_cow = match pattern_value {
                         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                        v => match v.exec_cast("TEXT") {
+                        v => match v.exec_cast("TEXT")? {
                             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                             _ => unreachable!("Cast to TEXT should yield Text"),
                         },
@@ -7677,7 +7678,7 @@ pub fn op_function(
 
                     let match_cow = match match_value {
                         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                        v => match v.exec_cast("TEXT") {
+                        v => match v.exec_cast("TEXT")? {
                             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                             _ => unreachable!("Cast to TEXT should yield Text"),
                         },
@@ -7724,7 +7725,7 @@ pub fn op_function(
                             _ => {
                                 let escape_cow = match escape_value {
                                     Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                                    v => match v.exec_cast("TEXT") {
+                                    v => match v.exec_cast("TEXT")? {
                                         Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                         _ => unreachable!("Cast to TEXT should yield Text"),
                                     },
@@ -7748,7 +7749,7 @@ pub fn op_function(
                         // 3. Prepare Pattern and Text
                         let pattern_cow = match pattern_value {
                             Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                            v => match v.exec_cast("TEXT") {
+                            v => match v.exec_cast("TEXT")? {
                                 Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                 _ => unreachable!("Cast to TEXT should yield Text"),
                             },
@@ -7756,7 +7757,7 @@ pub fn op_function(
 
                         let match_cow = match match_value {
                             Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                            v => match v.exec_cast("TEXT") {
+                            v => match v.exec_cast("TEXT")? {
                                 Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                 _ => unreachable!("Cast to TEXT should yield Text"),
                             },
@@ -8001,7 +8002,7 @@ pub fn op_function(
                     str_value.get_value(),
                     start_value.get_value(),
                     length_value.map(|x| x.get_value()),
-                );
+                )?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Date => {
@@ -8083,7 +8084,7 @@ pub fn op_function(
                     source.get_value(),
                     pattern.get_value(),
                     replacement.get_value(),
-                ));
+                )?);
             }
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
@@ -13377,11 +13378,10 @@ pub fn op_concat(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Concat { lhs, rhs, dest }, insn);
-    state.registers[*dest].set_value(
-        state.registers[*lhs]
-            .get_value()
-            .exec_concat(state.registers[*rhs].get_value()),
-    );
+    let value = state.registers[*lhs]
+        .get_value()
+        .exec_concat(state.registers[*rhs].get_value())?;
+    state.registers[*dest].set_value(value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -14116,7 +14116,7 @@ pub fn op_cast(
         Affinity::Numeric => value.exec_cast("NUMERIC"),
         Affinity::Integer => value.exec_cast("INTEGER"),
         Affinity::Real => value.exec_cast("REAL"),
-    };
+    }?;
 
     state.registers[*reg].set_value(result);
     state.pc += 1;

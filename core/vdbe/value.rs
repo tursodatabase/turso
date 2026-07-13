@@ -457,7 +457,7 @@ impl Value {
         value: &Value,
         start_value: &Value,
         length_value: Option<&Value>,
-    ) -> Value {
+    ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
         /// Function is stabilized but not released for version 1.88 \
         /// https://doc.rust-lang.org/src/core/str/mod.rs.html#453
         const fn ceil_char_boundary(s: &str, index: usize) -> usize {
@@ -538,18 +538,20 @@ impl Value {
             (start, end)
         }
 
-        let start_value = start_value.exec_cast("INT");
-        let length_value = length_value.map(|value| value.exec_cast("INT"));
+        let start_value = start_value.exec_cast("INT")?;
+        let length_value = length_value
+            .map(|value| value.exec_cast("INT"))
+            .transpose()?;
 
         // If length is explicitly NULL, return NULL (SQLite behavior)
         if matches!(length_value, Some(Value::Null)) {
-            return Value::Null;
+            return Ok(Value::Null);
         }
 
-        match (value, start_value) {
+        Ok(match (value, start_value) {
             (Value::Blob(b), Value::Numeric(Numeric::Integer(start))) => {
                 let (start, end) = calculate_postions(start, b.len(), length_value.as_ref());
-                Value::from_slice(&b[start..end])
+                return Value::from_slice(&b[start..end]);
             }
             (value, Value::Numeric(Numeric::Integer(start))) => {
                 if let Some(text) = value.cast_text() {
@@ -577,7 +579,7 @@ impl Value {
                 }
             }
             _ => Value::Null,
-        }
+        })
     }
 
     pub fn exec_instr(&self, pattern: &Value) -> Value {
@@ -880,21 +882,24 @@ impl Value {
             .unwrap_or(jump_if_null)
     }
 
-    pub fn exec_cast(&self, datatype: &str) -> Value {
+    pub fn exec_cast(
+        &self,
+        datatype: &str,
+    ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
         if matches!(self, Value::Null) {
-            return Value::Null;
+            return Ok(Value::Null);
         }
-        match Affinity::affinity(datatype) {
+        Ok(match Affinity::affinity(datatype) {
             // NONE	Casting a value to a type-name with no affinity causes the value to be converted into a BLOB. Casting to a BLOB consists of first casting the value to TEXT in the encoding of the database connection, then interpreting the resulting byte sequence as a BLOB instead of as TEXT.
             // Historically called NONE, but it's the same as BLOB
             Affinity::Blob => {
                 if let Value::Blob(blob) = self {
-                    return Value::Blob(blob.clone());
+                    return Ok(Value::Blob(blob.clone()));
                 }
                 // Convert to TEXT first, then interpret as BLOB
                 // TODO: handle encoding
                 let text = self.to_string();
-                Value::from_slice(text.as_bytes())
+                return Value::from_slice(text.as_bytes());
             }
             // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
             // Casting an INTEGER or REAL value into TEXT renders the value as if via sqlite3_snprintf() except that the resulting TEXT uses the encoding of the database connection.
@@ -947,10 +952,14 @@ impl Value {
                         .unwrap_or_else(|| Value::from_i64(0))
                 }
             },
-        }
+        })
     }
 
-    pub fn exec_replace(source: &Value, pattern: &Value, replacement: &Value) -> Value {
+    pub fn exec_replace(
+        source: &Value,
+        pattern: &Value,
+        replacement: &Value,
+    ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
         // The replace(X,Y,Z) function returns a string formed by substituting string Z for every occurrence of
         // string Y in string X. The BINARY collating sequence is used for comparisons. If Y is an empty string
         // then return X unchanged. If Z is not initially a string, it is cast to a UTF-8 string prior to processing.
@@ -960,24 +969,24 @@ impl Value {
             || matches!(pattern, Value::Null)
             || matches!(replacement, Value::Null)
         {
-            return Value::Null;
+            return Ok(Value::Null);
         }
 
-        let source = source.exec_cast("TEXT");
-        let pattern = pattern.exec_cast("TEXT");
-        let replacement = replacement.exec_cast("TEXT");
+        let source = source.exec_cast("TEXT")?;
+        let pattern = pattern.exec_cast("TEXT")?;
+        let replacement = replacement.exec_cast("TEXT")?;
 
         // If any of the casts failed, panic as text casting is not expected to fail.
         match (&source, &pattern, &replacement) {
             (Value::Text(source), Value::Text(pattern), Value::Text(replacement)) => {
                 if pattern.as_str().is_empty() || pattern.as_str().starts_with('\0') {
-                    return Value::Text(source.clone());
+                    return Ok(Value::Text(source.clone()));
                 }
 
                 let result = source
                     .as_str()
                     .replace(pattern.as_str(), replacement.as_str());
-                Value::build_text(result)
+                Ok(Value::build_text(result))
             }
             _ => unreachable!("text cast should never fail"),
         }
@@ -1151,25 +1160,30 @@ impl Value {
         }
     }
 
-    pub fn exec_concat(&self, rhs: &Value) -> Value {
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::Concat)]
+    pub fn exec_concat(
+        &self,
+        rhs: &Value,
+    ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
-            let mut blob = <crate::ValueBlob as crate::alloc::TursoVecExt<u8>>::with_capacity(
-                lhs.len() + rhs.len(),
-            );
+            let mut blob =
+                <crate::ValueBlob as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
+                    lhs.len() + rhs.len(),
+                )?;
             blob.extend_from_slice(lhs);
             blob.extend_from_slice(rhs);
-            return Value::Blob(blob);
+            return Ok(Value::Blob(blob));
         }
 
         let Some(lhs) = self.cast_text() else {
-            return Value::Null;
+            return Ok(Value::Null);
         };
 
         let Some(rhs) = rhs.cast_text() else {
-            return Value::Null;
+            return Ok(Value::Null);
         };
 
-        Value::build_text(lhs + &rhs)
+        Ok(Value::build_text(lhs + &rhs))
     }
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
@@ -1640,6 +1654,22 @@ mod tests {
 
     use rand::{Rng, RngCore};
 
+    fn blob(bytes: &[u8]) -> Value {
+        Value::from_slice(bytes).expect(crate::alloc::ALLOC_ERR_MSG)
+    }
+
+    fn allocated(result: std::result::Result<Value, crate::alloc::TryReserveError>) -> Value {
+        result.expect(crate::alloc::ALLOC_ERR_MSG)
+    }
+
+    #[test]
+    fn exec_concat_builds_blob_fallibly() {
+        let lhs = blob(&[1, 2]);
+        let rhs = blob(&[3, 4]);
+
+        assert_eq!(lhs.exec_concat(&rhs).unwrap(), blob(&[1, 2, 3, 4]));
+    }
+
     #[test]
     fn test_exec_add() {
         let inputs = vec![
@@ -2008,7 +2038,7 @@ mod tests {
         let expected_len = Value::from_i64(7);
         assert_eq!(input_float.exec_length(), expected_len);
 
-        let expected_blob = Value::from_slice(b"example");
+        let expected_blob = blob(b"example");
         let expected_len = Value::from_i64(7);
         assert_eq!(expected_blob.exec_length(), expected_len);
     }
@@ -2058,7 +2088,7 @@ mod tests {
         let expected: Value = Value::build_text("text");
         assert_eq!(input.exec_typeof(), expected);
 
-        let input = Value::from_slice(b"limbo");
+        let input = blob(b"limbo");
         let expected: Value = Value::build_text("blob");
         assert_eq!(input.exec_typeof(), expected);
     }
@@ -2077,10 +2107,7 @@ mod tests {
         assert_eq!(Value::from_f64(0.0).exec_unicode(), Value::from_i64(48));
         assert_eq!(Value::from_f64(23.45).exec_unicode(), Value::from_i64(50));
         assert_eq!(Value::Null.exec_unicode(), Value::Null);
-        assert_eq!(
-            Value::from_slice(b"example").exec_unicode(),
-            Value::from_i64(101)
-        );
+        assert_eq!(blob(b"example").exec_unicode(), Value::from_i64(101));
     }
 
     #[test]
@@ -2173,7 +2200,7 @@ mod tests {
             Value::build_text("1.5")
         );
         assert_eq!(
-            Value::from_slice(&[0xDE, 0xAD]).exec_unistr_quote(),
+            blob(&[0xDE, 0xAD]).exec_unistr_quote(),
             Value::build_text("X'DEAD'")
         );
         assert_eq!(
@@ -2456,27 +2483,27 @@ mod tests {
         let expected_val = Value::build_text("31322E3334");
         assert_eq!(input_float.exec_hex(), expected_val);
 
-        let input_blob = Value::from_slice(&[0xff]);
+        let input_blob = blob(&[0xff]);
         let expected_val = Value::build_text("FF");
         assert_eq!(input_blob.exec_hex(), expected_val);
     }
 
     #[test]
     fn test_cast_blob_preserves_blob_bytes() {
-        let input_blob = Value::from_slice(&[0xd2, 0x64, 0xc0, 0x07, 0xf6, 0x44, 0xe4, 0x59]);
+        let input_blob = blob(&[0xd2, 0x64, 0xc0, 0x07, 0xf6, 0x44, 0xe4, 0x59]);
         let expected = input_blob.clone();
 
-        assert_eq!(input_blob.exec_cast("BLOB"), expected);
+        assert_eq!(allocated(input_blob.exec_cast("BLOB")), expected);
     }
 
     #[test]
     fn test_unhex() {
         let input = Value::build_text("6f");
-        let expected = Value::from_slice(&[0x6f]);
+        let expected = blob(&[0x6f]);
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("6f");
-        let expected = Value::from_slice(&[0x6f]);
+        let expected = blob(&[0x6f]);
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("611");
@@ -2484,7 +2511,7 @@ mod tests {
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("");
-        let expected = Value::from_slice(&[]);
+        let expected = blob(&[]);
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("61x");
@@ -2496,19 +2523,19 @@ mod tests {
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("aa-bb");
-        let expected = Value::from_slice(&[0xaa, 0xbb]);
+        let expected = blob(&[0xaa, 0xbb]);
         assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
 
         let input = Value::build_text("aa--bb");
-        let expected = Value::from_slice(&[0xaa, 0xbb]);
+        let expected = blob(&[0xaa, 0xbb]);
         assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
 
         let input = Value::build_text("aa-bb-cc");
-        let expected = Value::from_slice(&[0xaa, 0xbb, 0xcc]);
+        let expected = blob(&[0xaa, 0xbb, 0xcc]);
         assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
 
         let input = Value::build_text("aa bb");
-        let expected = Value::from_slice(&[0xaa, 0xbb]);
+        let expected = blob(&[0xaa, 0xbb]);
         assert_eq!(input.exec_unhex(Some(&Value::build_text(" "))), expected);
 
         let input = Value::build_text("A BCD");
@@ -2807,7 +2834,11 @@ mod tests {
         let length_value = Value::from_i64(3);
         let expected_val = Value::build_text("lim");
         assert_eq!(
-            Value::exec_substring(&str_value, &start_value, Some(&length_value)),
+            allocated(Value::exec_substring(
+                &str_value,
+                &start_value,
+                Some(&length_value),
+            )),
             expected_val
         );
 
@@ -2816,7 +2847,11 @@ mod tests {
         let length_value = Value::from_i64(10);
         let expected_val = Value::build_text("limbo");
         assert_eq!(
-            Value::exec_substring(&str_value, &start_value, Some(&length_value)),
+            allocated(Value::exec_substring(
+                &str_value,
+                &start_value,
+                Some(&length_value),
+            )),
             expected_val
         );
 
@@ -2825,7 +2860,11 @@ mod tests {
         let length_value = Value::from_i64(3);
         let expected_val = Value::build_text("");
         assert_eq!(
-            Value::exec_substring(&str_value, &start_value, Some(&length_value)),
+            allocated(Value::exec_substring(
+                &str_value,
+                &start_value,
+                Some(&length_value),
+            )),
             expected_val
         );
 
@@ -2834,7 +2873,11 @@ mod tests {
         let length_value = Value::Null;
         let expected_val = Value::Null;
         assert_eq!(
-            Value::exec_substring(&str_value, &start_value, Some(&length_value)),
+            allocated(Value::exec_substring(
+                &str_value,
+                &start_value,
+                Some(&length_value),
+            )),
             expected_val
         );
 
@@ -2843,7 +2886,11 @@ mod tests {
         let length_value = Value::Null;
         let expected_val = Value::Null;
         assert_eq!(
-            Value::exec_substring(&str_value, &start_value, Some(&length_value)),
+            allocated(Value::exec_substring(
+                &str_value,
+                &start_value,
+                Some(&length_value),
+            )),
             expected_val
         );
 
@@ -2852,7 +2899,11 @@ mod tests {
         let length_value = Value::from_i64(-4_829_175_794_346_763_833);
         let expected_val = Value::build_text("");
         assert_eq!(
-            Value::exec_substring(&str_value, &start_value, Some(&length_value)),
+            allocated(Value::exec_substring(
+                &str_value,
+                &start_value,
+                Some(&length_value),
+            )),
             expected_val
         );
     }
@@ -2939,23 +2990,23 @@ mod tests {
         let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::from_slice(&[1, 2, 3, 4, 5]);
-        let pattern = Value::from_slice(&[3, 4]);
+        let input = blob(&[1, 2, 3, 4, 5]);
+        let pattern = blob(&[3, 4]);
         let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::from_slice(&[1, 2, 3, 4, 5]);
-        let pattern = Value::from_slice(&[3, 2]);
+        let input = blob(&[1, 2, 3, 4, 5]);
+        let pattern = blob(&[3, 2]);
         let expected = Value::from_i64(0);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::from_slice(&[0x61, 0x62, 0x63, 0x64, 0x65]);
+        let input = blob(&[0x61, 0x62, 0x63, 0x64, 0x65]);
         let pattern = Value::build_text("cd");
         let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::build_text("abcde");
-        let pattern = Value::from_slice(&[0x63, 0x64]);
+        let pattern = blob(&[0x63, 0x64]);
         let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
@@ -3011,19 +3062,19 @@ mod tests {
         let expected = Some(Value::from_i64(0));
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::from_slice(b"abc");
+        let input = blob(b"abc");
         let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::from_slice(b"42");
+        let input = blob(b"42");
         let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::from_slice(b"-42");
+        let input = blob(b"-42");
         let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::from_slice(b"0");
+        let input = blob(b"0");
         let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
@@ -3035,11 +3086,11 @@ mod tests {
     #[test]
     fn test_exec_zeroblob() {
         let input = Value::from_i64(0);
-        let expected = Value::from_slice(&[]);
+        let expected = blob(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::Null;
-        let expected = Value::from_slice(&[]);
+        let expected = blob(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::from_i64(4);
@@ -3047,7 +3098,7 @@ mod tests {
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::from_i64(-1);
-        let expected = Value::from_slice(&[]);
+        let expected = blob(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::build_text("5");
@@ -3055,19 +3106,19 @@ mod tests {
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::build_text("-5");
-        let expected = Value::from_slice(&[]);
+        let expected = blob(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::build_text("text");
-        let expected = Value::from_slice(&[]);
+        let expected = blob(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::from_f64(2.6);
         let expected = Value::Blob(crate::alloc::vec![0; 2]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
-        let input = Value::from_slice(&[1]);
-        let expected = Value::from_slice(&[]);
+        let input = blob(&[1]);
+        let expected = blob(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         // Test TooBig error
@@ -3082,7 +3133,7 @@ mod tests {
         let replace_str = Value::build_text("a");
         let expected_str = Value::build_text("aoa");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3091,7 +3142,7 @@ mod tests {
         let replace_str = Value::build_text("");
         let expected_str = Value::build_text("o");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3100,7 +3151,7 @@ mod tests {
         let replace_str = Value::build_text("abc");
         let expected_str = Value::build_text("abcoabc");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3109,7 +3160,7 @@ mod tests {
         let replace_str = Value::build_text("b");
         let expected_str = Value::build_text("bob");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3118,7 +3169,7 @@ mod tests {
         let replace_str = Value::build_text("a");
         let expected_str = Value::build_text("bob");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3127,7 +3178,7 @@ mod tests {
         let replace_str = Value::build_text("a");
         let expected_str = Value::Null;
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3136,7 +3187,7 @@ mod tests {
         let replace_str = Value::build_text("a");
         let expected_str = Value::build_text("boa");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3145,7 +3196,7 @@ mod tests {
         let replace_str = Value::build_text("a");
         let expected_str = Value::build_text("boa");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3154,7 +3205,7 @@ mod tests {
         let replace_str = Value::build_text("a");
         let expected_str = Value::build_text("bo5");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3163,7 +3214,7 @@ mod tests {
         let replace_str = Value::from_f64(6.0);
         let expected_str = Value::build_text("bo6.0");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
 
@@ -3173,7 +3224,7 @@ mod tests {
         let replace_str = Value::from_f64(0.3);
         let expected_str = Value::build_text("tes0.3");
         assert_eq!(
-            Value::exec_replace(&input_str, &pattern_str, &replace_str),
+            allocated(Value::exec_replace(&input_str, &pattern_str, &replace_str,)),
             expected_str
         );
     }

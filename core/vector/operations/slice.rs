@@ -5,6 +5,7 @@ use crate::{
     LimboError, Result, ValueBlob,
 };
 
+#[turso_macros::allocation_site(crate::alloc::VectorAllocationSite::Slice)]
 pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector<'static>> {
     if start > end {
         return Err(LimboError::InvalidArgument(
@@ -22,7 +23,7 @@ pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector<
             dims: end - start,
             owned: Some(value_blob_from_slice(
                 &vector.bin_data()[start * 4..end * 4],
-            )),
+            )?),
             refer: None,
         }),
         VectorType::Float64Dense => Ok(Vector {
@@ -30,7 +31,7 @@ pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector<
             dims: end - start,
             owned: Some(value_blob_from_slice(
                 &vector.bin_data()[start * 8..end * 8],
-            )),
+            )?),
             refer: None,
         }),
         VectorType::Float32Sparse => {
@@ -42,9 +43,12 @@ pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector<
                 if i < start || i >= end {
                     continue;
                 }
+                values.try_reserve(4)?;
                 values.extend_from_slice(&value.to_le_bytes());
+                idx.try_reserve(4)?;
                 idx.extend_from_slice(&((i - start) as u32).to_le_bytes());
             }
+            values.try_reserve(idx.len())?;
             values.extend_from_slice(&idx);
             Ok(Vector {
                 vector_type: vector.vector_type,

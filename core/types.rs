@@ -184,9 +184,9 @@ impl<T: AnyBlob> Extendable<T> for ValueBlob {
                 self.set_len(needed);
             }
         } else {
+            // Reserve before mutation so an allocation failure leaves the old value intact.
+            self.try_reserve(needed - self.len())?;
             self.clear();
-            // Reserve mores space to extend the slice
-            self.try_reserve(self.len().abs_diff(needed))?;
             self.extend_from_slice(other_slice);
         }
         Ok(())
@@ -275,8 +275,10 @@ impl From<Text> for String {
 pub type ValueBlob = crate::alloc::Vec<u8>;
 
 #[inline]
-pub(crate) fn value_blob_from_slice(bytes: &[u8]) -> ValueBlob {
-    bytes.try_to_vec().expect(ALLOC_ERR_MSG)
+pub(crate) fn value_blob_from_slice(
+    bytes: &[u8],
+) -> std::result::Result<ValueBlob, crate::alloc::TryReserveError> {
+    bytes.try_to_vec()
 }
 
 #[cfg(feature = "serde")]
@@ -464,8 +466,9 @@ impl Value {
     }
 
     #[inline]
-    pub fn from_slice(data: &[u8]) -> Self {
-        Value::Blob(value_blob_from_slice(data))
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::FromSlice)]
+    pub fn from_slice(data: &[u8]) -> std::result::Result<Self, TryReserveError> {
+        Ok(Value::Blob(value_blob_from_slice(data)?))
     }
 
     pub fn to_text(&self) -> Option<&str> {
@@ -637,7 +640,7 @@ impl Value {
                 let Some(blob) = v.to_blob() else {
                     return Ok(Value::Null);
                 };
-                Ok(Value::from_slice(&blob))
+                Ok(Value::from_slice(&blob)?)
             }
             ExtValueType::Error => {
                 let Some(err) = v.to_error_details() else {
@@ -995,8 +998,10 @@ impl std::ops::DivAssign<Value> for Value {
     }
 }
 
-impl From<ValueRef<'_>> for Value {
-    fn from(value: ValueRef<'_>) -> Self {
+impl TryFrom<ValueRef<'_>> for Value {
+    type Error = TryReserveError;
+
+    fn try_from(value: ValueRef<'_>) -> std::result::Result<Self, Self::Error> {
         value.to_owned()
     }
 }
@@ -1107,14 +1112,21 @@ mod immutable_record {
         }
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     pub struct ImmutableRecordRef<'a> {
-        payload: &'a [u8],
+        payload: ImmutableRecordRefPayload<'a>,
+    }
+
+    #[derive(Clone)]
+    enum ImmutableRecordRefPayload<'a> {
+        Borrowed(&'a [u8]),
+        Owned(ValueBlob),
+        Shared(crate::alloc::ArcSlice<u8>),
     }
 
     impl std::fmt::Debug for ImmutableRecordRef<'_> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            let bytes = self.payload;
+            let bytes = self.get_payload();
             let preview = if bytes.len() > 20 {
                 format!("{:?} ... ({} bytes total)", &bytes[..20], bytes.len())
             } else {
@@ -1236,7 +1248,7 @@ mod immutable_record {
     fn values_owned(payload: &[u8]) -> Result<Vec<Value>> {
         let iter = iter(payload).expect("Failed to create payload iterator");
         let values = iter
-            .map(|v| Ok::<_, LimboError>(v?.to_owned()))
+            .map(|v| Ok::<_, LimboError>(v?.to_owned()?))
             .try_collect::<Result<_>>()??;
         Ok(values)
     }
@@ -1245,13 +1257,13 @@ mod immutable_record {
         let mut iter = iter(payload).expect("Failed to create payload iterator");
         let mut values = Vec::try_with_capacity_ext(range.end - range.start)?;
         if let Some(value) = iter.nth(range.start) {
-            values.push(value?.to_owned());
+            values.push(value?.to_owned()?);
         } else {
             return Ok(values);
         }
         for _ in range.start + 1..range.end {
             if let Some(value) = iter.next() {
-                values.push(value?.to_owned());
+                values.push(value?.to_owned()?);
             } else {
                 break;
             }
@@ -1427,20 +1439,20 @@ mod immutable_record {
 
     impl<'a> ImmutableRecordRef<'a> {
         #[inline(always)]
-        pub fn iter(&self) -> Result<ValueIterator<'a>, LimboError> {
-            iter(self.payload)
+        pub fn iter(&self) -> Result<ValueIterator<'_>, LimboError> {
+            iter(self.get_payload())
         }
 
-        pub fn get_values(&self) -> Result<Vec<ValueRef<'a>>> {
-            values(self.payload)
+        pub fn get_values(&self) -> Result<Vec<ValueRef<'_>>> {
+            values(self.get_payload())
         }
 
         pub fn get_two_values(
             &self,
             idx1: usize,
             idx2: usize,
-        ) -> Result<(ValueRef<'a>, ValueRef<'a>)> {
-            two_values(self.payload, idx1, idx2)
+        ) -> Result<(ValueRef<'_>, ValueRef<'_>)> {
+            two_values(self.get_payload(), idx1, idx2)
         }
 
         pub fn get_three_values(
@@ -1453,16 +1465,16 @@ mod immutable_record {
         }
 
         pub fn get_values_owned(&self) -> Result<Vec<Value>> {
-            values_owned(self.payload)
+            values_owned(self.get_payload())
         }
 
         #[inline]
-        pub fn get_value_opt(&self, idx: usize) -> Option<ValueRef<'a>> {
-            value_opt(self.payload, idx)
+        pub fn get_value_opt(&self, idx: usize) -> Option<ValueRef<'_>> {
+            value_opt(self.get_payload(), idx)
         }
 
         pub fn column_count(&self) -> usize {
-            column_count(self.payload)
+            column_count(self.get_payload())
         }
     }
 
@@ -1634,17 +1646,37 @@ mod immutable_record {
 
     impl<'a> ImmutableRecordRef<'a> {
         pub const fn from_bin_record(payload: &'a [u8]) -> Self {
-            Self { payload }
+            Self {
+                payload: ImmutableRecordRefPayload::Borrowed(payload),
+            }
+        }
+
+        pub(crate) fn from_owned_record(record: ImmutableRecord) -> ImmutableRecordRef<'static> {
+            ImmutableRecordRef {
+                payload: ImmutableRecordRefPayload::Owned(record.into_payload()),
+            }
+        }
+
+        pub(crate) fn from_shared_record(
+            payload: crate::alloc::ArcSlice<u8>,
+        ) -> ImmutableRecordRef<'static> {
+            ImmutableRecordRef {
+                payload: ImmutableRecordRefPayload::Shared(payload),
+            }
         }
 
         #[inline]
-        pub const fn get_payload(&self) -> &'a [u8] {
-            self.payload
+        pub fn get_payload(&self) -> &[u8] {
+            match &self.payload {
+                ImmutableRecordRefPayload::Borrowed(payload) => payload,
+                ImmutableRecordRefPayload::Owned(payload) => payload,
+                ImmutableRecordRefPayload::Shared(payload) => payload,
+            }
         }
 
         #[inline]
-        pub const fn is_invalidated(&self) -> bool {
-            self.payload.is_empty()
+        pub fn is_invalidated(&self) -> bool {
+            self.get_payload().is_empty()
         }
     }
 }
@@ -1978,16 +2010,16 @@ impl<'a> ValueRef<'a> {
     }
 
     #[inline]
-    pub fn to_owned(&self) -> Value {
-        match self {
+    pub fn to_owned(&self) -> std::result::Result<Value, TryReserveError> {
+        Ok(match self {
             ValueRef::Null => Value::Null,
             ValueRef::Numeric(n) => Value::from(*n),
             ValueRef::Text(text) => Value::Text(Text {
                 value: text.value.to_string().into(),
                 subtype: text.subtype,
             }),
-            ValueRef::Blob(b) => Value::from_slice(b),
-        }
+            ValueRef::Blob(b) => return Value::from_slice(b),
+        })
     }
 
     pub fn value_type(&self) -> ValueType {
@@ -3403,7 +3435,8 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn value_blob_serde_preserves_sequence_format() {
-        let encoded = serde_json::to_string(&Value::from_slice(&[1, 2, 3, 4])).unwrap();
+        let value = Value::from_slice(&[1, 2, 3, 4]).expect(crate::alloc::ALLOC_ERR_MSG);
+        let encoded = serde_json::to_string(&value).unwrap();
         assert_eq!(encoded, r#"{"Blob":[1,2,3,4]}"#);
 
         let decoded: Value = serde_json::from_str(&encoded).unwrap();
@@ -3458,7 +3491,7 @@ mod tests {
             Value::from_i64(100),
             Value::from_f64(std::f64::consts::PI),
             Value::Text(Text::new("test")),
-            Value::from_slice(&[1, 2, 3]),
+            Value::from_slice(&[1, 2, 3]).expect(crate::alloc::ALLOC_ERR_MSG),
             Value::from_i64(0),
             Value::from_i64(1),
         ]);
@@ -3979,7 +4012,7 @@ mod tests {
                 "large_field_count",
             ),
             (
-                vec![Value::from_slice(&[1, 2, 3])],
+                vec![Value::from_slice(&[1, 2, 3]).expect(crate::alloc::ALLOC_ERR_MSG)],
                 vec![ValueRef::Blob(&[1, 2, 3])],
                 "blob_first_field",
             ),
@@ -4269,7 +4302,9 @@ mod tests {
     #[test]
     fn test_serialize_blob() {
         let blob = std::vec![1, 2, 3, 4, 5];
-        let record = Record::new(vec![Value::from_slice(&blob)]);
+        let record = Record::new(vec![
+            Value::from_slice(&blob).expect(crate::alloc::ALLOC_ERR_MSG)
+        ]);
         let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 

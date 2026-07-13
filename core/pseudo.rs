@@ -25,7 +25,7 @@ impl PseudoCursor {
     #[inline]
     pub fn get_value(&self, column: usize) -> Result<Value> {
         if let Some(record) = self.current.as_ref() {
-            Ok(record.get_value(column)?.to_owned())
+            Ok(record.get_value(column)?.to_owned()?)
         } else {
             Ok(Value::Null)
         }

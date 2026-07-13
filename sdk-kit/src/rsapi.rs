@@ -1467,7 +1467,11 @@ impl TursoStatement {
                 "attempt to access row value out of bounds".to_string(),
             ));
         }
-        Ok(row.get_value(index).as_value_ref().to_owned())
+        Ok(row
+            .get_value(index)
+            .as_value_ref()
+            .to_owned()
+            .map_err(LimboError::from)?)
     }
     /// returns column count
     pub fn column_count(&self) -> usize {

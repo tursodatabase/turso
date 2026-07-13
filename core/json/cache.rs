@@ -1,5 +1,6 @@
 use std::cell::{Cell, UnsafeCell};
 
+use crate::alloc::TryReserveError;
 use crate::types::AsValueRef;
 use crate::{Value, ValueRef};
 
@@ -39,20 +40,25 @@ impl JsonCache {
         oldest_idx
     }
 
-    pub fn insert(&mut self, key: impl AsValueRef, value: &Jsonb) {
+    pub fn insert(
+        &mut self,
+        key: impl AsValueRef,
+        value: &Jsonb,
+    ) -> std::result::Result<(), TryReserveError> {
         let key = key.as_value_ref();
         if self.used < JSON_CACHE_SIZE {
-            self.entries[self.used] = Some((key.to_owned(), value.clone()));
+            self.entries[self.used] = Some((key.to_owned()?, value.clone()));
             self.age[self.used] = self.counter;
             self.counter += 1;
             self.used += 1
         } else {
             let id = self.find_oldest_entry();
 
-            self.entries[id] = Some((key.to_owned(), value.clone()));
+            self.entries[id] = Some((key.to_owned()?, value.clone()));
             self.age[id] = self.counter;
             self.counter += 1;
         }
+        Ok(())
     }
 
     pub fn lookup(&mut self, key: impl AsValueRef) -> Option<Jsonb> {
@@ -142,7 +148,7 @@ impl JsonCacheCell {
                     let result = value(key);
                     match result {
                         Ok(json) => {
-                            cache.insert(key, &json);
+                            cache.insert(key, &json)?;
                             Ok(json)
                         }
                         Err(e) => Err(e),
@@ -207,7 +213,9 @@ mod tests {
         let (key, value) = create_test_pair(json_str);
 
         // Insert a value
-        cache.insert(&key, &value);
+        cache
+            .insert(&key, &value)
+            .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // Verify it was inserted
         assert_eq!(cache.used, 1);
@@ -244,9 +252,15 @@ mod tests {
         let (key2, value2) = create_test_pair("{\"id\": 2}");
         let (key3, value3) = create_test_pair("{\"id\": 3}");
 
-        cache.insert(&key1, &value1);
-        cache.insert(&key2, &value2);
-        cache.insert(&key3, &value3);
+        cache
+            .insert(&key1, &value1)
+            .expect(crate::alloc::ALLOC_ERR_MSG);
+        cache
+            .insert(&key2, &value2)
+            .expect(crate::alloc::ALLOC_ERR_MSG);
+        cache
+            .insert(&key3, &value3)
+            .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // Verify they were all inserted
         assert_eq!(cache.used, 3);
@@ -276,10 +290,18 @@ mod tests {
         let (key4, value4) = create_test_pair("{\"id\": 4}");
         let (key5, value5) = create_test_pair("{\"id\": 5}");
 
-        cache.insert(&key1, &value1);
-        cache.insert(&key2, &value2);
-        cache.insert(&key3, &value3);
-        cache.insert(&key4, &value4);
+        cache
+            .insert(&key1, &value1)
+            .expect(crate::alloc::ALLOC_ERR_MSG);
+        cache
+            .insert(&key2, &value2)
+            .expect(crate::alloc::ALLOC_ERR_MSG);
+        cache
+            .insert(&key3, &value3)
+            .expect(crate::alloc::ALLOC_ERR_MSG);
+        cache
+            .insert(&key4, &value4)
+            .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // Cache is now full
         assert_eq!(cache.used, 4);
@@ -288,7 +310,9 @@ mod tests {
         let _ = cache.lookup(&key1);
 
         // Insert one more entry - should evict the oldest (key2)
-        cache.insert(&key5, &value5);
+        cache
+            .insert(&key5, &value5)
+            .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // Cache size should still be JSON_CACHE_SIZE
         assert_eq!(cache.used, 4);
@@ -313,9 +337,15 @@ mod tests {
         let (key2, value2) = create_test_pair("{\"id\": 2}");
         let (key3, value3) = create_test_pair("{\"id\": 3}");
 
-        cache.insert(&key1, &value1);
-        cache.insert(&key2, &value2);
-        cache.insert(&key3, &value3);
+        cache
+            .insert(&key1, &value1)
+            .expect(crate::alloc::ALLOC_ERR_MSG);
+        cache
+            .insert(&key2, &value2)
+            .expect(crate::alloc::ALLOC_ERR_MSG);
+        cache
+            .insert(&key3, &value3)
+            .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // key1 should be the oldest
         assert_eq!(cache.find_oldest_entry(), 0);

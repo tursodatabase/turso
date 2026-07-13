@@ -2308,7 +2308,7 @@ impl FtsCursor {
                         &[
                             Value::Text(Text::new(path_str.clone())),
                             Value::from_i64(actual_chunk_idx as i64),
-                            Value::from_slice(chunk_data),
+                            Value::from_slice(chunk_data)?,
                         ],
                         3,
                     )?;
