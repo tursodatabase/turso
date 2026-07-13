@@ -1,11 +1,10 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::FileSyncType;
-use crate::sync::Mutex;
+use crate::sync::{Mutex, RwLock};
 use crate::turso_assert;
 use crate::Result;
 use std::{
-    cell::{Cell, UnsafeCell},
     collections::{BTreeMap, HashMap},
     sync::Arc,
 };
@@ -18,6 +17,11 @@ pub struct MemoryIO {
 // TODO: page size flag
 pub(super) const PAGE_SIZE: usize = 4096;
 pub(super) type MemPage = Box<[u8; PAGE_SIZE]>;
+
+struct MemStoreInner {
+    pages: BTreeMap<usize, MemPage>,
+    size: u64,
+}
 
 impl MemoryIO {
     #[allow(clippy::arc_with_non_send_sync)]
@@ -89,40 +93,51 @@ impl IO for MemoryIO {
 /// In-memory page-backed storage shared by the synchronous [`MemoryIO`] and
 /// the yield-forcing [`super::MemoryYieldIO`] backends used for testing.
 pub(super) struct MemStore {
-    pages: UnsafeCell<BTreeMap<usize, MemPage>>,
-    size: Cell<u64>,
+    inner: RwLock<MemStoreInner>,
 }
-
-// SAFETY: callers serialize dependent operations (a dependent read is only
-// issued after the prior write's completion was observed), matching the
-// invariant the real async backends rely on. This is the same contract
-// `MemoryFile` has always upheld.
-unsafe impl Sync for MemStore {}
 
 impl MemStore {
     pub(super) fn new() -> Self {
         Self {
-            pages: BTreeMap::new().into(),
-            size: 0.into(),
+            inner: RwLock::new(MemStoreInner {
+                pages: BTreeMap::new(),
+                size: 0,
+            }),
         }
     }
 
-    #[allow(clippy::mut_from_ref)]
-    fn get_or_allocate_page(&self, page_no: u64) -> &mut MemPage {
-        unsafe {
-            let pages = &mut *self.pages.get();
-            pages
-                .entry(page_no as usize)
-                .or_insert_with(|| Box::new([0; PAGE_SIZE]))
-        }
+    fn get_or_allocate_page(inner: &mut MemStoreInner, page_no: usize) -> &mut MemPage {
+        inner
+            .pages
+            .entry(page_no)
+            .or_insert_with(|| Box::new([0; PAGE_SIZE]))
     }
 
-    fn get_page(&self, page_no: usize) -> Option<&MemPage> {
-        unsafe { (*self.pages.get()).get(&page_no) }
+    fn write_at_inner(inner: &mut MemStoreInner, pos: u64, data: &[u8]) -> usize {
+        let buf_len = data.len();
+        if buf_len == 0 {
+            return 0;
+        }
+        let mut offset = pos as usize;
+        let mut remaining = buf_len;
+        let mut buf_offset = 0;
+        while remaining > 0 {
+            let page_no = offset / PAGE_SIZE;
+            let page_offset = offset % PAGE_SIZE;
+            let bytes_to_write = remaining.min(PAGE_SIZE - page_offset);
+            let page = Self::get_or_allocate_page(inner, page_no);
+            page[page_offset..page_offset + bytes_to_write]
+                .copy_from_slice(&data[buf_offset..buf_offset + bytes_to_write]);
+            offset += bytes_to_write;
+            buf_offset += bytes_to_write;
+            remaining -= bytes_to_write;
+        }
+        inner.size = inner.size.max(pos + buf_len as u64);
+        buf_len
     }
 
     pub(super) fn size(&self) -> u64 {
-        self.size.get()
+        self.inner.read().size
     }
 
     /// Read `pos..` into `buf`, zero-filling holes. Returns bytes read.
@@ -131,7 +146,8 @@ impl MemStore {
         if buf_len == 0 {
             return 0;
         }
-        let file_size = self.size.get();
+        let inner = self.inner.read();
+        let file_size = inner.size;
         if pos >= file_size {
             return 0;
         }
@@ -144,7 +160,7 @@ impl MemStore {
             let page_no = offset / PAGE_SIZE;
             let page_offset = offset % PAGE_SIZE;
             let bytes_to_read = remaining.min(PAGE_SIZE - page_offset);
-            if let Some(page) = self.get_page(page_no) {
+            if let Some(page) = inner.pages.get(&page_no) {
                 dst[buf_offset..buf_offset + bytes_to_read]
                     .copy_from_slice(&page[page_offset..page_offset + bytes_to_read]);
             } else {
@@ -160,35 +176,16 @@ impl MemStore {
     /// Write `data` at `pos`, allocating pages as needed. Returns bytes written
     /// and grows the recorded file size if the write extends past it.
     pub(super) fn write_at(&self, pos: u64, data: &[u8]) -> usize {
-        let buf_len = data.len();
-        if buf_len == 0 {
-            return 0;
-        }
-        let mut offset = pos as usize;
-        let mut remaining = buf_len;
-        let mut buf_offset = 0;
-        while remaining > 0 {
-            let page_no = offset / PAGE_SIZE;
-            let page_offset = offset % PAGE_SIZE;
-            let bytes_to_write = remaining.min(PAGE_SIZE - page_offset);
-            let page = self.get_or_allocate_page(page_no as u64);
-            page[page_offset..page_offset + bytes_to_write]
-                .copy_from_slice(&data[buf_offset..buf_offset + bytes_to_write]);
-            offset += bytes_to_write;
-            buf_offset += bytes_to_write;
-            remaining -= bytes_to_write;
-        }
-        self.size
-            .set(core::cmp::max(pos + buf_len as u64, self.size.get()));
-        buf_len
+        Self::write_at_inner(&mut self.inner.write(), pos, data)
     }
 
     /// Vectored write of `buffers` starting at `pos`. Returns total bytes written.
     pub(super) fn writev(&self, pos: u64, buffers: &[Arc<Buffer>]) -> i32 {
+        let mut inner = self.inner.write();
         let mut offset = pos;
         let mut total_written = 0usize;
         for buffer in buffers {
-            let written = self.write_at(offset, buffer.as_slice());
+            let written = Self::write_at_inner(&mut inner, offset, buffer.as_slice());
             offset += written as u64;
             total_written += written;
         }
@@ -196,20 +193,19 @@ impl MemStore {
     }
 
     pub(super) fn truncate(&self, len: u64) {
-        if len < self.size.get() {
-            unsafe {
-                let pages = &mut *self.pages.get();
-                pages.retain(|&k, _| k * PAGE_SIZE < len as usize);
-            }
+        let mut inner = self.inner.write();
+        if len < inner.size {
+            inner.pages.retain(|&k, _| k * PAGE_SIZE < len as usize);
         }
-        self.size.set(len);
+        inner.size = len;
     }
 
     pub(super) fn has_hole(&self, pos: usize, len: usize) -> bool {
+        let inner = self.inner.read();
         let start_page = pos / PAGE_SIZE;
         let end_page = ((pos + len.max(1)) - 1) / PAGE_SIZE;
         for page_no in start_page..=end_page {
-            if self.get_page(page_no).is_some() {
+            if inner.pages.contains_key(&page_no) {
                 return false;
             }
         }
@@ -221,10 +217,11 @@ impl MemStore {
             pos % PAGE_SIZE == 0 && len % PAGE_SIZE == 0,
             "hole must be page aligned"
         );
+        let mut inner = self.inner.write();
         let start_page = pos / PAGE_SIZE;
         let end_page = ((pos + len.max(1)) - 1) / PAGE_SIZE;
         for page_no in start_page..=end_page {
-            unsafe { (*self.pages.get()).remove(&page_no) };
+            inner.pages.remove(&page_no);
         }
     }
 }
