@@ -1181,6 +1181,9 @@ pub fn translate_insert(
             .any(|m| m.column.notnull() && !m.column.is_rowid_alias());
         let has_unique = !constraints.constraints_to_check.is_empty();
         let has_triggers = has_before_triggers || has_after_triggers;
+        let has_upsert_do_update = upsert_actions
+            .iter()
+            .any(|(_, _, upsert)| matches!(upsert.do_clause, UpsertDo::Set { .. }));
         set_insert_stmt_journal_flags(
             program,
             resolver,
@@ -1192,6 +1195,7 @@ pub fn translate_insert(
             has_triggers,
             has_fks,
             has_upsert,
+            has_upsert_do_update,
             btree_table.has_autoincrement,
             notnull_col_exists,
             has_unique,
