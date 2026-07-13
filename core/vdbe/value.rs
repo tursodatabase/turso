@@ -650,12 +650,16 @@ impl Value {
         match self {
             Value::Null => Value::Null,
             _ => match ignored_chars {
-                None => match self
-                    .cast_text()
-                    .map(|s| hex::decode(&s[0..s.find('\0').unwrap_or(s.len())]))
-                {
-                    Some(Ok(bytes)) => Value::from_slice(&bytes),
-                    _ => Value::Null,
+                None => match self.cast_text() {
+                    Some(text) => {
+                        let input = &text[0..text.find('\0').unwrap_or(text.len())];
+                        let mut bytes = crate::alloc::vec![0; input.len() / 2];
+                        match hex::decode_to_slice(input, &mut bytes) {
+                            Ok(()) => Value::from_blob(bytes),
+                            Err(_) => Value::Null,
+                        }
+                    }
+                    None => Value::Null,
                 },
                 Some(ignore) => match ignore {
                     Value::Text(_) => {
