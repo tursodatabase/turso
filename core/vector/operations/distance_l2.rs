@@ -295,8 +295,8 @@ mod tests {
     /// Float1Bit L2 distance returns an error.
     #[test]
     fn test_vector_distance_l2_1bit_error() {
-        let v1 = Vector::from_1bit(4, vec![0b1010]);
-        let v2 = Vector::from_1bit(4, vec![0b0101]);
+        let v1 = Vector::from_1bit(4, crate::alloc::vec![0b1010]);
+        let v2 = Vector::from_1bit(4, crate::alloc::vec![0b0101]);
         assert!(vector_distance_l2(&v1, &v2).is_err());
     }
 }

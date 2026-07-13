@@ -1,6 +1,7 @@
 use crate::{
+    alloc::{TursoAllocExt, TursoVecExt},
     vector::vector_types::{Vector, VectorType},
-    LimboError, Result,
+    LimboError, Result, ValueBlob,
 };
 
 pub fn vector_to_text(vector: &Vector) -> String {
@@ -81,12 +82,12 @@ pub fn vector_from_text(vector_type: VectorType, text: &str) -> Result<Vector> {
                 ));
             }
             VectorType::Float8 => {
-                return Ok(Vector::from_f8(0, Vec::new(), 0.0, 0.0));
+                return Ok(Vector::from_f8(0, crate::alloc::vec![], 0.0, 0.0));
             }
             _ => Vector {
                 vector_type,
                 dims: 0,
-                owned: Some(Vec::new()),
+                owned: Some(crate::alloc::vec![]),
                 refer: None,
             },
         });
@@ -102,7 +103,7 @@ pub fn vector_from_text(vector_type: VectorType, text: &str) -> Result<Vector> {
 }
 
 fn vector32_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vector<'static>> {
-    let mut data = Vec::new();
+    let mut data: ValueBlob = TursoAllocExt::new();
     for token in tokens {
         let value = token
             .parse::<f32>()
@@ -123,7 +124,7 @@ fn vector32_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vecto
 }
 
 fn vector64_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vector<'static>> {
-    let mut data = Vec::new();
+    let mut data: ValueBlob = TursoAllocExt::new();
     for token in tokens {
         let value = token
             .parse::<f64>()
@@ -144,8 +145,8 @@ fn vector64_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vecto
 }
 
 fn vector32_sparse_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vector<'static>> {
-    let mut idx = Vec::new();
-    let mut values = Vec::new();
+    let mut idx: ValueBlob = TursoAllocExt::new();
+    let mut values: ValueBlob = TursoAllocExt::new();
     let mut dims = 0u32;
     for token in tokens {
         let value = token
@@ -189,7 +190,7 @@ fn vector_1bit_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Ve
     }
     let dims = floats.len();
     let byte_count = dims.div_ceil(8);
-    let mut bits = vec![0u8; byte_count];
+    let mut bits = crate::alloc::vec![0u8; byte_count];
     for (i, &f) in floats.iter().enumerate() {
         if f > 0.0 {
             bits[i / 8] |= 1 << (i & 7);
@@ -216,7 +217,7 @@ fn vector_f8_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vect
     let max_val = floats.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let alpha = (max_val - min_val) / 255.0;
     let shift = min_val;
-    let mut quantized = Vec::with_capacity(dims);
+    let mut quantized = <ValueBlob as TursoVecExt<u8>>::with_capacity(dims);
     for &f in &floats {
         let q = if alpha == 0.0 {
             0u8

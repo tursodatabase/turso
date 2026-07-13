@@ -1,6 +1,8 @@
 use crate::{
+    alloc::TursoAllocExt,
+    types::value_blob_from_slice,
     vector::vector_types::{Vector, VectorType},
-    LimboError, Result,
+    LimboError, Result, ValueBlob,
 };
 
 pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector<'static>> {
@@ -18,18 +20,22 @@ pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector<
         VectorType::Float32Dense => Ok(Vector {
             vector_type: vector.vector_type,
             dims: end - start,
-            owned: Some(vector.bin_data()[start * 4..end * 4].to_vec()),
+            owned: Some(value_blob_from_slice(
+                &vector.bin_data()[start * 4..end * 4],
+            )),
             refer: None,
         }),
         VectorType::Float64Dense => Ok(Vector {
             vector_type: vector.vector_type,
             dims: end - start,
-            owned: Some(vector.bin_data()[start * 8..end * 8].to_vec()),
+            owned: Some(value_blob_from_slice(
+                &vector.bin_data()[start * 8..end * 8],
+            )),
             refer: None,
         }),
         VectorType::Float32Sparse => {
-            let mut values = Vec::new();
-            let mut idx = Vec::new();
+            let mut values: ValueBlob = TursoAllocExt::new();
+            let mut idx: ValueBlob = TursoAllocExt::new();
             let sparse = vector.as_f32_sparse();
             for (&i, &value) in sparse.idx.iter().zip(sparse.values.iter()) {
                 let i = i as usize;
@@ -61,7 +67,7 @@ mod tests {
     };
 
     fn float32_vec_from(slice: &[f32]) -> Vector {
-        let mut data = Vec::new();
+        let mut data = crate::alloc::vec![];
         for &v in slice {
             data.extend_from_slice(&v.to_le_bytes());
         }
