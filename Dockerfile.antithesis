@@ -83,6 +83,7 @@ COPY ./testing/antithesis/stress-io_uring /opt/antithesis/test/v1/stress-io_urin
 COPY ./testing/antithesis/stress-mvcc /opt/antithesis/test/v1/stress-mvcc
 COPY ./testing/antithesis/stress-io_uring-mvcc /opt/antithesis/test/v1/stress-io_uring-mvcc
 COPY ./testing/antithesis/stress-unreliable /opt/antithesis/test/v1/stress-unreliable
+COPY ./testing/antithesis/stress-multiprocess /opt/antithesis/test/v1/stress-multiprocess
 RUN chmod 777 -R /opt/antithesis/test/v1
 
 RUN mkdir /opt/antithesis/catalog

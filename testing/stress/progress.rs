@@ -1,4 +1,4 @@
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 pub struct ProgressBars {
     num_ticks: usize,
@@ -6,9 +6,17 @@ pub struct ProgressBars {
 }
 
 impl ProgressBars {
-    pub(crate) fn new(num_ticks: usize) -> Self {
+    /// `hidden` suppresses drawing entirely; used by multiprocess workers,
+    /// whose bars would otherwise redraw over each other on the shared
+    /// terminal.
+    pub(crate) fn new(num_ticks: usize, hidden: bool) -> Self {
+        let multi_progress = if hidden {
+            MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+        } else {
+            MultiProgress::new()
+        };
         Self {
-            multi_progress: MultiProgress::new(),
+            multi_progress,
             num_ticks,
         }
     }

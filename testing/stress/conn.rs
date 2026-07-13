@@ -9,16 +9,23 @@ pub struct StressDb {
     db: Option<turso::Database>,
     db_file: String,
     vfs: Option<String>,
+    multiprocess: bool,
     sql_logger: Arc<SqlLogger>,
 }
 
 impl StressDb {
-    pub(crate) fn new(db_file: String, sql_logger: Arc<SqlLogger>, vfs: Option<String>) -> Self {
+    pub(crate) fn new(
+        db_file: String,
+        sql_logger: Arc<SqlLogger>,
+        vfs: Option<String>,
+        multiprocess: bool,
+    ) -> Self {
         Self {
             db: None,
             db_file,
             sql_logger,
             vfs,
+            multiprocess,
         }
     }
 
@@ -27,6 +34,9 @@ impl StressDb {
             let mut builder = Builder::new_local(&self.db_file);
             if let Some(ref vfs) = self.vfs {
                 builder = builder.with_io(vfs.clone());
+            }
+            if self.multiprocess {
+                builder = builder.experimental_multiprocess_wal(true);
             }
             self.db = Some(builder.build().await?);
         }
