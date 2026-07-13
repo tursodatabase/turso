@@ -3547,7 +3547,9 @@ impl StreamingLogicalLogReader {
                 commit_ts,
                 btree_resident,
             } => {
-                let key_record = crate::types::ImmutableRecord::from_bin_record(payload);
+                let key_record = crate::types::ImmutableRecord::from_bin_record(
+                    crate::types::value_blob_from_slice(&payload),
+                );
                 let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Upsert)?;
                 let key = Arc::new(SortableIndexKey::new_from_record(key_record, index_info));
@@ -3566,7 +3568,9 @@ impl StreamingLogicalLogReader {
                 commit_ts,
                 btree_resident,
             } => {
-                let key_record = crate::types::ImmutableRecord::from_bin_record(payload);
+                let key_record = crate::types::ImmutableRecord::from_bin_record(
+                    crate::types::value_blob_from_slice(&payload),
+                );
                 let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Delete)?;
                 let key = Arc::new(SortableIndexKey::new_from_record(key_record, index_info));
@@ -6365,7 +6369,10 @@ mod tests {
         commit_ts: u64,
         is_delete: bool,
     ) -> crate::mvcc::database::RowVersion {
-        let sortable_key = SortableIndexKey::new_from_bytes(payload_bytes, test_index_info());
+        let sortable_key = SortableIndexKey::new_from_bytes(
+            crate::types::value_blob_from_slice(&payload_bytes),
+            test_index_info(),
+        );
         let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
         let row = Row::new_index_row(row_id, 2);
         crate::mvcc::database::RowVersion {

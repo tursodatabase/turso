@@ -2226,8 +2226,8 @@ mod tests {
     #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SerialType::f64(), Value::from_f64(std::f64::consts::PI))]
     #[case(&[1, 2], SerialType::const_int0(), Value::from_i64(0))]
     #[case(&[65, 66], SerialType::const_int1(), Value::from_i64(1))]
-    #[case(&[1, 2, 3], SerialType::blob(3), Value::Blob(vec![1, 2, 3]))]
-    #[case(&[], SerialType::blob(0), Value::Blob(vec![]))] // empty blob
+    #[case(&[1, 2, 3], SerialType::blob(3), Value::from_slice(&[1, 2, 3]))]
+    #[case(&[], SerialType::blob(0), Value::from_slice(&[]))] // empty blob
     #[case(&[65, 66, 67], SerialType::text(3), Value::build_text("ABC"))]
     #[case(&[0x80], SerialType::i8(), Value::from_i64(-128))]
     #[case(&[0x80, 0], SerialType::i16(), Value::from_i64(-32768))]

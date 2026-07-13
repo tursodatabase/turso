@@ -18,7 +18,7 @@
 //! https://www.sqlite.org/opcode.html
 
 use crate::translate::plan::BitSet;
-use crate::types::{Extendable, Text};
+use crate::types::{Extendable, Text, ValueBlob};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
 pub mod affinity;
 pub mod array;
@@ -323,14 +323,10 @@ impl Register {
         Ok(())
     }
 
-    /// Set the value of the register to a blob,
-    /// reusing Register::Value(Value::Blob(_)) buffer if possible.
+    /// Move a blob into the register without copying its allocation.
     #[inline]
-    pub fn set_blob(&mut self, val: Vec<u8>) -> Result<()> {
+    pub fn set_blob(&mut self, val: ValueBlob) -> Result<()> {
         match self {
-            Register::Value(Value::Blob(existing)) => {
-                existing.do_extend(&val)?;
-            }
             Register::Value(other_value_kind) => {
                 *other_value_kind = Value::Blob(val);
             }
@@ -3084,7 +3080,9 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                         }
                     }
                     _ => {
-                        if let Err(err) = dest.set_blob(blob_data.to_vec()) {
+                        if let Err(err) =
+                            dest.set_blob(crate::types::value_blob_from_slice(blob_data))
+                        {
                             return Some(Err(err));
                         }
                     }

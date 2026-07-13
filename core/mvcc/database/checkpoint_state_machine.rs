@@ -3040,8 +3040,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> BuildLocalSchemaViewStateMachi
                         .data
                         .as_ref()
                         .expect("present schema version must carry row data at snapshot_ts");
-                    self.rows
-                        .insert(rowid, ImmutableRecord::from_bin_record(data.to_vec()));
+                    self.rows.insert(
+                        rowid,
+                        ImmutableRecord::from_bin_record(crate::types::value_blob_from_slice(data)),
+                    );
                 }
                 None => {
                     let existed_and_gone = versions.iter().any(|version| {

@@ -344,7 +344,7 @@ impl Value {
             return Err(LimboError::TooBig);
         }
 
-        let mut blob: Vec<u8> = vec![0; length as usize];
+        let mut blob = crate::alloc::vec![0; length as usize];
         fill_bytes(&mut blob);
         Ok(Value::Blob(blob))
     }
@@ -549,7 +549,7 @@ impl Value {
         match (value, start_value) {
             (Value::Blob(b), Value::Numeric(Numeric::Integer(start))) => {
                 let (start, end) = calculate_postions(start, b.len(), length_value.as_ref());
-                Value::from_blob(b[start..end].to_vec())
+                Value::from_slice(&b[start..end])
             }
             (value, Value::Numeric(Numeric::Integer(start))) => {
                 if let Some(text) = value.cast_text() {
@@ -654,7 +654,7 @@ impl Value {
                     .cast_text()
                     .map(|s| hex::decode(&s[0..s.find('\0').unwrap_or(s.len())]))
                 {
-                    Some(Ok(bytes)) => Value::Blob(bytes),
+                    Some(Ok(bytes)) => Value::from_slice(&bytes),
                     _ => Value::Null,
                 },
                 Some(ignore) => match ignore {
@@ -662,7 +662,10 @@ impl Value {
                         let input = self.to_string();
                         let ignore = ignore.to_string();
                         let mut chars = input.chars().peekable();
-                        let mut out = Vec::with_capacity(input.len() / 2);
+                        let mut out =
+                            <crate::ValueBlob as crate::alloc::TursoVecExt<u8>>::with_capacity(
+                                input.len() / 2,
+                            );
 
                         let is_sep = |c: char| ignore.contains(c) && !c.is_ascii_hexdigit();
 
@@ -862,7 +865,7 @@ impl Value {
             return Err(LimboError::TooBig);
         }
 
-        Ok(Value::Blob(vec![0; length as usize]))
+        Ok(Value::Blob(crate::alloc::vec![0; length as usize]))
     }
 
     // exec_if returns whether you should jump
@@ -887,7 +890,7 @@ impl Value {
                 // Convert to TEXT first, then interpret as BLOB
                 // TODO: handle encoding
                 let text = self.to_string();
-                Value::Blob(text.into_bytes())
+                Value::from_slice(text.as_bytes())
             }
             // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
             // Casting an INTEGER or REAL value into TEXT renders the value as if via sqlite3_snprintf() except that the resulting TEXT uses the encoding of the database connection.
@@ -1146,7 +1149,12 @@ impl Value {
 
     pub fn exec_concat(&self, rhs: &Value) -> Value {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
-            return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat());
+            let mut blob = <crate::ValueBlob as crate::alloc::TursoVecExt<u8>>::with_capacity(
+                lhs.len() + rhs.len(),
+            );
+            blob.extend_from_slice(lhs);
+            blob.extend_from_slice(rhs);
+            return Value::Blob(blob);
         }
 
         let Some(lhs) = self.cast_text() else {
@@ -1996,7 +2004,7 @@ mod tests {
         let expected_len = Value::from_i64(7);
         assert_eq!(input_float.exec_length(), expected_len);
 
-        let expected_blob = Value::Blob("example".as_bytes().to_vec());
+        let expected_blob = Value::from_slice(b"example");
         let expected_len = Value::from_i64(7);
         assert_eq!(expected_blob.exec_length(), expected_len);
     }
@@ -2046,7 +2054,7 @@ mod tests {
         let expected: Value = Value::build_text("text");
         assert_eq!(input.exec_typeof(), expected);
 
-        let input = Value::Blob("limbo".as_bytes().to_vec());
+        let input = Value::from_slice(b"limbo");
         let expected: Value = Value::build_text("blob");
         assert_eq!(input.exec_typeof(), expected);
     }
@@ -2066,7 +2074,7 @@ mod tests {
         assert_eq!(Value::from_f64(23.45).exec_unicode(), Value::from_i64(50));
         assert_eq!(Value::Null.exec_unicode(), Value::Null);
         assert_eq!(
-            Value::Blob("example".as_bytes().to_vec()).exec_unicode(),
+            Value::from_slice(b"example").exec_unicode(),
             Value::from_i64(101)
         );
     }
@@ -2161,7 +2169,7 @@ mod tests {
             Value::build_text("1.5")
         );
         assert_eq!(
-            Value::Blob(vec![0xDE, 0xAD]).exec_unistr_quote(),
+            Value::from_slice(&[0xDE, 0xAD]).exec_unistr_quote(),
             Value::build_text("X'DEAD'")
         );
         assert_eq!(
@@ -2444,14 +2452,14 @@ mod tests {
         let expected_val = Value::build_text("31322E3334");
         assert_eq!(input_float.exec_hex(), expected_val);
 
-        let input_blob = Value::Blob(vec![0xff]);
+        let input_blob = Value::from_slice(&[0xff]);
         let expected_val = Value::build_text("FF");
         assert_eq!(input_blob.exec_hex(), expected_val);
     }
 
     #[test]
     fn test_cast_blob_preserves_blob_bytes() {
-        let input_blob = Value::Blob(vec![0xd2, 0x64, 0xc0, 0x07, 0xf6, 0x44, 0xe4, 0x59]);
+        let input_blob = Value::from_slice(&[0xd2, 0x64, 0xc0, 0x07, 0xf6, 0x44, 0xe4, 0x59]);
         let expected = input_blob.clone();
 
         assert_eq!(input_blob.exec_cast("BLOB"), expected);
@@ -2460,11 +2468,11 @@ mod tests {
     #[test]
     fn test_unhex() {
         let input = Value::build_text("6f");
-        let expected = Value::Blob(vec![0x6f]);
+        let expected = Value::from_slice(&[0x6f]);
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("6f");
-        let expected = Value::Blob(vec![0x6f]);
+        let expected = Value::from_slice(&[0x6f]);
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("611");
@@ -2472,7 +2480,7 @@ mod tests {
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("");
-        let expected = Value::Blob(vec![]);
+        let expected = Value::from_slice(&[]);
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("61x");
@@ -2484,19 +2492,19 @@ mod tests {
         assert_eq!(input.exec_unhex(None), expected);
 
         let input = Value::build_text("aa-bb");
-        let expected = Value::Blob(vec![0xaa, 0xbb]);
+        let expected = Value::from_slice(&[0xaa, 0xbb]);
         assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
 
         let input = Value::build_text("aa--bb");
-        let expected = Value::Blob(vec![0xaa, 0xbb]);
+        let expected = Value::from_slice(&[0xaa, 0xbb]);
         assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
 
         let input = Value::build_text("aa-bb-cc");
-        let expected = Value::Blob(vec![0xaa, 0xbb, 0xcc]);
+        let expected = Value::from_slice(&[0xaa, 0xbb, 0xcc]);
         assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
 
         let input = Value::build_text("aa bb");
-        let expected = Value::Blob(vec![0xaa, 0xbb]);
+        let expected = Value::from_slice(&[0xaa, 0xbb]);
         assert_eq!(input.exec_unhex(Some(&Value::build_text(" "))), expected);
 
         let input = Value::build_text("A BCD");
@@ -2927,23 +2935,23 @@ mod tests {
         let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::Blob(vec![1, 2, 3, 4, 5]);
-        let pattern = Value::Blob(vec![3, 4]);
+        let input = Value::from_slice(&[1, 2, 3, 4, 5]);
+        let pattern = Value::from_slice(&[3, 4]);
         let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::Blob(vec![1, 2, 3, 4, 5]);
-        let pattern = Value::Blob(vec![3, 2]);
+        let input = Value::from_slice(&[1, 2, 3, 4, 5]);
+        let pattern = Value::from_slice(&[3, 2]);
         let expected = Value::from_i64(0);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::Blob(vec![0x61, 0x62, 0x63, 0x64, 0x65]);
+        let input = Value::from_slice(&[0x61, 0x62, 0x63, 0x64, 0x65]);
         let pattern = Value::build_text("cd");
         let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::build_text("abcde");
-        let pattern = Value::Blob(vec![0x63, 0x64]);
+        let pattern = Value::from_slice(&[0x63, 0x64]);
         let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
@@ -2999,19 +3007,19 @@ mod tests {
         let expected = Some(Value::from_i64(0));
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Blob(b"abc".to_vec());
+        let input = Value::from_slice(b"abc");
         let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Blob(b"42".to_vec());
+        let input = Value::from_slice(b"42");
         let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Blob(b"-42".to_vec());
+        let input = Value::from_slice(b"-42");
         let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Blob(b"0".to_vec());
+        let input = Value::from_slice(b"0");
         let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
@@ -3023,39 +3031,39 @@ mod tests {
     #[test]
     fn test_exec_zeroblob() {
         let input = Value::from_i64(0);
-        let expected = Value::Blob(vec![]);
+        let expected = Value::from_slice(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::Null;
-        let expected = Value::Blob(vec![]);
+        let expected = Value::from_slice(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::from_i64(4);
-        let expected = Value::Blob(vec![0; 4]);
+        let expected = Value::Blob(crate::alloc::vec![0; 4]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::from_i64(-1);
-        let expected = Value::Blob(vec![]);
+        let expected = Value::from_slice(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::build_text("5");
-        let expected = Value::Blob(vec![0; 5]);
+        let expected = Value::Blob(crate::alloc::vec![0; 5]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::build_text("-5");
-        let expected = Value::Blob(vec![]);
+        let expected = Value::from_slice(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::build_text("text");
-        let expected = Value::Blob(vec![]);
+        let expected = Value::from_slice(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::from_f64(2.6);
-        let expected = Value::Blob(vec![0; 2]);
+        let expected = Value::Blob(crate::alloc::vec![0; 2]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
-        let input = Value::Blob(vec![1]);
-        let expected = Value::Blob(vec![]);
+        let input = Value::from_slice(&[1]);
+        let expected = Value::from_slice(&[]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         // Test TooBig error

@@ -1,4 +1,5 @@
 use super::*;
+use crate::alloc::TursoIteratorExt;
 
 /// Emit literal values - shared between regular and RETURNING expression evaluation
 pub fn emit_literal(
@@ -42,7 +43,7 @@ pub fn emit_literal(
                     let hex_byte = std::str::from_utf8(pair).unwrap();
                     u8::from_str_radix(hex_byte, 16).unwrap()
                 })
-                .collect();
+                .try_collect()?;
             program.emit_insn(Insn::Blob {
                 value: bytes,
                 dest: target_register,

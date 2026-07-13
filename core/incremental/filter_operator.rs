@@ -283,7 +283,7 @@ mod tests {
 
         let values_with_blob = vec![
             Value::from_i64(1),
-            Value::Blob(vec![1, 2, 3]),
+            Value::from_slice(&[1, 2, 3]),
             Value::Text(Text::from("test")),
         ];
         assert!(!filter.evaluate_predicate(&values_with_blob));
@@ -321,7 +321,7 @@ mod tests {
         // Test with non-NULL value (Blob)
         let values_with_blob = vec![
             Value::from_i64(1),
-            Value::Blob(vec![1, 2, 3]),
+            Value::from_slice(&[1, 2, 3]),
             Value::Text(Text::from("test")),
         ];
         assert!(filter.evaluate_predicate(&values_with_blob));

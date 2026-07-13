@@ -167,7 +167,7 @@ impl<T: AnyText> Extendable<T> for Text {
     }
 }
 
-impl<T: AnyBlob> Extendable<T> for std::vec::Vec<u8> {
+impl<T: AnyBlob> Extendable<T> for ValueBlob {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) -> Result<()> {
         let other_slice = other.as_slice();
@@ -213,6 +213,13 @@ pub trait AnyBlob {
     fn as_slice(&self) -> &[u8];
 }
 
+impl AnyBlob for ValueBlob {
+    fn as_slice(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+#[cfg(nightly)]
 impl AnyBlob for std::vec::Vec<u8> {
     fn as_slice(&self) -> &[u8] {
         self.as_slice()
@@ -261,13 +268,74 @@ impl From<Text> for String {
 // No intermediate StructValue/UnionValue types are needed — blobs are
 // constructed from registers and extracted directly into registers.
 
+/// Owned bytes stored by [`Value::Blob`].
+///
+/// Stable builds use `std::vec::Vec`; allocator-enabled nightly builds retain
+/// [`TursoAllocator`] in the vector type.
+pub type ValueBlob = crate::alloc::Vec<u8>;
+
+#[inline]
+pub(crate) fn value_blob_from_slice(bytes: &[u8]) -> ValueBlob {
+    bytes.try_to_vec().expect(ALLOC_ERR_MSG)
+}
+
+#[cfg(feature = "serde")]
+mod value_blob_serde {
+    use super::ValueBlob;
+    use crate::alloc::{TursoAllocExt, TursoTryWithCapacityExt, TursoVecExt};
+    use serde::de::{Error as _, SeqAccess, Visitor};
+    use serde::{Deserializer, Serialize as _, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S>(value: &ValueBlob, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value.as_slice().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<ValueBlob, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ValueBlobVisitor;
+
+        impl<'de> Visitor<'de> for ValueBlobVisitor {
+            type Value = ValueBlob;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a sequence of bytes")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut value = match sequence.size_hint() {
+                    Some(capacity) => {
+                        <ValueBlob as TursoTryWithCapacityExt>::try_with_capacity_ext(capacity)
+                            .map_err(A::Error::custom)?
+                    }
+                    None => <ValueBlob as TursoAllocExt>::new(),
+                };
+                while let Some(byte) = sequence.next_element()? {
+                    value.try_push(byte).map_err(A::Error::custom)?;
+                }
+                Ok(value)
+            }
+        }
+
+        deserializer.deserialize_seq(ValueBlobVisitor)
+    }
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Value {
     Null,
     Numeric(Numeric),
     Text(Text),
-    Blob(std::vec::Vec<u8>),
+    Blob(#[cfg_attr(feature = "serde", serde(with = "value_blob_serde"))] ValueBlob),
 }
 
 #[derive(Clone, Copy)]
@@ -391,8 +459,13 @@ impl Value {
         }
     }
 
-    pub fn from_blob(data: std::vec::Vec<u8>) -> Self {
+    pub const fn from_blob(data: ValueBlob) -> Self {
         Value::Blob(data)
+    }
+
+    #[inline]
+    pub fn from_slice(data: &[u8]) -> Self {
+        Value::Blob(value_blob_from_slice(data))
     }
 
     pub fn to_text(&self) -> Option<&str> {
@@ -402,14 +475,14 @@ impl Value {
         }
     }
 
-    pub const fn as_blob(&self) -> &std::vec::Vec<u8> {
+    pub const fn as_blob(&self) -> &ValueBlob {
         match self {
             Value::Blob(b) => b,
             _ => panic!("as_blob must be called only for Value::Blob"),
         }
     }
 
-    pub const fn as_blob_mut(&mut self) -> &mut std::vec::Vec<u8> {
+    pub const fn as_blob_mut(&mut self) -> &mut ValueBlob {
         match self {
             Value::Blob(b) => b,
             _ => panic!("as_blob must be called only for Value::Blob"),
@@ -564,7 +637,7 @@ impl Value {
                 let Some(blob) = v.to_blob() else {
                     return Ok(Value::Null);
                 };
-                Ok(Value::Blob(blob))
+                Ok(Value::from_slice(&blob))
             }
             ExtValueType::Error => {
                 let Some(err) = v.to_error_details() else {
@@ -631,7 +704,7 @@ impl FromValue for f64 {
 }
 impl Sealed for f64 {}
 
-impl FromValue for std::vec::Vec<u8> {
+impl FromValue for ValueBlob {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
@@ -640,13 +713,16 @@ impl FromValue for std::vec::Vec<u8> {
         }
     }
 }
-impl Sealed for std::vec::Vec<u8> {}
+impl Sealed for ValueBlob {}
 
 impl<const N: usize> FromValue for [u8; N] {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
-            Value::Blob(blob) => blob.try_into().map_err(|_| LimboError::InvalidBlobSize(N)),
+            Value::Blob(blob) => blob
+                .as_slice()
+                .try_into()
+                .map_err(|_| LimboError::InvalidBlobSize(N)),
             _ => Err(LimboError::InvalidColumnType),
         }
     }
@@ -1049,14 +1125,14 @@ mod immutable_record {
     }
 
     struct AppendWriter<'a> {
-        buf: &'a mut std::vec::Vec<u8>,
+        buf: &'a mut ValueBlob,
         pos: usize,
         buf_capacity_start: usize,
         buf_ptr_start: *const u8,
     }
 
     impl<'a> AppendWriter<'a> {
-        fn new(buf: &'a mut std::vec::Vec<u8>, pos: usize) -> Self {
+        fn new(buf: &'a mut ValueBlob, pos: usize) -> Self {
             let buf_ptr_start = buf.as_ptr();
             let buf_capacity_start = buf.capacity();
             Self {
@@ -1392,14 +1468,14 @@ mod immutable_record {
 
     impl ImmutableRecord {
         pub fn new(payload_capacity: usize) -> Result<Self> {
-            let mut payload = std::vec::Vec::new();
+            let mut payload = crate::alloc::vec![];
             payload.try_reserve_exact(payload_capacity)?;
             Ok(Self {
                 payload: Value::Blob(payload),
             })
         }
 
-        pub const fn from_bin_record(payload: std::vec::Vec<u8>) -> Self {
+        pub const fn from_bin_record(payload: ValueBlob) -> Self {
             Self {
                 payload: Value::Blob(payload),
             }
@@ -1444,7 +1520,7 @@ mod immutable_record {
             let header_size = Record::calc_header_size(size_header);
 
             // 1. write header size
-            let mut buf = std::vec::Vec::new();
+            let mut buf = crate::alloc::vec![];
             buf.try_reserve_exact(header_size + size_values)?;
             assert_eq!(buf.capacity(), header_size + size_values);
             let n = write_varint(&mut serial_type_buf, header_size as u64);
@@ -1504,7 +1580,7 @@ mod immutable_record {
         }
 
         #[inline]
-        pub fn into_payload(self) -> std::vec::Vec<u8> {
+        pub fn into_payload(self) -> ValueBlob {
             match self.payload {
                 Value::Blob(b) => b,
                 _ => panic!("payload must be a blob"),
@@ -1512,7 +1588,7 @@ mod immutable_record {
         }
 
         #[inline]
-        pub const fn as_blob(&self) -> &std::vec::Vec<u8> {
+        pub const fn as_blob(&self) -> &ValueBlob {
             match &self.payload {
                 Value::Blob(b) => b,
                 _ => panic!("payload must be a blob"),
@@ -1520,7 +1596,7 @@ mod immutable_record {
         }
 
         #[inline]
-        pub const fn as_blob_mut(&mut self) -> &mut std::vec::Vec<u8> {
+        pub const fn as_blob_mut(&mut self) -> &mut ValueBlob {
             match &mut self.payload {
                 Value::Blob(b) => b,
                 _ => panic!("payload must be a blob"),
@@ -1910,7 +1986,7 @@ impl<'a> ValueRef<'a> {
                 value: text.value.to_string().into(),
                 subtype: text.subtype,
             }),
-            ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+            ValueRef::Blob(b) => Value::from_slice(b),
         }
     }
 
@@ -3302,6 +3378,41 @@ mod tests {
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
 
+    #[cfg(nightly)]
+    #[test]
+    fn moving_blobs_through_value_preserves_allocation() {
+        fn assert_move_preserves_allocation(blob: ValueBlob) {
+            let pointer = blob.as_ptr();
+            let capacity = blob.capacity();
+            let len = blob.len();
+
+            let value = Value::from_blob(blob);
+            let Value::Blob(blob) = value else {
+                unreachable!();
+            };
+
+            assert_eq!(blob.as_ptr(), pointer);
+            assert_eq!(blob.capacity(), capacity);
+            assert_eq!(blob.len(), len);
+        }
+
+        assert_move_preserves_allocation(vec![]);
+        assert_move_preserves_allocation(vec![1, 2, 3, 4]);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn value_blob_serde_preserves_sequence_format() {
+        let encoded = serde_json::to_string(&Value::from_slice(&[1, 2, 3, 4])).unwrap();
+        assert_eq!(encoded, r#"{"Blob":[1,2,3,4]}"#);
+
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+        let Value::Blob(blob) = decoded else {
+            panic!("expected blob value");
+        };
+        assert_eq!(blob.as_slice(), &[1, 2, 3, 4]);
+    }
+
     #[test]
     fn test_value_iterator_simple() {
         let mut buf = std::vec::Vec::new();
@@ -3347,7 +3458,7 @@ mod tests {
             Value::from_i64(100),
             Value::from_f64(std::f64::consts::PI),
             Value::Text(Text::new("test")),
-            Value::Blob(std::vec![1, 2, 3]),
+            Value::from_slice(&[1, 2, 3]),
             Value::from_i64(0),
             Value::from_i64(1),
         ]);
@@ -3868,7 +3979,7 @@ mod tests {
                 "large_field_count",
             ),
             (
-                vec![Value::Blob(std::vec![1, 2, 3])],
+                vec![Value::from_slice(&[1, 2, 3])],
                 vec![ValueRef::Blob(&[1, 2, 3])],
                 "blob_first_field",
             ),
@@ -4158,7 +4269,7 @@ mod tests {
     #[test]
     fn test_serialize_blob() {
         let blob = std::vec![1, 2, 3, 4, 5];
-        let record = Record::new(vec![Value::Blob(blob.clone())]);
+        let record = Record::new(vec![Value::from_slice(&blob)]);
         let mut buf = std::vec::Vec::new();
         record.serialize(&mut buf);
 

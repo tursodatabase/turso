@@ -81,8 +81,8 @@ impl Hash128 {
     }
 
     /// Convert to a big-endian byte array for storage
-    pub fn to_blob(self) -> Vec<u8> {
-        self.uuid.as_bytes().to_vec()
+    pub fn to_blob(self) -> crate::ValueBlob {
+        crate::types::value_blob_from_slice(self.uuid.as_bytes())
     }
 
     /// Create from a big-endian byte array

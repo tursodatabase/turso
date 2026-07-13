@@ -704,7 +704,7 @@ impl HybridBTreeDirectory {
             &[
                 Value::Text(Text::new(path_str.clone())),
                 Value::from_i64(uncached_start as i64),
-                Value::Blob(vec![]),
+                Value::Blob(crate::alloc::vec![]),
             ],
             Self::CHUNK_LEN,
         )
@@ -884,7 +884,7 @@ impl HybridBTreeDirectory {
             &[
                 Value::Text(Text::new(path_str.clone())),
                 Value::from_i64(0),
-                Value::Blob(vec![]),
+                Value::Blob(crate::alloc::vec![]),
             ],
             Self::CHUNK_LEN,
         )
@@ -2123,7 +2123,7 @@ impl FtsCursor {
                         &[
                             Value::Text(Text::new(path_str.clone())),
                             Value::from_i64(0),
-                            Value::Blob(vec![]),
+                            Value::Blob(crate::alloc::vec![]),
                         ],
                         3,
                     )?;
@@ -2308,7 +2308,7 @@ impl FtsCursor {
                         &[
                             Value::Text(Text::new(path_str.clone())),
                             Value::from_i64(actual_chunk_idx as i64),
-                            Value::Blob(chunk_data.to_vec()),
+                            Value::from_slice(chunk_data),
                         ],
                         3,
                     )?;
@@ -2393,7 +2393,7 @@ impl FtsCursor {
                         &[
                             Value::Text(Text::new(path_str)),
                             Value::from_i64(0),
-                            Value::Blob(vec![]),
+                            Value::Blob(crate::alloc::vec![]),
                         ],
                         3,
                     )?;

@@ -890,7 +890,7 @@ pub enum Insn {
 
     /// Write a blob value into a register.
     Blob {
-        value: Vec<u8>,
+        value: crate::ValueBlob,
         dest: usize,
     },
 

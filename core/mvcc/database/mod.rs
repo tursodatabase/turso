@@ -183,7 +183,7 @@ pub struct SortableIndexKey {
 }
 
 impl SortableIndexKey {
-    pub fn new_from_bytes(key_bytes: Vec<u8>, metadata: Arc<IndexInfo>) -> Self {
+    pub fn new_from_bytes(key_bytes: crate::ValueBlob, metadata: Arc<IndexInfo>) -> Self {
         Self {
             key: ImmutableRecord::from_bin_record(key_bytes),
             metadata,
@@ -759,7 +759,7 @@ fn portable_delete_op_extension_for_row_version<Clock: LogicalClock, A: Concurre
     }
 
     let pk_record = if pk_values.is_empty() {
-        Vec::new()
+        crate::alloc::vec![]
     } else {
         ImmutableRecord::from_values(&pk_values, pk_values.len())?.into_payload()
     };
@@ -8656,7 +8656,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         crate::with_mv_store_allocation_site!(SchemaRowPayload, {
                             schema_rows_after.insert(
                                 rowid.row_id.to_int_or_panic(),
-                                ImmutableRecord::from_bin_record(record_bytes.clone()),
+                                ImmutableRecord::from_bin_record(
+                                    crate::types::value_blob_from_slice(record_bytes),
+                                ),
                             );
                         });
                     }
@@ -8883,7 +8885,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 crate::with_mv_store_allocation_site!(SchemaRowPayload, {
                                     schema_rows.insert(
                                         rowid_int,
-                                        ImmutableRecord::from_bin_record(row.payload().to_vec()),
+                                        ImmutableRecord::from_bin_record(
+                                            crate::types::value_blob_from_slice(row.payload()),
+                                        ),
                                     );
                                 });
                             } else if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {

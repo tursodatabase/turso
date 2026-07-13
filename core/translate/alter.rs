@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
 use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
@@ -420,7 +421,7 @@ pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
                     let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
                     u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
                 })
-                .collect(),
+                .try_collect()?,
         )),
         ast::Literal::Null => Ok(Value::Null),
         ast::Literal::True => Ok(Value::from_i64(1)),

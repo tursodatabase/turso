@@ -15462,9 +15462,10 @@ fn test_mvcc_portable_changes_delete_carries_pk_projection_not_old_record() {
         _ => None,
     });
     let delete_pk_record = delete_pk_record.expect("expected data DELETE op");
-    let pk_values = ImmutableRecord::from_bin_record(delete_pk_record)
-        .get_values_owned()
-        .unwrap();
+    let pk_values =
+        ImmutableRecord::from_bin_record(crate::types::value_blob_from_slice(&delete_pk_record))
+            .get_values_owned()
+            .unwrap();
     assert_eq!(
         pk_values,
         vec![Value::Text(Text::new("item-a".to_string()))]
