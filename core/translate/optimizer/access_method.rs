@@ -676,6 +676,35 @@ fn consider_in_seek_access_method(
     }))
 }
 
+fn residual_literal_in_list_eval_cost(
+    constraints: &[Constraint],
+    where_clause: &[WhereTerm],
+    consumed_where_terms: &[usize],
+    input_cardinality: f64,
+    rows_per_outer_row: f64,
+    params: &CostModelParams,
+) -> Cost {
+    let eval_count = input_cardinality * rows_per_outer_row;
+    let comparison_count: f64 = constraints
+        .iter()
+        .filter(|constraint| !consumed_where_terms.contains(&constraint.where_clause_pos.0))
+        .filter(|constraint| {
+            where_clause
+                .get(constraint.where_clause_pos.0)
+                .is_some_and(|term| matches!(term.expr, ast::Expr::InList { .. }))
+        })
+        .filter_map(|constraint| match constraint.operator {
+            ConstraintOperator::In {
+                not: false,
+                estimated_values,
+            } => Some(estimated_values),
+            _ => None,
+        })
+        .sum();
+
+    Cost(eval_count * comparison_count * params.cpu_cost_per_row)
+}
+
 /// Return the best [AccessMethod] for a given join order.
 #[allow(clippy::too_many_arguments)]
 pub fn find_best_access_method_for_join_order(
@@ -830,6 +859,15 @@ fn find_best_access_method_for_btree(
     // Skip alternative access methods (in-seek, multi-index) when INDEXED BY or NOT INDEXED
     // is specified — the user explicitly requested a specific index or no index.
     if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
+        let in_seek_threshold = best_access_method.cost
+            + residual_literal_in_list_eval_cost(
+                &rhs_constraints.constraints,
+                where_clause,
+                &best_access_method.consumed_where_terms,
+                input_cardinality,
+                best_access_method.estimated_rows_per_outer_row,
+                params,
+            );
         if let Some(in_seek_method) = consider_in_seek_access_method(
             rhs_table,
             rhs_constraints,
@@ -837,7 +875,7 @@ fn find_best_access_method_for_btree(
             input_cardinality,
             base_row_count,
             params,
-            best_access_method.cost,
+            in_seek_threshold,
         )? {
             let mut in_seek_method = in_seek_method;
             if let AccessMethodParams::InSeek { index, .. } = &in_seek_method.params {
