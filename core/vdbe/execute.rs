@@ -16045,6 +16045,19 @@ pub struct OpJournalModeState {
     pub bootstrap_guard: Option<MvccBootstrapGuard>,
 }
 
+impl OpJournalModeState {
+    pub(super) fn cleanup_checkpoint(&mut self) -> Result<()> {
+        let Some(mut checkpoint_sm) = self.checkpoint_sm.take() else {
+            return Ok(());
+        };
+        checkpoint_sm
+            .inner_mut()
+            .cleanup_after_external_io_error(LimboError::InternalError(
+                "mvcc: abandoned journal-mode checkpoint".to_string(),
+            ))
+    }
+}
+
 /// Restores in-memory MVCC state if a `PRAGMA journal_mode=mvcc` bootstrap is
 /// abandoned (statement reset/dropped) or errors after the connection has been
 /// demoted and the shared `MvStore` installed.

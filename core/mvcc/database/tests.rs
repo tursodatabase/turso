@@ -1753,6 +1753,46 @@ fn test_journal_mode_switch_from_mvcc_to_wal_without_log_frames() {
     assert_eq!(rows[0][0].to_string().to_lowercase(), "wal");
 }
 
+#[test]
+fn abandoned_journal_mode_checkpoint_releases_pager_transaction_and_lock() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'one')").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut stmt = conn.prepare("PRAGMA journal_mode = 'wal'").unwrap();
+    for _ in 0..10_000 {
+        match stmt.step().unwrap() {
+            crate::StepResult::Yield if injector.is_empty() => break,
+            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            crate::StepResult::Yield => {}
+            other => {
+                panic!("journal-mode checkpoint completed before pager-commit yield: {other:?}")
+            }
+        }
+    }
+    assert!(injector.is_empty(), "checkpoint did not reach pager commit");
+
+    stmt.reset().unwrap();
+    conn.set_yield_injector(None);
+
+    let tx_state = conn.get_tx_state();
+    let checkpoint_lock_released = mvcc_store.blocking_checkpoint_lock.write();
+    if checkpoint_lock_released {
+        mvcc_store.blocking_checkpoint_lock.unlock();
+    }
+    assert!(
+        tx_state == crate::connection::TransactionState::None && checkpoint_lock_released,
+        "reset left journal-mode checkpoint resources owned: \
+         transaction_state={tx_state:?}, checkpoint_lock_released={checkpoint_lock_released}"
+    );
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+}
+
 #[turso_macros::test(encryption)]
 fn test_recovery_checkpoint_then_more_writes() {
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
@@ -18975,6 +19015,275 @@ fn mvcc_bug_repro_dropped_committed_delete_rewrites_all_tombstone_txids() {
     result
         .unwrap()
         .expect("later public writer must not conflict on a stale removed tombstone TxID");
+}
+
+/// Creates and drops a checkpointed table so the following schema changes reuse
+/// physical roots and expose a root mapping left behind by a failed checkpoint.
+fn prepare_recycled_root_pages_for_failed_checkpoint(conn: &Arc<Connection>) {
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE old(id INTEGER PRIMARY KEY, x TEXT, b BLOB)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO old
+         SELECT value, 'old' || value, zeroblob(1000)
+           FROM generate_series(1, 50)",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("DROP TABLE old").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+}
+
+fn expect_database_full_checkpoint(result: crate::Result<()>) {
+    let error = result.expect_err("checkpoint must fail when max_page_count is exhausted");
+    assert!(
+        error.to_string().contains("Database is full"),
+        "checkpoint must report that the database is full, got {error:?}"
+    );
+}
+
+fn assert_table_row(conn: &Arc<Connection>, table: &str, id: i64, expected_x: Option<&str>) {
+    let rows = get_rows(conn, &format!("SELECT id, x FROM {table} WHERE id = {id}"));
+    match expected_x {
+        Some(expected_x) => {
+            assert_eq!(
+                rows.len(),
+                1,
+                "expected {table} to contain id {id}, got {rows:?}"
+            );
+            assert_eq!(rows[0][0].as_int().unwrap(), id);
+            assert_eq!(rows[0][1].to_string(), expected_x);
+        }
+        None => assert!(
+            rows.is_empty(),
+            "expected {table} not to contain id {id}, got {rows:?}"
+        ),
+    }
+}
+
+fn assert_table_counts(conn: &Arc<Connection>, expected_t: i64, expected_u: i64) {
+    let rows = get_rows(
+        conn,
+        "SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM u)",
+    );
+    assert_eq!(rows.len(), 1, "count query returned {rows:?}");
+    assert_eq!(rows[0][0].as_int().unwrap(), expected_t, "t row count");
+    assert_eq!(rows[0][1].as_int().unwrap(), expected_u, "u row count");
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/7642.
+///
+/// A checkpoint that hits `max_page_count` must not leave the connection with
+/// a physical root mapping for a page that was never written to the database.
+#[test]
+fn test_read_after_database_full_checkpoint_remains_usable() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("PRAGMA max_page_count = 5").unwrap();
+    conn.execute("CREATE TABLE t(x TEXT)").unwrap();
+    conn.execute(
+        "INSERT INTO t
+         SELECT printf('%.*c', 1800, 'x')
+           FROM generate_series(1, 60)",
+    )
+    .unwrap();
+
+    expect_database_full_checkpoint(conn.execute("PRAGMA wal_checkpoint(TRUNCATE)"));
+
+    let mut read = conn.prepare("SELECT count(*) FROM t").unwrap();
+    let rows = read
+        .run_collect_rows()
+        .expect("read after failed checkpoint must not short-read an unwritten root page");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 60);
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/7642.
+///
+/// A failed automatic checkpoint must not persist an UPDATE against a recycled
+/// root belonging to a different table when the database is reopened.
+#[test]
+fn test_auto_checkpoint_update_stays_with_source_table_after_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        prepare_recycled_root_pages_for_failed_checkpoint(&conn);
+        conn.execute("PRAGMA max_page_count = 6").unwrap();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT, b BLOB)")
+            .unwrap();
+        conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, x TEXT, b BLOB)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t
+             SELECT value, 't' || value, zeroblob(1800)
+               FROM generate_series(1, 60)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES(1000, 't_old', zeroblob(1800))")
+            .unwrap();
+        conn.execute("INSERT INTO u VALUES(1000, 'u_old', zeroblob(1800))")
+            .unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.execute("UPDATE t SET x = 't_updated_by_auto_case' WHERE id = 1000")
+            .unwrap();
+
+        assert_table_row(&conn, "t", 1000, Some("t_updated_by_auto_case"));
+        assert_table_row(&conn, "u", 1000, Some("u_old"));
+    }
+
+    db.restart();
+    let conn = db.connect();
+    assert_table_row(&conn, "t", 1000, Some("t_updated_by_auto_case"));
+    assert_table_row(&conn, "u", 1000, Some("u_old"));
+    assert_table_counts(&conn, 61, 1);
+    assert_integrity_ok(&conn);
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/7642.
+///
+/// A DELETE issued after a failed checkpoint must remain attached to its
+/// source table both before and after recovery.
+#[test]
+fn test_delete_after_failed_checkpoint_stays_with_source_table() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        prepare_recycled_root_pages_for_failed_checkpoint(&conn);
+        conn.execute("PRAGMA max_page_count = 6").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT, b BLOB)")
+            .unwrap();
+        conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, x TEXT, b BLOB)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t
+             SELECT value, 't' || value, zeroblob(1800)
+               FROM generate_series(1, 60)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES(1000, 't_victim', zeroblob(1800))")
+            .unwrap();
+        conn.execute("INSERT INTO u VALUES(1000, 'u_victim', zeroblob(1800))")
+            .unwrap();
+
+        expect_database_full_checkpoint(conn.execute("PRAGMA wal_checkpoint(TRUNCATE)"));
+        conn.execute("DELETE FROM t WHERE id = 1000").unwrap();
+
+        assert_table_row(&conn, "t", 1000, None);
+        assert_table_row(&conn, "u", 1000, Some("u_victim"));
+        assert_table_counts(&conn, 60, 1);
+    }
+
+    db.restart();
+    let conn = db.connect();
+    assert_table_row(&conn, "t", 1000, None);
+    assert_table_row(&conn, "u", 1000, Some("u_victim"));
+    assert_table_counts(&conn, 60, 1);
+    assert_integrity_ok(&conn);
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/7642.
+///
+/// A failed checkpoint on one connection must not poison the shared root map
+/// used by a subsequent writer connection.
+#[test]
+fn test_failed_checkpoint_does_not_move_other_connection_insert() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn1 = db.connect();
+        let conn2 = db.connect();
+        prepare_recycled_root_pages_for_failed_checkpoint(&conn1);
+        conn1.execute("PRAGMA max_page_count = 6").unwrap();
+        conn1
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT, b BLOB)")
+            .unwrap();
+        conn1
+            .execute("CREATE TABLE u(id INTEGER PRIMARY KEY, x TEXT, b BLOB)")
+            .unwrap();
+        conn1
+            .execute(
+                "INSERT INTO t
+                 SELECT value, 't' || value, zeroblob(1800)
+                   FROM generate_series(1, 60)",
+            )
+            .unwrap();
+
+        expect_database_full_checkpoint(conn1.execute("PRAGMA wal_checkpoint(TRUNCATE)"));
+        conn2
+            .execute("INSERT INTO t VALUES(1000, 'conn2_after_leak', zeroblob(1800))")
+            .unwrap();
+
+        assert_table_row(&conn2, "t", 1000, Some("conn2_after_leak"));
+        assert_table_row(&conn2, "u", 1000, None);
+        assert_table_counts(&conn2, 61, 0);
+    }
+
+    db.restart();
+    let conn = db.connect();
+    assert_table_row(&conn, "t", 1000, Some("conn2_after_leak"));
+    assert_table_row(&conn, "u", 1000, None);
+    assert_table_counts(&conn, 61, 0);
+    assert_integrity_ok(&conn);
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/7642.
+///
+/// Replaying a row against the wrong table must not create a table/index
+/// split-brain that only becomes visible after a later successful checkpoint.
+#[test]
+fn test_failed_checkpoint_preserves_secondary_index_consistency() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        prepare_recycled_root_pages_for_failed_checkpoint(&conn);
+        conn.execute("PRAGMA max_page_count = 6").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT, b BLOB)")
+            .unwrap();
+        conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, x TEXT, b BLOB)")
+            .unwrap();
+        conn.execute("CREATE INDEX ux ON u(x)").unwrap();
+        conn.execute(
+            "INSERT INTO t
+             SELECT value, 't' || value, zeroblob(1800)
+               FROM generate_series(1, 60)",
+        )
+        .unwrap();
+
+        expect_database_full_checkpoint(conn.execute("PRAGMA wal_checkpoint(TRUNCATE)"));
+        conn.execute("INSERT INTO t VALUES(1000, 'missing_u_index', zeroblob(1800))")
+            .unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let indexed = get_rows(
+        &conn,
+        "SELECT id, x FROM u INDEXED BY ux WHERE x = 'missing_u_index'",
+    );
+    let scanned = get_rows(
+        &conn,
+        "SELECT id, x FROM u NOT INDEXED WHERE x = 'missing_u_index'",
+    );
+    assert_eq!(
+        indexed, scanned,
+        "secondary-index lookup and table scan must agree after recovery"
+    );
+    assert!(
+        scanned.is_empty(),
+        "a row inserted into t must not recover under u: {scanned:?}"
+    );
+    assert_table_row(&conn, "t", 1000, Some("missing_u_index"));
+    assert_table_row(&conn, "u", 1000, None);
+    assert_integrity_ok(&conn);
+
+    conn.execute("PRAGMA max_page_count = 1000").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_integrity_ok(&conn);
 }
 
 /// Concurrent DROP of a checkpointed table during a parked passive checkpoint must not panic.
