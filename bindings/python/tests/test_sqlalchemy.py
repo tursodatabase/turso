@@ -411,9 +411,6 @@ class TestBasicDialectIntegration:
             from sqlalchemy import inspect
             inspector = inspect(engine)
 
-            # get_foreign_keys is the only one that always returns empty
-            # (Turso lacks PRAGMA foreign_key_list). The others happen to be
-            # empty here only because this table has no indexes/unique/check.
             assert inspector.get_foreign_keys("test") == []
             assert inspector.get_indexes("test") == []
             assert inspector.get_unique_constraints("test") == []
