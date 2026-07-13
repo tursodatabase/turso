@@ -1753,6 +1753,46 @@ fn test_journal_mode_switch_from_mvcc_to_wal_without_log_frames() {
     assert_eq!(rows[0][0].to_string().to_lowercase(), "wal");
 }
 
+#[test]
+fn abandoned_journal_mode_checkpoint_releases_pager_transaction_and_lock() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'one')").unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut stmt = conn.prepare("PRAGMA journal_mode = 'wal'").unwrap();
+    for _ in 0..10_000 {
+        match stmt.step().unwrap() {
+            crate::StepResult::Yield if injector.is_empty() => break,
+            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            crate::StepResult::Yield => {}
+            other => {
+                panic!("journal-mode checkpoint completed before pager-commit yield: {other:?}")
+            }
+        }
+    }
+    assert!(injector.is_empty(), "checkpoint did not reach pager commit");
+
+    stmt.reset().unwrap();
+    conn.set_yield_injector(None);
+
+    let tx_state = conn.get_tx_state();
+    let checkpoint_lock_released = mvcc_store.blocking_checkpoint_lock.write();
+    if checkpoint_lock_released {
+        mvcc_store.blocking_checkpoint_lock.unlock();
+    }
+    assert!(
+        tx_state == crate::connection::TransactionState::None && checkpoint_lock_released,
+        "reset left journal-mode checkpoint resources owned: \
+         transaction_state={tx_state:?}, checkpoint_lock_released={checkpoint_lock_released}"
+    );
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+}
+
 #[turso_macros::test(encryption)]
 fn test_recovery_checkpoint_then_more_writes() {
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);

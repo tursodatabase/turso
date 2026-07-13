@@ -535,6 +535,13 @@ impl ActiveOpStateSlot {
         self.state = ActiveOpState::None;
     }
 
+    fn cleanup_journal_mode_checkpoint(&mut self) -> Result<()> {
+        match &mut self.state {
+            ActiveOpState::JournalMode(state) => state.cleanup_checkpoint(),
+            _ => Ok(()),
+        }
+    }
+
     active_state_accessor!(
         delete,
         Delete,
@@ -2426,6 +2433,16 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
+        // than commit_state. Clean it before transaction abort logic inspects
+        // pager checkpoint state or reset drops the opcode state.
+        if let Err(err) = state.active_op_state.cleanup_journal_mode_checkpoint() {
+            capture_abort_error(
+                &mut abort_error,
+                err,
+                "Failed to clean up journal-mode checkpoint during abort",
+            );
+        }
         // MVCC auto-checkpoint is owned by commit_state, not by normal_step().
         // If its yielded I/O fails, normal_step sees the error before
         // CommitStateMachine::Checkpoint gets another step, so the checkpoint

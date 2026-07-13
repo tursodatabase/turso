@@ -115,6 +115,7 @@ pub(crate) enum CheckpointYieldPoint {
     BeforeAcquireLock,
     AfterDurableBoundaryAdvanced,
     AfterCollectTableRows,
+    BeforePagerCommit,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -2648,6 +2649,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
             }
             CheckpointState::CommitPagerTxn => {
+                inject_transition_yield!(self, CheckpointYieldPoint::BeforePagerCommit);
                 let passive = matches!(self.mode, CheckpointMode::Passive { .. });
                 let passive_auto_publish_retry = passive && !self.update_transaction_state;
                 // Passive: btree commit and publish run off the RW lock (drain bit only).
