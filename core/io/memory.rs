@@ -23,6 +23,12 @@ struct MemStoreInner {
     size: u64,
 }
 
+#[cfg(test)]
+struct WritePause {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 impl MemoryIO {
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Self {
@@ -94,6 +100,8 @@ impl IO for MemoryIO {
 /// the yield-forcing [`super::MemoryYieldIO`] backends used for testing.
 pub(super) struct MemStore {
     inner: RwLock<MemStoreInner>,
+    #[cfg(test)]
+    next_write_pause: Mutex<Option<WritePause>>,
 }
 
 impl MemStore {
@@ -103,6 +111,35 @@ impl MemStore {
                 pages: BTreeMap::new(),
                 size: 0,
             }),
+            #[cfg(test)]
+            next_write_pause: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_next_write(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        assert!(
+            self.next_write_pause
+                .lock()
+                .replace(WritePause {
+                    entered: entered_tx,
+                    release: release_rx,
+                })
+                .is_none(),
+            "a write pause is already armed"
+        );
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    fn pause_test_write(&self) {
+        if let Some(pause) = self.next_write_pause.lock().take() {
+            pause.entered.send(()).unwrap();
+            pause.release.recv().unwrap();
         }
     }
 
@@ -188,6 +225,8 @@ impl MemStore {
             let written = Self::write_at_inner(&mut inner, offset, buffer.as_slice());
             offset += written as u64;
             total_written += written;
+            #[cfg(test)]
+            self.pause_test_write();
         }
         total_written as i32
     }
@@ -298,5 +337,56 @@ impl File for MemoryFile {
     fn punch_hole(&self, pos: usize, len: usize) -> Result<()> {
         self.store.punch_hole(pos, len);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn vectored_write_is_not_observed_partially() {
+        let store = Arc::new(MemStore::new());
+        store.write_at(0, &[0x11; PAGE_SIZE]);
+        let (write_entered, release_write) = store.pause_next_write();
+
+        let writer_store = store.clone();
+        let writer = std::thread::spawn(move || {
+            writer_store.writev(
+                0,
+                &[
+                    Arc::new(Buffer::new(vec![0xAA; PAGE_SIZE / 2])),
+                    Arc::new(Buffer::new(vec![0xAA; PAGE_SIZE / 2])),
+                ],
+            );
+        });
+        write_entered.recv().unwrap();
+
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let buffer = Buffer::new_temporary(PAGE_SIZE);
+            store.read_into(0, &buffer);
+            result_tx.send(buffer.as_slice().to_vec()).unwrap();
+        });
+
+        let early_result = result_rx.recv_timeout(Duration::from_secs(1));
+        release_write.send(()).unwrap();
+        writer.join().unwrap();
+        let bytes = match early_result {
+            Ok(bytes) => bytes,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                result_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("reader result channel disconnected")
+            }
+        };
+        reader.join().unwrap();
+        assert!(
+            bytes.iter().all(|&byte| byte == 0xAA),
+            "read returned a partially written file image; first old byte at offset {}",
+            bytes.iter().position(|&byte| byte == 0x11).unwrap()
+        );
     }
 }
