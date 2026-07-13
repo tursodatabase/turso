@@ -77,12 +77,30 @@ The CDC table (default name: `turso_cdc`) contains the following columns:
 |--------|------|-------------|
 | `change_id` | INTEGER | Auto-incrementing unique identifier for each change |
 | `change_time` | INTEGER | Timestamp of the change (Unix epoch) |
-| `change_type` | INTEGER | Type of change: 1 (INSERT), 0 (UPDATE), -1 (DELETE) |
-| `table_name` | TEXT | Name of the table that was changed |
-| `id` | varies | Primary key/rowid of the changed row |
+| `change_type` | INTEGER | Type of change: 1 (INSERT), 0 (UPDATE), -1 (DELETE), 2 (COMMIT) |
+| `table_name` | TEXT | Name of the table that was changed (NULL for COMMIT records) |
+| `id` | varies | Primary key/rowid of the changed row (NULL for COMMIT records) |
 | `before` | BLOB | Row data before the change (for modes: before, full) |
 | `after` | BLOB | Row data after the change (for modes: after, full) |
 | `updates` | BLOB | Details of updated columns (for mode: full) |
+| `change_txn_id` | INTEGER | Identifier grouping records that belong to the same transaction |
+
+### Commit Records
+
+In addition to row changes, the CDC table records transaction boundaries. A row
+with `change_type = 2` (COMMIT) marks the end of a transaction. Commit records
+carry no row data: their `table_name`, `id`, `before`, `after`, and `updates`
+columns are all NULL, so they appear as mostly empty rows when you select from
+the CDC table.
+
+Every statement executed outside an explicit transaction commits on its own, so
+each such statement is followed by its own COMMIT record. Inside an explicit
+transaction (`BEGIN ... COMMIT`), a single COMMIT record is written when the
+transaction commits.
+
+All records belonging to the same transaction, including its COMMIT record,
+share the same `change_txn_id` value (the `change_id` of the first record in
+the transaction).
 
 ## Querying Changes
 
@@ -100,6 +118,12 @@ SELECT * FROM turso_cdc WHERE change_type = 0;
 
 -- View only deletes
 SELECT * FROM turso_cdc WHERE change_type = -1;
+
+-- View row changes without transaction boundary (COMMIT) records
+SELECT * FROM turso_cdc WHERE change_type != 2;
+
+-- View all changes made by a single transaction
+SELECT * FROM turso_cdc WHERE change_txn_id = 5;
 
 -- View changes for a specific table
 SELECT * FROM turso_cdc WHERE table_name = 'users';
@@ -129,14 +153,18 @@ UPDATE users SET email = 'alice@newdomain.com' WHERE id = 1;
 DELETE FROM users WHERE id = 2;
 
 -- View the captured changes
-SELECT change_type, table_name, id
+SELECT change_type, table_name, id, change_txn_id
 FROM turso_cdc;
 
 -- Results will show:
--- 1 (INSERT) for Alice
--- 1 (INSERT) for Bob
--- 0 (UPDATE) for Alice's email change
--- -1 (DELETE) for Bob
+-- 1 (INSERT) for Alice, followed by a 2 (COMMIT) record
+-- 1 (INSERT) for Bob, followed by a 2 (COMMIT) record
+-- 0 (UPDATE) for Alice's email change, followed by a 2 (COMMIT) record
+-- -1 (DELETE) for Bob, followed by a 2 (COMMIT) record
+--
+-- Each statement above runs in autocommit mode, so each one is its own
+-- transaction and produces its own COMMIT record. The table_name and id
+-- columns of COMMIT records are NULL.
 ```
 
 ## Multiple Connections
@@ -156,19 +184,22 @@ PRAGMA capture_data_changes_conn('id,sync_queue');
 
 ## Transactions
 
-CDC respects transaction boundaries. Changes are only recorded when a transaction commits:
+CDC records are written in the same transaction as the changes themselves, so
+rolling back a transaction also discards its CDC entries. When a transaction
+commits, a single COMMIT record (`change_type = 2`) marks the boundary, and
+every record in the transaction shares the same `change_txn_id`:
 
 ```sql
 BEGIN;
 INSERT INTO users VALUES (3, 'Charlie', 'charlie@example.com');
 UPDATE users SET name = 'Charles' WHERE id = 3;
--- CDC table is not yet updated
-
 COMMIT;
--- Now both the INSERT and UPDATE appear in the CDC table
+
+-- The CDC table now contains the INSERT, the UPDATE, and one COMMIT record,
+-- all with the same change_txn_id
 ```
 
-If a transaction rolls back, no CDC entries are created for those changes.
+If a transaction rolls back, no CDC entries remain for those changes.
 
 ## Schema Changes
 
