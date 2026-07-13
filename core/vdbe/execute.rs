@@ -16182,6 +16182,23 @@ fn op_journal_mode_inner(
                     return Err(LimboError::ReadOnly);
                 }
 
+                // MVCC has no cross-process coordination: commit
+                // serialization, the logical-log append offset, and
+                // checkpoint exclusion are all process-local, so switching a
+                // multiprocess-coordinated database to MVCC would silently
+                // lose committed transactions and corrupt live views.
+                if matches!(new_mode, journal_mode::JournalMode::Mvcc)
+                    && program
+                        .connection
+                        .db
+                        .experimental_multiprocess_wal_enabled()
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "journal_mode=mvcc is not supported with experimental multiprocess WAL: MVCC does not support multiprocess access"
+                            .to_string(),
+                    ));
+                }
+
                 state.active_op_state.journal_mode().new_mode = Some(new_mode);
                 state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::Checkpoint;
             }
