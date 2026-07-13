@@ -367,7 +367,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "blob is not supported!")]
     fn test_blob_not_supported() {
-        let target = Value::Blob(vec![1, 2, 3]);
+        let target = Value::from_slice(&[1, 2, 3]);
         let patch = create_text("{}");
         let cache = JsonCacheCell::new();
 

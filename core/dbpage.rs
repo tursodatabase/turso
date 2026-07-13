@@ -182,7 +182,7 @@ impl InternalVirtualTableCursor for DbPageCursor {
                     if self.pgno == pending_page as i64 {
                         let page_size = self.pager.usable_space()
                             + self.pager.get_reserved_space().unwrap_or(0) as usize;
-                        return Ok(Value::from_blob(vec![0u8; page_size]));
+                        return Ok(Value::from_blob(crate::alloc::vec![0u8; page_size]));
                     }
                 }
 
@@ -194,7 +194,7 @@ impl InternalVirtualTableCursor for DbPageCursor {
 
                 let page_contents = page_ref.get_contents();
                 let data_slice = page_contents.as_ptr();
-                Ok(Value::from_blob(data_slice.to_vec()))
+                Ok(Value::from_slice(data_slice))
             }
             2 => Ok(Value::from_text("main")), // we don't support multiple databases - todo when we do
             _ => Ok(Value::Null),

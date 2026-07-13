@@ -78,7 +78,7 @@ pub fn jsonb(json_value: &Value, cache: &JsonCacheCell) -> crate::Result<Value> 
     }
 }
 
-pub fn convert_dbtype_to_raw_jsonb(data: &Value, strict: Conv) -> crate::Result<Vec<u8>> {
+pub fn convert_dbtype_to_raw_jsonb(data: &Value, strict: Conv) -> crate::Result<crate::ValueBlob> {
     let json = convert_dbtype_to_jsonb(data, strict)?;
     Ok(json.data())
 }
@@ -990,7 +990,7 @@ mod tests {
 
     #[test]
     fn test_get_json_blob_valid_jsonb() {
-        let binary_json = vec![124, 55, 104, 101, 121, 39, 121, 111];
+        let binary_json = crate::alloc::vec![124, 55, 104, 101, 121, 39, 121, 111];
         let input = Value::Blob(binary_json);
         let result = get_json(&input, None).unwrap();
         if let Value::Text(result_str) = result {
@@ -1003,7 +1003,7 @@ mod tests {
 
     #[test]
     fn test_get_json_blob_invalid_jsonb() {
-        let binary_json: Vec<u8> = vec![0xA2, 0x62, 0x6B, 0x31, 0x62, 0x76]; // Incomplete binary JSON
+        let binary_json: crate::ValueBlob = crate::alloc::vec![0xA2, 0x62, 0x6B, 0x31, 0x62, 0x76]; // Incomplete binary JSON
         let input = Value::Blob(binary_json);
         let result = get_json(&input, None);
         println!("{result:?}");
@@ -1123,7 +1123,7 @@ mod tests {
 
     #[test]
     fn test_json_array_blob_invalid() {
-        let blob = Value::Blob("1".as_bytes().to_vec());
+        let blob = Value::from_slice(b"1");
 
         let input = [blob];
 

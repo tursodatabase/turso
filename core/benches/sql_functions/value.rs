@@ -79,7 +79,7 @@ fn length_float(bencher: Bencher) {
 #[cfg(feature = "nanosecond-bench")]
 #[turso_macros::divan_bench]
 fn length_blob(bencher: Bencher) {
-    let value = Value::Blob(vec![0u8; 100]);
+    let value = Value::from_slice(&[0u8; 100]);
     bencher.bench_local(|| black_box(black_box(&value).exec_length()));
 }
 
@@ -202,7 +202,7 @@ fn substring_negative_start(bencher: Bencher) {
 
 #[turso_macros::divan_bench]
 fn substring_blob(bencher: Bencher) {
-    let value = Value::Blob(b"hello world".to_vec());
+    let value = Value::from_slice(b"hello world");
     let start = Value::from_i64(1);
     let length = Value::from_i64(5);
     bencher.bench_local(|| {
@@ -242,8 +242,8 @@ fn instr_not_found(bencher: Bencher) {
 #[cfg(feature = "nanosecond-bench")]
 #[turso_macros::divan_bench]
 fn instr_blob(bencher: Bencher) {
-    let value = Value::Blob(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-    let pattern = Value::Blob(vec![5, 6, 7]);
+    let value = Value::from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    let pattern = Value::from_slice(&[5, 6, 7]);
     bencher.bench_local(|| black_box(black_box(&value).exec_instr(black_box(&pattern))));
 }
 
@@ -317,7 +317,7 @@ fn quote_integer(bencher: Bencher) {
 
 #[turso_macros::divan_bench]
 fn quote_blob(bencher: Bencher) {
-    let value = Value::Blob(vec![0x01, 0x02, 0xAB, 0xCD, 0xEF]);
+    let value = Value::from_slice(&[0x01, 0x02, 0xAB, 0xCD, 0xEF]);
     bencher.bench_local(|| black_box(black_box(&value).exec_quote()));
 }
 
@@ -379,7 +379,7 @@ fn typeof_text(bencher: Bencher) {
 #[cfg(feature = "nanosecond-bench")]
 #[turso_macros::divan_bench]
 fn typeof_blob(bencher: Bencher) {
-    let value = Value::Blob(vec![1, 2, 3]);
+    let value = Value::from_slice(&[1, 2, 3]);
     bencher.bench_local(|| black_box(black_box(&value).exec_typeof()));
 }
 
@@ -442,7 +442,7 @@ fn hex_text(bencher: Bencher) {
 
 #[turso_macros::divan_bench]
 fn hex_blob(bencher: Bencher) {
-    let value = Value::Blob(vec![0x01, 0x02, 0xAB, 0xCD, 0xEF]);
+    let value = Value::from_slice(&[0x01, 0x02, 0xAB, 0xCD, 0xEF]);
     bencher.bench_local(|| black_box(black_box(&value).exec_hex()));
 }
 
@@ -768,8 +768,8 @@ fn concat_string_integer(bencher: Bencher) {
 
 #[turso_macros::divan_bench]
 fn concat_blobs(bencher: Bencher) {
-    let a = Value::Blob(b"hello ".to_vec());
-    let b = Value::Blob(b"world".to_vec());
+    let a = Value::from_slice(b"hello ");
+    let b = Value::from_slice(b"world");
     bencher.bench_local(|| black_box(black_box(&a).exec_concat(black_box(&b))));
 }
 

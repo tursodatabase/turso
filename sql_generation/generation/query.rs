@@ -20,6 +20,7 @@ use crate::model::table::{
 use indexmap::IndexSet;
 use rand::seq::IndexedRandom;
 use rand::Rng;
+use turso_core::alloc::{TursoSliceExt, ALLOC_ERR_MSG};
 use turso_parser::ast::{ColumnConstraint, Expr, SortOrder};
 
 use super::{backtrack, pick};
@@ -778,7 +779,9 @@ impl Arbitrary for Update {
                 Some(size) => {
                     let p = "X".repeat(size);
                     if matches!(marker_col.column_type, ColumnType::Blob) {
-                        SimValue(turso_core::Value::Blob(p.into_bytes()))
+                        SimValue(turso_core::Value::Blob(
+                            p.as_bytes().try_to_vec().expect(ALLOC_ERR_MSG),
+                        ))
                     } else {
                         SimValue(turso_core::Value::Text(p.into()))
                     }

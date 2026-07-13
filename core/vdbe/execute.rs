@@ -2291,7 +2291,7 @@ pub fn op_array_element(
                         if t.value.as_bytes().iter().any(|&b| b > 0x7F)
                             && std::str::from_utf8(t.value.as_bytes()).is_err()
                         {
-                            return Value::Blob(t.value.as_bytes().to_vec());
+                            return Value::from_slice(t.value.as_bytes());
                         }
                     }
                     vref.to_owned()
@@ -2464,7 +2464,7 @@ pub fn op_union_pack(
     let record_bytes = record.into_payload();
 
     // Format: [tag_index: 1 byte][record bytes]
-    let mut blob = Vec::with_capacity(1 + record_bytes.len());
+    let mut blob = <crate::ValueBlob as TursoVecExt<u8>>::with_capacity(1 + record_bytes.len());
     blob.push(*tag_index);
     blob.extend_from_slice(&record_bytes);
     state.registers[*dest].set_value(Value::Blob(blob));
@@ -6025,11 +6025,11 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-            payload.push(Value::Blob(vec![]));
+            payload.push(Value::Blob(crate::alloc::vec![]));
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
-            payload.push(Value::Blob(vec![]));
+            payload.push(Value::Blob(crate::alloc::vec![]));
         }
     };
     Ok(())
@@ -12151,12 +12151,12 @@ const SEQ_COMMIT_STATUS_CONFLICT_RETRY: i64 = 1;
 /// "no prior mv_tx for this db" (must be restored to `None`).
 fn encode_saved_outer_mv_tx(
     outer: Option<(TxID, crate::translate::emitter::TransactionMode)>,
-) -> Vec<u8> {
+) -> crate::ValueBlob {
     use crate::translate::emitter::TransactionMode;
     let Some((tx_id, mode)) = outer else {
-        return Vec::new();
+        return crate::alloc::vec![];
     };
-    let mut buf = Vec::with_capacity(9);
+    let mut buf = <crate::ValueBlob as TursoVecExt<u8>>::with_capacity(9);
     buf.extend_from_slice(&tx_id.to_le_bytes());
     let mode_tag: u8 = match mode {
         TransactionMode::None => 0,
@@ -12230,7 +12230,7 @@ pub fn op_sequence_begin_inner_tx(
         // WAL mode: no inner tx needed. The WAL single-writer lock
         // already serializes writes across processes.
         state.registers[*path_kind_reg].set_value(Value::from_i64(SEQ_PATH_SKIPPED));
-        state.registers[*saved_outer_reg].set_value(Value::Blob(Vec::new()));
+        state.registers[*saved_outer_reg].set_value(Value::Blob(crate::alloc::vec![]));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     };
@@ -12239,7 +12239,7 @@ pub fn op_sequence_begin_inner_tx(
     if let Some((outer_id, _)) = outer_tx {
         if mv_store.is_exclusive_tx(&outer_id) {
             state.registers[*path_kind_reg].set_value(Value::from_i64(SEQ_PATH_SKIPPED));
-            state.registers[*saved_outer_reg].set_value(Value::Blob(Vec::new()));
+            state.registers[*saved_outer_reg].set_value(Value::Blob(crate::alloc::vec![]));
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }

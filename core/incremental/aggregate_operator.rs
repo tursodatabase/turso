@@ -1001,7 +1001,11 @@ impl AggregateState {
         Ok(state)
     }
 
-    fn to_blob(&self, aggregates: &[AggregateFunction], group_key: &[Value]) -> Result<Vec<u8>> {
+    fn to_blob(
+        &self,
+        aggregates: &[AggregateFunction],
+        group_key: &[Value],
+    ) -> Result<crate::ValueBlob> {
         let mut all_values = Vec::new();
         // Store the group key size first
         all_values.push(Value::from_i64(group_key.len() as i64));
@@ -1009,7 +1013,7 @@ impl AggregateState {
         all_values.extend(self.to_value_vector(aggregates));
 
         let record = ImmutableRecord::from_values(&all_values, all_values.len())?;
-        Ok(record.as_blob().clone())
+        Ok(record.into_payload())
     }
 
     pub fn from_blob(blob: &[u8]) -> Result<(Self, Vec<Value>)> {

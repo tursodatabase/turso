@@ -258,7 +258,7 @@ fn numeric_from_null(bencher: Bencher) {
 
 #[turso_macros::divan_bench]
 fn numeric_from_blob(bencher: Bencher) {
-    let value = Value::Blob(b"12345".to_vec());
+    let value = Value::from_slice(b"12345");
     bencher.bench_local(|| black_box(Numeric::from_value(black_box(&value))));
 }
 
@@ -370,6 +370,6 @@ fn numeric_strict_from_text_invalid_prefix(bencher: Bencher) {
 #[turso_macros::divan_bench]
 fn numeric_strict_from_blob(bencher: Bencher) {
     // Blob is always Null in strict mode
-    let value = Value::Blob(b"12345".to_vec());
+    let value = Value::from_slice(b"12345");
     bencher.bench_local(|| black_box(Numeric::from_value_strict(black_box(&value))));
 }

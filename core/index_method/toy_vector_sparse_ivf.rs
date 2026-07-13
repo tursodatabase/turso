@@ -548,7 +548,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "first value must be sparse vector".to_string(),
                         ));
                     };
-                    let vector = Vector::from_vec(vector.to_vec())?;
+                    let vector = Vector::from_vec(crate::types::value_blob_from_slice(vector))?;
                     if !matches!(vector.vector_type, VectorType::Float32Sparse) {
                         return Err(LimboError::InternalError(
                             "first value must be sparse vector".to_string(),
@@ -800,7 +800,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "first value must be sparse vector".to_string(),
                         ));
                     };
-                    let vector = Vector::from_vec(vector.to_vec())?;
+                    let vector = Vector::from_vec(crate::types::value_blob_from_slice(vector))?;
                     if !matches!(vector.vector_type, VectorType::Float32Sparse) {
                         return Err(LimboError::InternalError(
                             "first value must be sparse vector".to_string(),
@@ -900,7 +900,9 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 };
                         }
                         SeekResult::NotFound => {
-                            return Err(LimboError::Corrupt("inverted index corrupted".to_string()))
+                            return Err(LimboError::Corrupt(
+                                "inverted index corrupted".to_string(),
+                            ));
                         }
                     }
                 }
@@ -970,7 +972,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         SeekResult::NotFound | SeekResult::TryAdvance => {
                             return Err(LimboError::Corrupt(
                                 "stats index corrupted: can't find component row".to_string(),
-                            ))
+                            ));
                         }
                     }
                 }
@@ -1067,7 +1069,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "second value must be i64 limit parameter".to_string(),
                         ));
                     };
-                    let vector = Vector::from_vec(vector.to_vec())?;
+                    let vector = Vector::from_vec(crate::types::value_blob_from_slice(vector))?;
                     if !matches!(vector.vector_type, VectorType::Float32Sparse) {
                         return Err(LimboError::InternalError(
                             "first value must be sparse vector".to_string(),
@@ -1532,7 +1534,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 "table column value must be sparse vector".to_string(),
                             ));
                         };
-                        let data = Vector::from_vec(data.to_vec())?;
+                        let data = Vector::from_vec(crate::types::value_blob_from_slice(data))?;
                         if !matches!(data.vector_type, VectorType::Float32Sparse) {
                             return Err(LimboError::InternalError(
                                 "table column value must be sparse vector".to_string(),
@@ -1543,7 +1545,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 "first value must be sparse vector".to_string(),
                             ));
                         };
-                        let arg = Vector::from_vec(arg.to_vec())?;
+                        let arg = Vector::from_vec(crate::types::value_blob_from_slice(arg))?;
                         if !matches!(arg.vector_type, VectorType::Float32Sparse) {
                             return Err(LimboError::InternalError(
                                 "first value must be sparse vector".to_string(),

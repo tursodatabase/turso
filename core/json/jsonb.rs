@@ -1,5 +1,7 @@
+use crate::alloc::TursoVecExt;
 use crate::json::error::{Error as PError, Result as PResult};
 use crate::json::Conv;
+use crate::types::{value_blob_from_slice, ValueBlob};
 use crate::{bail_parse_error, LimboError, Result};
 use std::{
     borrow::Cow,
@@ -176,7 +178,7 @@ static CHARACTER_TYPE_OK: [u8; 256] = make_character_type_ok_table();
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Jsonb {
-    data: Vec<u8>,
+    data: ValueBlob,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -907,11 +909,11 @@ impl Jsonb {
     pub fn new(capacity: usize, data: Option<&[u8]>) -> Self {
         if let Some(data) = data {
             return Self {
-                data: data.to_vec(),
+                data: value_blob_from_slice(data),
             };
         }
         Self {
-            data: Vec::with_capacity(capacity),
+            data: <ValueBlob as TursoVecExt<u8>>::with_capacity(capacity),
         }
     }
 
@@ -921,7 +923,7 @@ impl Jsonb {
 
     pub fn make_empty_array(size: usize) -> Self {
         let mut jsonb = Self {
-            data: Vec::with_capacity(size),
+            data: <ValueBlob as TursoVecExt<u8>>::with_capacity(size),
         };
         jsonb
             .write_element_header(0, ElementType::ARRAY, 0, false)
@@ -931,7 +933,7 @@ impl Jsonb {
 
     pub fn make_empty_obj(size: usize) -> Self {
         let mut jsonb = Self {
-            data: Vec::with_capacity(size),
+            data: <ValueBlob as TursoVecExt<u8>>::with_capacity(size),
         };
         jsonb
             .write_element_header(0, ElementType::OBJECT, 0, false)
@@ -943,7 +945,7 @@ impl Jsonb {
         self.data.extend_from_slice(data);
     }
 
-    pub fn append_jsonb_to_end(&mut self, mut data: Vec<u8>) {
+    pub fn append_jsonb_to_end(&mut self, mut data: ValueBlob) {
         self.data.append(&mut data);
     }
 
@@ -2380,7 +2382,7 @@ impl Jsonb {
         Self::new(data.len(), Some(data))
     }
 
-    pub fn data(self) -> Vec<u8> {
+    pub fn data(self) -> ValueBlob {
         self.data
     }
 
@@ -4608,7 +4610,7 @@ mod path_operations_tests {
         // a value that would cause overflow when added to the position.
         // Header byte: 0xFB = element type ARRAY (11) + size marker 15 (8-byte size)
         // Followed by 8 bytes of near-max u64 value.
-        let malformed: Vec<u8> = vec![
+        let malformed: ValueBlob = crate::alloc::vec![
             0xFB, // ARRAY type (11) with 8-byte payload size marker (15 << 4)
             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // huge payload size
         ];

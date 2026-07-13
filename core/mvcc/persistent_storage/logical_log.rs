@@ -294,10 +294,18 @@ const OP_EXT_FIELD_DELETE_IDENTITY_RECORD: u64 = 1;
 const OP_EXT_FIELD_DELETE_PK_RECORD: u64 = 2;
 const OP_EXT_FIELD_DELETE_ROWID: u64 = 3;
 
-#[derive(Default)]
 struct DeletePortableExtension {
-    identity_record: Vec<u8>,
-    pk_record: Vec<u8>,
+    identity_record: crate::ValueBlob,
+    pk_record: crate::ValueBlob,
+}
+
+impl Default for DeletePortableExtension {
+    fn default() -> Self {
+        Self {
+            identity_record: crate::alloc::vec![],
+            pk_record: crate::alloc::vec![],
+        }
+    }
 }
 
 const TX_HEADER_SIZE_V2: usize = 24; // FRAME_MAGIC(4) + payload_size(8) + op_count(4) + commit_ts(8)
@@ -1252,7 +1260,8 @@ fn decode_delete_portable_extension(extension: &[u8]) -> Result<DeletePortableEx
                         "delete identity record exceeds op extension".into(),
                     ));
                 }
-                decoded.identity_record = extension[offset..end].to_vec();
+                decoded.identity_record =
+                    crate::types::value_blob_from_slice(&extension[offset..end]);
                 offset = end;
             }
             (OP_EXT_FIELD_DELETE_PK_RECORD, 2) => {
@@ -1268,7 +1277,7 @@ fn decode_delete_portable_extension(extension: &[u8]) -> Result<DeletePortableEx
                         "delete PK record exceeds op extension".into(),
                     ));
                 }
-                decoded.pk_record = extension[offset..end].to_vec();
+                decoded.pk_record = crate::types::value_blob_from_slice(&extension[offset..end]);
                 offset = end;
             }
             (OP_EXT_FIELD_DELETE_ROWID, 0) => {
@@ -1568,7 +1577,7 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
             if rowid_len > payload.len() {
                 return Err(LimboError::Corrupt("rowid_len > payload".into()));
             }
-            let record_bytes = payload[rowid_len..].to_vec();
+            let record_bytes = crate::types::value_blob_from_slice(&payload[rowid_len..]);
             let rowid = RowID::new(table_id, RowKey::Int(rowid_u64 as i64));
             ParsedOp::UpsertTable {
                 table_id,
@@ -1587,8 +1596,8 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
                     "DELETE_TABLE payload size mismatch".into(),
                 ));
             }
-            let mut record_bytes = payload[rowid_len..].to_vec();
-            let mut pk_record_bytes = Vec::new();
+            let mut record_bytes = crate::types::value_blob_from_slice(&payload[rowid_len..]);
+            let mut pk_record_bytes = crate::alloc::vec![];
             if !extension.is_empty() {
                 let decoded = decode_delete_portable_extension(extension)?;
                 if record_bytes.is_empty() {
@@ -1607,13 +1616,13 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
         }
         OP_UPSERT_INDEX => ParsedOp::UpsertIndex {
             table_id: table_id.expect("index op must have table_id"),
-            payload: payload.to_vec(),
+            payload: crate::types::value_blob_from_slice(payload),
             commit_ts,
             btree_resident,
         },
         OP_DELETE_INDEX => ParsedOp::DeleteIndex {
             table_id: table_id.expect("index op must have table_id"),
-            payload: payload.to_vec(),
+            payload: crate::types::value_blob_from_slice(payload),
             commit_ts,
             btree_resident,
         },
@@ -2034,7 +2043,7 @@ impl StreamingLogicalLogReader {
                     let ops = match return_if_io!(self.parse_next_transaction()) {
                         ParseResult::Frame(frame) => frame.ops,
                         ParseResult::Eof | ParseResult::InvalidFrame => {
-                            return Ok(IOResult::Done(None))
+                            return Ok(IOResult::Done(None));
                         }
                     };
 
@@ -2406,7 +2415,7 @@ impl StreamingLogicalLogReader {
             )) {
                 EncryptedChunkReadResult::Ok { running_crc } => running_crc,
                 EncryptedChunkReadResult::Eof => {
-                    return Ok(IOResult::Done(PayloadParseResult::Eof))
+                    return Ok(IOResult::Done(PayloadParseResult::Eof));
                 }
             };
 
@@ -2658,7 +2667,7 @@ impl StreamingLogicalLogReader {
                 running_crc = crc32c::crc32c_append(running_crc, &extension);
                 (extension, extension_len_bytes_len + extension_len)
             } else {
-                (Vec::new(), 0)
+                (crate::alloc::vec![], 0)
             };
 
             let op_total_bytes = 6 + payload_len_bytes_len + payload_len + extension_total_bytes;
@@ -2708,7 +2717,7 @@ impl StreamingLogicalLogReader {
                     let rowid_i64 = rowid_u64 as i64;
                     let mut payload = payload;
                     let mut record_bytes = payload.split_off(rowid_len);
-                    let mut pk_record_bytes = Vec::new();
+                    let mut pk_record_bytes = crate::alloc::vec![];
                     if !portable_extension.is_empty() {
                         let decoded = decode_delete_portable_extension(&portable_extension)?;
                         if record_bytes.is_empty() {
@@ -3134,7 +3143,7 @@ impl StreamingLogicalLogReader {
             )? {
                 IOResult::Done(PayloadParseResult::Ok(ops, crc)) => (ops, crc),
                 IOResult::Done(PayloadParseResult::Eof) => {
-                    return Ok(IOResult::Done(PayloadOutcome::Eof))
+                    return Ok(IOResult::Done(PayloadOutcome::Eof));
                 }
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             };
@@ -3591,7 +3600,7 @@ impl StreamingLogicalLogReader {
         bytes_in_buffer + bytes_in_file
     }
 
-    fn try_consume_bytes(&mut self, amount: usize) -> Result<IOResult<Option<Vec<u8>>>> {
+    fn try_consume_bytes(&mut self, amount: usize) -> Result<IOResult<Option<crate::ValueBlob>>> {
         if self.remaining_bytes() < amount {
             return Ok(IOResult::Done(None));
         }
@@ -3599,7 +3608,7 @@ impl StreamingLogicalLogReader {
         let buffer = self.buffer.read();
         let start = self.buffer_offset;
         let end = start + amount;
-        let bytes = buffer[start..end].to_vec();
+        let bytes = crate::types::value_blob_from_slice(&buffer[start..end]);
         self.buffer_offset = end;
         Ok(IOResult::Done(Some(bytes)))
     }
@@ -3898,26 +3907,26 @@ pub(crate) enum ParsedOp {
     UpsertTable {
         table_id: MVTableId,
         rowid: RowID,
-        record_bytes: Vec<u8>,
+        record_bytes: crate::ValueBlob,
         commit_ts: u64,
         btree_resident: bool,
     },
     DeleteTable {
         rowid: RowID,
-        record_bytes: Vec<u8>,
-        pk_record_bytes: Vec<u8>,
+        record_bytes: crate::ValueBlob,
+        pk_record_bytes: crate::ValueBlob,
         commit_ts: u64,
         btree_resident: bool,
     },
     UpsertIndex {
         table_id: MVTableId,
-        payload: Vec<u8>,
+        payload: crate::ValueBlob,
         commit_ts: u64,
         btree_resident: bool,
     },
     DeleteIndex {
         table_id: MVTableId,
-        payload: Vec<u8>,
+        payload: crate::ValueBlob,
         commit_ts: u64,
         btree_resident: bool,
     },
@@ -4022,7 +4031,7 @@ mod tests {
     enum ExpectedTableOp {
         Upsert {
             rowid: i64,
-            payload: Vec<u8>,
+            payload: crate::ValueBlob,
             commit_ts: u64,
             btree_resident: bool,
         },
@@ -4934,9 +4943,9 @@ mod tests {
             read_back[0],
             ExpectedTableOp::Upsert {
                 rowid: 1,
-                payload: generate_simple_string_row((-2).into(), 1, "a")
-                    .payload()
-                    .to_vec(),
+                payload: crate::types::value_blob_from_slice(
+                    generate_simple_string_row((-2).into(), 1, "a").payload(),
+                ),
                 commit_ts: 1,
                 btree_resident: false,
             }
@@ -4945,9 +4954,9 @@ mod tests {
             read_back[1],
             ExpectedTableOp::Upsert {
                 rowid: 2,
-                payload: generate_simple_string_row((-2).into(), 2, "b")
-                    .payload()
-                    .to_vec(),
+                payload: crate::types::value_blob_from_slice(
+                    generate_simple_string_row((-2).into(), 2, "b").payload(),
+                ),
                 commit_ts: 2,
                 btree_resident: false,
             }
@@ -5222,9 +5231,9 @@ mod tests {
             read_back[0],
             ExpectedTableOp::Upsert {
                 rowid: 1,
-                payload: generate_simple_string_row((-2).into(), 1, "first")
-                    .payload()
-                    .to_vec(),
+                payload: crate::types::value_blob_from_slice(
+                    generate_simple_string_row((-2).into(), 1, "first").payload(),
+                ),
                 commit_ts: 1,
                 btree_resident: false,
             }
@@ -5362,9 +5371,9 @@ mod tests {
             ops,
             vec![ExpectedTableOp::Upsert {
                 rowid: 1,
-                payload: generate_simple_string_row((-2).into(), 1, "a")
-                    .payload()
-                    .to_vec(),
+                payload: crate::types::value_blob_from_slice(
+                    generate_simple_string_row((-2).into(), 1, "a").payload(),
+                ),
                 commit_ts: 10,
                 btree_resident: false,
             }]
@@ -5740,7 +5749,7 @@ mod tests {
                     });
                     expected.push(ExpectedTableOp::Upsert {
                         rowid,
-                        payload: row.payload().to_vec(),
+                        payload: crate::types::value_blob_from_slice(row.payload()),
                         commit_ts: tx.tx_timestamp,
                         btree_resident,
                     });
@@ -5760,7 +5769,7 @@ mod tests {
             let row = generate_simple_string_row((-3).into(), rowid, &large_text);
             expected.push(ExpectedTableOp::Upsert {
                 rowid,
-                payload: row.payload().to_vec(),
+                payload: crate::types::value_blob_from_slice(row.payload()),
                 commit_ts: large_commit_ts,
                 btree_resident: false,
             });
@@ -5824,7 +5833,7 @@ mod tests {
             } else {
                 ExpectedTableOp::Upsert {
                     rowid,
-                    payload: row.payload().to_vec(),
+                    payload: crate::types::value_blob_from_slice(row.payload()),
                     commit_ts,
                     btree_resident,
                 }
@@ -6365,7 +6374,10 @@ mod tests {
         commit_ts: u64,
         is_delete: bool,
     ) -> crate::mvcc::database::RowVersion {
-        let sortable_key = SortableIndexKey::new_from_bytes(payload_bytes, test_index_info());
+        let sortable_key = SortableIndexKey::new_from_bytes(
+            crate::types::value_blob_from_slice(&payload_bytes),
+            test_index_info(),
+        );
         let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
         let row = Row::new_index_row(row_id, 2);
         crate::mvcc::database::RowVersion {
@@ -6733,7 +6745,7 @@ mod tests {
         ParsedOp::UpsertTable {
             table_id: (-2).into(),
             rowid: RowID::new((-2).into(), RowKey::Int(rowid)),
-            record_bytes: row_version.row.payload().to_vec(),
+            record_bytes: crate::types::value_blob_from_slice(row_version.row.payload()),
             commit_ts,
             btree_resident: false,
         }

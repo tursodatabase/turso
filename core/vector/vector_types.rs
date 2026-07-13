@@ -1,5 +1,9 @@
-use crate::turso_debug_assert;
-use crate::{LimboError, Result};
+use crate::{
+    alloc::{TursoVecExt, Vec},
+    turso_debug_assert,
+    types::value_blob_from_slice,
+    LimboError, Result, ValueBlob,
+};
 
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum VectorType {
@@ -14,7 +18,7 @@ pub enum VectorType {
 pub struct Vector<'a> {
     pub vector_type: VectorType,
     pub dims: usize,
-    pub owned: Option<Vec<u8>>,
+    pub owned: Option<ValueBlob>,
     pub refer: Option<&'a [u8]>,
 }
 
@@ -89,11 +93,21 @@ impl<'a> Vector<'a> {
     }
     pub fn from_f32(mut values_f32: Vec<f32>) -> Self {
         let dims = values_f32.len();
+        #[cfg(not(nightly))]
         let values = unsafe {
-            Vec::from_raw_parts(
+            ValueBlob::from_raw_parts(
                 values_f32.as_mut_ptr() as *mut u8,
                 values_f32.len() * 4,
                 values_f32.capacity() * 4,
+            )
+        };
+        #[cfg(nightly)]
+        let values = unsafe {
+            ValueBlob::from_raw_parts_in(
+                values_f32.as_mut_ptr() as *mut u8,
+                values_f32.len() * 4,
+                values_f32.capacity() * 4,
+                crate::alloc::TursoAllocator,
             )
         };
         std::mem::forget(values_f32);
@@ -106,11 +120,21 @@ impl<'a> Vector<'a> {
     }
     pub fn from_f64(mut values_f64: Vec<f64>) -> Self {
         let dims = values_f64.len();
+        #[cfg(not(nightly))]
         let values = unsafe {
-            Vec::from_raw_parts(
+            ValueBlob::from_raw_parts(
                 values_f64.as_mut_ptr() as *mut u8,
                 values_f64.len() * 8,
                 values_f64.capacity() * 8,
+            )
+        };
+        #[cfg(nightly)]
+        let values = unsafe {
+            ValueBlob::from_raw_parts_in(
+                values_f64.as_mut_ptr() as *mut u8,
+                values_f64.len() * 8,
+                values_f64.capacity() * 8,
+                crate::alloc::TursoAllocator,
             )
         };
         std::mem::forget(values_f64);
@@ -122,20 +146,40 @@ impl<'a> Vector<'a> {
         }
     }
     pub fn from_f32_sparse(dims: usize, mut values_f32: Vec<f32>, mut idx_u32: Vec<u32>) -> Self {
+        #[cfg(not(nightly))]
         let mut values = unsafe {
-            Vec::from_raw_parts(
+            ValueBlob::from_raw_parts(
                 values_f32.as_mut_ptr() as *mut u8,
                 values_f32.len() * 4,
                 values_f32.capacity() * 4,
             )
         };
+        #[cfg(nightly)]
+        let mut values = unsafe {
+            ValueBlob::from_raw_parts_in(
+                values_f32.as_mut_ptr() as *mut u8,
+                values_f32.len() * 4,
+                values_f32.capacity() * 4,
+                crate::alloc::TursoAllocator,
+            )
+        };
         std::mem::forget(values_f32);
 
+        #[cfg(not(nightly))]
         let idx = unsafe {
-            Vec::from_raw_parts(
+            ValueBlob::from_raw_parts(
                 idx_u32.as_mut_ptr() as *mut u8,
                 idx_u32.len() * 4,
                 idx_u32.capacity() * 4,
+            )
+        };
+        #[cfg(nightly)]
+        let idx = unsafe {
+            ValueBlob::from_raw_parts_in(
+                idx_u32.as_mut_ptr() as *mut u8,
+                idx_u32.len() * 4,
+                idx_u32.capacity() * 4,
+                crate::alloc::TursoAllocator,
             )
         };
         std::mem::forget(idx_u32);
@@ -152,7 +196,7 @@ impl<'a> Vector<'a> {
         n.div_ceil(4) * 4
     }
 
-    pub fn from_1bit(dims: usize, bits: Vec<u8>) -> Self {
+    pub fn from_1bit(dims: usize, bits: ValueBlob) -> Self {
         debug_assert!(bits.len() == dims.div_ceil(8));
         Self {
             vector_type: VectorType::Float1Bit,
@@ -162,9 +206,9 @@ impl<'a> Vector<'a> {
         }
     }
 
-    pub fn from_f8(dims: usize, quantized: Vec<u8>, alpha: f32, shift: f32) -> Self {
+    pub fn from_f8(dims: usize, quantized: ValueBlob, alpha: f32, shift: f32) -> Self {
         let aligned = Self::align4(dims);
-        let mut data = Vec::with_capacity(aligned + 8);
+        let mut data = <ValueBlob as TursoVecExt<u8>>::with_capacity(aligned + 8);
         data.extend_from_slice(&quantized);
         data.resize(aligned, 0); // alignment padding
         data.extend_from_slice(&alpha.to_le_bytes());
@@ -178,7 +222,7 @@ impl<'a> Vector<'a> {
         }
     }
 
-    pub fn from_vec(mut blob: Vec<u8>) -> Result<Self> {
+    pub fn from_vec(mut blob: ValueBlob) -> Result<Self> {
         let (vector_type, len, explicit_dims) = Self::vector_type(&blob)?;
         blob.truncate(len);
         Self::from_data_with_dims(vector_type, Some(blob), None, explicit_dims)
@@ -189,7 +233,7 @@ impl<'a> Vector<'a> {
     }
     pub fn from_data(
         vector_type: VectorType,
-        owned: Option<Vec<u8>>,
+        owned: Option<ValueBlob>,
         refer: Option<&'a [u8]>,
     ) -> Result<Self> {
         Self::from_data_with_dims(vector_type, owned, refer, 0)
@@ -197,7 +241,7 @@ impl<'a> Vector<'a> {
 
     fn from_data_with_dims(
         vector_type: VectorType,
-        owned: Option<Vec<u8>>,
+        owned: Option<ValueBlob>,
         refer: Option<&'a [u8]>,
         explicit_dims: usize,
     ) -> Result<Self> {
@@ -321,11 +365,12 @@ impl<'a> Vector<'a> {
             .expect("Vector invariant: exactly one of owned or refer must be Some")
     }
 
-    pub fn bin_eject(self) -> Vec<u8> {
+    pub fn bin_eject(self) -> ValueBlob {
         self.owned.unwrap_or_else(|| {
-            self.refer
-                .expect("Vector invariant: exactly one of owned or refer must be Some")
-                .to_vec()
+            value_blob_from_slice(
+                self.refer
+                    .expect("Vector invariant: exactly one of owned or refer must be Some"),
+            )
         })
     }
 
@@ -435,6 +480,7 @@ impl<'a> Vector<'a> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::alloc::{TursoIteratorExt, ALLOC_ERR_MSG};
     use crate::vector::operations;
 
     use super::*;
@@ -467,7 +513,8 @@ pub(crate) mod tests {
                         }
                     }
                 })
-                .collect()
+                .try_collect()
+                .expect(ALLOC_ERR_MSG)
         }
 
         fn generate_f64_vector(g: &mut Gen) -> Vec<f64> {
@@ -487,7 +534,8 @@ pub(crate) mod tests {
                         }
                     }
                 })
-                .collect()
+                .try_collect()
+                .expect(ALLOC_ERR_MSG)
         }
     }
 
@@ -497,7 +545,7 @@ pub(crate) mod tests {
             Vector {
                 vector_type: v.vector_type,
                 dims: DIMS,
-                owned: Some(v.data),
+                owned: Some(value_blob_from_slice(&v.data)),
                 refer: None,
             }
         }
@@ -517,16 +565,24 @@ pub(crate) mod tests {
             let data = match vector_type {
                 VectorType::Float32Dense => {
                     let floats = Self::generate_f32_vector(g);
-                    floats.iter().flat_map(|f| f.to_le_bytes()).collect()
+                    floats
+                        .iter()
+                        .flat_map(|f| f.to_le_bytes())
+                        .try_collect()
+                        .expect(ALLOC_ERR_MSG)
                 }
                 VectorType::Float64Dense => {
                     let floats = Self::generate_f64_vector(g);
-                    floats.iter().flat_map(|f| f.to_le_bytes()).collect()
+                    floats
+                        .iter()
+                        .flat_map(|f| f.to_le_bytes())
+                        .try_collect()
+                        .expect(ALLOC_ERR_MSG)
                 }
                 VectorType::Float1Bit => {
                     // Generate random bits
                     let byte_count = DIMS.div_ceil(8);
-                    let mut bits = vec![0u8; byte_count];
+                    let mut bits = crate::alloc::vec![0u8; byte_count];
                     for b in bits.iter_mut() {
                         *b = u8::arbitrary(g);
                     }
@@ -547,7 +603,7 @@ pub(crate) mod tests {
                     let alpha = (max_val - min_val) / 255.0;
                     let shift = min_val;
                     let aligned = DIMS.div_ceil(4) * 4;
-                    let mut data = Vec::with_capacity(aligned + 8);
+                    let mut data: Vec<u8> = TursoVecExt::with_capacity(aligned + 8);
                     for &f in &floats {
                         let q = if alpha == 0.0 {
                             0u8
@@ -710,13 +766,13 @@ pub(crate) mod tests {
         let a = Vector {
             vector_type: VectorType::Float32Dense,
             dims: 2,
-            owned: Some(vec![0, 0, 0, 0, 52, 208, 106, 63]),
+            owned: Some(crate::alloc::vec![0, 0, 0, 0, 52, 208, 106, 63]),
             refer: None,
         };
         let b = Vector {
             vector_type: VectorType::Float32Dense,
             dims: 2,
-            owned: Some(vec![0, 0, 0, 0, 58, 100, 45, 192]),
+            owned: Some(crate::alloc::vec![0, 0, 0, 0, 58, 100, 45, 192]),
             refer: None,
         };
         assert!(

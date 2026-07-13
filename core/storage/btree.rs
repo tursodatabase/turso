@@ -9764,7 +9764,7 @@ mod tests {
         // Create a payload that is definitely larger than the maximum local size
         // This will force the creation of overflow pages
         let large_payload_size = max_local + usable_size * 2;
-        let large_payload = vec![b'X'; large_payload_size];
+        let large_payload = crate::alloc::vec![b'X'; large_payload_size];
 
         // Create a record with the large payload
         let regs = &[Register::Value(Value::Blob(large_payload))];
@@ -9819,7 +9819,7 @@ mod tests {
         );
 
         // Create a smaller record to overwrite with
-        let small_payload = vec![b'Y'; 100]; // Much smaller payload
+        let small_payload = crate::alloc::vec![b'Y'; 100]; // Much smaller payload
         let regs = &[Register::Value(Value::Blob(small_payload.clone()))];
         let small_record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
 
@@ -9939,7 +9939,7 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                let regs = &[Register::Value(Value::Blob(vec![0; *size]))];
+                let regs = &[Register::Value(Value::Blob(crate::alloc::vec![0; *size]))];
                 let value = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
                 tracing::info!("insert key:{}", key);
                 run_until_done(
@@ -10036,7 +10036,7 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                let regs = &[Register::Value(Value::Blob(vec![0; size]))];
+                let regs = &[Register::Value(Value::Blob(crate::alloc::vec![0; size]))];
                 let value = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
                 let btree_before = if do_validate {
                     format_btree(pager.clone(), root_page, 0)
@@ -10366,7 +10366,7 @@ mod tests {
                     }
                     expected_keys.push(key.clone());
 
-                    let regs = vec![Register::Value(Value::Blob(key))];
+                    let regs = vec![Register::Value(Value::from_slice(&key))];
                     let value = ImmutableRecord::from_registers(&regs, regs.len()).unwrap();
 
                     let seek_result = run_until_done(
@@ -10397,7 +10397,7 @@ mod tests {
                             tracing::info!("delete {}/{}, seed: {seed}", i + 1, operations);
                         }
 
-                        let regs = vec![Register::Value(Value::Blob(key_to_delete.clone()))];
+                        let regs = vec![Register::Value(Value::from_slice(&key_to_delete))];
                         let record = ImmutableRecord::from_registers(&regs, regs.len()).unwrap();
 
                         // Seek to the key to delete
@@ -10457,7 +10457,7 @@ mod tests {
             );
             let exists = run_until_done(
                 || {
-                    let regs = vec![Register::Value(Value::Blob(key.clone()))];
+                    let regs = vec![Register::Value(Value::from_slice(key))];
                     cursor.seek(
                         SeekKey::IndexKey(
                             &ImmutableRecord::from_registers(&regs, regs.len()).unwrap(),
@@ -11331,7 +11331,7 @@ mod tests {
             .block(|| pager.with_header(|header| header.database_size.get()))?;
 
         for rowid in 1..=record_count {
-            let large_blob = vec![b'A'; 8192];
+            let large_blob = crate::alloc::vec![b'A'; 8192];
             insert_record(&mut cursor, &pager, rowid, Value::Blob(large_blob))?;
         }
 
@@ -12000,7 +12000,7 @@ mod tests {
 
         let page = get_page(2);
         let usable_space = 4096;
-        let regs = &[Register::Value(Value::Blob(vec![0; 3600]))];
+        let regs = &[Register::Value(Value::Blob(crate::alloc::vec![0; 3600]))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let mut payload: Vec<u8> = Vec::new();
         let mut fill_cell_payload_state = FillCellPayloadState::Start;
@@ -12249,7 +12249,9 @@ mod tests {
 
     fn insert_cell(cell_idx: u64, size: u16, page: PageRef, pager: Arc<Pager>) {
         let mut payload = Vec::new();
-        let regs = &[Register::Value(Value::Blob(vec![0; size as usize]))];
+        let regs = &[Register::Value(Value::Blob(
+            crate::alloc::vec![0; size as usize],
+        ))];
         let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
         let mut fill_cell_payload_state = FillCellPayloadState::Start;
         let contents = page.get_contents();
@@ -12319,7 +12321,13 @@ mod tests {
 
             // Blob payloads so a handful of appends split the rightmost leaf.
             for rowid in 1..=8 {
-                insert_record(&mut writer, &pager, rowid, Value::Blob(vec![0u8; 1000])).unwrap();
+                insert_record(
+                    &mut writer,
+                    &pager,
+                    rowid,
+                    Value::Blob(crate::alloc::vec![0u8; 1000]),
+                )
+                .unwrap();
             }
 
             // Positions the reader on the last row and caches the rightmost page id.
@@ -12329,7 +12337,13 @@ mod tests {
 
             // Peer appends: balance_quick allocates a new rightmost leaf.
             for rowid in 9..=16 {
-                insert_record(&mut writer, &pager, rowid, Value::Blob(vec![0u8; 1000])).unwrap();
+                insert_record(
+                    &mut writer,
+                    &pager,
+                    rowid,
+                    Value::Blob(crate::alloc::vec![0u8; 1000]),
+                )
+                .unwrap();
             }
 
             run_until_done(|| reader.last(), pager.deref()).unwrap();

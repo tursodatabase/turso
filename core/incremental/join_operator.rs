@@ -572,7 +572,7 @@ fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
     Ok(HashableRow::new(rowid, values))
 }
 
-fn serialize_hashable_row(row: &HashableRow) -> Result<Vec<u8>> {
+fn serialize_hashable_row(row: &HashableRow) -> Result<crate::ValueBlob> {
     use crate::types::ImmutableRecord;
 
     let mut all_values = Vec::with_capacity(row.values.len() + 1);
@@ -580,7 +580,7 @@ fn serialize_hashable_row(row: &HashableRow) -> Result<Vec<u8>> {
     all_values.extend_from_slice(&row.values);
 
     let record = ImmutableRecord::from_values(&all_values, all_values.len())?;
-    Ok(record.as_blob().clone())
+    Ok(record.into_payload())
 }
 
 impl IncrementalOperator for JoinOperator {

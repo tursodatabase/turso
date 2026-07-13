@@ -701,7 +701,7 @@ mod tests {
     #[test]
     fn test_compute_array_length_invalid_blob_returns_none() {
         // A random blob that is not a valid record should return None
-        let invalid = Value::Blob(vec![0xFF, 0xFE, 0xFD]);
+        let invalid = Value::from_slice(&[0xFF, 0xFE, 0xFD]);
         assert_eq!(compute_array_length(&invalid), None);
     }
 

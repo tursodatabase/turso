@@ -1,7 +1,7 @@
 use std::{fmt::Display, hash::Hash, ops::Deref};
 
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use turso_core::alloc::{TursoIteratorExt, TursoSliceExt, ALLOC_ERR_MSG};
 use turso_core::{numeric::Numeric, types, LimboError};
 use turso_parser::ast::{self, ColumnConstraint, SortOrder};
 
@@ -121,11 +121,12 @@ impl Column {
 
 impl Display for Column {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let constraints = self
-            .constraints
-            .iter()
-            .map(|constraint| constraint.to_string())
-            .join(" ");
+        let constraints = itertools::join(
+            self.constraints
+                .iter()
+                .map(|constraint| constraint.to_string()),
+            " ",
+        );
         let mut col_string = format!("{} {}", self.name, self.column_type);
         if !constraints.is_empty() {
             col_string.push(' ');
@@ -243,7 +244,12 @@ impl SimValue {
             ColumnType::Integer => SimValue(types::Value::from_i64(offset)),
             ColumnType::Float => SimValue(types::Value::from_f64(offset as f64)),
             ColumnType::Text => SimValue(types::Value::Text(format!("u{offset}").into())),
-            ColumnType::Blob => SimValue(types::Value::Blob(format!("u{offset}").into_bytes())),
+            ColumnType::Blob => SimValue(types::Value::Blob(
+                format!("u{offset}")
+                    .as_bytes()
+                    .try_to_vec()
+                    .expect(ALLOC_ERR_MSG),
+            )),
         }
     }
 
@@ -457,7 +463,8 @@ impl From<&ast::Literal> for SimValue {
                         let hex_byte = std::str::from_utf8(pair).unwrap();
                         u8::from_str_radix(hex_byte, 16).unwrap()
                     })
-                    .collect(),
+                    .try_collect()
+                    .expect(ALLOC_ERR_MSG),
             ),
             ast::Literal::Keyword(keyword) => match keyword.to_uppercase().as_str() {
                 "TRUE" => types::Value::from_i64(1),
