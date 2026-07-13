@@ -7,6 +7,13 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# Declare the antithesis cfg (set by the Antithesis build) so the
+# `turso_assert_*` macro expansions pass check-cfg. Scoped narrowly rather
+# than `[lints] workspace = true` because the workspace's deny-level clippy
+# lints do not yet pass on this crate.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(antithesis)'] }
+
 [dependencies]
 turso_core = { workspace = true, features = ["conn_raw_api"] }
 turso_parser = { workspace = true }
@@ -23,8 +30,11 @@ prost = "0.14.1"
 roaring = "0.11.2"
 crc32c = "0.6.8"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.172" }
+
+[target.'cfg(antithesis)'.dependencies]
+antithesis_sdk = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
 ctor = "0.4.2"
