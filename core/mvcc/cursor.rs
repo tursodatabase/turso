@@ -475,7 +475,7 @@ impl<A: ConcurrentAllocator> IndexShadowFinger<A> {
                     // Version present at this key -> resolve the shadow bit now,
                     // on the one key that actually matches a B-tree row.
                     std::cmp::Ordering::Equal => {
-                        return !db.index_chain_invalidates_btree(versions, tx_id)
+                        return !db.index_chain_invalidates_btree(versions, tx_id);
                     }
                     // Finger behind the B-tree (a version-only key); catch up below.
                     std::cmp::Ordering::Less => {}
@@ -554,9 +554,23 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             (&*btree_cursor as &dyn Any).is::<BTreeCursor>(),
             "BTreeCursor expected for mvcc cursor"
         );
-        let table_id = db.get_table_id_from_root_page(root_page_or_table_id);
-        #[cfg(not(any(test, injected_yields)))]
-        let _ = connection;
+        // Resolve the root page against this reader's snapshot: a PASSIVE checkpoint may have
+        // dropped (and possibly reused) the page during collection while we still reference it at an
+        // older snapshot. The WAL read mark keeps the pages readable; this keeps the in-memory
+        // root_page -> table_id reverse lookup snapshot-consistent. See `retired_rootpages`.
+        let snapshot_ts = db.read_snapshot_ts(tx_id);
+        let table_id = if connection.experimental_mvcc_passive_checkpoint_enabled() {
+            // Under PASSIVE checkpointing a transaction can capture a schema cookie older than
+            // the drop committed within its own snapshot (the drop publishes its cookie after
+            // the transaction reads the header, even though the drop's commit ts precedes the
+            // transaction's begin ts). The compiled cursor then points at a positive root page
+            // its snapshot already sees dropped. That is a stale-schema read, not an invariant
+            // violation: reprepare against the current schema instead of panicking.
+            db.try_get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts)
+                .ok_or(LimboError::SchemaUpdated)?
+        } else {
+            db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts)
+        };
         Ok(Self {
             db,
             #[cfg(any(test, injected_yields))]
@@ -777,7 +791,16 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     fn is_btree_allocated(&self) -> bool {
-        self.db.is_btree_allocated(&self.table_id)
+        // Dual gate (logical base-validity AND physical visibility): a PASSIVE checkpoint may
+        // materialize this object's btree during collection. This cursor may read it only if the binding
+        // covers our snapshot AND its pages were already durable when we pinned our read mark
+        // (`visible_from <= observed_boundary`). A cursor that opened before checkpoint publish
+        // materialization therefore stays version-store-only for its whole life and never seeks
+        // the page its read mark can't see. See `MvStore::is_btree_readable_at`.
+        let begin_ts = self.db.read_snapshot_ts(self.tx_id);
+        let read_mark = self.db.read_tx_mark(self.tx_id);
+        self.db
+            .is_btree_readable_at(&self.table_id, begin_ts, read_mark)
     }
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {

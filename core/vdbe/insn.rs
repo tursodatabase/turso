@@ -1690,10 +1690,14 @@ pub enum Insn {
     /// otherwise writes a textual error summary.
     /// Higher-level semantic checks (row/index consistency, constraints, etc.)
     /// are emitted as normal VDBE bytecode in translation.
+    ///
+    /// In passive MVCC mode, `dropped_roots` lists checkpointed objects dropped before the next
+    /// checkpoint; execute walks them after live roots and skips pages already accounted for.
     IntegrityCk {
         db: usize,
         max_errors: usize,
         roots: Vec<i64>,
+        dropped_roots: Vec<i64>,
         message_register: usize,
     },
     RenameTable {

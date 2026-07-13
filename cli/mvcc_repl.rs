@@ -39,7 +39,7 @@ use rustyline::DefaultEditor;
 use std::{collections::HashMap, sync::Arc};
 use turso_core::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, Value};
 
-pub fn run(path: &str) -> anyhow::Result<()> {
+pub fn run(path: &str, passive_checkpoint: bool) -> anyhow::Result<()> {
     let interactive_stdin = std::io::IsTerminal::is_terminal(&std::io::stdin());
     if interactive_stdin {
         println!("MVCC REPL");
@@ -48,7 +48,7 @@ pub fn run(path: &str) -> anyhow::Result<()> {
         println!();
     }
 
-    let db = open_mvcc_db(path)?;
+    let db = open_mvcc_db(path, passive_checkpoint)?;
     let mut connections: HashMap<String, Arc<Connection>> = HashMap::new();
     let mut rl = DefaultEditor::new()?;
 
@@ -90,12 +90,12 @@ pub fn run(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn open_mvcc_db(path: &str) -> anyhow::Result<Arc<Database>> {
+fn open_mvcc_db(path: &str, passive_checkpoint: bool) -> anyhow::Result<Arc<Database>> {
     let (_, db) = Database::open_new::<&str>(
         path,
         None,
         OpenFlags::default(),
-        DatabaseOpts::default(),
+        DatabaseOpts::default().with_experimental_mvcc_passive_checkpoint(passive_checkpoint),
         None,
     )
     .context("failed to open database")?;

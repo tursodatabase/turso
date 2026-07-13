@@ -554,6 +554,7 @@ pub struct LogicalLog {
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
     encrypted_payload_chunk_size: usize,
+    max_appended_commit_ts: u64,
 }
 
 impl LogicalLog {
@@ -572,6 +573,7 @@ impl LogicalLog {
             pending_running_crc: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
+            max_appended_commit_ts: 0,
         }
     }
 
@@ -621,6 +623,7 @@ impl LogicalLog {
     ) -> Result<(Completion, u64)> {
         let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
+        self.max_appended_commit_ts = self.max_appended_commit_ts.max(commit_ts);
         // `tx.buf` is laid out as:
         //   [LOG_HDR slot (56B, zeros)] [TX_HEADER slot (24B, zeros)] [payload]
         debug_assert!(
@@ -979,7 +982,7 @@ impl LogicalLog {
         self.write_header(header)
     }
 
-    pub fn truncate(&mut self) -> Result<Completion> {
+    fn truncate_to_zero(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.
         let mut header = self.current_or_new_header()?;
@@ -995,7 +998,20 @@ impl LogicalLog {
         });
         let c = self.file.truncate(0, completion)?;
         self.offset = 0;
+        self.max_appended_commit_ts = 0;
         Ok(c)
+    }
+
+    /// Truncate when `max_appended_commit_ts <= boundary`; passive uses `durable_txid_max_new`,
+    /// truncate mode uses `u64::MAX` (always empty after checkpoint).
+    pub fn truncate(&mut self, checkpointed_through_ts: u64) -> Result<Completion> {
+        if self.max_appended_commit_ts > checkpointed_through_ts {
+            // Uncheckpointed frames remain — skip truncation.
+            let c = Completion::new_trunc(|_| {});
+            c.complete(0);
+            return Ok(c);
+        }
+        self.truncate_to_zero()
     }
 
     /// Reset the log to a header-only file and return one completion for the
@@ -1942,6 +1958,10 @@ impl StreamingLogicalLogReader {
         }
 
         let header_bytes = return_if_io!(self.read_exact_at(0, LOG_HDR_SIZE));
+        // All-zero header means no durable log header yet (pre-fsync crash), not corruption.
+        if header_bytes.iter().all(|&b| b == 0) {
+            return Ok(IOResult::Done(HeaderReadResult::NoLog));
+        }
         let hdr_len = u16::from_le_bytes([header_bytes[6], header_bytes[7]]) as usize;
         if hdr_len != LOG_HDR_SIZE {
             self.set_invalid_header_state();
@@ -3985,6 +4005,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row: row.clone(),
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&version);
         let c = log.log_tx(tx).unwrap();
@@ -4090,6 +4111,7 @@ mod tests {
             }),
             row,
             btree_resident,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         let tx = crate::mvcc::database::LogRecord::for_test(commit_ts, &[row_version], None);
         let c = log.log_tx(tx).unwrap();
@@ -4215,6 +4237,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row: generate_simple_string_row(table_id, rowid, data),
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
 
@@ -4827,6 +4850,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row: row.clone(),
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         });
         let c = log.log_tx(tx1).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -4840,6 +4864,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         });
         let c = log.log_tx(tx2).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -4995,6 +5020,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 row: row3,
                 btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             }],
             None,
         );
@@ -5056,6 +5082,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 row: generate_simple_string_row((-2).into(), 1, "first"),
                 btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             }],
             None,
         );
@@ -5073,6 +5100,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 row: generate_simple_string_row((-2).into(), 2, "second"),
                 btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             }],
             None,
         );
@@ -5132,6 +5160,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&version);
         let c = log.log_tx(tx).unwrap();
@@ -5606,6 +5635,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row: generate_simple_string_row((-2).into(), 42, "flip"),
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         });
         let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -5688,6 +5718,7 @@ mod tests {
                         )
                         .unwrap(),
                         btree_resident,
+                        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                     });
                     expected.push(ExpectedTableOp::Delete {
                         rowid,
@@ -5705,6 +5736,7 @@ mod tests {
                         end: crate::mvcc::database::PackedTs::pack(None),
                         row: row.clone(),
                         btree_resident,
+                        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                     });
                     expected.push(ExpectedTableOp::Upsert {
                         rowid,
@@ -5740,6 +5772,7 @@ mod tests {
                 end: crate::mvcc::database::PackedTs::pack(None),
                 row,
                 btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             });
         }
         let c = log.log_tx(large_tx).unwrap();
@@ -5750,7 +5783,6 @@ mod tests {
     }
 
     /// What this property checks: For arbitrary event sequences, write/read round-trip preserves operation intent.
-    /// Why this matters: Property checks broaden coverage beyond hand-crafted examples.
     #[quickcheck]
     fn prop_logical_log_roundtrip_sequence(events: Vec<(bool, i64, bool)>) -> bool {
         let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
@@ -5781,6 +5813,7 @@ mod tests {
                 }),
                 row: row.clone(),
                 btree_resident,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             };
             expected.push(if is_delete {
                 ExpectedTableOp::Delete {
@@ -5813,7 +5846,6 @@ mod tests {
     }
 
     /// What this property checks: Streaming varint decode returns the original value for encoded inputs.
-    /// Why this matters: Varint correctness is required for rowid and payload-length decoding.
     #[quickcheck]
     fn prop_streaming_varint_roundtrip(value: u64) -> bool {
         let mut encoded = [0u8; 9];
@@ -5840,7 +5872,6 @@ mod tests {
     }
 
     /// What this property checks: The streaming varint decoder agrees with the reference decoder on the same bytes.
-    /// Why this matters: Decoder agreement reduces risk of split-brain parsing behavior.
     #[quickcheck]
     fn prop_streaming_varint_matches_read_varint(bytes: Vec<u8>) -> bool {
         let bytes = if bytes.len() > 16 {
@@ -5886,6 +5917,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: true,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&version);
         let c = log.log_tx(tx).unwrap();
@@ -5947,6 +5979,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         tx.push_row_version_for_test(&version);
         let c = log.log_tx(tx).unwrap();
@@ -6037,8 +6070,9 @@ mod tests {
         let salt_before = log.header.as_ref().unwrap().salt;
 
         // Truncate to 0 (simulates checkpoint truncation); header with new salt
-        // will be written together with the next frame.
-        let c = log.truncate().unwrap();
+        // will be written together with the next frame. u64::MAX boundary => all
+        // frames are considered checkpointed, so it truncates unconditionally.
+        let c = log.truncate(u64::MAX).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let salt_after = log.header.as_ref().unwrap().salt;
@@ -6241,6 +6275,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
 
@@ -6269,6 +6304,7 @@ mod tests {
             end: crate::mvcc::database::PackedTs::pack(None),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
 
@@ -6318,6 +6354,7 @@ mod tests {
             }),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
 
@@ -6345,6 +6382,7 @@ mod tests {
             }),
             row,
             btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         }
     }
 

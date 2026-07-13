@@ -102,6 +102,11 @@ pub struct Opts {
         help = "Enable experimental multiprocess WAL coordination (on Windows, use --vfs experimental_win_iocp)"
     )]
     pub experimental_multiprocess_wal: bool,
+    #[clap(
+        long,
+        help = "Enable experimental passive MVCC checkpointing (requires journal_mode=mvcc)"
+    )]
+    pub experimental_mvcc_passive_checkpoint: bool,
     #[cfg(feature = "mvcc_repl")]
     #[clap(long, help = "Start MVCC concurrent transaction harness")]
     pub mvcc: bool,
@@ -245,6 +250,7 @@ impl Limbo {
             .with_generated_columns(opts.experimental_generated_columns)
             .with_without_rowid(opts.experimental_without_rowid)
             .with_multiprocess_wal(opts.experimental_multiprocess_wal)
+            .with_experimental_mvcc_passive_checkpoint(opts.experimental_mvcc_passive_checkpoint)
             .with_unsafe_testing(opts.unsafe_testing);
 
         let db_file = normalize_db_path(db_file);

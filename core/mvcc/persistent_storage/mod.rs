@@ -66,7 +66,10 @@ pub trait DurableStorage: Send + Sync + Debug {
     /// reaching into concrete storage internals.
     fn update_header(&self) -> Result<Completion>;
 
-    fn truncate(&self) -> Result<Completion>;
+    /// Truncate the logical log, discarding frames at or below
+    /// `checkpointed_through_ts` (the checkpoint's published boundary). Frames
+    /// above the boundary (uncheckpointed concurrent commits) are preserved.
+    fn truncate(&self, checkpointed_through_ts: u64) -> Result<Completion>;
 
     /// Reset the logical log to a fresh header-only file.
     ///
@@ -193,9 +196,15 @@ impl DurableStorage for Storage {
         self.logical_log.write().update_header()
     }
 
-    fn truncate(&self) -> Result<Completion> {
-        let c = self.logical_log.write().truncate()?;
-        self.shadow_offset_store(0);
+    fn truncate(&self, checkpointed_through_ts: u64) -> Result<Completion> {
+        let mut log = self.logical_log.write();
+        let c = log.truncate(checkpointed_through_ts)?;
+        // Shadow the log's actual offset: 0 if it truncated, unchanged if it
+        // skipped (uncheckpointed frames remain), so should_checkpoint() stays
+        // accurate.
+        let new_offset = log.offset;
+        drop(log);
+        self.shadow_offset_store(new_offset);
         Ok(c)
     }
 

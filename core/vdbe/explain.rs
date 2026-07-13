@@ -2212,6 +2212,7 @@ pub fn insn_to_row(
                 db,
                 max_errors,
                 roots,
+                dropped_roots,
                 message_register,
             } => (
                 "IntegrityCk",
@@ -2220,7 +2221,7 @@ pub fn insn_to_row(
                 0,
                 Value::build_text(""),
                 0,
-                format!("db={db} roots={roots:?} message_register={message_register}"),
+                format!("db={db} roots={roots:?} dropped_roots={dropped_roots:?} message_register={message_register}"),
             ),
             Insn::RowData { cursor_id, dest } => (
                 "RowData",
