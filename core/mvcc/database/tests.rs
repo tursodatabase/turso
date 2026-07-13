@@ -12177,13 +12177,16 @@ fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
 }
 
 /// `PRAGMA journal_mode=mvcc` installs the shared `MvStore` and demotes the
-/// connection in `Finalize`, then yields repeatedly while the store bootstraps
-/// (reparse, checkpoint, log recovery). If the statement is dropped while
-/// parked at one of those bootstrap yields, the abandonment guard must
-/// re-promote the connection and uninstall the un-bootstrapped store. Without
-/// the guard, `is_mvcc_bootstrap_connection` would stay set forever (silently
-/// bypassing MVCC) and other connections on the same `Database` could trip an
-/// assertion on the un-bootstrapped store (`global_header = None`) at commit.
+/// connection in `InstallMvStore`, then yields repeatedly while the store
+/// bootstraps (reparse, checkpoint, log recovery). The on-disk header still
+/// says WAL at that point (the durable page-1 flip is the last step of the
+/// switch), so if the statement is dropped while parked at one of those
+/// bootstrap yields, the abandonment guard must re-promote the connection and
+/// uninstall the un-bootstrapped store, leaving the database simply in WAL
+/// mode. Without the guard, `is_mvcc_bootstrap_connection` would stay set
+/// forever (silently bypassing MVCC) and other connections on the same
+/// `Database` could trip an assertion on the un-bootstrapped store
+/// (`global_header = None`) at commit (#7596).
 ///
 /// Gated on `io_memory_yield`: the test needs [`crate::MemoryYieldIO`] to defer
 /// completions so the bootstrap yields are observable. CI exercises it via the
@@ -12249,7 +12252,8 @@ fn test_abandoned_journal_mode_mvcc_bootstrap_restores_connection() {
     );
 
     // Abandon the statement mid-bootstrap; dropping it drops the
-    // `MvccBootstrapGuard` held in its `active_op_state`.
+    // `MvccBootstrapGuard` held in its `active_op_state`, which restores
+    // in-memory state (the on-disk header still says WAL).
     drop(stmt);
 
     assert!(
@@ -12260,6 +12264,26 @@ fn test_abandoned_journal_mode_mvcc_bootstrap_restores_connection() {
         db.get_mv_store().is_none(),
         "abandonment guard must uninstall the un-bootstrapped store",
     );
+
+    // The connection is simply back in WAL mode: ordinary writes work.
+    conn.execute("INSERT INTO t VALUES (1, 'after-abandon')")
+        .unwrap();
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(rows.len(), 1, "unexpected rows: {rows:?}");
+
+    // Re-running the pragma must complete the switch cleanly, after which
+    // MVCC-only features work and the earlier write is still visible.
+    conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+    assert!(
+        db.get_mv_store().is_some(),
+        "re-running the pragma must install the bootstrapped store",
+    );
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'after-switch')")
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(rows.len(), 2, "unexpected rows: {rows:?}");
 }
 
 /// `step_build_log_record` chunks the commit's write_set into batches of
