@@ -429,6 +429,8 @@ jobs:
           files=(
             src/Turso.Data.Sqlite/bin/Release/Turso.Data.Sqlite.*.nupkg
             src/Turso.Data.Sqlite.NativeAot/bin/Release/Turso.Data.Sqlite.NativeAot.*.nupkg
+            src/Turso.Platform.Client/bin/Release/Turso.Platform.Client.*.nupkg
+            src/Turso.Serverless.Client/bin/Release/Turso.Serverless.Client.*.nupkg
           )
           if [ ${#files[@]} -eq 0 ]; then
             echo "No NuGet packages found to upload"
