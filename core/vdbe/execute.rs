@@ -7000,7 +7000,7 @@ pub fn op_agg_final(
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupArray => {
                     state.registers[dest_reg]
-                        .set_blob(json::jsonb::Jsonb::make_empty_array(1).data())?;
+                        .set_blob(json::jsonb::Jsonb::make_empty_array(1)?.data())?;
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonGroupObject => {
@@ -7009,7 +7009,7 @@ pub fn op_agg_final(
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupObject => {
                     state.registers[dest_reg]
-                        .set_blob(json::jsonb::Jsonb::make_empty_obj(1).data())?;
+                        .set_blob(json::jsonb::Jsonb::make_empty_obj(1)?.data())?;
                 }
                 AggFunc::External(ext_func) => {
                     let value = match ext_func.as_ref() {
@@ -8272,7 +8272,8 @@ pub fn op_function(
                         }
                     };
 
-                    let mut json = json::jsonb::Jsonb::make_empty_array(table.columns().len() * 10);
+                    let mut json =
+                        json::jsonb::Jsonb::make_empty_array(table.columns().len() * 10)?;
                     for column in table.columns() {
                         use crate::types::TextRef;
 
@@ -8329,9 +8330,9 @@ pub fn op_function(
 
                     let mut payload_iterator = ValueIterator::new(bin_record.as_slice())?;
 
-                    let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len);
+                    let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len)?;
                     for i in 0..columns_len {
-                        let mut op = json::jsonb::SearchOperation::new(0);
+                        let mut op = json::jsonb::SearchOperation::new(0)?;
                         let path = json::path::JsonPath {
                             elements: vec![
                                 json::path::PathElement::Root(),

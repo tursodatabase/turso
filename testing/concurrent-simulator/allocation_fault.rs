@@ -227,6 +227,7 @@ fn allocation_site_id(site: AllocationSite) -> u64 {
             ValueBlobAllocationSite::FromSlice => 25,
             ValueBlobAllocationSite::JsonbCopy => 26,
             ValueBlobAllocationSite::Hash128 => 27,
+            ValueBlobAllocationSite::JsonbConstruction => 28,
         },
         AllocationSite::Vector(site) => match site {
             VectorAllocationSite::Parse => 15,
@@ -298,6 +299,7 @@ mod tests {
             ValueBlobAllocationSite::Concat,
             ValueBlobAllocationSite::RecordDecode,
             ValueBlobAllocationSite::FromSlice,
+            ValueBlobAllocationSite::JsonbConstruction,
             ValueBlobAllocationSite::JsonbCopy,
             ValueBlobAllocationSite::Hash128,
         ];

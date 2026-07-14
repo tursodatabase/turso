@@ -206,7 +206,7 @@ impl JsonEachCursor {
     fn empty(traversal_mode: JsonTraversalMode) -> Self {
         Self {
             rowid: 0,
-            json: Jsonb::new(0),
+            json: Jsonb::empty(),
             traversal_states: Vec::new(),
             path_to_current_value: InPlaceJsonPath::new_root(),
             columns: Columns::default(),
@@ -494,7 +494,7 @@ fn navigate_to_path(jsonb: &mut Jsonb, path: &Value) -> Result<Option<Jsonb>, Li
     let json_path = json_path_from_db_value(path, true)?.ok_or_else(|| {
         LimboError::InvalidArgument(format!("path '{path}' is not a valid json path"))
     })?;
-    let mut search_operation = SearchOperation::new(jsonb.len() / 2);
+    let mut search_operation = SearchOperation::new(jsonb.len() / 2)?;
     if jsonb
         .operate_on_path(&json_path, &mut search_operation)
         .is_err()
@@ -548,7 +548,7 @@ mod columns {
         fn default() -> Columns {
             Self {
                 key: Key::empty(),
-                value: Jsonb::new(0),
+                value: Jsonb::empty(),
                 fullkey: "".to_owned(),
                 parent_id: None,
                 innermost_container_path: "".to_owned(),
