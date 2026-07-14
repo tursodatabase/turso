@@ -909,6 +909,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
             for i in 0..num_conns {
                 let conn = rusqlite::Connection::open(env.get_db_path())
                     .expect("Failed to open SQLite connection");
+                crate::runner::env::register_simulator_rusqlite_udfs(&conn);
                 for name in &env.attached_dbs {
                     let aux_path = env.get_aux_db_path(name);
                     conn.execute(&format!("ATTACH '{}' AS {name}", aux_path.display()), [])
@@ -953,6 +954,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
 
             for i in 0..num_conns {
                 let conn = env.db.as_ref().expect("db to be Some").connect().unwrap();
+                crate::runner::env::register_simulator_turso_udfs(&conn);
                 for name in &env.attached_dbs {
                     let aux_path = env.get_aux_db_path(name);
                     conn.execute(format!("ATTACH '{}' AS {name}", aux_path.display()))

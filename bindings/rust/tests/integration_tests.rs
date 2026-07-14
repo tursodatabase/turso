@@ -63,6 +63,38 @@ async fn test_rows_next() {
 }
 
 #[tokio::test]
+async fn test_register_scalar_function() {
+    use turso::core::Value as CoreValue;
+
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.register_scalar_function("rust_concat", 2, true, |args| {
+        let mut combined = String::new();
+        for arg in args {
+            if let CoreValue::Text(text) = arg {
+                combined.push_str(text.as_str());
+            }
+        }
+        Ok(CoreValue::build_text(combined))
+    })
+    .unwrap();
+
+    let mut rows = conn
+        .query("SELECT rust_concat('ab', 'cd')", ())
+        .await
+        .unwrap();
+    let value = rows.next().await.unwrap().unwrap().get_value(0).unwrap();
+    assert_eq!(value, Value::Text("abcd".to_string()));
+
+    conn.unregister_scalar_function("rust_concat").unwrap();
+    assert!(conn
+        .query("SELECT rust_concat('ab', 'cd')", ())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn test_cacheflush() {
     let builder = Builder::new_local("test.db");
     let db = builder.build().await.unwrap();

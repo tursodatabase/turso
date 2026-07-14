@@ -156,7 +156,41 @@ pub fn expr_to_value<T: TableContext>(
             assert_eq!(exprs.len(), 1);
             expr_to_value(&exprs[0], row, table)
         }
+        ast::Expr::FunctionCall { name, args, .. } => {
+            let argument = args
+                .first()
+                .and_then(|arg| expr_to_value(arg, row, table))?;
+            eval_sim_udf(&name.as_str().to_ascii_lowercase(), &argument.0).map(SimValue)
+        }
         _ => unreachable!("{:?}", expr),
+    }
+}
+
+pub const SIM_UDF_NAMES: &[&str] = &["sim_double", "sim_is_even"];
+
+pub fn eval_sim_udf(name: &str, argument: &turso_core::Value) -> Option<turso_core::Value> {
+    match name {
+        "sim_double" => Some(sim_double(argument)),
+        "sim_is_even" => Some(sim_is_even(argument)),
+        _ => None,
+    }
+}
+
+fn sim_double(value: &turso_core::Value) -> turso_core::Value {
+    match value {
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(n)) => {
+            turso_core::Value::from_i64(n.wrapping_mul(2))
+        }
+        _ => turso_core::Value::Null,
+    }
+}
+
+fn sim_is_even(value: &turso_core::Value) -> turso_core::Value {
+    match value {
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(n)) => {
+            turso_core::Value::from_i64((n % 2 == 0) as i64)
+        }
+        _ => turso_core::Value::Null,
     }
 }
 

@@ -4266,12 +4266,10 @@ impl Connection {
             .read()
             .functions
             .values()
+            .flatten()
             .map(|f| {
                 let is_agg = f.func.is_aggregate();
-                let argc = match &f.func {
-                    function::ExtFunc::Aggregate { argc, .. } => *argc,
-                    function::ExtFunc::Scalar { argc, .. } => *argc,
-                };
+                let argc = f.func.argc();
                 (
                     f.name.clone(),
                     is_agg,
@@ -4876,7 +4874,7 @@ pub type StepResult = vdbe::StepResult;
 
 #[derive(Default)]
 pub struct SymbolTable {
-    pub functions: HashMap<String, Arc<function::ExternalFunc>>,
+    pub functions: HashMap<String, Vec<Arc<function::ExternalFunc>>>,
     pub collations: HashMap<u32, Arc<function::ExternalCollation>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
@@ -4929,15 +4927,15 @@ impl SymbolTable {
         name: &str,
         arg_count: usize,
     ) -> Option<Arc<function::ExternalFunc>> {
-        self.functions
+        let overloads = self
+            .functions
             .get(name)
+            .or_else(|| self.functions.get(&crate::util::normalize_ident(name)))?;
+        overloads
+            .iter()
+            .find(|func| func.func.argc() == arg_count as i32)
+            .or_else(|| overloads.iter().find(|func| func.func.argc() < 0))
             .cloned()
-            .or_else(|| {
-                self.functions
-                    .get(&crate::util::normalize_ident(name))
-                    .cloned()
-            })
-            .filter(|func| func.func.matches_arg_count(arg_count))
     }
 
     pub fn resolve_collation(&self, name: &str) -> Option<CollationSeq> {
@@ -4948,8 +4946,8 @@ impl SymbolTable {
     }
 
     pub fn extend(&mut self, other: &SymbolTable) {
-        for (name, func) in &other.functions {
-            self.functions.insert(name.clone(), func.clone());
+        for (name, funcs) in &other.functions {
+            self.functions.insert(name.clone(), funcs.clone());
         }
         for (id, collation) in &other.collations {
             self.collations.insert(*id, collation.clone());
