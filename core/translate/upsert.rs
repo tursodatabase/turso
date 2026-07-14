@@ -966,8 +966,65 @@ pub fn emit_upsert(
         }
     }
 
-    // Index rebuild (DELETE old, INSERT new), honoring partial-index WHEREs
+    // Index maintenance (DELETE old key, INSERT new key), honoring
+    // partial-index WHEREs. Mirroring SQLite, every UNIQUE constraint (the
+    // rowid first, then each unique index) is verified against the NEW row
+    // image before any index entry is touched: a constraint failure must
+    // abort the statement without leaving the indexes out of sync with the
+    // table (issue #6858).
+    let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+
+    // If SET changed the rowid, ensure no other row already owns the new one.
+    if let Some(rnew) = new_rowid_reg {
+        let ok = program.allocate_label();
+
+        // If equal to old rowid, skip uniqueness probe
+        program.emit_insn(Insn::Eq {
+            lhs: rnew,
+            rhs: ctx.conflict_rowid_reg,
+            target_pc: ok,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+
+        // If another row already has rnew -> constraint
+        program.emit_insn(Insn::NotExists {
+            cursor: ctx.cursor_id,
+            rowid_reg: rnew,
+            target_pc: ok,
+        });
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+            description: format!(
+                "{}.{}",
+                table.get_name(),
+                table
+                    .columns()
+                    .iter()
+                    .find(|c| c.is_rowid_alias())
+                    .and_then(|c| c.name.as_deref())
+                    .unwrap_or("rowid")
+            ),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(ok);
+    }
+
+    struct PendingIndexRebuild {
+        idx_cid: usize,
+        idx_meta: Arc<Index>,
+        before_pred_reg: Option<usize>,
+        new_pred_reg: Option<usize>,
+        ins_start: usize,
+        record_reg: usize,
+    }
+
     if let Some(before) = before_start {
+        let mut pending_rebuilds: Vec<PendingIndexRebuild> = Vec::new();
+
+        // Pass 1: compute the NEW key for every affected index and probe the
+        // unique ones for conflicts, without modifying any index yet.
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
             let idx_meta = resolver
                 .with_schema(ctx.database_id, |s| {
@@ -989,13 +1046,14 @@ pub fn emit_upsert(
                 resolver,
                 &layout,
             );
-            let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_pred_reg = eval_partial_pred_for_row_image(
                 program, table, &idx_meta, new_start, new_rowid, resolver, &layout,
             );
 
-            // Skip delete if BEFORE predicate false/NULL
-            let maybe_skip_del = before_pred_reg.map(|r| {
+            // Skip key computation and probe if NEW predicate false/NULL:
+            // a key that fails the partial-index predicate is never inserted,
+            // so it cannot conflict.
+            let maybe_skip_probe = new_pred_reg.map(|r| {
                 let lbl = program.allocate_label();
                 program.emit_insn(Insn::IfNot {
                     reg: r,
@@ -1005,56 +1063,7 @@ pub fn emit_upsert(
                 lbl
             });
 
-            // DELETE old key
-            let del = program.alloc_registers(k + 1);
-            for (i, ic) in idx_meta.columns.iter().enumerate() {
-                if ic.expr.is_some() {
-                    emit_upsert_expr_index_value(
-                        program,
-                        resolver,
-                        table,
-                        ic,
-                        before,
-                        ctx.conflict_rowid_reg,
-                        del + i,
-                        &layout,
-                    )?;
-                } else {
-                    let (ci, _) = table.get_column_by_name(&ic.name).unwrap();
-                    program.emit_insn(Insn::Copy {
-                        src_reg: layout.to_register(before, ci),
-                        dst_reg: del + i,
-                        extra_amount: 0,
-                    });
-                }
-            }
-            program.emit_insn(Insn::Copy {
-                src_reg: ctx.conflict_rowid_reg,
-                dst_reg: del + k,
-                extra_amount: 0,
-            });
-            program.emit_insn(Insn::IdxDelete {
-                start_reg: del,
-                num_regs: k + 1,
-                cursor_id: *idx_cid,
-                raise_error_if_no_matching_entry: false,
-            });
-            if let Some(label) = maybe_skip_del {
-                program.preassign_label_to_next_insn(label);
-            }
-
-            // Skip insert if NEW predicate false/NULL
-            let maybe_skip_ins = new_pred_reg.map(|r| {
-                let lbl = program.allocate_label();
-                program.emit_insn(Insn::IfNot {
-                    reg: r,
-                    target_pc: lbl,
-                    jump_if_null: true,
-                });
-                lbl
-            });
-
-            // INSERT new key (use NEW rowid if present)
+            // NEW key (use NEW rowid if present)
             let ins = program.alloc_registers(k + 1);
             for (i, ic) in idx_meta.columns.iter().enumerate() {
                 if ic.expr.is_some() {
@@ -1131,8 +1140,10 @@ pub fn emit_upsert(
                     cursor_id: *idx_cid,
                     dest: hit,
                 });
+                // A hit on the row being updated is not a conflict: its old
+                // key is deleted before the new one is inserted below.
                 program.emit_insn(Insn::Eq {
-                    lhs: new_rowid,
+                    lhs: ctx.conflict_rowid_reg,
                     rhs: hit,
                     target_pc: ok,
                     flags: CmpInsFlags::default(),
@@ -1148,10 +1159,89 @@ pub fn emit_upsert(
                 program.preassign_label_to_next_insn(ok);
             }
 
-            program.emit_insn(Insn::IdxInsert {
-                cursor_id: *idx_cid,
+            if let Some(lbl) = maybe_skip_probe {
+                program.preassign_label_to_next_insn(lbl);
+            }
+
+            pending_rebuilds.push(PendingIndexRebuild {
+                idx_cid: *idx_cid,
+                idx_meta,
+                before_pred_reg,
+                new_pred_reg,
+                ins_start: ins,
                 record_reg: rec,
-                unpacked_start: Some(ins),
+            });
+        }
+
+        // Pass 2: every UNIQUE constraint holds, so the index mutations can
+        // no longer be interrupted by a constraint failure.
+        for pending in pending_rebuilds {
+            let k = pending.idx_meta.columns.len();
+
+            // Skip delete if BEFORE predicate false/NULL
+            let maybe_skip_del = pending.before_pred_reg.map(|r| {
+                let lbl = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: r,
+                    target_pc: lbl,
+                    jump_if_null: true,
+                });
+                lbl
+            });
+
+            // DELETE old key
+            let del = program.alloc_registers(k + 1);
+            for (i, ic) in pending.idx_meta.columns.iter().enumerate() {
+                if ic.expr.is_some() {
+                    emit_upsert_expr_index_value(
+                        program,
+                        resolver,
+                        table,
+                        ic,
+                        before,
+                        ctx.conflict_rowid_reg,
+                        del + i,
+                        &layout,
+                    )?;
+                } else {
+                    let (ci, _) = table.get_column_by_name(&ic.name).unwrap();
+                    program.emit_insn(Insn::Copy {
+                        src_reg: layout.to_register(before, ci),
+                        dst_reg: del + i,
+                        extra_amount: 0,
+                    });
+                }
+            }
+            program.emit_insn(Insn::Copy {
+                src_reg: ctx.conflict_rowid_reg,
+                dst_reg: del + k,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: del,
+                num_regs: k + 1,
+                cursor_id: pending.idx_cid,
+                raise_error_if_no_matching_entry: false,
+            });
+            if let Some(label) = maybe_skip_del {
+                program.preassign_label_to_next_insn(label);
+            }
+
+            // Skip insert if NEW predicate false/NULL
+            let maybe_skip_ins = pending.new_pred_reg.map(|r| {
+                let lbl = program.allocate_label();
+                program.emit_insn(Insn::IfNot {
+                    reg: r,
+                    target_pc: lbl,
+                    jump_if_null: true,
+                });
+                lbl
+            });
+
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: pending.idx_cid,
+                record_reg: pending.record_reg,
+                unpacked_start: Some(pending.ins_start),
                 unpacked_count: Some((k + 1) as u16),
                 flags: IdxInsertFlags::new().nchange(true),
             });
@@ -1172,44 +1262,11 @@ pub fn emit_upsert(
         table.btree().is_some_and(|bt| bt.is_strict),
     );
 
-    // If rowid changed, first ensure no other row owns it, then delete+insert
+    // If rowid changed, delete+insert (uniqueness of the new rowid was
+    // already verified before index maintenance above)
     if let Some(rnew) = new_rowid_reg {
-        let ok = program.allocate_label();
-
-        // If equal to old rowid, skip uniqueness probe
-        program.emit_insn(Insn::Eq {
-            lhs: rnew,
-            rhs: ctx.conflict_rowid_reg,
-            target_pc: ok,
-            flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
-        });
-
-        // If another row already has rnew -> constraint
-        program.emit_insn(Insn::NotExists {
-            cursor: ctx.cursor_id,
-            rowid_reg: rnew,
-            target_pc: ok,
-        });
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-            description: format!(
-                "{}.{}",
-                table.get_name(),
-                table
-                    .columns()
-                    .iter()
-                    .find(|c| c.is_rowid_alias())
-                    .and_then(|c| c.name.as_deref())
-                    .unwrap_or("rowid")
-            ),
-            on_error: None,
-            description_reg: None,
-        });
-        program.preassign_label_to_next_insn(ok);
-
-        // important: the cursor was repositioned in the previous conflict check via NotExists,
-        // so if we didn't conflict+halt above, we need to re-seek to the row under update.
+        // important: the cursor was repositioned in the earlier rowid uniqueness
+        // probe via NotExists, so we need to re-seek to the row under update.
         program.emit_insn(Insn::SeekRowid {
             cursor_id: ctx.cursor_id,
             src_reg: ctx.conflict_rowid_reg,
