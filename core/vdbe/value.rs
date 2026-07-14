@@ -894,7 +894,7 @@ impl Value {
             // Historically called NONE, but it's the same as BLOB
             Affinity::Blob => {
                 if let Value::Blob(blob) = self {
-                    return Ok(Value::Blob(blob.clone()));
+                    return Value::from_slice(blob);
                 }
                 // Convert to TEXT first, then interpret as BLOB
                 // TODO: handle encoding
