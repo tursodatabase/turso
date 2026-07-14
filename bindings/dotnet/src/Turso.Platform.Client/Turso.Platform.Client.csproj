@@ -47,7 +47,7 @@
           Outputs="$(TransformedOpenApiDocument);$(GeneratedClientSource)">
     <MakeDir Directories="$(MSBuildProjectDirectory)/obj/$(TargetFramework)" />
     <Exec Command="dotnet run --project &quot;$(MSBuildProjectDirectory)/tools/OpenApiTitler/OpenApiTitler.csproj&quot; --configuration $(Configuration) --no-launch-profile -p:BaseIntermediateOutputPath=$(MSBuildProjectDirectory)/obj/$(Configuration)/$(TargetFramework)/OpenApiTitler/obj/ -p:BaseOutputPath=$(MSBuildProjectDirectory)/obj/$(Configuration)/$(TargetFramework)/OpenApiTitler/bin/ -- &quot;$(MSBuildProjectDirectory)/openapi.json&quot; &quot;$(TransformedOpenApiDocument)&quot;" />
-    <Exec Command="$(NSwagExe_Net90) run &quot;$(MSBuildProjectDirectory)/nswag.json&quot; &quot;/variables:OpenApiDocument=$(TransformedOpenApiDocument),GeneratedClientSource=$(GeneratedClientSource)&quot;" />
+    <Exec Command="$(NSwagExe_Net100) run &quot;$(MSBuildProjectDirectory)/nswag.json&quot; &quot;/variables:OpenApiDocument=$(TransformedOpenApiDocument),GeneratedClientSource=$(GeneratedClientSource)&quot;" />
   </Target>
 
   <Target Name="CleanGeneratedPlatformClient" AfterTargets="CoreClean">
