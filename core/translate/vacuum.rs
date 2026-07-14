@@ -1,8 +1,9 @@
 //! Translation of VACUUM statements to VDBE bytecode.
 
+use crate::util::OpenOptions;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::Insn;
-use crate::{bail_parse_error, Connection, Result};
+use crate::{bail_parse_error, Connection, EncryptionOpts, Result};
 use crate::{sync::Arc, LimboError};
 use turso_parser::ast::{Expr, Literal, Name};
 
@@ -28,11 +29,25 @@ pub fn translate_vacuum(
     match into {
         Some(dest_expr) => {
             // VACUUM INTO 'path' - create compacted copy at destination
-            let dest_path = extract_path_from_expr(dest_expr)?;
-            program.emit_insn(Insn::VacuumInto {
-                schema_name,
-                dest_path,
-            });
+            let dest = extract_path_from_expr(dest_expr)?;
+            let opts = OpenOptions::parse(dest.as_str())?;
+            // TODO: Handle all URI parameters, including throwing errors for nonsense ones like
+            // mode=ro
+            match (opts.cipher, opts.hexkey) {
+                (Some(cipher), Some(hexkey)) => program.emit_insn(Insn::VacuumInto {
+                    schema_name,
+                    dest_path: opts.path,
+                    encryption_opts: Some(EncryptionOpts { cipher, hexkey }),
+                }),
+                (Some(_), None) => bail_parse_error!("hexkey is required when cipher is provided"),
+                (None, Some(_)) => bail_parse_error!("cipher is required when hexkey is provided"),
+                (None, None) => program.emit_insn(Insn::VacuumInto {
+                    schema_name,
+                    dest_path: opts.path,
+                    encryption_opts: None,
+                }),
+            }
+
             Ok(())
         }
         None => {
@@ -91,6 +106,8 @@ fn extract_path_from_expr(expr: &Expr) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vdbe::builder::ProgramBuilderOpts;
+    use crate::{DatabaseOpts, QueryMode};
 
     #[test]
     fn test_extract_path_from_string_literal() {
@@ -117,5 +134,100 @@ mod tests {
     fn test_extract_path_empty_fails() {
         let expr = Expr::Literal(Literal::String("''".to_string()));
         assert!(extract_path_from_expr(&expr).is_err());
+    }
+
+    fn make_builder() -> ProgramBuilder {
+        ProgramBuilder::new(
+            QueryMode::Normal,
+            None,
+            ProgramBuilderOpts {
+                num_cursors: 0,
+                approx_num_insns: 4,
+                approx_num_labels: 0,
+            },
+        )
+    }
+
+    fn quoted_string_expr(s: &str) -> Expr {
+        Expr::Literal(Literal::String(format!("'{s}'")))
+    }
+
+    #[test]
+    fn test_translate_vacuum_into_uri_with_cipher_and_hexkey() {
+        let mut program = make_builder();
+        let dest = quoted_string_expr("file:test.db?cipher=aes256&hexkey=00112233");
+        let (_, connection) = Connection::from_uri(":memory:", DatabaseOpts::new())
+            .expect("in-memory connection should succeed");
+        translate_vacuum(&mut program, None, Some(&dest), connection).unwrap();
+
+        let (dest_path, encryption_opts) = program
+            .insns
+            .iter()
+            .find_map(|(insn, _)| match insn {
+                Insn::VacuumInto {
+                    schema_name: _,
+                    dest_path,
+                    encryption_opts,
+                } => Some((dest_path.clone(), encryption_opts.clone())),
+                _ => None,
+            })
+            .expect("VacuumInto instruction was not emitted");
+
+        // The URI scheme and query string are stripped from the destination path.
+        assert_eq!(dest_path, "test.db");
+        let opts = encryption_opts.expect("encryption_opts should be set");
+        assert_eq!(opts.cipher, "aes256");
+        assert_eq!(opts.hexkey, "00112233");
+    }
+
+    #[test]
+    fn test_translate_vacuum_into_uri_only_cipher_errors() {
+        let mut program = make_builder();
+        let dest = quoted_string_expr("file:test.db?cipher=aes256");
+        let (_, connection) = Connection::from_uri(":memory:", DatabaseOpts::new())
+            .expect("in-memory connection should succeed");
+        let err = translate_vacuum(&mut program, None, Some(&dest), connection).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parse error: hexkey is required when cipher is provided"
+        );
+    }
+
+    #[test]
+    fn test_translate_vacuum_into_uri_only_hexkey_errors() {
+        let mut program = make_builder();
+        let dest = quoted_string_expr("file:test.db?hexkey=00112233");
+        let (_, connection) = Connection::from_uri(":memory:", DatabaseOpts::new())
+            .expect("in-memory connection should succeed");
+        let err = translate_vacuum(&mut program, None, Some(&dest), connection).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parse error: cipher is required when hexkey is provided"
+        );
+    }
+
+    #[test]
+    fn test_translate_vacuum_into_uri_without_encryption_params() {
+        let mut program = make_builder();
+        let dest = quoted_string_expr("file:test.db");
+        let (_, connection) = Connection::from_uri(":memory:", DatabaseOpts::new())
+            .expect("in-memory connection should succeed");
+        translate_vacuum(&mut program, None, Some(&dest), connection).unwrap();
+
+        let (dest_path, encryption_opts) = program
+            .insns
+            .iter()
+            .find_map(|(insn, _)| match insn {
+                Insn::VacuumInto {
+                    schema_name: _,
+                    dest_path,
+                    encryption_opts,
+                } => Some((dest_path.clone(), encryption_opts.clone())),
+                _ => None,
+            })
+            .expect("VacuumInto instruction was not emitted");
+
+        assert_eq!(dest_path, "test.db");
+        assert!(encryption_opts.is_none());
     }
 }
