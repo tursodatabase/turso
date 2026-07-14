@@ -97,6 +97,11 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn set_checkpoint_threshold(&self, threshold: i64);
     fn checkpoint_threshold(&self) -> i64;
     fn advance_logical_log_offset_after_success(&self, bytes: u64) -> Result<()>;
+    #[aristo::intent(
+        "the pending running-CRC slot is cleared by the storage abort path after an abandoned deferred-offset write",
+        id = "logical_log_pending_crc_cleared_on_abort",
+        verify = "full"
+    )]
     fn discard_pending_log_write(&self) -> Result<()> {
         Ok(())
     }
@@ -210,6 +215,7 @@ impl DurableStorage for Storage {
         self.logical_log.write().update_header()
     }
 
+    #[aristo::intent("after a truncate, once no write is in flight, the in-memory shadow_offset equals the on-disk durable_offset (the tracked end-of-log matches what's been fsync'd)", id = "aristos:logical_log_shadow_offset_matches_durable", verify = "full")]
     fn truncate(
         &self,
         checkpointed_through_ts: u64,

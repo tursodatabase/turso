@@ -572,10 +572,12 @@ fn derive_initial_crc(salt: u64) -> u32 {
     crc32c::crc32c(&salt.to_le_bytes())
 }
 
+#[cfg_attr(feature = "aristo-instr", derive(aristo::instrument::Inspect))]
 pub struct LogicalLog {
     pub file: Arc<dyn File>,
     io: Arc<dyn crate::IO>,
     pub offset: u64,
+    #[cfg_attr(feature = "aristo-instr", inspect(ret = Option<u8>, with = |h| h.as_ref().map(|x| x.version), name = "header_version"))]
     header: Option<LogHeader>,
     /// Running CRC state for chained checksums. Seeded from the header salt;
     /// updated after each committed frame. The next frame's CRC is computed as
@@ -584,12 +586,24 @@ pub struct LogicalLog {
     /// Pending CRC from a deferred-offset write. Applied by
     /// `advance_offset_after_success` so that an abandoned write
     /// doesn't corrupt the chain.
+    #[cfg_attr(feature = "aristo-instr", inspect(name = "pending_running_crc"))]
     pending_running_crc: Option<u32>,
     encryption_ctx: Option<EncryptionContext>,
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
     encrypted_payload_chunk_size: usize,
     max_appended_commit_ts: u64,
+}
+
+#[cfg(feature = "aristo-instr")]
+impl LogicalLog {
+    /// Harness accessor: the logical-log write cursor and running CRC as one
+    /// owned snapshot, read by the durability-ordering (DOI) differential tests.
+    /// Both underlying fields are already `pub`; this pairs them under the exact
+    /// symbol the routed conformance tests expect.
+    pub fn read_logicallog_offset_crc(&self) -> (u64, u32) {
+        (self.offset, self.running_crc)
+    }
 }
 
 impl LogicalLog {
@@ -918,6 +932,7 @@ impl LogicalLog {
         self.frame_and_pwrite_tx(tx, false, on_serialization_complete)
     }
 
+    #[aristo::intent("the in-memory log offset advances only after the corresponding frame pwrite has completed durably", id = "aristos:logical_log_inmemory_offset_advances_after_durable_write", verify = "full")]
     pub fn advance_offset_after_success(&mut self, bytes: u64) {
         self.offset = self
             .offset
@@ -950,6 +965,7 @@ impl LogicalLog {
         ))
     }
 
+    #[aristo::intent("the in-memory log header is published only after the on-disk header pwrite has completed durably", id = "aristos:logical_log_header_publish_after_fsync", verify = "full")]
     fn write_header(&mut self, mut header: LogHeader) -> Result<Completion> {
         let header_bytes = header.encode();
         header.hdr_crc32c = u32::from_le_bytes([
@@ -981,6 +997,7 @@ impl LogicalLog {
         self.write_header(header)
     }
 
+    #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
     fn truncate_to_zero(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.

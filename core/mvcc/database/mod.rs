@@ -516,6 +516,10 @@ pub struct LogRecord {
 }
 
 impl LogRecord {
+    #[cfg_attr(
+        feature = "aristo-instr",
+        aristo::instrument::expose_pub(as = "new_for_test")
+    )]
     pub(crate) fn new(tx_timestamp: TxID) -> Self {
         Self {
             tx_timestamp,
@@ -8569,6 +8573,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Replay a single committed logical-log transaction frame into the MVCC
     /// store. Fully synchronous (the only recovery IO is reading the next frame,
     /// driven by the caller); operates on accumulators borrowed from `ctx`.
+    ///
+    /// A same-transaction create-then-drop leaves a delete of a sqlite_schema rowid absent from
+    /// the merged state; replay treats that as a legal no-op, not corruption.
+    #[aristo::intent(
+        "Replaying a committed logical-log transaction never aborts with a corruption error",
+        id = "mvcc_recovery_total_on_committed_log",
+        verify = "full"
+    )]
     fn recover_process_frame(
         &self,
         connection: &Arc<Connection>,
