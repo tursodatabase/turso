@@ -292,59 +292,61 @@ pub fn translate_condition_expr(
         ast::Expr::Name(_) => {
             crate::bail_parse_error!("Name as a direct predicate in WHERE clause is not supported");
         }
-        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
-            // In a binary AND, never jump to the parent 'jump_target_when_true' label on the first condition, because
-            // the second condition MUST also be true. Instead we instruct the child expression to jump to a local
-            // true label.
-            let jump_target_when_true = program.allocate_label();
-            translate_condition_expr(
-                program,
-                referenced_tables,
-                lhs,
-                ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_true,
-                    ..condition_metadata
-                },
-                resolver,
-            )?;
-            program.preassign_label_to_next_insn(jump_target_when_true);
-            translate_condition_expr(
-                program,
-                referenced_tables,
-                rhs,
-                condition_metadata,
-                resolver,
-            )?;
-        }
-        ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
-            // In a binary OR, never jump to the parent 'jump_target_when_false' or
-            // 'jump_target_when_null' label on the first condition, because the second
-            // condition CAN also be true. Instead we instruct the child expression to
-            // jump to a local false label so the right side of OR gets evaluated.
-            // This is critical for cases like `x IN (NULL, 3) OR b` where the left side
-            // evaluates to NULL — we must still evaluate the right side.
-            let jump_target_when_false = program.allocate_label();
-            translate_condition_expr(
-                program,
-                referenced_tables,
-                lhs,
-                ConditionMetadata {
-                    jump_if_condition_is_true: true,
-                    jump_target_when_false,
-                    jump_target_when_null: jump_target_when_false,
-                    ..condition_metadata
-                },
-                resolver,
-            )?;
-            program.preassign_label_to_next_insn(jump_target_when_false);
-            translate_condition_expr(
-                program,
-                referenced_tables,
-                rhs,
-                condition_metadata,
-                resolver,
-            )?;
+        ast::Expr::Binary(_, ast::Operator::And | ast::Operator::Or, _) => {
+            // A left spine of AND/OR links can be up to MAX_EXPR_DEPTH long
+            // while recursion here must stay within MAX_EXPR_NESTING frames,
+            // so unroll the spine iteratively: descending, each spine node
+            // allocates the local label its lhs jumps to and derives the
+            // ConditionMetadata its lhs is translated with; ascending, terms
+            // are translated left to right, placing each node's local label
+            // right before its rhs term.
+            //
+            // In a binary AND, the lhs must never jump to the parent
+            // 'jump_target_when_true' label, because the rhs MUST also be
+            // true; it jumps to a local true label instead. In a binary OR,
+            // the lhs must never jump to the parent 'jump_target_when_false'
+            // or 'jump_target_when_null' labels, because the rhs CAN still be
+            // true (critical for cases like `x IN (NULL, 3) OR b` where the
+            // left side evaluates to NULL — the right side must still be
+            // evaluated); it jumps to a local false label instead.
+            let mut node = expr;
+            // Each spine node's rhs term, the metadata it is translated with,
+            // and the local label placed right before it.
+            let mut spine = vec![];
+            let mut metadata = condition_metadata;
+            while let ast::Expr::Binary(lhs, op @ (ast::Operator::And | ast::Operator::Or), rhs) =
+                node
+            {
+                let label = program.allocate_label();
+                let lhs_metadata = match op {
+                    ast::Operator::And => ConditionMetadata {
+                        jump_if_condition_is_true: false,
+                        jump_target_when_true: label,
+                        ..metadata
+                    },
+                    ast::Operator::Or => ConditionMetadata {
+                        jump_if_condition_is_true: true,
+                        jump_target_when_false: label,
+                        jump_target_when_null: label,
+                        ..metadata
+                    },
+                    _ => unreachable!(),
+                };
+                spine.push((rhs.as_ref(), metadata, label));
+                metadata = lhs_metadata;
+                node = lhs.as_ref();
+            }
+            translate_condition_expr(program, referenced_tables, node, metadata, resolver)?;
+            for (term, term_metadata, label) in spine.into_iter().rev() {
+                program.preassign_label_to_next_insn(label);
+                translate_condition_expr(
+                    program,
+                    referenced_tables,
+                    term,
+                    term_metadata,
+                    resolver,
+                )?;
+            }
         }
         // Handle IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE in conditions
         // Delegate to translate_expr which handles these correctly with IsTrue instruction

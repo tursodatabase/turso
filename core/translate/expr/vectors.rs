@@ -1,8 +1,47 @@
 use super::*;
 
 /// Get the number of values returned by an expression
+///
+/// Binary chains (`a OR b OR c ...`) can be [`turso_parser::MAX_EXPR_DEPTH`]
+/// links long while recursion here must stay within
+/// [`turso_parser::MAX_EXPR_NESTING`] frames, so walk the left spine of
+/// binary operators iteratively and only recurse into the (nesting-bounded)
+/// operands hanging off it.
 pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
-    Ok(match unwrap_parens(expr)? {
+    let mut node = unwrap_parens(expr)?;
+    // Descend the Binary left spine iteratively, remembering each node so the
+    // per-node checks can run afterwards in the same (innermost-first) order
+    // the recursive formulation applied them.
+    let mut spine = vec![];
+    while let Expr::Binary(lhs, _, _) = node {
+        spine.push(node);
+        node = unwrap_parens(lhs)?;
+    }
+    let leaf_size = expr_vector_size_non_spine(node)?;
+    let mut size = leaf_size;
+    while let Some(spine_node) = spine.pop() {
+        let Expr::Binary(_, operator, rhs) = spine_node else {
+            unreachable!("only Binary nodes are pushed onto the spine");
+        };
+        let evs_left = size;
+        let evs_right = expr_vector_size(rhs)?;
+        if evs_left != evs_right {
+            crate::bail_parse_error!(
+                "all arguments to binary operator {operator} must return the same number of values. Got: ({evs_left}) {operator} ({evs_right})"
+            );
+        }
+        if evs_left > 1 && !supports_row_value_binary_comparison(operator) {
+            crate::bail_parse_error!("row value misused");
+        }
+        size = 1;
+    }
+    Ok(size)
+}
+
+/// Vector size of an expression that is already known not to be a
+/// (parenthesized) binary spine node.
+fn expr_vector_size_non_spine(expr: &Expr) -> Result<usize> {
+    Ok(match expr {
         Expr::Between {
             lhs, start, end, ..
         } => {
@@ -16,18 +55,8 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             }
             1
         }
-        Expr::Binary(expr, operator, expr1) => {
-            let evs_left = expr_vector_size(expr)?;
-            let evs_right = expr_vector_size(expr1)?;
-            if evs_left != evs_right {
-                crate::bail_parse_error!(
-                    "all arguments to binary operator {operator} must return the same number of values. Got: ({evs_left}) {operator} ({evs_right})"
-                );
-            }
-            if evs_left > 1 && !supports_row_value_binary_comparison(operator) {
-                crate::bail_parse_error!("row value misused");
-            }
-            1
+        Expr::Binary(..) => {
+            unreachable!("Binary nodes are handled by expr_vector_size's spine walk")
         }
         Expr::Register(_) => 1,
         Expr::Case {

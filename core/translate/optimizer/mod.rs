@@ -3017,97 +3017,127 @@ impl Optimizable for ast::Expr {
         }
     }
     /// Returns true if the expression is a constant i.e. does not depend on columns and can be evaluated only once during the execution
+    ///
+    /// Iterative (explicit work stack) because it can be called on expression
+    /// trees up to [`turso_parser::MAX_EXPR_DEPTH`] deep (e.g. long binary
+    /// operator chains), which recursion could not traverse within
+    /// [`turso_parser::MAX_EXPR_NESTING`]-sized stack budgets.
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool {
-        match self {
-            Expr::SubqueryResult { .. } => false,
-            Expr::Between {
-                lhs, start, end, ..
-            } => {
-                lhs.is_constant(resolver)
-                    && start.is_constant(resolver)
-                    && end.is_constant(resolver)
-            }
-            Expr::Binary(expr, _, expr1) => {
-                expr.is_constant(resolver) && expr1.is_constant(resolver)
-            }
-            Expr::Case {
-                base,
-                when_then_pairs,
-                else_expr,
-            } => {
-                base.as_ref().is_none_or(|base| base.is_constant(resolver))
-                    && when_then_pairs.iter().all(|(when, then)| {
-                        when.is_constant(resolver) && then.is_constant(resolver)
-                    })
-                    && else_expr
-                        .as_ref()
-                        .is_none_or(|else_expr| else_expr.is_constant(resolver))
-            }
-            Expr::Cast { expr, .. } => expr.is_constant(resolver),
-            Expr::Collate(expr, _) => expr.is_constant(resolver),
-            // Not constant. Normally rewritten to Expr::Column by the optimizer,
-            // but CHECK constraints bypass the rewrite pass and legitimately
-            // contain DoublyQualified nodes.
-            Expr::DoublyQualified(_, _, _) => false,
-            Expr::Exists(_) => false,
-            Expr::FunctionCall {
-                args,
-                name,
-                filter_over,
-                ..
-            } => {
-                if filter_over.over_clause.is_some() {
-                    return false;
+        let mut stack: smallvec::SmallVec<[&Expr; 8]> = smallvec::smallvec![self];
+        while let Some(expr) = stack.pop() {
+            match expr {
+                Expr::SubqueryResult { .. } => return false,
+                Expr::Between {
+                    lhs, start, end, ..
+                } => {
+                    stack.push(lhs);
+                    stack.push(start);
+                    stack.push(end);
                 }
-                let Some(func) = resolver
-                    .resolve_function(name.as_str(), args.len())
-                    .ok()
-                    .flatten()
-                else {
-                    return false;
-                };
-                func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
-            }
-            Expr::FunctionCallStar { .. } => false,
-            Expr::Id(_) => true,
-            Expr::Column { .. } => false,
-            Expr::RowId { .. } => false,
-            Expr::InList { lhs, rhs, .. } => {
-                lhs.is_constant(resolver)
-                    && (rhs.is_empty() || rhs.iter().all(|v| v.is_constant(resolver)))
-            }
-            Expr::InSelect { .. } => {
-                false // might be constant, too annoying to check subqueries etc. implement later
-            }
-            Expr::InTable { .. } => false,
-            Expr::IsNull(expr) => expr.is_constant(resolver),
-            Expr::Like {
-                lhs, rhs, escape, ..
-            } => {
-                lhs.is_constant(resolver)
-                    && rhs.is_constant(resolver)
-                    && escape
-                        .as_ref()
-                        .is_none_or(|escape| escape.is_constant(resolver))
-            }
-            Expr::Literal(_) => true,
-            Expr::Name(_) => false,
-            Expr::NotNull(expr) => expr.is_constant(resolver),
-            Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_constant(resolver)),
-            // Not constant. Normally rewritten to Expr::Column by the optimizer,
-            // but CHECK constraints bypass the rewrite pass and legitimately
-            // contain Qualified nodes.
-            Expr::Qualified(_, _) | Expr::FieldAccess { .. } => false,
-            Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
-            Expr::Subquery(_) => false,
-            Expr::Unary(_, expr) => expr.is_constant(resolver),
-            Expr::Variable(_) => true,
-            Expr::Register(_) => false,
-            Expr::Default => true,
-            Expr::Array { .. } | Expr::Subscript { .. } => {
-                unreachable!("Array and Subscript are desugared into function calls by the parser")
+                Expr::Binary(expr, _, expr1) => {
+                    stack.push(expr);
+                    stack.push(expr1);
+                }
+                Expr::Case {
+                    base,
+                    when_then_pairs,
+                    else_expr,
+                } => {
+                    if let Some(base) = base {
+                        stack.push(base);
+                    }
+                    for (when, then) in when_then_pairs {
+                        stack.push(when);
+                        stack.push(then);
+                    }
+                    if let Some(else_expr) = else_expr {
+                        stack.push(else_expr);
+                    }
+                }
+                Expr::Cast { expr, .. } => stack.push(expr),
+                Expr::Collate(expr, _) => stack.push(expr),
+                // Not constant. Normally rewritten to Expr::Column by the optimizer,
+                // but CHECK constraints bypass the rewrite pass and legitimately
+                // contain DoublyQualified nodes.
+                Expr::DoublyQualified(_, _, _) => return false,
+                Expr::Exists(_) => return false,
+                Expr::FunctionCall {
+                    args,
+                    name,
+                    filter_over,
+                    ..
+                } => {
+                    if filter_over.over_clause.is_some() {
+                        return false;
+                    }
+                    let Some(func) = resolver
+                        .resolve_function(name.as_str(), args.len())
+                        .ok()
+                        .flatten()
+                    else {
+                        return false;
+                    };
+                    if !func.is_deterministic() {
+                        return false;
+                    }
+                    for arg in args {
+                        stack.push(arg);
+                    }
+                }
+                Expr::FunctionCallStar { .. } => return false,
+                Expr::Id(_) => {}
+                Expr::Column { .. } => return false,
+                Expr::RowId { .. } => return false,
+                Expr::InList { lhs, rhs, .. } => {
+                    stack.push(lhs);
+                    for v in rhs {
+                        stack.push(v);
+                    }
+                }
+                Expr::InSelect { .. } => {
+                    return false; // might be constant, too annoying to check subqueries etc. implement later
+                }
+                Expr::InTable { .. } => return false,
+                Expr::IsNull(expr) => stack.push(expr),
+                Expr::Like {
+                    lhs, rhs, escape, ..
+                } => {
+                    stack.push(lhs);
+                    stack.push(rhs);
+                    if let Some(escape) = escape {
+                        stack.push(escape);
+                    }
+                }
+                Expr::Literal(_) => {}
+                Expr::Name(_) => return false,
+                Expr::NotNull(expr) => stack.push(expr),
+                Expr::Parenthesized(exprs) => {
+                    for expr in exprs {
+                        stack.push(expr);
+                    }
+                }
+                // Not constant. Normally rewritten to Expr::Column by the optimizer,
+                // but CHECK constraints bypass the rewrite pass and legitimately
+                // contain Qualified nodes.
+                Expr::Qualified(_, _) | Expr::FieldAccess { .. } => return false,
+                Expr::Raise(_, expr) => {
+                    if let Some(expr) = expr {
+                        stack.push(expr);
+                    }
+                }
+                Expr::Subquery(_) => return false,
+                Expr::Unary(_, expr) => stack.push(expr),
+                Expr::Variable(_) => {}
+                Expr::Register(_) => return false,
+                Expr::Default => {}
+                Expr::Array { .. } | Expr::Subscript { .. } => {
+                    unreachable!(
+                        "Array and Subscript are desugared into function calls by the parser"
+                    )
+                }
             }
         }
+        true
     }
     /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false
     fn check_always_true_or_false(&self) -> Result<Option<AlwaysTrueOrFalse>> {
@@ -3170,40 +3200,53 @@ impl Optimizable for ast::Expr {
 
                 Ok(None)
             }
-            Self::Binary(lhs, op, rhs) => {
-                let lhs_trivial = lhs.check_always_true_or_false()?;
-                let rhs_trivial = rhs.check_always_true_or_false()?;
-                match op {
-                    ast::Operator::And => {
-                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
-                            || rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
-                        {
-                            return Ok(Some(AlwaysTrueOrFalse::AlwaysFalse));
-                        }
-                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
-                            && rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
-                        {
-                            return Ok(Some(AlwaysTrueOrFalse::AlwaysTrue));
-                        }
-
-                        Ok(None)
-                    }
-                    ast::Operator::Or => {
-                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
-                            || rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
-                        {
-                            return Ok(Some(AlwaysTrueOrFalse::AlwaysTrue));
-                        }
-                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
-                            && rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
-                        {
-                            return Ok(Some(AlwaysTrueOrFalse::AlwaysFalse));
-                        }
-
-                        Ok(None)
-                    }
-                    _ => Ok(None),
+            Self::Binary(..) => {
+                // Evaluate Binary left spines iteratively (descent, then a
+                // bottom-up fold of the same per-level logic the recursive
+                // formulation used): chains can be MAX_EXPR_DEPTH links long,
+                // which recursion could not traverse within
+                // MAX_EXPR_NESTING-sized stack budgets. The rhs evaluations
+                // re-enter this arm for any spine nested inside them.
+                let mut spine = vec![];
+                let mut node = self;
+                while let Self::Binary(lhs, op, rhs) = node {
+                    spine.push((op, rhs));
+                    node = lhs;
                 }
+                let mut lhs_trivial = node.check_always_true_or_false()?;
+                for (op, rhs) in spine.into_iter().rev() {
+                    let rhs_trivial = rhs.check_always_true_or_false()?;
+                    lhs_trivial = match op {
+                        ast::Operator::And => {
+                            if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
+                                || rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
+                            {
+                                Some(AlwaysTrueOrFalse::AlwaysFalse)
+                            } else if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
+                                && rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
+                            {
+                                Some(AlwaysTrueOrFalse::AlwaysTrue)
+                            } else {
+                                None
+                            }
+                        }
+                        ast::Operator::Or => {
+                            if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
+                                || rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
+                            {
+                                Some(AlwaysTrueOrFalse::AlwaysTrue)
+                            } else if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
+                                && rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
+                            {
+                                Some(AlwaysTrueOrFalse::AlwaysFalse)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                }
+                Ok(lhs_trivial)
             }
             _ => Ok(None),
         }

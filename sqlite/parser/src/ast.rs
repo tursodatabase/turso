@@ -421,7 +421,10 @@ pub enum FieldAccessResolution {
 }
 
 // https://sqlite.org/syntax/expr.html
-#[derive(Clone, Debug, PartialEq, Eq)]
+// Clone and PartialEq are implemented manually (below the enum) so that
+// Binary left spines are traversed iteratively; the derived impls would
+// recurse once per chain link.
+#[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Expr {
     /// `BETWEEN`
@@ -612,6 +615,437 @@ pub enum Expr {
 impl Default for Expr {
     fn default() -> Self {
         Self::Literal(Literal::Null)
+    }
+}
+
+impl PartialEq for Expr {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare Binary left spines iteratively so that equality recursion
+        // depth tracks expression *nesting* (MAX_EXPR_NESTING), not chain
+        // length (MAX_EXPR_DEPTH). The rhs comparisons re-enter this loop for
+        // any spine nested inside them.
+        let (mut a, mut b) = (self, other);
+        loop {
+            match (a, b) {
+                (Expr::Binary(lhs1, op1, rhs1), Expr::Binary(lhs2, op2, rhs2)) => {
+                    if op1 != op2 || rhs1 != rhs2 {
+                        return false;
+                    }
+                    a = lhs1;
+                    b = lhs2;
+                }
+                _ => return a.eq_non_binary(b),
+            }
+        }
+    }
+}
+
+impl Eq for Expr {}
+
+impl Expr {
+    /// Field-wise equality of every variant pairing except
+    /// (`Binary`, `Binary`), which [`Expr::eq`] handles iteratively.
+    fn eq_non_binary(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Expr::Binary(..), _) | (_, Expr::Binary(..)) => false,
+            (
+                Expr::Between {
+                    lhs: lhs1,
+                    not: not1,
+                    start: start1,
+                    end: end1,
+                },
+                Expr::Between {
+                    lhs: lhs2,
+                    not: not2,
+                    start: start2,
+                    end: end2,
+                },
+            ) => lhs1 == lhs2 && not1 == not2 && start1 == start2 && end1 == end2,
+            (Expr::Register(reg1), Expr::Register(reg2)) => reg1 == reg2,
+            (
+                Expr::Case {
+                    base: base1,
+                    when_then_pairs: pairs1,
+                    else_expr: else1,
+                },
+                Expr::Case {
+                    base: base2,
+                    when_then_pairs: pairs2,
+                    else_expr: else2,
+                },
+            ) => base1 == base2 && pairs1 == pairs2 && else1 == else2,
+            (
+                Expr::Cast {
+                    expr: expr1,
+                    type_name: type1,
+                },
+                Expr::Cast {
+                    expr: expr2,
+                    type_name: type2,
+                },
+            ) => expr1 == expr2 && type1 == type2,
+            (Expr::Collate(expr1, name1), Expr::Collate(expr2, name2)) => {
+                expr1 == expr2 && name1 == name2
+            }
+            (Expr::DoublyQualified(db1, tbl1, col1), Expr::DoublyQualified(db2, tbl2, col2)) => {
+                db1 == db2 && tbl1 == tbl2 && col1 == col2
+            }
+            (Expr::Exists(select1), Expr::Exists(select2)) => select1 == select2,
+            (
+                Expr::FieldAccess {
+                    base: base1,
+                    field: field1,
+                    resolved: resolved1,
+                },
+                Expr::FieldAccess {
+                    base: base2,
+                    field: field2,
+                    resolved: resolved2,
+                },
+            ) => base1 == base2 && field1 == field2 && resolved1 == resolved2,
+            (
+                Expr::FunctionCall {
+                    name: name1,
+                    distinctness: distinctness1,
+                    args: args1,
+                    order_by: order_by1,
+                    within_group: within_group1,
+                    filter_over: filter_over1,
+                },
+                Expr::FunctionCall {
+                    name: name2,
+                    distinctness: distinctness2,
+                    args: args2,
+                    order_by: order_by2,
+                    within_group: within_group2,
+                    filter_over: filter_over2,
+                },
+            ) => {
+                name1 == name2
+                    && distinctness1 == distinctness2
+                    && args1 == args2
+                    && order_by1 == order_by2
+                    && within_group1 == within_group2
+                    && filter_over1 == filter_over2
+            }
+            (
+                Expr::FunctionCallStar {
+                    name: name1,
+                    filter_over: filter_over1,
+                },
+                Expr::FunctionCallStar {
+                    name: name2,
+                    filter_over: filter_over2,
+                },
+            ) => name1 == name2 && filter_over1 == filter_over2,
+            (Expr::Id(name1), Expr::Id(name2)) => name1 == name2,
+            (
+                Expr::Column {
+                    database: database1,
+                    table: table1,
+                    column: column1,
+                    is_rowid_alias: is_rowid_alias1,
+                },
+                Expr::Column {
+                    database: database2,
+                    table: table2,
+                    column: column2,
+                    is_rowid_alias: is_rowid_alias2,
+                },
+            ) => {
+                database1 == database2
+                    && table1 == table2
+                    && column1 == column2
+                    && is_rowid_alias1 == is_rowid_alias2
+            }
+            (
+                Expr::RowId {
+                    database: database1,
+                    table: table1,
+                },
+                Expr::RowId {
+                    database: database2,
+                    table: table2,
+                },
+            ) => database1 == database2 && table1 == table2,
+            (
+                Expr::InList {
+                    lhs: lhs1,
+                    not: not1,
+                    rhs: rhs1,
+                },
+                Expr::InList {
+                    lhs: lhs2,
+                    not: not2,
+                    rhs: rhs2,
+                },
+            ) => lhs1 == lhs2 && not1 == not2 && rhs1 == rhs2,
+            (
+                Expr::InSelect {
+                    lhs: lhs1,
+                    not: not1,
+                    rhs: rhs1,
+                },
+                Expr::InSelect {
+                    lhs: lhs2,
+                    not: not2,
+                    rhs: rhs2,
+                },
+            ) => lhs1 == lhs2 && not1 == not2 && rhs1 == rhs2,
+            (
+                Expr::InTable {
+                    lhs: lhs1,
+                    not: not1,
+                    rhs: rhs1,
+                    args: args1,
+                },
+                Expr::InTable {
+                    lhs: lhs2,
+                    not: not2,
+                    rhs: rhs2,
+                    args: args2,
+                },
+            ) => lhs1 == lhs2 && not1 == not2 && rhs1 == rhs2 && args1 == args2,
+            (Expr::IsNull(expr1), Expr::IsNull(expr2)) => expr1 == expr2,
+            (
+                Expr::Like {
+                    lhs: lhs1,
+                    not: not1,
+                    op: op1,
+                    rhs: rhs1,
+                    escape: escape1,
+                },
+                Expr::Like {
+                    lhs: lhs2,
+                    not: not2,
+                    op: op2,
+                    rhs: rhs2,
+                    escape: escape2,
+                },
+            ) => lhs1 == lhs2 && not1 == not2 && op1 == op2 && rhs1 == rhs2 && escape1 == escape2,
+            (Expr::Literal(lit1), Expr::Literal(lit2)) => lit1 == lit2,
+            (Expr::Name(name1), Expr::Name(name2)) => name1 == name2,
+            (Expr::NotNull(expr1), Expr::NotNull(expr2)) => expr1 == expr2,
+            (Expr::Parenthesized(exprs1), Expr::Parenthesized(exprs2)) => exprs1 == exprs2,
+            (Expr::Qualified(qual1, name1), Expr::Qualified(qual2, name2)) => {
+                qual1 == qual2 && name1 == name2
+            }
+            (Expr::Raise(resolve1, expr1), Expr::Raise(resolve2, expr2)) => {
+                resolve1 == resolve2 && expr1 == expr2
+            }
+            (Expr::Subquery(select1), Expr::Subquery(select2)) => select1 == select2,
+            (Expr::Unary(op1, expr1), Expr::Unary(op2, expr2)) => op1 == op2 && expr1 == expr2,
+            (Expr::Variable(var1), Expr::Variable(var2)) => var1 == var2,
+            (
+                Expr::SubqueryResult {
+                    subquery_id: subquery_id1,
+                    lhs: lhs1,
+                    not_in: not_in1,
+                    query_type: query_type1,
+                },
+                Expr::SubqueryResult {
+                    subquery_id: subquery_id2,
+                    lhs: lhs2,
+                    not_in: not_in2,
+                    query_type: query_type2,
+                },
+            ) => {
+                subquery_id1 == subquery_id2
+                    && lhs1 == lhs2
+                    && not_in1 == not_in2
+                    && query_type1 == query_type2
+            }
+            (Expr::Default, Expr::Default) => true,
+            (
+                Expr::Array {
+                    elements: elements1,
+                },
+                Expr::Array {
+                    elements: elements2,
+                },
+            ) => elements1 == elements2,
+            (
+                Expr::Subscript {
+                    base: base1,
+                    index: index1,
+                },
+                Expr::Subscript {
+                    base: base2,
+                    index: index2,
+                },
+            ) => base1 == base2 && index1 == index2,
+            _ => false,
+        }
+    }
+}
+
+impl Clone for Expr {
+    fn clone(&self) -> Self {
+        // Left spines of Binary nodes (`a OR b OR c ...`) can be up to
+        // MAX_EXPR_DEPTH links long; clone them iteratively so that clone
+        // recursion depth tracks expression *nesting* (MAX_EXPR_NESTING), not
+        // chain length. The rhs clones below re-enter this loop for any
+        // spine nested inside them, so every spine anywhere in the tree is
+        // cloned iteratively.
+        let mut links = Vec::new();
+        let mut node = self;
+        while let Expr::Binary(lhs, op, rhs) = node {
+            links.push((*op, rhs.as_ref().clone()));
+            node = lhs;
+        }
+        let mut cloned = node.clone_non_binary();
+        for (op, rhs) in links.into_iter().rev() {
+            cloned = Expr::Binary(Box::new(cloned), op, Box::new(rhs));
+        }
+        cloned
+    }
+}
+
+impl Expr {
+    /// Field-wise clone of every variant except `Binary`, which
+    /// [`Expr::clone`] handles iteratively.
+    fn clone_non_binary(&self) -> Self {
+        match self {
+            Expr::Binary(..) => unreachable!("Binary nodes are cloned by Expr::clone's spine walk"),
+            Expr::Between {
+                lhs,
+                not,
+                start,
+                end,
+            } => Expr::Between {
+                lhs: lhs.clone(),
+                not: *not,
+                start: start.clone(),
+                end: end.clone(),
+            },
+            Expr::Register(reg) => Expr::Register(*reg),
+            Expr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+            } => Expr::Case {
+                base: base.clone(),
+                when_then_pairs: when_then_pairs.clone(),
+                else_expr: else_expr.clone(),
+            },
+            Expr::Cast { expr, type_name } => Expr::Cast {
+                expr: expr.clone(),
+                type_name: type_name.clone(),
+            },
+            Expr::Collate(expr, name) => Expr::Collate(expr.clone(), name.clone()),
+            Expr::DoublyQualified(db, tbl, col) => {
+                Expr::DoublyQualified(db.clone(), tbl.clone(), col.clone())
+            }
+            Expr::Exists(select) => Expr::Exists(select.clone()),
+            Expr::FieldAccess {
+                base,
+                field,
+                resolved,
+            } => Expr::FieldAccess {
+                base: base.clone(),
+                field: field.clone(),
+                resolved: *resolved,
+            },
+            Expr::FunctionCall {
+                name,
+                distinctness,
+                args,
+                order_by,
+                within_group,
+                filter_over,
+            } => Expr::FunctionCall {
+                name: name.clone(),
+                distinctness: *distinctness,
+                args: args.clone(),
+                order_by: order_by.clone(),
+                within_group: within_group.clone(),
+                filter_over: filter_over.clone(),
+            },
+            Expr::FunctionCallStar { name, filter_over } => Expr::FunctionCallStar {
+                name: name.clone(),
+                filter_over: filter_over.clone(),
+            },
+            Expr::Id(name) => Expr::Id(name.clone()),
+            Expr::Column {
+                database,
+                table,
+                column,
+                is_rowid_alias,
+            } => Expr::Column {
+                database: *database,
+                table: *table,
+                column: *column,
+                is_rowid_alias: *is_rowid_alias,
+            },
+            Expr::RowId { database, table } => Expr::RowId {
+                database: *database,
+                table: *table,
+            },
+            Expr::InList { lhs, not, rhs } => Expr::InList {
+                lhs: lhs.clone(),
+                not: *not,
+                rhs: rhs.clone(),
+            },
+            Expr::InSelect { lhs, not, rhs } => Expr::InSelect {
+                lhs: lhs.clone(),
+                not: *not,
+                rhs: rhs.clone(),
+            },
+            Expr::InTable {
+                lhs,
+                not,
+                rhs,
+                args,
+            } => Expr::InTable {
+                lhs: lhs.clone(),
+                not: *not,
+                rhs: rhs.clone(),
+                args: args.clone(),
+            },
+            Expr::IsNull(expr) => Expr::IsNull(expr.clone()),
+            Expr::Like {
+                lhs,
+                not,
+                op,
+                rhs,
+                escape,
+            } => Expr::Like {
+                lhs: lhs.clone(),
+                not: *not,
+                op: *op,
+                rhs: rhs.clone(),
+                escape: escape.clone(),
+            },
+            Expr::Literal(literal) => Expr::Literal(literal.clone()),
+            Expr::Name(name) => Expr::Name(name.clone()),
+            Expr::NotNull(expr) => Expr::NotNull(expr.clone()),
+            Expr::Parenthesized(exprs) => Expr::Parenthesized(exprs.clone()),
+            Expr::Qualified(qualifier, name) => Expr::Qualified(qualifier.clone(), name.clone()),
+            Expr::Raise(resolve_type, expr) => Expr::Raise(*resolve_type, expr.clone()),
+            Expr::Subquery(select) => Expr::Subquery(select.clone()),
+            Expr::Unary(op, expr) => Expr::Unary(*op, expr.clone()),
+            Expr::Variable(variable) => Expr::Variable(variable.clone()),
+            Expr::SubqueryResult {
+                subquery_id,
+                lhs,
+                not_in,
+                query_type,
+            } => Expr::SubqueryResult {
+                subquery_id: *subquery_id,
+                lhs: lhs.clone(),
+                not_in: *not_in,
+                query_type: query_type.clone(),
+            },
+            Expr::Default => Expr::Default,
+            Expr::Array { elements } => Expr::Array {
+                elements: elements.clone(),
+            },
+            Expr::Subscript { base, index } => Expr::Subscript {
+                base: base.clone(),
+                index: index.clone(),
+            },
+        }
     }
 }
 

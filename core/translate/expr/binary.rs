@@ -72,100 +72,193 @@ pub(super) fn emit_binary_expr_scalar(
     resolver: &Resolver,
     emit_mode: BinaryEmitMode,
 ) -> Result<usize> {
+    // A left spine of binary operators (`a OR b OR c ...`) can be up to
+    // MAX_EXPR_DEPTH links long, while recursion in the translator must stay
+    // within MAX_EXPR_NESTING frames. Translate the spine iteratively:
+    // descend it running each node's prologue (constant-span bookkeeping,
+    // operand-equivalence check, register allocation) in exactly the order
+    // the recursive translate_expr -> binary path ran them, then emit from
+    // the innermost node outwards. Only the operands hanging off the spine
+    // are translated via (nesting-bounded) recursion.
+
+    /// Registers of one spine node: either one register shared by both
+    /// operands (when they are equivalent expressions), or a contiguous
+    /// (lhs, rhs) pair starting at the given register.
+    enum SpineRegs {
+        Shared(usize),
+        Pair(usize),
+    }
+
+    struct SpineNode<'a> {
+        lhs: &'a ast::Expr,
+        op: &'a ast::Operator,
+        rhs: &'a ast::Expr,
+        /// Register this node's value is emitted into.
+        target: usize,
+        regs: SpineRegs,
+        /// Constant span opened by this node's prologue. Always `None` for
+        /// the outermost node: its prologue ran in its own translate_expr
+        /// frame, which also closes the span.
+        constant_span: Option<usize>,
+        emit_mode: BinaryEmitMode,
+    }
+
     // Check if both sides of the expression are equivalent and reuse the same register if so
-    if exprs_are_equivalent(e1, e2) {
-        let shared_reg = program.alloc_register();
-        translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
-
-        match emit_mode {
-            BinaryEmitMode::Value => emit_binary_insn(
-                program,
-                op,
-                shared_reg,
-                shared_reg,
-                target_register,
-                e1,
-                e2,
-                referenced_tables,
-                Some(resolver),
-            )?,
-            BinaryEmitMode::Condition(metadata) => emit_binary_condition_insn(
-                program,
-                op,
-                shared_reg,
-                shared_reg,
-                target_register,
-                e1,
-                e2,
-                referenced_tables,
-                metadata,
-                Some(resolver),
-            )?,
+    fn alloc_operand_regs(
+        program: &mut ProgramBuilder,
+        e1: &ast::Expr,
+        e2: &ast::Expr,
+    ) -> (SpineRegs, usize) {
+        if exprs_are_equivalent(e1, e2) {
+            let shared_reg = program.alloc_register();
+            (SpineRegs::Shared(shared_reg), shared_reg)
+        } else {
+            let e1_reg = program.alloc_registers(2);
+            (SpineRegs::Pair(e1_reg), e1_reg)
         }
-        if op.is_comparison() {
-            program.reset_collation();
+    }
+
+    let (regs, mut cur_target) = alloc_operand_regs(program, e1, e2);
+    let mut nodes = vec![SpineNode {
+        lhs: e1,
+        op,
+        rhs: e2,
+        target: target_register,
+        regs,
+        constant_span: None,
+        emit_mode,
+    }];
+    let mut cur = e1;
+    loop {
+        let ast::Expr::Binary(cur_lhs, cur_op, cur_rhs) = cur else {
+            break;
+        };
+        // Nodes that translate_expr's Binary arm routes to dedicated paths
+        // terminate the spine and are translated as opaque operands below:
+        // IS TRUE/FALSE forms (bounded because the parser counts them as
+        // nesting), custom-type operator nodes (bounded because they require
+        // a Column lhs, so they can never be consecutive on a spine), and
+        // cached subexpressions (terminal: they emit a register copy).
+        if matches!(
+            (cur_op, cur_rhs.as_ref()),
+            (
+                ast::Operator::Is | ast::Operator::IsNot,
+                ast::Expr::Literal(ast::Literal::True | ast::Literal::False)
+            )
+        ) {
+            break;
         }
-        Ok(target_register)
-    } else {
-        let e1_reg = program.alloc_registers(2);
-        let e2_reg = e1_reg + 1;
+        if resolver.resolve_cached_expr_reg(cur).is_some() {
+            break;
+        }
+        if find_custom_type_operator(cur_lhs, cur_rhs, cur_op, referenced_tables, resolver)
+            .is_some()
+        {
+            break;
+        }
+        // Row-valued comparisons (e.g. `(a,b,c) < (1,2,3)`) produce a scalar,
+        // so they can sit on a spine, but their own emission needs the
+        // row-valued path; only nodes with scalar operands are foldable.
+        // These arities were already validated by the caller's
+        // expr_vector_size checks, so this cannot fail here.
+        if expr_vector_size(cur_lhs)? != 1 || expr_vector_size(cur_rhs)? != 1 {
+            break;
+        }
+        // Replica of translate_expr's entry prologue for this node.
+        let constant_span = if cur.is_constant(resolver) {
+            if !program.constant_span_is_open() {
+                Some(program.constant_span_start())
+            } else {
+                None
+            }
+        } else {
+            program.constant_span_end_all();
+            None
+        };
+        let (regs, next_target) = alloc_operand_regs(program, cur_lhs, cur_rhs);
+        nodes.push(SpineNode {
+            lhs: cur_lhs,
+            op: cur_op,
+            rhs: cur_rhs,
+            target: cur_target,
+            regs,
+            constant_span,
+            emit_mode: BinaryEmitMode::Value,
+        });
+        cur_target = next_target;
+        cur = cur_lhs;
+    }
 
-        translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
-        let left_collation_ctx = program.curr_collation_ctx();
-        program.reset_collation();
+    // The leftmost operand of the spine.
+    translate_expr(program, referenced_tables, cur, cur_target, resolver)?;
 
-        translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
-        let right_collation_ctx = program.curr_collation_ctx();
-        program.reset_collation();
+    for node in nodes.into_iter().rev() {
+        let (lhs_reg, rhs_reg) = match node.regs {
+            SpineRegs::Shared(shared_reg) => (shared_reg, shared_reg),
+            SpineRegs::Pair(e1_reg) => {
+                let e2_reg = e1_reg + 1;
+                let left_collation_ctx = program.curr_collation_ctx();
+                program.reset_collation();
 
-        /*
-         * The rules for determining which collating function to use for a binary comparison
-         * operator (=, <, >, <=, >=, !=, IS, and IS NOT) are as follows:
-         *
-         * 1. If either operand has an explicit collating function assignment using the postfix COLLATE operator,
-         * then the explicit collating function is used for comparison,
-         * with precedence to the collating function of the left operand.
-         *
-         * 2. If either operand is a column, then the collating function of that column is used
-         * with precedence to the left operand. For the purposes of the previous sentence,
-         * a column name preceded by one or more unary "+" operators and/or CAST operators is still considered a column name.
-         *
-         * 3. Otherwise, the BINARY collating function is used for comparison.
-         */
-        let collation_ctx = {
-            match (left_collation_ctx, right_collation_ctx) {
-                (Some((c_left, true)), _) => Some((c_left, true)),
-                (_, Some((c_right, true))) => Some((c_right, true)),
-                (Some((c_left, from_collate_left)), None) => Some((c_left, from_collate_left)),
-                (None, Some((c_right, from_collate_right))) => Some((c_right, from_collate_right)),
-                (Some((c_left, from_collate_left)), Some((_, false))) => {
-                    Some((c_left, from_collate_left))
-                }
-                _ => None,
+                translate_expr(program, referenced_tables, node.rhs, e2_reg, resolver)?;
+                let right_collation_ctx = program.curr_collation_ctx();
+                program.reset_collation();
+
+                /*
+                 * The rules for determining which collating function to use for a binary comparison
+                 * operator (=, <, >, <=, >=, !=, IS, and IS NOT) are as follows:
+                 *
+                 * 1. If either operand has an explicit collating function assignment using the postfix COLLATE operator,
+                 * then the explicit collating function is used for comparison,
+                 * with precedence to the collating function of the left operand.
+                 *
+                 * 2. If either operand is a column, then the collating function of that column is used
+                 * with precedence to the left operand. For the purposes of the previous sentence,
+                 * a column name preceded by one or more unary "+" operators and/or CAST operators is still considered a column name.
+                 *
+                 * 3. Otherwise, the BINARY collating function is used for comparison.
+                 */
+                let collation_ctx = {
+                    match (left_collation_ctx, right_collation_ctx) {
+                        (Some((c_left, true)), _) => Some((c_left, true)),
+                        (_, Some((c_right, true))) => Some((c_right, true)),
+                        (Some((c_left, from_collate_left)), None) => {
+                            Some((c_left, from_collate_left))
+                        }
+                        (None, Some((c_right, from_collate_right))) => {
+                            Some((c_right, from_collate_right))
+                        }
+                        (Some((c_left, from_collate_left)), Some((_, false))) => {
+                            Some((c_left, from_collate_left))
+                        }
+                        _ => None,
+                    }
+                };
+                program.set_collation(collation_ctx);
+                (e1_reg, e2_reg)
             }
         };
-        program.set_collation(collation_ctx);
 
-        match emit_mode {
+        match node.emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(
                 program,
-                op,
-                e1_reg,
-                e2_reg,
-                target_register,
-                e1,
-                e2,
+                node.op,
+                lhs_reg,
+                rhs_reg,
+                node.target,
+                node.lhs,
+                node.rhs,
                 referenced_tables,
                 Some(resolver),
             )?,
             BinaryEmitMode::Condition(metadata) => emit_binary_condition_insn(
                 program,
-                op,
-                e1_reg,
-                e2_reg,
-                target_register,
-                e1,
-                e2,
+                node.op,
+                lhs_reg,
+                rhs_reg,
+                node.target,
+                node.lhs,
+                node.rhs,
                 referenced_tables,
                 metadata,
                 Some(resolver),
@@ -176,11 +269,14 @@ pub(super) fn emit_binary_expr_scalar(
         // collation to the parent expression so that e.g.
         //   (name COLLATE NOCASE || '') <> 'admin'
         // correctly applies NOCASE to the Ne comparison.
-        if op.is_comparison() {
+        if node.op.is_comparison() {
             program.reset_collation();
         }
-        Ok(target_register)
+        if let Some(span) = node.constant_span {
+            program.constant_span_end(span);
+        }
     }
+    Ok(target_register)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -788,74 +884,90 @@ pub(super) fn emit_binary_insn(
 
 /// Check if an expression is known to produce an array value.
 pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferences>) -> bool {
-    match expr {
-        Expr::Column { table, column, .. } => {
-            if let Some(tables) = referenced_tables {
-                tables
-                    .find_table_by_internal_id(*table)
-                    .map(|(_, t)| t)
-                    .and_then(|t| t.get_column_at(*column))
-                    .is_some_and(|col| col.is_array())
-            } else {
-                false
+    // Iterative (explicit work stack) because Concat chains can be up to
+    // MAX_EXPR_DEPTH links long, which recursion could not traverse within
+    // MAX_EXPR_NESTING-sized stack budgets.
+    let mut stack: smallvec::SmallVec<[&Expr; 8]> = smallvec::smallvec![expr];
+    while let Some(expr) = stack.pop() {
+        match expr {
+            Expr::Column { table, column, .. } => {
+                if let Some(tables) = referenced_tables {
+                    if tables
+                        .find_table_by_internal_id(*table)
+                        .map(|(_, t)| t)
+                        .and_then(|t| t.get_column_at(*column))
+                        .is_some_and(|col| col.is_array())
+                    {
+                        return true;
+                    }
+                }
             }
-        }
-        Expr::FunctionCall { name, args, .. } => {
-            if let Ok(Some(f)) = Func::resolve_function(name.as_str(), args.len()) {
-                match &f {
-                    Func::Scalar(sf) if sf.returns_array_blob() => return true,
-                    Func::Agg(AggFunc::ArrayAgg) => return true,
+            Expr::FunctionCall { name, args, .. } => {
+                if let Ok(Some(f)) = Func::resolve_function(name.as_str(), args.len()) {
+                    match &f {
+                        Func::Scalar(sf) if sf.returns_array_blob() => return true,
+                        Func::Agg(AggFunc::ArrayAgg) => return true,
+                        _ => {}
+                    }
+                }
+                // Wrapper functions that pass through an array value
+                match name.as_str().to_lowercase().as_str() {
+                    "coalesce" | "ifnull" | "min" | "max" => {
+                        for a in args {
+                            stack.push(a);
+                        }
+                    }
+                    "iif" => {
+                        // args: condition, then_val, else_val
+                        if let Some(a) = args.get(1) {
+                            stack.push(a);
+                        }
+                        if let Some(a) = args.get(2) {
+                            stack.push(a);
+                        }
+                    }
+                    "nullif" => {
+                        if let Some(a) = args.first() {
+                            stack.push(a);
+                        }
+                    }
+                    "array_element" => {
+                        // Subscripting a multi-dim array yields a lower-dim array
+                        if let Some(tables) = referenced_tables {
+                            if args
+                                .first()
+                                .is_some_and(|a| expr_array_dimensions(a, tables) > 1)
+                            {
+                                return true;
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
-            // Wrapper functions that pass through an array value
-            match name.as_str().to_lowercase().as_str() {
-                "coalesce" | "ifnull" | "min" | "max" => {
-                    args.iter().any(|a| expr_is_array(a, referenced_tables))
-                }
-                "iif" => {
-                    // args: condition, then_val, else_val
-                    args.get(1)
-                        .is_some_and(|a| expr_is_array(a, referenced_tables))
-                        || args
-                            .get(2)
-                            .is_some_and(|a| expr_is_array(a, referenced_tables))
-                }
-                "nullif" => args
-                    .first()
-                    .is_some_and(|a| expr_is_array(a, referenced_tables)),
-                "array_element" => {
-                    // Subscripting a multi-dim array yields a lower-dim array
-                    if let Some(tables) = referenced_tables {
-                        args.first()
-                            .is_some_and(|a| expr_array_dimensions(a, tables) > 1)
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
+            Expr::Array { .. } | Expr::Subscript { .. } => {
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
             }
+            Expr::Binary(lhs, ast::Operator::Concat, rhs) => {
+                stack.push(lhs);
+                stack.push(rhs);
+            }
+            Expr::Case {
+                when_then_pairs,
+                else_expr,
+                ..
+            } => {
+                for (_, then_expr) in when_then_pairs {
+                    stack.push(then_expr);
+                }
+                if let Some(e) = else_expr {
+                    stack.push(e);
+                }
+            }
+            _ => {}
         }
-        Expr::Array { .. } | Expr::Subscript { .. } => {
-            unreachable!("Array and Subscript are desugared into function calls by the parser")
-        }
-        Expr::Binary(lhs, ast::Operator::Concat, rhs) => {
-            expr_is_array(lhs, referenced_tables) || expr_is_array(rhs, referenced_tables)
-        }
-        Expr::Case {
-            when_then_pairs,
-            else_expr,
-            ..
-        } => {
-            when_then_pairs
-                .iter()
-                .any(|(_, then_expr)| expr_is_array(then_expr, referenced_tables))
-                || else_expr
-                    .as_ref()
-                    .is_some_and(|e| expr_is_array(e, referenced_tables))
-        }
-        _ => false,
     }
+    false
 }
 
 /// Return the number of array dimensions for an expression, or 0 for non-array.

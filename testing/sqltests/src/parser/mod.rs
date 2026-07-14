@@ -29,24 +29,29 @@ fn eval_block_macro_count(expr: &str) -> Result<usize, String> {
         .filter(|ch| !ch.is_whitespace())
         .collect::<String>();
 
-    if expr == "expr_depth_limit" {
-        return Ok(turso_parser::MAX_EXPR_DEPTH);
-    }
+    for (name, limit) in [
+        ("expr_depth_limit", turso_parser::MAX_EXPR_DEPTH),
+        ("expr_nesting_limit", turso_parser::MAX_EXPR_NESTING),
+    ] {
+        if expr == name {
+            return Ok(limit);
+        }
 
-    if let Some(rest) = expr.strip_prefix("expr_depth_limit+") {
-        let delta = rest
-            .parse::<usize>()
-            .map_err(|_| format!("invalid repeat count expression: {expr}"))?;
-        return Ok(turso_parser::MAX_EXPR_DEPTH + delta);
-    }
+        if let Some(rest) = expr.strip_prefix(&format!("{name}+")) {
+            let delta = rest
+                .parse::<usize>()
+                .map_err(|_| format!("invalid repeat count expression: {expr}"))?;
+            return Ok(limit + delta);
+        }
 
-    if let Some(rest) = expr.strip_prefix("expr_depth_limit-") {
-        let delta = rest
-            .parse::<usize>()
-            .map_err(|_| format!("invalid repeat count expression: {expr}"))?;
-        return turso_parser::MAX_EXPR_DEPTH
-            .checked_sub(delta)
-            .ok_or_else(|| format!("repeat count underflow in expression: {expr}"));
+        if let Some(rest) = expr.strip_prefix(&format!("{name}-")) {
+            let delta = rest
+                .parse::<usize>()
+                .map_err(|_| format!("invalid repeat count expression: {expr}"))?;
+            return limit
+                .checked_sub(delta)
+                .ok_or_else(|| format!("repeat count underflow in expression: {expr}"));
+        }
     }
 
     expr.parse::<usize>()

@@ -769,12 +769,29 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 && exprs_are_equivalent(start1, start2)
                 && exprs_are_equivalent(end1, end2)
         }
-        (Expr::Binary(lhs1, op1, rhs1), Expr::Binary(lhs2, op2, rhs2)) => {
-            op1 == op2
-                && ((exprs_are_equivalent(lhs1, lhs2) && exprs_are_equivalent(rhs1, rhs2))
-                    || (op1.is_commutative()
-                        && exprs_are_equivalent(lhs1, rhs2)
-                        && exprs_are_equivalent(rhs1, lhs2)))
+        (Expr::Binary(..), Expr::Binary(..)) => {
+            // Compare Binary left spines iteratively (lockstep descent, then a
+            // bottom-up fold over the same per-level condition the recursive
+            // formulation used): chains can be MAX_EXPR_DEPTH links long,
+            // which recursion could not traverse within MAX_EXPR_NESTING-sized
+            // stack budgets. The rhs/swap comparisons below re-enter this arm
+            // for any spines nested inside them.
+            let mut levels = vec![];
+            let (mut a, mut b) = (expr1, expr2);
+            while let (Expr::Binary(lhs1, op1, rhs1), Expr::Binary(lhs2, op2, rhs2)) = (a, b) {
+                levels.push((lhs1, op1, rhs1, lhs2, op2, rhs2));
+                a = lhs1;
+                b = lhs2;
+            }
+            let mut equivalent = exprs_are_equivalent(a, b);
+            for (lhs1, op1, rhs1, lhs2, op2, rhs2) in levels.into_iter().rev() {
+                equivalent = op1 == op2
+                    && ((equivalent && exprs_are_equivalent(rhs1, rhs2))
+                        || (op1.is_commutative()
+                            && exprs_are_equivalent(lhs1, rhs2)
+                            && exprs_are_equivalent(rhs1, lhs2)));
+            }
+            equivalent
         }
         (
             Expr::Case {

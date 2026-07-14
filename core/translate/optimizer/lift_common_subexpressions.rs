@@ -137,21 +137,36 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
 
 /// Flatten an ast::Expr::Binary(lhs, OR, rhs) into a list of disjuncts.
 fn flatten_or_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
-    let Expr::Binary(lhs, Operator::Or, rhs) = expr else {
-        return Ok(vec![expr]);
-    };
-    let mut flattened = flatten_or_expr_owned(*lhs)?;
-    flattened.extend(flatten_or_expr_owned(*rhs)?);
+    // Iterative (explicit work stack) because OR chains can be up to
+    // MAX_EXPR_DEPTH links long, which recursion could not traverse within
+    // MAX_EXPR_NESTING-sized stack budgets. Popping the lhs before the rhs
+    // preserves left-to-right operand order.
+    let mut flattened = vec![];
+    let mut stack = vec![expr];
+    while let Some(expr) = stack.pop() {
+        if let Expr::Binary(lhs, Operator::Or, rhs) = expr {
+            stack.push(*rhs);
+            stack.push(*lhs);
+        } else {
+            flattened.push(expr);
+        }
+    }
     Ok(flattened)
 }
 
 /// Flatten an ast::Expr::Binary(lhs, AND, rhs) into a list of conjuncts.
 fn flatten_and_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
-    let Expr::Binary(lhs, Operator::And, rhs) = expr else {
-        return Ok(vec![expr]);
-    };
-    let mut flattened = flatten_and_expr_owned(*lhs)?;
-    flattened.extend(flatten_and_expr_owned(*rhs)?);
+    // Iterative for the same reason as [`flatten_or_expr_owned`].
+    let mut flattened = vec![];
+    let mut stack = vec![expr];
+    while let Some(expr) = stack.pop() {
+        if let Expr::Binary(lhs, Operator::And, rhs) = expr {
+            stack.push(*rhs);
+            stack.push(*lhs);
+        } else {
+            flattened.push(expr);
+        }
+    }
     Ok(flattened)
 }
 
