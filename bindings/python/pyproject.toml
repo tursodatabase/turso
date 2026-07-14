@@ -39,7 +39,7 @@ dev = [
     "maturin==1.12.6",
 ]
 sqlalchemy = [
-    "sqlalchemy>=2.0",
+    "sqlalchemy>=2.0.45",
 ]
 
 [project.urls]
