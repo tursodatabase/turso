@@ -990,9 +990,10 @@ impl Connection {
                 };
                 (cmd, parser.offset())
             };
-            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
-                .unwrap()
-                .trim();
+            // The parser only stops on token boundaries, so slicing the
+            // already-valid &str directly avoids re-validating UTF-8 on
+            // every prepare.
+            let input = sql[..byte_offset_end].trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input)?;
 
             Ok(Statement::new_with_origin(
@@ -1628,9 +1629,7 @@ impl Connection {
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
             let byte_offset_end = parser.offset();
-            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
-                .unwrap()
-                .trim();
+            let input = sql[..byte_offset_end].trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input)?;
             Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
         }
@@ -1647,9 +1646,7 @@ impl Connection {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         let byte_offset_end = parser.offset();
-        let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
-            .unwrap()
-            .trim();
+        let input = sql[..byte_offset_end].trim();
         match cmd {
             Some(cmd) => self.run_cmd(cmd, input),
             None => Ok(None),
@@ -1686,9 +1683,7 @@ impl Connection {
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
             let byte_offset_end = parser.offset();
-            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
-                .unwrap()
-                .trim();
+            let input = sql[..byte_offset_end].trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input)?;
             {
                 crate::stack::trace_stack!("run");
@@ -1708,9 +1703,7 @@ impl Connection {
             return Ok(None);
         };
         let byte_offset_end = parser.offset();
-        let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
-            .unwrap()
-            .trim();
+        let input = sql.as_ref()[..byte_offset_end].trim();
         let (program, pager, mode) = self.compile_cmd(cmd, input)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some((stmt, parser.offset())))

@@ -254,3 +254,7 @@ harness = false
 [[bench]]
 name = "prepare_params_benchmark"
 harness = false
+
+[[bench]]
+name = "prepare_benchmark"
+harness = false
