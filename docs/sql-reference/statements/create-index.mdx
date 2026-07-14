@@ -12,7 +12,7 @@ Create an index on a table to improve query performance for lookups, joins, and 
 
 ```sql
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema-name.]index-name
-    ON table-name (column-or-expr [ASC|DESC], ...)
+    ON table-name (column-or-expr [COLLATE collation-name] [ASC|DESC], ...)
     [WHERE filter-expression];
 ```
 
@@ -30,6 +30,7 @@ CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema-name.]index-name
 | `index-name` | A unique name for the index within the database. |
 | `table-name` | The table to index. |
 | `column-or-expr` | A column name or an expression to include in the index. Multiple entries are separated by commas. |
+| `COLLATE collation-name` | An optional collation sequence applied to the indexed column (e.g. `NOCASE`). |
 | `ASC` / `DESC` | Sort direction for the indexed column. Default is `ASC`. |
 | `WHERE filter-expression` | An optional filter that creates a partial index. Only rows matching the expression are included in the index. |
 
@@ -178,5 +179,6 @@ CREATE INDEX idx_pending_tasks ON tasks (assignee, due_date)
 ## See Also
 
 - [DROP INDEX](/docs/sql-reference/statements/drop-index) for removing indexes
+- [REINDEX](/docs/sql-reference/statements/reindex) for rebuilding indexes
 - [CREATE TABLE](/docs/sql-reference/statements/create-table) for inline UNIQUE and PRIMARY KEY constraints
 - [EXPLAIN](/docs/sql-reference/statements/explain) for verifying index usage in query plans
