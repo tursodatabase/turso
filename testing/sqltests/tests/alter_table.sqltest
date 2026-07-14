@@ -11,6 +11,26 @@ expect {
 }
 
 @cross-check-integrity
+test alter-table-rename-table-with-trigger-cte {
+    CREATE TABLE a(x);
+    CREATE TABLE b(y);
+    CREATE TABLE c(z);
+    CREATE TRIGGER trg AFTER INSERT ON a BEGIN
+        INSERT INTO b WITH cte_0 AS (SELECT 1 AS y) SELECT y FROM cte_0;
+    END;
+    ALTER TABLE c RENAME TO c2;
+    SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name;
+    INSERT INTO a VALUES (1);
+    SELECT * FROM b;
+}
+expect {
+    a
+    b
+    c2
+    1
+}
+
+@cross-check-integrity
 test alter-table-rename-autoindex-updated {
     CREATE TABLE new_cas (id integer, database_id integer UNIQUE, cluster_id integer UNIQUE, PRIMARY KEY (id));
     ALTER TABLE new_cas RENAME TO cas;
@@ -2110,6 +2130,28 @@ test alter-table-drop-column-cross-table-trigger-select-surviving-column {
     SELECT * FROM drop_select_log;
 }
 expect {
+    2
+}
+
+@cross-check-integrity
+test alter-table-drop-column-trigger-cte-output-columns {
+    CREATE TABLE drop_cte_driver (x);
+    CREATE TABLE drop_cte_log (y);
+    CREATE TABLE drop_cte_target (removed, retained);
+    CREATE TRIGGER trig_drop_cte AFTER INSERT ON drop_cte_driver BEGIN
+        INSERT INTO drop_cte_log
+            WITH cte_0 AS (SELECT 1 AS y)
+            SELECT y FROM cte_0;
+        INSERT INTO drop_cte_log
+            WITH cte_1(result) AS (SELECT 2)
+            SELECT result FROM cte_1;
+    END;
+    ALTER TABLE drop_cte_target DROP COLUMN removed;
+    INSERT INTO drop_cte_driver VALUES (1);
+    SELECT * FROM drop_cte_log ORDER BY y;
+}
+expect {
+    1
     2
 }
 
