@@ -2590,16 +2590,20 @@ fn rewrite_trigger_sql_for_column_rename(
     let old_col_norm = normalize_ident(old_column_name);
     let new_col_norm = normalize_ident(new_column_name);
 
-    // Get the trigger's owning table to check unqualified column references
+    // Get the trigger's owning table to check unqualified column references.
+    // TEMP triggers live in the temp schema but may target a table in main
+    // or an attached database — resolve the table where it actually lives.
     let trigger_table_name_raw = tbl_name.name.as_str();
     let trigger_table_name = normalize_ident(trigger_table_name_raw);
-    let trigger_table = resolver
-        .with_schema(trigger_database_id, |schema| {
-            schema.get_btree_table(&trigger_table_name)
-        })
-        .ok_or_else(|| {
-            LimboError::ParseError(format!("trigger table not found: {trigger_table_name}"))
-        })?;
+    let trigger_table = resolve_trigger_command_table_for_alter(
+        resolver,
+        trigger_database_id,
+        &trigger_table_name,
+        tbl_name.db_name.as_ref().map(|db| db.as_str()),
+    )
+    .ok_or_else(|| {
+        LimboError::ParseError(format!("trigger table not found: {trigger_table_name}"))
+    })?;
 
     // Check if this trigger references the column being renamed
     // We need to check if the column exists in the table being renamed
@@ -2960,10 +2964,11 @@ fn apply_expr_for_column_rename(
     {
         let ctx_name_norm = normalize_ident(ctx_name);
         let is_renaming = ctx_name_norm == *target_table_name;
-        let table = resolve_trigger_command_table_for_alter(resolver, database_id, &ctx_name_norm)
-            .ok_or_else(|| {
-                LimboError::ParseError(format!("context table not found: {ctx_name_norm}"))
-            })?;
+        let table =
+            resolve_trigger_command_table_for_alter(resolver, database_id, &ctx_name_norm, None)
+                .ok_or_else(|| {
+                    LimboError::ParseError(format!("context table not found: {ctx_name_norm}"))
+                })?;
         Some((table, ctx_name_norm, is_renaming))
     } else {
         None
@@ -3985,15 +3990,17 @@ fn validate_trigger_columns_after_drop(
                 .collect(),
         )
     } else {
-        resolver.with_schema(trigger_database_id, |s| {
-            s.get_table(&trigger_table_norm).and_then(|t| {
-                t.btree().map(|bt| {
-                    bt.columns()
-                        .iter()
-                        .filter_map(|c| c.name.as_deref().map(normalize_ident))
-                        .collect()
-                })
-            })
+        resolve_trigger_command_table_for_alter(
+            resolver,
+            trigger_database_id,
+            &trigger_table_norm,
+            None,
+        )
+        .map(|bt| {
+            bt.columns()
+                .iter()
+                .filter_map(|c| c.name.as_deref().map(normalize_ident))
+                .collect()
         })
     };
 
@@ -5617,26 +5624,43 @@ fn get_table_columns(
     }
 }
 
+/// Resolve the table named in a trigger's `ON <table>` clause during ALTER TABLE.
+///
+/// Triggers are stored in one schema (temp, main, or attached) but may fire on a
+/// table in another e.g. `CREATE TEMP TRIGGER ... ON t` where `t` lives in main.
+/// Callers must look up the target table where it actually resides, not where the
+/// trigger definition is stored.
 fn resolve_trigger_command_table_for_alter(
     resolver: &Resolver,
     trigger_database_id: usize,
     table_name_norm: &str,
+    explicit_db_name: Option<&str>,
 ) -> Option<Arc<BTreeTable>> {
-    if trigger_database_id == crate::TEMP_DB_ID {
+    let lookup_database_id = if let Some(db_name) = explicit_db_name {
+        // Qualified target, e.g. `ON main.t` or `ON attached.t`.
         resolver
-            .with_schema(crate::TEMP_DB_ID, |schema| {
-                schema.get_btree_table(table_name_norm)
-            })
-            .or_else(|| {
-                resolver.with_schema(crate::MAIN_DB_ID, |schema| {
-                    schema.get_btree_table(table_name_norm)
-                })
-            })
+            .resolve_database_id(&ast::QualifiedName::fullname(
+                ast::Name::exact(db_name.to_string()),
+                ast::Name::exact(table_name_norm.to_string()),
+            ))
+            .ok()?
+    } else if trigger_database_id == crate::TEMP_DB_ID {
+        // Unqualified TEMP trigger: prefer temp schema, fall back to main.
+        if resolver.with_schema(crate::TEMP_DB_ID, |schema| {
+            schema.get_btree_table(table_name_norm).is_some()
+        }) {
+            crate::TEMP_DB_ID
+        } else {
+            crate::MAIN_DB_ID
+        }
     } else {
-        resolver.with_schema(trigger_database_id, |schema| {
-            schema.get_btree_table(table_name_norm)
-        })
-    }
+        // Permanent trigger: target table is in the same schema as the trigger.
+        trigger_database_id
+    };
+
+    resolver.with_schema(lookup_database_id, |schema| {
+        schema.get_btree_table(table_name_norm)
+    })
 }
 
 fn merge_column_lists(left: &[String], right: &[String]) -> Vec<String> {

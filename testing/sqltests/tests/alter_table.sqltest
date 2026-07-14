@@ -1854,6 +1854,47 @@ expect pattern {
     CREATE TRIGGER trig1 AFTER INSERT ON t1\s+BEGIN\s+INSERT INTO log VALUES\s*\(NEW\.b\);?\s+END
 }
 
+# TEMP trigger on a main-table target must not block RENAME COLUMN
+@cross-check-integrity
+test alter-table-rename-column-temp-trigger-on-main-table {
+    CREATE TABLE t(a, b);
+    CREATE TEMP TRIGGER trg BEFORE UPDATE ON t BEGIN SELECT 1; END;
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    SELECT group_concat(name) FROM pragma_table_info('t');
+}
+expect {
+    a2,b
+}
+
+# Qualified ON main.t must resolve the main-table target
+@cross-check-integrity
+test alter-table-rename-column-temp-trigger-on-main-qualified {
+    CREATE TABLE t(a, b);
+    CREATE TEMP TRIGGER trg BEFORE UPDATE ON main.t BEGIN SELECT 1; END;
+    ALTER TABLE main.t RENAME COLUMN a TO a2;
+    SELECT group_concat(name) FROM main.pragma_table_info('t');
+}
+expect {
+    a2,b
+}
+
+# Qualified ON main.t must not follow a temp shadow with the same name
+@cross-check-integrity
+test alter-table-rename-column-temp-trigger-on-main-qualified-shadow {
+    CREATE TABLE t(a, b);
+    INSERT INTO main.t VALUES (1, 2);
+    CREATE TEMP TABLE t(x);
+    INSERT INTO temp.t VALUES (99);
+    CREATE TEMP TRIGGER trg BEFORE UPDATE ON main.t BEGIN SELECT 1; END;
+    ALTER TABLE main.t RENAME COLUMN a TO a2;
+    SELECT group_concat(a2 || ':' || b) FROM main.t;
+    SELECT group_concat(x) FROM temp.t;
+}
+expect {
+    1:2
+    99
+}
+
 test alter-table-rename-column-temp-trigger-main-cross-table {
     CREATE TABLE src_temp_main (a INTEGER PRIMARY KEY, b);
     CREATE TABLE log_temp_main (v);
