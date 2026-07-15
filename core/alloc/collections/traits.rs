@@ -33,6 +33,12 @@ pub trait TursoVecExt<T>: Sized {
     /// <https://doc.rust-lang.org/src/alloc/vec/mod.rs.html#2786>
     ///
     /// Takes O(1) time.
+    #[aristo::intent(
+        "The allocator is never invoked, regardless of whether insertion succeeds or the element \
+         is returned for lack of capacity.",
+        verify = "test",
+        id = "bounded_vector_push_never_invokes_allocator"
+    )]
     fn push_within_capacity(&mut self, value: T) -> Result<&mut T, T>;
 
     fn try_push(&mut self, value: T) -> Result<(), TryReserveError>;
