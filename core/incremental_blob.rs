@@ -29,6 +29,7 @@
 use std::num::NonZero;
 use std::sync::Arc;
 
+use crate::alloc::TursoSliceExt;
 use crate::schema::{BTreeTable, Column, Schema};
 use crate::storage::pager::Pager;
 use crate::vdbe::builder::{CursorType, ProgramBuilder, ProgramBuilderOpts, QueryMode};
@@ -127,7 +128,7 @@ impl Blob {
         // op=2 (write), offset, src blob.
         self.bind(1, 2)?;
         self.bind(2, offset as i64)?;
-        self.bind_blob(4, data.to_vec())?;
+        self.bind_blob(4, data.try_to_vec()?)?;
         match self.step_op()? {
             Value::Numeric(Numeric::Integer(1)) => Ok(()),
             other => Err(LimboError::InternalError(format!(
@@ -165,11 +166,9 @@ impl Blob {
         )
     }
 
-    fn bind_blob(&mut self, index: usize, value: Vec<u8>) -> Result<()> {
-        self.stmt.bind_at(
-            NonZero::new(index).unwrap(),
-            Value::Blob(crate::types::value_blob_from_slice(&value)?),
-        )
+    fn bind_blob(&mut self, index: usize, value: crate::alloc::Vec<u8>) -> Result<()> {
+        self.stmt
+            .bind_at(NonZero::new(index).unwrap(), Value::Blob(value))
     }
 
     /// Step the bound op to its result row and return the single acknowledging value.
