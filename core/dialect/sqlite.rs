@@ -13,7 +13,8 @@ use crate::sync::Arc;
 use crate::vtab::{VirtualTable, VirtualTableType};
 use turso_ext::VTabKind;
 
-/// The SQLite dialect: `sqlite_schema` rows are canonical SQLite text.
+/// The SQLite dialect: statements are SQLite SQL and `sqlite_schema`
+/// rows are canonical SQLite text.
 pub struct SqliteDialect;
 
 impl super::Dialect for SqliteDialect {
@@ -21,9 +22,20 @@ impl super::Dialect for SqliteDialect {
         "sqlite"
     }
 
+    fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        parse(sql)
+    }
+
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
         BTreeTable::from_sql(sql, root_page)
     }
+}
+
+/// Parse the first SQLite statement in `sql` and return its consumed byte count.
+pub fn parse(sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+    let cmd = parser.next_cmd()?;
+    Ok((cmd, parser.offset()))
 }
 
 /// Insert the standard SQLite-style catalog tables into `schema`.

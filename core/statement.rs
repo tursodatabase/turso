@@ -8,10 +8,7 @@ use std::{
 };
 
 use tracing::{instrument, Level};
-use turso_parser::{
-    ast::{fmt::ToTokens, Cmd},
-    parser::Parser,
-};
+use turso_parser::ast::{fmt::ToTokens, Cmd};
 
 use crate::alloc::TursoIteratorExt;
 use crate::{
@@ -866,8 +863,7 @@ impl Statement {
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
         let new_program = {
-            let mut parser = Parser::new(self.program.sql.as_bytes());
-            let cmd = parser.next_cmd()?;
+            let (cmd, _) = conn.parse_sql(&self.program.sql)?;
             let cmd = cmd.expect("Same SQL string should be able to be parsed");
 
             let syms = conn.syms.read();
