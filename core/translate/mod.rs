@@ -70,6 +70,7 @@ use update::translate_update;
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
 #[turso_macros::trace_stack]
+#[allow(clippy::too_many_arguments)]
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
@@ -78,6 +79,7 @@ pub fn translate(
     syms: &SymbolTable,
     query_mode: QueryMode,
     input: &str,
+    origin: crate::statement::StatementOrigin,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
@@ -111,7 +113,14 @@ pub fn translate(
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        connection.dialect(),
+        // Engine-generated helper statements are always SQLite text and
+        // must resolve functions with SQLite semantics regardless of the
+        // database's dialect — the same invariant as unmarked schema rows.
+        if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
+            Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
+        } else {
+            connection.dialect()
+        },
     );
 
     match stmt {
@@ -541,6 +550,7 @@ mod tests {
             &empty_syms,
             QueryMode::Normal,
             "",
+            crate::statement::StatementOrigin::Root,
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -580,8 +590,17 @@ mod tests {
             _ => panic!("expected statement"),
         };
 
-        let err = translate(&schema, stmt, pager, conn, &syms, QueryMode::Normal, "")
-            .expect_err("translation should fail with malformed sqlite_sequence");
+        let err = translate(
+            &schema,
+            stmt,
+            pager,
+            conn,
+            &syms,
+            QueryMode::Normal,
+            "",
+            crate::statement::StatementOrigin::Root,
+        )
+        .expect_err("translation should fail with malformed sqlite_sequence");
         match err {
             crate::LimboError::Corrupt(msg) => {
                 assert!(
@@ -614,8 +633,17 @@ mod tests {
             _ => panic!("expected statement"),
         };
 
-        let err = translate(&schema, stmt, pager, conn, &syms, QueryMode::Normal, "")
-            .expect_err("translation should fail with missing sqlite_sequence");
+        let err = translate(
+            &schema,
+            stmt,
+            pager,
+            conn,
+            &syms,
+            QueryMode::Normal,
+            "",
+            crate::statement::StatementOrigin::Root,
+        )
+        .expect_err("translation should fail with missing sqlite_sequence");
         match err {
             crate::LimboError::Corrupt(msg) => {
                 assert!(

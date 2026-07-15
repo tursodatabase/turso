@@ -480,7 +480,9 @@ impl<'a> Resolver<'a> {
         func_name: &str,
         arg_count: usize,
     ) -> Result<Option<Func>, LimboError> {
-        match Func::resolve_function(func_name, arg_count)? {
+        // The dialect owns the function name surface of user SQL; extension
+        // functions resolve after it.
+        match self.dialect.resolve_function(func_name, arg_count)? {
             Some(func) => Ok(Some(func)),
             None => Ok(self
                 .symbol_table
