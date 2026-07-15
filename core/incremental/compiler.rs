@@ -81,7 +81,7 @@ impl WriteRowView {
 
                         // Weight is always the last value
                         let existing_weight = match last {
-                            Some(val) => match val?.to_owned() {
+                            Some(val) => match val?.to_owned()? {
                                 Value::Numeric(Numeric::Integer(w)) => w as isize,
                                 _ => {
                                     return Err(LimboError::InternalError(format!(
@@ -2778,7 +2778,7 @@ mod tests {
 
             for _ in 0..num_data_columns {
                 let value = values_iter.next().expect("we already checked bounds")?;
-                values.push(value.to_owned());
+                values.push(value.to_owned()?);
             }
 
             delta.insert(rowid, values);

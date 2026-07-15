@@ -194,7 +194,7 @@ impl InternalVirtualTableCursor for DbPageCursor {
 
                 let page_contents = page_ref.get_contents();
                 let data_slice = page_contents.as_ptr();
-                Ok(Value::from_slice(data_slice))
+                Ok(Value::from_slice(data_slice)?)
             }
             2 => Ok(Value::from_text("main")), // we don't support multiple databases - todo when we do
             _ => Ok(Value::Null),

@@ -34,7 +34,7 @@ fn run<T>(db: &TempDatabase, mut f: impl FnMut() -> Result<IOResult<T>>) -> Resu
 
 fn sparse_vector(v: &str) -> Value {
     let vector = vector::operations::text::vector_from_text(VectorType::Float32Sparse, v).unwrap();
-    vector::operations::serialize::vector_serialize(vector)
+    vector::operations::serialize::vector_serialize(vector).expect(turso_core::alloc::ALLOC_ERR_MSG)
 }
 
 // TODO: cannot use MVCC as we use indexes here

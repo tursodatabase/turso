@@ -238,8 +238,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
         let d1 = vector_distance_cos(&v1, &v2).unwrap();
 
         let sparse1 = vector_convert(v1, VectorType::Float32Sparse).unwrap();
@@ -254,8 +262,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
         let d1 = vector_f32_distance_cos_rust(v1.as_f32_slice(), v2.as_f32_slice());
         let d2 = vector_f32_distance_cos_simsimd(v1.as_f32_slice(), v2.as_f32_slice());
         println!("d1 vs d2: {d1} vs {d2}");
@@ -267,8 +283,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float64Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float64Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float64Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float64Dense,
+        )
+        .unwrap();
         let d1 = vector_f64_distance_cos_rust(v1.as_f64_slice(), v2.as_f64_slice());
         let d2 = vector_f64_distance_cos_simsimd(v1.as_f64_slice(), v2.as_f64_slice());
         println!("d1 vs d2: {d1} vs {d2}");
@@ -281,8 +305,16 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
         let v1_f8 = vector_convert(v1, VectorType::Float8).unwrap();
         let v2_f8 = vector_convert(v2, VectorType::Float8).unwrap();
         let d_f8 = vector_distance_cos(&v1_f8, &v2_f8).unwrap();
@@ -300,8 +332,16 @@ mod tests {
         v2: ArbitraryVector<100>,
     ) -> bool {
         use crate::vector::operations::distance_dot::vector_distance_dot;
-        let v1 = vector_convert(v1.into(), VectorType::Float1Bit).unwrap();
-        let v2 = vector_convert(v2.into(), VectorType::Float1Bit).unwrap();
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float1Bit,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float1Bit,
+        )
+        .unwrap();
         let cos = vector_distance_cos(&v1, &v2).unwrap();
         let dot = vector_distance_dot(&v1, &v2).unwrap();
         // hamming = cos, dot = -(dims - 2*hamming), so cos = (dims + dot) / 2

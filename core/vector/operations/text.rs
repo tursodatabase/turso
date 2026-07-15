@@ -1,5 +1,5 @@
 use crate::{
-    alloc::{TursoAllocExt, TursoVecExt},
+    alloc::{TursoAllocExt, TursoTryWithCapacityExt, TursoVecExt},
     vector::vector_types::{Vector, VectorType},
     LimboError, Result, ValueBlob,
 };
@@ -65,6 +65,7 @@ fn format_text<T: std::string::ToString>(values: impl Iterator<Item = T>) -> Str
 /// ```console
 /// [1.0, 2.0, 3.0]
 /// ```
+#[turso_macros::allocation_site(crate::alloc::VectorAllocationSite::Parse)]
 pub fn vector_from_text(vector_type: VectorType, text: &str) -> Result<Vector> {
     let text = text.trim();
     let mut chars = text.chars();
@@ -75,22 +76,20 @@ pub fn vector_from_text(vector_type: VectorType, text: &str) -> Result<Vector> {
     }
     let text = &text[1..text.len() - 1];
     if text.trim().is_empty() {
-        return Ok(match vector_type {
+        return match vector_type {
             VectorType::Float1Bit => {
                 return Err(LimboError::ConversionError(
                     "empty vector not supported for this type".to_string(),
                 ));
             }
-            VectorType::Float8 => {
-                return Ok(Vector::from_f8(0, crate::alloc::vec![], 0.0, 0.0));
-            }
-            _ => Vector {
+            VectorType::Float8 => Ok(Vector::from_f8(0, crate::alloc::vec![], 0.0, 0.0)?),
+            _ => Ok(Vector {
                 vector_type,
                 dims: 0,
                 owned: Some(crate::alloc::vec![]),
                 refer: None,
-            },
-        });
+            }),
+        };
     }
     let tokens = text.split(',').map(|x| x.trim());
     match vector_type {
@@ -113,6 +112,7 @@ fn vector32_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vecto
                 "Invalid vector value".to_string(),
             ));
         }
+        data.try_reserve(4)?;
         data.extend_from_slice(&value.to_le_bytes());
     }
     Ok(Vector {
@@ -134,6 +134,7 @@ fn vector64_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vecto
                 "Invalid vector value".to_string(),
             ));
         }
+        data.try_reserve(8)?;
         data.extend_from_slice(&value.to_le_bytes());
     }
     Ok(Vector {
@@ -162,10 +163,13 @@ fn vector32_sparse_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Resul
         if value == 0.0 {
             continue;
         }
+        idx.try_reserve(4)?;
         idx.extend_from_slice(&(dims - 1).to_le_bytes());
+        values.try_reserve(4)?;
         values.extend_from_slice(&value.to_le_bytes());
     }
 
+    values.try_reserve(idx.len())?;
     values.extend_from_slice(&idx);
     Ok(Vector {
         vector_type: VectorType::Float32Sparse,
@@ -176,7 +180,7 @@ fn vector32_sparse_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Resul
 }
 
 fn vector_1bit_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vector<'static>> {
-    let mut floats = Vec::new();
+    let mut floats: crate::alloc::Vec<f32> = TursoAllocExt::new();
     for token in tokens {
         let value = token
             .parse::<f32>()
@@ -186,11 +190,11 @@ fn vector_1bit_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Ve
                 "Invalid vector value".to_string(),
             ));
         }
-        floats.push(value);
+        floats.try_push(value)?;
     }
     let dims = floats.len();
     let byte_count = dims.div_ceil(8);
-    let mut bits = crate::alloc::vec![0u8; byte_count];
+    let mut bits = crate::alloc::try_vec![0u8; byte_count]?;
     for (i, &f) in floats.iter().enumerate() {
         if f > 0.0 {
             bits[i / 8] |= 1 << (i & 7);
@@ -200,7 +204,7 @@ fn vector_1bit_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Ve
 }
 
 fn vector_f8_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vector<'static>> {
-    let mut floats = Vec::new();
+    let mut floats: crate::alloc::Vec<f32> = TursoAllocExt::new();
     for token in tokens {
         let value = token
             .parse::<f32>()
@@ -210,14 +214,14 @@ fn vector_f8_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vect
                 "Invalid vector value".to_string(),
             ));
         }
-        floats.push(value);
+        floats.try_push(value)?;
     }
     let dims = floats.len();
     let min_val = floats.iter().cloned().fold(f32::INFINITY, f32::min);
     let max_val = floats.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let alpha = (max_val - min_val) / 255.0;
     let shift = min_val;
-    let mut quantized = <ValueBlob as TursoVecExt<u8>>::with_capacity(dims);
+    let mut quantized = <ValueBlob as TursoTryWithCapacityExt>::try_with_capacity_ext(dims)?;
     for &f in &floats {
         let q = if alpha == 0.0 {
             0u8
@@ -227,5 +231,5 @@ fn vector_f8_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vect
         };
         quantized.push(q);
     }
-    Ok(Vector::from_f8(dims, quantized, alpha, shift))
+    Ok(Vector::from_f8(dims, quantized, alpha, shift)?)
 }

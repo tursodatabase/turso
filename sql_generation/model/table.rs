@@ -277,7 +277,7 @@ impl SimValue {
             ast::Operator::BitwiseAnd => self.0.exec_bit_and(&other.0).into(),
             ast::Operator::BitwiseOr => self.0.exec_bit_or(&other.0).into(),
             ast::Operator::BitwiseNot => todo!(), // TODO: Do not see any function usage of this operator in Core
-            ast::Operator::Concat => self.0.exec_concat(&other.0).into(),
+            ast::Operator::Concat => self.0.exec_concat(&other.0).expect(ALLOC_ERR_MSG).into(),
             ast::Operator::Equals => self
                 .sqlite_cmp(other)
                 .map(|o| o == std::cmp::Ordering::Equal)

@@ -81,7 +81,8 @@ impl Hash128 {
     }
 
     /// Convert to a big-endian byte array for storage
-    pub fn to_blob(self) -> crate::ValueBlob {
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::Hash128)]
+    pub fn to_blob(self) -> std::result::Result<crate::ValueBlob, crate::alloc::TryReserveError> {
         crate::types::value_blob_from_slice(self.uuid.as_bytes())
     }
 
@@ -99,8 +100,8 @@ impl Hash128 {
     }
 
     /// Convert to a Value::Blob for storage
-    pub fn to_value(self) -> Value {
-        Value::Blob(self.to_blob())
+    pub fn to_value(self) -> std::result::Result<Value, crate::alloc::TryReserveError> {
+        Ok(Value::Blob(self.to_blob()?))
     }
 
     /// Try to extract a Hash128 from a Value
@@ -171,7 +172,7 @@ impl HashableRow {
 impl Hash for HashableRow {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Hash the 128-bit value by hashing both parts
-        self.cached_hash.to_blob().hash(state);
+        self.cached_hash.uuid.as_bytes().hash(state);
     }
 }
 

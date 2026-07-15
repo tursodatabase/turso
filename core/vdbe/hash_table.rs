@@ -543,7 +543,7 @@ impl HashEntry {
                     ));
                 }
                 let b =
-                    crate::types::value_blob_from_slice(&buf[offset..offset + blob_len as usize]);
+                    crate::types::value_blob_from_slice(&buf[offset..offset + blob_len as usize])?;
                 offset += blob_len as usize;
                 Value::Blob(b)
             }
@@ -3548,7 +3548,10 @@ mod hashtests {
                 Value::from_f64(std::f64::consts::PI),
             ],
             100,
-            vec![Value::from_slice(&[1, 2, 3, 4, 5]), Value::from_i64(-999)],
+            vec![
+                Value::from_slice(&[1, 2, 3, 4, 5]).expect(crate::alloc::ALLOC_ERR_MSG),
+                Value::from_i64(-999),
+            ],
         );
 
         // Serialize using the Vec-based method
@@ -4256,7 +4259,10 @@ mod hashtests {
         // Insert entry with blob payload
         let key = vec![Value::from_i64(1)];
         let blob_data = std::vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let payload = vec![Value::from_slice(&blob_data), Value::from_i64(42)];
+        let payload = vec![
+            Value::from_slice(&blob_data).expect(crate::alloc::ALLOC_ERR_MSG),
+            Value::from_i64(42),
+        ];
         let _ = ht.insert(key.clone(), 100, payload, None).unwrap();
 
         let _ = ht.finalize_build(None);
@@ -4265,7 +4271,10 @@ mod hashtests {
         assert!(result.is_some());
         let entry = result.unwrap();
         assert_eq!(entry.payload_values.len(), 2);
-        assert_eq!(entry.payload_values[0], Value::from_slice(&blob_data));
+        assert_eq!(
+            entry.payload_values[0],
+            Value::from_slice(&blob_data).expect(crate::alloc::ALLOC_ERR_MSG)
+        );
         assert_eq!(entry.payload_values[1], Value::from_i64(42));
     }
 
@@ -4347,7 +4356,7 @@ mod hashtests {
                 Value::from_i64(999),
                 Value::from_f64(std::f64::consts::PI),
                 Value::Null,
-                Value::from_slice(&[1, 2, 3, 4]),
+                Value::from_slice(&[1, 2, 3, 4]).expect(crate::alloc::ALLOC_ERR_MSG),
             ],
         );
 
@@ -4378,7 +4387,7 @@ mod hashtests {
         assert_eq!(deserialized.payload_values[3], Value::Null);
         assert_eq!(
             deserialized.payload_values[4],
-            Value::from_slice(&[1, 2, 3, 4])
+            Value::from_slice(&[1, 2, 3, 4]).expect(crate::alloc::ALLOC_ERR_MSG)
         );
     }
 

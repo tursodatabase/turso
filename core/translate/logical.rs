@@ -1931,7 +1931,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 };
                 Ok(Value::Text(unquoted.to_string().into()))
             }
-            ast::Literal::Blob(b) => Ok(Value::from_slice(b.as_bytes())),
+            ast::Literal::Blob(b) => Ok(Value::from_slice(b.as_bytes())?),
             ast::Literal::CurrentDate
             | ast::Literal::CurrentTime
             | ast::Literal::CurrentTimestamp => Err(LimboError::ParseError(

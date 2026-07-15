@@ -39,7 +39,7 @@ impl ReadRecord {
                             ))
                         })?;
                         // The blob is in column 3: operator_id, zset_id, element_id, value, weight
-                        let blob = r.get_value(3)?.to_owned();
+                        let blob = r.get_value(3)?.to_owned()?;
 
                         let (state, _group_key) = match blob {
                             Value::Blob(blob) => AggregateState::from_blob(&blob),
@@ -155,7 +155,7 @@ impl WriteRow {
 
                         // Weight is always the last value (column 4 in our 5-column structure)
                         let existing_weight = match weight_opt {
-                            Some(val) => match val.to_owned() {
+                            Some(val) => match val.to_owned()? {
                                 Value::Numeric(Numeric::Integer(w)) => w as isize,
                                 _ => {
                                     return Err(LimboError::InternalError(

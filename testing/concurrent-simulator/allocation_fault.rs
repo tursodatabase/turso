@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use turso_core::alloc::{
     AllocError, AllocationSite, ApiAllocator, Global, Layout, MvStoreAllocationSite,
     MvccCheckpointAllocationSite, SchemaAllocationSite, SetAllocatorError, TursoAllocBackend,
+    ValueBlobAllocationSite, VectorAllocationSite,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -220,6 +221,23 @@ fn allocation_site_id(site: AllocationSite) -> u64 {
         AllocationSite::Schema(site) => match site {
             SchemaAllocationSite::MakeMut => 14,
         },
+        AllocationSite::ValueBlob(site) => match site {
+            ValueBlobAllocationSite::Concat => 23,
+            ValueBlobAllocationSite::RecordDecode => 24,
+            ValueBlobAllocationSite::FromSlice => 25,
+            ValueBlobAllocationSite::JsonbCopy => 26,
+            ValueBlobAllocationSite::Hash128 => 27,
+        },
+        AllocationSite::Vector(site) => match site {
+            VectorAllocationSite::Parse => 15,
+            VectorAllocationSite::Convert => 16,
+            VectorAllocationSite::Concat => 17,
+            VectorAllocationSite::Slice => 18,
+            VectorAllocationSite::Serialize => 19,
+            VectorAllocationSite::SparseConstruction => 20,
+            VectorAllocationSite::Float8Construction => 21,
+            VectorAllocationSite::IndexPayloadCopy => 22,
+        },
     }
 }
 
@@ -254,5 +272,80 @@ mod tests {
             allocation_hash(4, context, site, 0, layout),
             allocation_hash(4, context, site, 1, layout)
         );
+    }
+
+    #[test]
+    fn vector_allocation_sites_have_distinct_ids() {
+        let sites = [
+            VectorAllocationSite::Parse,
+            VectorAllocationSite::Convert,
+            VectorAllocationSite::Concat,
+            VectorAllocationSite::Slice,
+            VectorAllocationSite::Serialize,
+            VectorAllocationSite::SparseConstruction,
+            VectorAllocationSite::Float8Construction,
+            VectorAllocationSite::IndexPayloadCopy,
+        ];
+        let ids = sites.map(|site| allocation_site_id(AllocationSite::Vector(site)));
+        for (index, id) in ids.iter().enumerate() {
+            assert!(!ids[index + 1..].contains(id), "duplicate site id {id}");
+        }
+    }
+
+    #[test]
+    fn value_blob_allocation_sites_have_distinct_ids() {
+        let sites = [
+            ValueBlobAllocationSite::Concat,
+            ValueBlobAllocationSite::RecordDecode,
+            ValueBlobAllocationSite::FromSlice,
+            ValueBlobAllocationSite::JsonbCopy,
+            ValueBlobAllocationSite::Hash128,
+        ];
+        let ids = sites.map(|site| allocation_site_id(AllocationSite::ValueBlob(site)));
+        for (index, id) in ids.iter().enumerate() {
+            assert!(!ids[index + 1..].contains(id), "duplicate site id {id}");
+        }
+    }
+
+    #[test]
+    fn vector_allocation_site_is_fault_injectable() {
+        static INJECTOR: SimulatorAllocationFaultInjector = SimulatorAllocationFaultInjector {
+            enabled: AtomicBool::new(true),
+            seed: AtomicU64::new(7),
+            threshold: AtomicU64::new(u64::MAX),
+            injected_faults: AtomicU64::new(0),
+        };
+
+        let _context = INJECTOR.enter_context(AllocationFaultContext {
+            step: 1,
+            fiber_idx: 2,
+            execution_id: 3,
+        });
+        let _site = turso_core::alloc::enter_allocation_site(VectorAllocationSite::Serialize);
+        let layout = Layout::from_size_align(16, 8).unwrap();
+
+        assert!(INJECTOR.allocate(layout).is_err());
+        assert_eq!(INJECTOR.injected_faults(), 1);
+    }
+
+    #[test]
+    fn value_blob_concat_site_is_fault_injectable() {
+        static INJECTOR: SimulatorAllocationFaultInjector = SimulatorAllocationFaultInjector {
+            enabled: AtomicBool::new(true),
+            seed: AtomicU64::new(11),
+            threshold: AtomicU64::new(u64::MAX),
+            injected_faults: AtomicU64::new(0),
+        };
+
+        let _context = INJECTOR.enter_context(AllocationFaultContext {
+            step: 4,
+            fiber_idx: 5,
+            execution_id: 6,
+        });
+        let _site = turso_core::alloc::enter_allocation_site(ValueBlobAllocationSite::Concat);
+        let layout = Layout::from_size_align(16, 8).unwrap();
+
+        assert!(INJECTOR.allocate(layout).is_err());
+        assert_eq!(INJECTOR.injected_faults(), 1);
     }
 }
