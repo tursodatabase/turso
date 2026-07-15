@@ -53,6 +53,7 @@ Turso Database is an in-process SQL database written in Rust, compatible with SQ
 
 The database has the following experimental features:
 
+* **Postgres compatibility** for SQL dialect and wire protocol, see the see [compatibility reference](postgres/COMPAT.md) for details.
 * **Encryption at rest** for protecting the data locally.
 * **Incremental computation** using DBSP for incremental view maintenance and query subscriptions.
 * **Full-Text-Search** powered by the awesome [tantivy](https://github.com/quickwit-oss/tantivy) library
