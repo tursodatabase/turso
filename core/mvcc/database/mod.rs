@@ -8233,7 +8233,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .block(|| pager.with_header(|header| header.schema_cookie))?
                     .get(),
             );
-        let mut fresh = Schema::new();
+        let mut fresh = Schema::with_options(
+            connection.db.experimental_custom_types_enabled(),
+            connection.db.dialect().as_ref(),
+        )?;
         fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
         let mut from_sql_indexes = crate::alloc::vec![];
@@ -9172,7 +9175,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .as_ref()
             .map(|header| header.schema_cookie.get())
             .unwrap_or(fallback_cookie);
-        let mut fresh = Schema::new();
+        let mut fresh = Schema::with_options(
+            connection.db.experimental_custom_types_enabled(),
+            connection.db.dialect().as_ref(),
+        )?;
         fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
         let mut from_sql_indexes =

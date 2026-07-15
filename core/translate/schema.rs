@@ -2077,10 +2077,7 @@ pub fn translate_drop_table(
             });
         }
         Table::Virtual(vtab) => {
-            // From what I see, TableValuedFunction is not stored in the schema as a table.
-            // But this line here below is a safeguard in case this behavior changes in the future
-            // And mirrors what SQLite does.
-            if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) {
+            if !vtab.is_droppable {
                 return Err(crate::LimboError::ParseError(format!(
                     "table {} may not be dropped",
                     vtab.name

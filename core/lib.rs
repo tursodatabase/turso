@@ -112,7 +112,6 @@ use crate::{
     },
     translate::{emitter::TransactionMode, pragma::TURSO_CDC_DEFAULT_TABLE_NAME},
     vdbe::metrics::ConnectionMetrics,
-    vtab::VirtualTable,
 };
 use arc_swap::{ArcSwap, ArcSwapOption};
 use core::str;
@@ -186,7 +185,7 @@ pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     FromValueRow, PrepareContext, PreparedProgram, Program, Register,
 };
-pub use vtab::{InternalVirtualTable, InternalVirtualTableCursor};
+pub use vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable};
 
 /// Database index for the main database (always 0 in SQLite).
 pub const MAIN_DB_ID: usize = 0;
@@ -750,7 +749,7 @@ impl Database {
             path,
             wal_path,
             schema: Arc::new(Mutex::new(Arc::new({
-                let mut s = Schema::with_options(opts.enable_custom_types)?;
+                let mut s = Schema::with_options(opts.enable_custom_types, dialect.as_ref())?;
                 s.generated_columns_enabled = opts.enable_generated_columns;
                 s
             }))),

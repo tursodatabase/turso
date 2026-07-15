@@ -890,10 +890,14 @@ impl Schema {
     /// bug). Production code that opens user databases should prefer
     /// [`Schema::with_options`] which returns `Result`.
     pub fn new() -> Self {
-        Self::with_options(true).expect("built-in type definitions are malformed")
+        Self::with_options(true, &crate::dialect::SqliteDialect)
+            .expect("built-in type definitions are malformed")
     }
 
-    pub fn with_options(enable_custom_types: bool) -> crate::Result<Self> {
+    pub fn with_options(
+        enable_custom_types: bool,
+        dialect: &dyn crate::dialect::Dialect,
+    ) -> crate::Result<Self> {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
         #[cfg(feature = "conn_raw_api")]
         let mut table_names_by_root_page = HashMap::default();
@@ -938,7 +942,7 @@ impl Schema {
             generated_columns_enabled: false,
             sequences: HashMap::default(),
         };
-        crate::dialect::sqlite::register_builtin_catalog(&mut schema, enable_custom_types)?;
+        dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
     }
 
@@ -2670,6 +2674,7 @@ impl TryClone for VirtualTable {
             kind: self.kind,
             vtab_type: self.vtab_type.clone(),
             vtab_id: self.vtab_id,
+            is_droppable: self.is_droppable,
             innocuous: self.innocuous,
         })
     }

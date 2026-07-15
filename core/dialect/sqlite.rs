@@ -55,6 +55,14 @@ impl super::Dialect for SqliteDialect {
             }
         }
     }
+
+    fn register_catalog(
+        &self,
+        schema: &mut Schema,
+        enable_custom_types: bool,
+    ) -> crate::Result<()> {
+        register_builtin_catalog(schema, enable_custom_types)
+    }
 }
 
 /// Parse the first SQLite statement in `sql` and return its consumed byte count.
@@ -152,6 +160,7 @@ fn pragma_vtabs() -> Vec<Arc<VirtualTable>> {
                 kind: VTabKind::TableValuedFunction,
                 vtab_type: VirtualTableType::Pragma(tab),
                 vtab_id: 0,
+                is_droppable: false,
                 innocuous: true,
             })
         })

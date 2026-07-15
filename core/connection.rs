@@ -16,7 +16,6 @@ use crate::types::{WalFrameInfo, WalState};
 use crate::util::{OpenMode, OpenOptions};
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::Page;
-use crate::SqliteDialect;
 use crate::{
     ast, function,
     io::{MemoryIO, IO},
@@ -575,8 +574,11 @@ impl Connection {
 
     pub(crate) fn empty_temp_schema(&self) -> Arc<Schema> {
         // with_options only fails if built-in type SQL is malformed (programmer bug).
-        let mut schema = Schema::with_options(self.db.experimental_custom_types_enabled())
-            .expect("built-in type definitions are malformed");
+        let mut schema = Schema::with_options(
+            self.db.experimental_custom_types_enabled(),
+            self.db.dialect().as_ref(),
+        )
+        .expect("built-in type definitions are malformed");
         schema.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         Arc::new(schema)
     }
@@ -618,7 +620,7 @@ impl Connection {
                 OpenFlags::Create,
                 db_opts,
                 None,
-                Arc::new(SqliteDialect),
+                self.db.dialect(),
             )?;
             let pager = Arc::new(db._init(None)?);
             pager.set_initial_page_size(page_size)?;
@@ -649,7 +651,7 @@ impl Connection {
                 OpenFlags::Create,
                 db_opts,
                 None,
-                Arc::new(SqliteDialect),
+                self.db.dialect(),
             )?;
             let pager = Arc::new(db._init(None)?);
             pager.set_initial_page_size(page_size)?;
@@ -669,6 +671,7 @@ impl Connection {
                 OpenFlags::Create,
                 db_opts,
                 None,
+                self.db.dialect(),
             )?;
             let pager = Arc::new(db._init(None)?);
             pager.set_initial_page_size(page_size)?;
@@ -685,6 +688,7 @@ impl Connection {
             OpenFlags::Create,
             self.make_temp_database_opts(),
             None,
+            self.db.dialect(),
         )?;
         let pager = Arc::new(db._init(None)?);
         pager.set_initial_page_size(self.get_page_size())?;
@@ -1313,7 +1317,10 @@ impl Connection {
         let guard = self.schema_reparse_guard();
         self.pager.load().set_schema_cookie(Some(cookie));
         // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::with_options(self.experimental_custom_types_enabled())?;
+        let mut fresh = Schema::with_options(
+            self.experimental_custom_types_enabled(),
+            self.db.dialect().as_ref(),
+        )?;
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
 

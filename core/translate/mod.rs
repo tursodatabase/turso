@@ -111,6 +111,7 @@ pub fn translate(
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
+        connection.dialect(),
     );
 
     match stmt {

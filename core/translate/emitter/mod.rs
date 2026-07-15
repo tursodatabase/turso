@@ -169,6 +169,9 @@ pub struct Resolver<'a> {
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
     pub dqs_dml: DoubleQuotedDml,
+    /// Schema dialect of the database being compiled against; used when a
+    /// fresh placeholder schema must be constructed during resolution.
+    pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
     /// When set, we are compiling a trigger subprogram for this database.
     /// Ordinary triggers are restricted to their own database, but temp-backed
     /// triggers follow SQLite's looser resolution rules and may access objects
@@ -273,6 +276,7 @@ impl<'a> Resolver<'a> {
     const MAIN_DB: &'static str = "main";
     const TEMP_DB: &'static str = "temp";
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
@@ -281,6 +285,7 @@ impl<'a> Resolver<'a> {
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
         dqs_dml: DoubleQuotedDml,
+        dialect: Arc<dyn crate::dialect::Dialect>,
     ) -> Self {
         let has_temp_schema = temp_database.read().is_some();
         Self {
@@ -298,6 +303,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(None),
             enable_custom_types,
             dqs_dml,
+            dialect,
             trigger_context: None,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
@@ -328,6 +334,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
+            dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -350,6 +357,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
+            dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -439,7 +447,7 @@ impl<'a> Resolver<'a> {
                 .unwrap_or_else(|| {
                     // with_options only fails if built-in type SQL is malformed (programmer bug).
                     Arc::new(
-                        Schema::with_options(self.enable_custom_types)
+                        Schema::with_options(self.enable_custom_types, self.dialect.as_ref())
                             .expect("built-in type definitions are malformed"),
                     )
                 }),

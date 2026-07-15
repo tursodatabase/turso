@@ -102,6 +102,23 @@ pub trait Dialect: Send + Sync + 'static {
         };
         self.format_table_sql(&stmt.to_string(), tbl_name, body)
     }
+
+    /// Install the dialect's catalog tables into a freshly constructed
+    /// schema.
+    ///
+    /// Called by [`crate::schema::Schema::with_options`] on every schema
+    /// construction and rebuild, so catalog tables survive rebuilds
+    /// structurally instead of being re-registered by hand. The SQLite
+    /// dialect registers the standard built-in catalog here; other
+    /// dialects typically compose with it via
+    /// [`sqlite::register_builtin_catalog`] and then add their own tables
+    /// (constructed with [`crate::VirtualTable::new_internal`], which
+    /// requires no connection).
+    fn register_catalog(
+        &self,
+        schema: &mut crate::schema::Schema,
+        enable_custom_types: bool,
+    ) -> crate::Result<()>;
 }
 
 #[cfg(test)]
@@ -162,6 +179,21 @@ mod tests {
         ) -> crate::Result<String> {
             Ok(format!("/* test */ {input}"))
         }
+
+        fn register_catalog(
+            &self,
+            schema: &mut crate::schema::Schema,
+            enable_custom_types: bool,
+        ) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, enable_custom_types)?;
+            let vtab = crate::VirtualTable::new_internal(
+                "test_catalog".to_string(),
+                "CREATE TABLE test_catalog (value INTEGER)".to_string(),
+                turso_ext::VTabKind::VirtualTable,
+                Arc::new(crate::sync::RwLock::new(TestCatalogTable)),
+            )?;
+            schema.add_virtual_table(Arc::new(vtab))
+        }
     }
 
     /// Stores table definitions in syntax that SQLite cannot parse and always
@@ -203,6 +235,92 @@ mod tests {
             _body: &turso_parser::ast::CreateTableBody,
         ) -> crate::Result<String> {
             Ok(format!("{}{input}", Self::PREFIX))
+        }
+
+        fn register_catalog(
+            &self,
+            schema: &mut crate::schema::Schema,
+            enable_custom_types: bool,
+        ) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, enable_custom_types)
+        }
+    }
+
+    /// A one-row catalog table installed by [`TestDialect`],
+    /// standing in for a frontend catalog surface like `pg_class`.
+    #[derive(Debug)]
+    struct TestCatalogTable;
+
+    impl crate::InternalVirtualTable for TestCatalogTable {
+        fn name(&self) -> String {
+            "test_catalog".to_string()
+        }
+
+        fn sql(&self) -> String {
+            "CREATE TABLE test_catalog (value INTEGER)".to_string()
+        }
+
+        fn open(
+            &self,
+            _conn: Arc<crate::Connection>,
+        ) -> crate::Result<Arc<crate::sync::RwLock<dyn crate::InternalVirtualTableCursor>>>
+        {
+            Ok(Arc::new(crate::sync::RwLock::new(TestCatalogCursor {
+                row: 0,
+            })))
+        }
+
+        fn best_index(
+            &self,
+            constraints: &[turso_ext::ConstraintInfo],
+            _order_by: &[turso_ext::OrderByInfo],
+        ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
+            Ok(turso_ext::IndexInfo {
+                idx_num: 0,
+                idx_str: None,
+                order_by_consumed: false,
+                estimated_cost: 1.0,
+                estimated_rows: 1,
+                constraint_usages: constraints
+                    .iter()
+                    .map(|_| turso_ext::ConstraintUsage {
+                        argv_index: None,
+                        omit: false,
+                    })
+                    .collect(),
+            })
+        }
+    }
+
+    struct TestCatalogCursor {
+        row: usize,
+    }
+
+    impl crate::InternalVirtualTableCursor for TestCatalogCursor {
+        fn filter(
+            &mut self,
+            _args: &[crate::Value],
+            _idx_str: Option<String>,
+            _idx_num: i32,
+        ) -> crate::Result<bool> {
+            self.row = 0;
+            Ok(true)
+        }
+
+        fn next(&mut self) -> crate::Result<bool> {
+            self.row += 1;
+            Ok(self.row < 1)
+        }
+
+        fn rowid(&self) -> i64 {
+            self.row as i64
+        }
+
+        fn column(&self, column: usize) -> crate::Result<crate::Value> {
+            match column {
+                0 => Ok(crate::Value::Numeric(crate::numeric::Numeric::Integer(42))),
+                _ => Ok(crate::Value::Null),
+            }
         }
     }
 
@@ -300,6 +418,129 @@ mod tests {
         assert!(runner.next().is_some_and(|result| result.is_err()));
         assert!(runner.next().is_none());
         conn.close().unwrap();
+    }
+
+    #[test]
+    fn dialect_catalog_available_on_every_schema_and_rebuild() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-catalog.db", Arc::new(TestDialect::default())).unwrap();
+
+        let query_catalog = |conn: &Arc<crate::Connection>| -> Vec<Vec<crate::Value>> {
+            conn.prepare("SELECT value FROM test_catalog")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+        };
+
+        let conn1 = db.connect().unwrap();
+        let conn2 = db.connect().unwrap();
+        assert_eq!(
+            query_catalog(&conn1),
+            vec![vec![crate::Value::Numeric(
+                crate::numeric::Numeric::Integer(42)
+            )]]
+        );
+        assert_eq!(
+            query_catalog(&conn2),
+            vec![vec![crate::Value::Numeric(
+                crate::numeric::Numeric::Integer(42)
+            )]]
+        );
+
+        // DDL on another connection forces conn1 to rebuild its schema from
+        // sqlite_schema; the catalog table must survive because schema
+        // construction re-registers it.
+        conn2.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        assert_eq!(
+            query_catalog(&conn1),
+            vec![vec![crate::Value::Numeric(
+                crate::numeric::Numeric::Integer(42)
+            )]]
+        );
+
+        conn1.close().unwrap();
+        conn2.close().unwrap();
+    }
+
+    #[test]
+    fn dialect_catalog_cannot_be_dropped() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(
+            &io,
+            "dialect-catalog-drop.db",
+            Arc::new(TestDialect::default()),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        let error = conn.execute("DROP TABLE test_catalog").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("table test_catalog may not be dropped"),
+            "unexpected error: {error}"
+        );
+
+        let new_conn = db.connect().unwrap();
+        for catalog_conn in [&conn, &new_conn] {
+            let rows = catalog_conn
+                .prepare("SELECT value FROM test_catalog")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(rows, vec![vec![crate::Value::from_i64(42)]]);
+        }
+        conn.close().unwrap();
+        new_conn.close().unwrap();
+    }
+
+    #[test]
+    fn dialect_catalog_survives_mvcc_recovery() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "dialect-catalog-mvcc-recovery.db";
+
+        {
+            let db = open_db(&io, path, Arc::new(TestDialect::default())).unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("PRAGMA journal_mode = mvcc").unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+            conn.close().unwrap();
+        }
+
+        let db = open_db(&io, path, Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect().unwrap();
+        let rows = conn
+            .prepare("SELECT value FROM test_catalog")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![crate::Value::from_i64(42)]]);
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn dialect_catalog_available_in_initialized_temp_schema() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(
+            &io,
+            "dialect-catalog-temp.db",
+            Arc::new(TestDialect::default()),
+        )
+        .unwrap();
+
+        for temp_store in ["MEMORY", "FILE"] {
+            let conn = db.connect().unwrap();
+            conn.execute(format!("PRAGMA temp_store = {temp_store}"))
+                .unwrap();
+            conn.execute("CREATE TEMP TABLE t (x INTEGER)").unwrap();
+            let rows = conn
+                .prepare("SELECT value FROM temp.test_catalog")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(rows, vec![vec![crate::Value::from_i64(42)]]);
+            conn.close().unwrap();
+        }
     }
 
     #[test]
