@@ -168,7 +168,7 @@ impl Blob {
     fn bind_blob(&mut self, index: usize, value: Vec<u8>) -> Result<()> {
         self.stmt.bind_at(
             NonZero::new(index).unwrap(),
-            Value::Blob(crate::types::value_blob_from_slice(&value)),
+            Value::Blob(crate::types::value_blob_from_slice(&value)?),
         )
     }
 
