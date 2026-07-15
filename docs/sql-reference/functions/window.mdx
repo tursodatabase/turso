@@ -9,7 +9,7 @@ sidebarTitle: Window
 Window functions perform calculations across a set of rows that are related to the current row. Unlike aggregate functions with GROUP BY, window functions do not collapse rows into a single output row. Every input row produces a corresponding output row, with the window function result appended.
 
 <Info>
-Turso supports aggregate functions used as window functions with the default frame definition. Custom frame specifications (ROWS, RANGE, or GROUPS with explicit bounds) and dedicated window functions (row_number, rank, dense_rank, ntile, lag, lead, first_value, last_value, nth_value) are not yet supported.
+Turso supports aggregate functions used as window functions with the default frame definition, the `row_number()` ranking function, and the `FILTER (WHERE ...)` clause. The remaining dedicated window functions (`rank`, `dense_rank`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`) and custom frame specifications (ROWS, RANGE, or GROUPS with explicit bounds) are not yet supported.
 </Info>
 
 ## Syntax
@@ -54,6 +54,42 @@ Any aggregate function can be used as a window function by adding an OVER clause
 | `max(expression)` | Maximum value in the frame |
 | `total(expression)` | Sum as REAL (returns 0.0 for empty frames instead of NULL) |
 | `group_concat(expression, separator)` | Concatenation of values in the frame |
+
+## Ranking Functions
+
+### row_number()
+
+Assigns a sequential integer (starting at 1) to each row within its partition, in the order defined by the window's `ORDER BY`. This is the one dedicated ranking function supported in Turso.
+
+```sql
+SELECT
+    department,
+    name,
+    salary,
+    ROW_NUMBER() OVER (PARTITION BY department ORDER BY salary DESC) AS rank_in_dept
+FROM employees;
+```
+
+| department | name | salary | rank_in_dept |
+|------------|------|--------|--------------|
+| Engineering | Alice | 90000 | 1 |
+| Engineering | Bob | 85000 | 2 |
+| Engineering | Carol | 75000 | 3 |
+| Marketing | Dave | 70000 | 1 |
+| Marketing | Eve | 60000 | 2 |
+
+## FILTER (WHERE ...)
+
+A `FILTER (WHERE ...)` clause restricts which rows an aggregate window function includes, without affecting the rows returned by the query.
+
+```sql
+SELECT
+    department,
+    name,
+    salary,
+    SUM(salary) FILTER (WHERE salary > 70000) OVER (PARTITION BY department) AS high_earner_total
+FROM employees;
+```
 
 ## PARTITION BY
 
@@ -240,7 +276,6 @@ The following window function features are not yet supported in Turso:
 
 | Feature | Status |
 |---------|--------|
-| `row_number()` | Not supported |
 | `rank()` | Not supported |
 | `dense_rank()` | Not supported |
 | `ntile(N)` | Not supported |
@@ -255,7 +290,8 @@ The following window function features are not yet supported in Turso:
 | Custom frame: `RANGE BETWEEN ... AND ...` | Not supported |
 | Custom frame: `GROUPS BETWEEN ...` | Not supported |
 | `EXCLUDE` clause | Not supported |
-| `FILTER (WHERE ...)` on window functions | Not supported |
+
+`row_number()` and `FILTER (WHERE ...)` are supported — see the sections above.
 
 ## See Also
 
