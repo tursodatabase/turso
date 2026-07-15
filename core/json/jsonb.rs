@@ -1,4 +1,4 @@
-use crate::alloc::{TryReserveError, TursoVecExt};
+use crate::alloc::{TryClone, TryReserveError, TursoAllocExt, TursoTryWithCapacityExt};
 use crate::json::error::{Error as PError, Result as PResult};
 use crate::json::Conv;
 use crate::types::{value_blob_from_slice, ValueBlob};
@@ -179,6 +179,14 @@ static CHARACTER_TYPE_OK: [u8; 256] = make_character_type_ok_table();
 #[derive(Debug, Clone, PartialEq)]
 pub struct Jsonb {
     data: ValueBlob,
+}
+
+impl TryClone for Jsonb {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> std::result::Result<Self, Self::Error> {
+        Self::from_raw_data(&self.data)
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -635,11 +643,11 @@ pub struct SearchOperation {
 }
 
 impl SearchOperation {
-    pub fn new(capacity: usize) -> Self {
-        Self {
+    pub fn new(capacity: usize) -> std::result::Result<Self, TryReserveError> {
+        Ok(Self {
             mode: PathOperationMode::ReplaceExisting,
-            value: Jsonb::new(capacity),
-        }
+            value: Jsonb::new(capacity)?,
+        })
     }
 
     pub fn result(self) -> Jsonb {
@@ -909,34 +917,33 @@ pub type ArrayIteratorItem = ((usize, Jsonb), ArrayIteratorState);
 pub type ObjectIteratorItem = ((usize, Jsonb, Jsonb), ObjectIteratorState);
 
 impl Jsonb {
-    pub fn new(capacity: usize) -> Self {
+    pub fn empty() -> Self {
         Self {
-            data: <ValueBlob as TursoVecExt<u8>>::with_capacity(capacity),
+            data: <ValueBlob as TursoAllocExt>::new(),
         }
+    }
+
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::JsonbConstruction)]
+    pub fn new(capacity: usize) -> std::result::Result<Self, TryReserveError> {
+        Ok(Self {
+            data: <ValueBlob as TursoTryWithCapacityExt>::try_with_capacity_ext(capacity)?,
+        })
     }
 
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
-    pub fn make_empty_array(size: usize) -> Self {
-        let mut jsonb = Self {
-            data: <ValueBlob as TursoVecExt<u8>>::with_capacity(size),
-        };
-        jsonb
-            .write_element_header(0, ElementType::ARRAY, 0, false)
-            .expect("writing header to new vector should not fail");
-        jsonb
+    pub fn make_empty_array(size: usize) -> Result<Self> {
+        let mut jsonb = Self::new(size.max(1))?;
+        jsonb.write_element_header(0, ElementType::ARRAY, 0, false)?;
+        Ok(jsonb)
     }
 
-    pub fn make_empty_obj(size: usize) -> Self {
-        let mut jsonb = Self {
-            data: <ValueBlob as TursoVecExt<u8>>::with_capacity(size),
-        };
-        jsonb
-            .write_element_header(0, ElementType::OBJECT, 0, false)
-            .expect("writing header to new vector should not fail");
-        jsonb
+    pub fn make_empty_obj(size: usize) -> Result<Self> {
+        let mut jsonb = Self::new(size.max(1))?;
+        jsonb.write_element_header(0, ElementType::OBJECT, 0, false)?;
+        Ok(jsonb)
     }
 
     pub fn append_to_array_unsafe(&mut self, data: &[u8]) {
@@ -2335,7 +2342,7 @@ impl Jsonb {
     }
 
     fn from_str(input: &str) -> PResult<Self> {
-        let mut result = Self::new(input.len());
+        let mut result = Self::new(input.len())?;
         let input = input.as_bytes();
 
         if input.is_empty() {
@@ -3567,7 +3574,7 @@ mod tests {
     #[test]
     fn test_null_serialization() {
         // Create JSONB with null value
-        let mut jsonb = Jsonb::new(10);
+        let mut jsonb = Jsonb::new(10).unwrap();
         jsonb.data.push(ElementType::NULL as u8);
 
         // Test serialization
@@ -3582,12 +3589,12 @@ mod tests {
     #[test]
     fn test_boolean_serialization() {
         // True
-        let mut jsonb_true = Jsonb::new(10);
+        let mut jsonb_true = Jsonb::new(10).unwrap();
         jsonb_true.data.push(ElementType::TRUE as u8);
         assert_eq!(jsonb_true.to_string().unwrap(), "true");
 
         // False
-        let mut jsonb_false = Jsonb::new(10);
+        let mut jsonb_false = Jsonb::new(10).unwrap();
         jsonb_false.data.push(ElementType::FALSE as u8);
         assert_eq!(jsonb_false.to_string().unwrap(), "false");
 
@@ -4473,7 +4480,7 @@ mod path_operations_tests {
         let mut jsonb = Jsonb::from_str(json_str).unwrap();
 
         // Create a search operation
-        let mut operation = SearchOperation::new(100);
+        let mut operation = SearchOperation::new(100).unwrap();
 
         // Create a path to the "person" property
         let path = create_path(vec![

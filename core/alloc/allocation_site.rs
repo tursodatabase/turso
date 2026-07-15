@@ -14,6 +14,7 @@ pub enum AllocationSite {
 pub enum ValueBlobAllocationSite {
     Concat,
     FromSlice,
+    JsonbConstruction,
     JsonbCopy,
     Hash128,
     RecordDecode,

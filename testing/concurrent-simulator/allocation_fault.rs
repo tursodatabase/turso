@@ -227,6 +227,7 @@ fn allocation_site_id(site: AllocationSite) -> u64 {
             ValueBlobAllocationSite::FromSlice => 25,
             ValueBlobAllocationSite::JsonbCopy => 26,
             ValueBlobAllocationSite::Hash128 => 27,
+            ValueBlobAllocationSite::JsonbConstruction => 28,
         },
         AllocationSite::Vector(site) => match site {
             VectorAllocationSite::Parse => 15,
@@ -298,6 +299,7 @@ mod tests {
             ValueBlobAllocationSite::Concat,
             ValueBlobAllocationSite::RecordDecode,
             ValueBlobAllocationSite::FromSlice,
+            ValueBlobAllocationSite::JsonbConstruction,
             ValueBlobAllocationSite::JsonbCopy,
             ValueBlobAllocationSite::Hash128,
         ];
@@ -347,5 +349,132 @@ mod tests {
 
         assert!(INJECTOR.allocate(layout).is_err());
         assert_eq!(INJECTOR.injected_faults(), 1);
+    }
+
+    #[cfg(nightly)]
+    #[test]
+    fn production_allocation_failures_propagate_and_leave_state_reusable() {
+        let injector =
+            install_global_allocation_fault_backend(AllocationFaultConfig { probability: 1.0 }, 29)
+                .unwrap()
+                .unwrap();
+
+        let lhs = turso_core::Value::from_slice(&[1, 2]).unwrap();
+        let rhs = turso_core::Value::from_slice(&[3, 4]).unwrap();
+        let blob = turso_core::Value::from_slice(&[1, 2, 3, 4]).unwrap();
+        let vector_bytes = 1.0f32.to_le_bytes();
+        let json = turso_core::Value::build_text(r#"{"key":"value"}"#);
+        let json_cache = turso_core::json::JsonCacheCell::new();
+        turso_core::json::jsonb(&json, &json_cache).unwrap();
+
+        let before = injector.injected_faults();
+        {
+            let _context = injector.enter_context(AllocationFaultContext {
+                step: 10,
+                fiber_idx: 11,
+                execution_id: 12,
+            });
+            assert!(lhs.exec_concat(&rhs).is_err());
+        }
+        assert_eq!(injector.injected_faults(), before + 1);
+        assert_eq!(
+            lhs.exec_concat(&rhs).unwrap().to_blob(),
+            Some([1, 2, 3, 4].as_slice())
+        );
+
+        let before = injector.injected_faults();
+        {
+            let _context = injector.enter_context(AllocationFaultContext {
+                step: 13,
+                fiber_idx: 14,
+                execution_id: 15,
+            });
+            assert!(blob.exec_cast("BLOB").is_err());
+        }
+        assert_eq!(injector.injected_faults(), before + 1);
+        assert_eq!(blob.exec_cast("BLOB").unwrap().to_blob(), blob.to_blob());
+
+        let before = injector.injected_faults();
+        {
+            let _context = injector.enter_context(AllocationFaultContext {
+                step: 16,
+                fiber_idx: 17,
+                execution_id: 18,
+            });
+            let vector =
+                turso_core::vector::vector_types::Vector::from_slice(&vector_bytes).unwrap();
+            assert!(turso_core::vector::operations::serialize::vector_serialize(vector).is_err());
+        }
+        assert_eq!(injector.injected_faults(), before + 1);
+        let vector = turso_core::vector::vector_types::Vector::from_slice(&vector_bytes).unwrap();
+        assert_eq!(
+            turso_core::vector::operations::serialize::vector_serialize(vector)
+                .unwrap()
+                .to_blob(),
+            Some(vector_bytes.as_slice())
+        );
+
+        let before = injector.injected_faults();
+        {
+            let _context = injector.enter_context(AllocationFaultContext {
+                step: 19,
+                fiber_idx: 20,
+                execution_id: 21,
+            });
+            assert!(matches!(
+                turso_core::json::jsonb(&json, &json_cache),
+                Err(turso_core::LimboError::OutOfMemory)
+            ));
+        }
+        assert_eq!(injector.injected_faults(), before + 1);
+        assert!(turso_core::json::jsonb(&json, &json_cache).is_ok());
+
+        let insert_key = turso_core::Value::build_text(r#"{"insert":"value"}"#);
+        let insert_cache = turso_core::json::JsonCacheCell::new();
+        let prepared_json =
+            turso_core::json::convert_dbtype_to_jsonb(&insert_key, turso_core::json::Conv::Strict)
+                .unwrap();
+        let before = injector.injected_faults();
+        {
+            let _context = injector.enter_context(AllocationFaultContext {
+                step: 22,
+                fiber_idx: 23,
+                execution_id: 24,
+            });
+            assert!(matches!(
+                insert_cache.get_or_insert_with(&insert_key, |_| Ok(prepared_json)),
+                Err(turso_core::LimboError::OutOfMemory)
+            ));
+        }
+        assert_eq!(injector.injected_faults(), before + 1);
+
+        let prepared_json =
+            turso_core::json::convert_dbtype_to_jsonb(&insert_key, turso_core::json::Conv::Strict)
+                .unwrap();
+        let insert_closure_called = Cell::new(false);
+        assert!(
+            insert_cache
+                .get_or_insert_with(&insert_key, |_| {
+                    insert_closure_called.set(true);
+                    Ok(prepared_json)
+                })
+                .is_ok()
+        );
+        assert!(insert_closure_called.get());
+
+        let before = injector.injected_faults();
+        {
+            let _context = injector.enter_context(AllocationFaultContext {
+                step: 25,
+                fiber_idx: 26,
+                execution_id: 27,
+            });
+            assert!(turso_core::json::is_json_valid(&json).is_err());
+        }
+        assert_eq!(injector.injected_faults(), before + 1);
+        assert_eq!(
+            turso_core::json::is_json_valid(&json).unwrap().as_int(),
+            Some(1)
+        );
     }
 }
