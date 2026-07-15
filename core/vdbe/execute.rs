@@ -2873,7 +2873,7 @@ pub fn op_blob_read(
         Err(LimboError::BlobHandleExpired) => return Ok(blob_expired_ack(state, *dest)),
         Err(err) => return Err(err),
     }
-    state.registers[*dest].set_value(Value::Blob(crate::types::value_blob_from_slice(&out)));
+    state.registers[*dest].set_value(Value::Blob(crate::types::value_blob_from_slice(&out)?));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

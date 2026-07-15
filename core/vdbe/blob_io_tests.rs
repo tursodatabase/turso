@@ -139,7 +139,8 @@ fn blob_write_local_persists() {
             dest: r_off,
         });
         b.emit_insn(Insn::Blob {
-            value: crate::types::value_blob_from_slice(&[0xAA, 0xBB, 0xCC]),
+            value: crate::types::value_blob_from_slice(&[0xAA, 0xBB, 0xCC])
+                .expect(crate::alloc::ALLOC_ERR_MSG),
             dest: r_src,
         });
         let r_ack = b.alloc_register();
@@ -183,7 +184,8 @@ fn blob_read_write_across_overflow() {
     // Write a marker straddling the local/overflow boundary region (offset 3000, which
     // is well past the ~4KB local cap for a page, and spanning into deeper overflow).
     let pattern: Vec<u8> = (0u16..600).map(|i| (i % 251) as u8).collect();
-    let pat_for_move = crate::types::value_blob_from_slice(&pattern);
+    let pat_for_move =
+        crate::types::value_blob_from_slice(&pattern).expect(crate::alloc::ALLOC_ERR_MSG);
     let rows = run_blob_program(&conn, root, move |b, cursor| {
         let r_off = b.alloc_register();
         let r_src = b.alloc_register();
