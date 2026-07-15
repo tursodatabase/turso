@@ -115,11 +115,23 @@ const _HELP_TEMPLATE: &str = "{before-help}{name}
 
 #[cfg(test)]
 mod tests {
-    use super::CommandParser;
+    use super::{Command, CommandParser};
+    use crate::input::OutputMode;
+    use clap::Parser;
 
     #[test]
     fn cli_assert() {
         use clap::CommandFactory;
         CommandParser::command().debug_assert();
+    }
+
+    #[test]
+    fn parses_box_output_mode() {
+        let parsed = CommandParser::try_parse_from(["mode", "box"]).expect("box mode must parse");
+
+        assert!(matches!(
+            parsed.command,
+            Command::OutputMode(args) if args.mode == OutputMode::Box
+        ));
     }
 }

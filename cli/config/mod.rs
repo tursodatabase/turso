@@ -82,7 +82,7 @@ impl Config {
     }
 
     pub fn for_output_mode(mode: OutputMode) -> Self {
-        let table = if mode == OutputMode::Pretty {
+        let table = if matches!(mode, OutputMode::Pretty | OutputMode::Box) {
             TableConfig::adaptive_colors()
         } else {
             TableConfig::no_colors()

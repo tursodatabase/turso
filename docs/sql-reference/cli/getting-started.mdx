@@ -62,7 +62,7 @@ Use `.quit` or `.exit` to leave the shell. Pressing Ctrl+C twice also exits.
 
 ## Output Modes
 
-Turso supports three output modes, selectable with the `-m` flag or the `.mode` dot command.
+Turso supports four output modes, selectable with the `-m` flag or the `.mode` dot command.
 
 ### Pretty (Default)
 
@@ -72,12 +72,17 @@ Human-readable table with borders:
 tursodb -q -m pretty
 ```
 
+The equivalent `box` mode follows the SQLite and DuckDB shell interface:
+
+```bash
+tursodb -q -m box
+```
+
 ```
 ┌────┬─────────┬─────────────┬─────────┐
 │ id │ name    │ department  │ salary  │
 ├────┼─────────┼─────────────┼─────────┤
 │  1 │ Alice   │ Engineering │ 95000.0 │
-├────┼─────────┼─────────────┼─────────┤
 │  2 │ Bob     │ Marketing   │ 72000.0 │
 └────┴─────────┴─────────────┴─────────┘
 ```
@@ -141,4 +146,3 @@ Start a sync server for database replication:
 ```bash
 tursodb --sync-server 0.0.0.0:8080 mydata.db
 ```
-

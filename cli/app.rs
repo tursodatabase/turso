@@ -119,6 +119,19 @@ pub struct Opts {
 
 const PROMPT: &str = "turso> ";
 
+// Keep only the outer border, column dividers, and header separator, matching
+// the box layouts produced by the SQLite and DuckDB shells.
+const BOX_TABLE_STYLE: &str = "││──├─┼┤│    ┬┴┌┐└┘";
+
+fn new_box_table() -> Table {
+    let mut table = Table::new();
+    table
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_truncation_indicator("…")
+        .apply_modifier(BOX_TABLE_STYLE);
+    table
+}
+
 pub struct Limbo {
     pub prompt: String,
     io: Arc<dyn turso_core::IO>,
@@ -517,12 +530,19 @@ impl Limbo {
     }
 
     fn set_mode(&mut self, mode: OutputMode) -> Result<(), String> {
-        if mode == OutputMode::Pretty && !self.opts.is_stdout {
-            Err("pretty output can only be written to a tty".to_string())
-        } else {
-            self.opts.output_mode = mode;
-            Ok(())
+        if !self.opts.is_stdout {
+            match mode {
+                OutputMode::Pretty => {
+                    return Err("pretty output can only be written to a tty".to_string());
+                }
+                OutputMode::Box => {
+                    return Err("box output can only be written to a tty".to_string());
+                }
+                OutputMode::List | OutputMode::Line => {}
+            }
         }
+        self.opts.output_mode = mode;
+        Ok(())
     }
 
     fn write_fmt(&mut self, fmt: std::fmt::Arguments) -> io::Result<()> {
@@ -989,7 +1009,7 @@ impl Limbo {
                     (_, QueryMode::Explain) => {
                         self.print_explain(rows, statistics)?;
                     }
-                    (OutputMode::Pretty, _) => {
+                    (OutputMode::Pretty | OutputMode::Box, _) => {
                         self.print_pretty_mode(rows, statistics)?;
                     }
                     (OutputMode::Line, _) => {
@@ -1242,11 +1262,7 @@ impl Limbo {
             .map(|c| c.as_comfy_table_color())
             .collect();
 
-        let mut table = Table::new();
-        table
-            .set_content_arrangement(ContentArrangement::Dynamic)
-            .set_truncation_indicator("…")
-            .apply_modifier("││──├─┼┤│─┼├┤┬┴┌┐└┘");
+        let mut table = new_box_table();
 
         if num_columns > 0 {
             let header = column_names
@@ -2377,6 +2393,19 @@ fn normalize_db_path(db_file: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn box_table_omits_separators_between_data_rows() {
+        let mut table = new_box_table();
+        table.set_header(["value"]);
+        table.add_row(["1"]);
+        table.add_row(["2"]);
+
+        assert_eq!(
+            table.to_string(),
+            "┌───────┐\n│ value │\n├───────┤\n│ 1     │\n│ 2     │\n└───────┘"
+        );
+    }
 
     #[test]
     fn test_normalize_db_path_adds_file_prefix_for_query_params() {

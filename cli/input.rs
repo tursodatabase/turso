@@ -67,6 +67,7 @@ impl Default for Io {
 pub enum OutputMode {
     List,
     Pretty,
+    Box,
     Line,
 }
 

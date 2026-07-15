@@ -146,7 +146,7 @@ The SQL shell supports the following command line options:
 
 | Option | Description |
 |--------|-------------|
-| `-m`, `--output-mode` `<mode>` | Configure output mode. Supported values for `<mode>`: <ul><li>`pretty` for pretty output (default)</li><li>`list` for minimal SQLite compatible format</li></ul>
+| `-m`, `--output-mode` `<mode>` | Configure output mode. Supported values for `<mode>`: <ul><li>`pretty` for pretty output (default)</li><li>`box` for SQLite/DuckDB-style box output</li><li>`list` for minimal SQLite compatible format</li><li>`line` for one column per line</li></ul>
 | `-q`, `--quiet` | Don't display program information at startup |
 | `-e`, `--echo` | Print commands before execution |
 | `--readonly` | Open database in read-only mode |
@@ -1139,13 +1139,9 @@ SELECT * FROM turso_cdc;
 │ change_id │ change_time │ change_type │ table_name    │ id │ before   │ after                                                                        │ updates       │
 ├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
 │         1 │  1756713161 │           1 │ sqlite_schema │  2 │          │ ytableusersusersCREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT) │               │
-├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
 │         2 │  1756713176 │           1 │ users         │  1 │          │       John                                                                      │               │
-├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
 │         3 │  1756713176 │           1 │ users         │  2 │          │ Jane                                                                     │               │
-├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
 │         4 │  1756713176 │           0 │ users         │  1 │  John  │         John Doe                                                                  │     John Doe │
-├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
 │         5 │  1756713176 │          -1 │ users         │  2 │ Jane │                                                                              │               │
 └───────────┴─────────────┴─────────────┴───────────────┴────┴──────────┴──────────────────────────────────────────────────────────────────────────────┴───────────────┘
 turso>

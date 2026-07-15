@@ -147,6 +147,7 @@ Set the output display mode.
 | Mode | Description |
 |------|-------------|
 | `pretty` | Table with borders (default) |
+| `box` | SQLite/DuckDB-style box table |
 | `list` | Pipe-delimited values |
 | `line` | One column per line with column names |
 
@@ -167,6 +168,13 @@ tursodb> SELECT 1 AS a, 2 AS b;
 ├───┼───┤
 │ 1 │ 2 │
 └───┴───┘
+```
+
+`box` uses the same table renderer as `pretty` and follows the SQLite and DuckDB
+shell interface:
+
+```
+tursodb> .mode box
 ```
 
 ### .headers
@@ -378,9 +386,7 @@ tursodb> SELECT * FROM people;
 │ name    │ age │
 ├─────────┼─────┤
 │ Alice   │  30 │
-├─────────┼─────┤
 │ Bob     │  25 │
-├─────────┼─────┤
 │ Charlie │  35 │
 └─────────┴─────┘
 ```
