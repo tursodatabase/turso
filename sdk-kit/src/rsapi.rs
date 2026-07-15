@@ -20,9 +20,11 @@ use tracing_subscriber::{
 };
 use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, QueryMode,
-    Statement, StepResult, IO,
+    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, QueryMode, Statement,
+    StepResult, IO,
 };
+
+pub use turso_core::OpenFlags;
 
 use crate::{
     assert_send, assert_sync,
@@ -391,12 +393,16 @@ impl Default for TursoDatabaseOpenState {
 
 impl TursoDatabaseOpenState {
     pub fn new() -> Self {
+        Self::new_with_open_flags(OpenFlags::default())
+    }
+
+    fn new_with_open_flags(open_flags: OpenFlags) -> Self {
         Self {
             phase: TursoDatabaseOpenPhase::Init,
             io: None,
             db_file: None,
             opts: None,
-            open_flags: OpenFlags::default(),
+            open_flags,
             open_db_state: OpenDbAsyncState::new(),
         }
     }
@@ -660,10 +666,15 @@ impl TursoDatabase {
     /// create database holder struct but do not initialize it yet
     /// this can be useful for some environments, where IO operations must be executed in certain fashion (and open do IO under the hood)
     pub fn new(config: TursoDatabaseConfig) -> Arc<Self> {
+        Self::new_with_open_flags(config, OpenFlags::default())
+    }
+
+    /// Create a database holder with custom flags but do not initialize it yet.
+    pub fn new_with_open_flags(config: TursoDatabaseConfig, open_flags: OpenFlags) -> Arc<Self> {
         Arc::new(Self {
             config,
             db: Arc::new(Mutex::new(None)),
-            open_state: Mutex::new(TursoDatabaseOpenState::new()),
+            open_state: Mutex::new(TursoDatabaseOpenState::new_with_open_flags(open_flags)),
             io: Mutex::new(None),
         })
     }
@@ -760,7 +771,7 @@ impl TursoDatabase {
                         ));
                     }
 
-                    let mut open_flags = OpenFlags::default();
+                    let mut open_flags = state.open_flags;
                     if opts.enable_multiprocess_wal {
                         open_flags |= OpenFlags::NoLock;
                     }
@@ -1578,7 +1589,7 @@ impl TursoStatement {
 #[cfg(test)]
 mod tests {
     use crate::rsapi::{
-        TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR,
+        OpenFlags, TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR,
     };
     use turso_core::Value;
 
@@ -1625,6 +1636,56 @@ mod tests {
             config_with_features(Some("strict,unknown")).database_opts(),
             turso_core::DatabaseOpts::new()
         );
+    }
+
+    #[test]
+    fn database_open_flags_read_only() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("read-only.db");
+        let path = path.to_str().unwrap();
+        let config = || TursoDatabaseConfig {
+            path: path.to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        };
+
+        {
+            let db = TursoDatabase::new(config());
+            assert!(!db.open().unwrap().is_io());
+            let conn = db.connect().unwrap();
+            let mut statement = conn
+                .prepare_single("CREATE TABLE test (value INTEGER)")
+                .unwrap();
+            assert_eq!(
+                statement.execute(None).unwrap().status,
+                TursoStatusCode::Done
+            );
+            let mut statement = conn.prepare_single("INSERT INTO test VALUES (1)").unwrap();
+            assert_eq!(
+                statement.execute(None).unwrap().status,
+                TursoStatusCode::Done
+            );
+            conn.close().unwrap();
+        }
+
+        let db = TursoDatabase::new_with_open_flags(config(), OpenFlags::ReadOnly);
+        assert!(!db.open().unwrap().is_io());
+        let conn = db.connect().unwrap();
+        let mut statement = conn.prepare_single("SELECT value FROM test").unwrap();
+        assert_eq!(statement.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(statement.row_value(0).unwrap(), Value::from_i64(1));
+        assert_eq!(statement.step(None).unwrap(), TursoStatusCode::Done);
+
+        let mut statement = conn.prepare_single("INSERT INTO test VALUES (2)").unwrap();
+        assert!(matches!(
+            statement.execute(None),
+            Err(TursoError::Readonly(_))
+        ));
+        conn.close().unwrap();
     }
 
     #[test]
