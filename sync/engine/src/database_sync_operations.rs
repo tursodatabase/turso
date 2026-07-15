@@ -2378,7 +2378,7 @@ fn convert_to_args(
                 value: value.as_str().to_string(),
             },
             Value::Blob(value) => server_proto::Value::Blob {
-                value: value.into(),
+                value: Bytes::copy_from_slice(&value),
             },
         })
         .collect()
