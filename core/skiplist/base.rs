@@ -285,6 +285,70 @@ impl<K, V> Node<K, V> {
     }
 }
 
+/// A pre-allocated skip list node, created with [`SkipList::try_reserve_node`].
+///
+/// Reserving a node up front moves the only fallible part of an insertion
+/// (allocating the node) to a call site that can surface allocation failure.
+/// The reservation is later consumed by [`SkipList::insert_reserved`] in a
+/// context that must not allocate or fail (e.g. a destructor).
+///
+/// The node's tower height is drawn at reservation time from the list's
+/// height distribution. Dropping an unused reservation deallocates the node;
+/// it never allocates and cannot fail.
+///
+/// A reservation is tied to the list it was reserved from: consuming it with
+/// a different list panics (nodes must be freed by the allocator that
+/// allocated them). The tie is checked by list address, so the list must not
+/// be moved between reserving and consuming — keep it behind a stable
+/// allocation (e.g. an `Arc`) while reservations for it are outstanding.
+/// Dropping a reservation unused is always safe, even after the list is
+/// moved or gone: it deallocates through its own allocator handle.
+pub struct NodeReservation<K, V, A: SkiplistAllocator> {
+    /// The reserved node. `refs_and_height` is initialized and the tower is
+    /// zeroed; the key and value stay uninitialized until the reservation is
+    /// consumed by an insert.
+    node: NonNull<Node<K, V>>,
+    /// Identity of the list this reservation was drawn from; consuming
+    /// inserts assert against it so a reservation cannot cross lists.
+    list_id: *const (),
+    /// The allocator the node was allocated in; used to deallocate the node
+    /// when the reservation is dropped unused.
+    alloc: A,
+}
+
+// SAFETY: the reservation exclusively owns raw node storage whose key and
+// value are uninitialized, so moving it across threads transfers no `K`/`V`
+// values; the allocator itself is `Send + Sync` per `ConcurrentAllocator`.
+// `&NodeReservation` exposes no operations, making `Sync` trivially sound.
+unsafe impl<K, V, A: SkiplistAllocator> Send for NodeReservation<K, V, A> {}
+unsafe impl<K, V, A: SkiplistAllocator> Sync for NodeReservation<K, V, A> {}
+
+impl<K, V, A: SkiplistAllocator> NodeReservation<K, V, A> {
+    /// Consumes the reservation without deallocating, returning the node and
+    /// transferring its ownership to the caller.
+    fn into_node(self) -> NonNull<Node<K, V>> {
+        let mut this = mem::ManuallyDrop::new(self);
+        let node = this.node;
+        // Drop the allocator clone; `node` itself must not be deallocated.
+        unsafe { ptr::drop_in_place(&mut this.alloc) };
+        node
+    }
+}
+
+impl<K, V, A: SkiplistAllocator> Drop for NodeReservation<K, V, A> {
+    fn drop(&mut self) {
+        // The key and value were never written: deallocate without running
+        // destructors.
+        unsafe { Node::dealloc(&self.alloc, self.node.as_ptr()) }
+    }
+}
+
+impl<K, V, A: SkiplistAllocator> fmt::Debug for NodeReservation<K, V, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("NodeReservation { .. }")
+    }
+}
+
 impl<'a, K, V> NodeRef<'a, K, V> {
     /// Creates a NodeRef.
     ///
@@ -693,7 +757,7 @@ where
 
     /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist.
     pub fn get_or_insert(&self, key: K, value: V, guard: &Guard) -> RefEntry<'_, K, V, C, A> {
-        match self.insert_internal(key, || value, |_| false, guard) {
+        match self.insert_internal(key, || value, |_| false, None, guard) {
             Ok(entry) => entry,
             Err(layout) => handle_alloc_error(layout),
         }
@@ -709,7 +773,7 @@ where
         value: V,
         guard: &Guard,
     ) -> Result<RefEntry<'_, K, V, C, A>, TryReserveError> {
-        self.insert_internal(key, || value, |_| false, guard)
+        self.insert_internal(key, || value, |_| false, None, guard)
             .map_err(|_| TryReserveError)
     }
 
@@ -724,7 +788,7 @@ where
     where
         F: FnOnce() -> V,
     {
-        match self.insert_internal(key, value, |_| false, guard) {
+        match self.insert_internal(key, value, |_| false, None, guard) {
             Ok(entry) => entry,
             Err(layout) => handle_alloc_error(layout),
         }
@@ -744,7 +808,7 @@ where
     where
         F: FnOnce() -> V,
     {
-        self.insert_internal(key, value, |_| false, guard)
+        self.insert_internal(key, value, |_| false, None, guard)
             .map_err(|_| TryReserveError)
     }
 
@@ -805,6 +869,40 @@ where
             tail: None,
             _marker: PhantomData,
         }
+    }
+
+    /// Reserves a node for a future insertion into this skip list.
+    ///
+    /// This performs the only allocation an insertion needs, so consuming the
+    /// reservation with [`insert_reserved`](Self::insert_reserved) never
+    /// allocates and cannot fail — suitable for drop paths that cannot
+    /// surface allocation errors. The tower height is drawn now, from this
+    /// list's current height distribution.
+    pub fn try_reserve_node(&self) -> Result<NodeReservation<K, V, A>, TryReserveError> {
+        let height = self.random_height();
+        // The reference count starts at two to account for:
+        // 1. The entry that the consuming insert will return.
+        // 2. The link at level 0 of the tower.
+        let node = unsafe { Node::<K, V>::try_alloc(&self.alloc, height, 2) }
+            .map_err(|_| TryReserveError)?;
+        Ok(NodeReservation {
+            // SAFETY: `try_alloc` never returns null on success.
+            node: unsafe { NonNull::new_unchecked(node) },
+            list_id: (self as *const Self).cast(),
+            alloc: self.alloc.clone(),
+        })
+    }
+
+    /// Asserts that `reservation` was reserved from this list.
+    ///
+    /// A reservation's node must be freed by the allocator that allocated it,
+    /// and its tower height was drawn from this list's height distribution,
+    /// so consuming it elsewhere is a bug.
+    fn check_reservation(&self, reservation: &NodeReservation<K, V, A>) {
+        assert!(
+            reservation.list_id == (self as *const Self).cast(),
+            "NodeReservation consumed by a different skip list than it was reserved from"
+        );
     }
 
     /// Generates a random height and returns it.
@@ -1114,6 +1212,10 @@ where
     ///
     /// If `replace` is `true`, then any existing entry with this key will first be removed.
     ///
+    /// If `reservation` is `Some`, the pre-allocated node is used instead of allocating a
+    /// new one and no allocation is performed; a reservation left unconsumed (the key was
+    /// found and not replaced) is deallocated.
+    ///
     /// If allocating the new node fails, returns the layout that could not be allocated.
     /// In that case the skip list is unchanged and both `key` and the constructed value
     /// are dropped.
@@ -1122,6 +1224,7 @@ where
         key: K,
         value: F,
         replace: CompareF,
+        reservation: Option<NodeReservation<K, V, A>>,
         guard: &Guard,
     ) -> Result<RefEntry<'_, K, V, C, A>, Layout>
     where
@@ -1153,14 +1256,23 @@ where
 
             // create value before creating node, so extra allocation doesn't happen if value() function panics
             let value = value();
-            // Create a new node.
-            let height = self.random_height();
+            // Take the pre-allocated node from the reservation, or create a new one.
+            let (height, n) = match reservation {
+                Some(r) => {
+                    let node = r.into_node();
+                    // The reservation's node has its `refs_and_height` initialized.
+                    let height = node.as_ref().height();
+                    (height, node.as_ptr())
+                }
+                None => {
+                    let height = self.random_height();
+                    // The reference count is initially two to account for:
+                    // 1. The entry that will be returned.
+                    // 2. The link at the level 0 of the tower.
+                    (height, Node::<K, V>::try_alloc(&self.alloc, height, 2)?)
+                }
+            };
             let (node, n) = {
-                // The reference count is initially two to account for:
-                // 1. The entry that will be returned.
-                // 2. The link at the level 0 of the tower.
-                let n = Node::<K, V>::try_alloc(&self.alloc, height, 2)?;
-
                 // Write the key and the value into the node.
                 ptr::addr_of_mut!((*n).key).write(key);
                 ptr::addr_of_mut!((*n).value).write(value);
@@ -1352,9 +1464,37 @@ where
     /// If there is an existing entry with this key, it will be removed before inserting the new
     /// one.
     pub fn insert(&self, key: K, value: V, guard: &Guard) -> RefEntry<'_, K, V, C, A> {
-        match self.insert_internal(key, || value, |_| true, guard) {
+        match self.insert_internal(key, || value, |_| true, None, guard) {
             Ok(entry) => entry,
             Err(layout) => handle_alloc_error(layout),
+        }
+    }
+
+    /// Inserts a `key`-`value` pair using a node previously reserved with
+    /// [`try_reserve_node`](Self::try_reserve_node) and returns the new entry.
+    ///
+    /// Behaves like [`insert`](Self::insert) — any existing entry with this key is removed
+    /// first — but never allocates: the reservation supplies the node. This makes it safe
+    /// to call from contexts that cannot surface allocation failure, such as destructors.
+    /// (Note that removing an existing entry defers its destruction through the epoch
+    /// collector, which may itself allocate; callers wanting a strictly allocation-free
+    /// insert must ensure the key is not already present.)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `reservation` was reserved from a different skip list.
+    pub fn insert_reserved(
+        &self,
+        key: K,
+        value: V,
+        reservation: NodeReservation<K, V, A>,
+        guard: &Guard,
+    ) -> RefEntry<'_, K, V, C, A> {
+        self.check_reservation(&reservation);
+        match self.insert_internal(key, || value, |_| true, Some(reservation), guard) {
+            Ok(entry) => entry,
+            // The node comes from the reservation, so no allocation can fail.
+            Err(_) => unreachable!("insert_internal cannot fail with a reservation"),
         }
     }
 
@@ -1368,7 +1508,7 @@ where
         value: V,
         guard: &Guard,
     ) -> Result<RefEntry<'_, K, V, C, A>, TryReserveError> {
-        self.insert_internal(key, || value, |_| true, guard)
+        self.insert_internal(key, || value, |_| true, None, guard)
             .map_err(|_| TryReserveError)
     }
 
@@ -1387,7 +1527,7 @@ where
     where
         F: Fn(&V) -> bool,
     {
-        match self.insert_internal(key, || value, compare_fn, guard) {
+        match self.insert_internal(key, || value, compare_fn, None, guard) {
             Ok(entry) => entry,
             Err(layout) => handle_alloc_error(layout),
         }
@@ -1407,7 +1547,7 @@ where
     where
         F: Fn(&V) -> bool,
     {
-        self.insert_internal(key, || value, compare_fn, guard)
+        self.insert_internal(key, || value, compare_fn, None, guard)
             .map_err(|_| TryReserveError)
     }
 

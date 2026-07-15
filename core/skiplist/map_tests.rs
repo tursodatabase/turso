@@ -1179,3 +1179,100 @@ fn try_get_or_insert_family_fails_on_missing_key() {
     assert!(map.try_compare_insert(1, 20, |_| true).is_err());
     assert_eq!(*map.get(&1).unwrap().value(), 10);
 }
+
+#[test]
+fn insert_reserved_performs_no_allocation() {
+    let alloc = FailOnDemandAlloc::default();
+    let map: SkipMap<i32, String, _, _> = SkipMap::new_in(alloc.clone());
+    let reservation = map.try_reserve_node().unwrap();
+
+    alloc.fail_allocations(true);
+
+    // Reserving needs an allocation and fails while faults are on...
+    assert!(map.try_reserve_node().is_err());
+
+    // ...but consuming an existing reservation must succeed without allocating.
+    let entry = map.insert_reserved(1, "one".to_string(), reservation);
+    assert_eq!(*entry.value(), "one");
+    assert_eq!(map.len(), 1);
+    assert_eq!(*map.get(&1).unwrap().value(), "one");
+}
+
+#[test]
+fn insert_reserved_replaces_existing_entry() {
+    let map: SkipMap<i32, String> = SkipMap::new();
+    map.insert(1, "one".to_string());
+
+    // Same replace semantics as `insert`.
+    let reservation = map.try_reserve_node().unwrap();
+    let entry = map.insert_reserved(1, "uno".to_string(), reservation);
+    assert_eq!(*entry.value(), "uno");
+    assert_eq!(map.len(), 1);
+    assert_eq!(*map.get(&1).unwrap().value(), "uno");
+}
+
+#[test]
+fn unused_reservation_drop_is_dealloc_only() {
+    let alloc = FailOnDemandAlloc::default();
+    let map: SkipMap<i32, String, _, _> = SkipMap::new_in(alloc.clone());
+    let reservation = map.try_reserve_node().unwrap();
+    let outlives_map = map.try_reserve_node().unwrap();
+
+    // Dropping an unused reservation only deallocates; it must work while
+    // allocations fail and must leave the map untouched.
+    alloc.fail_allocations(true);
+    drop(reservation);
+    assert!(map.is_empty());
+
+    // A reservation may even outlive its map: it carries its own allocator
+    // clone for the deallocation.
+    drop(map);
+    drop(outlives_map);
+}
+
+#[test]
+fn insert_reserved_drops_values_exactly_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountsDrops(Arc<AtomicUsize>);
+    impl Drop for CountsDrops {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let map: SkipMap<i32, CountsDrops> = SkipMap::new();
+
+    // Reserved insert of a fresh key: the stored value is not dropped.
+    let reservation = map.try_reserve_node().unwrap();
+    map.insert_reserved(1, CountsDrops(drops.clone()), reservation);
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+    // Reserved insert over an existing key: the replaced value is destroyed
+    // (via the epoch collector), the new value stays stored.
+    let reservation = map.try_reserve_node().unwrap();
+    map.insert_reserved(1, CountsDrops(drops.clone()), reservation);
+    assert_eq!(map.len(), 1);
+
+    // Dropping the map finalizes the stored value; flush the collector until
+    // the deferred destruction of the replaced value has run too. The total
+    // must be exactly 2 — anything more is a double drop.
+    drop(map);
+    for _ in 0..128 {
+        if drops.load(Ordering::Relaxed) == 2 {
+            break;
+        }
+        crossbeam_epoch::pin().flush();
+    }
+    assert_eq!(drops.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+#[should_panic(expected = "different skip list")]
+fn insert_reserved_rejects_foreign_reservation() {
+    let map_a: SkipMap<i32, i32> = SkipMap::new();
+    let map_b: SkipMap<i32, i32> = SkipMap::new();
+    let reservation = map_a.try_reserve_node().unwrap();
+    map_b.insert_reserved(1, 10, reservation);
+}

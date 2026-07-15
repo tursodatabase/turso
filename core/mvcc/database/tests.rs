@@ -296,6 +296,89 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
     assert!(savepoint.newly_added_to_write_set.is_empty());
 }
 
+/// `remove_tx` runs on connection/statement drop paths that cannot surface
+/// allocation failure, so recording a committed writer in `finalized_tx_states`
+/// must not allocate: it consumes the node reserved at `begin_tx`. Without the
+/// reservation this test dies on the fallible-allocation expect inside
+/// `remove_tx` (the finalized-state insert would need to allocate while
+/// allocations fail).
+#[test]
+fn remove_tx_of_committed_writer_does_not_allocate() {
+    let alloc = FailOnDemandAlloc::default();
+    let store = MvStore::new_in(
+        MvccClock::new(),
+        test_mvcc_storage("mv-store-remove-tx-no-alloc.db-log"),
+        alloc.clone(),
+        false,
+    )
+    .unwrap();
+
+    let tx_id = 7;
+    let tx = new_tx_in::<FailOnDemandAlloc>(tx_id, 1, TransactionState::Active);
+    *tx.finalized_state_reservation.lock() = Some(store.reserve_finalized_tx_state().unwrap());
+    tx.begin_savepoint();
+    store.txs.try_insert(tx_id, tx).unwrap();
+
+    let table_id = MVTableId::from(-2);
+    let row_id = RowID::new(table_id, RowKey::Int(42));
+    let row = Row::new_table_row(row_id, &[], 0).unwrap();
+    store.insert(tx_id, row).unwrap();
+
+    let commit_ts = 5;
+    {
+        let tx = store.txs.get(&tx_id).unwrap();
+        assert!(!tx.value().write_set.lock().is_empty());
+        tx.value()
+            .state
+            .store(TransactionState::Committed(commit_ts));
+    }
+
+    alloc.fail_allocations(true);
+    store.remove_tx(tx_id);
+    alloc.fail_allocations(false);
+
+    assert!(store.txs.get(&tx_id).is_none());
+    let finalized = store.finalized_tx_states.get(&tx_id).unwrap();
+    assert_eq!(
+        *finalized.value(),
+        TransactionState::Committed(commit_ts),
+        "finalized state must be recorded from the begin_tx reservation"
+    );
+}
+
+/// A committed read-only transaction needs no finalized-state entry; its
+/// unused reservation is just deallocated, which is likewise infallible.
+#[test]
+fn remove_tx_of_read_only_tx_drops_reservation() {
+    let alloc = FailOnDemandAlloc::default();
+    let store = MvStore::new_in(
+        MvccClock::new(),
+        test_mvcc_storage("mv-store-remove-tx-ro.db-log"),
+        alloc.clone(),
+        false,
+    )
+    .unwrap();
+
+    let tx_id = 8;
+    let tx = new_tx_in::<FailOnDemandAlloc>(tx_id, 1, TransactionState::Active);
+    *tx.finalized_state_reservation.lock() = Some(store.reserve_finalized_tx_state().unwrap());
+    store.txs.try_insert(tx_id, tx).unwrap();
+    store
+        .txs
+        .get(&tx_id)
+        .unwrap()
+        .value()
+        .state
+        .store(TransactionState::Committed(5));
+
+    alloc.fail_allocations(true);
+    store.remove_tx(tx_id);
+    alloc.fail_allocations(false);
+
+    assert!(store.txs.get(&tx_id).is_none());
+    assert!(store.finalized_tx_states.is_empty());
+}
+
 impl MvccTestDb {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
@@ -330,7 +413,7 @@ fn mvcc_active_read_tx_blocks_vacuum_gate() {
         Err(LimboError::Busy)
     ));
 
-    db.mvcc_store.remove_tx(tx_id).unwrap();
+    db.mvcc_store.remove_tx(tx_id);
     db.mvcc_store.try_begin_vacuum_gate().unwrap();
     db.mvcc_store.release_vacuum_gate();
 }
@@ -6281,6 +6364,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
+        finalized_state_reservation: Mutex::new(None),
     }
 }
 
@@ -7968,6 +8052,7 @@ fn transaction_display() {
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
+        finalized_state_reservation: Mutex::new(None),
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }] }";
@@ -10136,7 +10221,7 @@ fn test_gc_active_reader_pins_lwm() {
     );
 
     // Close the reader transaction.
-    db.mvcc_store.remove_tx(tx2).unwrap();
+    db.mvcc_store.remove_tx(tx2);
 
     // LWM should now be u64::MAX.
     assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
@@ -10696,7 +10781,7 @@ fn test_gc_incremental_respects_held_snapshot() {
 
     // Close the snapshot; now incremental GC reclaims the superseded v1
     // without any checkpoint having run.
-    db.mvcc_store.remove_tx(tx2).unwrap();
+    db.mvcc_store.remove_tx(tx2);
     assert_eq!(
         db.mvcc_store
             .gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC),

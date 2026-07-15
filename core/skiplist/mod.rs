@@ -236,15 +236,17 @@
 //! prefer upstreaming fixes.
 //!
 //! Notable local modifications: node allocation is parameterized over a
-//! [`SkiplistAllocator`] (defaulting to Turso's allocator), and `try_`-prefixed
-//! insert methods surface allocation failure instead of aborting.
+//! [`SkiplistAllocator`] (defaulting to Turso's allocator), `try_`-prefixed
+//! insert methods surface allocation failure instead of aborting, and nodes
+//! can be pre-allocated with `try_reserve_node` so a later `insert_reserved`
+//! is allocation-free (see [`NodeReservation`]).
 
 #![warn(missing_docs, unsafe_op_in_unsafe_fn)]
 
 pub mod base;
 
 #[doc(inline)]
-pub use base::{SkipList, SkiplistAllocator};
+pub use base::{NodeReservation, SkipList, SkiplistAllocator};
 
 pub mod map;
 pub mod set;

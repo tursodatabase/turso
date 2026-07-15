@@ -10,7 +10,7 @@ use core::{
 use crossbeam_epoch as epoch;
 
 use super::{
-    base::{self, try_pin_loop, SkiplistAllocator},
+    base::{self, try_pin_loop, NodeReservation, SkiplistAllocator},
     comparator::{BasicComparator, Comparator},
 };
 use crate::alloc::{TryReserveError, TursoAllocator};
@@ -295,6 +295,31 @@ where
             .map(Entry::new)
     }
 
+    /// Reserves a node for a future insertion into this map.
+    ///
+    /// This performs the only allocation an insertion needs, so consuming the
+    /// reservation with [`insert_reserved`](Self::insert_reserved) never allocates and
+    /// cannot fail — suitable for drop paths that cannot surface allocation errors.
+    /// Dropping an unused reservation deallocates the node and never fails.
+    ///
+    /// The reservation is tied to this map by address: don't move the map while
+    /// reservations for it are outstanding (see [`NodeReservation`]).
+    ///
+    /// # Example
+    /// ```
+    /// use turso_core::skiplist::SkipMap;
+    ///
+    /// let map = SkipMap::new();
+    /// let reservation = map.try_reserve_node().unwrap();
+    ///
+    /// // ... later, in a context that must not allocate:
+    /// map.insert_reserved("key", "value", reservation);
+    /// assert_eq!(*map.get("key").unwrap().value(), "value");
+    /// ```
+    pub fn try_reserve_node(&self) -> Result<NodeReservation<K, V, A>, TryReserveError> {
+        self.inner.try_reserve_node()
+    }
+
     /// Returns an iterator over all entries in the map,
     /// sorted by key.
     ///
@@ -518,6 +543,40 @@ where
     pub fn try_insert(&self, key: K, value: V) -> Result<Entry<'_, K, V, C, A>, TryReserveError> {
         let guard = &epoch::pin();
         self.inner.try_insert(key, value, guard).map(Entry::new)
+    }
+
+    /// Inserts a `key`-`value` pair using a node previously reserved with
+    /// [`try_reserve_node`](Self::try_reserve_node) and returns the new entry.
+    ///
+    /// Behaves like [`insert`](Self::insert) — any existing entry with this key is removed
+    /// first — but never allocates: the reservation supplies the node. This makes it safe
+    /// to call from contexts that cannot surface allocation failure, such as destructors.
+    /// (Note that removing an existing entry defers its destruction through the epoch
+    /// collector, which may itself allocate; callers wanting a strictly allocation-free
+    /// insert must ensure the key is not already present.)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `reservation` was reserved from a different map.
+    ///
+    /// # Example
+    /// ```
+    /// use turso_core::skiplist::SkipMap;
+    ///
+    /// let map = SkipMap::new();
+    /// let reservation = map.try_reserve_node().unwrap();
+    /// map.insert_reserved("key", "value", reservation);
+    ///
+    /// assert_eq!(*map.get("key").unwrap().value(), "value");
+    /// ```
+    pub fn insert_reserved(
+        &self,
+        key: K,
+        value: V,
+        reservation: NodeReservation<K, V, A>,
+    ) -> Entry<'_, K, V, C, A> {
+        let guard = &epoch::pin();
+        Entry::new(self.inner.insert_reserved(key, value, reservation, guard))
     }
 
     /// Inserts a `key`-`value` pair into the skip list and returns the new entry.

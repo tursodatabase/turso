@@ -1,6 +1,5 @@
 use crate::alloc::{
     ConcurrentAllocator, TryReserveError, TursoAllocator, TursoTryWithCapacityExt, TursoVecInExt,
-    ALLOC_ERR_MSG,
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
@@ -948,6 +947,13 @@ impl<A: RowVersionAllocator> WriteSet<A> {
     }
 }
 
+/// A `finalized_tx_states` node pre-allocated at `begin_tx`, consumed by `remove_tx`.
+///
+/// `remove_tx` runs on connection/statement drop paths that cannot surface allocation
+/// failure, so the node it inserts must be allocated up front where errors still
+/// propagate to the user.
+type FinalizedTxStateReservation<A> = crate::skiplist::NodeReservation<TxID, TransactionState, A>;
+
 /// Transaction
 #[derive(Debug)]
 pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
@@ -991,6 +997,11 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// materialization's frames are at-or-below this read mark (or in an earlier, backfilled WAL
     /// epoch). See [`MvStore::is_btree_readable_at`] / [`MvStore::compute_min_reader_mark`].
     read_mark: WalPos,
+    /// Node reserved in `finalized_tx_states` at `begin_tx`, consumed by `remove_tx` to
+    /// record the Committed state without allocating (drop paths cannot surface allocation
+    /// failure). `None` only for test-constructed transactions that bypass `begin_tx`, or
+    /// after consumption.
+    finalized_state_reservation: Mutex<Option<FinalizedTxStateReservation<A>>>,
 }
 
 impl<A: RowVersionAllocator> Transaction<A> {
@@ -1000,6 +1011,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
         header: DatabaseHeader,
         read_mark: WalPos,
         schema_generation_at_begin: u64,
+        finalized_state_reservation: FinalizedTxStateReservation<A>,
     ) -> Transaction<A> {
         Transaction {
             state: TransactionState::Active.into(),
@@ -1007,6 +1019,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             begin_ts,
             read_mark,
             schema_generation_at_begin,
+            finalized_state_reservation: Mutex::new(Some(finalized_state_reservation)),
             write_set: Mutex::new(WriteSet::new()),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
@@ -2915,7 +2928,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                     }
                     mvcc_store.unlock_commit_lock_if_held(tx);
-                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -2995,7 +3008,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.pager_commit_lock.unlock();
                     }
-                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -3274,7 +3287,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     mvcc_store.release_exclusive_tx(&self.tx_id);
                 }
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
-                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
+                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 if mvcc_store.storage.should_checkpoint() {
                     let auto_checkpoint_mode = if self
@@ -5743,6 +5756,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         } else {
             None
         };
+        // Reserve the fresh transaction's `finalized_tx_states` node before taking any
+        // locks, while allocation failure can still be surfaced to the caller;
+        // `remove_tx` consumes it on drop paths that must not allocate. Upgrades keep
+        // the reservation made by `begin_tx`.
+        let mut finalized_state_reservation = if maybe_existing_tx_id.is_none() {
+            Some(self.reserve_finalized_tx_state()?)
+        } else {
+            None
+        };
         if acquires_checkpoint_guard && !self.blocking_checkpoint_lock.read() {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
             return Err(LimboError::Busy);
@@ -5790,7 +5812,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .expect("global_header initialized above");
                 self.txs.insert(
                     tx_id,
-                    Transaction::new(tx_id, ts, header, read_mark, schema_generation),
+                    Transaction::new(
+                        tx_id,
+                        ts,
+                        header,
+                        read_mark,
+                        schema_generation,
+                        finalized_state_reservation
+                            .take()
+                            .expect("reserved above for fresh exclusive begins"),
+                    ),
                 );
             });
             if schema_stale {
@@ -5941,6 +5972,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         expected_schema_generation: Option<u64>,
     ) -> Result<TxID> {
         let passive = self.experimental_mvcc_passive_checkpoint;
+        // Reserve the `finalized_tx_states` node before taking any locks, while
+        // allocation failure can still be surfaced to the caller; `remove_tx` consumes
+        // it on drop paths that must not allocate.
+        let mut finalized_state_reservation = Some(self.reserve_finalized_tx_state()?);
         if !passive && !self.blocking_checkpoint_lock.read() {
             // Stop-the-world truncate checkpoint in progress.
             return Err(LimboError::Busy);
@@ -5989,7 +6024,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .expect("global_header initialized above");
             self.txs.insert(
                 tx_id,
-                Transaction::new(tx_id, ts, header, read_mark, schema_generation),
+                Transaction::new(
+                    tx_id,
+                    ts,
+                    header,
+                    read_mark,
+                    schema_generation,
+                    finalized_state_reservation
+                        .take()
+                        .expect("timestamp callback runs once"),
+                ),
             );
         });
         if schema_stale {
@@ -6017,18 +6061,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
-    pub fn remove_tx(&self, tx_id: TxID) -> Result<(), TryReserveError> {
+    pub fn remove_tx(&self, tx_id: TxID) {
         self.remove_sequence_allocations(tx_id);
         if let Some(entry) = self.txs.get(&tx_id) {
             let tx = entry.value();
             let held_checkpoint_read = tx.holds_blocking_checkpoint_read.load(Ordering::Acquire);
+            let reservation = tx.finalized_state_reservation.lock().take();
             if let TransactionState::Committed(commit_ts) = tx.state.load() {
                 // Read-only transactions cannot leave row versions with stale TxID
                 // references, so they do not need finalized-state caching.
                 if !tx.write_set.lock().is_empty() {
-                    crate::without_allocation_faults!(self
-                        .insert_finalized_tx_state(tx_id, commit_ts)
-                        .expect(ALLOC_ERR_MSG));
+                    // The node was reserved at `begin_tx`, so this insert performs no
+                    // allocation and cannot fail — `remove_tx` runs on drop paths that
+                    // cannot surface allocation errors.
+                    let reservation = reservation.expect(
+                        "committed writer must hold the finalized-state reservation from begin_tx",
+                    );
+                    self.finalized_tx_states.insert_reserved(
+                        tx_id,
+                        TransactionState::Committed(commit_ts),
+                        reservation,
+                    );
                 }
             }
             let dep_set = std::mem::take(&mut *tx.commit_dep_set.lock());
@@ -6044,21 +6097,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if held_checkpoint_read {
                 self.blocking_checkpoint_lock.unlock();
             }
-            return Ok(());
+            return;
         }
         self.txs.remove(&tx_id);
-        Ok(())
     }
 
+    /// Reserves the `finalized_tx_states` node for a transaction being created.
+    ///
+    /// Called at `begin_tx` so that `remove_tx` — which runs on drop paths that
+    /// cannot surface allocation failure — can record the finalized state without
+    /// allocating.
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::FinalizedTxStateInsert)]
-    fn insert_finalized_tx_state(
+    fn reserve_finalized_tx_state(
         &self,
-        tx_id: TxID,
-        commit_ts: u64,
-    ) -> Result<(), TryReserveError> {
-        self.finalized_tx_states
-            .try_insert(tx_id, TransactionState::Committed(commit_ts))?;
-        Ok(())
+    ) -> Result<FinalizedTxStateReservation<A>, TryReserveError> {
+        self.finalized_tx_states.try_reserve_node()
     }
 
     pub fn register_sequence_allocation(
@@ -6154,14 +6207,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Use this anywhere the commit state machine would otherwise call
     /// `remove_tx` directly. Other call sites that don't have a connection
     /// context (e.g. tests poking internal state) keep using `remove_tx`.
-    pub fn finish_committed_tx(
-        &self,
-        tx_id: TxID,
-        conn: &Connection,
-        db_id: usize,
-    ) -> Result<(), TryReserveError> {
+    pub fn finish_committed_tx(&self, tx_id: TxID, conn: &Connection, db_id: usize) {
         conn.set_mv_tx_for_db(db_id, None);
-        self.remove_tx(tx_id)
+        self.remove_tx(tx_id);
     }
 
     fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> DatabaseHeader {
@@ -6386,7 +6434,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // already completed its register_commit_dependency call (it runs under the
         // read lock), so no future txs.get() for this tx_id can come from a
         // speculative read path.
-        crate::without_allocation_faults!(self.remove_tx(tx_id).expect(ALLOC_ERR_MSG));
+        self.remove_tx(tx_id);
     }
 
     fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
@@ -6409,9 +6457,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
                 }
-                crate::without_allocation_faults!(self
-                    .finish_committed_tx(tx_id, connection, db_id)
-                    .expect(ALLOC_ERR_MSG));
+                self.finish_committed_tx(tx_id, connection, db_id);
             }
             Some(TransactionState::Aborted | TransactionState::Terminated) | None => {
                 if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
