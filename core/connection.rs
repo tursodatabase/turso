@@ -16,6 +16,7 @@ use crate::types::{WalFrameInfo, WalState};
 use crate::util::{OpenMode, OpenOptions};
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::Page;
+use crate::SqliteDialect;
 use crate::{
     function,
     io::{MemoryIO, IO},
@@ -617,6 +618,7 @@ impl Connection {
                 OpenFlags::Create,
                 db_opts,
                 None,
+                Arc::new(SqliteDialect),
             )?;
             let pager = Arc::new(db._init(None)?);
             pager.set_initial_page_size(page_size)?;
@@ -647,6 +649,7 @@ impl Connection {
                 OpenFlags::Create,
                 db_opts,
                 None,
+                Arc::new(SqliteDialect),
             )?;
             let pager = Arc::new(db._init(None)?);
             pager.set_initial_page_size(page_size)?;
@@ -1341,6 +1344,7 @@ impl Connection {
                         &mut inner.fresh,
                         &self.syms.read(),
                         &attached_resolver,
+                        self.db.dialect().as_ref(),
                     ));
 
                     // Rehydrate built-in table-valued functions captured at init.
@@ -1674,13 +1678,24 @@ impl Connection {
     }
 
     #[cfg(feature = "fs")]
-    pub fn from_uri(uri: &str, db_opts: DatabaseOpts) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
+    pub fn from_uri(
+        uri: &str,
+        db_opts: DatabaseOpts,
+        dialect: Arc<dyn crate::Dialect>,
+    ) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
         let flags = opts.get_flags()?;
         if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
             let io = Arc::new(MemoryIO::new());
-            let db = Database::open_file_with_flags(io.clone(), MEMORY_PATH, flags, db_opts, None)?;
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                MEMORY_PATH,
+                flags,
+                db_opts,
+                None,
+                dialect,
+            )?;
             let conn = db.connect()?;
             return Ok((io, conn));
         }
@@ -1704,6 +1719,7 @@ impl Connection {
             flags,
             db_opts,
             encryption_opts,
+            dialect,
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
@@ -1726,6 +1742,7 @@ impl Connection {
         mut db_opts: DatabaseOpts,
         main_db_flags: OpenFlags,
         io: Arc<dyn IO>,
+        dialect: Arc<dyn crate::Dialect>,
     ) -> Result<(Arc<Database>, Option<EncryptionOpts>)> {
         let opts = OpenOptions::parse(uri)?;
         let mut flags = opts.get_flags()?;
@@ -1756,6 +1773,7 @@ impl Connection {
             flags,
             db_opts,
             encryption_opts.clone(),
+            dialect,
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
@@ -2578,8 +2596,13 @@ impl Connection {
     }
 
     #[cfg(feature = "fs")]
-    pub fn open_new(&self, path: &str, vfs: &str) -> Result<(Arc<dyn IO>, Arc<Database>)> {
-        Database::open_with_vfs(&self.db, path, vfs)
+    pub fn open_new(
+        &self,
+        path: &str,
+        vfs: &str,
+        dialect: Arc<dyn crate::Dialect>,
+    ) -> Result<(Arc<dyn IO>, Arc<Database>)> {
+        Database::open_with_vfs(&self.db, path, vfs, dialect)
     }
 
     pub fn list_vfs(&self) -> Vec<String> {
@@ -2690,6 +2713,7 @@ impl Connection {
                     &mut dbsp_state_index_roots,
                     &mut materialized_view_info,
                     &attached_resolver,
+                    self.db.dialect().as_ref(),
                 ) {
                     Ok(()) => {}
                     Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
@@ -2745,6 +2769,11 @@ impl Connection {
         let pragma = format!("PRAGMA {pragma_name} = {pragma_value}");
         let mut stmt = self.prepare(pragma)?;
         stmt.run_collect_rows()
+    }
+
+    /// The SQL dialect of the database this connection belongs to.
+    pub fn dialect(&self) -> Arc<dyn crate::Dialect> {
+        self.db.dialect()
     }
 
     pub fn experimental_views_enabled(&self) -> bool {
@@ -3250,8 +3279,13 @@ impl Connection {
                         self.db.io.clone()
                     };
                     let main_db_flags = self.db.open_flags;
-                    let (db, encryption_opts) =
-                        Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
+                    let (db, encryption_opts) = Self::from_uri_attached(
+                        path,
+                        db_opts,
+                        main_db_flags,
+                        io,
+                        self.db.dialect(),
+                    )?;
                     let attached_is_fresh = !db.initialized();
                     if !is_memory_db {
                         Self::validate_attach_target(&db, attached_is_fresh, alias)?;
@@ -4926,6 +4960,7 @@ impl SymbolTable {
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
+    use crate::SqliteDialect;
     use tempfile::TempDir;
 
     fn open_connection_with_opts(path: &std::path::Path, opts: DatabaseOpts) -> Arc<Connection> {
@@ -4936,6 +4971,7 @@ mod tests {
             OpenFlags::default(),
             opts,
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         db.connect().unwrap()
@@ -4995,8 +5031,10 @@ mod tests {
     #[test]
     fn test_named_memory_databases_on_same_io_are_distinct() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let draft_db = Database::open_file(io.clone(), ":memory:sync-draft").unwrap();
-        let synced_db = Database::open_file(io, ":memory:sync-synced").unwrap();
+        let draft_db =
+            Database::open_file(io.clone(), ":memory:sync-draft", Arc::new(SqliteDialect)).unwrap();
+        let synced_db =
+            Database::open_file(io, ":memory:sync-synced", Arc::new(SqliteDialect)).unwrap();
         assert!(!Arc::ptr_eq(&draft_db, &synced_db));
 
         let draft = draft_db.connect().unwrap();
@@ -5025,13 +5063,14 @@ mod tests {
     fn test_named_memory_database_reopened_on_same_io_sees_same_rows() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
 
-        let first_db = Database::open_file(io.clone(), ":memory:reopen").unwrap();
+        let first_db =
+            Database::open_file(io.clone(), ":memory:reopen", Arc::new(SqliteDialect)).unwrap();
         let first = first_db.connect().unwrap();
         first
             .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(99)")
             .unwrap();
 
-        let second_db = Database::open_file(io, ":memory:reopen").unwrap();
+        let second_db = Database::open_file(io, ":memory:reopen", Arc::new(SqliteDialect)).unwrap();
         let second = second_db.connect().unwrap();
         assert_eq!(query_single_i64(&second, "SELECT x FROM t"), 99);
     }
@@ -5066,6 +5105,7 @@ mod tests {
             OpenFlags::default(),
             DatabaseOpts::new().with_attach(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();

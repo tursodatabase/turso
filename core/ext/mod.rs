@@ -216,6 +216,7 @@ impl Database {
         &self,
         path: &str,
         vfs: &str,
+        dialect: Arc<dyn crate::Dialect>,
     ) -> crate::Result<(Arc<dyn IO>, Arc<Database>)> {
         use crate::{MemoryIO, SyscallIO};
         use dynamic::get_vfs_modules;
@@ -236,7 +237,7 @@ impl Database {
                 }
             },
         };
-        let db = Self::open_file(io.clone(), path)?;
+        let db = Self::open_file(io.clone(), path, dialect)?;
         Ok((io, db))
     }
 

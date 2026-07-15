@@ -1519,8 +1519,9 @@ impl Schema {
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: &Arc<Pager>,
         syms: &SymbolTable,
+        dialect: &dyn crate::dialect::Dialect,
     ) -> Result<IOResult<()>> {
-        let result = self.make_from_btree_internal(state, mv_cursor, pager, syms);
+        let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, dialect);
         if result.is_err() {
             state.cleanup(pager);
         } else if let Ok(IOResult::Done(..)) = result {
@@ -1538,6 +1539,7 @@ impl Schema {
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: &Arc<Pager>,
         syms: &SymbolTable,
+        dialect: &dyn crate::dialect::Dialect,
     ) -> Result<IOResult<()>> {
         loop {
             tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
@@ -1644,6 +1646,7 @@ impl Schema {
                         &mut acc.dbsp_state_index_roots,
                         &mut acc.materialized_view_info,
                         &|_| None,
+                        dialect,
                     )?;
 
                     state.phase = MakeFromBtreePhase::Advancing;
@@ -2077,6 +2080,7 @@ impl Schema {
         // `&|_| None`; unresolvable names become `Some(INVALID_DB_ID)`
         // so the trigger never fires against a real db.
         resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
+        dialect: &dyn crate::dialect::Dialect,
     ) -> Result<()> {
         match ty {
             "table" => {
@@ -2113,7 +2117,7 @@ impl Schema {
                     };
                     self.add_virtual_table(vtab)?;
                 } else {
-                    let table = BTreeTable::from_sql(sql, root_page)?;
+                    let table = dialect.parse_table_sql(sql, root_page)?;
 
                     if table.has_virtual_columns && !self.generated_columns_enabled {
                         return Err(LimboError::ParseError(format!(
@@ -6736,6 +6740,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &|_| None,
+            &crate::dialect::SqliteDialect,
         );
         assert!(result
             .unwrap_err()
@@ -6760,6 +6765,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &|_| None,
+            &crate::dialect::SqliteDialect,
         );
         assert!(result
             .unwrap_err()
@@ -6787,6 +6793,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &|_| None,
+            &crate::dialect::SqliteDialect,
         );
         assert!(result.is_err());
         assert!(schema.get_table("v1").is_none());
@@ -6809,6 +6816,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &|_| None,
+            &crate::dialect::SqliteDialect,
         );
         assert!(result.is_err());
         assert!(schema.get_table("v1").is_none());
@@ -6834,6 +6842,7 @@ mod tests {
                 &mut HashMap::default(),
                 &mut HashMap::default(),
                 &|_| None,
+                &crate::dialect::SqliteDialect,
             )
             .unwrap();
         let table = schema.get_btree_table("t1").unwrap();

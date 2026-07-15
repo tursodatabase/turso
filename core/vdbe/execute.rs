@@ -56,6 +56,7 @@ use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
     vector_distance_dot, vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
 };
+use crate::SqliteDialect;
 use crate::{
     connection::Row,
     get_cursor, info, is_attached_db,
@@ -12824,6 +12825,7 @@ fn op_parse_schema_step(
                     &mut inner.dbsp_state_index_roots,
                     &mut inner.materialized_view_info,
                     &attached_resolver,
+                    conn.dialect().as_ref(),
                 )?;
                 continue;
             }
@@ -16876,6 +16878,7 @@ fn op_vacuum_into_inner(
                     OpenFlags::Create,
                     output_opts,
                     None,
+                    Arc::new(SqliteDialect),
                 )?;
                 let output_conn = output_db.connect()?;
                 output_conn.reset_page_size(page_size)?;
@@ -17075,6 +17078,7 @@ mod tests {
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
+    use crate::SqliteDialect;
     use crate::{Database, DatabaseOpts, MemoryIO, IO};
 
     fn prepare_test_statement() -> Statement {
@@ -17085,6 +17089,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -17145,6 +17150,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -17209,6 +17215,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_attach(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -17270,6 +17277,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -17314,6 +17322,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -17865,6 +17874,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();

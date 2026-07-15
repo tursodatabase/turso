@@ -1495,6 +1495,7 @@ impl Drop for Statement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SqliteDialect;
     use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
 
     fn open_test_connection() -> crate::Result<Arc<crate::Connection>> {
@@ -1505,6 +1506,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )?;
         db.connect()
     }

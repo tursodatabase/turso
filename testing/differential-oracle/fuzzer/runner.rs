@@ -13,6 +13,7 @@ use std::io::Write;
 use std::panic::RefUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
+use turso_core::SqliteDialect;
 
 use anyhow::{Context, Result, bail};
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
@@ -204,6 +205,7 @@ impl Fuzzer {
             turso_core::OpenFlags::default(),
             opts,
             None,
+            Arc::new(SqliteDialect),
         )?;
         let turso_conn = turso_db.connect()?;
 

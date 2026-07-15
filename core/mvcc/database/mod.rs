@@ -8318,6 +8318,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 &mut dbsp_state_index_roots,
                 &mut materialized_view_info,
                 &attached_resolver,
+                connection.dialect().as_ref(),
             )?;
         }
         fresh.populate_indices(
@@ -9258,6 +9259,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 &mut dbsp_state_index_roots,
                 &mut materialized_view_info,
                 &attached_resolver,
+                connection.dialect().as_ref(),
             )?;
         }
         fresh.populate_indices(

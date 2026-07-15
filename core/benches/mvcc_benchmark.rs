@@ -1,6 +1,7 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use turso_core::SqliteDialect;
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{
@@ -28,7 +29,7 @@ struct BenchDb {
 
 fn bench_db() -> BenchDb {
     let io = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:").unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
     // Enable MVCC via PRAGMA
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
@@ -320,7 +321,7 @@ impl HugeMultiWriteHarness {
         // In-memory IO: no fsync per commit, so the measurement reflects the
         // CPU-bound index-probe path the eq-only seek bound affects.
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:").unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         // Keep everything in MvStore so the measurement reflects the in-memory

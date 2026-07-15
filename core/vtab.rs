@@ -601,6 +601,7 @@ pub trait InternalVirtualTableCursor: Send + Sync {
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
+    use crate::SqliteDialect;
     use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags};
 
     /// Minimal `InternalVirtualTable` that exposes a fixed two-row table. Used
@@ -692,6 +693,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let name = db
@@ -735,6 +737,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let name = db

@@ -5,6 +5,7 @@ use std::{
         Arc, Mutex,
     },
 };
+use turso_core::SqliteDialect;
 
 use turso_core::{Buffer, Completion, DatabaseStorage, LimboError, OpenDbAsyncState, OpenFlags};
 
@@ -138,6 +139,7 @@ mod tests {
         time::Duration,
     };
     use tempfile::NamedTempFile;
+    use turso_core::SqliteDialect;
 
     #[test]
     fn logical_mvcc_pull_disabled_by_config_falls_back_to_page_pull() {
@@ -818,7 +820,9 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let main_path = temp_file.path().to_str().unwrap().to_string();
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let main_db = turso_core::Database::open_file(io.clone(), &main_path).unwrap();
+        let main_db =
+            turso_core::Database::open_file(io.clone(), &main_path, Arc::new(SqliteDialect))
+                .unwrap();
 
         let meta = DatabaseMetadata {
             version: DATABASE_METADATA_VERSION.to_string(),
@@ -941,8 +945,12 @@ mod tests {
         ];
         std::fs::write(changes_temp.path(), encoded_logical_txns(&txns)).unwrap();
 
-        let db =
-            turso_core::Database::open_file(io.clone(), db_temp.path().to_str().unwrap()).unwrap();
+        let db = turso_core::Database::open_file(
+            io.clone(),
+            db_temp.path().to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let db_file = db.db_file.clone();
         let db_io = db.io.clone();
         let main_tape = DatabaseTape::new_with_opts(
@@ -1112,8 +1120,12 @@ mod tests {
         }];
         std::fs::write(changes_temp.path(), encoded_logical_txns(&txns)).unwrap();
 
-        let db =
-            turso_core::Database::open_file(io.clone(), db_temp.path().to_str().unwrap()).unwrap();
+        let db = turso_core::Database::open_file(
+            io.clone(),
+            db_temp.path().to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let db_file = db.db_file.clone();
         let db_io = db.io.clone();
         let main_tape = DatabaseTape::new_with_opts(
@@ -1275,7 +1287,9 @@ mod tests {
         let changes_path = changes_file.path().to_str().unwrap().to_string();
 
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let remote_db = turso_core::Database::open_file(io.clone(), &remote_path).unwrap();
+        let remote_db =
+            turso_core::Database::open_file(io.clone(), &remote_path, Arc::new(SqliteDialect))
+                .unwrap();
         let remote_conn = remote_db.connect().unwrap();
         remote_conn
             .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
@@ -1388,10 +1402,14 @@ mod tests {
 
                 drop(conn);
                 drop(engine);
-                let verify_db =
-                    turso_core::Database::open_file(io.clone(), &main_path).map_err(|error| {
-                        Error::DatabaseSyncEngineError(format!("test verify open failed: {error}"))
-                    })?;
+                let verify_db = turso_core::Database::open_file(
+                    io.clone(),
+                    &main_path,
+                    Arc::new(SqliteDialect),
+                )
+                .map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test verify open failed: {error}"))
+                })?;
                 let verify_conn = verify_db.connect().map_err(|error| {
                     Error::DatabaseSyncEngineError(format!("test verify connect failed: {error}"))
                 })?;
@@ -2602,6 +2620,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 opts.db_opts,
                 None,
                 None,
+                Arc::new(SqliteDialect),
             )? {
                 turso_core::IOResult::Done(db) => break db,
                 turso_core::IOResult::IO(io_completion) => {
@@ -2632,6 +2651,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     self.opts.db_opts,
                     None,
                     None,
+                    Arc::new(SqliteDialect),
                 )? {
                     turso_core::IOResult::Done(db) => break db,
                     turso_core::IOResult::IO(io_completion) => {

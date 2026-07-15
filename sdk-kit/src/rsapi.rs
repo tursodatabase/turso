@@ -10,6 +10,7 @@ use std::{
     task::Waker,
     time::Duration,
 };
+use turso_core::SqliteDialect;
 
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
@@ -801,6 +802,7 @@ impl TursoDatabase {
                         opts,
                         self.config.encryption.clone(),
                         None,
+                        Arc::new(SqliteDialect),
                     )? {
                         IOResult::Done(db) => {
                             let mut inner_db = self.db.lock().unwrap();
