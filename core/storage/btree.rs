@@ -56,7 +56,7 @@ use crate::{
 };
 use crate::{
     turso_assert_eq, turso_assert_greater_than, turso_assert_greater_than_or_equal,
-    turso_assert_less_than, turso_assert_less_than_or_equal,
+    turso_assert_less_than, turso_assert_less_than_or_equal, turso_debug_assert,
 };
 use std::{
     any::Any,
@@ -647,6 +647,44 @@ pub trait CursorTrait: Any + Send + Sync {
     fn prev(&mut self) -> Result<IOResult<()>>;
     /// Get the rowid of the entry the cursor is poiting to if any
     fn rowid(&mut self) -> Result<IOResult<Option<i64>>>;
+
+    /// Incremental blob I/O — read `len` bytes at `off` within column `column`'s value
+    /// into `out`. Only table (rowid) b-tree cursors support this; the default errors.
+    fn blob_read_column(
+        &mut self,
+        _column: usize,
+        _off: usize,
+        _len: usize,
+        _out: &mut Vec<u8>,
+    ) -> Result<IOResult<()>> {
+        Err(LimboError::InternalError(
+            "incremental blob I/O is only supported on table rows".to_string(),
+        ))
+    }
+    /// Incremental blob I/O — write `data` at `off` within column `column`'s value.
+    fn blob_write_column(
+        &mut self,
+        _column: usize,
+        _off: usize,
+        _data: &[u8],
+    ) -> Result<IOResult<()>> {
+        Err(LimboError::InternalError(
+            "incremental blob I/O is only supported on table rows".to_string(),
+        ))
+    }
+    /// Byte length of column `column`'s value on the current row, validating that
+    /// the value is byte-addressable (TEXT or BLOB).
+    fn blob_column_len(&mut self, _column: usize) -> Result<IOResult<usize>> {
+        Err(LimboError::InternalError(
+            "incremental blob I/O is only supported on table rows".to_string(),
+        ))
+    }
+    /// Notification, delivered during a peer's saveAllCursors pass, that the peer is
+    /// about to write the row `rowid` in this cursor's b-tree (`None` when the rowid
+    /// is unknown, which must be treated as "could be any row"). Lets cursors backing
+    /// incremental blob handles expire when their own row is written — SQLite's
+    /// invalidateIncrblobCursors — while surviving writes to other rows. Default no-op.
+    fn note_external_row_write(&mut self, _rowid: Option<i64>) {}
     /// Get the record of the entry the cursor is poiting to if any
     fn record(&mut self) -> Result<IOResult<Option<&ImmutableRecord>>>;
     /// Move the cursor based on the key and the type of operation (op).
@@ -777,6 +815,24 @@ pub struct BTreeCursor {
     /// Reusable buffer for cell payloads during insert/update operations.
     /// This avoids allocating a new Vec for each write operation.
     reusable_cell_payload: Vec<u8>,
+    /// Per-cell access cache for incremental blob I/O. Caches the leaf cell's payload
+    /// layout, the overflow-page-number array (Turso's runtime reconstruction of
+    /// SQLite's `aOverflow`), and the byte range of the most recently accessed column,
+    /// so repeated byte accesses to the same row avoid re-parsing the cell and record
+    /// header and re-walking the overflow chain — turning each access into an O(1)
+    /// page lookup. Invalidated when the cursor moves to a different (page, cell). The
+    /// on-disk format is unchanged; this index lives only in RAM.
+    blob_cache: BlobCellCache,
+    /// Rowid the incremental-blob machinery last addressed. Unlike `blob_cache` it
+    /// survives position saves: it is what `note_external_row_write` compares against
+    /// to decide whether a peer's write hit *this* handle's row (expire, like SQLite's
+    /// invalidateIncrblobCursors) or a different row (survivable via re-seek).
+    blob_pinned_rowid: Option<i64>,
+    /// Latched when an external write hits the pinned row or the position becomes
+    /// unrecoverable. Every subsequent blob operation fails with
+    /// [`LimboError::BlobHandleExpired`]; nothing ever clears it — SQLite's expired
+    /// blob handles behave the same way until closed.
+    blob_expired: bool,
     /// If `Some(page_idx)`, a previous call to [`BTreeCursor::get_next_record`]
     /// or [`BTreeCursor::get_prev_record`] yielded mid-descent into `page_idx`
     /// for spill IO, AFTER the loop-top `stack.advance()` / `stack.retreat()`
@@ -811,6 +867,142 @@ pub struct BTreeCursor {
 enum IterationPendingDescent {
     Forwards(i64),
     Backwards(i64),
+}
+
+/// Cache backing the incremental-blob-I/O fast path (see [`BTreeCursor::blob_cache`]).
+/// `valid`/`col_valid` gate the two tiers: the cell payload layout and the parsed byte
+/// range of the last-accessed column. `overflow_pages[i]` is the i-th overflow page
+/// number (`overflow_pages[0]` == the value's first overflow page); it grows lazily as
+/// deeper offsets are touched. All offsets are payload-relative (0 == first payload byte)
+/// except `local_off`, which is the leaf page byte offset of the local payload.
+#[derive(Default)]
+struct BlobCellCache {
+    valid: bool,
+    leaf_id: usize,
+    cell_idx: usize,
+    /// Byte offset of the local payload within the leaf page.
+    local_off: usize,
+    /// Number of payload bytes held locally on the leaf (the rest are in overflow).
+    local_len: usize,
+    /// Total payload size of the cell.
+    payload_size: usize,
+    /// Data bytes per overflow page (`usable - 4`).
+    per: usize,
+    first_overflow: Option<u32>,
+    overflow_pages: Vec<u32>,
+    /// Most recently accessed overflow page and its index in `overflow_pages`, held
+    /// for spatial locality: consecutive accesses landing on the same page reuse it
+    /// instead of going back through the pager's page cache. The [`PinGuard`] type is
+    /// load-bearing, not incidental: any `PageRef` kept live across a blob operation
+    /// MUST be pinned, or the pager can evict it and take its buffer out from under
+    /// the still-held reference (eviction does `buffer.take()` regardless of live
+    /// `Arc<Page>` refs). Storing a `PinGuard` — which pins on construction and unpins
+    /// on drop — makes an unpinned held page unrepresentable rather than a discipline
+    /// to remember. Storing a raw page NUMBER (like `overflow_pages`) is the other
+    /// safe option, because it is re-fetched through the pager on each use.
+    last_ov_idx: usize,
+    last_ov_page: Option<PinGuard>,
+    col_valid: bool,
+    col: usize,
+    /// Payload-relative byte offset of column `col`'s value.
+    col_body_off: usize,
+    col_len: usize,
+    /// Serial type of column `col`, kept so every access can re-assert the value is
+    /// TEXT or BLOB (byte-addressable) without re-parsing the record header.
+    col_serial: u64,
+}
+
+impl BlobCellCache {
+    /// Drop every cached tier, including the pinned overflow page. Called whenever the
+    /// cursor's position stops being trustworthy (external writes, stack invalidation)
+    /// so no stale offset or page number can ever back a byte-level read or write.
+    fn reset(&mut self) {
+        self.valid = false;
+        self.col_valid = false;
+        self.first_overflow = None;
+        self.overflow_pages.clear();
+        self.release_pinned_overflow();
+    }
+
+    /// Pin `page` and remember it as the spatial-locality overflow page for `idx`,
+    /// releasing whatever was pinned before. The [`PinGuard`] keeps the pager from
+    /// evicting the page (and taking its buffer) while a blob handle still holds this
+    /// reference — the same contract the cursor's page stack relies on, applied to
+    /// the one overflow page kept live between blob operations.
+    fn pin_overflow_page(&mut self, idx: usize, page: PageRef) {
+        self.last_ov_idx = idx;
+        // Assigning a fresh guard drops the previous one, unpinning the old page.
+        self.last_ov_page = Some(PinGuard::new(page));
+    }
+
+    /// Forget the cached overflow page; dropping its [`PinGuard`] unpins the page.
+    /// Idempotent.
+    fn release_pinned_overflow(&mut self) {
+        self.last_ov_page = None;
+        self.last_ov_idx = 0;
+    }
+}
+
+/// Upper bound on a well-formed record header: the header-size varint plus one
+/// maximum-width (9 byte) serial-type varint per column, at SQLite's hard column
+/// limit of 32767. Anything larger is corruption, and rejecting it also bounds the
+/// allocation made when a spilled header is materialized from the overflow chain.
+const MAX_RECORD_HEADER_SIZE: usize = 9 + 32767 * 9;
+
+/// Where a run of payload bytes physically lives. A payload byte range maps to a
+/// sequence of these; reading and writing are the same traversal with opposite copy
+/// directions, so the (bug-prone) offset arithmetic lives here once, in
+/// [`BTreeCursor::blob_span`], rather than being transcribed per operation.
+enum BlobSpan {
+    /// Bytes resident on the leaf page at byte offset `page_off` within it.
+    Local { page_off: usize, take: usize },
+    /// Bytes on overflow page number `idx` in the chain, `within` bytes past that
+    /// page's 4-byte next-pointer.
+    Overflow {
+        idx: usize,
+        within: usize,
+        take: usize,
+    },
+}
+
+/// Walk the serial types of a record header and locate `column`'s value. `header`
+/// must be exactly the header bytes (so a varint can never stray into the body) and
+/// `hpos0` the offset of the first serial type, i.e. the width of the header-size
+/// varint. Returns the value's payload-relative byte offset, its byte length, and
+/// its serial type, after checking the range lies inside `payload_size`.
+fn blob_locate_column_in_header(
+    header: &[u8],
+    hpos0: usize,
+    payload_size: usize,
+    column: usize,
+) -> Result<(usize, usize, u64)> {
+    let header_size = header.len();
+    let mut hpos = hpos0;
+    let mut body = header_size;
+    let mut col = 0usize;
+    loop {
+        if hpos >= header_size {
+            return Err(LimboError::InternalError(format!(
+                "blob column {column} out of range for row with {col} columns"
+            )));
+        }
+        let (serial, n) = crate::storage::sqlite3_ondisk::read_varint(&header[hpos..])?;
+        hpos += n;
+        let size = crate::types::get_serial_type_size(serial)?;
+        let end = body
+            .checked_add(size)
+            .ok_or_else(|| LimboError::Corrupt("record body offsets overflow usize".to_string()))?;
+        if end > payload_size {
+            return Err(LimboError::Corrupt(format!(
+                "column {col} claims bytes {body}..{end} beyond payload size {payload_size}"
+            )));
+        }
+        if col == column {
+            return Ok((body, size, serial));
+        }
+        body = end;
+        col += 1;
+    }
 }
 
 crate::assert::assert_send!(BTreeCursor);
@@ -878,6 +1070,9 @@ impl BTreeCursor {
             move_to_state: MoveToState::Start,
             skip_advance: false,
             reusable_cell_payload: Vec::new(),
+            blob_cache: BlobCellCache::default(),
+            blob_pinned_rowid: None,
+            blob_expired: false,
             iteration_pending_descent: None,
             pending_peer_save: None,
             has_peers: crate::sync::atomic::AtomicBool::new(false),
@@ -5232,6 +5427,417 @@ impl BTreeCursor {
         Ok(())
     }
 
+    /// True iff the cursor sits cleanly on a row: valid, positioned, and not mid-way
+    /// through some other operation's state machine.
+    fn blob_position_is_live(&self) -> bool {
+        self.valid_state == CursorValidState::Valid
+            && self.has_record
+            && matches!(self.state, CursorState::None)
+            && self.stack.current_page >= 0
+    }
+
+    /// Gate for every incremental-blob entry point: ensure the cursor owns a live
+    /// position on its row before any byte-level access.
+    ///
+    /// A peer write to the same table saves this cursor's position first
+    /// (drive_pending_peer_save), and the same pass expires the handle if the write
+    /// hit the pinned row (note_external_row_write) — SQLite's
+    /// invalidateIncrblobCursors. An expired handle fails here with
+    /// [`LimboError::BlobHandleExpired`] (SQLITE_ABORT at the C API), permanently. A
+    /// position merely disturbed by a write to a *different* row is restored by
+    /// re-seeking the pinned rowid, exactly like SQLite's restoreCursorPosition for
+    /// incrblob cursors; if the row cannot be found again the handle expires too.
+    fn blob_ensure_position(&mut self) -> Result<IOResult<()>> {
+        if self.blob_expired {
+            return Err(LimboError::BlobHandleExpired);
+        }
+        if self.blob_position_is_live() {
+            return Ok(IOResult::Done(()));
+        }
+        if self.needs_restore() {
+            return_if_io!(self.restore_context());
+        }
+        if !self.blob_position_is_live() {
+            self.blob_expired = true;
+            return Err(LimboError::BlobHandleExpired);
+        }
+        Ok(IOResult::Done(()))
+    }
+
+    /// Populate the cell-layout tier of `blob_cache` for the cursor's current
+    /// table-leaf cell, unless it is already cached for this (page, cell), and pin
+    /// the cell's rowid for expiry tracking. Restoring a disturbed position may
+    /// yield IO; the layout parse itself reads only the resident leaf page.
+    fn blob_ensure_layout(&mut self) -> Result<IOResult<()>> {
+        return_if_io!(self.blob_ensure_position());
+        let usable = self.pager.usable_space();
+        turso_assert!(usable > 4, "usable space must exceed overflow header");
+        let cell_idx = self.stack.current_cell_index();
+        if cell_idx < 0 {
+            return Err(LimboError::BlobHandleExpired);
+        }
+        let cell_idx = cell_idx as usize;
+        let leaf_id = self.stack.top_ref().get().id;
+        if self.blob_cache.valid
+            && self.blob_cache.leaf_id == leaf_id
+            && self.blob_cache.cell_idx == cell_idx
+        {
+            return Ok(IOResult::Done(()));
+        }
+        // Extract owned scalars from the cell before mutating the cache (the cell borrows
+        // the page, which borrows `self`).
+        let (rowid, local_off, local_len, payload_size, first_overflow) = {
+            let page = self.stack.top_ref();
+            let contents = page.get_contents();
+            let base = contents.as_ptr().as_ptr() as usize;
+            let BTreeCell::TableLeafCell(cell) = contents.cell_get(cell_idx, usable)? else {
+                return Err(LimboError::InternalError(
+                    "incremental blob I/O requires a table (rowid) row".to_string(),
+                ));
+            };
+            (
+                cell.rowid,
+                cell.payload.as_ptr() as usize - base,
+                cell.payload.len(),
+                cell.payload_size as usize,
+                cell.first_overflow_page,
+            )
+        };
+        self.blob_pinned_rowid = Some(rowid);
+        if local_len > payload_size {
+            return Err(LimboError::Corrupt(format!(
+                "cell claims {payload_size} payload bytes but holds {local_len} locally"
+            )));
+        }
+        let c = &mut self.blob_cache;
+        c.valid = true;
+        c.leaf_id = leaf_id;
+        c.cell_idx = cell_idx;
+        c.local_off = local_off;
+        c.local_len = local_len;
+        c.payload_size = payload_size;
+        c.per = usable - 4;
+        c.first_overflow = first_overflow;
+        c.overflow_pages.clear();
+        if let Some(fo) = first_overflow {
+            c.overflow_pages.push(fo);
+        }
+        // Moving to a different cell: unpin the previous cell's cached overflow page.
+        c.release_pinned_overflow();
+        c.col_valid = false;
+        Ok(IOResult::Done(()))
+    }
+
+    /// Fetch the `idx`-th overflow page, reusing the pinned last page on a spatial-
+    /// locality hit and otherwise going through the O(1) overflow cache + pager, then
+    /// pinning the result for the next access.
+    fn blob_overflow_page(&mut self, idx: usize) -> Result<IOResult<PageRef>> {
+        if self.blob_cache.last_ov_idx == idx {
+            if let Some(p) = &self.blob_cache.last_ov_page {
+                // Pinned while cached, so the pager can't evict it and take its
+                // buffer; the asserts guard that (as_ptr would panic otherwise —
+                // crash over corrupt).
+                turso_debug_assert!(p.is_pinned(), "cached blob overflow page must be pinned");
+                turso_debug_assert!(p.is_loaded(), "pinned blob overflow page must stay loaded");
+                return Ok(IOResult::Done(p.to_page()));
+            }
+        }
+        return_if_io!(self.ensure_overflow_cached(idx));
+        let pageno = *self.blob_cache.overflow_pages.get(idx).ok_or_else(|| {
+            LimboError::Corrupt(format!(
+                "overflow page {idx} requested but chain holds only {}",
+                self.blob_cache.overflow_pages.len()
+            ))
+        })?;
+        let (page, c) = return_if_io!(self.read_page(pageno as i64));
+        if let Some(c) = c {
+            io_yield_one!(c);
+        }
+        self.blob_cache.pin_overflow_page(idx, page.clone());
+        Ok(IOResult::Done(page))
+    }
+
+    /// Populate the column tier of `blob_cache` for `column`, unless already cached.
+    /// Parses the record header to find the column value's payload-relative byte
+    /// offset, length, and serial type. The header usually sits in the local payload
+    /// (no IO), but a wide row on a small page can spill it into the overflow chain,
+    /// in which case just the header bytes are streamed in (with IO yields).
+    fn blob_ensure_column(&mut self, column: usize) -> Result<IOResult<()>> {
+        return_if_io!(self.blob_ensure_layout());
+        if self.blob_cache.col_valid && self.blob_cache.col == column {
+            return Ok(IOResult::Done(()));
+        }
+        let local_off = self.blob_cache.local_off;
+        let local_len = self.blob_cache.local_len;
+        let payload_size = self.blob_cache.payload_size;
+        // The header-size varint itself is always local: either the record fits
+        // entirely in the local payload, or SQLite's minimum-local formula keeps
+        // well over 9 bytes (one max-size varint) on the leaf. A truncated varint
+        // here therefore means a corrupt cell, and read_varint reports it as such.
+        let (header_size, hpos0) = {
+            let page = self.stack.top_ref();
+            let contents = page.get_contents();
+            let local = &contents.as_ptr()[local_off..local_off + local_len];
+            crate::storage::sqlite3_ondisk::read_varint(local)?
+        };
+        let header_size = usize::try_from(header_size)
+            .map_err(|_| LimboError::Corrupt("record header size does not fit".to_string()))?;
+        if header_size < hpos0 || header_size > payload_size || header_size > MAX_RECORD_HEADER_SIZE
+        {
+            return Err(LimboError::Corrupt(format!(
+                "record header size {header_size} out of bounds (payload {payload_size})"
+            )));
+        }
+        let (body_off, len, serial) = if header_size <= local_len {
+            let page = self.stack.top_ref();
+            let contents = page.get_contents();
+            let local = &contents.as_ptr()[local_off..local_off + local_len];
+            blob_locate_column_in_header(&local[..header_size], hpos0, payload_size, column)?
+        } else {
+            // Header spills into the overflow chain: materialize exactly the header
+            // bytes (bounded above by MAX_RECORD_HEADER_SIZE) and parse those. On an
+            // IO yield the whole function restarts; every step up to here is a pure
+            // cached read, so the restart is cheap and idempotent.
+            let mut header = vec![0u8; header_size];
+            return_if_io!(self.blob_read_range(0, &mut header));
+            blob_locate_column_in_header(&header, hpos0, payload_size, column)?
+        };
+        let c = &mut self.blob_cache;
+        c.col = column;
+        c.col_body_off = body_off;
+        c.col_len = len;
+        c.col_serial = serial;
+        c.col_valid = true;
+        Ok(IOResult::Done(()))
+    }
+
+    /// Error unless the cached column value is byte-addressable, i.e. stored as TEXT
+    /// or BLOB. SQLite refuses incremental I/O on NULL/integer/real values because
+    /// their on-disk bytes are an encoding, not the value: "writing" into them would
+    /// silently manufacture a different number. Callers must run
+    /// [`Self::blob_ensure_column`] first.
+    fn blob_require_text_or_blob(&self) -> Result<()> {
+        turso_assert!(
+            self.blob_cache.col_valid,
+            "column tier must be cached before the type check"
+        );
+        let serial = self.blob_cache.col_serial;
+        if serial >= 12 {
+            return Ok(());
+        }
+        let type_name = match serial {
+            0 => "null",
+            7 => "real",
+            _ => "integer",
+        };
+        Err(LimboError::InternalError(format!(
+            "cannot open value of type {type_name}"
+        )))
+    }
+
+    /// Ensure `blob_cache.overflow_pages` holds at least `upto + 1` entries, extending
+    /// it by walking the chain from the last cached page. Turso's runtime `aOverflow`:
+    /// the first access pays the O(n) walk, after which any offset is located in O(1).
+    ///
+    /// Idempotent and IO-reentrant: the array lives on the cursor and grows append-only,
+    /// so on a yield the operation restarts and this resumes where it left off.
+    fn ensure_overflow_cached(&mut self, upto: usize) -> Result<IOResult<()>> {
+        loop {
+            let last = {
+                let pages = &self.blob_cache.overflow_pages;
+                if pages.len() > upto {
+                    return Ok(IOResult::Done(()));
+                }
+                match pages.last() {
+                    Some(p) => *p,
+                    None => {
+                        return Err(LimboError::Corrupt(
+                            "blob value needs overflow pages but has none".to_string(),
+                        ))
+                    }
+                }
+            };
+            let (page, c) = return_if_io!(self.read_page(last as i64));
+            if let Some(c) = c {
+                io_yield_one!(c);
+            }
+            let next = page.get_contents().read_u32_no_offset(0);
+            if next == 0 {
+                // The loop only reaches here while the chain is still shorter than the
+                // requested index, so a terminated chain means the record header
+                // promises more payload than the pages can hold.
+                return Err(LimboError::Corrupt(format!(
+                    "overflow chain ends after {} pages but the record needs at least {}",
+                    self.blob_cache.overflow_pages.len(),
+                    upto + 1
+                )));
+            }
+            self.blob_cache.overflow_pages.push(next);
+        }
+    }
+
+    /// Map payload offset `pos` (0 = first payload byte) to the physical span that
+    /// begins there, yielding at most `remaining` bytes. Pure arithmetic over the
+    /// cached cell layout; the caller fetches the page and copies. Requires
+    /// `blob_ensure_layout` to have populated the layout tier.
+    fn blob_span(&self, pos: usize, remaining: usize) -> BlobSpan {
+        // Overflow spans divide by `per` (bytes per overflow page); it is `usable - 4`,
+        // established > 0 by blob_ensure_layout. Assert it so the invariant is explicit.
+        turso_debug_assert!(
+            self.blob_cache.per > 0,
+            "overflow bytes-per-page must be > 0"
+        );
+        let local_len = self.blob_cache.local_len;
+        if pos < local_len {
+            let take = (local_len - pos).min(remaining);
+            BlobSpan::Local {
+                page_off: self.blob_cache.local_off + pos,
+                take,
+            }
+        } else {
+            let per = self.blob_cache.per;
+            let ov = pos - local_len;
+            let within = ov % per;
+            let take = (per - within).min(remaining);
+            BlobSpan::Overflow {
+                idx: ov / per,
+                within,
+                take,
+            }
+        }
+    }
+
+    /// Copy `buf.len()` bytes starting at payload offset `off` (0 = first byte of the
+    /// value) into `buf`, spanning the leaf-local payload and the overflow chain. Uses
+    /// the O(1) overflow cache to locate each page. Requires `blob_ensure_layout` first.
+    fn blob_read_range(&mut self, off: usize, buf: &mut [u8]) -> Result<IOResult<()>> {
+        let len = buf.len();
+        let mut done = 0usize;
+        while done < len {
+            match self.blob_span(off + done, len - done) {
+                // Local bytes are on the resident leaf page — no IO.
+                BlobSpan::Local { page_off, take } => {
+                    let src = self.stack.top_ref().get_contents().as_ptr();
+                    buf[done..done + take].copy_from_slice(&src[page_off..page_off + take]);
+                    done += take;
+                }
+                BlobSpan::Overflow { idx, within, take } => {
+                    let page = return_if_io!(self.blob_overflow_page(idx));
+                    let src = page.get_contents().as_ptr();
+                    buf[done..done + take].copy_from_slice(&src[4 + within..4 + within + take]);
+                    done += take;
+                }
+            }
+        }
+        Ok(IOResult::Done(()))
+    }
+
+    /// Write `data` starting at payload offset `off` in place, spanning the leaf-local
+    /// payload and the overflow chain. Each mutated page is registered dirty so the
+    /// write is journaled. Requires `blob_ensure_layout` first.
+    fn blob_write_range(&mut self, off: usize, data: &[u8]) -> Result<IOResult<()>> {
+        let len = data.len();
+        let mut done = 0usize;
+        while done < len {
+            match self.blob_span(off + done, len - done) {
+                BlobSpan::Local { page_off, take } => {
+                    let page = self.stack.top_ref().clone();
+                    self.pager.add_dirty(&page)?;
+                    let dst = page.get_contents().as_ptr();
+                    dst[page_off..page_off + take].copy_from_slice(&data[done..done + take]);
+                    done += take;
+                }
+                BlobSpan::Overflow { idx, within, take } => {
+                    let page = return_if_io!(self.blob_overflow_page(idx));
+                    self.pager.add_dirty(&page)?;
+                    let dst = page.get_contents().as_ptr();
+                    dst[4 + within..4 + within + take].copy_from_slice(&data[done..done + take]);
+                    done += take;
+                }
+            }
+        }
+        Ok(IOResult::Done(()))
+    }
+
+    /// Shared entry validation for every incremental-blob column access: bring the
+    /// column tier of the cache up to date and confirm the value is byte-addressable
+    /// (TEXT or BLOB). Reads/writes/length all funnel through here so the type rule
+    /// is enforced in exactly one place.
+    fn blob_typed_column(&mut self, column: usize) -> Result<IOResult<()>> {
+        return_if_io!(self.blob_ensure_column(column));
+        self.blob_require_text_or_blob()?;
+        Ok(IOResult::Done(()))
+    }
+
+    /// Validate the byte range `[off, off+len)` against column `column`'s value and
+    /// return its payload-relative start offset (for `blob_read_range` /
+    /// `blob_write_range`). One bounds check backs both read and write.
+    fn blob_resolve_range(
+        &mut self,
+        column: usize,
+        off: usize,
+        len: usize,
+    ) -> Result<IOResult<usize>> {
+        return_if_io!(self.blob_typed_column(column));
+        if off.saturating_add(len) > self.blob_cache.col_len {
+            return Err(LimboError::InternalError(
+                "blob access past end of column value".to_string(),
+            ));
+        }
+        Ok(IOResult::Done(self.blob_cache.col_body_off + off))
+    }
+
+    /// Total byte length of column `column`'s value in the current row, validating
+    /// that the value is byte-addressable (TEXT or BLOB). This backs
+    /// `sqlite3_blob_open`, so the type error surfaces at open time.
+    pub fn blob_column_len_inherent(&mut self, column: usize) -> Result<IOResult<usize>> {
+        return_if_io!(self.blob_typed_column(column));
+        Ok(IOResult::Done(self.blob_cache.col_len))
+    }
+
+    /// Read `len` bytes at `off` within column `column`'s value into `out`.
+    ///
+    /// Reentrant: on an IO yield it restarts from the beginning. Every step is a pure
+    /// read and therefore idempotent, so no per-call state is saved — a restart simply
+    /// re-reads (now-cached) pages and reproduces the same output.
+    pub fn blob_read_column_inherent(
+        &mut self,
+        column: usize,
+        off: usize,
+        len: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<IOResult<()>> {
+        let payload_off = return_if_io!(self.blob_resolve_range(column, off, len));
+        out.clear();
+        if len == 0 {
+            return Ok(IOResult::Done(()));
+        }
+        out.resize(len, 0);
+        return_if_io!(self.blob_read_range(payload_off, out));
+        Ok(IOResult::Done(()))
+    }
+
+    /// Write `data` at `off` within column `column`'s value, in place across the
+    /// local page and overflow chain; the value's size cannot change. Each mutated
+    /// page is registered dirty so the write is journaled and persisted.
+    ///
+    /// Reentrant: on an IO yield it restarts from the beginning. Every write is
+    /// idempotent (the same bytes to the same offsets), so a restart re-applies
+    /// already-written bytes harmlessly.
+    pub fn blob_write_column_inherent(
+        &mut self,
+        column: usize,
+        off: usize,
+        data: &[u8],
+    ) -> Result<IOResult<()>> {
+        let payload_off = return_if_io!(self.blob_resolve_range(column, off, data.len()));
+        if data.is_empty() {
+            return Ok(IOResult::Done(()));
+        }
+        return_if_io!(self.blob_write_range(payload_off, data));
+        Ok(IOResult::Done(()))
+    }
+
     pub fn overwrite_cell(
         &mut self,
         page: &PageRef,
@@ -5354,10 +5960,42 @@ impl BTreeCursor {
         self.has_record() && self.stack.current_cell_index() > 0
     }
 
+    /// Rowid of the table-leaf cell the cursor currently sits on, or `None` when the
+    /// cursor is not cleanly positioned on a table leaf (index cursors, sentinel
+    /// stacks, mid-operation states). Callers that use `None` must treat it as
+    /// "unknown row" and act conservatively.
+    fn current_table_leaf_rowid(&self) -> Option<i64> {
+        if self.valid_state != CursorValidState::Valid || !self.has_record {
+            return None;
+        }
+        if self.stack.current_page < 0
+            || (self.stack.current_page as usize) >= self.stack.stack.len()
+            || self.stack.stack[self.stack.current_page as usize].is_none()
+        {
+            return None;
+        }
+        let cell_idx = self.stack.current_cell_index();
+        if cell_idx < 0 {
+            return None;
+        }
+        let page = self.stack.top_ref();
+        let contents = page.get_contents();
+        if !matches!(contents.page_type(), Ok(PageType::TableLeaf)) {
+            return None;
+        }
+        if cell_idx as usize >= contents.cell_count() {
+            return None;
+        }
+        contents.cell_table_leaf_read_rowid(cell_idx as usize).ok()
+    }
+
     /// saveAllCursors pass for this cursor's insert/delete entry. Iteration
     /// state lives in `pending_peer_save` so we can resume across IO yields
-    /// from per-peer overflow-chain reads.
-    fn drive_pending_peer_save(&mut self) -> Result<IOResult<()>> {
+    /// from per-peer overflow-chain reads. `written_rowid` is the row about to be
+    /// written (`None` when unknown); peers backing incremental blob handles use it
+    /// to expire exactly when their own row is hit (sqlite3's
+    /// invalidateIncrblobCursors, btree.c:672).
+    fn drive_pending_peer_save(&mut self, written_rowid: Option<i64>) -> Result<IOResult<()>> {
         if self.pending_peer_save.is_none() && matches!(self.state, CursorState::None) {
             // BTCF_Multiple fast path (sqlite3 btree.c:9348).
             if !self.has_peers.load(crate::sync::atomic::Ordering::Relaxed) {
@@ -5375,6 +6013,9 @@ impl BTreeCursor {
         };
         while *idx < peers.len() {
             let peer = peers[*idx];
+            // Idempotent, so safe to re-run for the same peer after an IO yield
+            // below. SAFETY: see RegisteredCursor's invariant.
+            unsafe { peer.as_mut().note_external_row_write(written_rowid) };
             // SAFETY: see RegisteredCursor's invariant.
             let outcome =
                 unsafe { return_if_io!(peer.as_mut().try_save_position_for_external_balance()) };
@@ -5392,6 +6033,12 @@ impl BTreeCursor {
     pub fn save_context(&mut self, cursor_context: CursorContext) {
         self.valid_state = CursorValidState::RequireSeek;
         self.context = Some(cursor_context);
+        // The tree is about to change under this cursor (that is the only reason a
+        // position ever gets saved), so cached payload offsets and overflow page
+        // numbers must not survive: blob I/O through them would touch relocated or
+        // freed pages. The next blob access re-seeks via restore_context and
+        // re-parses the layout from scratch (see blob_ensure_position).
+        self.blob_cache.reset();
     }
 
     /// Drop any pending saved seek-context; used by callers that re-navigate
@@ -5576,6 +6223,26 @@ impl Drop for BTreeCursor {
 }
 
 impl CursorTrait for BTreeCursor {
+    fn blob_read_column(
+        &mut self,
+        column: usize,
+        off: usize,
+        len: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<IOResult<()>> {
+        self.blob_read_column_inherent(column, off, len, out)
+    }
+    fn blob_write_column(
+        &mut self,
+        column: usize,
+        off: usize,
+        data: &[u8],
+    ) -> Result<IOResult<()>> {
+        self.blob_write_column_inherent(column, off, data)
+    }
+    fn blob_column_len(&mut self, column: usize) -> Result<IOResult<usize>> {
+        self.blob_column_len_inherent(column)
+    }
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn next(&mut self) -> Result<IOResult<()>> {
         if self.valid_state == CursorValidState::Invalid {
@@ -5776,7 +6443,7 @@ impl CursorTrait for BTreeCursor {
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         // saveAllCursors at the head of sqlite3BtreeInsert (btree.c:9348).
-        return_if_io!(self.drive_pending_peer_save());
+        return_if_io!(self.drive_pending_peer_save(key.maybe_rowid()));
         return_if_io!(self.insert_into_page(key));
         self.invalidate_count_cache();
         if key.maybe_rowid().is_some() {
@@ -5800,8 +6467,11 @@ impl CursorTrait for BTreeCursor {
     /// 10. Finish -> Delete operation is done. Return CursorResult(Ok())
     fn delete(&mut self) -> Result<IOResult<()>> {
         if let CursorState::None = &self.state {
-            // saveAllCursors at the head of sqlite3BtreeDelete (btree.c:9841).
-            return_if_io!(self.drive_pending_peer_save());
+            // saveAllCursors at the head of sqlite3BtreeDelete (btree.c:9841). The
+            // cursor is positioned on the row being deleted, so its rowid tells peer
+            // blob cursors whether the deletion hits their pinned row.
+            let deleted_rowid = self.current_table_leaf_rowid();
+            return_if_io!(self.drive_pending_peer_save(deleted_rowid));
             self.invalidate_count_cache();
             self.state = CursorState::Delete(DeleteState::Start);
         }
@@ -6448,6 +7118,18 @@ impl CursorTrait for BTreeCursor {
         self.has_record = false;
         self.move_to_right_state.1 = None;
         self.invalidate_count_cache();
+        self.blob_cache.reset();
+    }
+
+    fn note_external_row_write(&mut self, rowid: Option<i64>) {
+        // Only cursors that have served incremental blob I/O carry a pin. An unknown
+        // rowid could be the pinned row, so it must expire the handle too — better a
+        // spurious SQLITE_ABORT than byte access to a rewritten value.
+        if let Some(pinned) = self.blob_pinned_rowid {
+            if rowid.is_none_or(|r| r == pinned) {
+                self.blob_expired = true;
+            }
+        }
     }
 
     fn register_with_pager(&self) {

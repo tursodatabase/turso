@@ -2807,6 +2807,139 @@ pub fn op_mem_max(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Read a non-negative integer offset/length from a register for the blob opcodes.
+fn blob_reg_usize(state: &ProgramState, reg: usize, opcode: &str, what: &str) -> Result<usize> {
+    match state.registers[reg].get_value() {
+        Value::Numeric(Numeric::Integer(n)) if *n >= 0 => Ok(*n as usize),
+        other => Err(LimboError::InternalError(format!(
+            "{opcode}: {what} register must hold a non-negative integer, got {other:?}"
+        ))),
+    }
+}
+
+/// Resolve `cursor` to the b-tree cursor the blob opcodes require, or error. Only
+/// table-row cursors expose byte-level column access, so this is the single gate all
+/// three opcodes (BlobRead/BlobWrite/BlobLen) share.
+fn blob_btree_cursor<'a>(
+    state: &'a mut ProgramState,
+    cursor: usize,
+    opcode: &str,
+) -> Result<&'a mut dyn crate::storage::btree::CursorTrait> {
+    match state.get_cursor(cursor) {
+        Cursor::BTree(btree) => Ok(btree.as_mut()),
+        _ => Err(LimboError::InternalError(format!(
+            "{opcode} requires a b-tree cursor"
+        ))),
+    }
+}
+
+/// Signal incremental-blob expiry to `Blob::read`/`write`: store NULL in `dest` and
+/// advance. Expiry must fail the operation without aborting the program — the paused
+/// blob program owns the handle's transaction, and writes made before the expiry
+/// must still commit at close (sqlite3_blob semantics). Shared by BlobRead/BlobWrite.
+fn blob_expired_ack(state: &mut ProgramState, dest: usize) -> InsnFunctionStepResult {
+    state.registers[dest].set_value(Value::Null);
+    state.pc += 1;
+    InsnFunctionStepResult::Step
+}
+
+pub fn op_blob_read(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        BlobRead {
+            cursor,
+            column,
+            offset,
+            amount,
+            dest
+        },
+        insn
+    );
+    let off = blob_reg_usize(state, *offset, "BlobRead", "offset")?;
+    let amt = blob_reg_usize(state, *amount, "BlobRead", "amount")?;
+    // The callee validates (off, amt) against the value's length before sizing `out`,
+    // so a hostile amount register cannot force an allocation here.
+    let mut out = Vec::new();
+    match blob_btree_cursor(state, *cursor, "BlobRead")?
+        .blob_read_column(*column, off, amt, &mut out)
+    {
+        Ok(IOResult::Done(())) => {}
+        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+        Err(LimboError::BlobHandleExpired) => return Ok(blob_expired_ack(state, *dest)),
+        Err(err) => return Err(err),
+    }
+    state.registers[*dest].set_value(Value::Blob(crate::types::value_blob_from_slice(&out)));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Store the byte length of a column's value on the cursor's current row, validating
+/// that the value is byte-addressable (TEXT or BLOB) — the VDBE backing for
+/// sqlite3_blob_open's length and type check.
+pub fn op_blob_len(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        BlobLen {
+            cursor,
+            column,
+            dest
+        },
+        insn
+    );
+    let len = return_if_io!(blob_btree_cursor(state, *cursor, "BlobLen")?.blob_column_len(*column));
+    let len = i64::try_from(len)
+        .map_err(|_| LimboError::Corrupt("column byte length does not fit in i64".to_string()))?;
+    state.registers[*dest].set_value(Value::Numeric(Numeric::Integer(len)));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Write a blob's bytes into a column's value at an offset, in place — the VDBE
+/// backing for sqlite3_blob_write.
+pub fn op_blob_write(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        BlobWrite {
+            cursor,
+            column,
+            offset,
+            src,
+            dest
+        },
+        insn
+    );
+    let off = blob_reg_usize(state, *offset, "BlobWrite", "offset")?;
+    let data = match state.registers[*src].get_value() {
+        Value::Blob(b) => b.clone(),
+        other => {
+            return Err(LimboError::InternalError(format!(
+                "BlobWrite: source register must hold a blob, got {other:?}"
+            )))
+        }
+    };
+    match blob_btree_cursor(state, *cursor, "BlobWrite")?.blob_write_column(*column, off, &data) {
+        Ok(IOResult::Done(())) => {}
+        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+        Err(LimboError::BlobHandleExpired) => return Ok(blob_expired_ack(state, *dest)),
+        Err(err) => return Err(err),
+    }
+    state.registers[*dest].set_value(Value::Numeric(Numeric::Integer(1)));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_result_row(
     _program: &Program,
     state: &mut ProgramState,
