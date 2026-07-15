@@ -5681,6 +5681,12 @@ impl BTreeCursor {
     /// cached cell layout; the caller fetches the page and copies. Requires
     /// `blob_ensure_layout` to have populated the layout tier.
     fn blob_span(&self, pos: usize, remaining: usize) -> BlobSpan {
+        // Overflow spans divide by `per` (bytes per overflow page); it is `usable - 4`,
+        // established > 0 by blob_ensure_layout. Assert it so the invariant is explicit.
+        turso_debug_assert!(
+            self.blob_cache.per > 0,
+            "overflow bytes-per-page must be > 0"
+        );
         let local_len = self.blob_cache.local_len;
         if pos < local_len {
             let take = (local_len - pos).min(remaining);

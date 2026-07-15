@@ -1950,3 +1950,82 @@ fn test_blob_read_corrupt_overflow_chain_no_panic(db: TempDatabase) {
         Err(_) => panic!("corrupt overflow chain caused a panic instead of an error"),
     }
 }
+
+/// Companion to the test above for the *record header's* overflow chain. When a row
+/// has enough columns that its header (one serial-type byte per column) spills into
+/// overflow, locating a column streams header bytes across that chain. Truncating the
+/// header's overflow chain must surface as an error, never a panic — exercising the
+/// header-parse path inside `blob_ensure_column` rather than the value-read path.
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_blob_read_corrupt_spilled_header_overflow_no_panic(db: TempDatabase) {
+    const PS: usize = 512;
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA page_size = 512;").unwrap();
+    // Many columns so the record header alone spans several overflow pages (with
+    // 512-byte pages the local payload holds only a few hundred bytes). Integer values
+    // of 1 encode as serial type 9 (byte 0x09) with no body, so the header is a long
+    // run of 0x09 — a distinctive signature for finding its overflow pages below.
+    let cols: Vec<String> = (0..1500).map(|i| format!("c{i} INT")).collect();
+    conn.execute(&format!(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, {}, data BLOB);",
+        cols.join(", ")
+    ))
+    .unwrap();
+    let ones = vec!["1"; 1500].join(", ");
+    conn.execute(&format!("INSERT INTO t VALUES (1, {ones}, zeroblob(64));"))
+        .unwrap();
+    checkpoint_database(&conn);
+    drop(conn);
+
+    // Truncate the header's overflow chain: find the first overflow page carrying header
+    // bytes (a run of serial-type-9 == 0x09) whose next-pointer is non-zero, and zero
+    // that pointer so parsing the header runs off the end of the chain before it reaches
+    // the last column.
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db.path)
+            .unwrap();
+        let n_pages = file.metadata().unwrap().len() as usize / PS;
+        let mut truncated = None;
+        for pg in 2..=n_pages {
+            let off = ((pg - 1) * PS) as u64;
+            let mut page = [0u8; PS];
+            file.seek(SeekFrom::Start(off)).unwrap();
+            file.read_exact(&mut page).unwrap();
+            let next = u32::from_be_bytes([page[0], page[1], page[2], page[3]]);
+            // Data region (after the 4-byte next-pointer) is all header serial types.
+            let is_header_overflow = page[4..104].iter().all(|&b| b == 0x09);
+            if next != 0 && is_header_overflow {
+                page[0..4].copy_from_slice(&[0, 0, 0, 0]);
+                file.seek(SeekFrom::Start(off)).unwrap();
+                file.write_all(&page).unwrap();
+                truncated = Some(pg);
+                break;
+            }
+        }
+        file.sync_all().unwrap();
+        assert!(
+            truncated.is_some(),
+            "expected a spilled-header overflow page to truncate"
+        );
+    }
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Reaching the last column (`data`) forces parsing the full, now-broken header.
+        let mut blob = conn.blob_open("t", "data", 1, false)?;
+        let mut buf = [0u8; 8];
+        blob.read(0, &mut buf)
+    }));
+    match result {
+        Ok(Ok(())) => panic!("access through a truncated spilled header unexpectedly succeeded"),
+        Ok(Err(_)) => {} // graceful error — the desired outcome
+        Err(_) => {
+            panic!("truncated spilled-header overflow chain caused a panic instead of an error")
+        }
+    }
+}
