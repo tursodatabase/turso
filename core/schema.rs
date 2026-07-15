@@ -5418,9 +5418,11 @@ impl TryFrom<&ColumnDefinition> for Column {
             match constraint {
                 ast::ColumnConstraint::PrimaryKey { .. } => primary_key = true,
                 ast::ColumnConstraint::NotNull {
-                    conflict_clause, ..
+                    nullable,
+                    conflict_clause,
+                    ..
                 } => {
-                    notnull = true;
+                    notnull = !nullable;
                     notnull_conflict_clause = *conflict_clause;
                 }
                 ast::ColumnConstraint::Unique(..) => unique = true,
