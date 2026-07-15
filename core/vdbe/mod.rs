@@ -1095,6 +1095,26 @@ impl ProgramState {
             .unwrap_or_else(|| panic!("cursor id {cursor_id} is None"))
     }
 
+    /// Close all virtual table cursors owned by this program.
+    ///
+    /// A virtual table cursor can own a nested helper statement on the same
+    /// connection (e.g. `PragmaVirtualTableCursor` runs `PRAGMA ...` via
+    /// `Connection::prepare_internal`), and that helper holds the
+    /// connection's nested-statement guard until it is dropped. Both
+    /// `commit_txn` and `abort` consult `Connection::is_nested_stmt()` to
+    /// decide whether the current statement owns top-level transaction
+    /// finalization, so the helpers must be dropped first — otherwise a root
+    /// statement that scanned a pragma virtual table misclassifies itself as
+    /// nested, skips ending its implicit read transaction, and subsequent
+    /// writes on the connection never auto-commit (issue #7466).
+    pub(crate) fn close_virtual_table_cursors(&mut self) {
+        for slot in self.cursors.iter_mut() {
+            if matches!(slot, Some(Cursor::Virtual(_))) {
+                *slot = None;
+            }
+        }
+    }
+
     /// Begin a statement subtransaction.
     ///
     /// Creates a savepoint on the main DB's MvStore (or pager for WAL mode),
@@ -1983,6 +2003,11 @@ impl Program {
 
         // Reset state for next use
         program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
+        // Drop virtual table cursors before the `is_nested_stmt()` check
+        // below: a pragma virtual table cursor owns a nested helper statement
+        // whose guard would otherwise make this top-level statement classify
+        // itself as nested and skip transaction finalization entirely.
+        program_state.close_virtual_table_cursors();
         let tx_state = self.connection.get_tx_state();
         if tx_state == TransactionState::None
             && matches!(program_state.commit_state, CommitState::Ready)
@@ -2484,6 +2509,11 @@ impl Program {
                 "Failed to clean up VACUUM state during abort",
             );
         }
+
+        // Virtual table cursors (pragma table-valued functions) also own
+        // nested helper statements whose drop releases nested guards. Drop
+        // them before the `is_nested_stmt()` check below for the same reason.
+        state.close_virtual_table_cursors();
 
         // Only end trigger execution if the subprogram was actually running.
         // Cached (pooled) statements may be dropped after their trigger execution
