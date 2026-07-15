@@ -1,4 +1,3 @@
-use crate::SqliteDialect;
 use rustc_hash::FxHashMap;
 use std::sync::{atomic::Ordering, Arc};
 
@@ -299,7 +298,7 @@ pub(crate) fn open_vacuum_temp_db(
         OpenFlags::Create,
         vacuum_target_opts_from_source(source_db),
         encryption_opts,
-        Arc::new(SqliteDialect),
+        source_db.dialect(),
     )?;
     let conn = db.connect_with_encryption(encryption_key)?;
     conn.reset_page_size(page_size)?;
@@ -671,7 +670,7 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.tables_to_create[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                let sql_str = &entry.sql;
+                let sql = table_sql_for_vacuum_replay(&state.target_conn, &entry.sql)?;
 
                 // System tables (sqlite_stat1, __turso_internal_types, etc.) have
                 // reserved name prefixes that translate_create_table rejects for
@@ -684,7 +683,7 @@ pub(crate) fn vacuum_target_build_step(
                 if is_system {
                     state.target_conn.start_nested();
                 }
-                let target_stmt = state.target_conn.prepare(sql_str);
+                let target_stmt = state.target_conn.prepare(&sql);
                 if is_system {
                     state.target_conn.end_nested();
                 }
@@ -1002,6 +1001,10 @@ pub(crate) fn vacuum_target_build_step(
             }
         }
     }
+}
+
+fn table_sql_for_vacuum_replay(target_conn: &Arc<Connection>, sql: &str) -> Result<String> {
+    target_conn.dialect().table_sql_for_replay(sql)
 }
 
 // Build the SELECT and INSERT SQL strings for copying a table's data.

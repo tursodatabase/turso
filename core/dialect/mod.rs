@@ -51,6 +51,57 @@ pub trait Dialect: Send + Sync + 'static {
         sql: &str,
         root_page: i64,
     ) -> crate::Result<crate::schema::BTreeTable>;
+
+    /// Decode a storage-backed table's persisted SQL into its `CREATE TABLE`
+    /// AST.
+    ///
+    /// Unlike [`Dialect::parse`], this method receives SQL read from
+    /// `sqlite_schema` and must recognize the representation produced by
+    /// [`Dialect::format_table_sql`] and
+    /// [`Dialect::format_rewritten_table_sql`]. Internal engine tables use
+    /// plain SQLite text, so implementations must retain the same SQLite
+    /// fallback required by [`Dialect::parse_table_sql`].
+    fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt>;
+
+    /// Recover SQL that can be prepared to recreate a persisted table.
+    ///
+    /// Dialects that wrap original frontend DDL in their stored representation
+    /// must unwrap it here so replay preserves that DDL. The returned statement
+    /// must create the table in the connection's main schema, even when the
+    /// persisted statement originally qualified the source database. Unmarked
+    /// internal engine tables must retain the SQLite fallback used by the
+    /// schema parsing methods.
+    fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String>;
+
+    /// Produce the SQL text to store in `sqlite_schema` for a
+    /// `CREATE TABLE`.
+    ///
+    /// `input` is the original statement text as the user wrote it, in the
+    /// frontend's dialect; `tbl_name` and `body` are the translated AST.
+    /// The SQLite dialect formats canonical SQLite text from the AST; a
+    /// frontend dialect typically stores `input` with a marker it can
+    /// recognize in [`Dialect::parse_table_sql`].
+    fn format_table_sql(
+        &self,
+        input: &str,
+        tbl_name: &turso_parser::ast::QualifiedName,
+        body: &turso_parser::ast::CreateTableBody,
+    ) -> crate::Result<String>;
+
+    /// Produce stored SQL after the engine rewrites a `CREATE TABLE` AST.
+    ///
+    /// Schema rewrites cannot reuse the original frontend text because it no
+    /// longer describes the rewritten table. Dialects that need syntax beyond
+    /// a marker around canonical SQL can override this to render their native
+    /// table definition from the rewritten AST.
+    fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> crate::Result<String> {
+        let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
+            return Err(crate::LimboError::InternalError(
+                "format_rewritten_table_sql requires CREATE TABLE".to_string(),
+            ));
+        };
+        self.format_table_sql(&stmt.to_string(), tbl_name, body)
+    }
 }
 
 #[cfg(test)]
@@ -91,6 +142,67 @@ mod tests {
             self.parse_calls.fetch_add(1, Ordering::SeqCst);
             let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
             BTreeTable::from_sql(sql, root_page)
+        }
+
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
+            sqlite::parse_table_sql_ast(sql)
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
+            sqlite::table_sql_for_replay(sql)
+        }
+
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _tbl_name: &turso_parser::ast::QualifiedName,
+            _body: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(format!("/* test */ {input}"))
+        }
+    }
+
+    /// Stores table definitions in syntax that SQLite cannot parse and always
+    /// adds its marker, so replay tests detect repeated storage formatting.
+    struct StrictTestDialect;
+
+    impl StrictTestDialect {
+        const PREFIX: &'static str = "strict: ";
+    }
+
+    impl Dialect for StrictTestDialect {
+        fn name(&self) -> &'static str {
+            "strict-test"
+        }
+
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            sqlite::parse(sql)
+        }
+
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
+            BTreeTable::from_sql(sql, root_page)
+        }
+
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
+            sqlite::parse_table_sql_ast(sql)
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
+            sqlite::table_sql_for_replay(sql)
+        }
+
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _tbl_name: &turso_parser::ast::QualifiedName,
+            _body: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(format!("{}{input}", Self::PREFIX))
         }
     }
 
@@ -191,6 +303,112 @@ mod tests {
     }
 
     #[test]
+    fn create_table_stores_dialect_formatted_sql() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        {
+            let dialect = Arc::new(TestDialect::default());
+            let db = open_db(&io, "dialect-store.db", dialect).unwrap();
+            let conn = db.connect().unwrap();
+
+            // A frontend prepares its translated AST while supplying the
+            // original statement text.
+            let input = "CREATE TABLE t (x INTEGER)";
+            let stmt = match turso_parser::parser::Parser::new(input.as_bytes())
+                .next_cmd()
+                .unwrap()
+                .unwrap()
+            {
+                turso_parser::ast::Cmd::Stmt(stmt) => stmt,
+                other => panic!("unexpected command: {other:?}"),
+            };
+            conn.prepare_translated_stmt(stmt, input)
+                .unwrap()
+                .run_ignore_rows()
+                .unwrap();
+
+            // The stored schema row carries the dialect marker and the
+            // original text.
+            let rows = conn
+                .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            let stored = rows[0][0].to_string();
+            assert_eq!(stored.trim_matches('\''), format!("/* test */ {input}"));
+            conn.close().unwrap();
+        }
+
+        // Round-trip: reopening parses the marked row back through the
+        // dialect and the table stays usable.
+        let dialect = Arc::new(TestDialect::default());
+        let db = open_db(&io, "dialect-store.db", dialect.clone()).unwrap();
+        assert!(dialect.parse_calls.load(Ordering::SeqCst) >= 1);
+        let conn = db.connect().unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        let rows = conn
+            .prepare("SELECT x FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn alter_table_rewrites_dialect_formatted_sql() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-alter-table.db", Arc::new(StrictTestDialect)).unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        conn.execute("ALTER TABLE t RENAME TO u").unwrap();
+
+        let rows = conn
+            .prepare("SELECT sql FROM sqlite_schema WHERE name = 'u'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0][0].to_string().trim_matches('\''),
+            "strict: CREATE TABLE u (x INTEGER)"
+        );
+        conn.execute("INSERT INTO u VALUES (1)").unwrap();
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn alter_table_rename_column_decodes_dialect_formatted_sql() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-alter-column.db", Arc::new(StrictTestDialect)).unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        conn.execute("ALTER TABLE t RENAME COLUMN x TO y").unwrap();
+
+        let rows = conn
+            .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0][0].to_string().trim_matches('\''),
+            "strict: CREATE TABLE t (y INTEGER)"
+        );
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        assert_eq!(
+            conn.prepare("SELECT y FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![crate::Value::from_i64(1)]]
+        );
+        conn.close().unwrap();
+    }
+
+    #[test]
     fn registry_rejects_dialect_mismatch() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let _db = open_db(&io, "dialect-mismatch.db", Arc::new(SqliteDialect)).unwrap();
@@ -230,6 +448,142 @@ mod tests {
         assert!(
             err.to_string().contains("already open with dialect"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    #[test]
+    fn vacuum_into_replays_schema_with_source_dialect() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.db");
+        let output_path = dir.path().join("output.db");
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            source_path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(StrictTestDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (42)").unwrap();
+
+        conn.execute(format!("VACUUM INTO '{}'", output_path.display()))
+            .unwrap();
+
+        let output_db = Database::open_file(
+            io,
+            output_path.to_str().unwrap(),
+            Arc::new(StrictTestDialect),
+        )
+        .unwrap();
+        let output_conn = output_db.connect().unwrap();
+        let schema_rows = output_conn
+            .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(schema_rows.len(), 1);
+        assert_eq!(
+            schema_rows[0][0].to_string().trim_matches('\''),
+            "strict: CREATE TABLE t(x INTEGER)"
+        );
+        assert_eq!(
+            output_conn
+                .prepare("SELECT x FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![crate::Value::from_i64(42)]]
+        );
+    }
+
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    #[test]
+    fn vacuum_attached_database_strips_source_schema_from_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.db");
+        let attached_path = dir.path().join("attached.db");
+        let output_path = dir.path().join("output.db");
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            source_path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new().with_attach(true),
+            None,
+            Arc::new(StrictTestDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(format!(
+            "ATTACH DATABASE '{}' AS aux",
+            attached_path.display()
+        ))
+        .unwrap();
+        conn.execute("CREATE TABLE aux.t (x INTEGER)").unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (42)").unwrap();
+
+        conn.execute(format!("VACUUM aux INTO '{}'", output_path.display()))
+            .unwrap();
+
+        let output_db = Database::open_file(
+            io,
+            output_path.to_str().unwrap(),
+            Arc::new(StrictTestDialect),
+        )
+        .unwrap();
+        let output_conn = output_db.connect().unwrap();
+        assert_eq!(
+            output_conn
+                .prepare("SELECT x FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![crate::Value::from_i64(42)]]
+        );
+    }
+
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    #[test]
+    fn in_place_vacuum_replays_schema_with_source_dialect() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.db");
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new().with_vacuum(true),
+            None,
+            Arc::new(StrictTestDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (42)").unwrap();
+
+        conn.execute("VACUUM").unwrap();
+
+        let schema_rows = conn
+            .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(schema_rows.len(), 1);
+        assert_eq!(
+            schema_rows[0][0].to_string().trim_matches('\''),
+            "strict: CREATE TABLE t(x INTEGER)"
+        );
+        assert_eq!(
+            conn.prepare("SELECT x FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![crate::Value::from_i64(42)]]
         );
     }
 }

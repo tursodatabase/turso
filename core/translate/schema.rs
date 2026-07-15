@@ -1093,6 +1093,7 @@ fn emit_ctas_insert(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn translate_create_table(
     tbl_name: ast::QualifiedName,
     resolver: &Resolver,
@@ -1101,6 +1102,7 @@ pub fn translate_create_table(
     body: ast::CreateTableBody,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
+    input: &str,
 ) -> Result<()> {
     // For CTAS, extract the SELECT, determine column info, and convert to a
     // regular ColumnsAndConstraints body + separate SELECT for data insertion.
@@ -1291,11 +1293,16 @@ pub fn translate_create_table(
         false
     };
 
-    // For CTAS, use the pre-built SQL string; for regular CREATE TABLE, build it from the body.
+    // For CTAS, use the pre-built SQL string; for regular CREATE TABLE, let
+    // the schema dialect format the SQL to store (the SQLite dialect renders
+    // canonical text from the AST, a frontend dialect preserves its own
+    // input text).
     let sql = if let Some(ref info) = ctas_info {
         info.schema_sql.clone()
     } else {
-        create_table_body_to_str(&tbl_name, &body)?
+        connection
+            .dialect()
+            .format_table_sql(input, &tbl_name, &body)?
     };
 
     let parse_schema_label = program.allocate_label();
@@ -1619,25 +1626,6 @@ fn collect_autoindexes(
     } else {
         Ok(Some(regs))
     }
-}
-
-fn create_table_body_to_str(
-    tbl_name: &ast::QualifiedName,
-    body: &ast::CreateTableBody,
-) -> crate::Result<String> {
-    let mut sql = String::new();
-    sql.push_str(format!("CREATE TABLE {} {}", tbl_name.name.as_ident(), body).as_str());
-    match body {
-        ast::CreateTableBody::ColumnsAndConstraints {
-            columns: _,
-            constraints: _,
-            options: _,
-        } => {}
-        ast::CreateTableBody::AsSelect(_select) => {
-            crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
-        }
-    }
-    Ok(sql)
 }
 
 fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImpl>) -> String {

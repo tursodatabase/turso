@@ -1300,6 +1300,50 @@ fn subprocess_database_open_parent_directly_uses_child_created_table() {
 }
 
 #[test]
+fn subprocess_database_open_parent_translated_stmt_uses_child_created_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("coordination-translated-child-table-use.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "child schema process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&schema_output.stdout),
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    let input = "insert into child_table(value) values ('parent-schema')";
+    let (cmd, _) = crate::dialect::sqlite::parse(input).unwrap();
+    let Some(turso_parser::ast::Cmd::Stmt(stmt)) = cmd else {
+        panic!("translated statement input did not parse as a statement");
+    };
+    conn.prepare_translated_stmt(stmt, input)
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+
+    let child_rows =
+        get_rows_without_schema_retry(&conn, "select value from child_table order by rowid");
+    assert_eq!(child_rows.len(), 2);
+    assert_eq!(child_rows[0][0].to_string(), "child-schema");
+    assert_eq!(child_rows[1][0].to_string(), "parent-schema");
+}
+
+#[test]
 fn subprocess_database_open_parent_execute_uses_child_created_table() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-execute-child-table-use.db");

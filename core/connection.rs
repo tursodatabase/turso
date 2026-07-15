@@ -18,7 +18,7 @@ use crate::util::{OpenMode, OpenOptions};
 use crate::Page;
 use crate::SqliteDialect;
 use crate::{
-    function,
+    ast, function,
     io::{MemoryIO, IO},
     progress::{ProgressHandler, ProgressHandlerCallback},
     translate,
@@ -1003,6 +1003,52 @@ impl Connection {
                 pager,
                 mode,
                 byte_offset_end,
+                origin,
+                needs_nested_guard,
+            ))
+        })();
+        if result.is_err() && needs_nested_guard {
+            self.end_nested();
+        }
+        result
+    }
+
+    /// Prepare an already-translated statement while keeping the original
+    /// SQL text.
+    ///
+    /// A frontend that already has an engine AST can call this instead of
+    /// parsing through [`Dialect::parse`](crate::Dialect::parse), while the
+    /// original text remains available for schema storage, diagnostics, and
+    /// later re-preparation through the dialect.
+    pub fn prepare_translated_stmt(
+        self: &Arc<Connection>,
+        stmt: ast::Stmt,
+        input: &str,
+    ) -> Result<Statement> {
+        self.prepare_stmt_with_input_and_origin(stmt, input, StatementOrigin::Root)
+    }
+
+    #[turso_macros::trace_stack]
+    fn prepare_stmt_with_input_and_origin(
+        self: &Arc<Connection>,
+        stmt: ast::Stmt,
+        input: &str,
+        origin: StatementOrigin,
+    ) -> Result<Statement> {
+        if self.is_closed() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+        let needs_nested_guard = origin.needs_nested_guard();
+        if needs_nested_guard {
+            self.start_nested();
+        }
+        let result = (|| {
+            let (program, pager, mode) = self.compile_cmd(Cmd::Stmt(stmt), input)?;
+            Ok(Statement::new_with_origin(
+                program,
+                pager,
+                mode,
+                0,
                 origin,
                 needs_nested_guard,
             ))
