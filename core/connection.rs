@@ -17,7 +17,7 @@ use crate::util::{OpenMode, OpenOptions};
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::Page;
 use crate::{
-    ast, function,
+    function,
     io::{MemoryIO, IO},
     progress::{ProgressHandler, ProgressHandlerCallback},
     translate,
@@ -1000,55 +1000,6 @@ impl Connection {
                 pager,
                 mode,
                 byte_offset_end,
-                origin,
-                needs_nested_guard,
-            ))
-        })();
-        if result.is_err() && needs_nested_guard {
-            self.end_nested();
-        }
-        result
-    }
-
-    /// Prepare a statement from an AST node directly, skipping SQL parsing.
-    /// This is more efficient when AST is already available or constructed programmatically.
-    pub fn prepare_stmt(self: &Arc<Connection>, stmt: ast::Stmt) -> Result<Statement> {
-        self.prepare_stmt_with_origin(stmt, StatementOrigin::Root)
-    }
-
-    #[turso_macros::trace_stack]
-    fn prepare_stmt_with_origin(
-        self: &Arc<Connection>,
-        stmt: ast::Stmt,
-        origin: StatementOrigin,
-    ) -> Result<Statement> {
-        if self.is_closed() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
-        }
-        let needs_nested_guard = origin.needs_nested_guard();
-        if needs_nested_guard {
-            self.start_nested();
-        }
-        let result = (|| {
-            self.maybe_update_schema();
-            let syms = self.syms.read();
-            let pager = self.pager.load().clone();
-            let mode = QueryMode::Normal;
-            let schema = self.schema.read().clone();
-            let program = translate::translate(
-                &schema,
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                "<ast>", // No SQL input string available
-            )?;
-            Ok(Statement::new_with_origin(
-                program,
-                pager,
-                mode,
-                0,
                 origin,
                 needs_nested_guard,
             ))
