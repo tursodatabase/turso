@@ -37,7 +37,6 @@ use crate::vdbe::{
     BranchOffset, CursorID,
 };
 use crate::{
-    bail_parse_error,
     error::SQLITE_CONSTRAINT_CHECK,
     function::Func,
     sync::Arc,
@@ -1568,11 +1567,8 @@ pub fn emit_cdc_commit_insns(
     program.mark_last_insn_constant();
 
     // reg+1: change_time = unixepoch()
-    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0)? else {
-        bail_parse_error!("no function {}", "unixepoch");
-    };
     let unixepoch_fn_ctx = crate::function::FuncCtx {
-        func: unixepoch_fn,
+        func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
     };
     program.emit_insn(Insn::Function {
@@ -1586,11 +1582,8 @@ pub fn emit_cdc_commit_insns(
     // Pass -1 as candidate: if a txn_id exists, return it; if not, -1 is stored (and will be reset).
     let minus_one_reg = program.alloc_register();
     program.emit_int(-1, minus_one_reg);
-    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1)? else {
-        bail_parse_error!("no function {}", "conn_txn_id");
-    };
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
-        func: conn_txn_id_fn,
+        func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
     };
     program.emit_insn(Insn::Function {
@@ -1648,11 +1641,8 @@ pub fn emit_cdc_autocommit_commit(
     let cdc_info = program.capture_data_changes_info().as_ref();
     if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
         // Check if we're in autocommit mode; if so, emit a COMMIT record.
-        let Some(is_autocommit_fn) = resolver.resolve_function("is_autocommit", 0)? else {
-            bail_parse_error!("no function {}", "is_autocommit");
-        };
         let is_autocommit_fn_ctx = crate::function::FuncCtx {
-            func: is_autocommit_fn,
+            func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
             arg_count: 0,
         };
         let autocommit_reg = program.alloc_register();
@@ -1702,16 +1692,13 @@ pub fn emit_cdc_explicit_commit_insns(
 ) -> Result<()> {
     let minus_one_reg = program.alloc_register();
     program.emit_int(-1, minus_one_reg);
-    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1)? else {
-        bail_parse_error!("no function {}", "conn_txn_id");
-    };
     let txn_id_reg = program.alloc_register();
     program.emit_insn(Insn::Function {
         constant_mask: 0,
         start_reg: minus_one_reg,
         dest: txn_id_reg,
         func: crate::function::FuncCtx {
-            func: conn_txn_id_fn,
+            func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
             arg_count: 1,
         },
     });
