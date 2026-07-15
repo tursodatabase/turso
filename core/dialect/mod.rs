@@ -149,6 +149,14 @@ pub trait Dialect: Send + Sync + 'static {
             "no such function: {name}"
         )))
     }
+
+    /// Whether this dialect needs the custom-type machinery (DECODE/ENCODE,
+    /// affinity metadata) regardless of the experimental database flag.
+    /// A dialect whose type system leans on custom types (e.g. PostgreSQL)
+    /// returns true so its databases never open with the machinery off.
+    fn requires_custom_types(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

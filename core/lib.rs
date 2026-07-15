@@ -744,13 +744,15 @@ impl Database {
             None
         };
 
+        let enable_custom_types = opts.enable_custom_types || dialect.requires_custom_types();
+
         let db = Database {
             mv_store,
             mv_store_allocator,
             path,
             wal_path,
             schema: Arc::new(Mutex::new(Arc::new({
-                let mut s = Schema::with_options(opts.enable_custom_types, dialect.as_ref())?;
+                let mut s = Schema::with_options(enable_custom_types, dialect.as_ref())?;
                 s.generated_columns_enabled = opts.enable_generated_columns;
                 s
             }))),
@@ -1605,11 +1607,11 @@ impl Database {
                     // contents. We need to read the stored type definitions so
                     // that DECODE/ENCODE and affinity metadata are available to
                     // all subsequent connections.
-                    if opts.enable_custom_types {
-                        let conn = state
-                            .conn
-                            .as_ref()
-                            .expect("conn must be initialized in Init phase");
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .expect("conn must be initialized in Init phase");
+                    if conn.experimental_custom_types_enabled() {
                         // Sync the connection's schema from the database so it
                         // can query __turso_internal_types.
                         conn.maybe_update_schema();
@@ -3018,7 +3020,7 @@ impl Database {
     }
 
     pub fn experimental_custom_types_enabled(&self) -> bool {
-        self.opts.enable_custom_types
+        self.opts.enable_custom_types || self.dialect.requires_custom_types()
     }
 
     pub fn experimental_encryption_enabled(&self) -> bool {
