@@ -655,7 +655,7 @@ pub trait CursorTrait: Any + Send + Sync {
         _column: usize,
         _off: usize,
         _len: usize,
-        _out: &mut Vec<u8>,
+        _out: &mut crate::ValueBlob,
     ) -> Result<IOResult<()>> {
         Err(LimboError::InternalError(
             "incremental blob I/O is only supported on table rows".to_string(),
@@ -5805,7 +5805,7 @@ impl BTreeCursor {
         column: usize,
         off: usize,
         len: usize,
-        out: &mut Vec<u8>,
+        out: &mut crate::ValueBlob,
     ) -> Result<IOResult<()>> {
         let payload_off = return_if_io!(self.blob_resolve_range(column, off, len));
         out.clear();
@@ -6228,7 +6228,7 @@ impl CursorTrait for BTreeCursor {
         column: usize,
         off: usize,
         len: usize,
-        out: &mut Vec<u8>,
+        out: &mut crate::ValueBlob,
     ) -> Result<IOResult<()>> {
         self.blob_read_column_inherent(column, off, len, out)
     }

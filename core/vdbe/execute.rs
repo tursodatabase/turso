@@ -1,5 +1,6 @@
 use crate::alloc::{
-    DynAllocator, TursoIteratorExt, TursoSliceExt, TursoTryWithCapacityExt, TursoVecExt,
+    DynAllocator, TursoAllocExt, TursoIteratorExt, TursoSliceExt, TursoTryWithCapacityExt,
+    TursoVecExt,
 };
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
@@ -2864,7 +2865,7 @@ pub fn op_blob_read(
     let amt = blob_reg_usize(state, *amount, "BlobRead", "amount")?;
     // The callee validates (off, amt) against the value's length before sizing `out`,
     // so a hostile amount register cannot force an allocation here.
-    let mut out = Vec::new();
+    let mut out: crate::ValueBlob = TursoAllocExt::new();
     match blob_btree_cursor(state, *cursor, "BlobRead")?
         .blob_read_column(*column, off, amt, &mut out)
     {
@@ -2873,7 +2874,7 @@ pub fn op_blob_read(
         Err(LimboError::BlobHandleExpired) => return Ok(blob_expired_ack(state, *dest)),
         Err(err) => return Err(err),
     }
-    state.registers[*dest].set_value(Value::Blob(crate::types::value_blob_from_slice(&out)?));
+    state.registers[*dest].set_value(Value::Blob(out));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
