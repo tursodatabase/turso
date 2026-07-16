@@ -7453,6 +7453,24 @@ pub fn op_rowset_test(
     Ok(InsnFunctionStepResult::Step)
 }
 
+fn parse_schema_sql_for_alter(
+    dialect: &dyn crate::Dialect,
+    entry_type: &str,
+    root_page: i64,
+    sql: &str,
+) -> Result<Option<ast::Cmd>> {
+    if entry_type == "table" && root_page != 0 {
+        let stmt = dialect.parse_table_sql_ast(sql)?;
+        if !matches!(stmt, ast::Stmt::CreateTable { .. }) {
+            return Err(LimboError::Corrupt(
+                "storage-backed table schema is not CREATE TABLE".to_string(),
+            ));
+        }
+        return Ok(Some(ast::Cmd::Stmt(stmt)));
+    }
+    dialect.parse(sql).map(|(cmd, _)| cmd)
+}
+
 pub fn op_function(
     program: &Program,
     state: &mut ProgramState,
@@ -9139,8 +9157,23 @@ pub fn op_function(
                 ),
             },
         },
+        crate::function::Func::Dialect(name) => {
+            let args: Vec<Value> = state.registers[*start_reg..*start_reg + arg_count]
+                .iter()
+                .map(|r| r.get_value().clone())
+                .collect();
+            let result = program.connection.dialect().exec_scalar_function(
+                &program.connection,
+                name,
+                &args,
+            )?;
+            state.registers[*dest].set_value(result);
+        }
         crate::function::Func::AlterTable(alter_func) => {
             let r#type = &state.registers[*start_reg].get_value().clone();
+            let Value::Text(entry_type) = r#type else {
+                panic!("sqlite_schema.type should be TEXT")
+            };
 
             let Value::Text(name) = &state.registers[*start_reg + 1].get_value() else {
                 panic!("sqlite_schema.name should be TEXT")
@@ -9198,10 +9231,13 @@ pub fn op_function(
                             break 'sql None;
                         };
 
-                        let mut parser = Parser::new(sql.as_str().as_bytes());
-                        let ast::Cmd::Stmt(stmt) =
-                            parser.next().expect("parser should have next item")?
-                        else {
+                        let cmd = parse_schema_sql_for_alter(
+                            program.connection.dialect().as_ref(),
+                            entry_type.as_str(),
+                            *root_page,
+                            sql.as_str(),
+                        )?;
+                        let Some(ast::Cmd::Stmt(stmt)) = cmd else {
                             return Err(LimboError::InternalError(
                                 "Unexpected command during ALTER TABLE RENAME processing"
                                     .to_string(),
@@ -9326,24 +9362,32 @@ pub fn op_function(
                                             options,
                                         },
                                     };
-                                    Some(new_stmt.to_string())
+                                    Some(
+                                        program
+                                            .connection
+                                            .dialect()
+                                            .format_rewritten_table_sql(&new_stmt)?,
+                                    )
                                 } else {
                                     // Other tables: only emit if we actually changed their FK targets.
                                     if !any_change {
                                         break 'sql None;
                                     }
+                                    let new_stmt = ast::Stmt::CreateTable {
+                                        tbl_name,
+                                        temporary,
+                                        if_not_exists,
+                                        body: ast::CreateTableBody::ColumnsAndConstraints {
+                                            columns,
+                                            constraints,
+                                            options,
+                                        },
+                                    };
                                     Some(
-                                        ast::Stmt::CreateTable {
-                                            tbl_name,
-                                            temporary,
-                                            if_not_exists,
-                                            body: ast::CreateTableBody::ColumnsAndConstraints {
-                                                columns,
-                                                constraints,
-                                                options,
-                                            },
-                                        }
-                                        .to_string(),
+                                        program
+                                            .connection
+                                            .dialect()
+                                            .format_rewritten_table_sql(&new_stmt)?,
                                     )
                                 }
                             }
@@ -9469,10 +9513,13 @@ pub fn op_function(
                             break 'sql None;
                         };
 
-                        let mut parser = Parser::new(sql.as_str().as_bytes());
-                        let ast::Cmd::Stmt(stmt) =
-                            parser.next().expect("parser should have next item")?
-                        else {
+                        let cmd = parse_schema_sql_for_alter(
+                            program.connection.dialect().as_ref(),
+                            entry_type.as_str(),
+                            *root_page,
+                            sql.as_str(),
+                        )?;
+                        let Some(ast::Cmd::Stmt(stmt)) = cmd else {
                             return Err(LimboError::InternalError(
                                 "Unexpected command during ALTER TABLE RENAME COLUMN processing"
                                     .to_string(),
@@ -9694,18 +9741,21 @@ pub fn op_function(
                                         break 'sql None;
                                     }
                                 }
+                                let new_stmt = ast::Stmt::CreateTable {
+                                    tbl_name,
+                                    body: ast::CreateTableBody::ColumnsAndConstraints {
+                                        columns,
+                                        constraints,
+                                        options,
+                                    },
+                                    temporary,
+                                    if_not_exists,
+                                };
                                 Some(
-                                    ast::Stmt::CreateTable {
-                                        tbl_name,
-                                        body: ast::CreateTableBody::ColumnsAndConstraints {
-                                            columns,
-                                            constraints,
-                                            options,
-                                        },
-                                        temporary,
-                                        if_not_exists,
-                                    }
-                                    .to_string(),
+                                    program
+                                        .connection
+                                        .dialect()
+                                        .format_rewritten_table_sql(&new_stmt)?,
                                 )
                             }
                             // Trigger SQL is rewritten by separate UPDATE statements
@@ -12824,6 +12874,7 @@ fn op_parse_schema_step(
                     &mut inner.dbsp_state_index_roots,
                     &mut inner.materialized_view_info,
                     &attached_resolver,
+                    conn.dialect().as_ref(),
                 )?;
                 continue;
             }
@@ -16876,6 +16927,7 @@ fn op_vacuum_into_inner(
                     OpenFlags::Create,
                     output_opts,
                     None,
+                    source_db.dialect(),
                 )?;
                 let output_conn = output_db.connect()?;
                 output_conn.reset_page_size(page_size)?;
@@ -17075,6 +17127,7 @@ mod tests {
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
+    use crate::SqliteDialect;
     use crate::{Database, DatabaseOpts, MemoryIO, IO};
 
     fn prepare_test_statement() -> Statement {
@@ -17085,6 +17138,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -17145,6 +17199,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -17209,6 +17264,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_attach(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -17270,6 +17326,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -17314,6 +17371,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -17865,6 +17923,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();

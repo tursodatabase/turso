@@ -5,6 +5,7 @@ use std::ops::{Deref, DerefMut};
 use std::panic::UnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use turso_core::SqliteDialect;
 
 use bitmaps::Bitmap;
 use garde::Validate;
@@ -40,6 +41,7 @@ fn enable_mvcc_on_attached_dbs(io: &Arc<dyn SimIO>, aux_paths: impl Iterator<Ite
                 .with_attach(true)
                 .with_generated_columns(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap_or_else(|e| panic!("Failed to open aux DB {aux_path:?}: {e}"));
         let aux_conn = aux_db
@@ -1172,6 +1174,7 @@ impl SimulatorEnv {
                 .with_attach(true)
                 .with_generated_columns(true),
             None,
+            Arc::new(SqliteDialect),
         ) {
             Ok(db) => db,
             Err(e) => {
@@ -1393,6 +1396,7 @@ impl SimulatorEnv {
                 .with_attach(true)
                 .with_generated_columns(true),
             None,
+            Arc::new(SqliteDialect),
         ) {
             Ok(db) => db,
             Err(e) => {

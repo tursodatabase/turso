@@ -5,6 +5,7 @@ use jni::objects::{JByteArray, JObject, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 use std::sync::Arc;
+use turso_core::SqliteDialect;
 use turso_core::{Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags};
 
 struct TursoDB {
@@ -78,7 +79,7 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openUtf8<'local>(
         }
     };
 
-    let db = match Database::open_file(io.clone(), &path) {
+    let db = match Database::open_file(io.clone(), &path, Arc::new(SqliteDialect)) {
         Ok(db) => db,
         Err(e) => {
             set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
@@ -167,6 +168,7 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openWithEncryptionUtf8<'loca
         OpenFlags::Create,
         db_opts,
         encryption_opts,
+        Arc::new(SqliteDialect),
     ) {
         Ok(db) => db,
         Err(e) => {

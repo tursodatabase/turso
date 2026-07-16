@@ -132,6 +132,7 @@ fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
         OpenFlags::default(),
         multiprocess_wal_db_opts(),
         None,
+        Arc::new(SqliteDialect),
     )
 }
 
@@ -153,6 +154,7 @@ fn open_multiprocess_db_async(io: Arc<dyn IO>, path: &str) -> Result<Arc<Databas
             multiprocess_wal_db_opts(),
             None,
             None,
+            Arc::new(SqliteDialect),
         )? {
             IOResult::Done(db) => return Ok(db),
             IOResult::IO(io_completion) => io_completion.wait(&*io)?,
@@ -165,7 +167,14 @@ fn open_multiprocess_db_with_flags(
     path: &str,
     flags: OpenFlags,
 ) -> Result<Arc<Database>> {
-    Database::open_file_with_flags(io, path, flags, multiprocess_wal_db_opts(), None)
+    Database::open_file_with_flags(
+        io,
+        path,
+        flags,
+        multiprocess_wal_db_opts(),
+        None,
+        Arc::new(SqliteDialect),
+    )
 }
 
 #[test]
@@ -255,7 +264,7 @@ fn database_open_without_experimental_multiprocess_wal_uses_in_process_backend()
     let db_path = dir.path().join("coordination-default-off.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let db = Database::open_file(io, db_path_str).unwrap();
+    let db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -275,7 +284,7 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_process() 
     let db_path = dir.path().join("coordination-default-locked.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let _db = Database::open_file(io, db_path_str).unwrap();
+    let _db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
     let child_output = Command::new(&current_exe)
@@ -302,6 +311,7 @@ fn database_open_with_experimental_multiprocess_wal_rejects_unsupported_io_backe
         OpenFlags::default(),
         multiprocess_wal_db_opts(),
         None,
+        Arc::new(SqliteDialect),
     )
     .expect_err("multiprocess WAL should reject IO backends without shared coordination");
     assert!(
@@ -336,7 +346,7 @@ fn multiprocess_wal_rejects_opening_mvcc_database() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     {
-        let db = Database::open_file(io.clone(), db_path_str).unwrap();
+        let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -361,7 +371,7 @@ fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     {
-        let db = Database::open_file(io.clone(), db_path_str).unwrap();
+        let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -406,7 +416,7 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_multiproce
         .join("coordination-default-parent-multiprocess-child.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let _db = Database::open_file(io, db_path_str).unwrap();
+    let _db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
     let child_output = Command::new(&current_exe)
@@ -830,7 +840,7 @@ fn default_locked_db_child_process() {
     };
 
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let err = Database::open_file(io, db_path.to_str().unwrap())
+    let err = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(SqliteDialect))
         .expect_err("default non-multiprocess open should stay DB-file locked across processes");
     assert!(
         matches!(err, LimboError::LockingError(_)),
@@ -1054,6 +1064,7 @@ fn plain_vacuum_rejects_multiprocess_wal_database() {
         OpenFlags::default(),
         multiprocess_wal_db_opts().with_vacuum(true),
         None,
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db.connect().unwrap();
@@ -1280,6 +1291,50 @@ fn subprocess_database_open_parent_directly_uses_child_created_table() {
         .prepare("insert into child_table(value) values ('parent-schema')")
         .unwrap();
     stmt.run_ignore_rows().unwrap();
+
+    let child_rows =
+        get_rows_without_schema_retry(&conn, "select value from child_table order by rowid");
+    assert_eq!(child_rows.len(), 2);
+    assert_eq!(child_rows[0][0].to_string(), "child-schema");
+    assert_eq!(child_rows[1][0].to_string(), "parent-schema");
+}
+
+#[test]
+fn subprocess_database_open_parent_translated_stmt_uses_child_created_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("coordination-translated-child-table-use.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "child schema process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&schema_output.stdout),
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    let input = "insert into child_table(value) values ('parent-schema')";
+    let (cmd, _) = crate::dialect::sqlite::parse(input).unwrap();
+    let Some(turso_parser::ast::Cmd::Stmt(stmt)) = cmd else {
+        panic!("translated statement input did not parse as a statement");
+    };
+    conn.prepare_translated_stmt(stmt, input)
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
 
     let child_rows =
         get_rows_without_schema_retry(&conn, "select value from child_table order by rowid");
@@ -1841,7 +1896,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
 #[test]
 fn memory_database_keeps_in_process_wal_backend() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:").unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -1854,7 +1909,7 @@ fn memory_database_keeps_in_process_wal_backend() {
 #[test]
 fn memory_database_query_can_close_without_checkpointing() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:").unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
 
     conn.query("VALUES ('ok')").unwrap();

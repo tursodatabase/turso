@@ -8,6 +8,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use turso_core::SqliteDialect;
 
 use turso_core::{
     CheckpointMode, Connection, Database, DatabaseOpts, LimboError, OpenFlags,
@@ -58,7 +59,8 @@ pub fn run_worker(
         db_path,
         OpenFlags::default(),
         db_opts,
-        None, // encryption_opts
+        None,
+        Arc::new(SqliteDialect),
     )?;
 
     if connections_per_process == 0 {

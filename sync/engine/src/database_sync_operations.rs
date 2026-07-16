@@ -3785,6 +3785,7 @@ mod tests {
         collections::BTreeMap,
         sync::{Arc, Mutex},
     };
+    use turso_core::SqliteDialect;
 
     use bytes::{Bytes, BytesMut};
     use prost::Message;
@@ -4157,8 +4158,12 @@ mod tests {
     fn max_local_change_id_reads_cdc_high_water_mark() {
         let temp_file = NamedTempFile::new().unwrap();
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db = turso_core::Database::open_file(io.clone(), temp_file.path().to_str().unwrap())
-            .unwrap();
+        let db = turso_core::Database::open_file(
+            io.clone(),
+            temp_file.path().to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let db = Arc::new(DatabaseTape::new(db));
 
         let mut gen = genawaiter::sync::Gen::new({
@@ -5078,8 +5083,12 @@ mod tests {
         ];
         std::fs::write(txns_temp.path(), encoded_logical_txns(&txns)).unwrap();
 
-        let db =
-            turso_core::Database::open_file(io.clone(), db_temp.path().to_str().unwrap()).unwrap();
+        let db = turso_core::Database::open_file(
+            io.clone(),
+            db_temp.path().to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let db = Arc::new(DatabaseTape::new(db));
         let txns_file = io
             .open_file(

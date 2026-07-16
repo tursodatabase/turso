@@ -37,7 +37,6 @@ use crate::vdbe::{
     BranchOffset, CursorID,
 };
 use crate::{
-    bail_parse_error,
     error::SQLITE_CONSTRAINT_CHECK,
     function::Func,
     sync::Arc,
@@ -169,6 +168,9 @@ pub struct Resolver<'a> {
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
     pub dqs_dml: DoubleQuotedDml,
+    /// Schema dialect of the database being compiled against; used when a
+    /// fresh placeholder schema must be constructed during resolution.
+    pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
     /// When set, we are compiling a trigger subprogram for this database.
     /// Ordinary triggers are restricted to their own database, but temp-backed
     /// triggers follow SQLite's looser resolution rules and may access objects
@@ -273,6 +275,7 @@ impl<'a> Resolver<'a> {
     const MAIN_DB: &'static str = "main";
     const TEMP_DB: &'static str = "temp";
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
@@ -281,6 +284,7 @@ impl<'a> Resolver<'a> {
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
         dqs_dml: DoubleQuotedDml,
+        dialect: Arc<dyn crate::dialect::Dialect>,
     ) -> Self {
         let has_temp_schema = temp_database.read().is_some();
         Self {
@@ -298,6 +302,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(None),
             enable_custom_types,
             dqs_dml,
+            dialect,
             trigger_context: None,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
@@ -328,6 +333,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
+            dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -350,6 +356,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
+            dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -439,7 +446,7 @@ impl<'a> Resolver<'a> {
                 .unwrap_or_else(|| {
                     // with_options only fails if built-in type SQL is malformed (programmer bug).
                     Arc::new(
-                        Schema::with_options(self.enable_custom_types)
+                        Schema::with_options(self.enable_custom_types, self.dialect.as_ref())
                             .expect("built-in type definitions are malformed"),
                     )
                 }),
@@ -473,7 +480,9 @@ impl<'a> Resolver<'a> {
         func_name: &str,
         arg_count: usize,
     ) -> Result<Option<Func>, LimboError> {
-        match Func::resolve_function(func_name, arg_count)? {
+        // The dialect owns the function name surface of user SQL; extension
+        // functions resolve after it.
+        match self.dialect.resolve_function(func_name, arg_count)? {
             Some(func) => Ok(Some(func)),
             None => Ok(self
                 .symbol_table
@@ -1560,11 +1569,8 @@ pub fn emit_cdc_commit_insns(
     program.mark_last_insn_constant();
 
     // reg+1: change_time = unixepoch()
-    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0)? else {
-        bail_parse_error!("no function {}", "unixepoch");
-    };
     let unixepoch_fn_ctx = crate::function::FuncCtx {
-        func: unixepoch_fn,
+        func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
     };
     program.emit_insn(Insn::Function {
@@ -1578,11 +1584,8 @@ pub fn emit_cdc_commit_insns(
     // Pass -1 as candidate: if a txn_id exists, return it; if not, -1 is stored (and will be reset).
     let minus_one_reg = program.alloc_register();
     program.emit_int(-1, minus_one_reg);
-    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1)? else {
-        bail_parse_error!("no function {}", "conn_txn_id");
-    };
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
-        func: conn_txn_id_fn,
+        func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
     };
     program.emit_insn(Insn::Function {
@@ -1640,11 +1643,8 @@ pub fn emit_cdc_autocommit_commit(
     let cdc_info = program.capture_data_changes_info().as_ref();
     if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
         // Check if we're in autocommit mode; if so, emit a COMMIT record.
-        let Some(is_autocommit_fn) = resolver.resolve_function("is_autocommit", 0)? else {
-            bail_parse_error!("no function {}", "is_autocommit");
-        };
         let is_autocommit_fn_ctx = crate::function::FuncCtx {
-            func: is_autocommit_fn,
+            func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
             arg_count: 0,
         };
         let autocommit_reg = program.alloc_register();
@@ -1694,16 +1694,13 @@ pub fn emit_cdc_explicit_commit_insns(
 ) -> Result<()> {
     let minus_one_reg = program.alloc_register();
     program.emit_int(-1, minus_one_reg);
-    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1)? else {
-        bail_parse_error!("no function {}", "conn_txn_id");
-    };
     let txn_id_reg = program.alloc_register();
     program.emit_insn(Insn::Function {
         constant_mask: 0,
         start_reg: minus_one_reg,
         dest: txn_id_reg,
         func: crate::function::FuncCtx {
-            func: conn_txn_id_fn,
+            func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
             arg_count: 1,
         },
     });

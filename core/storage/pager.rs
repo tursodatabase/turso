@@ -6510,6 +6510,7 @@ mod checkpoint_phase_tests {
     use crate::sync::atomic::Ordering;
     use crate::types::IOResult;
     use crate::Database;
+    use crate::SqliteDialect;
 
     /// Returns an IO backend that supports shared WAL coordination on the host.
     /// On Windows the default `PlatformIO` (`WindowsIO`) lacks the byte-locking
@@ -6542,6 +6543,7 @@ mod checkpoint_phase_tests {
             crate::OpenFlags::default(),
             crate::DatabaseOpts::new().with_multiprocess_wal(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         (db, dir)

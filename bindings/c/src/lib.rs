@@ -6,6 +6,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::trace;
+use turso_core::SqliteDialect;
 use turso_core::{CheckpointMode, DatabaseOpts, LimboError, Value};
 use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
@@ -394,6 +395,7 @@ pub unsafe extern "C" fn sqlite3_open(
         turso_core::OpenFlags::default(),
         default_db_opts(),
         None,
+        Arc::new(SqliteDialect),
     ) {
         Ok(db) => {
             let conn = db.connect().unwrap();
@@ -554,7 +556,8 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     let use_shared_memory = use_memory && cache_shared;
 
     let (io, db) = if use_shared_memory {
-        match turso_core::Database::open_shared_memory(&effective_filename) {
+        match turso_core::Database::open_shared_memory(&effective_filename, Arc::new(SqliteDialect))
+        {
             Ok(db) => (db.io.clone(), db),
             Err(e) => {
                 trace!("error opening shared memory database {effective_filename}: {e:?}");
@@ -569,6 +572,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             turso_core::OpenFlags::default(),
             default_db_opts(),
             None,
+            Arc::new(SqliteDialect),
         ) {
             Ok(db) => (io, db),
             Err(e) => {
@@ -587,6 +591,7 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             turso_core::OpenFlags::default(),
             default_db_opts(),
             None,
+            Arc::new(SqliteDialect),
         ) {
             Ok(db) => (io, db),
             Err(e) => {

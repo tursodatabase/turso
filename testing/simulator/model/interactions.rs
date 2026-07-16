@@ -7,6 +7,7 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
+use turso_core::SqliteDialect;
 
 use indexmap::IndexSet;
 use itertools::Itertools;
@@ -930,6 +931,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
                     .with_attach(true)
                     .with_generated_columns(true),
                 None,
+                Arc::new(SqliteDialect),
             ) {
                 Ok(db) => db,
                 Err(e) => {

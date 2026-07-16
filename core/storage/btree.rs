@@ -9766,6 +9766,7 @@ fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
 
 #[cfg(test)]
 mod tests {
+    use crate::SqliteDialect;
     use rand::{rng, Rng};
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
@@ -9889,7 +9890,8 @@ mod tests {
                 .unwrap();
         }
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), path.to_str().unwrap()).unwrap();
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(SqliteDialect))
+            .unwrap();
 
         db
     }
@@ -9898,7 +9900,8 @@ mod tests {
     fn wal_reuses_freelist_leaf_after_abandoned_overflowing_insert() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, "freelist-stale-overflow.db").unwrap();
+        let db =
+            Database::open_file(io, "freelist-stale-overflow.db", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
 
         conn.execute("PRAGMA journal_mode = WAL").unwrap();
@@ -10020,7 +10023,8 @@ mod tests {
     fn wal_overflowing_insert_resumes_after_yield_before_balance() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, "resume-overflow-yield.db").unwrap();
+        let db =
+            Database::open_file(io, "resume-overflow-yield.db", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
 
         conn.execute("PRAGMA journal_mode = WAL").unwrap();
@@ -10394,7 +10398,7 @@ mod tests {
     fn empty_btree() -> (Arc<Pager>, i64, Arc<Database>, Arc<Connection>) {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:").unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         let pager = conn.pager.load().clone();
 
@@ -10418,7 +10422,7 @@ mod tests {
     fn btree_with_virtual_page_1() -> Result<()> {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:").unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         let pager = conn.pager.load().clone();
 

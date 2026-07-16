@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use turso_core::SqliteDialect;
 
 use turso_core::{Database, MemoryIO, IO};
 use turso_parser::MAX_EXPR_DEPTH;
@@ -105,7 +106,7 @@ fn run_on_big_stack(sql: String) -> turso_core::Result<()> {
         .stack_size(WORKER_STACK)
         .spawn(move || -> turso_core::Result<()> {
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-            let db = Database::open_file(io, ":memory:")?;
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
             let conn = db.connect()?;
             conn.execute(&sql)?;
             Ok(())

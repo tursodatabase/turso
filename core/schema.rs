@@ -890,10 +890,14 @@ impl Schema {
     /// bug). Production code that opens user databases should prefer
     /// [`Schema::with_options`] which returns `Result`.
     pub fn new() -> Self {
-        Self::with_options(true).expect("built-in type definitions are malformed")
+        Self::with_options(true, &crate::dialect::SqliteDialect)
+            .expect("built-in type definitions are malformed")
     }
 
-    pub fn with_options(enable_custom_types: bool) -> crate::Result<Self> {
+    pub fn with_options(
+        enable_custom_types: bool,
+        dialect: &dyn crate::dialect::Dialect,
+    ) -> crate::Result<Self> {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
         #[cfg(feature = "conn_raw_api")]
         let mut table_names_by_root_page = HashMap::default();
@@ -938,7 +942,7 @@ impl Schema {
             generated_columns_enabled: false,
             sequences: HashMap::default(),
         };
-        crate::dialect::sqlite::register_builtin_catalog(&mut schema, enable_custom_types)?;
+        dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
     }
 
@@ -1519,8 +1523,9 @@ impl Schema {
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: &Arc<Pager>,
         syms: &SymbolTable,
+        dialect: &dyn crate::dialect::Dialect,
     ) -> Result<IOResult<()>> {
-        let result = self.make_from_btree_internal(state, mv_cursor, pager, syms);
+        let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, dialect);
         if result.is_err() {
             state.cleanup(pager);
         } else if let Ok(IOResult::Done(..)) = result {
@@ -1538,6 +1543,7 @@ impl Schema {
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: &Arc<Pager>,
         syms: &SymbolTable,
+        dialect: &dyn crate::dialect::Dialect,
     ) -> Result<IOResult<()>> {
         loop {
             tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
@@ -1644,6 +1650,7 @@ impl Schema {
                         &mut acc.dbsp_state_index_roots,
                         &mut acc.materialized_view_info,
                         &|_| None,
+                        dialect,
                     )?;
 
                     state.phase = MakeFromBtreePhase::Advancing;
@@ -2077,119 +2084,118 @@ impl Schema {
         // `&|_| None`; unresolvable names become `Some(INVALID_DB_ID)`
         // so the trigger never fires against a real db.
         resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
+        dialect: &dyn crate::dialect::Dialect,
     ) -> Result<()> {
         match ty {
             "table" => {
                 let sql = maybe_sql.expect("sql should be present for table");
-                // Classify the row by parsing its schema SQL, mirroring
-                // SQLite, where sqlite3InitCallback feeds the sql column to
-                // the parser and a row becomes a virtual table purely as a
-                // byproduct of the create_vtab grammar rule.
-                match Parser::new(sql.as_bytes()).next_cmd()? {
-                    Some(Cmd::Stmt(Stmt::CreateVirtualTable(_))) => {
-                        if root_page != 0 {
+                // In the SQLite file format a `type='table'` row describes a
+                // virtual table iff its rootpage is 0: virtual tables have no
+                // B-tree, while every real table stores a nonzero root (MVCC
+                // uses negative logical ids, which are still B-tree tables).
+                // Classify on the root page before touching the SQL text so
+                // only the B-tree arm needs to parse the row's stored SQL.
+                if root_page == 0 {
+                    match Parser::new(sql.as_bytes()).next_cmd()? {
+                        Some(Cmd::Stmt(Stmt::CreateVirtualTable(_))) => {}
+                        other => {
                             return Err(LimboError::Corrupt(format!(
-                                "sqlite_schema root_page must be 0 for virtual table {name}, got {root_page}"
+                                "sqlite_schema table row {name} with root page 0 has unexpected SQL {sql:?}: parsed as {other:?}"
                             )));
                         }
-                        // a virtual table is found in the sqlite_schema, but it's no
-                        // longer in the in-memory schema. We need to recreate it if
-                        // the module is loaded in the symbol table.
-                        let vtab = if let Some(vtab) = syms.vtabs.get(name) {
-                            vtab.clone()
-                        } else {
-                            let mod_name = module_name_from_sql(sql)?;
-                            crate::VirtualTable::table(
-                                Some(name),
-                                mod_name,
-                                module_args_from_sql(sql)?,
-                                syms,
-                            )?
-                        };
-                        self.add_virtual_table(vtab)?;
                     }
-                    Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
-                        let table = create_table(tbl_name.name.as_str(), &body, root_page)?;
 
-                        if table.has_virtual_columns && !self.generated_columns_enabled {
-                            return Err(LimboError::ParseError(format!(
+                    // a virtual table is found in the sqlite_schema, but it's no
+                    // longer in the in-memory schema. We need to recreate it if
+                    // the module is loaded in the symbol table.
+                    let vtab = if let Some(vtab) = syms.vtabs.get(name) {
+                        vtab.clone()
+                    } else {
+                        let mod_name = module_name_from_sql(sql)?;
+                        crate::VirtualTable::table(
+                            Some(name),
+                            mod_name,
+                            module_args_from_sql(sql)?,
+                            syms,
+                        )?
+                    };
+                    self.add_virtual_table(vtab)?;
+                } else {
+                    let table = dialect.parse_table_sql(sql, root_page)?;
+
+                    if table.has_virtual_columns && !self.generated_columns_enabled {
+                        return Err(LimboError::ParseError(format!(
                             "table '{}' uses generated columns but the generated_columns feature is not enabled",
                             table.name
                         )));
-                        }
+                    }
 
-                        // Detect sequence-backing tables by name prefix.
-                        // Just add the table (for B-tree access); sequences are created by
-                        // AddSequence at CREATE time or initialize_sequences at open time.
-                        if table.name.starts_with(SEQ_BACKING_TABLE_PREFIX) {
-                            self.add_btree_table(Arc::new(table))?;
-                            return Ok(());
-                        }
+                    // Detect sequence-backing tables by name prefix.
+                    // Just add the table (for B-tree access); sequences are created by
+                    // AddSequence at CREATE time or initialize_sequences at open time.
+                    if table.name.starts_with(SEQ_BACKING_TABLE_PREFIX) {
+                        self.add_btree_table(Arc::new(table))?;
+                        return Ok(());
+                    }
 
-                        // Check if this is a DBSP state table
-                        if table.name.starts_with(DBSP_TABLE_PREFIX) {
-                            // Extract version and view name from __turso_internal_dbsp_state_v<version>_<viewname>
-                            let suffix = table.name.strip_prefix(DBSP_TABLE_PREFIX).unwrap();
+                    // Check if this is a DBSP state table
+                    if table.name.starts_with(DBSP_TABLE_PREFIX) {
+                        // Extract version and view name from __turso_internal_dbsp_state_v<version>_<viewname>
+                        let suffix = table.name.strip_prefix(DBSP_TABLE_PREFIX).unwrap();
 
-                            // Parse version and view name (format: "<version>_<viewname>")
-                            if let Some(underscore_pos) = suffix.find('_') {
-                                let version_str = &suffix[..underscore_pos];
-                                let view_name = &suffix[underscore_pos + 1..];
+                        // Parse version and view name (format: "<version>_<viewname>")
+                        if let Some(underscore_pos) = suffix.find('_') {
+                            let version_str = &suffix[..underscore_pos];
+                            let view_name = &suffix[underscore_pos + 1..];
 
-                                // Check version compatibility
-                                if let Ok(stored_version) = version_str.parse::<u32>() {
-                                    if stored_version == DBSP_CIRCUIT_VERSION {
-                                        // Version matches, store the root page
-                                        dbsp_state_roots.insert(view_name.to_string(), root_page);
-                                    } else {
-                                        // Version mismatch - DO NOT insert into dbsp_state_roots
-                                        // This will cause populate_materialized_views to skip this view
-                                        tracing::warn!(
+                            // Check version compatibility
+                            if let Ok(stored_version) = version_str.parse::<u32>() {
+                                if stored_version == DBSP_CIRCUIT_VERSION {
+                                    // Version matches, store the root page
+                                    dbsp_state_roots.insert(view_name.to_string(), root_page);
+                                } else {
+                                    // Version mismatch - DO NOT insert into dbsp_state_roots
+                                    // This will cause populate_materialized_views to skip this view
+                                    tracing::warn!(
                                         "Skipping materialized view '{}' - has version {} but current version is {}. DROP and recreate the view to use it.",
                                         view_name,
                                         stored_version,
                                         DBSP_CIRCUIT_VERSION
                                     );
-                                        // We can't track incompatible views here since we're in handle_schema_row
-                                        // which doesn't have mutable access to self
-                                    }
+                                    // We can't track incompatible views here since we're in handle_schema_row
+                                    // which doesn't have mutable access to self
                                 }
                             }
                         }
-
-                        let mut table = table;
-                        table.resolve_custom_type_affinities(self);
-                        table.propagate_domain_constraints(self)?;
-                        let has_autoinc = table.has_autoincrement;
-                        let tbl_name = table.name.clone();
-                        self.add_btree_table(Arc::new(table))?;
-
-                        // Create the hidden sequence object owned by this
-                        // AUTOINCREMENT table. The `__turso_internal_autoincrement_`
-                        // prefix is a sequence namespace marker, not a table name;
-                        // the physical table is the corresponding
-                        // `__turso_internal_seq_<sequence-name>` backing table.
-                        if has_autoinc {
-                            let seq_name = autoincrement_sequence_name(&tbl_name);
-                            if let std::collections::hash_map::Entry::Vacant(e) =
-                                self.sequences.entry(normalize_ident(&seq_name))
-                            {
-                                let seq = Sequence::new(
-                                    seq_name.clone(),
-                                    Some(1),
-                                    Some(1),
-                                    None,
-                                    None,
-                                    false,
-                                )?;
-                                e.insert(Arc::new(seq));
-                            }
-                        }
                     }
-                    other => {
-                        return Err(LimboError::Corrupt(format!(
-                            "sqlite_schema table row {name} has unexpected SQL {sql:?}: parsed as {other:?}"
-                        )));
+
+                    let mut table = table;
+                    table.resolve_custom_type_affinities(self);
+                    table.propagate_domain_constraints(self)?;
+                    let has_autoinc = table.has_autoincrement;
+                    let tbl_name = table.name.clone();
+                    self.add_btree_table(Arc::new(table))?;
+
+                    // Create the hidden sequence object owned by this
+                    // AUTOINCREMENT table. The `__turso_internal_autoincrement_`
+                    // prefix is a sequence namespace marker, not a table name;
+                    // the physical table is the corresponding
+                    // `__turso_internal_seq_<sequence-name>` backing table.
+                    if has_autoinc {
+                        let seq_name = autoincrement_sequence_name(&tbl_name);
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            self.sequences.entry(normalize_ident(&seq_name))
+                        {
+                            let seq = Sequence::new(
+                                seq_name.clone(),
+                                Some(1),
+                                Some(1),
+                                None,
+                                None,
+                                false,
+                            )?;
+                            e.insert(Arc::new(seq));
+                        }
                     }
                 }
             }
@@ -2668,6 +2674,7 @@ impl TryClone for VirtualTable {
             kind: self.kind,
             vtab_type: self.vtab_type.clone(),
             vtab_id: self.vtab_id,
+            is_droppable: self.is_droppable,
             innocuous: self.innocuous,
         })
     }
@@ -3504,10 +3511,27 @@ impl BTreeTable {
         let cmd = parser.next_cmd()?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
-                create_table(tbl_name.name.as_str(), &body, root_page)
+                Self::from_create_table_ast(&tbl_name, &body, root_page)
             }
-            _ => unreachable!("Expected CREATE TABLE statement"),
+            Some(Cmd::Stmt(Stmt::CreateVirtualTable(vtab))) => Err(LimboError::Corrupt(format!(
+                "sqlite_schema root_page must be 0 for virtual table {}, got {root_page}",
+                vtab.tbl_name.name.as_str()
+            ))),
+            other => Err(LimboError::Corrupt(format!(
+                "sqlite_schema table row has unexpected SQL {sql:?}: parsed as {other:?}"
+            ))),
         }
+    }
+
+    /// Build a table definition from an already-parsed `CREATE TABLE`
+    /// statement. This is the single AST-to-table lowering path shared by
+    /// [`BTreeTable::from_sql`] and callers that hold a translated AST.
+    pub fn from_create_table_ast(
+        tbl_name: &ast::QualifiedName,
+        body: &CreateTableBody,
+        root_page: i64,
+    ) -> Result<BTreeTable> {
+        create_table(tbl_name.name.as_str(), body, root_page)
     }
 
     /// Reconstruct the SQL for the table.
@@ -6721,11 +6745,113 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &|_| None,
+            &crate::dialect::SqliteDialect,
         );
         assert!(result
             .unwrap_err()
             .to_string()
             .contains("generated columns"));
+    }
+
+    #[test]
+    fn test_schema_row_vtab_with_nonzero_root_page_is_corrupt() {
+        let mut schema = Schema::new();
+
+        let result = schema.handle_schema_row(
+            "table",
+            "v1",
+            "v1",
+            2,
+            Some("CREATE VIRTUAL TABLE v1 USING somemodule"),
+            &SymbolTable::default(),
+            &mut vec![],
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &|_| None,
+            &crate::dialect::SqliteDialect,
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("root_page must be 0 for virtual table v1"));
+    }
+
+    #[test]
+    fn test_schema_row_with_zero_root_page_takes_virtual_table_path() {
+        let mut schema = Schema::new();
+
+        // Root page 0 must route to virtual-table handling; with no such
+        // module registered, that path fails module resolution instead of
+        // creating a B-tree table with an invalid root page.
+        let result = schema.handle_schema_row(
+            "table",
+            "v1",
+            "v1",
+            0,
+            Some("CREATE VIRTUAL TABLE v1 USING nosuchmodule"),
+            &SymbolTable::default(),
+            &mut vec![],
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &|_| None,
+            &crate::dialect::SqliteDialect,
+        );
+        assert!(result.is_err());
+        assert!(schema.get_table("v1").is_none());
+    }
+
+    #[test]
+    fn test_schema_row_with_zero_root_page_rejects_malformed_sql() {
+        let mut schema = Schema::new();
+
+        let result = schema.handle_schema_row(
+            "table",
+            "v1",
+            "v1",
+            0,
+            Some("CREATE VIRTUAL TABLE v1 USING"),
+            &SymbolTable::default(),
+            &mut vec![],
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &|_| None,
+            &crate::dialect::SqliteDialect,
+        );
+        assert!(result.is_err());
+        assert!(schema.get_table("v1").is_none());
+    }
+
+    #[test]
+    fn test_schema_row_table_with_virtual_table_substring_is_btree() {
+        let mut schema = Schema::new();
+
+        // A regular table whose SQL merely contains virtual-table syntax
+        // (e.g. in a DEFAULT literal) must classify as a B-tree table.
+        schema
+            .handle_schema_row(
+                "table",
+                "t1",
+                "t1",
+                2,
+                Some("CREATE TABLE t1(x TEXT DEFAULT 'create virtual table')"),
+                &SymbolTable::default(),
+                &mut vec![],
+                &mut HashMap::default(),
+                &mut HashMap::default(),
+                &mut HashMap::default(),
+                &mut HashMap::default(),
+                &|_| None,
+                &crate::dialect::SqliteDialect,
+            )
+            .unwrap();
+        let table = schema.get_btree_table("t1").unwrap();
+        assert_eq!(table.root_page, 2);
     }
 
     fn indices(mask: &ColumnMask) -> Vec<usize> {
