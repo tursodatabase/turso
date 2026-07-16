@@ -110,9 +110,6 @@ jobs:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests)' --failure-output=final
         timeout-minutes: 30
-      - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
-        run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check) | test(short_read)' --failure-output=final
-        timeout-minutes: 5
       - name: Test doctests
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
@@ -124,6 +121,29 @@ jobs:
           name: coverage-report
           path: coverage/
           retention-days: 14
+
+  # Runs without --all-features because the corruption and short-read tests
+  # are compile-gated on the "checksum" feature being disabled: with page
+  # checksums active, byte-level corruption is caught at the pager layer
+  # before integrity_check's structural validation ever runs. The tests
+  # exercise platform-independent core logic, so one Linux runner suffices.
+  integrity-corruption-tests:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
+        run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check) | test(short_read)' --failure-output=final
+        timeout-minutes: 5
 
   build-windows-arm64-cli:
     runs-on: windows-2025
