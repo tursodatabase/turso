@@ -218,7 +218,7 @@ fn infer_expression_primitive(
             | Operator::BitwiseNot
             | Operator::LeftShift
             | Operator::RightShift => Some("INTEGER"),
-            // Comparison and logical: SQLite returns 0/1 INTEGER; pgmicro
+            // Comparison and logical: SQLite returns 0/1 INTEGER; tursopg
             // maps INTEGER to BOOL at the wire layer for boolean columns,
             // but the type the wire layer reports is still INTEGER here.
             Operator::Equals
@@ -395,6 +395,12 @@ impl Statement {
         self.state
             .n_change
             .load(crate::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn set_n_change(&self, n: i64) {
+        self.state
+            .n_change
+            .store(n, crate::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn n_total_change(&self) -> i64 {
@@ -1214,6 +1220,29 @@ impl Statement {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Returns the inferred type affinity name for a result column by examining
+    /// the column expression. Unlike `get_column_decltype` which only works for
+    /// table columns, this works for arbitrary expressions (CAST, function calls,
+    /// literals, etc.) by inferring the type from the expression structure.
+    pub fn get_column_inferred_type(&self, idx: usize) -> Option<String> {
+        if self.query_mode != QueryMode::Normal {
+            return None;
+        }
+        let column = &self.program.result_columns.get(idx)?;
+        let affinity = translate::expr::get_expr_affinity(
+            &column.expr,
+            Some(&self.program.table_references),
+            None,
+        );
+        match affinity {
+            crate::vdbe::affinity::Affinity::Integer => Some("INTEGER".to_string()),
+            crate::vdbe::affinity::Affinity::Real => Some("REAL".to_string()),
+            crate::vdbe::affinity::Affinity::Text => Some("TEXT".to_string()),
+            crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC".to_string()),
+            crate::vdbe::affinity::Affinity::Blob => None, // Blob means "no affinity"
         }
     }
 

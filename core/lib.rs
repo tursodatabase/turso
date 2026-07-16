@@ -2979,9 +2979,16 @@ impl Database {
     {
         self.with_schema_mut(|schema| schema.register_internal_vtab(table))
     }
+
     /// The SQL dialect this database was opened with.
     pub fn dialect(&self) -> Arc<dyn Dialect> {
         self.dialect.clone()
+    }
+
+    pub fn register_virtual_table(&self, table: Arc<VirtualTable>) -> Result<String> {
+        let name = table.name.clone();
+        self.with_schema_mut(|schema| schema.add_virtual_table(table))?;
+        Ok(name)
     }
 
     pub(crate) fn clone_schema(&self) -> Arc<Schema> {

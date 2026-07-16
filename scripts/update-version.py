@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Script to update version in Cargo.toml, package.json, package-lock.json,
-gradle.properties, and Directory.Build.props files for the Turso project.
-This script updates all occurrences of the version in the workspace configuration,
-updates the JavaScript and WebAssembly bindings package.json and package-lock.json files,
-updates the Java bindings gradle.properties file, updates the .NET bindings
-Directory.Build.props file,
-uses cargo update to update Cargo.lock, creates a git commit, and adds a version tag.
+Script to update version in workspace Cargo manifests, package.json,
+package-lock.json, gradle.properties, and Directory.Build.props files for the
+Turso project. This script updates all occurrences of the version in the
+workspace configuration, updates the JavaScript and WebAssembly bindings
+package.json and package-lock.json files, updates the Java bindings
+gradle.properties file, updates the .NET bindings Directory.Build.props file,
+uses cargo update to update Cargo.lock, creates a git commit, and adds a
+version tag.
 """
 
 import argparse
@@ -53,6 +54,14 @@ NPM_WORKSPACES = [
 
 JAVA_GRADLE_PROPERTIES = "bindings/java/gradle.properties"
 DOTNET_DIRECTORY_BUILD_PROPS = "bindings/dotnet/Directory.Build.props"
+
+
+def iter_cargo_toml_files():
+    """Yield all Cargo.toml manifests in the repo, excluding build output."""
+    for path in sorted(Path(".").rglob("Cargo.toml")):
+        if "target" in path.parts:
+            continue
+        yield path
 
 
 def parse_args():
@@ -268,7 +277,8 @@ def create_git_commit_and_tag(version):
     """Create a git commit with all changes and add a version tag."""
     try:
         # Add files that exist and have changes
-        files_to_add = ["Cargo.toml", "Cargo.lock"]
+        files_to_add = [str(path) for path in iter_cargo_toml_files()]
+        files_to_add.append("Cargo.lock")
 
         # Add Java gradle.properties if it exists
         if os.path.exists(JAVA_GRADLE_PROPERTIES):

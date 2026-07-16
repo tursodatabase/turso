@@ -304,6 +304,19 @@ impl Database {
 }
 
 impl Connection {
+    /// Register statically linked functions or virtual tables against this
+    /// connection using the generic extension API.
+    pub fn register_static_extension<F>(&self, register: F)
+    where
+        F: FnOnce(&mut ExtensionApi),
+    {
+        unsafe {
+            let mut ext_api = self._build_turso_ext();
+            register(&mut ext_api);
+            self._free_extension_ctx(ext_api);
+        }
+    }
+
     /// Build the connection's extension api context for manually registering an extension.
     /// you probably want to use `Connection::load_extension(path)`.
     ///
