@@ -110,7 +110,7 @@ turso_ext = { path = "extensions/core", version = "0.7.0" }
 turso_macros = { path = "macros", version = "0.7.0" }
 turso_parser = { path = "sqlite/parser", version = "0.7.0" }
 turso_pg = { path = "postgres/frontend", version = "0.7.0" }
-turso_parser_pg = { path = "postgres/parser", version = "0.7.0" }
+turso_pg_parser = { path = "postgres/parser", version = "0.7.0" }
 turso_pg_server = { path = "postgres/server", version = "0.7.0" }
 sql_generation = { path = "sql_generation" }
 turso-dbhash = { path = "tools/dbhash" }

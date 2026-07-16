@@ -7367,17 +7367,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "turso_parser_pg"
-version = "0.7.0"
-dependencies = [
- "criterion",
- "miette",
- "pg_query",
- "thiserror 2.0.16",
- "turso_parser",
-]
-
-[[package]]
 name = "turso_pg"
 version = "0.7.0"
 dependencies = [
@@ -7388,7 +7377,18 @@ dependencies = [
  "turso_core",
  "turso_ext",
  "turso_parser",
- "turso_parser_pg",
+ "turso_pg_parser",
+]
+
+[[package]]
+name = "turso_pg_parser"
+version = "0.7.0"
+dependencies = [
+ "criterion",
+ "miette",
+ "pg_query",
+ "thiserror 2.0.16",
+ "turso_parser",
 ]
 
 [[package]]

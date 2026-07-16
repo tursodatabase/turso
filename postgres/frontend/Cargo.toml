@@ -20,7 +20,7 @@ turso_core = { workspace = true, default-features = true, features = [
 ] }
 turso_parser = { workspace = true }
 turso_ext = { workspace = true, features = ["core_only"] }
-turso_parser_pg = { workspace = true }
+turso_pg_parser = { workspace = true }
 
 [lints]
 workspace = true

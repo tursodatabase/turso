@@ -1,5 +1,5 @@
 [package]
-name = "turso_parser_pg"
+name = "turso_pg_parser"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -11,7 +11,7 @@ description = "PostgreSQL parser for Turso"
 workspace = true
 
 [lib]
-name = "turso_parser_pg"
+name = "turso_pg_parser"
 path = "lib.rs"
 
 [dependencies]

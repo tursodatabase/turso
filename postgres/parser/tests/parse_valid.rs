@@ -1,6 +1,6 @@
 //! Tests for valid PostgreSQL SQL that should parse successfully
 
-use turso_parser_pg::{parse, split_statements};
+use turso_pg_parser::{parse, split_statements};
 
 #[test]
 fn test_basic_select() {

@@ -27,7 +27,7 @@ impl Dialect for PostgresDialect {
         // Engine-generated helper statements and pragmas are canonical SQLite
         // text that pg_query rejects, so anything the PostgreSQL parser cannot
         // handle falls back to SQLite parsing.
-        let Ok(parse_result) = turso_parser_pg::parse(sql) else {
+        let Ok(parse_result) = turso_pg_parser::parse(sql) else {
             return turso_core::dialect::sqlite::parse(sql);
         };
         let stmts = &parse_result.protobuf.stmts;
@@ -42,7 +42,7 @@ impl Dialect for PostgresDialect {
             Some(next) => next.stmt_location as usize,
             None => sql.len(),
         };
-        let translator = turso_parser_pg::translator::PostgreSQLTranslator::new();
+        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         match translator.translate(&parse_result) {
             Ok(stmt) => Ok((Some(turso_parser::ast::Cmd::Stmt(stmt)), consumed)),
             Err(_) => turso_core::dialect::sqlite::parse(sql),
@@ -57,8 +57,8 @@ impl Dialect for PostgresDialect {
         };
 
         let parse_result =
-            turso_parser_pg::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-        let translator = turso_parser_pg::translator::PostgreSQLTranslator::new();
+            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
@@ -80,8 +80,8 @@ impl Dialect for PostgresDialect {
         };
 
         let parse_result =
-            turso_parser_pg::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-        let translator = turso_parser_pg::translator::PostgreSQLTranslator::new();
+            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
             .map_err(|e| LimboError::ParseError(e.to_string()))?;

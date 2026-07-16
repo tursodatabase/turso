@@ -1,6 +1,6 @@
 //! Tests for invalid PostgreSQL SQL that should fail to parse
 
-use turso_parser_pg::parse;
+use turso_pg_parser::parse;
 
 #[test]
 fn test_invalid_syntax() {

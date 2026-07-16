@@ -6,7 +6,7 @@ use crate::aliases;
 use crate::catalog::{self, PostgresDialect};
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast;
-use turso_parser_pg::translator::{
+use turso_pg_parser::translator::{
     is_refresh_matview, try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema,
     try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
     PostgreSQLTranslator,
@@ -140,7 +140,7 @@ impl Iterator for PgQueryRunner<'_> {
 }
 
 pub fn split_statements(sql: &str) -> Result<Vec<String>> {
-    match turso_parser_pg::split_statements(sql) {
+    match turso_pg_parser::split_statements(sql) {
         Ok(stmts) if stmts.is_empty() && !sql.trim().is_empty() => Ok(vec![sql.trim().to_string()]),
         Ok(stmts) => Ok(stmts),
         Err(_) => Ok(vec![sql.trim().to_string()]),
@@ -162,7 +162,7 @@ fn prepare_statement(conn: &Arc<Connection>, sql: &str) -> Result<Statement> {
     }
 
     let parse_result =
-        turso_parser_pg::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
     let translator = PostgreSQLTranslator::new();
     let translated = translator
         .translate_with_prereqs(&parse_result)
@@ -218,7 +218,7 @@ fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
 }
 
 fn try_prepare_special(conn: &Arc<Connection>, sql: &str) -> Result<Option<Statement>> {
-    let parse_result = match turso_parser_pg::parse(sql) {
+    let parse_result = match turso_pg_parser::parse(sql) {
         Ok(result) => result,
         Err(_) => return Ok(None),
     };
