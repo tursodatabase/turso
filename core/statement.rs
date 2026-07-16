@@ -1161,9 +1161,24 @@ impl Statement {
                 kind,
             }));
         }
+        // CAST expression: report the cast target verbatim rather than the
+        // affinity it collapses to, so `CAST(x AS INT8)` surfaces `"INT8"`
+        // and wire layers can report the exact type the user asked for.
+        if let turso_parser::ast::Expr::Cast {
+            type_name: Some(ty),
+            ..
+        } = &column.expr
+        {
+            return Ok(Some(ColumnTypeInfo {
+                declared_name: ty.name.clone(),
+                array_dimensions: ty.array_dimensions,
+                base_type: None,
+                kind: ColumnTypeKind::Builtin,
+            }));
+        }
         // Not a table column: infer the result primitive from the
         // expression's shape (literal value type, operand types of a binary
-        // op, the CAST target, etc.).
+        // op, etc.).
         let Some(name) =
             infer_expression_primitive(&column.expr, Some(&self.program.table_references))
         else {

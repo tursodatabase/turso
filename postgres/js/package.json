@@ -1,0 +1,44 @@
+{
+  "name": "@tursodatabase/pg-experimental",
+  "version": "0.7.0",
+  "description": "PGlite-compatible JavaScript API for the Turso Postgres frontend",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tursodatabase/turso"
+  },
+  "license": "MIT",
+  "type": "module",
+  "main": "./pglite.js",
+  "module": "./pglite.js",
+  "types": "./pglite.d.ts",
+  "exports": {
+    ".": "./pglite.js"
+  },
+  "imports": {
+    "#native": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "pglite.js",
+    "pglite.d.ts",
+    "types.js",
+    "README.md"
+  ],
+  "devDependencies": {
+    "@napi-rs/cli": "^3.1.5"
+  },
+  "scripts": {
+    "build": "napi build --platform --esm --output-dir .",
+    "build:debug": "napi build --platform --esm --output-dir ."
+  },
+  "napi": {
+    "binaryName": "turso-pg",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc",
+      "aarch64-apple-darwin",
+      "aarch64-unknown-linux-gnu"
+    ]
+  }
+}

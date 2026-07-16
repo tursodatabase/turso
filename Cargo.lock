@@ -7358,6 +7358,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_pg_node"
+version = "0.7.0"
+dependencies = [
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "turso_core",
+ "turso_pg",
+]
+
+[[package]]
 name = "turso_pg_server"
 version = "0.7.0"
 dependencies = [

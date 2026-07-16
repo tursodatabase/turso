@@ -1,0 +1,24 @@
+[package]
+name = "turso_pg_node"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PGlite-compatible Node bindings for the Turso Postgres frontend"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+turso_core = { workspace = true }
+turso_pg = { workspace = true }
+napi = { version = "3.8.3", default-features = false, features = ["napi6"] }
+napi-derive = { version = "3.5.2", default-features = true }
+
+[build-dependencies]
+napi-build = "2.3.1"

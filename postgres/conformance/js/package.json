@@ -1,0 +1,17 @@
+{
+  "name": "turso-postgres-conformance-tests",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "npm run test:pglite",
+    "test:pglite": "PROVIDER=pglite ava __test__/*.test.js",
+    "test:turso": "PROVIDER=turso ava __test__/*.test.js"
+  },
+  "devDependencies": {
+    "ava": "^6.4.1"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.5.4",
+    "@tursodatabase/pg-experimental": "../../js"
+  }
+}

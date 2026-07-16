@@ -27,6 +27,7 @@ members = [
     "sqlite/parser",
     "postgres/cli",
     "postgres/frontend",
+    "postgres/js",
     "postgres/parser",
     "postgres/server",
     "postgres/tests",

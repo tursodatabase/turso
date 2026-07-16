@@ -2012,11 +2012,22 @@ impl PostgreSQLTranslator {
                 let arg = type_cast.arg.as_ref().ok_or_else(|| {
                     ParseError::ParseError("TypeCast missing inner expression".into())
                 })?;
-                let expr = Box::new(self.translate_expr(arg)?);
                 let type_name = type_cast
                     .type_name
                     .as_ref()
                     .and_then(pg_type_name_to_ast_type);
+                // PostgreSQL bytea input uses `\x` hex text ('\x0102'::bytea).
+                // A SQLite CAST to BLOB keeps the literal's text bytes, so
+                // decode the hex here and emit a blob literal instead.
+                if type_name.as_ref().is_some_and(|t| t.name == "BLOB") {
+                    if let Some(hex) = bytea_literal_hex(arg) {
+                        return Ok(ast::Expr::Cast {
+                            expr: Box::new(ast::Expr::Literal(ast::Literal::Blob(hex))),
+                            type_name,
+                        });
+                    }
+                }
+                let expr = Box::new(self.translate_expr(arg)?);
                 Ok(ast::Expr::Cast { expr, type_name })
             }
             Some(pg_query::protobuf::node::Node::SubLink(sub_link)) => {
@@ -2291,10 +2302,21 @@ impl PostgreSQLTranslator {
                     Ok(ast::Expr::Literal(ast::Literal::Numeric(f.fval.clone())))
                 }
                 pg_query::protobuf::a_const::Val::Boolval(b) => {
-                    // SQLite uses 0/1 for booleans
-                    Ok(ast::Expr::Literal(ast::Literal::Numeric(
-                        if b.boolval { "1" } else { "0" }.to_string(),
-                    )))
+                    // SQLite uses 0/1 for booleans. Wrap the literal in
+                    // CAST(x AS BOOLEAN) so statement metadata reports BOOL
+                    // to PostgreSQL clients; "BOOLEAN" gets NUMERIC affinity,
+                    // which preserves the 0/1 integer, so evaluation is
+                    // unchanged.
+                    Ok(ast::Expr::Cast {
+                        expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
+                            if b.boolval { "1" } else { "0" }.to_string(),
+                        ))),
+                        type_name: Some(ast::Type {
+                            name: "BOOLEAN".to_string(),
+                            size: None,
+                            array_dimensions: 0,
+                        }),
+                    })
                 }
                 _ => Err(ParseError::ParseError(
                     "Unsupported constant type".to_string(),
@@ -3961,6 +3983,24 @@ fn translate_create_enum(
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types.
+/// If `node` is a string constant in PostgreSQL bytea hex format
+/// (`'\x0102...'`), return the bare hex digits for an `ast::Literal::Blob`.
+fn bytea_literal_hex(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+    let Some(Node::AConst(a_const)) = &node.node else {
+        return None;
+    };
+    let Some(pg_query::protobuf::a_const::Val::Sval(s)) = &a_const.val else {
+        return None;
+    };
+    let hex = s.sval.strip_prefix("\\x")?;
+    if hex.len() % 2 == 0 && !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(hex.to_string())
+    } else {
+        None
+    }
+}
+
 fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<ast::Type> {
     use pg_query::protobuf::node::Node;
 
@@ -3978,11 +4018,18 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
     let pg_type = parts.join(" ");
 
     let name = match pg_type.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "BIGINT" | "INT8" | "SERIAL"
-        | "BIGSERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
-        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
-            "REAL"
-        }
+        "INTEGER" | "INT" | "INT4" | "SERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
+        // Preserve integer/float width where it is execution-safe: these
+        // names carry the exact PG type to statement metadata (so wire
+        // layers report INT2/INT8/FLOAT4 instead of a collapsed primitive)
+        // while SQLite's substring affinity rules ("INT" -> INTEGER,
+        // "FLOA" -> REAL) still assign the same affinity the collapsed
+        // names had, so CAST semantics do not change.
+        "SMALLINT" | "INT2" | "SMALLSERIAL" => "INT2",
+        "BIGINT" | "INT8" | "BIGSERIAL" => "INT8",
+        "REAL" | "FLOAT4" => "FLOAT4",
+        "DOUBLE PRECISION" | "FLOAT8" => "FLOAT8",
+        "NUMERIC" | "DECIMAL" | "MONEY" => "REAL",
         // For CAST expressions, map all text-like PG types to TEXT and
         // boolean to INTEGER for SQLite VDBE compatibility
         "BOOLEAN" | "BOOL" => "INTEGER",
