@@ -1,4 +1,4 @@
-# pgmicro: Missing PG Features
+# tursopg: Missing PG Features
 
 Sorted by implementation difficulty.
 

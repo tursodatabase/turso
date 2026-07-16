@@ -1,8 +1,8 @@
-# pgmicro
+# tursopg
 
 In-process PostgreSQL reimplementation backed by Turso's SQLite-compatible engine.
 
-pgmicro translates PostgreSQL SQL (via libpg_query) directly into Turso's AST,
+tursopg translates PostgreSQL SQL (via libpg_query) directly into Turso's AST,
 then executes it through the full Turso compilation and bytecode pipeline. No
 SQLite text is ever generated — the entire path from PG parse tree to bytecode
 is native.
@@ -10,7 +10,7 @@ is native.
 ## Live Materialized Views
 
 Unlike PostgreSQL, where materialized views are static snapshots that require
-`REFRESH MATERIALIZED VIEW` to update, pgmicro's materialized views are **live**.
+`REFRESH MATERIALIZED VIEW` to update, tursopg's materialized views are **live**.
 They automatically reflect changes to the underlying tables without any manual
 refresh step.
 

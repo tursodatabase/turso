@@ -2,14 +2,14 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Output, Stdio};
 
-fn run_pgmicro(input: &[u8]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pgmicro"))
+fn run_tursopg(input: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
         .arg(":memory:")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to run pgmicro");
+        .expect("failed to run tursopg");
 
     let mut stdin = child.stdin.take().expect("failed to take stdin");
     stdin.write_all(input).expect("failed to write stdin");
@@ -28,14 +28,14 @@ fn stdout(output: &Output) -> String {
 
 /// The SQL standard `POSITION(needle IN haystack)` is parsed by libpg_query
 /// into a regular function call with operands swapped to `(haystack, needle)`.
-/// pgmicro's PG translator rewrites the function name from `position` to
+/// tursopg's PG translator rewrites the function name from `position` to
 /// `strpos` (which Turso core already implements as an alias of `instr`) so
 /// the alias does not need to live in core. This test pins the end-to-end
 /// behavior: needle found → 1-based index, needle not found → 0, empty
 /// needle → 1 (matches PostgreSQL).
 #[test]
 fn position_in_form_returns_index() {
-    let output = run_pgmicro(b"SELECT POSITION('world' IN 'hello world') AS a, POSITION('xyz' IN 'hello') AS b, POSITION('' IN 'hello') AS c;\n");
+    let output = run_tursopg(b"SELECT POSITION('world' IN 'hello world') AS a, POSITION('xyz' IN 'hello') AS b, POSITION('' IN 'hello') AS c;\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -54,7 +54,7 @@ fn position_in_form_returns_index() {
 
 #[test]
 fn create_table_then_select() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE kv(k TEXT, v INT);\nINSERT INTO kv VALUES ('hello', 42);\nSELECT * FROM kv;\n",
     );
     assert_eq!(output.status.code(), Some(0));
@@ -65,7 +65,7 @@ fn create_table_then_select() {
 
 #[test]
 fn create_multiple_tables() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE a(x INT);\nCREATE TABLE b(y INT);\nCREATE TABLE c(z INT);\nSELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;\n",
     );
     assert_eq!(output.status.code(), Some(0));
@@ -81,7 +81,7 @@ fn create_multiple_tables() {
 
 #[test]
 fn dt_lists_created_tables() {
-    let output = run_pgmicro(b"CREATE TABLE foo(bar TEXT);\n\\dt\n");
+    let output = run_tursopg(b"CREATE TABLE foo(bar TEXT);\n\\dt\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(out.contains("foo"), "\\dt should list 'foo', got: {out}");
@@ -89,7 +89,7 @@ fn dt_lists_created_tables() {
 
 #[test]
 fn dt_lists_multiple_tables() {
-    let output = run_pgmicro(b"CREATE TABLE alpha(x INT);\nCREATE TABLE beta(y TEXT);\n\\dt\n");
+    let output = run_tursopg(b"CREATE TABLE alpha(x INT);\nCREATE TABLE beta(y TEXT);\n\\dt\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(out.contains("alpha"), "\\dt should list alpha");
@@ -98,7 +98,7 @@ fn dt_lists_multiple_tables() {
 
 #[test]
 fn dt_empty_database() {
-    let output = run_pgmicro(b"\\dt\n");
+    let output = run_tursopg(b"\\dt\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -114,7 +114,7 @@ fn dt_empty_database() {
 #[test]
 fn d_describes_table_columns() {
     let output =
-        run_pgmicro(b"CREATE TABLE users(id INT PRIMARY KEY, name TEXT, age INT);\n\\d users\n");
+        run_tursopg(b"CREATE TABLE users(id INT PRIMARY KEY, name TEXT, age INT);\n\\d users\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(out.contains("id"), "should show column 'id'");
@@ -125,7 +125,7 @@ fn d_describes_table_columns() {
 
 #[test]
 fn d_nonexistent_table() {
-    let output = run_pgmicro(b"\\d nonexistent\n");
+    let output = run_tursopg(b"\\d nonexistent\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -140,7 +140,7 @@ fn d_nonexistent_table() {
 
 #[test]
 fn l_lists_database() {
-    let output = run_pgmicro(b"\\l\n");
+    let output = run_tursopg(b"\\l\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -155,7 +155,7 @@ fn l_lists_database() {
 
 #[test]
 fn conninfo_shows_database_and_dialect() {
-    let output = run_pgmicro(b"\\conninfo\n");
+    let output = run_tursopg(b"\\conninfo\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(out.contains(":memory:"), "should show database path");
@@ -168,7 +168,7 @@ fn conninfo_shows_database_and_dialect() {
 
 #[test]
 fn help_lists_commands() {
-    let output = run_pgmicro(b"\\?\n");
+    let output = run_tursopg(b"\\?\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(out.contains("\\dt"), "help should mention \\dt");
@@ -183,7 +183,7 @@ fn help_lists_commands() {
 
 #[test]
 fn unknown_command_reports_error() {
-    let output = run_pgmicro(b"\\bogus\n");
+    let output = run_tursopg(b"\\bogus\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -198,7 +198,7 @@ fn unknown_command_reports_error() {
 
 #[test]
 fn pg_class_shows_created_table() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE test_tbl(id INT, name TEXT);\nSELECT relname FROM pg_class WHERE relkind = 'r';\n",
     );
     assert_eq!(output.status.code(), Some(0));
@@ -215,7 +215,7 @@ fn pg_class_shows_created_table() {
 
 #[test]
 fn rejects_sqlite_syntax() {
-    let output = run_pgmicro(b"SELECT * FROM sqlite_schema;\n");
+    let output = run_tursopg(b"SELECT * FROM sqlite_schema;\n");
     assert_ne!(
         output.status.code(),
         Some(0),
@@ -229,19 +229,19 @@ fn rejects_sqlite_syntax() {
 
 #[test]
 fn success_returns_zero() {
-    let output = run_pgmicro(b"SELECT 1;\n");
+    let output = run_tursopg(b"SELECT 1;\n");
     assert_eq!(output.status.code(), Some(0));
 }
 
 #[test]
 fn error_returns_nonzero() {
-    let output = run_pgmicro(b"SELECT * FROM nonexistent;\n");
+    let output = run_tursopg(b"SELECT * FROM nonexistent;\n");
     assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]
 fn empty_input_returns_zero() {
-    let output = run_pgmicro(b"");
+    let output = run_tursopg(b"");
     assert_eq!(output.status.code(), Some(0));
 }
 
@@ -251,7 +251,7 @@ fn empty_input_returns_zero() {
 
 #[test]
 fn default_now_produces_value() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE t(id INT, ts TEXT DEFAULT now());\n\
           INSERT INTO t(id) VALUES (1);\n\
           SELECT ts FROM t;\n",
@@ -267,7 +267,7 @@ fn default_now_produces_value() {
 
 #[test]
 fn default_gen_random_uuid_produces_value() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE t(id INT, uid TEXT DEFAULT gen_random_uuid());\n\
           INSERT INTO t(id) VALUES (1);\n\
           INSERT INTO t(id) VALUES (2);\n\
@@ -284,7 +284,7 @@ fn default_gen_random_uuid_produces_value() {
 
 #[test]
 fn describe_table_shows_default_expressions() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE t(id INT, ts TEXT DEFAULT now(), uid TEXT DEFAULT gen_random_uuid());\n\
           \\d t\n",
     );
@@ -302,7 +302,7 @@ fn describe_table_shows_default_expressions() {
 
 #[test]
 fn default_casted_expression() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE config(id INT, data jsonb DEFAULT '{}'::jsonb, tags jsonb DEFAULT '[]'::jsonb);\n\
           INSERT INTO config(id) VALUES (1);\n\
           SELECT data, tags FROM config;\n",
@@ -325,7 +325,7 @@ fn default_casted_expression() {
 
 #[test]
 fn di_lists_created_indexes() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE t(id INT PRIMARY KEY, name TEXT);\nCREATE INDEX idx_name ON t(name);\n\\di\n",
     );
     assert_eq!(output.status.code(), Some(0));
@@ -338,7 +338,7 @@ fn di_lists_created_indexes() {
 
 #[test]
 fn di_empty_database() {
-    let output = run_pgmicro(b"\\di\n");
+    let output = run_tursopg(b"\\di\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -353,7 +353,7 @@ fn di_empty_database() {
 
 #[test]
 fn dv_empty_database() {
-    let output = run_pgmicro(b"\\dv\n");
+    let output = run_tursopg(b"\\dv\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -368,7 +368,7 @@ fn dv_empty_database() {
 
 #[test]
 fn dn_lists_schemas() {
-    let output = run_pgmicro(b"\\dn\n");
+    let output = run_tursopg(b"\\dn\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -379,7 +379,7 @@ fn dn_lists_schemas() {
 
 #[test]
 fn dn_lists_created_schema() {
-    let output = run_pgmicro(b"CREATE SCHEMA foo;\n\\dn\n");
+    let output = run_tursopg(b"CREATE SCHEMA foo;\n\\dn\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(out.contains("foo"), "\\dn should list 'foo', got: {out}");
@@ -391,7 +391,7 @@ fn dn_lists_created_schema() {
 
 #[test]
 fn d_upper_t_lists_types() {
-    let output = run_pgmicro(b"CREATE TYPE mood AS ENUM ('happy', 'sad');\n\\dT\n");
+    let output = run_tursopg(b"CREATE TYPE mood AS ENUM ('happy', 'sad');\n\\dT\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(out.contains("mood"), "\\dT should list 'mood', got: {out}");
@@ -399,7 +399,7 @@ fn d_upper_t_lists_types() {
 
 #[test]
 fn d_upper_t_empty() {
-    let output = run_pgmicro(b"\\dT\n");
+    let output = run_tursopg(b"\\dT\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -414,7 +414,7 @@ fn d_upper_t_empty() {
 
 #[test]
 fn du_lists_roles() {
-    let output = run_pgmicro(b"\\du\n");
+    let output = run_tursopg(b"\\du\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -429,7 +429,7 @@ fn du_lists_roles() {
 
 #[test]
 fn df_lists_functions() {
-    let output = run_pgmicro(b"\\df\n");
+    let output = run_tursopg(b"\\df\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -444,7 +444,7 @@ fn df_lists_functions() {
 
 #[test]
 fn d_plus_describes_table_extended() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE tbl(id INT PRIMARY KEY, name TEXT);\nCREATE INDEX idx_tbl_name ON tbl(name);\n\\d+ tbl\n",
     );
     assert_eq!(output.status.code(), Some(0));
@@ -462,7 +462,7 @@ fn d_plus_describes_table_extended() {
 
 #[test]
 fn dt_plus_lists_tables_extended() {
-    let output = run_pgmicro(b"CREATE TABLE tbl(id INT);\n\\dt+\n");
+    let output = run_tursopg(b"CREATE TABLE tbl(id INT);\n\\dt+\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -477,7 +477,7 @@ fn dt_plus_lists_tables_extended() {
 
 #[test]
 fn x_toggles_expanded() {
-    let output = run_pgmicro(b"\\x\n");
+    let output = run_tursopg(b"\\x\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -492,7 +492,7 @@ fn x_toggles_expanded() {
 
 #[test]
 fn timing_toggles() {
-    let output = run_pgmicro(b"\\timing\n");
+    let output = run_tursopg(b"\\timing\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -507,7 +507,7 @@ fn timing_toggles() {
 
 #[test]
 fn echo_prints_text() {
-    let output = run_pgmicro(b"\\echo hello world\n");
+    let output = run_tursopg(b"\\echo hello world\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -522,7 +522,7 @@ fn echo_prints_text() {
 
 #[test]
 fn help_lists_new_commands() {
-    let output = run_pgmicro(b"\\?\n");
+    let output = run_tursopg(b"\\?\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(out.contains("\\di"), "help should mention \\di, got: {out}");
@@ -536,7 +536,7 @@ fn help_lists_new_commands() {
 
 #[test]
 fn array_constructor_and_subscript() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE t(id INT, tags TEXT[]);\n\
           INSERT INTO t VALUES (1, ARRAY['a','b','c']);\n\
           SELECT tags[1], tags[2], tags[3] FROM t;\n",
@@ -550,7 +550,7 @@ fn array_constructor_and_subscript() {
 
 #[test]
 fn array_slice() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE t(id INT, tags TEXT[]);\n\
           INSERT INTO t VALUES (1, ARRAY['a','b','c','d']);\n\
           SELECT tags[2:3] FROM t;\n",
@@ -569,7 +569,7 @@ fn array_slice() {
 
 #[test]
 fn array_in_where_clause() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE t(id INT, vals INT[]);\n\
           INSERT INTO t VALUES (1, ARRAY[10,20,30]);\n\
           INSERT INTO t VALUES (2, ARRAY[40,50,60]);\n\
@@ -590,7 +590,7 @@ fn array_in_where_clause() {
 
 #[test]
 fn dollar_quoted_string() {
-    let output = run_pgmicro(b"SELECT $$hello world$$;\n");
+    let output = run_tursopg(b"SELECT $$hello world$$;\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -601,7 +601,7 @@ fn dollar_quoted_string() {
 
 #[test]
 fn dollar_quoted_with_embedded_quote() {
-    let output = run_pgmicro(b"SELECT $$it's fine$$;\n");
+    let output = run_tursopg(b"SELECT $$it's fine$$;\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -612,7 +612,7 @@ fn dollar_quoted_with_embedded_quote() {
 
 #[test]
 fn tagged_dollar_quoted_string() {
-    let output = run_pgmicro(b"SELECT $tag$content$tag$;\n");
+    let output = run_tursopg(b"SELECT $tag$content$tag$;\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(out.contains("content"), "expected 'content', got: {out}");
@@ -620,7 +620,7 @@ fn tagged_dollar_quoted_string() {
 
 #[test]
 fn escape_string_backslash_n() {
-    let output = run_pgmicro(b"SELECT E'line1\\nline2';\n");
+    let output = run_tursopg(b"SELECT E'line1\\nline2';\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -631,7 +631,7 @@ fn escape_string_backslash_n() {
 
 #[test]
 fn escape_string_backslash_t() {
-    let output = run_pgmicro(b"SELECT E'col1\\tcol2';\n");
+    let output = run_tursopg(b"SELECT E'col1\\tcol2';\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
@@ -646,7 +646,7 @@ fn escape_string_backslash_t() {
 
 #[test]
 fn create_materialized_view_basic() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE items(id INT, name TEXT, price INT);\n\
           INSERT INTO items VALUES (1, 'Laptop', 1200), (2, 'Mouse', 25), (3, 'Monitor', 400);\n\
           CREATE MATERIALIZED VIEW expensive AS SELECT * FROM items WHERE price > 100;\n\
@@ -664,7 +664,7 @@ fn create_materialized_view_basic() {
 
 #[test]
 fn materialized_view_with_aggregation() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE sales(product TEXT, amount INT);\n\
           INSERT INTO sales VALUES ('A', 10), ('B', 20), ('A', 30), ('B', 5);\n\
           CREATE MATERIALIZED VIEW totals AS SELECT product, SUM(amount) as total FROM sales GROUP BY product;\n\
@@ -680,7 +680,7 @@ fn materialized_view_with_aggregation() {
 
 #[test]
 fn materialized_view_live_update() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE counters(grp TEXT, val INT);\n\
           INSERT INTO counters VALUES ('x', 1), ('y', 2);\n\
           CREATE MATERIALIZED VIEW sums AS SELECT grp, SUM(val) as total FROM counters GROUP BY grp;\n\
@@ -698,7 +698,7 @@ fn materialized_view_live_update() {
 
 #[test]
 fn materialized_view_duplicate_errors() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE t(id INT);\n\
           CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;\n\
           CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;\n",
@@ -714,7 +714,7 @@ fn materialized_view_duplicate_errors() {
 
 #[test]
 fn drop_materialized_view() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE t(id INT);\n\
           CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;\n\
           DROP MATERIALIZED VIEW mv;\n\
@@ -727,7 +727,7 @@ fn drop_materialized_view() {
 
 #[test]
 fn drop_materialized_view_if_exists() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"DROP MATERIALIZED VIEW IF EXISTS nonexistent;\n\
           SELECT 'ok';\n",
     );
@@ -738,7 +738,7 @@ fn drop_materialized_view_if_exists() {
 
 #[test]
 fn refresh_materialized_view_is_noop() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE t(id INT);\n\
           CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;\n\
           REFRESH MATERIALIZED VIEW mv;\n\
@@ -755,7 +755,7 @@ fn refresh_materialized_view_is_noop() {
 
 #[test]
 fn named_window_basic() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE emp(id INT, dept TEXT, salary INT);\n\
           INSERT INTO emp VALUES (1, 'eng', 100), (2, 'eng', 200), (3, 'sales', 150);\n\
           SELECT dept, salary, SUM(salary) OVER w FROM emp WINDOW w AS (PARTITION BY dept);\n",
@@ -770,7 +770,7 @@ fn named_window_basic() {
 
 #[test]
 fn named_window_row_number() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE items(id INT, name TEXT);\n\
           INSERT INTO items VALUES (1, 'a'), (2, 'b'), (3, 'c');\n\
           SELECT name, ROW_NUMBER() OVER w FROM items WINDOW w AS (ORDER BY id);\n",
@@ -784,7 +784,7 @@ fn named_window_row_number() {
 
 #[test]
 fn named_window_multiple_functions_same_window() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE vals(x INT);\n\
           INSERT INTO vals VALUES (10), (20), (30);\n\
           SELECT x, SUM(x) OVER w, AVG(x) OVER w FROM vals WINDOW w AS (ORDER BY x);\n",
@@ -799,7 +799,7 @@ fn named_window_multiple_functions_same_window() {
 
 #[test]
 fn named_window_multiple_definitions() {
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE data(grp TEXT, val INT);\n\
           INSERT INTO data VALUES ('a', 1), ('a', 2), ('b', 3);\n\
           SELECT grp, SUM(val) OVER w1, COUNT(*) OVER w2 \
@@ -817,7 +817,7 @@ fn named_window_multiple_definitions() {
 #[test]
 fn named_window_running_total() {
     // ORDER BY in a named window produces a running total (default RANGE UNBOUNDED PRECEDING)
-    let output = run_pgmicro(
+    let output = run_tursopg(
         b"CREATE TABLE seq(id INT, val INT);\n\
           INSERT INTO seq VALUES (1, 10), (2, 20), (3, 30);\n\
           SELECT id, SUM(val) OVER w FROM seq WINDOW w AS (ORDER BY id);\n",
@@ -836,7 +836,7 @@ fn named_window_running_total() {
 
 /// Write content to a temp file and return its path (file is kept alive via the path).
 fn write_temp_copy_file(name: &str, content: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!("pgmicro_test_{name}_{}.tsv", std::process::id()));
+    let path = std::env::temp_dir().join(format!("tursopg_test_{name}_{}.tsv", std::process::id()));
     std::fs::write(&path, content).expect("failed to write temp file");
     path
 }
@@ -848,7 +848,7 @@ fn copy_from_basic_repl() {
         "CREATE TABLE users(id INT, name TEXT);\nCOPY users FROM '{}';\nSELECT id, name FROM users ORDER BY id;\n",
         path.display()
     );
-    let output = run_pgmicro(input.as_bytes());
+    let output = run_tursopg(input.as_bytes());
     std::fs::remove_file(&path).ok();
 
     assert_eq!(output.status.code(), Some(0));
@@ -864,7 +864,7 @@ fn copy_from_with_options_repl() {
         "CREATE TABLE t(id INT, name TEXT);\nCOPY t FROM '{}' WITH (DELIMITER '|', NULL '<nil>', HEADER true);\nSELECT id, name FROM t ORDER BY id;\n",
         path.display()
     );
-    let output = run_pgmicro(input.as_bytes());
+    let output = run_tursopg(input.as_bytes());
     std::fs::remove_file(&path).ok();
 
     assert_eq!(output.status.code(), Some(0));
@@ -880,7 +880,7 @@ fn copy_from_with_options_repl() {
 #[test]
 fn copy_from_file_not_found_repl() {
     let output =
-        run_pgmicro(b"CREATE TABLE t(id INT);\nCOPY t FROM '/nonexistent/path/data.tsv';\n");
+        run_tursopg(b"CREATE TABLE t(id INT);\nCOPY t FROM '/nonexistent/path/data.tsv';\n");
     // Should fail with nonzero exit
     assert_ne!(output.status.code(), Some(0));
 }
@@ -889,17 +889,17 @@ fn copy_from_file_not_found_repl() {
 // Wire protocol: COPY FROM returns "COPY N"
 // ---------------------------------------------------------------------------
 
-/// Start pgmicro with --server and wait for it to be ready.
-fn start_pgmicro_server(port: u16) -> Child {
+/// Start tursopg with --server and wait for it to be ready.
+fn start_tursopg_server(port: u16) -> Child {
     let addr = format!("127.0.0.1:{port}");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pgmicro"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
         .arg(":memory:")
         .arg("--server")
         .arg(&addr)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to start pgmicro server");
+        .expect("failed to start tursopg server");
 
     // Wait for the server to be ready by polling TCP connect
     for _ in 0..50 {
@@ -910,7 +910,7 @@ fn start_pgmicro_server(port: u16) -> Child {
     }
     child.kill().ok();
     child.wait().ok();
-    panic!("pgmicro server did not start on {addr}");
+    panic!("tursopg server did not start on {addr}");
 }
 
 /// Minimal PG wire protocol client for testing.
@@ -1094,7 +1094,7 @@ fn extract_command_tags(data: &[u8]) -> Vec<String> {
 fn wire_copy_from_returns_copy_n() {
     // Use a unique port to avoid conflicts with parallel tests
     let port = 15432 + (std::process::id() % 1000) as u16;
-    let mut server = start_pgmicro_server(port);
+    let mut server = start_tursopg_server(port);
 
     let path = write_temp_copy_file("wire", "1\tAlice\n2\tBob\n3\tCharlie\n");
 
@@ -1128,14 +1128,14 @@ fn wire_copy_from_returns_copy_n() {
     server.wait().ok();
 }
 
-/// Wire-protocol fixture: spin up pgmicro, hand the caller a connected
+/// Wire-protocol fixture: spin up tursopg, hand the caller a connected
 /// client, run their assertions, then shut the server down. Each test
 /// gets its own port so they can run in parallel without TCP collisions.
 fn with_pg_client<F: FnOnce(&mut PgTestClient)>(port_seed: u16, f: F) {
     // Compose a port from the test-supplied seed and the test process id so
     // multiple test files don't collide on a shared port range either.
     let port = 16000 + port_seed + (std::process::id() % 100) as u16;
-    let mut server = start_pgmicro_server(port);
+    let mut server = start_tursopg_server(port);
     let mut client = PgTestClient::connect(port);
     f(&mut client);
     server.kill().ok();
@@ -1155,7 +1155,7 @@ fn wire_integer_literal_reports_int4() {
 }
 
 /// `SELECT 3.14` reports FLOAT8. PG normally returns NUMERIC for unannotated
-/// numeric literals; FLOAT8 is the pgmicro choice because Turso stores
+/// numeric literals; FLOAT8 is the tursopg choice because Turso stores
 /// reals as 64-bit floats and the client decodes the wire bytes directly.
 #[test]
 fn wire_real_literal_reports_float8() {
@@ -1209,7 +1209,7 @@ fn wire_bitwise_ops_report_int4() {
 }
 
 /// Comparison and logical ops return INT4 — SQLite returns 0/1 as INTEGER
-/// at runtime; pgmicro's wire layer reports INT4 here. A future change
+/// at runtime; tursopg's wire layer reports INT4 here. A future change
 /// could map these to BOOL OID, but for now stable + assertable.
 #[test]
 fn wire_comparison_and_logical_report_int4() {

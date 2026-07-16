@@ -1,4 +1,4 @@
-// pgmicro — PostgreSQL-compatible micro database CLI
+// tursopg — PostgreSQL-compatible micro database CLI
 #![allow(clippy::arc_with_non_send_sync)]
 
 #[path = "../../cli/config/mod.rs"]
@@ -8,10 +8,10 @@ mod helper;
 mod read_state_machine;
 
 // Stubs for shared modules that reference crate-level types from the tursodb binary.
-// pgmicro doesn't use these codepaths, but the types must exist so shared code compiles.
+// tursopg doesn't use these codepaths, but the types must exist so shared code compiles.
 mod commands {
     #[derive(clap::Parser, Debug)]
-    #[command(name = "pgmicro-stub", disable_help_flag(true))]
+    #[command(name = "tursopg-stub", disable_help_flag(true))]
     pub struct CommandParser {}
 }
 mod input {
@@ -52,17 +52,17 @@ use turso_pg_server::TursoPgServer;
 pub static HOME_DIR: LazyLock<PathBuf> =
     LazyLock::new(|| dirs::home_dir().expect("Could not determine home directory"));
 
-pub static HISTORY_FILE: LazyLock<PathBuf> = LazyLock::new(|| HOME_DIR.join(".pgmicro_history"));
+pub static HISTORY_FILE: LazyLock<PathBuf> = LazyLock::new(|| HOME_DIR.join(".tursopg_history"));
 
-const PROMPT: &str = "pgmicro> ";
-const PROMPT_CONT: &str = "pgmicro-> ";
+const PROMPT: &str = "tursopg> ";
+const PROMPT_CONT: &str = "tursopg-> ";
 
 // ---------------------------------------------------------------------------
 // CLI options
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(name = "pgmicro")]
+#[command(name = "tursopg")]
 #[command(author, version, about = "PostgreSQL-compatible micro database")]
 struct Opts {
     #[clap(index = 1, help = "Database file", default_value = ":memory:")]
@@ -927,7 +927,7 @@ impl Repl {
         let h = LimboHelper::new(self.conn.inner().clone(), Some(config.highlight));
         rl.set_helper(Some(h));
 
-        println!("pgmicro v{}", env!("CARGO_PKG_VERSION"));
+        println!("tursopg v{}", env!("CARGO_PKG_VERSION"));
         println!("Type \\? for help, \\q to quit.");
         if self.db_file == ":memory:" {
             println!("Connected to a transient in-memory database.");

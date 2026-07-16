@@ -218,7 +218,7 @@ fn infer_expression_primitive(
             | Operator::BitwiseNot
             | Operator::LeftShift
             | Operator::RightShift => Some("INTEGER"),
-            // Comparison and logical: SQLite returns 0/1 INTEGER; pgmicro
+            // Comparison and logical: SQLite returns 0/1 INTEGER; tursopg
             // maps INTEGER to BOOL at the wire layer for boolean columns,
             // but the type the wire layer reports is still INTEGER here.
             Operator::Equals

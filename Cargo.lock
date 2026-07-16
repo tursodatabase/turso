@@ -4382,40 +4382,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgmicro"
-version = "0.7.0"
-dependencies = [
- "anyhow",
- "cfg-if",
- "clap",
- "clap_complete",
- "comfy-table",
- "ctrlc",
- "dirs 5.0.1",
- "include_dir",
- "itertools 0.14.0",
- "libc",
- "limbo_completion",
- "mimalloc",
- "nu-ansi-term",
- "rustyline",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "shlex",
- "syntect",
- "toml",
- "toml_edit 0.22.26",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "turso_core",
- "turso_pg",
- "turso_pg_server",
- "validator",
-]
-
-[[package]]
 name = "pgwire"
 version = "0.36.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7575,6 +7541,40 @@ dependencies = [
  "turso_core",
  "turso_parser",
  "twox-hash",
+]
+
+[[package]]
+name = "tursopg"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "cfg-if",
+ "clap",
+ "clap_complete",
+ "comfy-table",
+ "ctrlc",
+ "dirs 5.0.1",
+ "include_dir",
+ "itertools 0.14.0",
+ "libc",
+ "limbo_completion",
+ "mimalloc",
+ "nu-ansi-term",
+ "rustyline",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "shlex",
+ "syntect",
+ "toml",
+ "toml_edit 0.22.26",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "turso_core",
+ "turso_pg",
+ "turso_pg_server",
+ "validator",
 ]
 
 [[package]]

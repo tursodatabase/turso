@@ -24,7 +24,7 @@ engine can execute. Components:
 - `postgres/parser` — parse + translate PostgreSQL SQL to Turso AST
 - `postgres/frontend` — pg_catalog emulation, COPY, schemas, session handling
 - `postgres/server` — PostgreSQL wire protocol (v3) server, built on `pgwire`
-- `postgres/cli` — `pgmicro`, a psql-like REPL that can also host the server
+- `postgres/cli` — `tursopg`, a psql-like REPL that can also host the server
 
 Because the parser accepts the full PostgreSQL grammar, some clauses parse
 and run but their semantics are silently dropped, producing wrong results or
@@ -516,7 +516,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| psql-style REPL | 🟡 Partial | `pgmicro` (not psql itself); supports `\d[+]`, `\dt[+]`, `\di`, `\dv`, `\dn`, `\dT`, `\du`/`\dg`, `\df`, `\l`, `\x`, `\timing`, `\echo`, `\conninfo`, `\?`, `\q`; no `\copy`, `\i`, `\e`, `\set`, `\pset`, `\g`, `\watch` |
+| psql-style REPL | 🟡 Partial | `tursopg` (not psql itself); supports `\d[+]`, `\dt[+]`, `\di`, `\dv`, `\dn`, `\dT`, `\du`/`\dg`, `\df`, `\l`, `\x`, `\timing`, `\echo`, `\conninfo`, `\?`, `\q`; no `\copy`, `\i`, `\e`, `\set`, `\pset`, `\g`, `\watch` |
 | pgbench | ❌ Not supported | |
 | pg_combinebackup | ❌ Not supported | |
 | pg_createsubscriber | ❌ Not supported | |

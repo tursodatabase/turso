@@ -898,7 +898,7 @@ fn test_pg_create_table_columns_in_pg_attribute(db: TempDatabase) {
     conn.execute("CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price INT)")
         .unwrap();
 
-    // Join pg_attribute + pg_class + pg_type to get column info (same query pgmicro \d uses)
+    // Join pg_attribute + pg_class + pg_type to get column info (same query tursopg \d uses)
     let mut stmt = conn
         .prepare(
             "SELECT a.attname, t.typname \

@@ -81,7 +81,7 @@ impl Config {
         }
     }
 
-    // dead_code: this file is shared with pgmicro via #[path], which doesn't call this.
+    // dead_code: this file is shared with tursopg via #[path], which doesn't call this.
     #[allow(dead_code)]
     pub fn for_output_mode(mode: OutputMode) -> Self {
         let table = if mode == OutputMode::Pretty {
