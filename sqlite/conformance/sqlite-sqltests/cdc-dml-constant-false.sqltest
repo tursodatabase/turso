@@ -1,0 +1,76 @@
+@database :memory:
+@skip-file-if mvcc "CDC is not supported in MVCC mode"
+@skip-file-if sqlite "CDC is a turso-specific feature"
+
+# CDC + DML with constant false WHERE clause should not crash.
+# Bug: when WHERE clause is constant false (e.g. WHERE 0), the optimizer skips
+# the main loop including OpenWrite for the CDC cursor, but the CDC autocommit
+# epilogue still tries to use that cursor via NewRowid, causing a panic.
+
+test cdc-delete-where-false {
+    CREATE TABLE t(id INTEGER, val TEXT);
+    INSERT INTO t VALUES (1, 'a');
+    INSERT INTO t VALUES (2, 'b');
+    PRAGMA unstable_capture_data_changes_conn('full');
+    DELETE FROM t WHERE 0;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+}
+
+test cdc-delete-where-not-1 {
+    CREATE TABLE t2(id INTEGER);
+    INSERT INTO t2 VALUES (1);
+    PRAGMA unstable_capture_data_changes_conn('full');
+    DELETE FROM t2 WHERE NOT 1;
+    SELECT * FROM t2;
+}
+expect {
+    1
+}
+
+test cdc-delete-empty-table-where-false {
+    CREATE TABLE t3(id INTEGER);
+    PRAGMA unstable_capture_data_changes_conn('full');
+    DELETE FROM t3 WHERE 0;
+    SELECT count(*) FROM t3;
+}
+expect {
+    0
+}
+
+test cdc-update-where-false {
+    CREATE TABLE t4(id INTEGER, val TEXT);
+    INSERT INTO t4 VALUES (1, 'a');
+    INSERT INTO t4 VALUES (2, 'b');
+    PRAGMA unstable_capture_data_changes_conn('full');
+    UPDATE t4 SET val = 'x' WHERE 0;
+    SELECT * FROM t4 ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+}
+
+test cdc-update-where-not-1 {
+    CREATE TABLE t5(id INTEGER, val TEXT);
+    INSERT INTO t5 VALUES (1, 'a');
+    PRAGMA unstable_capture_data_changes_conn('full');
+    UPDATE t5 SET val = 'x' WHERE NOT 1;
+    SELECT * FROM t5;
+}
+expect {
+    1|a
+}
+
+test cdc-update-empty-table-where-false {
+    CREATE TABLE t6(id INTEGER, val TEXT);
+    PRAGMA unstable_capture_data_changes_conn('full');
+    UPDATE t6 SET val = 'x' WHERE 0;
+    SELECT count(*) FROM t6;
+}
+expect {
+    0
+}
