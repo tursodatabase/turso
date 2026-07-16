@@ -363,6 +363,64 @@ test('example-2', async () => {
     ]);
 })
 
+// The transaction() wrapper must own the connection for the whole
+// BEGIN..COMMIT window. Statements are only serialized individually, so a
+// concurrent caller can currently interleave its statements into an open
+// transaction: its BEGIN fails as nested, and its ROLLBACK then erases the
+// first transaction's in-flight writes while later writes land in autocommit.
+test('concurrent transaction() calls must not interleave', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE t(tag TEXT, i INTEGER)');
+
+    const insertMany = db.transaction(async (tag: string, fail: boolean) => {
+        for (let i = 0; i < 10; i++) {
+            await db.run('INSERT INTO t VALUES (?, ?)', [tag, i]);
+        }
+        if (fail) {
+            throw new Error('abort transaction');
+        }
+    });
+
+    const [committed, aborted] = await Promise.allSettled([
+        insertMany('committed', false),
+        insertMany('rolled-back', true),
+    ]);
+
+    // the first transaction commits; the second fails only with its own error
+    expect(committed).toEqual({ status: 'fulfilled', value: undefined });
+    expect(aborted.status).toBe('rejected');
+    expect((aborted as PromiseRejectedResult).reason.message).toBe('abort transaction');
+
+    // atomicity: every row of the committed transaction survives and no row
+    // of the rolled-back transaction does
+    const rows = await db.all('SELECT tag, COUNT(*) AS cnt FROM t GROUP BY tag ORDER BY tag');
+    expect(rows).toEqual([{ tag: 'committed', cnt: 10 }]);
+})
+
+// Same root cause, worst manifestation: an independent autocommit statement
+// racing with a transaction() call slips into the open BEGIN..ROLLBACK window,
+// reports success, and is then silently erased by the transaction's rollback.
+test('statement racing a transaction() must not be lost to its rollback', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE t(tag TEXT)');
+
+    const failing = db.transaction(async () => {
+        await db.run('INSERT INTO t VALUES (?)', ['txn']);
+        await new Promise((resolve) => setImmediate(resolve));
+        throw new Error('abort transaction');
+    });
+
+    const [txnResult, plainResult] = await Promise.allSettled([
+        failing(),
+        db.run('INSERT INTO t VALUES (?)', ['plain']),
+    ]);
+    expect(txnResult.status).toBe('rejected');
+    expect(plainResult.status).toBe('fulfilled');
+
+    // the transaction rolled back, but the successful independent insert must survive
+    expect(await db.all('SELECT tag FROM t')).toEqual([{ tag: 'plain' }]);
+})
+
 test('transaction.concurrent uses BEGIN CONCURRENT', async () => {
     const db = await connect(':memory:');
     const originalExec = db.exec;
