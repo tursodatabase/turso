@@ -58,8 +58,8 @@ addr  opcode                    p1  p2  p3  p4            p5  comment
   31        Null                 0  16   0                 0  r[16]=NULL
   32        Integer              1  17   0                 0  r[17]=1; LIMIT counter
   33        IfNot               17  45   0                 0  if !r[17] goto 45
-  34        OpenRead             2   2   0  k(3,B,B)       0  table=grouped_values, root=2, iDb=0
-  35        OpenRead             3   3   0  k(2,B)         0  index=idx_grouped_values_grp, root=3, iDb=0
+  34        ReopenIdx            2   2   0  k(3,B,B)       0  table=grouped_values, root=2, iDb=0
+  35        ReopenIdx            3   3   0  k(2,B)         0  index=idx_grouped_values_grp, root=3, iDb=0
   36        Copy                 8  18   0                 0  r[18]=r[8]
   37        IsNull              18  45   0                 0  if (r[18]==NULL) goto 45
   38        SeekGE               3  45  18                 0  key=[18..18]

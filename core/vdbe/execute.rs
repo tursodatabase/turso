@@ -49,8 +49,8 @@ use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
-    registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
-    StepResult, TxnCleanup, VacuumOpState,
+    registers_to_ref_values, CursorID, DeferredSeekState, EndStatement, OpHashBuildState,
+    OpHashProbeState, PageIdx, StepResult, TxnCleanup, VacuumOpState,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -1159,7 +1159,65 @@ pub fn op_open_read(
         },
         insn
     );
+    open_read_cursor(program, state, cursor_id, root_page, db)
+}
 
+/// Works like OpenRead, except it is a no-op if the cursor slot already holds a btree
+/// cursor on the same root page: the cursor is reused, and a subsequent Seek/Rewind
+/// repositions it. Emitted instead of OpenRead inside subqueries, which re-execute once
+/// per outer row when correlated: rebuilding the BTreeCursor every iteration (allocation,
+/// pager registration, dropping the previous cursor) dominated runtime there.
+/// Mirrors SQLite's OP_ReopenIdx.
+pub fn op_reopen_idx(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        ReopenIdx {
+            cursor_id,
+            root_page,
+            db,
+        },
+        insn
+    );
+    let can_reuse_cursor = matches!(
+        state.cursors.get(*cursor_id),
+        Some(Some(Cursor::BTree(btree_cursor))) if btree_cursor.root_page() == *root_page
+    );
+    if can_reuse_cursor {
+        // Mirrors SQLite's `assert(pCur->iDb==pOp->p3)`. The reuse condition above only
+        // compares root_page, but root pages are unique only *within* a database file:
+        // two ATTACHed databases can each hold a btree at the same root page. A cursor
+        // slot is bound to a single table reference (hence a single database) by codegen,
+        // so this never fires today — the assert is a guard rail against a future change
+        // that lets a cursor_id be reopened against a different database, which would
+        // otherwise silently reuse a cursor pointing at the wrong database's btree.
+        #[cfg(debug_assertions)]
+        if let Some(Some(Cursor::BTree(btree_cursor))) = state.cursors.get(*cursor_id) {
+            let expected_pager = program
+                .get_pager_from_database_index(db)
+                .expect("pager should exist for db");
+            debug_assert!(
+                Arc::ptr_eq(&btree_cursor.get_pager(), &expected_pager),
+                "ReopenIdx reused a cursor bound to a different database (cursor {cursor_id}, db {db})"
+            );
+        }
+        invalidate_deferred_seeks_for_cursor(state, *cursor_id);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    open_read_cursor(program, state, cursor_id, root_page, db)
+}
+
+fn open_read_cursor(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: &CursorID,
+    root_page: &PageIdx,
+    db: &usize,
+) -> Result<InsnFunctionStepResult> {
     invalidate_deferred_seeks_for_cursor(state, *cursor_id);
 
     let pager = program.get_pager_from_database_index(db)?;
@@ -1192,6 +1250,7 @@ pub fn op_open_read(
         );
     }
     let cursors = &mut state.cursors;
+
     let num_columns = match cursor_type {
         CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
         CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),

@@ -30,8 +30,8 @@ addr  opcode                    p1  p2  p3  p4                     p5  comment
    4            Integer          0   8   0                          0  r[8]=0; clear group by abort flag
    5            Null             0   9   0                          0  r[9]=NULL; initialize group by comparison registers to NULL
    6            Gosub           16  39   0                          0  ; go to clear accumulator subroutine
-   7            OpenRead         1   2   0  k(5,B,B,B,B,B)          0  table=employees, root=2, iDb=0
-   8            OpenRead         2   4   0  k(2,B)                  0  index=idx_employees_department, root=4, iDb=0
+   7            ReopenIdx        1   2   0  k(5,B,B,B,B,B)          0  table=employees, root=2, iDb=0
+   8            ReopenIdx        2   4   0  k(2,B)                  0  index=idx_employees_department, root=4, iDb=0
    9            Rewind           2  25   0                          0  Rewind index idx_employees_department
   10              DeferredSeek   2   1   0                          0
   11              Column         2   0  14                          0  r[14]=idx_employees_department.department

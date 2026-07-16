@@ -497,6 +497,19 @@ pub enum Insn {
         db: usize,
     },
 
+    /// Works like OpenRead, except it becomes a no-op if the cursor slot already holds a
+    /// btree cursor on the same root page: the cursor is reused instead of rebuilt, and a
+    /// subsequent Seek/Rewind repositions it. Emitted instead of OpenRead inside subqueries,
+    /// which re-execute once per outer row when correlated — rebuilding the cursor on every
+    /// iteration (allocation + pager registration + dropping the previous cursor) dominates
+    /// runtime there. Mirrors SQLite's OP_ReopenIdx, which SQLite emits only for the
+    /// OR-optimization's shared index cursors; we also emit it for table cursors.
+    ReopenIdx {
+        cursor_id: CursorID,
+        root_page: PageIdx,
+        db: usize,
+    },
+
     /// Open a cursor for a virtual table.
     VOpen {
         cursor_id: CursorID,
@@ -2046,6 +2059,7 @@ impl InsnVariants {
             InsnVariants::If => execute::op_if,
             InsnVariants::IfNot => execute::op_if_not,
             InsnVariants::OpenRead => execute::op_open_read,
+            InsnVariants::ReopenIdx => execute::op_reopen_idx,
             InsnVariants::VOpen => execute::op_vopen,
             InsnVariants::VCreate => execute::op_vcreate,
             InsnVariants::VFilter => execute::op_vfilter,

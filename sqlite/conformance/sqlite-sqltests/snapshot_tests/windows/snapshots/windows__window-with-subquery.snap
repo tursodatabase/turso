@@ -39,8 +39,8 @@ addr  opcode              p1   p2  p3  p4                     p5  comment
    1      InitCoroutine    1   77   2                          0
    2      InitCoroutine    2   51   3                          0
    3      InitCoroutine    3   15   4                          0
-   4      OpenRead         0    2   0  k(5,B,B,B,B,B)          0  table=employees, root=2, iDb=0
-   5      OpenRead         1    4   0  k(2,B)                  0  index=idx_employees_department, root=4, iDb=0
+   4      ReopenIdx        0    2   0  k(5,B,B,B,B,B)          0  table=employees, root=2, iDb=0
+   5      ReopenIdx        1    4   0  k(2,B)                  0  index=idx_employees_department, root=4, iDb=0
    6      Rewind           1   14   0                          0  Rewind index idx_employees_department
    7        DeferredSeek   1    0   0                          0
    8        Column         1    0   4                          0  r[4]=idx_employees_department.department

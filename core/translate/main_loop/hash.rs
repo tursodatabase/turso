@@ -310,11 +310,11 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         });
 
         if !config.use_materialized_keys {
-            planner.program.emit_insn(Insn::OpenRead {
-                cursor_id: planner.hash_build_cursor_id,
-                root_page: btree.root_page,
-                db: build_table.database_id,
-            });
+            planner.program.emit_open_read(
+                planner.hash_build_cursor_id,
+                btree.root_page,
+                build_table.database_id,
+            );
         }
 
         planner.program.emit_insn(Insn::Rewind {
@@ -618,11 +618,8 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                 CursorKey::table(build_table.internal_id),
                 CursorType::BTreeTable(btree.clone()),
             );
-            self.program.emit_insn(Insn::OpenRead {
-                cursor_id,
-                root_page: btree.root_page,
-                db: build_table.database_id,
-            });
+            self.program
+                .emit_open_read(cursor_id, btree.root_page, build_table.database_id);
             cursor_id
         };
 

@@ -39,7 +39,7 @@ addr  opcode           p1  p2  p3  p4          p5  comment
   17      Null          0  13   0               0  r[13]=NULL
   18      Integer       1  14   0               0  r[14]=1; LIMIT counter
   19      IfNot        14  24   0               0  if !r[14] goto 24
-  20      OpenRead      2   2   0  k(3,B,B,B)   0  table=t, root=2, iDb=0
+  20      ReopenIdx     2   2   0  k(3,B,B,B)   0  table=t, root=2, iDb=0
   21      Rewind        2  24   0               0  Rewind table t
   22        AggStep     0  15  13  count        0  accum=r[13] step(r[15])
   23      Next          2  22   0               0

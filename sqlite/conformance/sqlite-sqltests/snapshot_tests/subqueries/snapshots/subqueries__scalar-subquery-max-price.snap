@@ -29,7 +29,7 @@ addr  opcode             p1  p2  p3  p4              p5  comment
    4    Null              0   4   0                   0  r[4]=NULL
    5    Integer           1   5   0                   0  r[5]=1; LIMIT counter
    6    IfNot             5  14   0                   0  if !r[5] goto 14
-   7    OpenRead          0   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+   7    ReopenIdx         0   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
    8    Rewind            0  14   0                   0  Rewind table products
    9      Column          0   3   6                   0  r[6]=products.price
   10      RealAffinity    6   0   0                   0

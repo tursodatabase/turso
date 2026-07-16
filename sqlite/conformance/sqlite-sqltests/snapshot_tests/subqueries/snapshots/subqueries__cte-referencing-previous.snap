@@ -58,8 +58,8 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
    5          Integer            0   9   0                   0  r[9]=0; clear group by abort flag
    6          Null               0  10   0                   0  r[10]=NULL; initialize group by comparison registers to NULL
    7          Gosub             18  43   0                   0  ; go to clear accumulator subroutine
-   8          OpenRead           0   5   0  k(5,B,B,B,B,B)   0  table=order_items, root=5, iDb=0
-   9          OpenRead           1  11   0  k(2,B)           0  index=idx_order_items_product, root=11, iDb=0
+   8          ReopenIdx          0   5   0  k(5,B,B,B,B,B)   0  table=order_items, root=5, iDb=0
+   9          ReopenIdx          1  11   0  k(2,B)           0  index=idx_order_items_product, root=11, iDb=0
   10          Rewind             1  30   0                   0  Rewind index idx_order_items_product
   11            DeferredSeek     1   0   0                   0
   12            Column           1   0  15                   0  r[15]=idx_order_items_product.product_id
@@ -107,7 +107,7 @@ addr  opcode                    p1  p2  p3  p4              p5  comment
   54    Yield                    2   0   0                   0
   55  Goto                       0  48   0                   0
   56  EndCoroutine               2   0   0                   0
-  57  OpenRead                   2   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  57  ReopenIdx                  2   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
   58  InitCoroutine              2   0   3                   0
   59    Yield                    2  68   0                   0
   60    Copy                    21  31   0                   0  r[31]=r[21]

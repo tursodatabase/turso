@@ -42,9 +42,9 @@ addr  opcode                   p1   p2   p3  p4                     p5  comment
    2          InitCoroutine     2  132    3                          0
    3          InitCoroutine     3   75    4                          0
    4          InitCoroutine     4   21    5                          0
-   5          OpenRead          0    2    0  k(5,B,B,B,B,B)          0  table=employees, root=2, iDb=0
-   6          OpenRead          1    3    0  k(5,B,B,B,B,B)          0  table=sales, root=3, iDb=0
-   7          OpenRead          2    8    0  k(2,B)                  0  index=idx_sales_region, root=8, iDb=0
+   5          ReopenIdx         0    2    0  k(5,B,B,B,B,B)          0  table=employees, root=2, iDb=0
+   6          ReopenIdx         1    3    0  k(5,B,B,B,B,B)          0  table=sales, root=3, iDb=0
+   7          ReopenIdx         2    8    0  k(2,B)                  0  index=idx_sales_region, root=8, iDb=0
    8          Rewind            2   20    0                          0  Rewind index idx_sales_region
    9            DeferredSeek    2    1    0                          0
   10            Column          1    1   11                          0  r[11]=sales.emp_id

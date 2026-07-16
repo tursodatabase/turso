@@ -49,7 +49,7 @@ addr  opcode              p1  p2  p3  p4            p5  comment
    2  Once                23   0   0                 0  goto 23
    3  OpenEphemeral        0   0   0                 0  cursor=0 is_table=false
    4  InitCoroutine        2  17   5                 0
-   5  OpenRead             1   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
+   5  ReopenIdx            1   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
    6  Rewind               1  16   0                 0  Rewind table orders
    7    Column             1   3   7                 0  r[7]=orders.total_amount
    8    RealAffinity       7   0   0                 0
@@ -67,7 +67,7 @@ addr  opcode              p1  p2  p3  p4            p5  comment
   20    MakeRecord         9   1  10                 0  r[10]=mkrec(r[9..9]); for ephemeral_index_where_sub_t4
   21    IdxInsert          0  10   0                 8  key=r[10]
   22  Goto                 0  18   0                 0
-  23  OpenRead             2   6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
+  23  ReopenIdx            2   6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
   24  NullRow              0   0   0                 0  Set cursor 0 to a (pseudo) NULL row
   25  Rewind               0  33   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t4)
   26    Column             0   0  13                 0  r[13]=ephemeral(ephemeral_index_where_sub_t4).customer_id
