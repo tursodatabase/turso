@@ -94,12 +94,12 @@ jobs:
           artifact-name: native-iossimulator-arm64
           ios-deployment-target: "12.2"
 
-        - os: windows-2025
+        - os: blacksmith-4vcpu-windows-2025
           make-target: build-rust-windows64
           target: x86_64-pc-windows-msvc
           artifact-name: native-win-x64
 
-        - os: windows-2025
+        - os: blacksmith-4vcpu-windows-2025
           make-target: build-rust-windowsarm64
           target: aarch64-pc-windows-msvc
           artifact-name: native-win-arm64
@@ -451,7 +451,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-        - os: windows-2025
+        - os: blacksmith-4vcpu-windows-2025
           rid: win-x64
           executable: NativeAotSample.exe
 

@@ -33,11 +33,11 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          - host: windows-latest
+          - host: blacksmith-4vcpu-windows-2025
             target: x86_64-pc-windows-msvc
             artifact: db-bindings-x86_64-pc-windows-msvc
             build: yarn workspace @tursodatabase/database napi-build --target x86_64-pc-windows-msvc
-          - host: windows-latest
+          - host: blacksmith-4vcpu-windows-2025
             target: x86_64-pc-windows-msvc
             artifact: sync-bindings-x86_64-pc-windows-msvc
             build: yarn workspace @tursodatabase/sync napi-build --target x86_64-pc-windows-msvc
@@ -212,7 +212,7 @@ jobs:
       matrix:
         node:
           - "20"
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
@@ -337,7 +337,7 @@ jobs:
       matrix:
         node:
           - "20"
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     steps:
       - uses: actions/checkout@v4
       - name: Setup node

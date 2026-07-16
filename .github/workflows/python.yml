@@ -40,7 +40,7 @@ jobs:
         os:
           - blacksmith-4vcpu-ubuntu-2404
           - blacksmith-6vcpu-macos-latest
-          - windows-latest
+          - blacksmith-4vcpu-windows-2025
         python-version: ${{ fromJson(needs.configure-strategy.outputs.python-versions) }}
     runs-on: ${{ matrix.os }}
 

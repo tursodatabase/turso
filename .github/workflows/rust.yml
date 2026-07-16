@@ -56,14 +56,14 @@ jobs:
           fi
 
   build-native:
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 120 || 30 }}
+    timeout-minutes: ${{ matrix.os == 'blacksmith-8vcpu-windows-2025' && 120 || 30 }}
     strategy:
       matrix:
         os:
           [
             blacksmith-4vcpu-ubuntu-2404,
             blacksmith-6vcpu-macos-latest,
-            windows-latest,
+            blacksmith-8vcpu-windows-2025,
           ]
 
     runs-on: ${{ matrix.os }}
@@ -146,7 +146,7 @@ jobs:
         timeout-minutes: 5
 
   build-windows-arm64-cli:
-    runs-on: windows-2025
+    runs-on: blacksmith-4vcpu-windows-2025
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -450,7 +450,7 @@ jobs:
           ' _
 
   concurrent-simulator-windows:
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
