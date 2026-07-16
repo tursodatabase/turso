@@ -15,6 +15,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
+  # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
+  # crate's clang-cl preference fails; force the MSVC compiler instead.
+  CC_x86_64_pc_windows_msvc: cl.exe
 
 jobs:
   license-check:
@@ -56,14 +59,14 @@ jobs:
           fi
 
   build-native:
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 120 || 30 }}
+    timeout-minutes: ${{ matrix.os == 'blacksmith-8vcpu-windows-2025' && 120 || 30 }}
     strategy:
       matrix:
         os:
           [
             blacksmith-4vcpu-ubuntu-2404,
             blacksmith-6vcpu-macos-latest,
-            windows-latest,
+            blacksmith-8vcpu-windows-2025,
           ]
 
     runs-on: ${{ matrix.os }}
@@ -85,6 +88,13 @@ jobs:
       - name: Install cargo-llvm-cov
         if: runner.os == 'Linux'
         uses: taiki-e/install-action@cargo-llvm-cov
+      # Blacksmith Windows images ship no LLVM; the all-features build pulls in
+      # pg_query, whose bindgen needs libclang.dll.
+      - name: Install LLVM (libclang for bindgen)
+        if: runner.os == 'Windows'
+        run: |
+          choco install llvm -y --no-progress
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
       - name: Set up Python 3.10
         uses: useblacksmith/setup-python@v6
         with:
@@ -146,6 +156,8 @@ jobs:
         timeout-minutes: 5
 
   build-windows-arm64-cli:
+    # Stays on GitHub-hosted: Blacksmith Windows images lack the MSVC ARM64
+    # cross tools (Microsoft.VisualStudio.Component.VC.Tools.ARM64).
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
@@ -450,7 +462,7 @@ jobs:
           ' _
 
   concurrent-simulator-windows:
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

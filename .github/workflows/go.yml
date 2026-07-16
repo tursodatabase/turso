@@ -22,6 +22,9 @@ env:
   GH_TOKEN: ${{ secrets.TURSO_GO_PLATFORM_LIBS_TOKEN }}
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
+  # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
+  # crate's clang-cl preference fails; force the MSVC compiler instead.
+  CC_x86_64_pc_windows_msvc: cl.exe
 
 jobs:
   test:
@@ -33,7 +36,7 @@ jobs:
         os:
           - blacksmith-4vcpu-ubuntu-2404
           - blacksmith-6vcpu-macos-latest
-          - windows-latest
+          - blacksmith-4vcpu-windows-2025
     env:
       CARGO_TERM_COLOR: always
     steps:

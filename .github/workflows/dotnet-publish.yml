@@ -31,6 +31,9 @@ concurrency:
 
 env:
   working-directory: bindings/dotnet
+  # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
+  # crate's clang-cl preference fails; force the MSVC compiler instead.
+  CC_x86_64_pc_windows_msvc: cl.exe
 
 jobs:
   # Build native libraries for each platform/architecture
@@ -94,11 +97,13 @@ jobs:
           artifact-name: native-iossimulator-arm64
           ios-deployment-target: "12.2"
 
-        - os: windows-2025
+        - os: blacksmith-4vcpu-windows-2025
           make-target: build-rust-windows64
           target: x86_64-pc-windows-msvc
           artifact-name: native-win-x64
 
+        # Stays on GitHub-hosted: Blacksmith Windows images lack the MSVC ARM64
+        # cross tools (Microsoft.VisualStudio.Component.VC.Tools.ARM64).
         - os: windows-2025
           make-target: build-rust-windowsarm64
           target: aarch64-pc-windows-msvc
@@ -451,7 +456,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-        - os: windows-2025
+        - os: blacksmith-4vcpu-windows-2025
           rid: win-x64
           executable: NativeAotSample.exe
 
