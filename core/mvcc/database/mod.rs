@@ -183,22 +183,15 @@ pub struct SortableIndexKey {
 }
 
 impl SortableIndexKey {
-    pub fn new_from_record_ref_in<A: ConcurrentAllocator>(
-        key: ImmutableRecordRef<'_>,
-        metadata: Arc<IndexInfo>,
-        alloc: A,
-    ) -> Result<Self, TryReserveError> {
-        Self::new_from_payload_in(key.get_payload(), metadata, alloc)
-    }
-
-    fn new_from_payload_in<A: ConcurrentAllocator>(
-        payload: &[u8],
+    pub fn new_from_payload_in<A: ConcurrentAllocator>(
+        payload: impl AsRef<[u8]>,
         metadata: Arc<IndexInfo>,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
         Ok(Self {
             key: ImmutableRecordRef::from_shared_record(crate::alloc::try_arc_slice_from_slice_in(
-                payload, alloc,
+                payload.as_ref(),
+                alloc,
             )?),
             metadata,
         })

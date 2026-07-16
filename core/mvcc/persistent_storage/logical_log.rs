@@ -3559,7 +3559,7 @@ impl StreamingLogicalLogReader {
                 let key_record = crate::types::ImmutableRecordRef::from_bin_record(&payload);
                 let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Upsert)?;
-                let key = Arc::new(SortableIndexKey::new_from_record_ref_in(
+                let key = Arc::new(SortableIndexKey::new_from_payload_in(
                     key_record, index_info, alloc,
                 )?);
                 let rowid = RowID::new(table_id, RowKey::Record(key));
@@ -3580,7 +3580,7 @@ impl StreamingLogicalLogReader {
                 let key_record = crate::types::ImmutableRecordRef::from_bin_record(&payload);
                 let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Delete)?;
-                let key = Arc::new(SortableIndexKey::new_from_record_ref_in(
+                let key = Arc::new(SortableIndexKey::new_from_payload_in(
                     key_record, index_info, alloc,
                 )?);
                 let rowid = RowID::new(table_id, RowKey::Record(key));
@@ -4796,8 +4796,8 @@ mod tests {
                 2,
             )
             .unwrap();
-            let sortable_key = SortableIndexKey::new_from_record_ref_in(
-                ImmutableRecordRef::from_bin_record(key_record.get_payload()),
+            let sortable_key = SortableIndexKey::new_from_payload_in(
+                &key_record,
                 index_info.clone(),
                 crate::alloc::TursoAllocator,
             )
@@ -6318,8 +6318,8 @@ mod tests {
             2,
         )
         .unwrap();
-        let sortable_key = SortableIndexKey::new_from_record_ref_in(
-            ImmutableRecordRef::from_bin_record(key_record.get_payload()),
+        let sortable_key = SortableIndexKey::new_from_payload_in(
+            &key_record,
             test_index_info(),
             crate::alloc::TursoAllocator,
         )
@@ -6395,8 +6395,8 @@ mod tests {
         commit_ts: u64,
         is_delete: bool,
     ) -> crate::mvcc::database::RowVersion {
-        let sortable_key = SortableIndexKey::new_from_record_ref_in(
-            ImmutableRecordRef::from_bin_record(&payload_bytes),
+        let sortable_key = SortableIndexKey::new_from_payload_in(
+            &payload_bytes,
             test_index_info(),
             crate::alloc::TursoAllocator,
         )

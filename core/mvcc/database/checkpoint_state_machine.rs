@@ -3313,12 +3313,8 @@ mod tests {
             2,
         )
         .unwrap();
-        let sortable_key = SortableIndexKey::new_from_record_ref_in(
-            ImmutableRecordRef::from_bin_record(key_record.get_payload()),
-            index_info,
-            TursoAllocator,
-        )
-        .unwrap();
+        let sortable_key =
+            SortableIndexKey::new_from_payload_in(&key_record, index_info, TursoAllocator).unwrap();
         let key_arc = Arc::new(sortable_key.clone());
         let row = Row::new_index_row(
             RowID::new(index_id, RowKey::Record(Arc::new(sortable_key))),

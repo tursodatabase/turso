@@ -280,15 +280,11 @@ fn index_key_payload_allocation_uses_passed_allocator() {
     );
 
     alloc.fail_allocations(true);
-    let result = SortableIndexKey::new_from_record_ref_in(
-        record_ref.clone(),
-        index_info.clone(),
-        alloc.clone(),
-    );
+    let result = SortableIndexKey::new_from_payload_in(&record, index_info.clone(), alloc.clone());
     assert!(matches!(result, Err(crate::alloc::TryReserveError)));
 
     alloc.fail_allocations(false);
-    let key = SortableIndexKey::new_from_record_ref_in(record_ref, index_info, alloc).unwrap();
+    let key = SortableIndexKey::new_from_payload_in(record_ref, index_info, alloc).unwrap();
     assert_eq!(key.key.get_payload(), record.get_payload());
 }
 
@@ -6736,12 +6732,8 @@ fn test_index_finger_no_spurious_dep_on_stepped_over_key() {
     let idx_key = |v: i64| {
         let rec = crate::types::ImmutableRecord::from_values(&[Value::from_i64(v)], 1).unwrap();
         std::sync::Arc::new(
-            SortableIndexKey::new_from_record_ref_in(
-                ImmutableRecordRef::from_bin_record(rec.get_payload()),
-                info.clone(),
-                crate::alloc::TursoAllocator,
-            )
-            .unwrap(),
+            SortableIndexKey::new_from_payload_in(&rec, info.clone(), crate::alloc::TursoAllocator)
+                .unwrap(),
         )
     };
 
@@ -8746,12 +8738,9 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         2,
     )
     .unwrap();
-    let row_key = SortableIndexKey::new_from_record_ref_in(
-        ImmutableRecordRef::from_bin_record(record.get_payload()),
-        index_info,
-        crate::alloc::TursoAllocator,
-    )
-    .unwrap();
+    let row_key =
+        SortableIndexKey::new_from_payload_in(&record, index_info, crate::alloc::TursoAllocator)
+            .unwrap();
     let row = Row::new_index_row(
         RowID::new(MVTableId::new(-42), RowKey::Record(Arc::new(row_key))),
         index.columns.len(),

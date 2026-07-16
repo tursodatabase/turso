@@ -13,8 +13,8 @@ use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
-    compare_immutable, IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef, IndexInfo,
-    SeekKey, SeekOp, SeekResult, Value,
+    compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
+    SeekResult, Value,
 };
 use crate::vdbe::make_record;
 use crate::vdbe::Register;
@@ -1047,8 +1047,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 let Some(record) = maybe_record else {
                     return Ok(None);
                 };
-                let key = SortableIndexKey::new_from_record_ref_in(
-                    ImmutableRecordRef::from_bin_record(record.get_payload()),
+                let key = SortableIndexKey::new_from_payload_in(
+                    record,
                     index_info.clone(),
                     self.db.allocator(),
                 )?;
@@ -1619,8 +1619,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                     self.db.allocator(),
                                 )?)
                             };
-                            let sortable_key = SortableIndexKey::new_from_record_ref_in(
-                                index_key.clone(),
+                            let sortable_key = SortableIndexKey::new_from_payload_in(
+                                index_key,
                                 index_info,
                                 self.db.allocator(),
                             )?;
@@ -1743,7 +1743,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     panic!("BTreeKey::IndexKey requires Index cursor type");
                 };
                 let record = key.get_record().expect("index key has a record");
-                let sortable_key = Arc::new(SortableIndexKey::new_from_record_ref_in(
+                let sortable_key = Arc::new(SortableIndexKey::new_from_payload_in(
                     record,
                     index_info.clone(),
                     self.db.allocator(),
