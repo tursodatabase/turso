@@ -12857,6 +12857,94 @@ mod tests {
         pager.io.block(action)
     }
 
+    /// drop_cell must decrement the `index` of every overflow cell positioned
+    /// after the deleted regular cell, so overflow-cell indices stay within
+    /// bounds for the subsequent balance pass.
+    #[test]
+    pub fn test_drop_cell_adjusts_overflow_cell_indices() {
+        let (pager, _, _, _) = empty_btree();
+        let usable_space = pager.usable_space();
+
+        // Create a test page
+        let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
+        btree_init_page(&page, PageType::TableLeaf, 0, usable_space);
+
+        let page_contents = page.get_contents();
+
+        // Insert several small cells to fill the page partially
+        for i in 0..10 {
+            let regs = &[Register::Value(Value::from_i64(i))];
+            let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
+            let mut payload = Vec::new();
+            let mut fill_state = FillCellPayloadState::Start;
+            run_until_done(
+                || {
+                    fill_cell_payload(
+                        &PinGuard::new(page.clone()),
+                        Some(i),
+                        &mut payload,
+                        i as usize,
+                        &record,
+                        usable_space,
+                        pager.clone(),
+                        &mut fill_state,
+                    )
+                },
+                &pager,
+            )
+            .unwrap();
+            insert_into_cell(page_contents, &payload, i as usize, usable_space).unwrap();
+        }
+
+        assert_eq!(page_contents.cell_count(), 10);
+
+        // Add overflow cells at indices 10 and 11, as balancing inserts would.
+        page_contents.overflow_cells.push(OverflowCell {
+            index: 10,
+            payload: std::pin::Pin::new(vec![1, 2, 3, 4]),
+        });
+        page_contents.overflow_cells.push(OverflowCell {
+            index: 11,
+            payload: std::pin::Pin::new(vec![5, 6, 7, 8]),
+        });
+
+        assert_eq!(page_contents.overflow_cells.len(), 2);
+        assert_eq!(page_contents.overflow_cells[0].index, 10);
+        assert_eq!(page_contents.overflow_cells[1].index, 11);
+
+        // Deleting cell 5 must decrement both overflow indices (both > 5).
+        drop_cell(page_contents, 5, usable_space).unwrap();
+
+        assert_eq!(page_contents.cell_count(), 9);
+        assert_eq!(page_contents.overflow_cells[0].index, 9);
+        assert_eq!(page_contents.overflow_cells[1].index, 10);
+
+        // Deleting cell 0 must decrement them again.
+        drop_cell(page_contents, 0, usable_space).unwrap();
+
+        assert_eq!(page_contents.cell_count(), 8);
+        assert_eq!(page_contents.overflow_cells[0].index, 8);
+        assert_eq!(page_contents.overflow_cells[1].index, 9);
+
+        // Deleting the last regular cell leaves the overflow indices untouched,
+        // since they point past it.
+        drop_cell(page_contents, 7, usable_space).unwrap();
+
+        assert_eq!(page_contents.cell_count(), 7);
+        assert_eq!(page_contents.overflow_cells[0].index, 7);
+        assert_eq!(page_contents.overflow_cells[1].index, 8);
+
+        // Overflow indices must stay <= cell_count + overflow_cells.len().
+        assert!(
+            page_contents.overflow_cells[0].index
+                <= page_contents.cell_count() + page_contents.overflow_cells.len()
+        );
+        assert!(
+            page_contents.overflow_cells[1].index
+                <= page_contents.cell_count() + page_contents.overflow_cells.len()
+        );
+    }
+
     #[test]
     fn test_free_array() {
         let (mut rng, seed) = rng_from_time_or_env();
