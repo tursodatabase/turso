@@ -380,6 +380,8 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "julianday" => Ok(Some(Func::Scalar(ScalarFunc::JulianDay))),
         "hex" => Ok(Some(Func::Scalar(ScalarFunc::Hex))),
         "unhex" => Ok(Some(Func::Scalar(ScalarFunc::Unhex))),
+        "get_byte" => Ok(Some(Func::Scalar(ScalarFunc::GetByte))),
+        "set_byte" => Ok(Some(Func::Scalar(ScalarFunc::SetByte))),
         "zeroblob" => Ok(Some(Func::Scalar(ScalarFunc::ZeroBlob))),
         "soundex" => Ok(Some(Func::Scalar(ScalarFunc::Soundex))),
         "table_columns_json_array" => Ok(Some(Func::Scalar(ScalarFunc::TableColumnsJsonArray))),
