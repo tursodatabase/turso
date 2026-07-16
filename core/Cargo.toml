@@ -201,6 +201,11 @@ name = "mvcc_recovery_benchmark"
 harness = false
 
 [[bench]]
+name = "logical_log_serialization"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
 name = "json_benchmark"
 harness = false
 
