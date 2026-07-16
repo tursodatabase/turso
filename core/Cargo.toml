@@ -153,9 +153,6 @@ aegis = { version = "0.9.8", features = ["pure-rust"] }
 [target.'cfg(not(any(target_os = "android", target_os = "macos")))'.dependencies]
 aegis = { version = "0.9.8" }
 
-[build-dependencies]
-cfg_aliases = "0.2.1"
-
 [target.'cfg(not(target_family = "windows"))'.dev-dependencies]
 pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
 
