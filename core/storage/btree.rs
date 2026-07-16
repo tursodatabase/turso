@@ -429,9 +429,7 @@ impl<'a> BTreeKey<'a> {
     /// Get the record, if present. Index will always be present,
     pub fn get_record(&self) -> Option<ImmutableRecordRef<'_>> {
         match self {
-            BTreeKey::TableRowId((_, record)) => {
-                record.map(|record| ImmutableRecordRef::from_bin_record(record.get_payload()))
-            }
+            BTreeKey::TableRowId((_, record)) => record.map(|record| record.as_record_ref()),
             BTreeKey::IndexKey(record) => Some(record.reborrow()),
         }
     }
@@ -1611,8 +1609,8 @@ impl BTreeCursor {
     fn do_seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
         let ret = return_if_io!(match &key {
             SeekKey::TableRowId(rowid) => self.tablebtree_seek(*rowid, op),
-            SeekKey::IndexKey(_) => {
-                self.indexbtree_seek(key.index_record().expect("index key"), op)
+            SeekKey::IndexKey(index_key) => {
+                self.indexbtree_seek(index_key, op)
             }
         });
         self.valid_state = CursorValidState::Valid;
@@ -2747,9 +2745,7 @@ impl BTreeCursor {
                 MoveToState::MoveToPage => {
                     let ret = match &key {
                         SeekKey::TableRowId(rowid_key) => self.tablebtree_move_to(*rowid_key, cmp),
-                        SeekKey::IndexKey(_) => {
-                            self.indexbtree_move_to(key.index_record().expect("index key"), cmp)
-                        }
+                        SeekKey::IndexKey(index_key) => self.indexbtree_move_to(index_key, cmp),
                     };
                     return_if_io!(ret);
                     self.move_to_state = MoveToState::Start;
@@ -6081,7 +6077,7 @@ impl BTreeCursor {
         let ctx = self.context.take().unwrap();
         let seek_key = match ctx.key {
             CursorContextKey::TableRowId(rowid) => SeekKey::TableRowId(rowid),
-            CursorContextKey::IndexKeyRowId(ref record) => SeekKey::IndexKey(record.clone()),
+            CursorContextKey::IndexKeyRowId(ref record) => SeekKey::IndexKey(record.reborrow()),
         };
         let res = self.seek(seek_key, ctx.seek_op)?;
         match res {
