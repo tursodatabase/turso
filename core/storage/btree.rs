@@ -49,8 +49,8 @@ use crate::{
     numeric::Numeric,
     return_corrupt, return_if_io,
     types::{
-        compare_immutable_iter, AsValueRef, IOResult, ImmutableRecord, SeekKey, SeekOp, Value,
-        ValueRef,
+        compare_immutable_iter, AsValueRef, IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey,
+        SeekOp, Value, ValueRef,
     },
     LimboError, Result,
 };
@@ -411,26 +411,28 @@ impl std::ops::Deref for PinGuard {
 #[derive(Clone, Debug)]
 pub enum BTreeKey<'a> {
     TableRowId((i64, Option<&'a ImmutableRecord>)),
-    IndexKey(&'a ImmutableRecord),
+    IndexKey(ImmutableRecordRef<'a>),
 }
 
-impl BTreeKey<'_> {
+impl<'a> BTreeKey<'a> {
     /// Create a new table rowid key from a rowid and an optional immutable record.
     /// The record is optional because it may not be available when the key is created.
-    pub fn new_table_rowid(rowid: i64, record: Option<&ImmutableRecord>) -> BTreeKey<'_> {
+    pub fn new_table_rowid(rowid: i64, record: Option<&'a ImmutableRecord>) -> Self {
         BTreeKey::TableRowId((rowid, record))
     }
 
     /// Create a new index key from an immutable record.
-    pub fn new_index_key(record: &ImmutableRecord) -> BTreeKey<'_> {
+    pub fn new_index_key(record: ImmutableRecordRef<'a>) -> Self {
         BTreeKey::IndexKey(record)
     }
 
     /// Get the record, if present. Index will always be present,
-    pub fn get_record(&self) -> Option<&'_ ImmutableRecord> {
+    pub fn get_record(&self) -> Option<ImmutableRecordRef<'_>> {
         match self {
-            BTreeKey::TableRowId((_, record)) => *record,
-            BTreeKey::IndexKey(record) => Some(record),
+            BTreeKey::TableRowId((_, record)) => {
+                record.map(|record| ImmutableRecordRef::from_bin_record(record.get_payload()))
+            }
+            BTreeKey::IndexKey(record) => Some(record.reborrow()),
         }
     }
 
@@ -446,7 +448,9 @@ impl BTreeKey<'_> {
     fn to_rowid(&self) -> i64 {
         match self {
             BTreeKey::TableRowId((rowid, _)) => *rowid,
-            BTreeKey::IndexKey(_) => panic!("BTreeKey::to_rowid called on IndexKey"),
+            BTreeKey::IndexKey(_) => {
+                panic!("BTreeKey::to_rowid called on IndexKey")
+            }
         }
     }
 }
@@ -532,7 +536,7 @@ pub enum CursorContextKey {
 
     /// If we are in an index tree we can then reuse this field to save
     /// our cursor information
-    IndexKeyRowId(ImmutableRecord),
+    IndexKeyRowId(ImmutableRecordRef<'static>),
 }
 
 #[derive(Debug)]
@@ -543,18 +547,18 @@ pub struct CursorContext {
 
 impl CursorContext {
     fn seek_eq_only(key: &BTreeKey<'_>) -> Self {
-        Self {
-            key: key.into(),
-            seek_op: SeekOp::GE { eq_only: true },
-        }
-    }
-}
-
-impl From<&BTreeKey<'_>> for CursorContextKey {
-    fn from(key: &BTreeKey<'_>) -> Self {
-        match key {
+        let key = match key {
             BTreeKey::TableRowId((rowid, _)) => CursorContextKey::TableRowId(*rowid),
-            BTreeKey::IndexKey(record) => CursorContextKey::IndexKeyRowId((*record).clone()),
+            BTreeKey::IndexKey(record) => {
+                let payload = crate::types::value_blob_from_slice(record.get_payload())
+                    .expect(crate::alloc::ALLOC_ERR_MSG);
+                let owned = ImmutableRecord::from_bin_record(payload);
+                CursorContextKey::IndexKeyRowId(ImmutableRecordRef::from_owned_record(owned))
+            }
+        };
+        Self {
+            key,
+            seek_op: SeekOp::GE { eq_only: true },
         }
     }
 }
@@ -1605,12 +1609,10 @@ impl BTreeCursor {
     /// or e.g. find the first record greater than the seek key in a range query (e.g. SELECT * FROM table WHERE col > 10).
     /// We don't include the rowid in the comparison and that's why the last value from the record is not included.
     fn do_seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
-        let ret = return_if_io!(match key {
-            SeekKey::TableRowId(rowid) => {
-                self.tablebtree_seek(rowid, op)
-            }
-            SeekKey::IndexKey(index_key) => {
-                self.indexbtree_seek(index_key, op)
+        let ret = return_if_io!(match &key {
+            SeekKey::TableRowId(rowid) => self.tablebtree_seek(*rowid, op),
+            SeekKey::IndexKey(_) => {
+                self.indexbtree_seek(key.index_record().expect("index key"), op)
             }
         });
         self.valid_state = CursorValidState::Valid;
@@ -1924,7 +1926,7 @@ impl BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip(self, index_key), level = Level::DEBUG))]
     fn indexbtree_move_to(
         &mut self,
-        index_key: &ImmutableRecord,
+        index_key: &ImmutableRecordRef<'_>,
         cmp: SeekOp,
     ) -> Result<IOResult<()>> {
         let key_values = index_key.get_values()?;
@@ -2424,7 +2426,7 @@ impl BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn indexbtree_seek(
         &mut self,
-        key: &ImmutableRecord,
+        key: &ImmutableRecordRef<'_>,
         seek_op: SeekOp,
     ) -> Result<IOResult<SeekResult>> {
         let key_values = key.get_values()?;
@@ -2743,9 +2745,11 @@ impl BTreeCursor {
                     }
                 }
                 MoveToState::MoveToPage => {
-                    let ret = match key {
-                        SeekKey::TableRowId(rowid_key) => self.tablebtree_move_to(rowid_key, cmp),
-                        SeekKey::IndexKey(index_key) => self.indexbtree_move_to(index_key, cmp),
+                    let ret = match &key {
+                        SeekKey::TableRowId(rowid_key) => self.tablebtree_move_to(*rowid_key, cmp),
+                        SeekKey::IndexKey(_) => {
+                            self.indexbtree_move_to(key.index_record().expect("index key"), cmp)
+                        }
                     };
                     return_if_io!(ret);
                     self.move_to_state = MoveToState::Start;
@@ -2868,7 +2872,7 @@ impl BTreeCursor {
                         bkey.maybe_rowid(),
                         new_payload,
                         *cell_idx,
-                        record,
+                        &record,
                         usable_space,
                         self.pager.clone(),
                         fill_cell_payload_state,
@@ -2919,7 +2923,7 @@ impl BTreeCursor {
                     let mut state = state.take().expect("state should be present");
                     let cell_idx = *cell_idx;
                     if let IOResult::IO(io) =
-                        self.overwrite_cell(&page, cell_idx, record, &mut state)?
+                        self.overwrite_cell(&page, cell_idx, &record, &mut state)?
                     {
                         let CursorState::Write(write_state) = &mut self.state else {
                             panic!("expected write state");
@@ -5842,7 +5846,7 @@ impl BTreeCursor {
         &mut self,
         page: &PageRef,
         cell_idx: usize,
-        record: &ImmutableRecord,
+        record: &ImmutableRecordRef<'_>,
         state: &mut OverwriteCellState,
     ) -> Result<IOResult<()>> {
         loop {
@@ -6077,7 +6081,7 @@ impl BTreeCursor {
         let ctx = self.context.take().unwrap();
         let seek_key = match ctx.key {
             CursorContextKey::TableRowId(rowid) => SeekKey::TableRowId(rowid),
-            CursorContextKey::IndexKeyRowId(ref record) => SeekKey::IndexKey(record),
+            CursorContextKey::IndexKeyRowId(ref record) => SeekKey::IndexKey(record.clone()),
         };
         let res = self.seek(seek_key, ctx.seek_op)?;
         match res {
@@ -6515,7 +6519,9 @@ impl CursorTrait for BTreeCursor {
                             None => unreachable!("there should've been a record"),
                         };
                         CursorContext {
-                            key: CursorContextKey::IndexKeyRowId(record),
+                            key: CursorContextKey::IndexKeyRowId(
+                                ImmutableRecordRef::from_owned_record(record),
+                            ),
                             seek_op: SeekOp::GE { eq_only: true },
                         }
                     } else {
@@ -7216,7 +7222,7 @@ impl CursorTrait for BTreeCursor {
             owned
         };
         self.save_context(CursorContext {
-            key: CursorContextKey::IndexKeyRowId(cloned),
+            key: CursorContextKey::IndexKeyRowId(ImmutableRecordRef::from_owned_record(cloned)),
             seek_op: SeekOp::GE { eq_only: true },
         });
         Ok(IOResult::Done(SavePositionResult::Saved))
@@ -9556,7 +9562,7 @@ fn fill_cell_payload(
     int_key: Option<i64>,
     cell_payload: &mut Vec<u8>,
     cell_idx: usize,
-    record: &ImmutableRecord,
+    record: &impl AsRef<[u8]>,
     usable_space: usize,
     pager: Arc<Pager>,
     fill_cell_payload_state: &mut FillCellPayloadState,
@@ -9564,7 +9570,7 @@ fn fill_cell_payload(
     let overflow_page_pointer_size = 4;
     let overflow_page_data_size = usable_space - overflow_page_pointer_size;
     let result = loop {
-        let record_buf = record.get_payload();
+        let record_buf = record.as_ref();
         match fill_cell_payload_state {
             FillCellPayloadState::Start => {
                 let page_contents = page.get_contents();
@@ -10868,14 +10874,14 @@ mod tests {
                 run_until_done(
                     || {
                         let record = ImmutableRecord::from_registers(&regs, regs.len()).unwrap();
-                        let key = SeekKey::IndexKey(&record);
+                        let key = SeekKey::IndexKey(record.as_record_ref());
                         cursor.seek(key, SeekOp::GE { eq_only: true })
                     },
                     pager.deref(),
                 )
                 .unwrap();
                 run_until_done(
-                    || cursor.insert(&BTreeKey::new_index_key(&value)),
+                    || cursor.insert(&BTreeKey::new_index_key(value.as_record_ref())),
                     pager.deref(),
                 )
                 .unwrap();
@@ -10899,7 +10905,9 @@ mod tests {
                             .collect::<Vec<_>>();
                         cursor.seek(
                             SeekKey::IndexKey(
-                                &ImmutableRecord::from_registers(&regs, regs.len()).unwrap(),
+                                ImmutableRecord::from_registers(&regs, regs.len())
+                                    .unwrap()
+                                    .as_record_ref(),
                             ),
                             SeekOp::GE { eq_only: true },
                         )
@@ -11061,7 +11069,7 @@ mod tests {
                         || {
                             let record =
                                 ImmutableRecord::from_registers(&regs, regs.len()).unwrap();
-                            let key = SeekKey::IndexKey(&record);
+                            let key = SeekKey::IndexKey(record.as_record_ref());
                             cursor.seek(key, SeekOp::GE { eq_only: true })
                         },
                         pager.deref(),
@@ -11071,7 +11079,7 @@ mod tests {
                         run_until_done(|| cursor.next(), pager.deref()).unwrap();
                     }
                     run_until_done(
-                        || cursor.insert(&BTreeKey::new_index_key(&value)),
+                        || cursor.insert(&BTreeKey::new_index_key(value.as_record_ref())),
                         pager.deref(),
                     )
                     .unwrap();
@@ -11093,8 +11101,10 @@ mod tests {
                         // Seek to the key to delete
                         let seek_result = run_until_done(
                             || {
-                                cursor
-                                    .seek(SeekKey::IndexKey(&record), SeekOp::GE { eq_only: true })
+                                cursor.seek(
+                                    SeekKey::IndexKey(record.as_record_ref()),
+                                    SeekOp::GE { eq_only: true },
+                                )
                             },
                             pager.deref(),
                         )
@@ -11152,7 +11162,9 @@ mod tests {
                     )];
                     cursor.seek(
                         SeekKey::IndexKey(
-                            &ImmutableRecord::from_registers(&regs, regs.len()).unwrap(),
+                            ImmutableRecord::from_registers(&regs, regs.len())
+                                .unwrap()
+                                .as_record_ref(),
                         ),
                         SeekOp::GE { eq_only: true },
                     )

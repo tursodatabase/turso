@@ -3556,10 +3556,12 @@ impl StreamingLogicalLogReader {
                 commit_ts,
                 btree_resident,
             } => {
-                let key_record = crate::types::ImmutableRecord::from_bin_record(payload);
+                let key_record = crate::types::ImmutableRecordRef::from_bin_record(&payload);
                 let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Upsert)?;
-                let key = Arc::new(SortableIndexKey::new_from_record(key_record, index_info));
+                let key = Arc::new(SortableIndexKey::new_from_record_ref_in(
+                    key_record, index_info, alloc,
+                )?);
                 let rowid = RowID::new(table_id, RowKey::Record(key));
                 let row = Row::new_index_row(rowid.clone(), column_count);
                 Ok(StreamingResult::UpsertIndexRow {
@@ -3575,10 +3577,12 @@ impl StreamingLogicalLogReader {
                 commit_ts,
                 btree_resident,
             } => {
-                let key_record = crate::types::ImmutableRecord::from_bin_record(payload);
+                let key_record = crate::types::ImmutableRecordRef::from_bin_record(&payload);
                 let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Delete)?;
-                let key = Arc::new(SortableIndexKey::new_from_record(key_record, index_info));
+                let key = Arc::new(SortableIndexKey::new_from_record_ref_in(
+                    key_record, index_info, alloc,
+                )?);
                 let rowid = RowID::new(table_id, RowKey::Record(key));
                 let row = Row::new_index_row(rowid.clone(), column_count);
                 Ok(StreamingResult::DeleteIndexRow {
@@ -4792,7 +4796,12 @@ mod tests {
                 2,
             )
             .unwrap();
-            let sortable_key = SortableIndexKey::new_from_record(key_record, index_info.clone());
+            let sortable_key = SortableIndexKey::new_from_record_ref_in(
+                ImmutableRecordRef::from_bin_record(key_record.get_payload()),
+                index_info.clone(),
+                crate::alloc::TursoAllocator,
+            )
+            .unwrap();
             let index_rowid = RowID::new(index_id, RowKey::Record(Arc::new(sortable_key)));
 
             // Use read_from_table_or_index to read the index row
@@ -6309,7 +6318,12 @@ mod tests {
             2,
         )
         .unwrap();
-        let sortable_key = SortableIndexKey::new_from_record(key_record, test_index_info());
+        let sortable_key = SortableIndexKey::new_from_record_ref_in(
+            ImmutableRecordRef::from_bin_record(key_record.get_payload()),
+            test_index_info(),
+            crate::alloc::TursoAllocator,
+        )
+        .unwrap();
         let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
         let row = Row::new_index_row(row_id, 2);
         crate::mvcc::database::RowVersion {
@@ -6381,10 +6395,12 @@ mod tests {
         commit_ts: u64,
         is_delete: bool,
     ) -> crate::mvcc::database::RowVersion {
-        let sortable_key = SortableIndexKey::new_from_bytes(
-            crate::types::value_blob_from_slice(&payload_bytes).expect(crate::alloc::ALLOC_ERR_MSG),
+        let sortable_key = SortableIndexKey::new_from_record_ref_in(
+            ImmutableRecordRef::from_bin_record(&payload_bytes),
             test_index_info(),
-        );
+            crate::alloc::TursoAllocator,
+        )
+        .unwrap();
         let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
         let row = Row::new_index_row(row_id, 2);
         crate::mvcc::database::RowVersion {

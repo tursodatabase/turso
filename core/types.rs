@@ -1136,6 +1136,26 @@ mod immutable_record {
         }
     }
 
+    impl PartialEq for ImmutableRecordRef<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.get_payload() == other.get_payload()
+        }
+    }
+
+    impl Eq for ImmutableRecordRef<'_> {}
+
+    impl AsRef<[u8]> for ImmutableRecordRef<'_> {
+        fn as_ref(&self) -> &[u8] {
+            self.get_payload()
+        }
+    }
+
+    impl AsRef<[u8]> for ImmutableRecord {
+        fn as_ref(&self) -> &[u8] {
+            self.get_payload()
+        }
+    }
+
     struct AppendWriter<'a> {
         buf: &'a mut ValueBlob,
         pos: usize,
@@ -1469,6 +1489,16 @@ mod immutable_record {
         }
 
         #[inline]
+        pub fn contains_null(&self) -> Result<bool> {
+            contains_null(self.get_payload())
+        }
+
+        #[inline]
+        pub fn last_value(&self) -> Option<Result<ValueRef<'_>>> {
+            last_value(self.get_payload())
+        }
+
+        #[inline]
         pub fn get_value_opt(&self, idx: usize) -> Option<ValueRef<'_>> {
             value_opt(self.get_payload(), idx)
         }
@@ -1677,6 +1707,12 @@ mod immutable_record {
         #[inline]
         pub fn is_invalidated(&self) -> bool {
             self.get_payload().is_empty()
+        }
+
+        pub fn reborrow(&self) -> ImmutableRecordRef<'_> {
+            ImmutableRecordRef {
+                payload: ImmutableRecordRefPayload::Borrowed(self.get_payload()),
+            }
         }
     }
 }
@@ -3358,7 +3394,16 @@ impl SeekOp {
 #[derive(Clone, PartialEq, Debug)]
 pub enum SeekKey<'a> {
     TableRowId(i64),
-    IndexKey(&'a ImmutableRecord),
+    IndexKey(ImmutableRecordRef<'a>),
+}
+
+impl<'a> SeekKey<'a> {
+    pub fn index_record(&self) -> Option<&ImmutableRecordRef<'a>> {
+        match self {
+            Self::TableRowId(_) => None,
+            Self::IndexKey(record) => Some(record),
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -5667,7 +5667,7 @@ pub fn seek_internal(
                                 };
                                 (cursor, record)
                             };
-                            match cursor.seek(SeekKey::IndexKey(record), *op)? {
+                            match cursor.seek(SeekKey::IndexKey(record.as_record_ref()), *op)? {
                                 IOResult::Done(seek_result) => seek_result,
                                 IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                             }
@@ -10284,7 +10284,9 @@ pub fn op_insert(
                         };
                         return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
                     } else {
-                        return_if_io!(cursor.insert(&BTreeKey::new_index_key(&record)));
+                        return_if_io!(
+                            cursor.insert(&BTreeKey::new_index_key(record.as_record_ref()))
+                        );
                     }
                     state.record_rows_written(1);
                 }
@@ -10819,7 +10821,9 @@ pub fn op_idx_insert(
             {
                 let cursor = get_cursor!(state, cursor_id);
                 let cursor = cursor.as_btree_mut();
-                return_if_io!(cursor.insert(&BTreeKey::new_index_key(record_to_insert)));
+                return_if_io!(
+                    cursor.insert(&BTreeKey::new_index_key(record_to_insert.as_record_ref()))
+                );
             }
             if flags.has(IdxInsertFlags::NCHANGE) {
                 state.record_rows_written(1);

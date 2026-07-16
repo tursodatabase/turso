@@ -13,8 +13,8 @@ use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
-    compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
-    SeekResult, Value,
+    compare_immutable, IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef, IndexInfo,
+    SeekKey, SeekOp, SeekResult, Value,
 };
 use crate::vdbe::make_record;
 use crate::vdbe::Register;
@@ -170,9 +170,14 @@ fn current_pos_matches_seek_key(
     seek_key: &SeekKey<'_>,
     mv_cursor_type: &MvccCursorType,
 ) -> Result<bool> {
-    Ok(match (current_row_id, seek_key) {
-        (RowKey::Int(current), SeekKey::TableRowId(target)) => *current == *target,
-        (RowKey::Record(current), SeekKey::IndexKey(target)) => {
+    Ok(match current_row_id {
+        RowKey::Int(current) => {
+            matches!(seek_key, SeekKey::TableRowId(target) if current == target)
+        }
+        RowKey::Record(current) => {
+            let Some(target) = seek_key.index_record() else {
+                return Ok(false);
+            };
             let MvccCursorType::Index(index_info) = mv_cursor_type else {
                 return Ok(false);
             };
@@ -184,7 +189,6 @@ fn current_pos_matches_seek_key(
                 .collect();
             compare_immutable(target.get_values()?, current.key.get_values()?, &key_info).is_eq()
         }
-        _ => false,
     })
 }
 
@@ -1040,12 +1044,15 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                         }
                     }
                 };
-                Ok(maybe_record.map(|record| {
-                    RowKey::Record(Arc::new(SortableIndexKey {
-                        key: record.clone(),
-                        metadata: index_info.clone(),
-                    }))
-                }))
+                let Some(record) = maybe_record else {
+                    return Ok(None);
+                };
+                let key = SortableIndexKey::new_from_record_ref_in(
+                    ImmutableRecordRef::from_bin_record(record.get_payload()),
+                    index_info.clone(),
+                    self.db.allocator(),
+                )?;
+                Ok(Some(RowKey::Record(Arc::new(key))))
             }
         }
     }
@@ -1484,7 +1491,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         op: SeekOp,
     ) -> Result<IOResult<SeekResult>> {
         let record = make_record(registers, &0, &registers.len())?;
-        self.seek(SeekKey::IndexKey(&record), op)
+        self.seek(SeekKey::IndexKey(record.as_record_ref()), op)
     }
 
     fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
@@ -1598,7 +1605,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 };
                             }
                         }
-                        SeekKey::IndexKey(index_key) => {
+                        SeekKey::IndexKey(_) => {
+                            let index_key = seek_key.index_record().expect("index key");
                             let index_info = {
                                 let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
                                     panic!("SeekKey::IndexKey requires Index cursor type");
@@ -1611,8 +1619,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                     self.db.allocator(),
                                 )?)
                             };
-                            let sortable_key =
-                                SortableIndexKey::new_from_record((*index_key).clone(), index_info);
+                            let sortable_key = SortableIndexKey::new_from_record_ref_in(
+                                index_key.clone(),
+                                index_info,
+                                self.db.allocator(),
+                            )?;
 
                             // Seek in MVCC (synchronous)
                             let mvcc_rowid = self.db.seek_index(
@@ -1673,7 +1684,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                             // Check if the winner matches the seek key
                             let found = match &seek_key {
                                 SeekKey::TableRowId(row_id) => winner_key == RowKey::Int(*row_id),
-                                SeekKey::IndexKey(index_key) => {
+                                SeekKey::IndexKey(_) => {
+                                    let index_key = seek_key.index_record().expect("index key");
                                     let RowKey::Record(found_key) = &winner_key else {
                                         panic!("Found rowid is not a record");
                                     };
@@ -1726,14 +1738,16 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
         let row_id = match key {
             BTreeKey::TableRowId((rowid, _)) => RowID::new(self.table_id, RowKey::Int(*rowid)),
-            BTreeKey::IndexKey(record) => {
+            BTreeKey::IndexKey(_) => {
                 let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
                     panic!("BTreeKey::IndexKey requires Index cursor type");
                 };
-                let sortable_key = Arc::new(SortableIndexKey::new_from_record(
-                    (*record).clone(),
+                let record = key.get_record().expect("index key has a record");
+                let sortable_key = Arc::new(SortableIndexKey::new_from_record_ref_in(
+                    record,
                     index_info.clone(),
-                ));
+                    self.db.allocator(),
+                )?);
                 RowID::new(self.table_id, RowKey::Record(sortable_key))
             }
         };
@@ -1759,10 +1773,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 )
             }
             MvccCursorType::Index(_) => {
-                let BTreeKey::IndexKey(record) = key else {
-                    return Err(LimboError::InternalError(
-                        "Index cursor requires an IndexKey".to_string(),
-                    ));
+                let record = match key {
+                    BTreeKey::IndexKey(_) => key.get_record().expect("index key has a record"),
+                    BTreeKey::TableRowId(_) => {
+                        return Err(LimboError::InternalError(
+                            "Index cursor requires an IndexKey".to_string(),
+                        ));
+                    }
                 };
                 Ok(Row::new_index_row(row_id, record.column_count()))
             }

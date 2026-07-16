@@ -116,7 +116,7 @@ impl WriteRow {
                         ImmutableRecord::from_values(&index_values, index_values.len())?;
 
                     let res = return_if_io!(cursors.index_cursor.seek(
-                        SeekKey::IndexKey(&index_record),
+                        SeekKey::IndexKey(index_record.as_record_ref()),
                         SeekOp::GE { eq_only: true }
                     ));
 
@@ -257,7 +257,7 @@ impl WriteRow {
                     // Create the index record with the rowid appended
                     let index_record =
                         ImmutableRecord::from_values(&index_values, index_values.len())?;
-                    let index_btree_key = BTreeKey::new_index_key(&index_record);
+                    let index_btree_key = BTreeKey::new_index_key(index_record.as_record_ref());
 
                     // Mark as Done before index insert to avoid retry on I/O
                     *self = WriteRow::Done;

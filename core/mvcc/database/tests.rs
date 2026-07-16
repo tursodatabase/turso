@@ -259,6 +259,61 @@ fn row_payload_allocation_uses_passed_allocator() {
     assert_eq!(row.payload(), &[1, 2, 3]);
 }
 
+#[cfg(nightly)]
+#[test]
+fn index_key_payload_allocation_uses_passed_allocator() {
+    let alloc = FailOnDemandAlloc::default();
+    let record = ImmutableRecord::from_values(&[Value::from_i64(42)], 1).unwrap();
+    let record_ref = ImmutableRecordRef::from_bin_record(record.get_payload());
+    let index_info = Arc::new(
+        IndexInfo::new(
+            [crate::types::KeyInfo {
+                sort_order: turso_parser::ast::SortOrder::Asc,
+                collation: crate::translate::collate::CollationSeq::Binary,
+                nulls_order: None,
+            }],
+            false,
+            1,
+            false,
+        )
+        .unwrap(),
+    );
+
+    alloc.fail_allocations(true);
+    let result = SortableIndexKey::new_from_record_ref_in(
+        record_ref.clone(),
+        index_info.clone(),
+        alloc.clone(),
+    );
+    assert!(matches!(result, Err(crate::alloc::TryReserveError)));
+
+    alloc.fail_allocations(false);
+    let key = SortableIndexKey::new_from_record_ref_in(record_ref, index_info, alloc).unwrap();
+    assert_eq!(key.key.get_payload(), record.get_payload());
+}
+
+#[cfg(nightly)]
+#[test]
+#[should_panic(expected = "empty tombstone row")]
+fn seqcompact_tombstone_payload_uses_store_allocator() {
+    let alloc = FailOnDemandAlloc::default();
+    let store = MvStore::new_in(
+        MvccClock::new(),
+        test_mvcc_storage("mv-store-seqcompact-allocator.db-log"),
+        alloc.clone(),
+        false,
+    )
+    .unwrap();
+    let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
+    let versions = store
+        .get_or_create_table_row_versions(row_id.clone())
+        .unwrap();
+    versions.write().try_reserve(1).unwrap();
+
+    alloc.fail_allocations(true);
+    store.seqcompact_commit_delete(row_id, 1, 10);
+}
+
 #[test]
 fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
     let alloc = FailOnDemandAlloc::default();
@@ -6680,7 +6735,14 @@ fn test_index_finger_no_spurious_dep_on_stepped_over_key() {
     );
     let idx_key = |v: i64| {
         let rec = crate::types::ImmutableRecord::from_values(&[Value::from_i64(v)], 1).unwrap();
-        std::sync::Arc::new(SortableIndexKey::new_from_record(rec, info.clone()))
+        std::sync::Arc::new(
+            SortableIndexKey::new_from_record_ref_in(
+                ImmutableRecordRef::from_bin_record(rec.get_payload()),
+                info.clone(),
+                crate::alloc::TursoAllocator,
+            )
+            .unwrap(),
+        )
     };
 
     // Reader started after the writer's prepared end_ts → speculatively
@@ -8628,7 +8690,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         let seek_result = run_pager_until_done(
             || {
                 cursor.write().seek(
-                    crate::types::SeekKey::IndexKey(&record),
+                    crate::types::SeekKey::IndexKey(record.as_record_ref()),
                     crate::types::SeekOp::GE { eq_only: true },
                 )
             },
@@ -8639,7 +8701,11 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
             run_pager_until_done(|| cursor.write().next(), pager.as_ref()).unwrap();
         }
         run_pager_until_done(
-            || cursor.write().insert(&BTreeKey::new_index_key(&record)),
+            || {
+                cursor
+                    .write()
+                    .insert(&BTreeKey::new_index_key(record.as_record_ref()))
+            },
             pager.as_ref(),
         )
         .unwrap();
@@ -8654,7 +8720,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         let seek_result = run_pager_until_done(
             || {
                 cursor.write().seek(
-                    crate::types::SeekKey::IndexKey(&record),
+                    crate::types::SeekKey::IndexKey(record.as_record_ref()),
                     crate::types::SeekOp::GE { eq_only: true },
                 )
             },
@@ -8680,7 +8746,12 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         2,
     )
     .unwrap();
-    let row_key = SortableIndexKey::new_from_record(record, index_info);
+    let row_key = SortableIndexKey::new_from_record_ref_in(
+        ImmutableRecordRef::from_bin_record(record.get_payload()),
+        index_info,
+        crate::alloc::TursoAllocator,
+    )
+    .unwrap();
     let row = Row::new_index_row(
         RowID::new(MVTableId::new(-42), RowKey::Record(Arc::new(row_key))),
         index.columns.len(),
