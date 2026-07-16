@@ -20,6 +20,9 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "true"
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
+  # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
+  # crate's clang-cl preference fails; force the MSVC compiler instead.
+  CC_x86_64_pc_windows_msvc: cl.exe
 
 jobs:
   configure-strategy:
