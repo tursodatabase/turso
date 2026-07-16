@@ -199,6 +199,39 @@ macro_rules! define_aegis_cipher {
                 Ok((result, nonce))
             }
 
+            fn encrypt_in_place(
+                &self,
+                plaintext_ciphertext: &mut [u8],
+                ad: &[u8],
+                tag_out: &mut [u8],
+                nonce_out: &mut [u8],
+            ) -> Result<()> {
+                if tag_out.len() != Self::TAG_SIZE {
+                    return Err(CipherError::InvalidTagSize { cipher: $name }.into());
+                }
+                if nonce_out.len() != $nonce_size {
+                    return Err(LimboError::InternalError(format!(
+                        "Invalid nonce size for {}: expected {}, got {}",
+                        $name,
+                        $nonce_size,
+                        nonce_out.len()
+                    )));
+                }
+                let nonce = generate_secure_nonce::<$nonce_size>();
+                let key_bytes = self.key.$key_method().ok_or_else(|| -> LimboError {
+                    CipherError::InvalidKeySize {
+                        cipher: $name,
+                        expected: $key_size,
+                    }
+                    .into()
+                })?;
+                let tag = <$cipher_type>::new(key_bytes, &nonce)
+                    .encrypt_in_place(plaintext_ciphertext, ad);
+                tag_out.copy_from_slice(&tag);
+                nonce_out.copy_from_slice(&nonce);
+                Ok(())
+            }
+
             fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; $nonce_size], ad: &[u8]) -> Result<Vec<u8>> {
                 let mut out = Vec::with_capacity(ciphertext.len().saturating_sub(Self::TAG_SIZE));
                 self.decrypt_into(ciphertext, nonce, ad, &mut out)?;
@@ -275,6 +308,36 @@ macro_rules! define_aes_gcm_cipher {
                 let mut nonce_array = [0u8; 12];
                 nonce_array.copy_from_slice(&nonce);
                 Ok((ciphertext, nonce_array))
+            }
+
+            fn encrypt_in_place(
+                &self,
+                plaintext_ciphertext: &mut [u8],
+                ad: &[u8],
+                tag_out: &mut [u8],
+                nonce_out: &mut [u8],
+            ) -> Result<()> {
+                if tag_out.len() != Self::TAG_SIZE {
+                    return Err(CipherError::InvalidTagSize { cipher: $name }.into());
+                }
+                if nonce_out.len() != Self::NONCE_SIZE {
+                    return Err(LimboError::InternalError(format!(
+                        "Invalid nonce size for {}: expected {}, got {}",
+                        $name,
+                        Self::NONCE_SIZE,
+                        nonce_out.len()
+                    )));
+                }
+                let nonce = <$cipher_type>::generate_nonce(&mut OsRng);
+                let tag = self
+                    .cipher
+                    .encrypt_in_place_detached(&nonce, ad, plaintext_ciphertext)
+                    .map_err(|e| {
+                        LimboError::InternalError(format!("{} encryption failed: {e:?}", $name))
+                    })?;
+                tag_out.copy_from_slice(&tag);
+                nonce_out.copy_from_slice(&nonce);
+                Ok(())
             }
 
             fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; 12], ad: &[u8]) -> Result<Vec<u8>> {
@@ -559,6 +622,16 @@ impl EncryptionContext {
 
     pub fn encrypt_chunk(&self, plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         self.encrypt_raw_with_ad(plaintext, aad)
+    }
+
+    pub fn encrypt_chunk_in_place(
+        &self,
+        plaintext_ciphertext: &mut [u8],
+        aad: &[u8],
+        tag_out: &mut [u8],
+        nonce_out: &mut [u8],
+    ) -> Result<()> {
+        self.encrypt_raw_with_ad_in_place(plaintext_ciphertext, aad, tag_out, nonce_out)
     }
 
     pub fn decrypt_chunk(&self, ciphertext: &[u8], nonce: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
@@ -882,6 +955,31 @@ impl EncryptionContext {
         }
     }
 
+    fn encrypt_raw_with_ad_in_place(
+        &self,
+        plaintext_ciphertext: &mut [u8],
+        ad: &[u8],
+        tag_out: &mut [u8],
+        nonce_out: &mut [u8],
+    ) -> Result<()> {
+        macro_rules! encrypt_cipher {
+            ($cipher:expr) => {{
+                $cipher.encrypt_in_place(plaintext_ciphertext, ad, tag_out, nonce_out)
+            }};
+        }
+
+        match &self.cipher {
+            Cipher::Aes128Gcm(cipher) => encrypt_cipher!(cipher),
+            Cipher::Aes256Gcm(cipher) => encrypt_cipher!(cipher),
+            Cipher::Aegis256(cipher) => encrypt_cipher!(cipher),
+            Cipher::Aegis256X2(cipher) => encrypt_cipher!(cipher),
+            Cipher::Aegis256X4(cipher) => encrypt_cipher!(cipher),
+            Cipher::Aegis128L(cipher) => encrypt_cipher!(cipher),
+            Cipher::Aegis128X2(cipher) => encrypt_cipher!(cipher),
+            Cipher::Aegis128X4(cipher) => encrypt_cipher!(cipher),
+        }
+    }
+
     fn decrypt_raw(&self, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
         const AD: &[u8] = b"";
         self.decrypt_raw_with_ad(ciphertext, nonce, AD)
@@ -1048,6 +1146,15 @@ mod tests {
                 assert_ne!(ciphertext[..plaintext.len()], plaintext[..]);
 
                 let decrypted = ctx.decrypt_raw(&ciphertext, &nonce).unwrap();
+                assert_eq!(decrypted, plaintext);
+
+                let mut in_place_ciphertext = plaintext.to_vec();
+                let mut tag = vec![0; ctx.tag_size()];
+                let mut nonce = vec![0; ctx.nonce_size()];
+                ctx.encrypt_chunk_in_place(&mut in_place_ciphertext, b"", &mut tag, &mut nonce)
+                    .unwrap();
+                in_place_ciphertext.extend_from_slice(&tag);
+                let decrypted = ctx.decrypt_raw(&in_place_ciphertext, &nonce).unwrap();
                 assert_eq!(decrypted, plaintext);
             }
         };
