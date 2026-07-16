@@ -8061,6 +8061,19 @@ pub fn op_function(
                     .exec_unhex(ignored_chars.map(|x| x.get_value()));
                 state.registers[*dest].set_value(result);
             }
+            ScalarFunc::GetByte => {
+                let value = state.registers[*start_reg].get_value();
+                let offset = state.registers[*start_reg + 1].get_value();
+                let result = value.exec_get_byte(offset)?;
+                state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::SetByte => {
+                let value = state.registers[*start_reg].get_value();
+                let offset = state.registers[*start_reg + 1].get_value();
+                let new_value = state.registers[*start_reg + 2].get_value();
+                let result = value.exec_set_byte(offset, new_value)?;
+                state.registers[*dest].set_value(result);
+            }
             ScalarFunc::Random => {
                 state.registers[*dest].set_int(pager.io.generate_random_number());
             }

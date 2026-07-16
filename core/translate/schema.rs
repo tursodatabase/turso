@@ -431,6 +431,7 @@ fn resolve_scalar_func_return_type(
         | ScalarFunc::NumericLt
         | ScalarFunc::NumericEq
         | ScalarFunc::ValidateIpAddr
+        | ScalarFunc::GetByte
         | ScalarFunc::UnixEpoch => Ok(CheckExprType::Integer),
 
         // Functions that always return TEXT
@@ -464,7 +465,7 @@ fn resolve_scalar_func_return_type(
         ScalarFunc::Round | ScalarFunc::JulianDay => Ok(CheckExprType::Real),
 
         // Functions that always return BLOB
-        ScalarFunc::RandomBlob | ScalarFunc::ZeroBlob | ScalarFunc::Unhex => {
+        ScalarFunc::RandomBlob | ScalarFunc::ZeroBlob | ScalarFunc::Unhex | ScalarFunc::SetByte => {
             Ok(CheckExprType::Blob)
         }
 

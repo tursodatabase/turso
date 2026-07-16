@@ -763,6 +763,8 @@ pub enum ScalarFunc {
     JulianDay,
     Hex,
     Unhex,
+    GetByte,
+    SetByte,
     ZeroBlob,
     LastInsertRowid,
     Replace,
@@ -896,6 +898,8 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::JulianDay => false,
             ScalarFunc::Hex => true,
             ScalarFunc::Unhex => true,
+            ScalarFunc::GetByte => true,
+            ScalarFunc::SetByte => true,
             ScalarFunc::ZeroBlob => true,
             ScalarFunc::LastInsertRowid => false,
             ScalarFunc::Replace => true,
@@ -1040,6 +1044,8 @@ impl Display for ScalarFunc {
             Self::UnixEpoch => "unixepoch",
             Self::Hex => "hex",
             Self::Unhex => "unhex",
+            Self::GetByte => "get_byte",
+            Self::SetByte => "set_byte",
             Self::ZeroBlob => "zeroblob",
             Self::LastInsertRowid => "last_insert_rowid",
             Self::Replace => "replace",
@@ -1179,9 +1185,10 @@ impl ScalarFunc {
             | Self::Nullif
             | Self::IfNull
             | Self::Likelihood
+            | Self::GetByte
             | Self::TimeDiff => &[2],
             // 3-arg
-            Self::Iif | Self::Replace => &[3],
+            Self::Iif | Self::Replace | Self::SetByte => &[3],
             // Multi-arity (one row per valid arity)
             Self::Like => &[2, 3],
             Self::Trim | Self::LTrim | Self::RTrim | Self::Round | Self::Unhex => &[1, 2],

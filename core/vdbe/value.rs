@@ -707,6 +707,71 @@ impl Value {
         }
     }
 
+    /// Returns the raw bytes backing this value for the byte-manipulation
+    /// functions (`get_byte`/`set_byte`). Blobs are used verbatim; text is
+    /// interpreted as its UTF-8 bytes; numbers use their textual form (matching
+    /// how `hex()` coerces). `NULL` has no byte view.
+    fn byte_view(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+        match self {
+            Value::Null => None,
+            Value::Blob(b) => Some(std::borrow::Cow::Borrowed(b)),
+            Value::Text(t) => Some(std::borrow::Cow::Borrowed(t.as_str().as_bytes())),
+            Value::Numeric(_) => Some(std::borrow::Cow::Owned(self.to_string().into_bytes())),
+        }
+    }
+
+    /// PostgreSQL `get_byte(bytea, offset)`: returns the byte at the 0-based
+    /// `offset` as an integer in the range 0..=255. Raises an error when the
+    /// offset falls outside `0..length-1`, matching PostgreSQL exactly. A `NULL`
+    /// input or offset yields `NULL`.
+    pub fn exec_get_byte(&self, offset: &Value) -> Result<Value> {
+        let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast("INT")? else {
+            return Ok(Value::Null);
+        };
+        let Some(bytes) = self.byte_view() else {
+            return Ok(Value::Null);
+        };
+        let len = bytes.len() as i64;
+        if offset < 0 || offset >= len {
+            return Err(LimboError::InvalidArgument(format!(
+                "index {offset} out of valid range, 0..{}",
+                len - 1
+            )));
+        }
+        Ok(Value::from_i64(i64::from(bytes[offset as usize])))
+    }
+
+    /// PostgreSQL `set_byte(bytea, offset, newvalue)`: returns a blob with the
+    /// byte at the 0-based `offset` replaced by the low 8 bits of `newvalue`.
+    /// Raises an error when the offset falls outside `0..length-1`, matching
+    /// PostgreSQL exactly. A `NULL` input, offset, or value yields `NULL`.
+    pub fn exec_set_byte(&self, offset: &Value, new_value: &Value) -> Result<Value> {
+        let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast("INT")? else {
+            return Ok(Value::Null);
+        };
+        let Value::Numeric(Numeric::Integer(new_value)) = new_value.exec_cast("INT")? else {
+            return Ok(Value::Null);
+        };
+        let Some(bytes) = self.byte_view() else {
+            return Ok(Value::Null);
+        };
+        let len = bytes.len() as i64;
+        if offset < 0 || offset >= len {
+            return Err(LimboError::InvalidArgument(format!(
+                "index {offset} out of valid range, 0..{}",
+                len - 1
+            )));
+        }
+        // Copy into a Turso-allocated blob, then overwrite the target byte in place.
+        let mut result = Value::from_slice(&bytes)?;
+        if let Value::Blob(out) = &mut result {
+            // PostgreSQL truncates the new value to its low 8 bits (int32 stored
+            // into an unsigned char), so e.g. 6555 becomes 155 and -1 becomes 255.
+            out[offset as usize] = new_value as u8;
+        }
+        Ok(result)
+    }
+
     pub fn exec_unicode(&self) -> Value {
         match self {
             Value::Text(_) | Value::Numeric(_) | Value::Blob(_) => {
@@ -1780,6 +1845,94 @@ mod tests {
                 "Wrong subtract for lhs: {lhs}, rhs: {rhs}"
             );
         }
+    }
+
+    #[test]
+    fn test_exec_get_byte() {
+        // PostgreSQL: get_byte('\x1234567890'::bytea, 4) = 144.
+        let input = blob(&[0x12, 0x34, 0x56, 0x78, 0x90]);
+        assert_eq!(
+            input.exec_get_byte(&Value::from_i64(4)).unwrap(),
+            Value::from_i64(144)
+        );
+        assert_eq!(
+            input.exec_get_byte(&Value::from_i64(0)).unwrap(),
+            Value::from_i64(0x12)
+        );
+        // Text is read as its UTF-8 bytes ('A' == 65).
+        assert_eq!(
+            Value::build_text("ABC")
+                .exec_get_byte(&Value::from_i64(0))
+                .unwrap(),
+            Value::from_i64(65)
+        );
+        // A text offset that casts to an integer is accepted.
+        assert_eq!(
+            input.exec_get_byte(&Value::build_text("4")).unwrap(),
+            Value::from_i64(144)
+        );
+        // NULL input or offset yields NULL.
+        assert_eq!(
+            Value::Null.exec_get_byte(&Value::from_i64(0)).unwrap(),
+            Value::Null
+        );
+        assert_eq!(input.exec_get_byte(&Value::Null).unwrap(), Value::Null);
+        // Out-of-range and negative offsets raise an error, as does an empty blob.
+        assert!(input.exec_get_byte(&Value::from_i64(5)).is_err());
+        assert!(input.exec_get_byte(&Value::from_i64(-1)).is_err());
+        assert!(blob(&[]).exec_get_byte(&Value::from_i64(0)).is_err());
+    }
+
+    #[test]
+    fn test_exec_set_byte() {
+        let input = blob(&[0x12, 0x34, 0x56, 0x78, 0x90]);
+        // PostgreSQL: set_byte('\x1234567890'::bytea, 4, 64) = '\x1234567840'.
+        assert_eq!(
+            input
+                .exec_set_byte(&Value::from_i64(4), &Value::from_i64(64))
+                .unwrap(),
+            blob(&[0x12, 0x34, 0x56, 0x78, 0x40])
+        );
+        // Values wrap to their low 8 bits: 6555 & 0xff == 0x9b.
+        assert_eq!(
+            input
+                .exec_set_byte(&Value::from_i64(4), &Value::from_i64(6555))
+                .unwrap(),
+            blob(&[0x12, 0x34, 0x56, 0x78, 0x9b])
+        );
+        // Negative values wrap too: -1 -> 0xff.
+        assert_eq!(
+            input
+                .exec_set_byte(&Value::from_i64(4), &Value::from_i64(-1))
+                .unwrap(),
+            blob(&[0x12, 0x34, 0x56, 0x78, 0xff])
+        );
+        // NULL in any argument yields NULL.
+        assert_eq!(
+            Value::Null
+                .exec_set_byte(&Value::from_i64(0), &Value::from_i64(1))
+                .unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            input
+                .exec_set_byte(&Value::Null, &Value::from_i64(1))
+                .unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            input
+                .exec_set_byte(&Value::from_i64(0), &Value::Null)
+                .unwrap(),
+            Value::Null
+        );
+        // Out-of-range and negative offsets raise an error.
+        assert!(input
+            .exec_set_byte(&Value::from_i64(5), &Value::from_i64(0))
+            .is_err());
+        assert!(input
+            .exec_set_byte(&Value::from_i64(-1), &Value::from_i64(0))
+            .is_err());
     }
 
     #[test]

@@ -1670,6 +1670,14 @@ pub fn translate_expr(
                             target_register,
                             func_ctx,
                         ),
+                        ScalarFunc::GetByte | ScalarFunc::SetByte => translate_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        ),
                         ScalarFunc::Likely => {
                             if args.len() != 1 {
                                 crate::bail_parse_error!(
