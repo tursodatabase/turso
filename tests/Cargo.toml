@@ -18,6 +18,12 @@ path = "integration/mod.rs"
 name = "fuzz_tests"
 path = "fuzz/mod.rs"
 
+# Separate binary: uses a counting #[global_allocator] to detect
+# per-database memory leaks, which must not affect the other test targets.
+[[test]]
+name = "leak_tests"
+path = "leak/mod.rs"
+
 [dependencies]
 anyhow.workspace = true
 env_logger = { workspace = true }
@@ -46,6 +52,7 @@ similar-asserts.workspace = true
 serial_test = { version = "3", features = ["file_locks"] }
 test-log = { version = "0.2.17", features = ["trace"] }
 turso_macros.workspace = true
+crossbeam-epoch = "0.9.18"
 
 [features]
 default = ["test_helper", "fts", "io_uring"]

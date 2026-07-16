@@ -1157,6 +1157,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "crossbeam-epoch",
  "ctor 0.5.0",
  "env_logger",
  "log",

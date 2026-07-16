@@ -29,6 +29,10 @@ make -C testing/sqltests run-cli
 
 # Rust unit/integration tests (full workspace)
 cargo test
+
+# Memory leak check: repeated database open/workload/drop cycles must not
+# grow the heap (counting global allocator, separate test binary)
+cargo test -p core_tester --test leak_tests
 ```
 
 ## Writing Tests

@@ -113,6 +113,9 @@ jobs:
       - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
         run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check) | test(short_read)' --failure-output=final
         timeout-minutes: 5
+      - name: Memory leak check (repeated database open/workload/drop)
+        run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'binary(leak_tests)' --failure-output=final
+        timeout-minutes: 10
       - name: Test doctests
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"

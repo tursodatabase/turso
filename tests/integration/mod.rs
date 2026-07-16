@@ -6,6 +6,7 @@ mod common;
 mod conflict_resolution;
 mod custom_types;
 mod database;
+mod database_leak;
 mod expr_depth_stack_overflow;
 mod external_apis;
 mod functions;
