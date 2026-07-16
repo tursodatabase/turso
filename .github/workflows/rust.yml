@@ -88,6 +88,13 @@ jobs:
       - name: Install cargo-llvm-cov
         if: runner.os == 'Linux'
         uses: taiki-e/install-action@cargo-llvm-cov
+      # Blacksmith Windows images ship no LLVM; the all-features build pulls in
+      # pg_query, whose bindgen needs libclang.dll.
+      - name: Install LLVM (libclang for bindgen)
+        if: runner.os == 'Windows'
+        run: |
+          choco install llvm -y --no-progress
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
       - name: Set up Python 3.10
         uses: useblacksmith/setup-python@v6
         with:
