@@ -22,6 +22,9 @@ impl fmt::Display for TxMode {
     }
 }
 
+// Note: options that affect worker behavior must be forwarded to spawned
+// multiprocess workers in `WorkerSpawner::spawn` (main.rs); workers otherwise
+// run with defaults.
 #[derive(Parser, Clone)]
 #[command(name = "turso_stress")]
 #[command(author, version, about, long_about = None)]
@@ -33,6 +36,40 @@ pub struct Opts {
     /// Number of threads to run
     #[clap(short = 't', long, help = "the number of threads", default_value_t = 1)]
     pub nr_threads: usize,
+
+    /// Number of processes to run
+    #[clap(
+        short = 'p',
+        long,
+        help = "the number of processes; when greater than 1, spawns worker processes that all open the same database file with multiprocess WAL enabled",
+        default_value_t = 1
+    )]
+    pub nr_processes: usize,
+
+    /// Internal flag marking a spawned multiprocess worker process.
+    #[clap(long, hide = true)]
+    pub multiprocess_worker: bool,
+
+    /// Randomly SIGKILL and respawn multiprocess workers
+    #[clap(
+        long,
+        help = "randomly SIGKILL and respawn worker processes to exercise crash recovery of multiprocess coordination state (requires --nr-processes > 1)"
+    )]
+    pub kill_workers: bool,
+
+    /// Probability denominator for random PRAGMA wal_checkpoint injection
+    #[clap(
+        long,
+        help = "run PRAGMA wal_checkpoint with a random mode at 1/N probability per iteration; 0 disables. Defaults to 100 for multiprocess workers and 0 otherwise"
+    )]
+    pub checkpoint_ratio: Option<u32>,
+
+    /// MVCC auto-checkpoint threshold in bytes of logical log
+    #[clap(
+        long,
+        help = "set PRAGMA mvcc_checkpoint_threshold on every process (concurrent tx-mode only)"
+    )]
+    pub mvcc_checkpoint_threshold: Option<i64>,
 
     /// Number of iterations per thread
     #[clap(
