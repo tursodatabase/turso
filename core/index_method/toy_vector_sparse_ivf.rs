@@ -617,9 +617,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in SeekInverted state".to_string(),
                         ));
                     };
-                    let result =
-                        return_if_io!(inverted_cursor
-                            .seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true }));
+                    let result = return_if_io!(inverted_cursor.seek(
+                        SeekKey::IndexKey(k.as_record_ref()),
+                        SeekOp::GE { eq_only: true }
+                    ));
                     tracing::debug!("insert_state: seek: result={:?}", result);
                     self.insert_state = VectorSparseInvertedIndexInsertState::InsertInverted {
                         vector: vector.take(),
@@ -641,7 +642,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in InsertInverted state".to_string(),
                         ));
                     };
-                    return_if_io!(inverted_cursor.insert(&BTreeKey::IndexKey(k)));
+                    return_if_io!(inverted_cursor.insert(&BTreeKey::IndexKey(k.as_record_ref())));
 
                     let Some(v) = vector.as_ref() else {
                         return Err(LimboError::InternalError(
@@ -670,9 +671,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in SeekStats state".to_string(),
                         ));
                     };
-                    let result = return_if_io!(
-                        stats_cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
-                    );
+                    let result = return_if_io!(stats_cursor.seek(
+                        SeekKey::IndexKey(k.as_record_ref()),
+                        SeekOp::GE { eq_only: true },
+                    ));
                     match result {
                         SeekResult::Found => {
                             self.insert_state = VectorSparseInvertedIndexInsertState::ReadStats {
@@ -767,7 +769,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in UpdateStats state".to_string(),
                         ));
                     };
-                    return_if_io!(stats_cursor.insert(&BTreeKey::IndexKey(k)));
+                    return_if_io!(stats_cursor.insert(&BTreeKey::IndexKey(k.as_record_ref())));
 
                     self.insert_state = VectorSparseInvertedIndexInsertState::Prepare {
                         vector: vector.take(),
@@ -877,9 +879,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in SeekInverted state".to_string(),
                         ));
                     };
-                    let result = return_if_io!(
-                        cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
-                    );
+                    let result = return_if_io!(cursor.seek(
+                        SeekKey::IndexKey(k.as_record_ref()),
+                        SeekOp::GE { eq_only: true },
+                    ));
                     match result {
                         SeekResult::Found => {
                             self.delete_state =
@@ -957,9 +960,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in SeekStats state".to_string(),
                         ));
                     };
-                    let result = return_if_io!(
-                        stats_cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
-                    );
+                    let result = return_if_io!(stats_cursor.seek(
+                        SeekKey::IndexKey(k.as_record_ref()),
+                        SeekOp::GE { eq_only: true },
+                    ));
                     match result {
                         SeekResult::Found => {
                             self.delete_state = VectorSparseInvertedIndexDeleteState::ReadStats {
@@ -1026,7 +1030,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in UpdateStats state".to_string(),
                         ));
                     };
-                    return_if_io!(stats_cursor.insert(&BTreeKey::IndexKey(k)));
+                    return_if_io!(stats_cursor.insert(&BTreeKey::IndexKey(k.as_record_ref())));
 
                     self.delete_state = VectorSparseInvertedIndexDeleteState::Prepare {
                         vector: vector.take(),
@@ -1162,9 +1166,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in CollectComponentsSeek state".to_string(),
                         ));
                     };
-                    let result = return_if_io!(
-                        stats.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
-                    );
+                    let result = return_if_io!(stats.seek(
+                        SeekKey::IndexKey(k.as_record_ref()),
+                        SeekOp::GE { eq_only: true },
+                    ));
                     match result {
                         SeekResult::Found => {
                             self.search_state =
@@ -1308,9 +1313,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in Seek state".to_string(),
                         ));
                     };
-                    let result = return_if_io!(
-                        inverted.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: false })
-                    );
+                    let result = return_if_io!(inverted.seek(
+                        SeekKey::IndexKey(k.as_record_ref()),
+                        SeekOp::GE { eq_only: false },
+                    ));
                     match result {
                         SeekResult::Found => {
                             let Some(comp) = component.take() else {

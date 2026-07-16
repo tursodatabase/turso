@@ -1040,12 +1040,15 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                         }
                     }
                 };
-                Ok(maybe_record.map(|record| {
-                    RowKey::Record(Arc::new(SortableIndexKey {
-                        key: record.clone(),
-                        metadata: index_info.clone(),
-                    }))
-                }))
+                let Some(record) = maybe_record else {
+                    return Ok(None);
+                };
+                let key = SortableIndexKey::new_from_payload_in(
+                    record,
+                    index_info.clone(),
+                    self.db.allocator(),
+                )?;
+                Ok(Some(RowKey::Record(Arc::new(key))))
             }
         }
     }
@@ -1484,7 +1487,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         op: SeekOp,
     ) -> Result<IOResult<SeekResult>> {
         let record = make_record(registers, &0, &registers.len())?;
-        self.seek(SeekKey::IndexKey(&record), op)
+        self.seek(SeekKey::IndexKey(record.as_record_ref()), op)
     }
 
     fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
@@ -1611,8 +1614,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                     self.db.allocator(),
                                 )?)
                             };
-                            let sortable_key =
-                                SortableIndexKey::new_from_record((*index_key).clone(), index_info);
+                            let sortable_key = SortableIndexKey::new_from_payload_in(
+                                index_key,
+                                index_info,
+                                self.db.allocator(),
+                            )?;
 
                             // Seek in MVCC (synchronous)
                             let mvcc_rowid = self.db.seek_index(
@@ -1730,10 +1736,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
                     panic!("BTreeKey::IndexKey requires Index cursor type");
                 };
-                let sortable_key = Arc::new(SortableIndexKey::new_from_record(
-                    (*record).clone(),
+                let sortable_key = Arc::new(SortableIndexKey::new_from_payload_in(
+                    record,
                     index_info.clone(),
-                ));
+                    self.db.allocator(),
+                )?);
                 RowID::new(self.table_id, RowKey::Record(sortable_key))
             }
         };
