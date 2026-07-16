@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
 
 fn run_tursopg(input: &[u8]) -> Output {
@@ -889,28 +889,47 @@ fn copy_from_file_not_found_repl() {
 // Wire protocol: COPY FROM returns "COPY N"
 // ---------------------------------------------------------------------------
 
-/// Start tursopg with --server and wait for it to be ready.
-fn start_tursopg_server(port: u16) -> Child {
-    let addr = format!("127.0.0.1:{port}");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-        .arg(":memory:")
-        .arg("--server")
-        .arg(&addr)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to start tursopg server");
+/// Start tursopg with --server on a kernel-assigned ephemeral port and wait
+/// for it to be ready. Returns the child and the port it is serving.
+///
+/// The port must not be derived from a fixed seed: each test runs in its own
+/// process, so two concurrently started tests can compute the same port, and
+/// the loser of the bind race silently connects to the winner's server — and
+/// then fails mid-test when the winner tears it down. Instead, ask the kernel
+/// for a free ephemeral port and verify our own child is the process that
+/// came up on it, retrying with a fresh port if the child dies on bind.
+fn start_tursopg_server() -> (Child, u16) {
+    for _ in 0..10 {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = format!("127.0.0.1:{port}");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+            .arg(":memory:")
+            .arg("--server")
+            .arg(&addr)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start tursopg server");
 
-    // Wait for the server to be ready by polling TCP connect
-    for _ in 0..50 {
-        if TcpStream::connect(&addr).is_ok() {
-            return child;
+        // Wait for the server to be ready by polling TCP connect, bailing out
+        // to a new port if the child exited (lost a bind race).
+        for _ in 0..50 {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if TcpStream::connect(&addr).is_ok() && child.try_wait().unwrap().is_none() {
+                return (child, port);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        child.kill().ok();
+        child.wait().ok();
     }
-    child.kill().ok();
-    child.wait().ok();
-    panic!("tursopg server did not start on {addr}");
+    panic!("tursopg server did not start");
 }
 
 /// Minimal PG wire protocol client for testing.
@@ -1092,9 +1111,7 @@ fn extract_command_tags(data: &[u8]) -> Vec<String> {
 
 #[test]
 fn wire_copy_from_returns_copy_n() {
-    // Use a unique port to avoid conflicts with parallel tests
-    let port = 15432 + (std::process::id() % 1000) as u16;
-    let mut server = start_tursopg_server(port);
+    let (mut server, port) = start_tursopg_server();
 
     let path = write_temp_copy_file("wire", "1\tAlice\n2\tBob\n3\tCharlie\n");
 
@@ -1130,12 +1147,10 @@ fn wire_copy_from_returns_copy_n() {
 
 /// Wire-protocol fixture: spin up tursopg, hand the caller a connected
 /// client, run their assertions, then shut the server down. Each test
-/// gets its own port so they can run in parallel without TCP collisions.
-fn with_pg_client<F: FnOnce(&mut PgTestClient)>(port_seed: u16, f: F) {
-    // Compose a port from the test-supplied seed and the test process id so
-    // multiple test files don't collide on a shared port range either.
-    let port = 16000 + port_seed + (std::process::id() % 100) as u16;
-    let mut server = start_tursopg_server(port);
+/// gets its own kernel-assigned port so they can run in parallel without
+/// TCP collisions.
+fn with_pg_client<F: FnOnce(&mut PgTestClient)>(f: F) {
+    let (mut server, port) = start_tursopg_server();
     let mut client = PgTestClient::connect(port);
     f(&mut client);
     server.kill().ok();
@@ -1149,7 +1164,7 @@ fn with_pg_client<F: FnOnce(&mut PgTestClient)>(port_seed: u16, f: F) {
 /// where integer literals previously fell through to TEXT.
 #[test]
 fn wire_integer_literal_reports_int4() {
-    with_pg_client(1, |c| {
+    with_pg_client(|c| {
         assert_eq!(c.query_column_oids("SELECT 42"), vec![OID_INT4]);
     });
 }
@@ -1159,7 +1174,7 @@ fn wire_integer_literal_reports_int4() {
 /// reals as 64-bit floats and the client decodes the wire bytes directly.
 #[test]
 fn wire_real_literal_reports_float8() {
-    with_pg_client(2, |c| {
+    with_pg_client(|c| {
         assert_eq!(c.query_column_oids("SELECT 3.14"), vec![OID_FLOAT8]);
     });
 }
@@ -1168,7 +1183,7 @@ fn wire_real_literal_reports_float8() {
 /// asserting here to lock in the contract.
 #[test]
 fn wire_text_literal_reports_text() {
-    with_pg_client(3, |c| {
+    with_pg_client(|c| {
         assert_eq!(c.query_column_oids("SELECT 'hello'"), vec![OID_TEXT]);
     });
 }
@@ -1179,7 +1194,7 @@ fn wire_text_literal_reports_text() {
 /// the operand type — this test pins that walker down.
 #[test]
 fn wire_integer_arithmetic_reports_int4() {
-    with_pg_client(4, |c| {
+    with_pg_client(|c| {
         assert_eq!(c.query_column_oids("SELECT 42 + 1"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT 1 + 1 + 1"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT 100 - 7"), vec![OID_INT4]);
@@ -1191,7 +1206,7 @@ fn wire_integer_arithmetic_reports_int4() {
 /// Mixed numeric arithmetic widens INTEGER+REAL → REAL → wire FLOAT8.
 #[test]
 fn wire_mixed_arithmetic_widens_to_float8() {
-    with_pg_client(5, |c| {
+    with_pg_client(|c| {
         assert_eq!(c.query_column_oids("SELECT 42 + 1.5"), vec![OID_FLOAT8]);
         assert_eq!(c.query_column_oids("SELECT 3.14 * 2"), vec![OID_FLOAT8]);
     });
@@ -1200,7 +1215,7 @@ fn wire_mixed_arithmetic_widens_to_float8() {
 /// Bitwise ops always report INT4 — matches PostgreSQL.
 #[test]
 fn wire_bitwise_ops_report_int4() {
-    with_pg_client(6, |c| {
+    with_pg_client(|c| {
         assert_eq!(c.query_column_oids("SELECT 1 << 4"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT 256 >> 2"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT 12 & 10"), vec![OID_INT4]);
@@ -1213,7 +1228,7 @@ fn wire_bitwise_ops_report_int4() {
 /// could map these to BOOL OID, but for now stable + assertable.
 #[test]
 fn wire_comparison_and_logical_report_int4() {
-    with_pg_client(7, |c| {
+    with_pg_client(|c| {
         assert_eq!(c.query_column_oids("SELECT 1 = 1"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT 2 < 3"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT 5 > 4"), vec![OID_INT4]);
@@ -1227,7 +1242,7 @@ fn wire_comparison_and_logical_report_int4() {
 /// Concat (`||`) always reports TEXT.
 #[test]
 fn wire_concat_reports_text() {
-    with_pg_client(8, |c| {
+    with_pg_client(|c| {
         assert_eq!(c.query_column_oids("SELECT 'a' || 'b'"), vec![OID_TEXT]);
         assert_eq!(
             c.query_column_oids("SELECT 'x' || 'y' || 'z'"),
@@ -1240,7 +1255,7 @@ fn wire_concat_reports_text() {
 /// (`(1+2)*3`) still propagate types — the walker recurses through.
 #[test]
 fn wire_unary_and_parens_propagate() {
-    with_pg_client(9, |c| {
+    with_pg_client(|c| {
         assert_eq!(c.query_column_oids("SELECT -42"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT +5"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT (1 + 2) * 3"), vec![OID_INT4]);
@@ -1252,7 +1267,7 @@ fn wire_unary_and_parens_propagate() {
 /// the wire layer picks the matching PG OID.
 #[test]
 fn wire_cast_reports_target_type() {
-    with_pg_client(10, |c| {
+    with_pg_client(|c| {
         assert_eq!(
             c.query_column_oids("SELECT CAST('42' AS INTEGER)"),
             vec![OID_INT4]
@@ -1273,7 +1288,7 @@ fn wire_cast_reports_target_type() {
 /// layer must not regress to TEXT here.
 #[test]
 fn wire_table_columns_report_declared_type() {
-    with_pg_client(11, |c| {
+    with_pg_client(|c| {
         c.query_command_tags("CREATE TABLE t(id INTEGER, label TEXT, score REAL)");
         assert_eq!(
             c.query_column_oids("SELECT id, label, score FROM t"),
@@ -1287,7 +1302,7 @@ fn wire_table_columns_report_declared_type() {
 /// the correct OID rather than collapsing the row to a single type.
 #[test]
 fn wire_multi_column_select_classifies_each() {
-    with_pg_client(12, |c| {
+    with_pg_client(|c| {
         assert_eq!(
             c.query_column_oids("SELECT 1, 'two', 3.0, 1 + 1, 'a' || 'b'"),
             vec![OID_INT4, OID_TEXT, OID_FLOAT8, OID_INT4, OID_TEXT]
