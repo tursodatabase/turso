@@ -1,5 +1,5 @@
 [package]
-name = "turso_postgres_tests"
+name = "turso_pg_tests"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

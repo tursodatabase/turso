@@ -7406,7 +7406,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "turso_postgres_tests"
+name = "turso_pg_tests"
 version = "0.7.0"
 dependencies = [
  "anyhow",
