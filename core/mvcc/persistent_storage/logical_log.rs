@@ -1133,6 +1133,16 @@ pub(crate) fn serialize_op_entry(
     Ok(())
 }
 
+/// Serializes one logical-log operation for the serialization benchmark.
+#[cfg(feature = "bench")]
+pub fn benchmark_serialize_op_entry(
+    buffer: &mut Vec<u8>,
+    row_version: &RowVersion,
+    portable_extension: Option<&[u8]>,
+) -> Result<()> {
+    serialize_op_entry(buffer, row_version, portable_extension)
+}
+
 pub(crate) fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
     // Header op uses tag-only addressing (table_id=0, flags=0) and fixed payload length.
     buffer.push(OP_UPDATE_HEADER);
