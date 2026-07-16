@@ -1,11 +1,155 @@
 use super::*;
 
-/// A logical-log fragment that can be flattened into an exact byte iterator.
+/// A statically composed stream of logical-log chunks.
 ///
-/// `TursoFromIterator::try_extend` uses the iterator's upper bound to reserve
-/// before mutation and specializes for the concrete iterator where possible.
+/// Keeping inline values and borrowed slices as distinct chunks lets the
+/// serializer reserve for the complete stream once, then bulk-copy each slice.
+/// Flattening the same chain to `Iterator<Item = u8>` loses those slice
+/// boundaries and makes `Vec::extend` copy the payload one byte at a time.
+pub(super) trait LogChunkStream: Sized {
+    fn encoded_len(&self) -> Option<usize>;
+
+    fn copy_to(self, writer: &mut LogChunkWriter) -> Result<()>;
+
+    #[inline(always)]
+    fn chain<R: LogChunkStream>(self, right: R) -> ChainedLogChunks<Self, R> {
+        ChainedLogChunks { left: self, right }
+    }
+}
+
+pub(super) struct ChainedLogChunks<L, R> {
+    left: L,
+    right: R,
+}
+
+impl<L: LogChunkStream, R: LogChunkStream> LogChunkStream for ChainedLogChunks<L, R> {
+    #[inline(always)]
+    fn encoded_len(&self) -> Option<usize> {
+        self.left
+            .encoded_len()?
+            .checked_add(self.right.encoded_len()?)
+    }
+
+    #[inline(always)]
+    fn copy_to(self, writer: &mut LogChunkWriter) -> Result<()> {
+        self.left.copy_to(writer)?;
+        self.right.copy_to(writer)
+    }
+}
+
+struct InlineLogChunk<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> InlineLogChunk<N> {
+    #[inline(always)]
+    fn full(bytes: [u8; N]) -> Self {
+        Self { bytes, len: N }
+    }
+
+    #[inline(always)]
+    fn prefix(bytes: [u8; N], len: usize) -> Self {
+        assert!(
+            len <= N,
+            "inline logical-log chunk length exceeds its buffer"
+        );
+        Self { bytes, len }
+    }
+}
+
+impl<const N: usize> LogChunkStream for InlineLogChunk<N> {
+    #[inline(always)]
+    fn encoded_len(&self) -> Option<usize> {
+        Some(self.len)
+    }
+
+    #[inline(always)]
+    fn copy_to(self, writer: &mut LogChunkWriter) -> Result<()> {
+        writer.copy_from_slice(&self.bytes[..self.len])
+    }
+}
+
+struct BorrowedLogChunk<'a>(&'a [u8]);
+
+impl LogChunkStream for BorrowedLogChunk<'_> {
+    #[inline(always)]
+    fn encoded_len(&self) -> Option<usize> {
+        Some(self.0.len())
+    }
+
+    #[inline(always)]
+    fn copy_to(self, writer: &mut LogChunkWriter) -> Result<()> {
+        writer.copy_from_slice(self.0)
+    }
+}
+
 pub(super) trait LogBufferWrite {
-    fn into_bytes(self) -> impl Iterator<Item = u8>;
+    fn into_chunks(self) -> impl LogChunkStream;
+}
+
+pub(super) struct LogChunkWriter {
+    output: *mut u8,
+    capacity: usize,
+    written: usize,
+}
+
+impl LogChunkWriter {
+    #[inline(always)]
+    fn copy_from_slice(&mut self, bytes: &[u8]) -> Result<()> {
+        let next_written = self
+            .written
+            .checked_add(bytes.len())
+            .filter(|next| *next <= self.capacity)
+            .ok_or_else(log_buffer_len_mismatch)?;
+        // SAFETY: `next_written` proves this chunk fits in the reserved spare
+        // capacity. Chunk sources cannot overlap the mutably borrowed buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.output.add(self.written),
+                bytes.len(),
+            );
+        }
+        self.written = next_written;
+        Ok(())
+    }
+}
+
+trait LogBufferExt {
+    fn try_extend_chunks(&mut self, chunks: impl LogChunkStream) -> Result<()>;
+}
+
+impl LogBufferExt for Vec<u8> {
+    #[inline(always)]
+    fn try_extend_chunks(&mut self, chunks: impl LogChunkStream) -> Result<()> {
+        let encoded_len = chunks.encoded_len().ok_or_else(log_buffer_len_overflow)?;
+        let new_len = self
+            .len()
+            .checked_add(encoded_len)
+            .ok_or_else(log_buffer_len_overflow)?;
+        self.try_reserve(encoded_len)?;
+
+        let original_len = self.len();
+        // SAFETY: `try_reserve` above guarantees space for `encoded_len`
+        // additional bytes, so the first spare byte is within the allocation.
+        let output = unsafe { self.as_mut_ptr().add(original_len) };
+        let mut writer = LogChunkWriter {
+            output,
+            capacity: encoded_len,
+            written: 0,
+        };
+        chunks.copy_to(&mut writer)?;
+        if writer.written != encoded_len {
+            return Err(log_buffer_len_mismatch());
+        }
+        // SAFETY: every byte between the old and new lengths was initialized by
+        // the checked chunk copies above.
+        unsafe {
+            self.set_len(new_len);
+        }
+        Ok(())
+    }
 }
 
 macro_rules! log_write {
@@ -26,8 +170,8 @@ macro_rules! log_write {
     }};
     ($serializer:expr, [$first:expr $(, $rest:expr)* $(,)?]) => {{
         $serializer.write(
-            LogBufferWrite::into_bytes($first)
-                $(.chain(LogBufferWrite::into_bytes($rest)))*
+            LogBufferWrite::into_chunks($first)
+                $(.chain(LogBufferWrite::into_chunks($rest)))*
         )
     }};
 }
@@ -43,9 +187,8 @@ impl<'a> LogSerializer<'a> {
     }
 
     #[inline(always)]
-    fn write(&mut self, bytes: impl Iterator<Item = u8>) -> Result<()> {
-        self.buffer.try_extend(bytes)?;
-        Ok(())
+    fn write(&mut self, chunks: impl LogChunkStream) -> Result<()> {
+        self.buffer.try_extend_chunks(chunks)
     }
 
     #[inline(always)]
@@ -56,19 +199,9 @@ impl<'a> LogSerializer<'a> {
             ));
         }
 
-        let bytes = value.into_bytes();
-        let encoded_len = exact_iterator_len(&bytes).ok_or_else(log_buffer_len_overflow)?;
-        let new_len = self
-            .buffer
-            .len()
-            .checked_add(encoded_len)
-            .ok_or_else(log_buffer_len_overflow)?;
-        self.buffer.try_extend(bytes)?;
-        debug_assert_eq!(
-            self.buffer.len(),
-            new_len,
-            "logical log serializer encoded length mismatch"
-        );
+        let original_len = self.buffer.len();
+        self.write(value.into_chunks())?;
+        let encoded_len = self.buffer.len() - original_len;
         self.buffer[offset..].rotate_right(encoded_len);
         Ok(())
     }
@@ -360,10 +493,10 @@ struct SqliteVarint(u64);
 
 impl LogBufferWrite for SqliteVarint {
     #[inline(always)]
-    fn into_bytes(self) -> impl Iterator<Item = u8> {
+    fn into_chunks(self) -> impl LogChunkStream {
         let mut bytes = [0; 9];
         let len = write_varint(&mut bytes, self.0);
-        bytes.into_iter().take(len)
+        InlineLogChunk::prefix(bytes, len)
     }
 }
 
@@ -371,7 +504,7 @@ struct ProtoVarint(u64);
 
 impl LogBufferWrite for ProtoVarint {
     #[inline(always)]
-    fn into_bytes(self) -> impl Iterator<Item = u8> {
+    fn into_chunks(self) -> impl LogChunkStream {
         let mut value = self.0;
         let mut bytes = [0; 10];
         let mut len = 0;
@@ -384,7 +517,7 @@ impl LogBufferWrite for ProtoVarint {
                 break;
             }
         }
-        bytes.into_iter().take(len)
+        InlineLogChunk::prefix(bytes, len)
     }
 }
 
@@ -403,8 +536,8 @@ impl ProtoKey {
 }
 
 impl LogBufferWrite for ProtoKey {
-    fn into_bytes(self) -> impl Iterator<Item = u8> {
-        ProtoVarint((self.field << 3) | self.wire_type).into_bytes()
+    fn into_chunks(self) -> impl LogChunkStream {
+        ProtoVarint((self.field << 3) | self.wire_type).into_chunks()
     }
 }
 
@@ -424,39 +557,38 @@ impl ProtoSint64 {
 }
 
 impl LogBufferWrite for ProtoSint64 {
-    fn into_bytes(self) -> impl Iterator<Item = u8> {
+    fn into_chunks(self) -> impl LogChunkStream {
         let zigzag = self.zigzag();
         ProtoKey::new(self.field, PROTO_WIRE_VARINT)
-            .into_bytes()
-            .chain(ProtoVarint(zigzag).into_bytes())
+            .into_chunks()
+            .chain(ProtoVarint(zigzag).into_chunks())
     }
 }
 
 impl LogBufferWrite for u8 {
-    fn into_bytes(self) -> impl Iterator<Item = u8> {
-        std::iter::once(self)
+    fn into_chunks(self) -> impl LogChunkStream {
+        InlineLogChunk::full([self])
     }
 }
 
 impl<const N: usize> LogBufferWrite for [u8; N] {
-    fn into_bytes(self) -> impl Iterator<Item = u8> {
-        self.into_iter()
+    fn into_chunks(self) -> impl LogChunkStream {
+        InlineLogChunk::full(self)
     }
 }
 
 impl LogBufferWrite for &[u8] {
-    fn into_bytes(self) -> impl Iterator<Item = u8> {
-        self.iter().copied()
+    fn into_chunks(self) -> impl LogChunkStream {
+        BorrowedLogChunk(self)
     }
-}
-
-fn exact_iterator_len(iter: &impl Iterator) -> Option<usize> {
-    let (lower, upper) = iter.size_hint();
-    (upper == Some(lower)).then_some(lower)
 }
 
 fn log_buffer_len_overflow() -> LimboError {
     LimboError::InternalError("logical log serialization size overflow".to_string())
+}
+
+fn log_buffer_len_mismatch() -> LimboError {
+    LimboError::InternalError("logical log serialization length mismatch".to_string())
 }
 
 fn proto_varint_len(mut value: u64) -> usize {
@@ -575,18 +707,18 @@ impl<'a> PortableChangePayload<'a> {
     }
 }
 
-impl LogBufferWrite for PortableChangePayload<'_> {
-    fn into_bytes(self) -> impl Iterator<Item = u8> {
+impl<'payload> LogBufferWrite for PortableChangePayload<'payload> {
+    fn into_chunks(self) -> impl LogChunkStream {
         let body_len = self
             .body_len()
             .expect("portable payload length was checked before writing");
         ProtoVarint(body_len as u64)
-            .into_bytes()
-            .chain(ProtoKey::new(1, PROTO_WIRE_VARINT).into_bytes())
-            .chain(ProtoVarint(self.end_offset).into_bytes())
-            .chain(ProtoKey::new(2, PROTO_WIRE_VARINT).into_bytes())
-            .chain(ProtoVarint(self.commit_ts).into_bytes())
-            .chain(self.encoded_metadata.iter().copied())
+            .into_chunks()
+            .chain(ProtoKey::new(1, PROTO_WIRE_VARINT).into_chunks())
+            .chain(ProtoVarint(self.end_offset).into_chunks())
+            .chain(ProtoKey::new(2, PROTO_WIRE_VARINT).into_chunks())
+            .chain(ProtoVarint(self.commit_ts).into_chunks())
+            .chain(LogBufferWrite::into_chunks(self.encoded_metadata))
     }
 }
 
@@ -636,11 +768,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fragment_iterator_has_exact_size_hint() {
-        let bytes = PortableChangePayload::new(1, 2, &[3]).into_bytes();
+    fn fragment_chunks_preserve_wire_format() {
+        let metadata = [3];
+        let mut bytes = Vec::new();
+        LogSerializer::new(&mut bytes)
+            .write(PortableChangePayload::new(1, 2, &metadata).into_chunks())
+            .unwrap();
 
-        assert_eq!(bytes.size_hint(), (6, Some(6)));
-        assert_eq!(bytes.collect::<Vec<_>>(), [5, 8, 1, 16, 2, 3]);
+        assert_eq!(bytes, [5, 8, 1, 16, 2, 3]);
+    }
+
+    #[test]
+    fn chunk_length_mismatch_does_not_change_buffer() {
+        struct WrongLength;
+
+        impl LogChunkStream for WrongLength {
+            fn encoded_len(&self) -> Option<usize> {
+                Some(0)
+            }
+
+            fn copy_to(self, writer: &mut LogChunkWriter) -> Result<()> {
+                writer.copy_from_slice(&[1])
+            }
+        }
+
+        let mut buffer = vec![2];
+        let result = LogSerializer::new(&mut buffer).write(WrongLength);
+
+        assert!(result.is_err());
+        assert_eq!(buffer, [2]);
     }
 
     #[test]
