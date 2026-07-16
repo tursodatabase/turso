@@ -9746,6 +9746,17 @@ fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: usize) -> Re
         page.write_fragmented_bytes_count(0);
     }
     page.write_cell_count(page.cell_count() as u16 - 1);
+
+    // Overflow cells track their intended position via `index`. An overflow
+    // cell positioned after the deleted regular cell must have its index
+    // decremented so it stays correctly placed (and in bounds) during the
+    // subsequent balance pass.
+    for overflow_cell in page.overflow_cells.iter_mut() {
+        if overflow_cell.index > cell_idx {
+            overflow_cell.index -= 1;
+        }
+    }
+
     debug_validate_cells!(page, usable_space);
     Ok(())
 }
