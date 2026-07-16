@@ -817,7 +817,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
 
     let type_sqls: &[&str] = &[
         #[cfg(feature = "uuid")]
-        "CREATE TYPE uuid(value text) BASE blob ENCODE uuid_blob(value) DECODE uuid_str(value) DEFAULT uuid4_str() OPERATOR '<'",
+        "CREATE TYPE uuid(value text) BASE blob ENCODE CASE WHEN typeof(value) = 'blob' THEN value ELSE uuid_blob(value) END DECODE uuid_str(value) DEFAULT uuid4_str() OPERATOR '<'",
         "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",
         #[cfg(feature = "json")]
         "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
@@ -3340,8 +3340,10 @@ impl BTreeTable {
             if col.is_array() {
                 // Arrays are stored as record-format blobs.
                 col.ty_str = "BLOB".to_string();
+                col.set_base_affinity(Affinity::Blob);
             } else if let Ok(Some(resolved)) = schema.resolve_type(&col.ty_str, table.is_strict) {
                 col.ty_str = resolved.primitive.to_uppercase();
+                col.set_base_affinity(Affinity::affinity(&resolved.primitive));
             }
         }
         Arc::new(modified)
@@ -3400,8 +3402,14 @@ impl BTreeTable {
                 // Pre-encode: user input can be text ('[1,2]') or blob (ARRAY[]),
                 // so accept ANY here; the encoder handles conversion.
                 col.ty_str = "ANY".to_string();
-            } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
-                col.ty_str = type_def.value_input_type().to_uppercase();
+            } else if let Ok(Some(resolved)) = schema.resolve_type(&col.ty_str, table.is_strict) {
+                let input_type = if Affinity::affinity(&resolved.primitive) == Affinity::Blob {
+                    "ANY"
+                } else {
+                    resolved.leaf().value_input_type()
+                };
+                col.ty_str = input_type.to_uppercase();
+                col.set_base_affinity(Affinity::affinity(input_type));
             }
         }
         Ok(Arc::new(modified))
