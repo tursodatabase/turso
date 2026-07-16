@@ -410,11 +410,24 @@ jobs:
       - name: Run turso_whopper (${{ matrix.toolchain.label }}, ${{ matrix.profile.name }})
         env:
           RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
+          WHOPPER_ARGS: ${{ matrix.profile.args }}
         run: |
           cargo +${{ matrix.toolchain.version }} build -p turso_whopper --release
-          for i in $(seq 1 ${{ matrix.profile.iterations }}); do
-            ./target/release/turso_whopper ${{ matrix.profile.args }} || exit 1
-          done
+          # A single whopper run drives its connections serially (one blocking
+          # step at a time), so it only keeps about one core busy. Run
+          # iterations concurrently to use the whole runner; per-iteration log
+          # files keep output readable and preserve the failing seed.
+          seq 1 ${{ matrix.profile.iterations }} | xargs -P 4 -n 1 bash -c '
+            i="$1"
+            log="whopper-run-$i.log"
+            if ./target/release/turso_whopper $WHOPPER_ARGS >"$log" 2>&1; then
+              echo "iteration $i ok: $(grep -m1 "^seed = " "$log")"
+            else
+              echo "iteration $i FAILED ($(grep -m1 "^seed = " "$log")):"
+              cat "$log"
+              exit 255
+            fi
+          ' _
 
   concurrent-simulator-windows:
     runs-on: windows-latest
