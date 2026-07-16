@@ -444,6 +444,77 @@ fn test_integrity_check_freelist_count_mismatch(db: TempDatabase) {
     }
 }
 
+/// A set freelist trunk pointer with a zero freelist count cannot arise from
+/// correct bookkeeping (both header fields are updated together). allocate_page
+/// must surface this as Corrupt instead of underflowing the freelist count on
+/// the reuse path.
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_allocate_page_stale_freelist_trunk_errors_corrupt(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, data TEXT);")
+        .unwrap();
+    for i in 0..100 {
+        conn.execute(format!(
+            "INSERT INTO t1 VALUES ({}, '{}');",
+            i,
+            "x".repeat(100)
+        ))
+        .unwrap();
+    }
+    checkpoint_database(&conn);
+
+    // Delete rows to create freelist pages
+    conn.execute("DELETE FROM t1 WHERE id > 10;").unwrap();
+    checkpoint_database(&conn);
+    drop(conn);
+
+    // Zero the freelist count (offset 36) while leaving the trunk pointer
+    // (offset 32) set.
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db.path)
+            .unwrap();
+
+        let mut header = [0u8; 100];
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut header).unwrap();
+        let freelist_trunk = u32::from_be_bytes([header[32], header[33], header[34], header[35]]);
+        assert!(freelist_trunk > 0, "Expected freelist trunk page");
+
+        file.seek(SeekFrom::Start(36)).unwrap();
+        file.write_all(&0u32.to_be_bytes()).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+
+    // Force page allocation; the stale trunk must surface as a Corrupt error,
+    // not an underflow panic in the freelist bookkeeping.
+    let mut result = Ok(());
+    for i in 100..300 {
+        result = conn.execute(format!(
+            "INSERT INTO t1 VALUES ({}, '{}');",
+            i,
+            "x".repeat(100)
+        ));
+        if result.is_err() {
+            break;
+        }
+    }
+    match result {
+        Err(e) => assert!(
+            e.to_string().contains("freelist_trunk_page"),
+            "expected Corrupt error about the stale freelist trunk, got: {e}"
+        ),
+        Ok(_) => panic!("expected INSERT to fail with Corrupt on stale freelist trunk"),
+    }
+}
+
 // =============================================================================
 // ERROR CASE TESTS: IndexEntryCountMismatch
 // =============================================================================
