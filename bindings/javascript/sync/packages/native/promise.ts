@@ -270,10 +270,14 @@ class Database extends DatabasePromise {
             return async (...bindParameters: any[]) => {
                 await remoteWriter.beginTransaction(mode);
                 try {
-                    // remote-writes transactions route statements through the
-                    // database's own exec/prepare overrides (remoteWriter is
-                    // in-transaction), so the database acts as the handle -
-                    // there is no connection-level lock to bypass here
+                    // TODO: the database is passed as the transaction handle.
+                    // It duck-types the handle's statement API and its
+                    // exec/prepare overrides route to the remote while
+                    // remoteWriter is in-transaction, but it is not a real
+                    // Transaction: no lock is held, and the handle stays
+                    // usable after commit. Good enough while remote writes
+                    // are experimental - needs a proper handle before
+                    // stabilization.
                     const result = await fn(db as unknown as Transaction, ...bindParameters);
                     await remoteWriter.commitTransaction();
                     await db.pull();
