@@ -2244,6 +2244,20 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         if let Some(mv_store) = self.mv_store().as_ref() {
+            let mode = if self.experimental_mvcc_passive_checkpoint_enabled() {
+                assert!(
+                    matches!(
+                        mode,
+                        CheckpointMode::Passive { .. } | CheckpointMode::Truncate { .. }
+                    ),
+                    "MVCC checkpoint supports only Truncate or Passive when experimental_mvcc_passive_checkpoint is enabled"
+                );
+                mode
+            } else {
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                }
+            };
             let pager = self.pager.load().clone();
             let io = pager.io.clone();
             let mut ckpt_sm = CheckpointStateMachine::new(
@@ -2253,10 +2267,7 @@ impl Connection {
                 true,
                 self.get_sync_mode(),
                 MAIN_DB_ID,
-                // Explicit Connection::checkpoint fully resets the WAL.
-                crate::storage::wal::CheckpointMode::Truncate {
-                    upper_bound_inclusive: None,
-                },
+                mode,
             );
             loop {
                 match ckpt_sm.step(&()) {
