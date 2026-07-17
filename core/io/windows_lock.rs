@@ -172,12 +172,18 @@ pub(crate) fn acquire_process_file_lock(path: &str) -> Result<ProcessFileLockGua
     }
 
     let handle = open_lock_handle(&key)?;
-    match lock_range(handle, PROCESS_LOCK_OFFSET, true, true)? {
-        true => {
+    match lock_range(handle, PROCESS_LOCK_OFFSET, true, true) {
+        Err(err) => {
+            unsafe {
+                CloseHandle(handle);
+            }
+            Err(err)
+        }
+        Ok(true) => {
             registry.insert(key.clone(), ProcessFileLockEntry { handle, refcount: 1 });
             Ok(ProcessFileLockGuard { key })
         }
-        false => {
+        Ok(false) => {
             unsafe {
                 CloseHandle(handle);
             }
@@ -265,8 +271,14 @@ fn lock_shared_wal_byte(
             Ok(true)
         }
         Some(_) => Ok(false),
-        None => match lock_range(entry.handle, offset, exclusive, fail_immediately)? {
-            true => {
+        None => match lock_range(entry.handle, offset, exclusive, fail_immediately) {
+            Err(err) => {
+                if entry.locks.is_empty() {
+                    close_shared_wal_entry(&mut registry, &key);
+                }
+                Err(err)
+            }
+            Ok(true) => {
                 entry.locks.insert(
                     offset,
                     if exclusive {
@@ -283,7 +295,7 @@ fn lock_shared_wal_byte(
                 }
                 Ok(true)
             }
-            false => {
+            Ok(false) => {
                 if entry.locks.is_empty() {
                     close_shared_wal_entry(&mut registry, &key);
                 }
