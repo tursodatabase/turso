@@ -1261,6 +1261,7 @@ pub fn insn_to_row(
                 delimiter: _,
                 col,
                 comparator: _,
+                collation: _,
             } => (
                 "AggStep",
                 0,
@@ -2338,15 +2339,6 @@ pub fn insn_to_row(
                 0,
                 format!("r[{dest}]=journal_mode(db[{db}]{})",
                     new_mode.as_ref().map_or(String::new(), |m| format!(",'{m}'"))),
-            ),
-            Insn::CollSeq { reg, collation } => (
-                "CollSeq",
-                reg.unwrap_or(0) as i64,
-                0,
-                0,
-                Value::build_text(collation.to_string()),
-                0,
-                format!("collation={collation}"),
             ),
             Insn::IfNeg { reg, target_pc } => (
                 "IfNeg",

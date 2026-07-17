@@ -1128,6 +1128,7 @@ fn emit_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Window(win_func.clone()),
                     comparator: None,
+                    collation: None,
                 });
             }
         }
@@ -1266,6 +1267,7 @@ fn emit_peer_group_flush(
                 delimiter: 0,
                 func: AccumulatorFunc::Window(win_func.clone()),
                 comparator: None,
+                collation: None,
             });
             program.emit_insn(Insn::AggValue {
                 acc_reg,

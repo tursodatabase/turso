@@ -6875,6 +6875,7 @@ pub fn op_agg_step(
             delimiter,
             func,
             comparator,
+            collation,
         },
         insn
     );
@@ -6917,7 +6918,7 @@ pub fn op_agg_step(
         };
     }
 
-    let current_collation = state.current_collation.unwrap_or(CollationSeq::Binary);
+    let current_collation = collation.unwrap_or(CollationSeq::Binary);
     let comparator_factory = move || -> Result<Option<crate::vdbe::sorter::SortComparator>> {
         Ok(match comparator.as_ref() {
             Some(comparator) => Some(make_sort_comparator(comparator)?),
@@ -12754,28 +12755,6 @@ pub fn op_is_null(
     } else {
         state.pc += 1;
     }
-    Ok(InsnFunctionStepResult::Step)
-}
-
-pub fn op_coll_seq(
-    _program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
-    let Insn::CollSeq { reg, collation } = insn else {
-        unreachable!("unexpected Insn {:?}", insn)
-    };
-
-    // Set the current collation sequence for use by subsequent functions
-    state.current_collation = Some(*collation);
-
-    // If P1 is not zero, initialize that register to 0
-    if let Some(reg_idx) = reg {
-        state.registers[*reg_idx].set_int(0);
-    }
-
-    state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
 

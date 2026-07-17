@@ -749,8 +749,6 @@ pub struct ProgramState {
     seek_state: OpSeekState,
     /// Metrics collected for the lifetime of this prepared statement.
     pub metrics: StatementMetrics,
-    /// Current collation sequence set by OP_CollSeq instruction
-    current_collation: Option<CollationSeq>,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
@@ -846,7 +844,6 @@ impl ProgramState {
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
             distinct_key_values: Vec::new(),
-            current_collation: None,
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
@@ -956,7 +953,6 @@ impl ProgramState {
         self.once.clear();
         self.execution_state = ProgramExecutionState::Init;
         self.query_deadline = None;
-        self.current_collation = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
@@ -967,7 +963,6 @@ impl ProgramState {
         self.commit_state.cleanup_mvcc_checkpoint_state();
         self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
-        self.current_collation = None;
         self.commit_state = CommitState::Ready;
         // Drop any in-flight sequence inner-tx commit-state-machine. If
         // it was mid-step the inner mv_tx has already been swapped back
