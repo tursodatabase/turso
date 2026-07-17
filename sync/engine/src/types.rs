@@ -643,7 +643,7 @@ fn get_core_value_text_or_null(row: &turso_core::Row, index: usize) -> Result<Op
 fn get_core_value_blob_or_null(row: &turso_core::Row, index: usize) -> Result<Option<Vec<u8>>> {
     match row.get_value(index) {
         turso_core::Value::Null => Ok(None),
-        turso_core::Value::Blob(x) => Ok(Some(x.clone())),
+        turso_core::Value::Blob(x) => Ok(Some(x.to_vec())),
         v => Err(Error::DatabaseTapeError(format!(
             "column {index} type mismatch: expected blob, got '{v:?}'"
         ))),

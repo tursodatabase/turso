@@ -1,8 +1,10 @@
 use crate::common::{ExecRows, TempDatabase};
 use std::path::Path;
 use std::sync::Arc;
-use turso_core::SqliteDialect;
-use turso_core::{Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, StepResult};
+use turso_core::{
+    mvcc::persistent_storage::logical_log::LogTxFrameInfo, Database, DatabaseOpts, EncryptionKey,
+    EncryptionOpts, OpenFlags, SqliteDialect, StepResult,
+};
 
 /// Create a new database file at `path` with MVCC journal mode enabled.
 /// This is needed because ATTACH requires the attached DB's journal mode
@@ -67,7 +69,7 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         &self,
         m: turso_core::mvcc::database::LogRecord,
         on_serialization_complete: Option<
-            &dyn Fn(turso_core::SharedBufferData, u32) -> turso_core::Result<()>,
+            &dyn Fn(turso_core::SharedBufferData, LogTxFrameInfo) -> turso_core::Result<()>,
         >,
     ) -> turso_core::Result<(turso_core::Completion, u64)> {
         self.used_log_tx
