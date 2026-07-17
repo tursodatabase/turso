@@ -749,6 +749,19 @@ fn refresh_materialized_view_is_noop() {
     assert!(out.contains("ok"), "REFRESH should be a no-op: {out}");
 }
 
+#[test]
+fn comment_on_is_noop() {
+    let output = run_tursopg(
+        b"CREATE TABLE docs(id INT, title TEXT);\n\
+          COMMENT ON TABLE docs IS 'documentation';\n\
+          COMMENT ON COLUMN docs.title IS NULL;\n\
+          SELECT 'ok';\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("ok"), "COMMENT ON should be a no-op: {out}");
+}
+
 // ---------------------------------------------------------------------------
 // Named windows (WINDOW clause)
 // ---------------------------------------------------------------------------
@@ -1143,6 +1156,20 @@ fn wire_copy_from_returns_copy_n() {
     std::fs::remove_file(&path).ok();
     server.kill().ok();
     server.wait().ok();
+}
+
+#[test]
+fn wire_comment_on_returns_comment_tag() {
+    with_pg_client(|client| {
+        let tags = client.query_command_tags("CREATE TABLE docs(id INT)");
+        assert!(
+            tags.iter().any(|tag| tag.starts_with("CREATE")),
+            "expected CREATE tag, got: {tags:?}"
+        );
+
+        let tags = client.query_command_tags("COMMENT ON TABLE docs IS 'documentation'");
+        assert_eq!(tags, ["COMMENT"]);
+    });
 }
 
 /// Wire-protocol fixture: spin up tursopg, hand the caller a connected

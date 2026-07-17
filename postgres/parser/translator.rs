@@ -4289,6 +4289,18 @@ pub fn is_refresh_matview(parse_result: &ParseResult) -> bool {
     matches!(&nodes[0].0, NodeRef::RefreshMatViewStmt(_))
 }
 
+/// Returns true if the parse result is a COMMENT ON statement.
+/// Comments are accepted for PostgreSQL compatibility but are not persisted.
+pub fn is_comment_on(parse_result: &ParseResult) -> bool {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return false;
+    }
+    matches!(&nodes[0].0, NodeRef::CommentStmt(_))
+}
+
 /// Extracted COPY FROM statement info for use by the connection layer.
 #[derive(Debug, Clone)]
 pub struct PgCopyFromStmt {
