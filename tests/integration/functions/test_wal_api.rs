@@ -865,15 +865,12 @@ fn test_db_share_same_file() {
         .open_file(path.to_str().unwrap(), turso_core::OpenFlags::Create, false)
         .unwrap();
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(db_file));
-    let db1 = turso_core::Database::open_with_flags(
+    let db1 = turso_core::Database::open(
         io.clone(),
         path.to_str().unwrap(),
-        db_file.clone(),
-        turso_core::OpenFlags::Create,
-        turso_core::DatabaseOpts::new(),
-        None,
-        None,
-        Arc::new(SqliteDialect),
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(db_file.clone())
+            .flags(turso_core::OpenFlags::Create),
     )
     .unwrap();
     let conn1 = db1.connect().unwrap();

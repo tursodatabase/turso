@@ -45,16 +45,13 @@ pub fn open_database_with_io(
 ) -> Result<Arc<turso_core::Database>> {
     let file = io.open_file(path, flags, true)?;
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
-    turso_core::Database::open_with_flags_with_allocator(
+    turso_core::Database::open(
         io,
         path,
-        db_file,
-        flags,
-        opts,
-        None,
-        None,
-        turso_core::alloc::DynAllocator::default(),
-        Arc::new(PostgresDialect),
+        turso_core::OpenOptions::new(Arc::new(PostgresDialect))
+            .storage(db_file)
+            .flags(flags)
+            .db_opts(opts),
     )
 }
 

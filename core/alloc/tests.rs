@@ -97,16 +97,12 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
     )
     .unwrap();
     let db_file = StdArc::new(crate::storage::database::DatabaseFile::new(file));
-    let db = crate::Database::open_with_flags_with_allocator(
+    let db = crate::Database::open(
         io,
         "open-with-allocator.db",
-        db_file,
-        crate::OpenFlags::default(),
-        crate::DatabaseOpts::new(),
-        None,
-        None,
-        alloc,
-        StdArc::new(crate::SqliteDialect),
+        crate::OpenOptions::new(StdArc::new(crate::SqliteDialect))
+            .storage(db_file)
+            .allocator(alloc),
     )
     .unwrap();
     let conn = db.connect().unwrap();

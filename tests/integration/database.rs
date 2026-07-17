@@ -165,3 +165,39 @@ fn test_sdk_close_finalizes_leaked_statements() {
          close() should have finalized statements and released the stale Database"
     );
 }
+
+/// Database::open with OpenOptions: opening through the unified entry point
+/// works with pre-opened storage, and storage is required.
+#[test]
+fn test_database_open_with_options() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("opts.db");
+    let path = path.to_str().unwrap();
+
+    let io: Arc<dyn turso_core::IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+    let file = io.open_file(path, OpenFlags::Create, false).unwrap();
+    let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
+    let db = Database::open(
+        io.clone(),
+        path,
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(db_file)
+            .flags(OpenFlags::Create),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let err = Database::open(
+        io,
+        path,
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect)),
+    )
+    .expect_err("open without storage must fail until default storage resolution exists");
+    assert!(
+        matches!(err, turso_core::LimboError::InvalidArgument(ref m) if m.contains("storage")),
+        "expected InvalidArgument about missing storage, got {err:?}"
+    );
+}

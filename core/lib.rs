@@ -349,6 +349,81 @@ impl EncryptionOpts {
     }
 }
 
+/// Options for opening a [`Database`].
+///
+/// Mirrors the `std::fs::OpenOptions` idiom: configure, then open.
+///
+/// ```ignore
+/// let db = Database::open(
+///     io,
+///     "app.db",
+///     OpenOptions::new(Arc::new(SqliteDialect)).flags(OpenFlags::ReadOnly),
+/// )?;
+/// ```
+#[derive(Clone)]
+pub struct OpenOptions {
+    /// Pre-opened database storage for the file at the database path.
+    storage: Option<Arc<dyn DatabaseStorage>>,
+    flags: OpenFlags,
+    db_opts: DatabaseOpts,
+    encryption: Option<EncryptionOpts>,
+    durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+    allocator: alloc::DynAllocator,
+    /// SQL dialect the database is opened with. The dialect is fixed at open
+    /// time and shared by every user of the registered instance; a registry
+    /// hit with a different dialect is an error.
+    dialect: Arc<dyn Dialect>,
+}
+
+impl OpenOptions {
+    /// The dialect has no default: it is fixed at open time and shared by
+    /// every user of the instance, so the caller must choose it explicitly.
+    pub fn new(dialect: Arc<dyn Dialect>) -> Self {
+        Self {
+            storage: None,
+            flags: OpenFlags::default(),
+            db_opts: DatabaseOpts::default(),
+            encryption: None,
+            durable_storage: None,
+            allocator: alloc::DynAllocator::default(),
+            dialect,
+        }
+    }
+
+    pub fn storage(mut self, storage: Arc<dyn DatabaseStorage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    pub fn flags(mut self, flags: OpenFlags) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    pub fn db_opts(mut self, db_opts: DatabaseOpts) -> Self {
+        self.db_opts = db_opts;
+        self
+    }
+
+    pub fn encryption(mut self, encryption: impl Into<Option<EncryptionOpts>>) -> Self {
+        self.encryption = encryption.into();
+        self
+    }
+
+    pub fn durable_storage(
+        mut self,
+        durable_storage: impl Into<Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>>,
+    ) -> Self {
+        self.durable_storage = durable_storage.into();
+        self
+    }
+
+    pub fn allocator(mut self, allocator: alloc::DynAllocator) -> Self {
+        self.allocator = allocator;
+        self
+    }
+}
+
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
 
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
@@ -1074,68 +1149,40 @@ impl Database {
         //    authority appeared between the initial probe and the actual open
         Self::reject_live_multiprocess_wal_for_legacy_open(&io, path, opts)?;
         let db_file = Arc::new(DatabaseFile::new(file));
-        Self::open_with_flags_with_allocator(
+        Self::open(
             io,
             path,
-            db_file,
-            effective_flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            alloc::DynAllocator::default(),
-            dialect,
+            OpenOptions::new(dialect)
+                .storage(db_file)
+                .flags(effective_flags)
+                .db_opts(opts)
+                .encryption(encryption_opts)
+                .durable_storage(durable_storage),
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_with_flags(
-        io: Arc<dyn IO>,
-        path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<Arc<Database>> {
-        Self::open_with_flags_with_allocator(
-            io,
-            path,
-            db_file,
-            flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            alloc::DynAllocator::default(),
-            dialect,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_with_flags_with_allocator(
-        io: Arc<dyn IO>,
-        path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        allocator: alloc::DynAllocator,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<Arc<Database>> {
+    /// Open a database with the given [`OpenOptions`].
+    ///
+    /// Drives the IO loop internally. `OpenOptions::storage` must be set.
+    pub fn open(io: Arc<dyn IO>, path: &str, options: OpenOptions) -> Result<Arc<Database>> {
+        let Some(storage) = options.storage else {
+            return Err(LimboError::InvalidArgument(
+                "OpenOptions::storage is required for Database::open".to_string(),
+            ));
+        };
         let mut state = OpenDbAsyncState::new();
         loop {
             match Self::open_with_flags_async_with_allocator(
                 &mut state,
                 io.clone(),
                 path,
-                db_file.clone(),
-                flags,
-                opts,
-                encryption_opts.clone(),
-                durable_storage.clone(),
-                allocator.clone(),
-                dialect.clone(),
+                storage.clone(),
+                options.flags,
+                options.db_opts,
+                options.encryption.clone(),
+                options.durable_storage.clone(),
+                options.allocator.clone(),
+                options.dialect.clone(),
             )? {
                 IOResult::Done(db) => return Ok(db),
                 IOResult::IO(io_completion) => {
