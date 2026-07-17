@@ -26,6 +26,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[expect(clippy::large_enum_variant)]
 enum Commands {
     /// Run tests
     Run {

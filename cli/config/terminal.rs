@@ -5,7 +5,9 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TerminalTheme {
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     Light,
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     Dark,
     Unknown, // No colors - can't detect or unsupported platform
 }
@@ -222,7 +224,7 @@ impl TerminalDetector {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

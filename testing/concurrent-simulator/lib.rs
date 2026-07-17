@@ -57,7 +57,7 @@ use crate::{
 pub fn multiprocess_platform_io() -> anyhow::Result<Arc<dyn IO>> {
     #[cfg(target_os = "windows")]
     {
-        return Ok(Arc::new(WindowsIOCP::new()?));
+        Ok(Arc::new(WindowsIOCP::new()?))
     }
 
     #[cfg(unix)]

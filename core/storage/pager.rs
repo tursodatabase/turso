@@ -6504,7 +6504,9 @@ mod ptrmap_tests {
 #[cfg(all(test, feature = "fs", host_shared_wal))]
 mod checkpoint_phase_tests {
     use super::*;
-    use crate::io::{PlatformIO, IO};
+    #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+    use crate::io::PlatformIO;
+    use crate::io::IO;
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::storage::wal::CheckpointMode;
     use crate::sync::atomic::Ordering;
