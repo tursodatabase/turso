@@ -18,7 +18,8 @@ function isQueryOptions(value: any): boolean {
   return value != null
     && typeof value === "object"
     && !Array.isArray(value)
-    && Object.prototype.hasOwnProperty.call(value, "queryTimeout");
+    && (Object.prototype.hasOwnProperty.call(value, "queryTimeout")
+      || Object.prototype.hasOwnProperty.call(value, "requestHeaders"));
 }
 
 /**
