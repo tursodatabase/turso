@@ -1012,14 +1012,19 @@ impl LogicalLog {
 
     /// Truncate when `max_appended_commit_ts <= boundary`; passive uses `durable_txid_max_new`,
     /// truncate mode uses `u64::MAX` (always empty after checkpoint).
-    pub fn truncate(&mut self, checkpointed_through_ts: u64) -> Result<Completion> {
+    pub fn truncate(
+        &mut self,
+        checkpointed_through_ts: u64,
+    ) -> Result<(Completion, super::LogicalLogTruncateOutcome)> {
+        use super::LogicalLogTruncateOutcome;
         if self.max_appended_commit_ts > checkpointed_through_ts {
             // Uncheckpointed frames remain — skip truncation.
             let c = Completion::new_trunc(|_| {});
             c.complete(0);
-            return Ok(c);
+            return Ok((c, LogicalLogTruncateOutcome::Retained));
         }
-        self.truncate_to_zero()
+        let c = self.truncate_to_zero()?;
+        Ok((c, LogicalLogTruncateOutcome::Truncated))
     }
 
     /// Reset the log to a header-only file and return one completion for the
@@ -6107,7 +6112,11 @@ mod tests {
         // Truncate to 0 (simulates checkpoint truncation); header with new salt
         // will be written together with the next frame. u64::MAX boundary => all
         // frames are considered checkpointed, so it truncates unconditionally.
-        let c = log.truncate(u64::MAX).unwrap();
+        let (c, outcome) = log.truncate(u64::MAX).unwrap();
+        assert_eq!(
+            outcome,
+            crate::mvcc::persistent_storage::LogicalLogTruncateOutcome::Truncated
+        );
         io.wait_for_completion(c).unwrap();
 
         let salt_after = log.header.as_ref().unwrap().salt;
@@ -6139,6 +6148,33 @@ mod tests {
             io.block(|| reader.parse_next_transaction()),
             Ok(ParseResult::Eof)
         ));
+    }
+
+    /// Passive truncate must report Retained (and leave salt/offset alone) when commits
+    /// remain above the checkpoint boundary.
+    #[test]
+    fn test_truncate_retained_when_uncheckpointed_frames_remain() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("truncate-retained.db-log", crate::OpenFlags::Create, false)
+            .unwrap();
+        let mut log = LogicalLog::new(file, io.clone(), None);
+
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 1, 10, false, false, "a");
+        append_single_table_op_tx(&mut log, &io, (-2).into(), 2, 20, false, false, "b");
+        let salt_before = log.header.as_ref().unwrap().salt;
+        let offset_before = log.offset;
+
+        // Boundary below max_appended_commit_ts (20) => retain the live tail.
+        let (c, outcome) = log.truncate(10).unwrap();
+        assert_eq!(
+            outcome,
+            crate::mvcc::persistent_storage::LogicalLogTruncateOutcome::Retained
+        );
+        io.wait_for_completion(c).unwrap();
+        assert_eq!(log.header.as_ref().unwrap().salt, salt_before);
+        assert_eq!(log.offset, offset_before);
     }
 
     /// What this test checks: Corrupting frame 1 in a multi-frame log invalidates frame 2 even
