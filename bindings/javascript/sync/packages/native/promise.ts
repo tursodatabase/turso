@@ -327,7 +327,7 @@ async function connect(opts: DatabaseOpts): Promise<Database> {
     return db;
 }
 
-export { connect, Database }
+export { connect, Database, Transaction }
 export { retryFetch } from "@tursodatabase/sync-common"
 export type { DatabaseOpts, EncryptionOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult }
 export type { RetryFetchOpts } from "@tursodatabase/sync-common"

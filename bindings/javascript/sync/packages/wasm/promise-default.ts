@@ -1,5 +1,5 @@
 import { registerFileAtWorker, unregisterFileAtWorker, ioNotifier } from "@tursodatabase/database-wasm-common"
-import { DatabasePromise, TransactionFunction } from "@tursodatabase/database-common"
+import { DatabasePromise, Transaction, TransactionFunction } from "@tursodatabase/database-common"
 import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner, RemoteWriter, RemoteWriteStatement } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, initThreadPool, MainWorker, Database as NativeDatabase } from "./index-default.js";
 
@@ -351,7 +351,7 @@ async function connect(opts: DatabaseOpts): Promise<Database> {
     return db;
 }
 
-export { connect, Database }
+export { connect, Database, Transaction }
 export { retryFetch } from "@tursodatabase/sync-common"
 export type { DatabaseOpts, EncryptionOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult }
 export type { RetryFetchOpts } from "@tursodatabase/sync-common"

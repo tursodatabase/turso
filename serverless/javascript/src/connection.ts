@@ -387,23 +387,30 @@ export class Connection {
 
   /**
    * Returns a function that executes the given function in a transaction.
-   * 
-   * @param fn - The function to wrap in a transaction
+   *
+   * The callback receives a transaction handle as its first argument,
+   * followed by the arguments the wrapped function was called with —
+   * matching the local SDK's `Database.transaction()` signature. On a
+   * serverless connection all statements run on the connection's single
+   * session, so the handle is the connection itself.
+   *
+   * @param fn - The function to wrap in a transaction; receives the
+   *   transaction handle followed by the caller's arguments
    * @returns A function that will execute fn within a transaction
-   * 
+   *
    * @example
    * ```typescript
-   * const insert = await client.prepare("INSERT INTO users (name) VALUES (?)");
-   * const insertMany = client.transaction((users) => {
+   * const insertMany = client.transaction(async (tx, users) => {
+   *   const insert = await tx.prepare("INSERT INTO users (name) VALUES (?)");
    *   for (const user of users) {
-   *     insert.run([user]);
+   *     await insert.run([user]);
    *   }
    * });
-   * 
+   *
    * await insertMany(['Alice', 'Bob', 'Charlie']);
    * ```
    */
-  transaction(fn: (...args: any[]) => any): any {
+  transaction(fn: (tx: Connection, ...args: any[]) => any): any {
     if (typeof fn !== "function") {
       throw new TypeError("Expected first argument to be a function");
     }
@@ -413,7 +420,7 @@ export class Connection {
       return async (...bindParameters: any[]) => {
         await db.exec("BEGIN " + mode);
         try {
-          const result = await fn(...bindParameters);
+          const result = await fn(db, ...bindParameters);
           await db.exec("COMMIT");
           return result;
         } catch (err) {

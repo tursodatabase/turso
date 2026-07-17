@@ -321,8 +321,8 @@ test.serial("Database.batch() [rollback via transaction()]", async (t) => {
 
   // batch() itself is not transactional; transaction() provides
   // all-or-nothing semantics around the failing batch.
-  const txn = db.transaction(async () => {
-    return await db.batch([
+  const txn = db.transaction(async (tx) => {
+    return await tx.batch([
       { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Mallory", "mallory@example.net"] },
       // Duplicate primary key with the row inserted in beforeEach.
       { sql: "INSERT INTO users(id, name, email) VALUES (1, 'dup', 'dup@example.net')" },
@@ -428,9 +428,9 @@ test.serial("Database.batch() [non-insert batch does not expose lastInsertRowid]
 test.serial("Database.transaction().deferred() [batch]", async (t) => {
   const db = t.context.db;
 
-  const insertMany = db.transaction(async () => {
+  const insertMany = db.transaction(async (tx) => {
     t.is(db.inTransaction, true);
-    return await db.batch([
+    return await tx.batch([
       { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Joey", "joey@example.org"] },
       { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Sally", "sally@example.org"] },
       { sql: "INSERT INTO users(name, email) VALUES (:name, :email)", args: { name: "Junior", email: "junior@example.org" } },
@@ -542,12 +542,14 @@ test.serial("Database.inTransaction property", async (t) => {
 test.serial("Database.transaction()", async (t) => {
   const db = t.context.db;
 
-  const insert = await db.prepare(
-    "INSERT INTO users(name, email) VALUES (:name, :email)"
-  );
-
-  const insertMany = db.transaction(async (users) => {
+  const insertMany = db.transaction(async (tx, users) => {
     t.is(db.inTransaction, true);
+    // statements of the transaction must be prepared from its handle: the
+    // wrapper owns the connection lock for the whole transaction, so
+    // database-level statements would wait for it instead of joining it
+    const insert = await tx.prepare(
+      "INSERT INTO users(name, email) VALUES (:name, :email)"
+    );
     for (const user of users) await insert.run(user);
   });
 
@@ -567,12 +569,12 @@ test.serial("Database.transaction()", async (t) => {
 
 test.serial("Database.transaction().immediate()", async (t) => {
   const db = t.context.db;
-  const insert = await db.prepare(
-    "INSERT INTO users(name, email) VALUES (:name, :email)"
-  );
-  const insertMany = db.transaction((users) => {
+  const insertMany = db.transaction(async (tx, users) => {
     t.is(db.inTransaction, true);
-    for (const user of users) insert.run(user);
+    const insert = await tx.prepare(
+      "INSERT INTO users(name, email) VALUES (:name, :email)"
+    );
+    for (const user of users) await insert.run(user);
   });
   t.is(db.inTransaction, false);
   await insertMany.immediate([
