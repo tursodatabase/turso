@@ -278,7 +278,9 @@ async fn run_tests(
     if !integrity_fixtures.is_empty() {
         eprintln!("Generating integrity-check fixtures...");
         for rel in integrity_fixtures {
-            let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&rel);
+            // Resolve relative to the working directory, matching how the
+            // backends open relative @database paths from the test files.
+            let fixture_path = PathBuf::from(&rel);
             if let Err(e) = generate_integrity_fixture(&fixture_path, &rel).await {
                 eprintln!(
                     "Error generating integrity fixture '{}': {e}",

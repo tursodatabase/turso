@@ -1,5 +1,5 @@
 # get_byte / set_byte — PostgreSQL-compatible byte access on blobs.
-# These functions do not exist in SQLite, so they live in turso-tests.
+# These functions do not exist in SQLite, so they live in turso-sqltests.
 @database :memory:
 
 # --- get_byte -------------------------------------------------------------

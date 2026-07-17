@@ -12980,9 +12980,9 @@ mod tests {
     /// clear_btree's auto-invalidation of peers).
     ///
     /// Pairs with the SQL-surface red-first cases in
-    /// testing/sqltests/tests/save-all-cursors.sqltest (window function
+    /// sqlite/conformance/sqlite-sqltests/save-all-cursors.sqltest (window function
     /// over triple self-joined source) and the pre-existing
-    /// testing/sqltests/tests/window-selfjoin-reset-sorter.sqltest.
+    /// sqlite/conformance/sqlite-sqltests/window-selfjoin-reset-sorter.sqltest.
     /// Those exercise the same machinery end-to-end; the cases here
     /// pin individual primitives (peer registration, save vs.
     /// invalidate, restore semantics) so a regression bisects faster.
