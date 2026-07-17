@@ -1165,25 +1165,9 @@ impl Database {
     ///
     /// Drives the IO loop internally. `OpenOptions::storage` must be set.
     pub fn open(io: Arc<dyn IO>, path: &str, options: OpenOptions) -> Result<Arc<Database>> {
-        let Some(storage) = options.storage else {
-            return Err(LimboError::InvalidArgument(
-                "OpenOptions::storage is required for Database::open".to_string(),
-            ));
-        };
         let mut state = OpenDbAsyncState::new();
         loop {
-            match Self::open_with_flags_async_with_allocator(
-                &mut state,
-                io.clone(),
-                path,
-                storage.clone(),
-                options.flags,
-                options.db_opts,
-                options.encryption.clone(),
-                options.durable_storage.clone(),
-                options.allocator.clone(),
-                options.dialect.clone(),
-            )? {
+            match Self::open_async(&mut state, io.clone(), path, &options)? {
                 IOResult::Done(db) => return Ok(db),
                 IOResult::IO(io_completion) => {
                     io_completion.wait(&*io)?;
@@ -1192,69 +1176,47 @@ impl Database {
         }
     }
 
-    /// async flow of opening the database
-    /// this is important to have open async, otherwise sync-engine will not work properly for cases when schema table span multiple pages
-    /// (so, potentially network IO is needed to load them)
+    /// IOResult-driven twin of [`Database::open`]: the caller drives the IO
+    /// loop and passes `state` between calls. `OpenOptions::storage` must be
+    /// set.
     ///
-    /// Uses the database registry to ensure single Database instance per file within a process.
-    /// Caller must drive the IO loop and pass state between calls.
-    /// An `Opening` sentinel in the registry prevents concurrent opens of the same path
-    /// without holding the mutex across I/O yields.
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_with_flags_async(
+    /// This matters for the sync engine, which must yield on IO when the
+    /// schema table spans multiple pages (potentially needing network IO to
+    /// load them).
+    ///
+    /// Uses the database registry to ensure a single Database instance per
+    /// file within a process; an `Opening` sentinel prevents concurrent opens
+    /// of the same path without holding the mutex across I/O yields.
+    pub fn open_async(
         state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
         path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        dialect: Arc<dyn Dialect>,
+        options: &OpenOptions,
     ) -> Result<IOResult<Arc<Database>>> {
-        // Re-derive lock-mode flags from opts the same way the sync
-        // `open_file_with_flags` path does: multiprocess WAL must open the
+        let Some(storage) = options.storage.clone() else {
+            return Err(LimboError::InvalidArgument(
+                "OpenOptions::storage is required for Database::open_async".to_string(),
+            ));
+        };
+        // Re-derive lock-mode flags from opts: multiprocess WAL must open the
         // WAL file with NoLock or the second process fails to lock `-wal`.
+        // Callers may hand us default flags on every poll, so this runs each
+        // time; the rewrite is idempotent.
         #[cfg(feature = "fs")]
-        let flags = Self::effective_open_flags_for_path(&io, path, flags, opts)?;
-        Self::open_with_flags_async_with_allocator(
-            state,
-            io,
-            path,
-            db_file,
-            flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            alloc::DynAllocator::default(),
-            dialect,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_with_flags_async_with_allocator(
-        state: &mut OpenDbAsyncState,
-        io: Arc<dyn IO>,
-        path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        allocator: alloc::DynAllocator,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<IOResult<Arc<Database>>> {
+        let flags = Self::effective_open_flags_for_path(&io, path, options.flags, options.db_opts)?;
+        #[cfg(not(feature = "fs"))]
+        let flags = options.flags;
         let result = Self::open_with_flags_async_internal(
             state,
             io,
             path,
-            db_file,
+            storage,
             flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            allocator,
-            dialect,
+            options.db_opts,
+            options.encryption.clone(),
+            options.durable_storage.clone(),
+            options.allocator.clone(),
+            options.dialect.clone(),
         );
         if result.is_err() {
             // On error, remove the Opening sentinel so other callers can proceed.

@@ -143,19 +143,12 @@ fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
 fn open_multiprocess_db_async(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
     let file = io.open_file(path, OpenFlags::default() | OpenFlags::NoLock, true)?;
     let db_file = Arc::new(DatabaseFile::new(file));
+    let options = OpenOptions::new(Arc::new(SqliteDialect))
+        .storage(db_file)
+        .db_opts(multiprocess_wal_db_opts());
     let mut state = OpenDbAsyncState::new();
     loop {
-        match Database::open_with_flags_async(
-            &mut state,
-            io.clone(),
-            path,
-            db_file.clone(),
-            OpenFlags::default(),
-            multiprocess_wal_db_opts(),
-            None,
-            None,
-            Arc::new(SqliteDialect),
-        )? {
+        match Database::open_async(&mut state, io.clone(), path, &options)? {
             IOResult::Done(db) => return Ok(db),
             IOResult::IO(io_completion) => io_completion.wait(&*io)?,
         }

@@ -2609,18 +2609,17 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         )?;
 
         // Use async database opening that yields on IO for large schemas
+        let main_db_options = turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(main_db_storage)
+            .flags(OpenFlags::Create)
+            .db_opts(opts.db_opts);
         let mut open_state = turso_core::OpenDbAsyncState::new();
         let main_db = loop {
-            match turso_core::Database::open_with_flags_async(
+            match turso_core::Database::open_async(
                 &mut open_state,
                 io.clone(),
                 main_db_path,
-                main_db_storage.clone(),
-                OpenFlags::Create,
-                opts.db_opts,
-                None,
-                None,
-                Arc::new(SqliteDialect),
+                &main_db_options,
             )? {
                 turso_core::IOResult::Done(db) => break db,
                 turso_core::IOResult::IO(io_completion) => {
