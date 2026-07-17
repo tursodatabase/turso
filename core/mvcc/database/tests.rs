@@ -17834,7 +17834,13 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
         fn update_header(&self) -> Result<Completion> {
             self.inner.update_header()
         }
-        fn truncate(&self, checkpointed_through_ts: u64) -> Result<Completion> {
+        fn truncate(
+            &self,
+            checkpointed_through_ts: u64,
+        ) -> Result<(
+            Completion,
+            crate::mvcc::persistent_storage::LogicalLogTruncateOutcome,
+        )> {
             self.inner.truncate(checkpointed_through_ts)
         }
         fn reset_to_fresh_header(&self) -> Result<Completion> {

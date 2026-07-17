@@ -86,7 +86,13 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.inner.update_header()
     }
 
-    fn truncate(&self, checkpointed_through_ts: u64) -> turso_core::Result<turso_core::Completion> {
+    fn truncate(
+        &self,
+        checkpointed_through_ts: u64,
+    ) -> turso_core::Result<(
+        turso_core::Completion,
+        turso_core::mvcc::persistent_storage::LogicalLogTruncateOutcome,
+    )> {
         self.inner.truncate(checkpointed_through_ts)
     }
 

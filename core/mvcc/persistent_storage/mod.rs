@@ -15,6 +15,12 @@ use crate::mvcc::persistent_storage::logical_log::{
 };
 use crate::{CheckpointResult, Completion, File, LimboError, Result};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogicalLogTruncateOutcome {
+    Truncated,
+    Retained,
+}
+
 pub trait DurableStorage: Send + Sync + Debug {
     /// Append one row-version op to `log_record`'s payload buffer, in the
     /// on-disk wire format used by the logical log. Updates `op_count`.
@@ -69,7 +75,13 @@ pub trait DurableStorage: Send + Sync + Debug {
     /// Truncate the logical log, discarding frames at or below
     /// `checkpointed_through_ts` (the checkpoint's published boundary). Frames
     /// above the boundary (uncheckpointed concurrent commits) are preserved.
-    fn truncate(&self, checkpointed_through_ts: u64) -> Result<Completion>;
+    ///
+    /// Returns whether the log was actually truncated ([`LogicalLogTruncateOutcome::Truncated`])
+    /// or left intact ([`LogicalLogTruncateOutcome::Retained`]).
+    fn truncate(
+        &self,
+        checkpointed_through_ts: u64,
+    ) -> Result<(Completion, LogicalLogTruncateOutcome)>;
 
     /// Reset the logical log to a fresh header-only file.
     ///
@@ -196,16 +208,19 @@ impl DurableStorage for Storage {
         self.logical_log.write().update_header()
     }
 
-    fn truncate(&self, checkpointed_through_ts: u64) -> Result<Completion> {
+    fn truncate(
+        &self,
+        checkpointed_through_ts: u64,
+    ) -> Result<(Completion, LogicalLogTruncateOutcome)> {
         let mut log = self.logical_log.write();
-        let c = log.truncate(checkpointed_through_ts)?;
+        let (c, outcome) = log.truncate(checkpointed_through_ts)?;
         // Shadow the log's actual offset: 0 if it truncated, unchanged if it
         // skipped (uncheckpointed frames remain), so should_checkpoint() stays
         // accurate.
         let new_offset = log.offset;
         drop(log);
         self.shadow_offset_store(new_offset);
-        Ok(c)
+        Ok((c, outcome))
     }
 
     fn reset_to_fresh_header(&self) -> Result<Completion> {

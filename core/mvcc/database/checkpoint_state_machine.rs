@@ -1431,12 +1431,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 
     fn truncate_logical_log(&self) -> Result<Completion> {
+        use crate::mvcc::persistent_storage::LogicalLogTruncateOutcome;
         let boundary = if self.mode.should_restart_log() {
             u64::MAX
         } else {
             self.durable_txid_max_new
         };
-        self.mvstore.storage.truncate(boundary)
+        let (c, outcome) = self.mvstore.storage.truncate(boundary)?;
+        if self.mode.should_restart_log() {
+            turso_assert!(
+                matches!(outcome, LogicalLogTruncateOutcome::Truncated),
+                "TRUNCATE checkpoint must clear the logical log"
+            );
+        }
+        Ok(c)
     }
 
     /// Perform a TRUNCATE checkpoint on the WAL
