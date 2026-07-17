@@ -1,7 +1,5 @@
 import test from 'ava';
-import { decodeValue, encodeValue } from '../dist/protocol.js';
-import { Session } from '../dist/session.js';
-import { DatabaseError } from '../dist/error.js';
+import { decodeValue, encodeValue, Session, DatabaseError } from '../dist/index.js';
 
 // Unit tests for serverless protocol encoding/decoding.
 // These test the serverless driver directly — no server needed.
@@ -155,7 +153,7 @@ test.serial('prepare() sends describe with the current transaction baton', async
 
 // --- Session baton reset on error ---
 
-test('Session resets baton after HTTP error', async t => {
+test.serial('Session resets baton after HTTP error', async t => {
   const session = new Session({ url: 'http://127.0.0.1:1' });
 
   // Simulate a previous successful request that set a baton
@@ -194,6 +192,9 @@ test.serial('Session.batch encodes named arguments for statement objects', async
     { name: 'name', value: { type: 'text', value: 'alice' } },
     { name: 'age', value: { type: 'integer', value: '30' } },
   ]);
+  // The trailing step is the is_autocommit transaction-state probe.
+  const probeStep = requests[0].batch.steps.at(-1);
+  t.deepEqual(probeStep.condition, { type: 'is_autocommit' });
 });
 
 // --- requestHeaders ---
@@ -213,7 +214,7 @@ test.serial('Session attaches requestHeaders and lets them override Authorizatio
   globalThis.fetch = async (url, opts) => {
     capturedHeaders.push(opts.headers);
     return new Response(
-      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_begin', cols: [] })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 0 })}\n`,
+      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_begin', step: 0, cols: [] })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 0 })}\n`,
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     );
   };
