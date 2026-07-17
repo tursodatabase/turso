@@ -46,7 +46,7 @@ use crate::{Clock, Completion, CompletionError, File, LimboError, OpenFlags, Res
 use super::windows_lock::{
     acquire_process_file_lock, release_shared_wal_locks_on_drop, shared_wal_lock_byte,
     shared_wal_probe_exclusive_byte, shared_wal_try_lock_byte, shared_wal_unlock_byte,
-    ProcessFileLockGuard, SharedWalLockState,
+    stable_lock_path_for_handle, ProcessFileLockGuard, SharedWalLockState,
 };
 
 use smallvec::SmallVec;
@@ -54,7 +54,7 @@ use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use windows_sys::core::BOOL;
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -361,7 +361,7 @@ impl IO for WindowsIOCP {
             let windows_file = Arc::new(WindowsFile {
                 file_handle,
                 parent_io: self.instance.clone(),
-                path: PathBuf::from(file_path),
+                path: stable_lock_path_for_handle(file_handle, Path::new(file_path)),
                 _process_lock: process_lock,
                 shared_wal_locks: Mutex::new(SharedWalLockState::default()),
             });
@@ -1041,7 +1041,7 @@ impl File for WindowsFile {
         offset: u64,
         _kind: SharedWalLockKind,
     ) -> Result<bool> {
-        shared_wal_probe_exclusive_byte(&self.path, offset)
+        shared_wal_probe_exclusive_byte(&self.path, &self.shared_wal_locks, offset)
     }
 
     fn shared_wal_probe_exclusive_while_shared_byte(
@@ -1049,7 +1049,7 @@ impl File for WindowsFile {
         offset: u64,
         _kind: SharedWalLockKind,
     ) -> Result<bool> {
-        shared_wal_probe_exclusive_byte(&self.path, offset)
+        shared_wal_probe_exclusive_byte(&self.path, &self.shared_wal_locks, offset)
     }
 
     fn shared_wal_unlock_byte(&self, offset: u64, _kind: SharedWalLockKind) -> Result<()> {
