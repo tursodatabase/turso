@@ -91,12 +91,30 @@ They apply to that call only and are merged over the connection-level
 
 ```javascript
 await conn.execute("SELECT * FROM users", [], {
-  requestHeaders: { "x-request-id": "abc123" },
+  requestHeaders: { "X-Turso-Request-Identity": "abc123" },
 });
 
 // Also accepted by run()/get()/all()/iterate() and prepared statements:
 await conn.run("INSERT INTO users (email) VALUES (?)", "user@example.com", {
-  requestHeaders: { "x-request-id": "abc124" },
+  requestHeaders: { "X-Turso-Request-Identity": "abc124" },
+});
+```
+
+Per-query headers are attached to exactly the HTTP request(s) issued by that
+call. Inside a `conn.transaction(...)` callback each statement still carries
+only its own per-query headers — the `BEGIN`/`COMMIT`/`ROLLBACK` requests are
+issued by the transaction wrapper itself and carry just the connection-level
+headers. To stamp every request of a transaction (including `BEGIN` and
+`COMMIT`), set the header at the connection level, or use an atomic batch,
+which sends the whole transaction as a single HTTP request:
+
+```javascript
+// One HTTP request: BEGIN, both inserts, and COMMIT all carry the header.
+await conn.batch([
+  { sql: "INSERT INTO users (email) VALUES (?)", args: ["alice@example.com"] },
+  { sql: "INSERT INTO users (email) VALUES (?)", args: ["bob@example.com"] },
+], "immediate", {
+  requestHeaders: { "X-Turso-Request-Identity": "abc125" },
 });
 ```
 
