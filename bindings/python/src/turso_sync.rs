@@ -5,7 +5,10 @@ use pyo3::{
     types::{PyBytes, PyList, PyTuple},
     PyResult, Python,
 };
-use turso_sdk_kit::rsapi::{TursoDatabaseConfig, TursoStatusCode};
+use turso_sdk_kit::{
+    rsapi::{TursoDatabaseConfig, TursoStatusCode},
+    IoBackend,
+};
 use turso_sync_sdk_kit::{
     rsapi::{
         self, PartialBootstrapStrategy, PartialSyncOpts, TursoDatabaseSync,
@@ -174,7 +177,7 @@ pub fn py_turso_sync_new(
         experimental_features: db_config.experimental_features.clone(),
         async_io: true, // we will drive IO externally which is especially important for partial sync
         encryption: None,
-        vfs: None,
+        vfs: IoBackend::Default,
         io: None,
         db_file: None,
     };

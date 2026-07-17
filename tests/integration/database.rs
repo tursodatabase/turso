@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use turso::IoBackend;
 use turso_core::SqliteDialect;
 use turso_core::{Database, OpenFlags};
 use turso_sdk_kit::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoStatusCode};
@@ -94,7 +95,7 @@ fn test_sdk_close_finalizes_leaked_statements() {
         experimental_features: None,
         async_io: false,
         encryption: None,
-        vfs: None,
+        vfs: IoBackend::Default,
         io: None,
         db_file: None,
     });
