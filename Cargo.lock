@@ -7113,6 +7113,7 @@ dependencies = [
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "reqwest",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "thiserror 2.0.16",

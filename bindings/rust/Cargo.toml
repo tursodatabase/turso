@@ -58,6 +58,7 @@ name = "concurrent_writes"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 rand.workspace = true
 rand_chacha = { workspace = true }
