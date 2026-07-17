@@ -1,7 +1,5 @@
 import test from 'ava';
-import { decodeValue, encodeValue } from '../dist/protocol.js';
-import { Session } from '../dist/session.js';
-import { DatabaseError } from '../dist/error.js';
+import { decodeValue, encodeValue, Session, DatabaseError } from '../dist/index.js';
 
 // Unit tests for serverless protocol encoding/decoding.
 // These test the serverless driver directly — no server needed.
@@ -87,7 +85,7 @@ test('processCursorEntries handles string lastInsertRowid', async t => {
 
 // --- Connection.prepare() baton continuity (issue #6562) ---
 
-test('prepare() sends describe with the current transaction baton', async t => {
+test.serial('prepare() sends describe with the current transaction baton', async t => {
   const { connect } = await import('../dist/index.js');
 
   const requests = [];
@@ -155,7 +153,7 @@ test('prepare() sends describe with the current transaction baton', async t => {
 
 // --- Session baton reset on error ---
 
-test('Session resets baton after HTTP error', async t => {
+test.serial('Session resets baton after HTTP error', async t => {
   const session = new Session({ url: 'http://127.0.0.1:1' });
 
   // Simulate a previous successful request that set a baton
@@ -170,7 +168,7 @@ test('Session resets baton after HTTP error', async t => {
   t.is(session['baton'], null);
 });
 
-test('Session.batch encodes named arguments for statement objects', async t => {
+test.serial('Session.batch encodes named arguments for statement objects', async t => {
   const session = new Session({ url: 'http://fake-host' });
   const requests = [];
   const originalFetch = globalThis.fetch;
@@ -194,11 +192,14 @@ test('Session.batch encodes named arguments for statement objects', async t => {
     { name: 'name', value: { type: 'text', value: 'alice' } },
     { name: 'age', value: { type: 'integer', value: '30' } },
   ]);
+  // The trailing step is the is_autocommit transaction-state probe.
+  const probeStep = requests[0].batch.steps.at(-1);
+  t.deepEqual(probeStep.condition, { type: 'is_autocommit' });
 });
 
 // --- requestHeaders ---
 
-test('Session attaches requestHeaders and lets them override Authorization', async t => {
+test.serial('Session attaches requestHeaders and lets them override Authorization', async t => {
   const session = new Session({
     url: 'http://fake-host',
     authToken: 'standard-token',
@@ -213,7 +214,7 @@ test('Session attaches requestHeaders and lets them override Authorization', asy
   globalThis.fetch = async (url, opts) => {
     capturedHeaders.push(opts.headers);
     return new Response(
-      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_begin', cols: [] })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 0 })}\n`,
+      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_begin', step: 0, cols: [] })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 0 })}\n`,
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     );
   };
