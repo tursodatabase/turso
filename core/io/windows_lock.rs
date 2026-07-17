@@ -443,39 +443,73 @@ pub(crate) fn shared_wal_probe_exclusive_byte(path: &Path, offset: u64) -> Resul
         return Ok(false);
     }
 
+    // Use a disposable handle for the exclusive probe. If releasing that
+    // exclusive lock fails, closing the handle still guarantees it cannot
+    // survive past the probe and block restoration of the shared lock.
+    let probe_handle = open_lock_handle(&key)?;
     if had_shared_lock {
-        unlock_range(entry.handle, offset)?;
-    }
-
-    let probe = match lock_range(entry.handle, offset, true, true) {
-        Ok(probe) => probe,
-        Err(err) => {
-            if had_shared_lock {
-                if !lock_range(entry.handle, offset, false, false)? {
-                    return Err(LimboError::LockingError(
-                        "Failed restoring shared WAL lifetime lock after exclusive probe".into(),
-                    ));
-                }
-            } else if entry.locks.is_empty() {
-                close_shared_wal_entry(&mut registry, &key);
+        if let Err(err) = unlock_range(entry.handle, offset) {
+            if unsafe { CloseHandle(probe_handle) } == FALSE {
+                tracing::error!(
+                    path = %key.display(),
+                    error = %std::io::Error::last_os_error(),
+                    "failed closing shared WAL exclusive probe handle"
+                );
             }
             return Err(err);
         }
-    };
-    if probe {
-        unlock_range(entry.handle, offset)?;
     }
 
-    if had_shared_lock && !lock_range(entry.handle, offset, false, false)? {
-        return Err(LimboError::LockingError(
-            "Failed restoring shared WAL lifetime lock after exclusive probe".into(),
-        ));
+    let probe = match lock_range(probe_handle, offset, true, true) {
+        Ok(true) => {
+            let result = unlock_range(probe_handle, offset).map(|()| true);
+            if unsafe { CloseHandle(probe_handle) } == FALSE {
+                tracing::error!(
+                    path = %key.display(),
+                    error = %std::io::Error::last_os_error(),
+                    "failed closing shared WAL exclusive probe handle"
+                );
+            }
+            result
+        }
+        Ok(false) => {
+            if unsafe { CloseHandle(probe_handle) } == FALSE {
+                tracing::error!(
+                    path = %key.display(),
+                    error = %std::io::Error::last_os_error(),
+                    "failed closing shared WAL exclusive probe handle"
+                );
+            }
+            Ok(false)
+        }
+        Err(err) => {
+            if unsafe { CloseHandle(probe_handle) } == FALSE {
+                tracing::error!(
+                    path = %key.display(),
+                    error = %std::io::Error::last_os_error(),
+                    "failed closing shared WAL exclusive probe handle"
+                );
+            }
+            Err(err)
+        }
+    };
+
+    if had_shared_lock {
+        match lock_range(entry.handle, offset, false, false) {
+            Ok(true) => {}
+            Ok(false) => {
+                panic!("shared WAL lifetime lock restoration was blocked after exclusive probe")
+            }
+            Err(err) => {
+                panic!("shared WAL lifetime lock restoration failed after exclusive probe: {err}")
+            }
+        }
     }
 
     if entry.locks.is_empty() {
         close_shared_wal_entry(&mut registry, &key);
     }
-    Ok(probe)
+    probe
 }
 
 pub(crate) fn release_shared_wal_locks_on_drop(path: &Path, state: &Mutex<SharedWalLockState>) {
