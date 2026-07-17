@@ -10,8 +10,7 @@ use std::fmt::Debug;
 pub mod logical_log;
 use crate::mvcc::database::{LogRecord, RowVersion};
 use crate::mvcc::persistent_storage::logical_log::{
-    serialize_header_entry, serialize_op_entry, LogicalLog, OnSerializationComplete,
-    DEFAULT_LOG_CHECKPOINT_THRESHOLD,
+    LogSerializer, LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
 };
 use crate::{CheckpointResult, Completion, File, LimboError, Result};
 
@@ -162,7 +161,8 @@ impl DurableStorage for Storage {
         row_version: &RowVersion,
         portable_extension: Option<&[u8]>,
     ) -> Result<()> {
-        serialize_op_entry(&mut log_record.buf, row_version, portable_extension)?;
+        LogSerializer::new(&mut log_record.buf)
+            .serialize_op_entry(row_version, portable_extension)?;
         log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
             LimboError::InternalError("logical log op_count exceeds u32".to_string())
         })?;
@@ -178,7 +178,7 @@ impl DurableStorage for Storage {
             !log_record.has_header,
             "DatabaseHeader op appended more than once to a single LogRecord"
         );
-        serialize_header_entry(&mut log_record.buf, header);
+        LogSerializer::new(&mut log_record.buf).serialize_header_entry(header)?;
         log_record.has_header = true;
         log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
             LimboError::InternalError("logical log op_count exceeds u32".to_string())
