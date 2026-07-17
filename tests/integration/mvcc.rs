@@ -1498,9 +1498,15 @@ fn test_mvcc_index_scan_does_not_return_row_deleted_mid_scan(
 
 fn open_file_conn(path: &str) -> Arc<turso_core::Connection> {
     let io = Arc::new(turso_core::PlatformIO::new().unwrap());
-    let db =
-        Database::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None)
-            .unwrap();
+    let db = Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
     db.connect().unwrap()
 }
 
