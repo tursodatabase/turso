@@ -369,38 +369,31 @@ test.serial("Database.batch() [atomic mode rolls back on failure]", async (t) =>
   t.deepEqual(rows, []);
 });
 
-test.serial("Database.batch() [atomic mode does not abort manually-opened outer transaction on BEGIN failure]", async (t) => {
-  if (process.env.PROVIDER !== "serverless") {
-    // The native binding emits BEGIN via exec() sequentially and the
-    // failure propagates immediately; this race only exists on the
-    // serverless Hrana-condition-chain path.
-    t.pass();
-    return;
-  }
+test.serial("Database.batch() [atomic mode joins a manually-opened outer transaction]", async (t) => {
   const db = t.context.db;
 
   // Manually open an outer transaction on the same stream and write a
   // row inside it.
-  await db.execute("BEGIN");
-  await db.execute("INSERT INTO users(name, email) VALUES ('Outer', 'outer@example.net')");
+  await db.exec("BEGIN");
+  await db.run("INSERT INTO users(name, email) VALUES ('Outer', 'outer@example.net')");
 
-  // An atomic batch tries to emit BEGIN IMMEDIATE while a transaction
-  // is already open, so the synthetic BEGIN step errors. The atomic
-  // batch must (a) reject so the caller knows nothing committed, and
-  // (b) skip the synthetic ROLLBACK — otherwise it would abort the
-  // outer transaction along with it.
-  await t.throwsAsync(async () => {
-    await db.batch([
-      { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Inner", "inner@example.net"] },
-    ], "immediate");
-  });
+  // A transaction is already open on this stream, so the batch's mode is
+  // ignored and its statements join the outer transaction instead of
+  // emitting a nested BEGIN — the same contract as batch() inside a
+  // transaction() callback.
+  await db.batch([
+    { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Inner", "inner@example.net"] },
+  ], "immediate");
 
-  // The outer transaction is still open and can be committed.
-  await db.execute("COMMIT");
+  t.true(db.inTransaction, "outer transaction is still open after the batch");
+
+  // Rolling back the outer transaction must undo the batch's INSERT too —
+  // that proves the batch joined it rather than committing on its own.
+  await db.exec("ROLLBACK");
 
   const names = (await db.all("SELECT name FROM users ORDER BY id")).map(r => r.name);
-  t.true(names.includes("Outer"), "outer transaction's INSERT should be visible");
-  t.false(names.includes("Inner"), "atomic batch's INSERT must not have committed");
+  t.false(names.includes("Outer"), "outer transaction's INSERT was rolled back");
+  t.false(names.includes("Inner"), "batch INSERT rolled back with the outer transaction");
 });
 
 test.serial("Database.batch() [non-insert batch does not expose lastInsertRowid]", async (t) => {
@@ -537,6 +530,43 @@ test.serial("Database.inTransaction property", async (t) => {
   t.true(db.inTransaction, "in a transaction after raw BEGIN");
   await db.exec("ROLLBACK");
   t.false(db.inTransaction, "autocommit after raw ROLLBACK");
+});
+
+test.serial("Database.inTransaction tracks raw BEGIN via run()", async (t) => {
+  const db = t.context.db;
+
+  // inTransaction must reflect the real transaction state no matter which
+  // API opened or closed the transaction, not just exec().
+  await db.run("BEGIN IMMEDIATE");
+  t.true(db.inTransaction, "in a transaction after raw BEGIN via run()");
+  await db.run("ROLLBACK");
+  t.false(db.inTransaction, "autocommit after raw ROLLBACK via run()");
+});
+
+test.serial("Database.inTransaction after failed batch() with raw BEGIN", async (t) => {
+  const db = t.context.db;
+
+  // A UNIQUE constraint failure has statement-level ABORT semantics: it
+  // aborts the failing INSERT but leaves the surrounding explicit
+  // transaction open. inTransaction must report that open transaction —
+  // cleanup code relies on it to decide whether a ROLLBACK is needed, and
+  // a stale false here leaks a server-side write transaction that starves
+  // every other writer.
+  await t.throwsAsync(async () => {
+    await db.batch([
+      "BEGIN IMMEDIATE",
+      "INSERT INTO users (id, name, email) VALUES (100, 'Carol', 'carol@example.org')",
+      "INSERT INTO users (id, name, email) VALUES (100, 'Dave', 'dave@example.org')",
+    ]);
+  });
+
+  t.true(db.inTransaction, "transaction is still open after the constraint error");
+
+  await db.exec("ROLLBACK");
+  t.false(db.inTransaction, "autocommit after ROLLBACK on the same connection");
+
+  const rows = await db.all("SELECT COUNT(*) AS n FROM users WHERE id = 100");
+  t.is(rows[0].n, 0, "ROLLBACK undid the batch's successful INSERT");
 });
 
 test.serial("Database.transactionAsync()", async (t) => {

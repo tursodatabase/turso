@@ -256,10 +256,17 @@ function buildFetchOptions(ctx: HttpContext, body: string, signal?: AbortSignal)
   };
 }
 
-/** Per-query timeout options. Overrides defaultQueryTimeout for this call. */
+/** Per-query options. Override the session-level defaults for a single call. */
 export interface QueryOptions {
   /** Per-query timeout in milliseconds. Overrides defaultQueryTimeout for this call. */
   queryTimeout?: number;
+  /**
+   * Extra HTTP headers attached to this request only. Applied after the
+   * standard headers and any session-level `requestHeaders`, so they can
+   * override both. Passing the `Host` key (case-insensitive) throws —
+   * fetch forbids setting it.
+   */
+  requestHeaders?: Record<string, string>;
 }
 
 function wrapAbortError(error: unknown): never {
