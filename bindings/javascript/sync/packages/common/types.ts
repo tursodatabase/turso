@@ -119,6 +119,12 @@ export interface DatabaseOpts {
      */
     experimental?: ExperimentalFeature[],
     /**
+     * maximum number of idle extra connections kept alive for `transaction()`
+     * calls (default 1). mirrors the `poolSize` option of the non-sync
+     * `Database`.
+     */
+    poolSize?: number,
+    /**
      * When enabled, write statements execute on remote server instead of locally.
      * After each write (or transaction commit), changes are pulled for read-your-writes consistency.
      * Requires `url`. All explicit transactions go to remote.
@@ -218,4 +224,4 @@ export interface ProtocolIo {
     read(path: string): Promise<Buffer | Uint8Array | null>;
     write(path: string, content: Buffer | Uint8Array): Promise<void>;
 }
-export type GeneratorResponse = { type: 'IO' } | { type: 'Done' } | ({ type: 'SyncEngineStats' } & DatabaseStats) | { type: 'SyncEngineChanges', changes: any }
+export type GeneratorResponse = { type: 'IO' } | { type: 'Done' } | ({ type: 'SyncEngineStats' } & DatabaseStats) | { type: 'SyncEngineChanges', changes: any } | { type: 'Connection', connection: any }

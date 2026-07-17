@@ -56,7 +56,15 @@ pub enum GeneratorResponse {
     SyncEngineChanges {
         changes: SyncEngineChanges,
     },
+    Connection {
+        connection: turso_node::Connection,
+    },
 }
+
+// The Connection variant carries core handles that are not fully thread-safe
+// across the napi worker boundary - same unsoundness as turso_node::DbTask
+// and ResumeTask below, accepted for now.
+unsafe impl Send for GeneratorResponse {}
 
 #[napi]
 impl SyncEngineChanges {

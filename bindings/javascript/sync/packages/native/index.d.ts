@@ -5,33 +5,12 @@ export declare class BatchExecutor {
   reset(): void
 }
 
-/** A database connection. */
-export declare class Database {
-  /**
-   * Creates a new database instance.
-   *
-   * # Arguments
-   * * `path` - The path to the database file.
-   */
-  constructor(path: string, opts?: DatabaseOpts | undefined | null)
-  /**
-   * Connect the database synchronously
-   * This method is idempotent and can be called multiple times safely until the database will be closed
-   */
-  connectSync(): void
-  /**
-   * Connect the database asynchronously
-   * This method is idempotent and can be called multiple times safely until the database will be closed
-   */
-  connectAsync(): Promise<void>
-  /** Returns whether the database is in readonly-only mode. */
-  get readonly(): boolean
-  /** Returns whether the database is in memory-only mode. */
-  get memory(): boolean
-  /** Returns whether the database is in memory-only mode. */
-  get path(): string
-  /** Returns whether the database connection is open. */
+/** A single connection to a database with its own transaction state. */
+export declare class Connection {
+  /** Returns whether the connection is open. */
   get open(): boolean
+  /** Returns whether the connection is in readonly-only mode. */
+  get readonly(): boolean
   /**
    * Prepares a statement for execution.
    *
@@ -82,21 +61,51 @@ export declare class Database {
    */
   inTransaction(): boolean
   /**
-   * Closes the database connection.
-   *
-   * # Returns
-   *
-   * `Ok(())` if the database is closed successfully.
-   */
-  close(): void
-  /**
-   * Sets the default safe integers mode for all statements from this database.
+   * Sets the default safe integers mode for all statements from this connection.
    *
    * # Arguments
    *
    * * `toggle` - Whether to use safe integers by default.
    */
   defaultSafeIntegers(toggle?: boolean | undefined | null): void
+  /** Closes the connection. */
+  close(): void
+}
+
+/**
+ * A database: the shared per-file state from which connections are created.
+ * All per-connection operations live on [`Connection`], returned by
+ * `connectSync()`/`connectAsync()`.
+ */
+export declare class Database {
+  /**
+   * Creates a new database instance.
+   *
+   * # Arguments
+   * * `path` - The path to the database file.
+   */
+  constructor(path: string, opts?: DatabaseOpts | undefined | null)
+  /**
+   * Creates a new connection synchronously, opening the database on the
+   * first call.
+   */
+  connectSync(): Connection
+  /**
+   * Creates a new connection asynchronously, opening the database on the
+   * first call.
+   */
+  connectAsync(): Promise<Connection>
+  /** Returns whether the database is in memory-only mode. */
+  get memory(): boolean
+  /** Returns whether the database is in memory-only mode. */
+  get path(): string
+  /** Returns whether the database has been opened. */
+  get open(): boolean
+  /**
+   * Closes the database handle. Connections are closed individually via
+   * `Connection::close()`.
+   */
+  close(): void
   /** Runs the I/O loop synchronously. */
   ioLoopSync(): void
   /** Runs the I/O loop asynchronously, returning a Promise. */
@@ -231,6 +240,12 @@ export declare class SyncEngine {
   protocolIo(): JsProtocolRequestBytes | null
   protocolIoStep(): void
   push(): GeneratorHolder
+  /**
+   * Creates an additional read/write connection to the synced database,
+   * configured by the sync engine (CDC pragma, WAL auto-actions). Used by
+   * the JS layer to run transaction() calls on dedicated connections.
+   */
+  connectNew(): GeneratorHolder
   stats(): GeneratorHolder
   wait(): GeneratorHolder
   apply(changes: SyncEngineChanges): GeneratorHolder
@@ -274,6 +289,7 @@ export type GeneratorResponse =
   | { type: 'Done' }
   | { type: 'SyncEngineStats', cdcOperations: number, mainWalSize: number, revertWalSize: number, lastPullUnixTime?: number, lastPushUnixTime?: number, revision?: string, networkSentBytes: number, networkReceivedBytes: number }
   | { type: 'SyncEngineChanges', changes: SyncEngineChanges }
+  | { type: 'Connection', connection: Connection }
 
 export type JsPartialBootstrapStrategy =
   | { type: 'Prefix', length: number }

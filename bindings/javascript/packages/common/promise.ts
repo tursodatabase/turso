@@ -225,12 +225,26 @@ class Database {
   }
 
   /**
+   * Creates a new native connection for the transaction pool, or returns
+   * null when the database cannot open extra connections. Subclasses whose
+   * connections are managed externally (the sync engine) override this to
+   * mint properly configured connections through their owner.
+   */
+  protected async newPooledNativeConnection(): Promise<NativeConnection | null> {
+    try {
+      return this.db.connectSync();
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Takes an idle pooled connection for a transaction, lazily connecting a
    * new one when all are busy. Falls back to this database itself when the
-   * platform has no async-context tracking or the native database cannot
-   * open extra connections (e.g. it is managed by the sync engine).
+   * platform has no async-context tracking or the database cannot open
+   * extra connections.
    */
-  private acquireTransactionConnection(): Database {
+  private async acquireTransactionConnection(): Promise<Database> {
     if (this.asyncContext == null) {
       return this;
     }
@@ -240,10 +254,8 @@ class Database {
         return entry.db;
       }
     }
-    let native: NativeConnection;
-    try {
-      native = this.db.connectSync();
-    } catch {
+    const native = await this.newPooledNativeConnection();
+    if (native == null) {
       return this;
     }
     if (this.safeIntegersDefault !== undefined) {
@@ -354,7 +366,7 @@ class Database {
         if (!db.connected) {
           await db.connect();
         }
-        const txn = db.acquireTransactionConnection();
+        const txn = await db.acquireTransactionConnection();
         const body = async () => {
           await db.exec("BEGIN " + mode);
           try {

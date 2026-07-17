@@ -251,6 +251,10 @@ export async function run(runner: Runner, generator: any, lock?: AsyncLock): Pro
             //@ts-ignore
             return rest.changes;
         }
+        if (type == 'Connection') {
+            //@ts-ignore
+            return rest.connection;
+        }
         if (lock != null) {
             await lock.acquire();
         }

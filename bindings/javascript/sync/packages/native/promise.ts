@@ -1,4 +1,5 @@
-import { DatabasePromise, TransactionFunction } from "@tursodatabase/database-common"
+import { AsyncLocalStorage } from "node:async_hooks";
+import { DatabasePromise, NativeConnection, TransactionFunction } from "@tursodatabase/database-common"
 import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner, RemoteWriter, RemoteWriteStatement } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, Database as NativeDatabase } from "#index";
 import { promises } from "node:fs";
@@ -61,7 +62,7 @@ class Database extends DatabasePromise {
     constructor(opts: DatabaseOpts) {
         if (opts.url == null) {
             const db = new NativeDatabase(opts.path, { tracing: opts.tracing, experimental: opts.experimental }) as any;
-            super(db);
+            super(db, undefined, { poolSize: opts.poolSize, asyncContext: new AsyncLocalStorage() });
             this.#db = db;
             this.#engine = null;
             return;
@@ -134,7 +135,7 @@ class Database extends DatabasePromise {
         const io = memory ? memoryIO() : NodeIO;
         const run = runner(runOpts, io, engine);
 
-        super(engine.db() as unknown as any, () => run.wait());
+        super(engine.db() as unknown as any, () => run.wait(), { poolSize: opts.poolSize, asyncContext: new AsyncLocalStorage() });
 
         this.#db = engine.db() as unknown as any;
         this.#runner = run;
@@ -165,6 +166,21 @@ class Database extends DatabasePromise {
             await super.connect();
         }
         this.connected = true;
+    }
+    /**
+     * Mints extra connections for the transaction pool through the sync
+     * engine so they get the engine's per-connection setup (CDC pragma,
+     * WAL auto-actions).
+     */
+    protected override async newPooledNativeConnection(): Promise<NativeConnection | null> {
+        if (this.#engine == null) {
+            return super.newPooledNativeConnection();
+        }
+        try {
+            return await run(this.#runner!, this.#engine.connectNew());
+        } catch {
+            return null;
+        }
     }
     /**
      * pull new changes from the remote database

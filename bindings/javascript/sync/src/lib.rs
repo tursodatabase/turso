@@ -442,6 +442,21 @@ impl SyncEngine {
         })
     }
 
+    /// Creates an additional read/write connection to the synced database,
+    /// configured by the sync engine (CDC pragma, WAL auto-actions). Used by
+    /// the JS layer to run transaction() calls on dedicated connections.
+    #[napi]
+    pub fn connect_new(&self) -> GeneratorHolder {
+        self.run(async move |coro, guard| {
+            let sync_engine = try_read(guard)?;
+            let sync_engine = try_unwrap(&sync_engine)?;
+            let conn = sync_engine.connect_rw(coro).await?;
+            Ok(Some(GeneratorResponse::Connection {
+                connection: turso_node::Connection::create(conn),
+            }))
+        })
+    }
+
     #[napi]
     pub fn stats(&self) -> GeneratorHolder {
         self.run(async move |coro, guard| {

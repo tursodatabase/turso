@@ -541,7 +541,9 @@ impl Database {
 
 #[napi]
 impl Connection {
-    fn create(conn: Arc<turso_core::Connection>) -> Self {
+    /// Wraps an already established core connection (also used by the sync
+    /// binding for engine-managed connections).
+    pub fn create(conn: Arc<turso_core::Connection>) -> Self {
         Self {
             conn: Some(conn),
             default_safe_integers: Cell::new(false),

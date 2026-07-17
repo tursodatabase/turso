@@ -445,6 +445,45 @@ test('select-after-push', async ({ server }) => {
     }
 })
 
+// Each transaction() call must run on its own engine-configured pooled
+// connection: concurrent transactions must not interleave on the main
+// connection, and writes from pooled connections must flow through CDC so
+// push replicates them.
+test('concurrent transaction() calls run on pooled connections', async ({ server }) => {
+    const db = await connect({ path: ':memory:', url: server.dbUrl() });
+    await db.exec("CREATE TABLE IF NOT EXISTS txn_pool(tag TEXT, i INTEGER)");
+    await db.exec("DELETE FROM txn_pool");
+
+    const writer = db.transaction(async (tag: string) => {
+        for (let i = 0; i < 10; i++) {
+            await db.exec(`INSERT INTO txn_pool VALUES ('${tag}', ${i})`);
+        }
+    });
+    // read transaction so it can stay open while the writer holds the write lock
+    const abortedReader = db.transaction(async () => {
+        await (await db.prepare('SELECT COUNT(*) AS cnt FROM txn_pool')).all();
+        await new Promise((resolve) => setImmediate(resolve));
+        throw new Error('abort transaction');
+    });
+
+    const [committed, aborted] = await Promise.allSettled([
+        writer('committed'),
+        abortedReader(),
+    ]);
+    expect(committed).toEqual({ status: 'fulfilled', value: undefined });
+    expect(aborted.status).toBe('rejected');
+    expect((aborted as PromiseRejectedResult).reason.message).toBe('abort transaction');
+
+    const rows = await (await db.prepare('SELECT tag, COUNT(*) AS cnt FROM txn_pool GROUP BY tag')).all();
+    expect(rows).toEqual([{ tag: 'committed', cnt: 10 }]);
+
+    // writes made inside the pooled transaction must reach the remote
+    await db.push();
+    const db2 = await connect({ path: ':memory:', url: server.dbUrl() });
+    const remote = await (await db2.prepare('SELECT tag, COUNT(*) AS cnt FROM txn_pool GROUP BY tag')).all();
+    expect(remote).toEqual([{ tag: 'committed', cnt: 10 }]);
+})
+
 test('select-without-push', async ({ server }) => {
     {
         const db = await connect({ path: ':memory:', url: server.dbUrl() });
