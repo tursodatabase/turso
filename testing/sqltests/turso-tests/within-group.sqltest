@@ -758,3 +758,71 @@ test percentile-correlated-bad-fraction-all-null-inner-errors {
 }
 expect error {
 }
+
+# mode() is computed in O(1) space by relying on the GROUP BY sorter to deliver
+# rows pre-sorted by the WITHIN GROUP expression, but that only works when every
+# mode() call in a query orders by the same expression. Two mode() calls ordering
+# by different columns must still both be correct (falls back to buffering).
+setup two_cols {
+    CREATE TABLE tc(g, a, b);
+    INSERT INTO tc VALUES
+        (1,1,9),(1,1,9),(1,2,8),
+        (2,5,1),(2,5,2),(2,5,2);
+}
+
+@setup two_cols
+test mode-two-different-order-columns {
+    SELECT g,
+           mode() WITHIN GROUP (ORDER BY a),
+           mode() WITHIN GROUP (ORDER BY b)
+    FROM tc GROUP BY g ORDER BY g;
+}
+expect {
+    1|1|9
+    2|5|2
+}
+
+# Same WITHIN GROUP expression reused by two mode() calls in one query takes the
+# O(1) streaming path; both must agree and be correct.
+@setup grouped
+test mode-two-calls-same-order-column {
+    SELECT k, mode() WITHIN GROUP (ORDER BY v), mode() WITHIN GROUP (ORDER BY v)
+    FROM g GROUP BY k ORDER BY k;
+}
+expect {
+    a|1|1
+    b|10|10
+}
+
+# GROUP BY on a column already delivered in order by an index must not skip
+# sorting for mode()'s own WITHIN GROUP expression (which the index says
+# nothing about).
+setup indexed_groups {
+    CREATE TABLE ig(k INTEGER, v INTEGER);
+    CREATE INDEX ig_k ON ig(k);
+    INSERT INTO ig VALUES (1,30),(1,10),(1,10),(2,7),(2,7),(2,9);
+}
+
+@setup indexed_groups
+test mode-group-by-indexed-column {
+    SELECT k, mode() WITHIN GROUP (ORDER BY v) FROM ig GROUP BY k ORDER BY k;
+}
+expect {
+    1|10
+    2|7
+}
+
+# A larger group exercises the streaming run-tracking logic across many rows
+# and many distinct values instead of just a handful.
+setup biggroup {
+    CREATE TABLE bg(x);
+}
+
+@setup biggroup
+test mode-large-group {
+    INSERT INTO bg SELECT value % 7 FROM generate_series(1, 300);
+    SELECT mode() WITHIN GROUP (ORDER BY x) FROM bg;
+}
+expect {
+    1
+}

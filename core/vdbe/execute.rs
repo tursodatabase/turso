@@ -6147,8 +6147,20 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             // We serialize to a record blob only in finalize, avoiding O(n²) re-serialization.
             payload.push(Value::from_i64(0));
         }
-        AggFunc::Mode => {
-            // [0] = collation bits, [1] = count, [2..] = buffered values.
+        AggFunc::Mode { sorted: true } => {
+            // Streaming form (input guaranteed pre-sorted by the WITHIN GROUP
+            // expression): [0] = collation bits, [1] = current run's value,
+            // [2] = current run's count, [3] = best run's value so far,
+            // [4] = best run's count so far. O(1) regardless of row count.
+            payload.push(Value::from_i64(0)); // collation (recorded at step time)
+            payload.push(Value::Null); // current run value (Null = no run yet)
+            payload.push(Value::from_i64(0)); // current run count
+            payload.push(Value::Null); // best run value (Null = no run yet)
+            payload.push(Value::from_i64(0)); // best run count
+        }
+        AggFunc::Mode { sorted: false } => {
+            // Legacy form (no ordering guarantee): [0] = collation bits,
+            // [1] = count, [2..] = buffered values, sorted and scanned at finalize.
             payload.push(Value::from_i64(0)); // collation (recorded at step time)
             payload.push(Value::from_i64(0)); // count
         }
@@ -6449,7 +6461,49 @@ fn update_agg_payload(
             payload[0] = Value::from_i64((count + 1) as i64);
             payload.push(arg.clone());
         }
-        AggFunc::Mode => {
+        AggFunc::Mode { sorted: true } => {
+            // Record the value's collation (constant per group), then extend or
+            // close out the current run. Ordered-set aggregates ignore NULL inputs.
+            payload[0] = Value::from_i64(collation.to_bits() as i64);
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            let [_, current_val, current_count, best_val, best_count, ..] = payload.as_mut_slice()
+            else {
+                mark_unlikely();
+                return Err(LimboError::InternalError(
+                    "Mode: payload too short".to_string(),
+                ));
+            };
+            if matches!(current_val, Value::Null) {
+                *current_val = arg.clone();
+                *current_count = Value::from_i64(1);
+            } else {
+                let cmp_fn = comparator()?;
+                let cmp = if let Some(ref cmp_fn) = cmp_fn {
+                    cmp_fn(&arg.as_ref(), &current_val.as_ref())?
+                } else {
+                    compare_with_collation(arg, current_val, Some(collation), &cmp_fn)?
+                };
+                if cmp == std::cmp::Ordering::Equal {
+                    let Value::Numeric(Numeric::Integer(c)) = current_count else {
+                        mark_unlikely();
+                        return Err(LimboError::InternalError(
+                            "Mode: current run count is not an integer".to_string(),
+                        ));
+                    };
+                    *c = c.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+                } else {
+                    if current_count.as_int().unwrap_or(0) > best_count.as_int().unwrap_or(0) {
+                        *best_val = current_val.clone();
+                        *best_count = current_count.clone();
+                    }
+                    *current_val = arg.clone();
+                    *current_count = Value::from_i64(1);
+                }
+            }
+        }
+        AggFunc::Mode { sorted: false } => {
             // Record the value's collation (constant per group) for finalize-time sorting, then
             // buffer the value. Ordered-set aggregates ignore NULL inputs.
             payload[0] = Value::from_i64(collation.to_bits() as i64);
@@ -6566,7 +6620,24 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 Value::Blob(ImmutableRecord::from_values(elements, count)?.into_payload())
             }
         }
-        AggFunc::Mode => {
+        AggFunc::Mode { sorted: true } => {
+            // payload: [0]=collation bits, [1]=current val, [2]=current count,
+            // [3]=best val, [4]=best count. The last run never gets compared
+            // against `best` inside update_agg_payload, so do it here.
+            let [_, current_val, current_count, best_val, best_count] = payload else {
+                return Err(LimboError::InternalError(
+                    "Mode: payload too short".to_string(),
+                ));
+            };
+            if current_count.as_int().unwrap_or(0) > best_count.as_int().unwrap_or(0) {
+                current_val.clone()
+            } else if best_count.as_int().unwrap_or(0) > 0 {
+                best_val.clone()
+            } else {
+                Value::Null
+            }
+        }
+        AggFunc::Mode { sorted: false } => {
             // payload: [0]=collation bits, [1]=count, [2..]=buffered values.
             let collation =
                 CollationSeq::from_storage_bits(payload[0].as_int().unwrap_or(0) as u16);

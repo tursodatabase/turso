@@ -2382,7 +2382,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 AggFunc::PercentileCont => Ok(Type::Real),
                 // mode/percentile_disc return an element of the ordered set, whose
                 // type is not known statically.
-                AggFunc::Mode | AggFunc::PercentileDisc => Ok(Type::Text),
+                AggFunc::Mode { .. } | AggFunc::PercentileDisc => Ok(Type::Text),
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupArray
                 | AggFunc::JsonGroupArray

@@ -7,7 +7,7 @@ use super::{
     plan::{Distinctness, GroupBy, SelectPlan, SubqueryEvalPhase, SubqueryOrigin},
     result_row::emit_select_result,
 };
-use crate::function::AccumulatorFunc;
+use crate::function::{AccumulatorFunc, AggFunc};
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     order_by::{custom_type_comparator, EmitOrderBy},
@@ -110,6 +110,33 @@ impl EmitGroupBy {
             order_by,
         )?;
 
+        // If a mode() aggregate was marked `sorted` (decided earlier, once for the
+        // whole query: only when every mode() call shares the same WITHIN GROUP
+        // expression), that expression must be materialized as an extra sort key
+        // column right after the GROUP BY columns, so AggStep sees it pre-sorted
+        // and can track a running value/count pair instead of buffering every row.
+        let mode_sort_expr: Option<ast::Expr> =
+            plan.aggregates.iter().find_map(|agg| match &agg.func {
+                AggFunc::Mode { sorted: true } => Some(agg.args[0].clone()),
+                _ => None,
+            });
+        let mode_sort_expr_needs_own_column = mode_sort_expr.as_ref().is_some_and(|expr| {
+            !group_by
+                .exprs
+                .iter()
+                .any(|ge| exprs_are_equivalent(ge, expr))
+        });
+        if mode_sort_expr_needs_own_column {
+            let expr = mode_sort_expr.clone().unwrap();
+            t_ctx
+                .non_aggregate_expressions
+                .insert(group_by.exprs.len(), (std::borrow::Cow::Owned(expr), false));
+        }
+        // A sorter that only orders by GROUP BY columns cannot guarantee mode()'s
+        // WITHIN GROUP order, so force the sorter path even if the GROUP BY columns
+        // themselves are already delivered in order by an index (sort_elided).
+        let force_sorter_for_mode = mode_sort_expr.is_some();
+
         let label_subrtn_acc_output = program.allocate_label();
         let label_group_by_end_without_emitting_row = program.allocate_label();
         let label_acc_indicator_set_flag_true = program.allocate_label();
@@ -139,7 +166,8 @@ impl EmitGroupBy {
         // END BLOCK
 
         let reg_sorter_key = program.alloc_register();
-        let column_count = if !group_by.sort_elided {
+        let use_sorter = !group_by.sort_elided || force_sorter_for_mode;
+        let column_count = if use_sorter {
             // Sorter path: store only unique leaf columns from aggregate args
             // instead of pre-computed expression results.
             t_ctx.agg_leaf_columns = collect_agg_leaf_columns(&plan.aggregates, plan)?;
@@ -149,7 +177,7 @@ impl EmitGroupBy {
         };
         let reg_group_by_source_cols_start = program.alloc_registers(column_count);
 
-        let row_source = if !group_by.sort_elided {
+        let row_source = if use_sorter {
             let sort_order = &group_by.sort_order;
             let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
             // Should work the same way as Order By
@@ -160,7 +188,7 @@ impl EmitGroupBy {
              * then the collating sequence of the column is used to determine sort order.
              * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
              */
-            let order_collations_nulls: crate::alloc::Vec<(
+            let mut order_collations_nulls: crate::alloc::Vec<(
                 SortOrder,
                 Option<CollationSeq>,
                 Option<turso_parser::ast::NullsOrder>,
@@ -180,13 +208,33 @@ impl EmitGroupBy {
                 .try_collect::<Result<crate::alloc::Vec<_>>>()??;
 
             // Resolve custom type comparators for GROUP BY columns (e.g. array_lt).
-            let comparators = group_by
-                .exprs
-                .iter()
-                .map(|expr| {
-                    custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
-                })
-                .try_collect()?;
+            let mut comparators: crate::alloc::Vec<Option<crate::vdbe::insn::SortComparatorType>> =
+                group_by
+                    .exprs
+                    .iter()
+                    .map(|expr| {
+                        custom_type_comparator(
+                            expr,
+                            &plan.table_references,
+                            t_ctx.resolver.schema(),
+                        )
+                    })
+                    .try_collect()?;
+
+            if mode_sort_expr_needs_own_column {
+                let expr = mode_sort_expr.as_ref().unwrap();
+                let collation = get_collseq_from_expr_with_symbols(
+                    expr,
+                    &plan.table_references,
+                    Some(t_ctx.resolver.symbol_table),
+                )?;
+                order_collations_nulls.push((SortOrder::Asc, collation, None));
+                comparators.push(custom_type_comparator(
+                    expr,
+                    &plan.table_references,
+                    t_ctx.resolver.schema(),
+                ));
+            }
 
             program.emit_insn(Insn::SorterOpen {
                 cursor_id: sort_cursor,
@@ -390,7 +438,7 @@ fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Resu
 }
 
 fn collect_non_aggregate_expressions<'a>(
-    non_aggregate_expressions: &mut Vec<(&'a ast::Expr, bool)>,
+    non_aggregate_expressions: &mut Vec<(std::borrow::Cow<'a, ast::Expr>, bool)>,
     group_by: &'a GroupBy,
     plan: &SelectPlan,
     root_result_columns: &'a [ResultSetColumn],
@@ -417,7 +465,10 @@ fn collect_non_aggregate_expressions<'a>(
             || root_result_columns
                 .iter()
                 .any(|rc| exprs_are_equivalent(&rc.expr, group_expr));
-        non_aggregate_expressions.push((group_expr, expr_appears_in_result_columns));
+        non_aggregate_expressions.push((
+            std::borrow::Cow::Borrowed(group_expr),
+            expr_appears_in_result_columns,
+        ));
     }
     for expr in result_columns {
         let in_group_by = group_by
@@ -425,7 +476,7 @@ fn collect_non_aggregate_expressions<'a>(
             .iter()
             .any(|group_expr| exprs_are_equivalent(expr, group_expr));
         if !in_group_by {
-            non_aggregate_expressions.push((expr, true));
+            non_aggregate_expressions.push((std::borrow::Cow::Borrowed(expr), true));
         }
     }
     Ok(())
@@ -882,7 +933,7 @@ pub fn group_by_process_single_group(
                 if *expr_appears_in_result_columns {
                     program.emit_column_or_rowid(*pseudo_cursor, sorter_column_index, next_reg);
                     t_ctx.resolver.cache_scalar_expr_reg(
-                        std::borrow::Cow::Borrowed(expr),
+                        expr.clone(),
                         next_reg,
                         false,
                         &plan.table_references,
@@ -910,7 +961,7 @@ pub fn group_by_process_single_group(
                     &t_ctx.resolver,
                 )?;
                 t_ctx.resolver.cache_scalar_expr_reg(
-                    std::borrow::Cow::Borrowed(expr),
+                    expr.clone(),
                     dest_reg,
                     false,
                     &plan.table_references,
