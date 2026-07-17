@@ -350,6 +350,42 @@ func TestStatementError(t *testing.T) {
 	fmt.Println("Statement error test passed")
 }
 
+func TestQueryMissingParameterReturnsError(t *testing.T) {
+	newConn := openMem(t)
+	sql := "CREATE TABLE pair (k INTEGER NOT NULL, v INTEGER NOT NULL, UNIQUE(k, v));"
+	_, err := newConn.Exec(sql)
+	if err != nil {
+		t.Fatalf("Error creating table: %v", err)
+	}
+	sql = "INSERT OR IGNORE INTO pair(k, v) VALUES(1, 2);"
+	_, err = newConn.Exec(sql)
+	if err != nil {
+		t.Fatalf("Error inserting data: %v", err)
+	}
+	sql = "SELECT v FROM pair WHERE k=?;"
+	rows, err := newConn.Query(sql)
+	if rows != nil {
+		_ = rows.Close()
+	}
+	if err == nil {
+		t.Fatalf("Expected error, got nil")
+	}
+}
+
+func TestExecMissingParameterReturnsError(t *testing.T) {
+	newConn := openMem(t)
+	sql := "CREATE TABLE pair (k INTEGER, v INTEGER);"
+	_, err := newConn.Exec(sql)
+	if err != nil {
+		t.Fatalf("Error creating table: %v", err)
+	}
+	sql = "INSERT INTO pair(k, v) VALUES(?, ?);"
+	_, err = newConn.Exec(sql)
+	if err == nil {
+		t.Fatalf("Expected error, got nil")
+	}
+}
+
 func TestDriverRowsErrorMessages(t *testing.T) {
 	db := openMem(t)
 	_, err := db.Exec("CREATE TABLE test (id INTEGER, name TEXT)")
