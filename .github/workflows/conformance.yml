@@ -78,4 +78,4 @@ jobs:
       - name: Build libturso_tcl
         run: make -C bindings/tcl build
       - name: Run SQLite TCL conformance tests
-        run: tclsh testing/conformance/sqlite3/all.test
+        run: tclsh sqlite/conformance/upstream/all.test
