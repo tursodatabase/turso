@@ -7358,6 +7358,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_pg_regress"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "similar",
+]
+
+[[package]]
 name = "turso_pg_server"
 version = "0.7.0"
 dependencies = [
