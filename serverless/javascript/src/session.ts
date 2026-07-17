@@ -101,12 +101,19 @@ export class Session {
     this.baseUrl = normalizeUrl(config.url);
   }
 
-  private httpContext(): HttpContext {
+  private httpContext(queryOptions?: QueryOptions): HttpContext {
+    // Per-query headers are merged over the session-level ones, so a query
+    // can override a header the session sets (and both override the
+    // standard headers).
+    let requestHeaders = this.config.requestHeaders;
+    if (queryOptions?.requestHeaders) {
+      requestHeaders = { ...requestHeaders, ...queryOptions.requestHeaders };
+    }
     return {
       url: this.baseUrl,
       authToken: this.config.authToken,
       remoteEncryptionKey: this.config.remoteEncryptionKey,
-      requestHeaders: this.config.requestHeaders,
+      requestHeaders,
     };
   }
 
@@ -168,7 +175,7 @@ export class Session {
 
     let response;
     try {
-      response = await executePipeline(this.httpContext(), request, this.createAbortSignal(queryOptions));
+      response = await executePipeline(this.httpContext(queryOptions), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
       this.autocommit = true;
@@ -236,7 +243,7 @@ export class Session {
 
     let result;
     try {
-      result = await executeCursor(this.httpContext(), request, this.createAbortSignal(queryOptions));
+      result = await executeCursor(this.httpContext(queryOptions), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
       throw e;
@@ -432,7 +439,7 @@ export class Session {
 
     let batchResult;
     try {
-      batchResult = await executeCursor(this.httpContext(), request, this.createAbortSignal(queryOptions));
+      batchResult = await executeCursor(this.httpContext(queryOptions), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
       throw e;
@@ -553,7 +560,7 @@ export class Session {
 
     let seqResponse;
     try {
-      seqResponse = await executePipeline(this.httpContext(), request, this.createAbortSignal(queryOptions));
+      seqResponse = await executePipeline(this.httpContext(queryOptions), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
       this.autocommit = true;

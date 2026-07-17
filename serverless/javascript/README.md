@@ -85,6 +85,21 @@ const conn = connect({
 });
 ```
 
+Headers can also be set per query via the trailing query-options argument.
+They apply to that call only and are merged over the connection-level
+`requestHeaders`, so a query can override a header the connection sets:
+
+```javascript
+await conn.execute("SELECT * FROM users", [], {
+  requestHeaders: { "x-request-id": "abc123" },
+});
+
+// Also accepted by run()/get()/all()/iterate() and prepared statements:
+await conn.run("INSERT INTO users (email) VALUES (?)", "user@example.com", {
+  requestHeaders: { "x-request-id": "abc124" },
+});
+```
+
 ### libSQL Compatibility Layer
 
 For existing libSQL applications, use the compatibility layer:
