@@ -6182,6 +6182,7 @@ dependencies = [
  "tokio",
  "turso",
  "turso_parser",
+ "turso_pg_client",
 ]
 
 [[package]]
@@ -7344,6 +7345,13 @@ dependencies = [
  "turso_ext",
  "turso_parser",
  "turso_pg_parser",
+]
+
+[[package]]
+name = "turso_pg_client"
+version = "0.8.0-pre.1"
+dependencies = [
+ "thiserror 2.0.16",
 ]
 
 [[package]]

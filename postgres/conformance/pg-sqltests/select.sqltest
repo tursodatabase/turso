@@ -1,0 +1,89 @@
+# Scalar expression evaluation through the PostgreSQL frontend.
+#
+# Coverage here asserts behavior that real PostgreSQL also exhibits, so the
+# corpus stays valid for future differential runs against a stock server.
+
+@database :memory:
+
+test select-integer-literal {
+    SELECT 42;
+}
+expect {
+    42
+}
+
+test select-arithmetic {
+    SELECT 1 + 2 * 3;
+}
+expect {
+    7
+}
+
+test select-float-literal {
+    SELECT 3.14;
+}
+expect {
+    3.14
+}
+
+test select-text-literal {
+    SELECT 'hello';
+}
+expect {
+    hello
+}
+
+test select-concat-operator {
+    SELECT 'foo' || 'bar';
+}
+expect {
+    foobar
+}
+
+test select-multiple-columns {
+    SELECT 1, 'two', 3.5;
+}
+expect {
+    1|two|3.5
+}
+
+test select-null-renders-empty {
+    SELECT NULL;
+}
+expect {
+}
+
+test select-coalesce {
+    SELECT coalesce(NULL, NULL, 'fallback');
+}
+expect {
+    fallback
+}
+
+test select-cast-int-to-text {
+    SELECT 1::text || '!';
+}
+expect {
+    1!
+}
+
+test select-case-expression {
+    SELECT CASE WHEN 1 < 2 THEN 'lt' ELSE 'ge' END;
+}
+expect {
+    lt
+}
+
+test select-string-functions {
+    SELECT upper('abc'), lower('DEF'), length('four');
+}
+expect {
+    ABC|def|4
+}
+
+test select-abs {
+    SELECT abs(-7);
+}
+expect {
+    7
+}

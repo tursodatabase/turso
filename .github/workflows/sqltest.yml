@@ -28,6 +28,8 @@ jobs:
         run: make -C sqlite/conformance build-runner
       - name: Check test syntax
         run: make -C sqlite/conformance check
+      - name: Check pg test syntax
+        run: make -C postgres/conformance check
 
   sqltest-run-cli:
     name: Run SQL tests (CLI backend)
@@ -97,6 +99,22 @@ jobs:
       - name: Run tests (MVCC)
         working-directory: sqlite/conformance
         run: make run-js MVCC=1
+
+  sqltest-run-pg:
+    name: Run SQL tests (pg backend)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+      - name: Build tursopg
+        run: make -C postgres/conformance build-tursopg
+      - name: Build test runner
+        run: make -C postgres/conformance build-runner
+      - name: Run tests
+        run: make -C postgres/conformance run
 
   sqltest-sqlite:
     name: Run SQL tests (SQLite)

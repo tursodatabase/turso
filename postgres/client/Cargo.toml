@@ -1,0 +1,17 @@
+[package]
+name = "turso_pg_client"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Minimal PostgreSQL wire-protocol client for Turso test tooling"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

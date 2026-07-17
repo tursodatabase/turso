@@ -1,0 +1,96 @@
+# Table DDL and DML through the PostgreSQL frontend: PostgreSQL type names,
+# multi-row inserts, updates, deletes, aggregates, and grouping.
+
+@database :memory:
+
+setup users {
+    CREATE TABLE users (id serial, name varchar(50), age int, active boolean);
+    INSERT INTO users (id, name, age, active) VALUES
+        (1, 'alice', 30, true),
+        (2, 'bob', 25, false),
+        (3, 'carol', 35, true);
+}
+
+@setup users
+test table-select-all {
+    SELECT id, name, age FROM users ORDER BY id;
+}
+expect {
+    1|alice|30
+    2|bob|25
+    3|carol|35
+}
+
+@setup users
+test table-where-boolean-column {
+    SELECT name FROM users WHERE active ORDER BY name;
+}
+expect {
+    alice
+    carol
+}
+
+@setup users
+test table-update {
+    UPDATE users SET age = age + 1 WHERE name = 'bob';
+    SELECT age FROM users WHERE name = 'bob';
+}
+expect {
+    26
+}
+
+@setup users
+test table-delete {
+    DELETE FROM users WHERE age > 34;
+    SELECT count(*) FROM users;
+}
+expect {
+    2
+}
+
+@setup users
+test table-aggregates {
+    SELECT count(*), min(age), max(age) FROM users;
+}
+expect {
+    3|25|35
+}
+
+@setup users
+test table-group-by-having {
+    SELECT active, count(*) FROM users GROUP BY active HAVING count(*) >= 2 ORDER BY active;
+}
+expect {
+    t|2
+}
+
+@setup users
+test table-order-by-limit {
+    SELECT name FROM users ORDER BY age DESC LIMIT 2;
+}
+expect {
+    carol
+    alice
+}
+
+test table-insert-null {
+    CREATE TABLE t (a int, b text);
+    INSERT INTO t VALUES (1, NULL);
+    SELECT a, b FROM t;
+}
+expect {
+    1|
+}
+
+test table-join {
+    CREATE TABLE dept (id int, name text);
+    CREATE TABLE emp (id int, dept_id int, name text);
+    INSERT INTO dept VALUES (1, 'eng'), (2, 'ops');
+    INSERT INTO emp VALUES (1, 1, 'alice'), (2, 1, 'bob'), (3, 2, 'carol');
+    SELECT d.name, e.name FROM emp e JOIN dept d ON e.dept_id = d.id ORDER BY e.id;
+}
+expect {
+    eng|alice
+    eng|bob
+    ops|carol
+}

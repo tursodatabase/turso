@@ -26,6 +26,7 @@ members = [
     "tests",
     "sqlite/parser",
     "postgres/cli",
+    "postgres/client",
     "postgres/frontend",
     "postgres/parser",
     "postgres/regress",
@@ -111,6 +112,7 @@ turso_ext = { path = "extensions/core", version = "0.8.0-pre.1" }
 turso_macros = { path = "macros", version = "0.8.0-pre.1" }
 turso_parser = { path = "sqlite/parser", version = "0.8.0-pre.1" }
 turso_pg = { path = "postgres/frontend", version = "0.8.0-pre.1" }
+turso_pg_client = { path = "postgres/client", version = "0.8.0-pre.1" }
 turso_pg_parser = { path = "postgres/parser", version = "0.8.0-pre.1" }
 turso_pg_server = { path = "postgres/server", version = "0.8.0-pre.1" }
 sql_generation = { path = "sql_generation" }
