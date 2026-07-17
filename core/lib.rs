@@ -1087,24 +1087,6 @@ impl Database {
         )
     }
 
-    pub fn open(
-        io: Arc<dyn IO>,
-        path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<Arc<Database>> {
-        Self::open_with_flags(
-            io,
-            path,
-            db_file,
-            OpenFlags::default(),
-            DatabaseOpts::new(),
-            None,
-            None,
-            dialect,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn open_with_flags(
         io: Arc<dyn IO>,
