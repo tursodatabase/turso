@@ -453,6 +453,31 @@ test('transaction pool grows on demand and shrinks to poolSize', async () => {
     expect((db as any).pool.some((entry) => entry.busy)).toBe(false);
 })
 
+// A statement prepared before a transaction() call must join the transaction
+// when executed inside the callback (better-sqlite3 semantics): its writes
+// commit and roll back with the transaction instead of running autocommit on
+// the main connection.
+test('statement prepared outside transaction() joins the transaction', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE t(x)');
+    const insert = await db.prepare('INSERT INTO t VALUES (?)');
+
+    const failing = db.transaction(async () => {
+        await insert.run([1]);
+        throw new Error('abort transaction');
+    });
+    await expect(failing()).rejects.toThrow('abort transaction');
+    // the insert executed inside the transaction, so the rollback erased it
+    expect(await db.all('SELECT x FROM t')).toEqual([]);
+
+    await db.transaction(async () => { await insert.run([2]); })();
+    expect(await db.all('SELECT x FROM t')).toEqual([{ x: 2 }]);
+
+    // the statement keeps working on the main connection afterwards
+    await insert.run([3]);
+    expect(await db.all('SELECT x FROM t ORDER BY x')).toEqual([{ x: 2 }, { x: 3 }]);
+})
+
 // A transaction function invoked from inside another transaction's callback
 // would run on a second pooled connection and deadlock against the outer
 // transaction on the write lock, so it must be rejected upfront.

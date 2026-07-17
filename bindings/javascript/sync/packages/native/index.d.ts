@@ -245,7 +245,7 @@ export declare class SyncEngine {
    * configured by the sync engine (CDC pragma, WAL auto-actions). Used by
    * the JS layer to run transaction() calls on dedicated connections.
    */
-  connectNew(): GeneratorHolder
+  connectRw(): GeneratorHolder
   stats(): GeneratorHolder
   wait(): GeneratorHolder
   apply(changes: SyncEngineChanges): GeneratorHolder

@@ -413,10 +413,25 @@ class Database {
     }
 
     try {
+      // Routes each execution of the statement to the connection that must
+      // run it: inside a transaction() callback that is the transaction's
+      // pooled connection, so pre-prepared statements join the transaction
+      // (better-sqlite3 semantics). `conn` is a getter because for lazily
+      // prepared statements the connection exists only after the first
+      // execution triggers connect().
+      const route = () => {
+        const target = this.target();
+        return {
+          db: target,
+          get conn() { return target.mustConn(); },
+          lock: target.execLock,
+          primary: target === this,
+        };
+      };
       if (this.connected) {
-        return new Statement(maybeValue(this.mustConn().prepare(sql)), () => this.mustConn(), this.execLock, this.ioStep) as unknown as Promise<Statement>;
+        return new Statement(maybeValue(this.mustConn().prepare(sql)), sql, () => this.mustConn(), route, this.ioStep) as unknown as Promise<Statement>;
       } else {
-        return new Statement(maybePromise(() => this.connect().then(() => this.mustConn().prepare(sql))), () => this.mustConn(), this.execLock, this.ioStep) as unknown as Promise<Statement>;
+        return new Statement(maybePromise(() => this.connect().then(() => this.mustConn().prepare(sql))), sql, () => this.mustConn(), route, this.ioStep) as unknown as Promise<Statement>;
       }
     } catch (err) {
       throw convertError(err);
@@ -430,13 +445,16 @@ class Database {
    * transactions (and concurrent non-transaction statements on this
    * database) never interleave with the transaction's BEGIN..COMMIT window.
    * Statements issued via this database inside the callback's async context
-   * are routed to that pooled connection; statements prepared *outside* the
-   * callback keep targeting the main connection and do not join the
-   * transaction. Calling a transaction function from inside another
-   * transaction's callback is not supported and throws: the inner
-   * transaction would run on a second connection and deadlock against the
-   * outer one on the write lock. On platforms without async-context
-   * tracking the transaction runs directly on the main connection.
+   * are routed to that pooled connection, including statements prepared
+   * *before* the callback — they are transparently re-prepared on the
+   * transaction's connection so they join the transaction, matching
+   * better-sqlite3. Statements prepared *inside* the callback stay pinned to
+   * the transaction's connection and should not be used after it completes.
+   * Calling a transaction function from inside another transaction's
+   * callback is not supported and throws: the inner transaction would run
+   * on a second connection and deadlock against the outer one on the write
+   * lock. On platforms without async-context tracking the transaction runs
+   * directly on the main connection.
    *
    * @param {function} fn - The function to wrap in a transaction.
    */
@@ -905,21 +923,80 @@ function maybeValue<T>(value: T): MaybeLazy<T> {
 }
 
 /**
+ * The connection a statement execution is routed to: the pooled connection
+ * of the enclosing `transaction()` callback, or the statement's own database.
+ */
+interface StatementRoute {
+  db: Database;
+  conn: NativeConnection;
+  lock: AsyncLock;
+  primary: boolean;
+}
+
+/**
  * Statement represents a prepared SQL statement that can be executed.
+ *
+ * A statement is prepared on one connection, but executions issued inside a
+ * `transaction()` callback must join that transaction (matching
+ * better-sqlite3, where statements always run on the connection's current
+ * transaction). Since a native statement cannot switch connections, the
+ * statement is transparently re-prepared on the transaction's pooled
+ * connection and executed there.
  */
 class Statement {
   private stmt: MaybeLazy<NativeStatement>;
+  private sql: string;
   // Accessor rather than a direct reference: for lazily prepared statements
   // the connection does not exist until the owning database connects.
   private conn: () => NativeConnection;
-  private execLock: AsyncLock;
+  // Resolves the connection that must execute the next call. Built by
+  // Database.prepare() so it can reach the database's routing state.
+  private route: () => StatementRoute;
   private ioStep: () => Promise<void>;
+  // Presentation state replayed onto re-prepared per-transaction statements
+  // (the native statement tracks it per handle). Last call wins, matching
+  // the native setters.
+  private presentation: ['raw' | 'pluck', any] | null = null;
+  private safeIntegersMode: any = undefined;
+  private permanentBinds: any[] | null = null;
+  // Native statements re-prepared on pooled transaction connections, keyed
+  // by the pooled Database. WeakMap, so a pooled connection discarded by the
+  // pool releases its statements.
+  private txnStmts: WeakMap<Database, NativeStatement> = new WeakMap();
 
-  constructor(stmt: MaybeLazy<NativeStatement>, conn: () => NativeConnection, execLock: AsyncLock, ioStep: () => Promise<void>) {
+  constructor(stmt: MaybeLazy<NativeStatement>, sql: string, conn: () => NativeConnection, route: () => StatementRoute, ioStep: () => Promise<void>) {
     this.stmt = stmt;
+    this.sql = sql;
     this.conn = conn;
-    this.execLock = execLock;
+    this.route = route;
     this.ioStep = ioStep;
+  }
+
+  /**
+   * Returns the native statement executing on the routed connection: the
+   * statement itself, or its re-prepared twin on the transaction's pooled
+   * connection.
+   */
+  private async resolveNative(route: StatementRoute): Promise<NativeStatement> {
+    if (route.primary) {
+      return await this.stmt.resolve();
+    }
+    let stmt = this.txnStmts.get(route.db);
+    if (stmt == null) {
+      stmt = route.conn.prepare(this.sql);
+      this.txnStmts.set(route.db, stmt);
+      if (this.permanentBinds != null) {
+        bindParams(stmt, this.permanentBinds);
+      }
+    }
+    if (this.presentation != null) {
+      const [mode, arg] = this.presentation;
+      if (mode === 'raw') { stmt.raw(arg); } else { stmt.pluck(arg); }
+    }
+    if (this.safeIntegersMode !== undefined) {
+      stmt.safeIntegers(this.safeIntegersMode);
+    }
+    return stmt;
   }
 
   /**
@@ -928,6 +1005,7 @@ class Statement {
    * @param raw Enable or disable raw mode. If you don't pass the parameter, raw mode is enabled.
    */
   raw(raw) {
+    this.presentation = ['raw', raw];
     this.stmt.apply(s => s.raw(raw));
     return this;
   }
@@ -938,6 +1016,7 @@ class Statement {
    * @param pluckMode Enable or disable pluck mode. If you don't pass the parameter, pluck mode is enabled.
    */
   pluck(pluckMode) {
+    this.presentation = ['pluck', pluckMode];
     this.stmt.apply(s => s.pluck(pluckMode));
     return this;
   }
@@ -948,6 +1027,7 @@ class Statement {
    * @param {boolean} [toggle] - Whether to use safe integers.
    */
   safeIntegers(toggle) {
+    this.safeIntegersMode = toggle === undefined ? true : toggle;
     this.stmt.apply(s => s.safeIntegers(toggle));
     return this;
   }
@@ -977,15 +1057,16 @@ class Statement {
    * Executes the SQL statement and returns an info object.
    */
   async run(...bindParameters) {
-    let stmt = await this.stmt.resolve();
+    const route = this.route();
+    const stmt = await this.resolveNative(route);
     const { params, queryOptions } = splitBindParameters(bindParameters);
 
     stmt.setQueryTimeout(queryOptions);
     bindParams(stmt, toBindArgs(params));
 
-    const conn = this.conn();
+    const conn = route.conn;
     const totalChangesBefore = conn.totalChanges();
-    await this.execLock.acquire();
+    await route.lock.acquire();
     try {
       while (true) {
         const stepResult = await stmt.stepSync();
@@ -1008,7 +1089,7 @@ class Statement {
       return { changes, lastInsertRowid };
     } finally {
       stmt.reset();
-      this.execLock.release();
+      route.lock.release();
     }
   }
 
@@ -1018,13 +1099,14 @@ class Statement {
    * @param bindParameters - The bind parameters for executing the statement.
    */
   async get(...bindParameters) {
-    let stmt = await this.stmt.resolve();
+    const route = this.route();
+    const stmt = await this.resolveNative(route);
     const { params, queryOptions } = splitBindParameters(bindParameters);
 
     stmt.setQueryTimeout(queryOptions);
     bindParams(stmt, toBindArgs(params));
 
-    await this.execLock.acquire();
+    await route.lock.acquire();
     let row = undefined;
     try {
       while (true) {
@@ -1044,7 +1126,7 @@ class Statement {
       return row;
     } finally {
       stmt.reset();
-      this.execLock.release();
+      route.lock.release();
     }
   }
 
@@ -1054,13 +1136,14 @@ class Statement {
    * @param bindParameters - The bind parameters for executing the statement.
    */
   async *iterate(...bindParameters) {
-    let stmt = await this.stmt.resolve();
+    const route = this.route();
+    const stmt = await this.resolveNative(route);
     const { params, queryOptions } = splitBindParameters(bindParameters);
 
     stmt.setQueryTimeout(queryOptions);
     bindParams(stmt, toBindArgs(params));
 
-    await this.execLock.acquire();
+    await route.lock.acquire();
     try {
       while (true) {
         const stepResult = await stmt.stepSync();
@@ -1077,7 +1160,7 @@ class Statement {
       }
     } finally {
       stmt.reset();
-      this.execLock.release();
+      route.lock.release();
     }
   }
 
@@ -1087,14 +1170,15 @@ class Statement {
    * @param bindParameters - The bind parameters for executing the statement.
    */
   async all(...bindParameters) {
-    let stmt = await this.stmt.resolve();
+    const route = this.route();
+    const stmt = await this.resolveNative(route);
     const { params, queryOptions } = splitBindParameters(bindParameters);
 
     stmt.setQueryTimeout(queryOptions);
     bindParams(stmt, toBindArgs(params));
     const rows: any[] = [];
 
-    await this.execLock.acquire();
+    await route.lock.acquire();
     try {
       while (true) {
         const stepResult = await stmt.stepSync();
@@ -1113,7 +1197,7 @@ class Statement {
     }
     finally {
       stmt.reset();
-      this.execLock.release();
+      route.lock.release();
     }
   }
 
@@ -1137,6 +1221,7 @@ class Statement {
    */
   bind(...bindParameters) {
     try {
+      this.permanentBinds = bindParameters;
       bindParams(this.stmt, bindParameters);
       return this;
     } catch (err) {

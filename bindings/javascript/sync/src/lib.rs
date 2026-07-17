@@ -449,7 +449,7 @@ impl SyncEngine {
     /// configured by the sync engine (CDC pragma, WAL auto-actions). Used by
     /// the JS layer to run transaction() calls on dedicated connections.
     #[napi]
-    pub fn connect_new(&self) -> GeneratorHolder {
+    pub fn connect_rw(&self) -> GeneratorHolder {
         self.run(async move |coro, guard| {
             let sync_engine = try_read(guard)?;
             let sync_engine = try_unwrap(&sync_engine)?;

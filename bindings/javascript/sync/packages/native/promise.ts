@@ -177,7 +177,7 @@ class Database extends DatabasePromise {
             return super.newPooledNativeConnection();
         }
         try {
-            return await run(this.#runner!, this.#engine.connectNew());
+            return await run(this.#runner!, this.#engine.connectRw());
         } catch (err) {
             // connection setup runs a short write transaction (CDC pragma), so
             // an active write transaction can make it fail with SQLITE_BUSY
