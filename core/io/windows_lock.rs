@@ -779,6 +779,41 @@ mod tests {
     }
 
     #[test]
+    fn shared_wal_locks_for_different_files_use_independent_entries() {
+        let (_first_file, first_path, first_state) = shared_wal_test_state();
+        let (_second_file, second_path, second_state) = shared_wal_test_state();
+        shared_wal_lock_byte(&first_path, &first_state, 0, false)
+            .expect("acquire first shared lifetime lock");
+        shared_wal_lock_byte(&second_path, &second_state, 0, false)
+            .expect("acquire second shared lifetime lock");
+
+        let first_entry = first_state
+            .lock()
+            .entry
+            .as_ref()
+            .expect("first lock entry")
+            .entry
+            .clone();
+        let second_entry = second_state
+            .lock()
+            .entry
+            .as_ref()
+            .expect("second lock entry")
+            .entry
+            .clone();
+        assert!(!Arc::ptr_eq(&first_entry, &second_entry));
+        drop(first_entry);
+        drop(second_entry);
+
+        shared_wal_unlock_byte(&first_path, &first_state, 0)
+            .expect("release first shared lifetime lock");
+        release_shared_wal_locks_on_drop(&first_path, &first_state);
+        shared_wal_unlock_byte(&second_path, &second_state, 0)
+            .expect("release second shared lifetime lock");
+        release_shared_wal_locks_on_drop(&second_path, &second_state);
+    }
+
+    #[test]
     fn failed_lifetime_lock_restoration_poisoned_entry_cleans_up_on_drop() {
         let (_file, path, state) = shared_wal_test_state();
         shared_wal_lock_byte(&path, &state, 0, false).expect("acquire shared lifetime lock");
