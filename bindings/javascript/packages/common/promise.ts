@@ -186,6 +186,14 @@ class Database {
   // entries below are lazily created for concurrent transactions.
   private pool: { db: Database, busy: boolean }[] = [];
   private poolSize: number;
+  // Serializes pooled-connection creation: connection setup may need a write
+  // transaction (the sync engine runs the CDC pragma), so concurrent
+  // creations would fail with "database is busy".
+  private poolCreateLock: AsyncLock = new AsyncLock();
+  // Transactions waiting for a pooled connection to free up because a new
+  // one could not be created (e.g. connection setup is blocked by an active
+  // write transaction).
+  private poolWaiters: Array<{ resolve: (db: Database) => void, reject: (err: any) => void }> = [];
   private asyncContext: TransactionAsyncContext | null;
   // Pooled wrappers share the native database handle with their owner and
   // must not close it.
@@ -225,53 +233,101 @@ class Database {
   }
 
   /**
-   * Creates a new native connection for the transaction pool, or returns
-   * null when the database cannot open extra connections. Subclasses whose
-   * connections are managed externally (the sync engine) override this to
-   * mint properly configured connections through their owner.
+   * Creates a new native connection for the transaction pool. Returns null
+   * only when a pooled connection cannot be created right now (creation is
+   * temporarily blocked, e.g. by an active write transaction) so the caller
+   * waits for a pooled connection to free up instead. Hard failures are
+   * thrown and abort the transaction rather than silently downgrading its
+   * isolation. Subclasses whose connections are managed externally (the
+   * sync engine) override this to mint properly configured connections
+   * through their owner.
    */
   protected async newPooledNativeConnection(): Promise<NativeConnection | null> {
     try {
       return this.db.connectSync();
-    } catch {
-      return null;
+    } catch (err) {
+      throw convertError(err);
     }
   }
 
-  /**
-   * Takes an idle pooled connection for a transaction, lazily connecting a
-   * new one when all are busy. Falls back to this database itself when the
-   * platform has no async-context tracking or the database cannot open
-   * extra connections.
-   */
-  private async acquireTransactionConnection(): Promise<Database> {
-    if (this.asyncContext == null) {
-      return this;
-    }
+  /** Takes an idle pool entry, if any. */
+  private takeIdlePooled(): Database | null {
     for (const entry of this.pool) {
       if (!entry.busy) {
         entry.busy = true;
         return entry.db;
       }
     }
-    const native = await this.newPooledNativeConnection();
-    if (native == null) {
-      return this;
-    }
-    if (this.safeIntegersDefault !== undefined) {
-      native.defaultSafeIntegers(this.safeIntegersDefault);
-    }
-    const pooled = new Database(this.db, this.ioStep);
-    pooled.conn = native;
-    pooled.connected = true;
-    pooled.ownsDb = false;
-    this.pool.push({ db: pooled, busy: true });
-    return pooled;
+    return null;
   }
 
   /**
-   * Returns a pooled connection after a transaction ends. Keeps at most
-   * `poolSize` idle connections alive and deallocates the rest.
+   * Takes an idle pooled connection for a transaction, lazily connecting a
+   * new one when all are busy. When a new connection cannot be created
+   * (connection setup may be blocked by an active write transaction), waits
+   * for a running transaction to release its connection instead. Falls back
+   * to this database itself only when the platform has no async-context
+   * tracking or no pooled connection can exist at all.
+   */
+  private async acquireTransactionConnection(): Promise<Database> {
+    if (this.asyncContext == null) {
+      return this;
+    }
+    const idle = this.takeIdlePooled();
+    if (idle != null) {
+      return idle;
+    }
+    await this.poolCreateLock.acquire();
+    try {
+      // a transaction may have finished while waiting for the lock
+      const idle = this.takeIdlePooled();
+      if (idle != null) {
+        return idle;
+      }
+      const native = await this.newPooledNativeConnection();
+      if (native != null) {
+        if (this.safeIntegersDefault !== undefined) {
+          native.defaultSafeIntegers(this.safeIntegersDefault);
+        }
+        const pooled = new Database(this.db, this.ioStep);
+        pooled.conn = native;
+        pooled.connected = true;
+        pooled.ownsDb = false;
+        this.pool.push({ db: pooled, busy: true });
+        return pooled;
+      }
+    } finally {
+      this.poolCreateLock.release();
+    }
+    if (this.pool.length > 0) {
+      // creation failed but pooled connections exist: a transaction may have
+      // released one while we were trying to create, otherwise reuse the
+      // first connection that frees up so transactions never share one
+      const idle = this.takeIdlePooled();
+      if (idle != null) {
+        return idle;
+      }
+      return new Promise<Database>((resolve, reject) => { this.poolWaiters.push({ resolve, reject }); });
+    }
+    // no pooled connection exists and a new one cannot be created right now:
+    // the write lock is held outside the pool (a raw BEGIN on the main
+    // connection or a sync-engine operation). Fail loudly rather than run
+    // the transaction on the shared main connection with degraded isolation.
+    throw new SqliteError(
+      "cannot create a connection for the transaction: database is busy",
+      "SQLITE_BUSY",
+      "SQLITE_BUSY",
+    );
+  }
+
+  /**
+   * Returns a pooled connection after a transaction ends: hands it to a
+   * waiting transaction if any, otherwise keeps at most `poolSize` idle
+   * connections alive and deallocates the rest. A connection that is still
+   * inside a transaction (COMMIT and ROLLBACK both failed) or no longer
+   * open is discarded instead of being reused - handing it out would make
+   * the next transaction fail on BEGIN, and an abandoned write transaction
+   * would hold the write lock forever.
    */
   private async releaseTransactionConnection(pooled: Database) {
     if (pooled === this) {
@@ -279,6 +335,33 @@ class Database {
     }
     const entry = this.pool.find(e => e.db === pooled);
     if (entry === undefined) {
+      return;
+    }
+    let dirty = true;
+    try {
+      dirty = pooled.conn == null || !pooled.conn.open || pooled.conn.inTransaction();
+    } catch {
+      // treat a connection we cannot even inspect as dirty
+    }
+    if (dirty) {
+      this.pool.splice(this.pool.indexOf(entry), 1);
+      try {
+        await pooled.close();
+      } catch {
+        // the connection is discarded either way
+      }
+      const waiter = this.poolWaiters.shift();
+      if (waiter !== undefined) {
+        // the discarded connection cannot serve the waiter - route it back
+        // through the normal acquire path (fresh connection or the next
+        // release) without blocking this transaction's completion on it
+        this.acquireTransactionConnection().then(waiter.resolve, waiter.reject);
+      }
+      return;
+    }
+    const waiter = this.poolWaiters.shift();
+    if (waiter !== undefined) {
+      waiter.resolve(entry.db);
       return;
     }
     entry.busy = false;
@@ -349,8 +432,11 @@ class Database {
    * Statements issued via this database inside the callback's async context
    * are routed to that pooled connection; statements prepared *outside* the
    * callback keep targeting the main connection and do not join the
-   * transaction. On platforms without async-context tracking the transaction
-   * runs directly on the main connection.
+   * transaction. Calling a transaction function from inside another
+   * transaction's callback is not supported and throws: the inner
+   * transaction would run on a second connection and deadlock against the
+   * outer one on the write lock. On platforms without async-context
+   * tracking the transaction runs directly on the main connection.
    *
    * @param {function} fn - The function to wrap in a transaction.
    */
@@ -363,6 +449,9 @@ class Database {
     const db = this;
     const wrapTxn = (mode) => {
       return async (...bindParameters) => {
+        if (db.target() !== db) {
+          throw new Error("nested transactions are not supported");
+        }
         if (!db.connected) {
           await db.connect();
         }
@@ -745,6 +834,9 @@ class Database {
    * Closes the database connection.
    */
   async close() {
+    for (const waiter of this.poolWaiters.splice(0)) {
+      waiter.reject(new TypeError("The database connection is not open"));
+    }
     for (const entry of this.pool.splice(0)) {
       await entry.db.close();
     }

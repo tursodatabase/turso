@@ -5248,6 +5248,7 @@ mod tests {
             push_operations_threshold: None,
             pull_bytes_threshold: None,
             logical_mvcc_pull: true,
+            connect_rw_busy_timeout: crate::database_sync_engine::DEFAULT_CONNECT_RW_BUSY_TIMEOUT,
         };
         let internal_schema_change = DatabaseTapeRowChange {
             change_id: 1,

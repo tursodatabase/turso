@@ -453,6 +453,77 @@ test('transaction pool grows on demand and shrinks to poolSize', async () => {
     expect((db as any).pool.some((entry) => entry.busy)).toBe(false);
 })
 
+// A transaction function invoked from inside another transaction's callback
+// would run on a second pooled connection and deadlock against the outer
+// transaction on the write lock, so it must be rejected upfront.
+test('nested transaction() calls are forbidden', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE t(x)');
+
+    const inner = db.transaction(async () => {
+        await db.run('INSERT INTO t VALUES (2)');
+    });
+    const outer = db.transaction(async () => {
+        await db.run('INSERT INTO t VALUES (1)');
+        await inner();
+    });
+
+    await expect(outer()).rejects.toThrow('nested transactions are not supported');
+    // the outer transaction rolled back cleanly
+    expect(await db.all('SELECT x FROM t')).toEqual([]);
+})
+
+// When COMMIT and ROLLBACK both fail, the pooled connection is left with an
+// open transaction; returning it to the pool would make every following
+// transaction fail on BEGIN and keep the write lock held forever. It must be
+// discarded instead.
+test('a connection that fails to roll back is discarded, not pooled', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE t(x)');
+
+    // populate the pool with one connection
+    await db.transaction(async () => { await db.run('INSERT INTO t VALUES (0)'); })();
+    expect((db as any).pool.length).toBe(1);
+
+    const pooled = (db as any).pool[0].db;
+    const originalExec = pooled.exec.bind(pooled);
+    pooled.exec = async (sql: string, opts?: any) => {
+        if (sql === 'ROLLBACK') {
+            throw new Error('injected rollback failure');
+        }
+        return originalExec(sql, opts);
+    };
+
+    const failing = db.transaction(async () => {
+        await db.run('INSERT INTO t VALUES (1)');
+        throw new Error('abort transaction');
+    });
+    await expect(failing()).rejects.toThrow();
+
+    // the dirty connection was closed and dropped from the pool
+    expect((db as any).pool.length).toBe(0);
+
+    // dropping it released the write lock: new transactions work again
+    await db.transaction(async () => { await db.run('INSERT INTO t VALUES (2)'); })();
+    expect(await db.all('SELECT x FROM t ORDER BY x')).toEqual([{ x: 0 }, { x: 2 }]);
+})
+
+// Failing to create a pooled connection must never silently run the
+// transaction on the shared main connection with degraded isolation: hard
+// errors propagate, and "cannot create right now" with no pooled connection
+// to wait for fails with SQLITE_BUSY semantics.
+test('transaction() propagates pooled-connection creation failures', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE t(x)');
+
+    (db as any).newPooledNativeConnection = async () => { throw new Error('injected connect failure'); };
+    await expect(db.transaction(async () => { })()).rejects.toThrow('injected connect failure');
+
+    (db as any).newPooledNativeConnection = async () => null;
+    await expect(db.transaction(async () => { })()).rejects.toThrow('cannot create a connection for the transaction');
+    expect((db as any).pool.length).toBe(0);
+})
+
 test('transaction.concurrent uses BEGIN CONCURRENT', async () => {
     const db = await connect(':memory:');
     const originalExec = db.exec;

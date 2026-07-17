@@ -258,6 +258,8 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             push_operations_threshold: sync_config.push_operations_threshold,
             pull_bytes_threshold: sync_config.pull_bytes_threshold,
             logical_mvcc_pull: sync_config.logical_mvcc_pull,
+            connect_rw_busy_timeout:
+                turso_sync_engine::database_sync_engine::DEFAULT_CONNECT_RW_BUSY_TIMEOUT,
         };
         let is_memory = db_config.path == ":memory:";
         let db_io: Option<Arc<dyn IO>> = if is_memory {

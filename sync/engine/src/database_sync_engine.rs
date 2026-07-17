@@ -40,6 +40,11 @@ use crate::{
     Result,
 };
 
+/// Default busy timeout for user-facing connections created by
+/// [DatabaseSyncEngine::connect_rw] (matches better-sqlite3's default
+/// `timeout` option).
+pub const DEFAULT_CONNECT_RW_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Clone, Debug)]
 pub struct DatabaseSyncEngineOpts {
     pub remote_url: Option<String>,
@@ -83,6 +88,11 @@ pub struct DatabaseSyncEngineOpts {
     /// local configuration can support them. Call sites should keep this
     /// `false` until logical apply is wired end to end.
     pub logical_mvcc_pull: bool,
+    /// Busy timeout applied to user-facing connections created by
+    /// [`DatabaseSyncEngine::connect_rw`], so they wait out transient
+    /// write-lock contention instead of failing immediately with
+    /// "database is busy". Defaults to [`DEFAULT_CONNECT_RW_BUSY_TIMEOUT`].
+    pub connect_rw_busy_timeout: std::time::Duration,
 }
 
 pub struct DataStats {
@@ -553,6 +563,7 @@ mod tests {
             push_operations_threshold: None,
             pull_bytes_threshold: None,
             logical_mvcc_pull: true,
+            connect_rw_busy_timeout: super::DEFAULT_CONNECT_RW_BUSY_TIMEOUT,
         }
     }
 
@@ -4316,6 +4327,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             turso_core::WalAutoActions::empty(),
             "tape must be configured to have all auto-WAL actions disabled"
         );
+        // User-facing connections wait out transient write-lock contention
+        // (concurrent user transactions, the short CDC-pragma write
+        // transaction of another connection being set up) instead of failing
+        // immediately with "database is busy". The busy handler yields
+        // through the IO loop, so waiting does not block the event loop.
+        conn.set_busy_timeout(self.opts.connect_rw_busy_timeout);
         Ok(conn)
     }
 

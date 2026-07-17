@@ -13,7 +13,9 @@ use napi::bindgen_prelude::{AsyncTask, Either5, Null};
 use napi_derive::napi;
 use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
-    database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts},
+    database_sync_engine::{
+        DatabaseSyncEngine, DatabaseSyncEngineOpts, DEFAULT_CONNECT_RW_BUSY_TIMEOUT,
+    },
     database_sync_engine_io::SyncEngineIo,
     database_sync_operations::SyncEngineIoStats,
     types::{
@@ -371,6 +373,7 @@ impl SyncEngine {
             push_operations_threshold: self.opts.push_operations_threshold,
             pull_bytes_threshold: self.opts.pull_bytes_threshold,
             logical_mvcc_pull: self.opts.logical_mvcc_pull,
+            connect_rw_busy_timeout: DEFAULT_CONNECT_RW_BUSY_TIMEOUT,
         };
 
         let io = self.io()?;

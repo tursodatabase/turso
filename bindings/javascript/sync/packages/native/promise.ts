@@ -178,8 +178,16 @@ class Database extends DatabasePromise {
         }
         try {
             return await run(this.#runner!, this.#engine.connectNew());
-        } catch {
-            return null;
+        } catch (err) {
+            // connection setup runs a short write transaction (CDC pragma), so
+            // an active write transaction can make it fail with SQLITE_BUSY
+            // semantics; report "cannot create right now" so the transaction
+            // waits for a pooled connection to free up. Anything else is a
+            // hard failure and must abort the transaction.
+            if (/busy|locked/i.test(String((err as any)?.message ?? err))) {
+                return null;
+            }
+            throw err;
         }
     }
     /**

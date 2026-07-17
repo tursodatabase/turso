@@ -484,6 +484,95 @@ test('concurrent transaction() calls run on pooled connections', async ({ server
     expect(remote).toEqual([{ tag: 'committed', cnt: 10 }]);
 })
 
+// An independent autocommit statement racing a failing transaction must stay
+// on the main connection: it must not slip into the transaction's
+// BEGIN..ROLLBACK window and be silently erased by the rollback.
+test('statement racing a transaction() must not be lost to its rollback', async ({ server }) => {
+    const db = await connect({ path: ':memory:', url: server.dbUrl() });
+    await db.exec("CREATE TABLE IF NOT EXISTS txn_race(tag TEXT)");
+    await db.exec("DELETE FROM txn_race");
+
+    const failing = db.transaction(async () => {
+        await db.exec("INSERT INTO txn_race VALUES ('txn')");
+        await new Promise((resolve) => setImmediate(resolve));
+        throw new Error('abort transaction');
+    });
+
+    const [txnResult, plainResult] = await Promise.allSettled([
+        failing(),
+        db.exec("INSERT INTO txn_race VALUES ('plain')"),
+    ]);
+    expect(txnResult.status).toBe('rejected');
+    expect((txnResult as PromiseRejectedResult).reason.message).toBe('abort transaction');
+    expect(plainResult.status).toBe('fulfilled');
+
+    // the transaction rolled back, but the successful independent insert must survive
+    expect(await (await db.prepare('SELECT tag FROM txn_race')).all()).toEqual([{ tag: 'plain' }]);
+})
+
+// The transaction pool of a synced database grows by one engine-configured
+// connection per concurrent transaction and shrinks back to poolSize once
+// they finish.
+test('transaction pool grows on demand and shrinks to poolSize', async ({ server }) => {
+    const db = await connect({ path: ':memory:', url: server.dbUrl(), poolSize: 2 });
+    await db.exec("CREATE TABLE IF NOT EXISTS txn_gate(x)");
+
+    // read transactions so all three can stay open concurrently
+    const gate: { resolve: () => void, promise: Promise<void> }[] = [];
+    const txn = db.transaction(async () => {
+        await (await db.prepare('SELECT COUNT(*) AS cnt FROM txn_gate')).all();
+        let resolve;
+        const promise = new Promise<void>((r) => { resolve = r; });
+        gate.push({ resolve, promise });
+        await promise;
+    });
+
+    // three transactions suspended mid-body: one pooled connection each
+    const tasks = [txn(), txn(), txn()];
+    while (gate.length < 3) {
+        await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect((db as any).pool.length).toBe(3);
+    expect((db as any).pool.every((entry) => entry.busy)).toBe(true);
+
+    for (const g of gate) { g.resolve(); }
+    await Promise.all(tasks);
+
+    // idle connections beyond poolSize are deallocated
+    expect((db as any).pool.length).toBe(2);
+    expect((db as any).pool.some((entry) => entry.busy)).toBe(false);
+})
+
+// The local-only mode (no url) must pool transactions the same way: a writer
+// racing an aborting reader must not interleave on one connection.
+test('local-only db: concurrent transaction() calls must not interleave', async () => {
+    const db = new Database({ path: ':memory:' });
+    await db.connect();
+    await db.exec('CREATE TABLE txn_local(tag TEXT, i INTEGER)');
+
+    const writer = db.transaction(async (tag: string) => {
+        for (let i = 0; i < 10; i++) {
+            await db.exec(`INSERT INTO txn_local VALUES ('${tag}', ${i})`);
+        }
+    });
+    const abortedReader = db.transaction(async () => {
+        await (await db.prepare('SELECT COUNT(*) AS cnt FROM txn_local')).all();
+        await new Promise((resolve) => setImmediate(resolve));
+        throw new Error('abort transaction');
+    });
+
+    const [committed, aborted] = await Promise.allSettled([
+        writer('committed'),
+        abortedReader(),
+    ]);
+    expect(committed).toEqual({ status: 'fulfilled', value: undefined });
+    expect(aborted.status).toBe('rejected');
+    expect((aborted as PromiseRejectedResult).reason.message).toBe('abort transaction');
+
+    const rows = await (await db.prepare('SELECT tag, COUNT(*) AS cnt FROM txn_local GROUP BY tag')).all();
+    expect(rows).toEqual([{ tag: 'committed', cnt: 10 }]);
+})
+
 test('select-without-push', async ({ server }) => {
     {
         const db = await connect({ path: ':memory:', url: server.dbUrl() });
