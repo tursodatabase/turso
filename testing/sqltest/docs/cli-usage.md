@@ -9,7 +9,7 @@ This document describes the command-line interface for the test runner.
 cargo build --release
 
 # The binary will be at:
-./target/release/test-runner
+./target/release/sqltest
 ```
 
 ## Commands
@@ -19,7 +19,7 @@ cargo build --release
 Run SQL tests from files or directories.
 
 ```bash
-test-runner run <PATHS>... [OPTIONS]
+sqltest run <PATHS>... [OPTIONS]
 ```
 
 #### Arguments
@@ -40,26 +40,26 @@ test-runner run <PATHS>... [OPTIONS]
 
 ```bash
 # Run all tests in a directory
-test-runner run sqlite/conformance/sqlite-sqltests/
+sqltest run sqlite/conformance/sqlite-sqltests/
 
 # Run a specific test file
-test-runner run sqlite/conformance/sqlite-sqltests/select.sqltest
+sqltest run sqlite/conformance/sqlite-sqltests/select.sqltest
 
 # Run multiple paths
-test-runner run sqlite/conformance/sqlite-sqltests/select.sqltest sqlite/conformance/sqlite-sqltests/insert/
+sqltest run sqlite/conformance/sqlite-sqltests/select.sqltest sqlite/conformance/sqlite-sqltests/insert/
 
 # Custom binary path
-test-runner run sqlite/conformance/sqlite-sqltests/ --binary ./target/release/tursodb
+sqltest run sqlite/conformance/sqlite-sqltests/ --binary ./target/release/tursodb
 
 # Filter by test name
-test-runner run sqlite/conformance/sqlite-sqltests/ -f "select-*"
-test-runner run sqlite/conformance/sqlite-sqltests/ -f "*-join-*"
+sqltest run sqlite/conformance/sqlite-sqltests/ -f "select-*"
+sqltest run sqlite/conformance/sqlite-sqltests/ -f "*-join-*"
 
 # Limit concurrent jobs
-test-runner run sqlite/conformance/sqlite-sqltests/ -j 4
+sqltest run sqlite/conformance/sqlite-sqltests/ -j 4
 
 # JSON output for CI
-test-runner run sqlite/conformance/sqlite-sqltests/ -o json
+sqltest run sqlite/conformance/sqlite-sqltests/ -o json
 ```
 
 ### `check` - Validate Syntax
@@ -67,17 +67,17 @@ test-runner run sqlite/conformance/sqlite-sqltests/ -o json
 Validate test file syntax without executing tests.
 
 ```bash
-test-runner check <PATHS>...
+sqltest check <PATHS>...
 ```
 
 #### Examples
 
 ```bash
 # Check a single file
-test-runner check sqlite/conformance/sqlite-sqltests/select.sqltest
+sqltest check sqlite/conformance/sqlite-sqltests/select.sqltest
 
 # Check all files in a directory
-test-runner check sqlite/conformance/sqlite-sqltests/
+sqltest check sqlite/conformance/sqlite-sqltests/
 ```
 
 ## Output Formats
@@ -176,7 +176,7 @@ The `--filter` option supports simple glob patterns:
 ```yaml
 - name: Run SQL tests
   run: |
-    test-runner run sqlite/conformance/sqlite-sqltests/ \
+    sqltest run sqlite/conformance/sqlite-sqltests/ \
       --binary ./target/release/tursodb \
       --output json \
       > test-results.json
@@ -209,7 +209,7 @@ Uses `clap` with derive macros for argument parsing:
 
 ```rust
 #[derive(Parser)]
-#[command(name = "test-runner")]
+#[command(name = "sqltest")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

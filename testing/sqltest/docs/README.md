@@ -1,6 +1,6 @@
 # Turso Test Runner Documentation
 
-This directory contains documentation for the test-runner crate.
+This directory contains documentation for the sqltest crate.
 
 ## Quick Start
 
@@ -9,10 +9,10 @@ This directory contains documentation for the test-runner crate.
 cargo build --release
 
 # Check test file syntax
-./target/release/test-runner check sqlite/conformance/sqlite-sqltests/
+./target/release/sqltest check sqlite/conformance/sqlite-sqltests/
 
 # Run tests
-./target/release/test-runner run sqlite/conformance/sqlite-sqltests/ --binary ./target/release/tursodb
+./target/release/sqltest run sqlite/conformance/sqlite-sqltests/ --binary ./target/release/tursodb
 ```
 
 The `.sqltest` corpora live in `sqlite/conformance/` (`sqlite-sqltests/` for
@@ -52,7 +52,7 @@ Example test files are available in the `examples/` directory:
 ## Crate Structure
 
 ```
-test-runner/
+sqltest/
 ├── src/
 │   ├── lib.rs              # Public API exports
 │   ├── main.rs             # CLI binary entry point

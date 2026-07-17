@@ -1,6 +1,13 @@
 use clap::{Parser, Subcommand};
 use miette::{NamedSource, Report};
 use owo_colors::OwoColorize;
+use sqltest::{
+    DatabaseLocation, DefaultDatabases, Format, GeneratorConfig, INTEGRITY_FIXTURE_RELATIVE_PATHS,
+    OutputFormat, ParseError, RunnerConfig, SnapshotUpdateMode, TestRunner,
+    backends::cli::CliBackend, backends::js::JsBackend, backends::rust::RustBackend, create_output,
+    find_all_pending_snapshots, generate_database, generate_integrity_fixture, load_test_files,
+    summarize, tcl_converter,
+};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -9,16 +16,9 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
-use test_runner::{
-    DatabaseLocation, DefaultDatabases, Format, GeneratorConfig, INTEGRITY_FIXTURE_RELATIVE_PATHS,
-    OutputFormat, ParseError, RunnerConfig, SnapshotUpdateMode, TestRunner,
-    backends::cli::CliBackend, backends::js::JsBackend, backends::rust::RustBackend, create_output,
-    find_all_pending_snapshots, generate_database, generate_integrity_fixture, load_test_files,
-    summarize, tcl_converter,
-};
 
 #[derive(Parser)]
-#[command(name = "test-runner")]
+#[command(name = "sqltest")]
 #[command(about = "SQL test runner for Turso/Limbo")]
 struct Cli {
     #[command(subcommand)]
@@ -195,7 +195,7 @@ const DEFAULT_SEED: u64 = 42;
 /// Default number of users to generate
 const DEFAULT_USER_COUNT: usize = 10000;
 fn collect_integrity_fixtures<'a>(
-    test_files: impl Iterator<Item = &'a test_runner::TestFile>,
+    test_files: impl Iterator<Item = &'a sqltest::TestFile>,
 ) -> Vec<String> {
     let mut fixtures = std::collections::BTreeSet::new();
     for file in test_files {
@@ -452,11 +452,11 @@ async fn run_tests(
 /// Simple resolver that holds the paths directly
 struct DefaultDatabasesResolver(Option<PathBuf>, Option<PathBuf>);
 
-impl test_runner::DefaultDatabaseResolver for DefaultDatabasesResolver {
-    fn resolve(&self, location: &test_runner::DatabaseLocation) -> Option<PathBuf> {
+impl sqltest::DefaultDatabaseResolver for DefaultDatabasesResolver {
+    fn resolve(&self, location: &sqltest::DatabaseLocation) -> Option<PathBuf> {
         match location {
-            test_runner::DatabaseLocation::Default => self.0.clone(),
-            test_runner::DatabaseLocation::DefaultNoRowidAlias => self.1.clone(),
+            sqltest::DatabaseLocation::Default => self.0.clone(),
+            sqltest::DatabaseLocation::DefaultNoRowidAlias => self.1.clone(),
             _ => None,
         }
     }
@@ -543,7 +543,7 @@ async fn check_files(paths: Vec<PathBuf>) -> ExitCode {
 
 fn check_single_file(path: &PathBuf) -> bool {
     match std::fs::read_to_string(path) {
-        Ok(content) => match test_runner::parse(&content) {
+        Ok(content) => match sqltest::parse(&content) {
             Ok(file) => {
                 let snapshots_str = if file.snapshots.is_empty() {
                     String::new()
