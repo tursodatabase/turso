@@ -414,6 +414,12 @@ export class Connection {
     if (typeof fn !== "function") {
       throw new TypeError("Expected first argument to be a function");
     }
+    if (fn.length === 0) {
+      throw new TypeError(
+        "transaction() callbacks receive a transaction handle as their first argument " +
+        "and must declare it: db.transaction(async (tx, ...args) => { await tx.run(...) }).",
+      );
+    }
 
     const db = this;
     const wrapTxn = (mode: string) => {

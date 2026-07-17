@@ -64,12 +64,12 @@ When `mode` is set, `batch()` owns the surrounding `BEGIN`/`COMMIT`/`ROLLBACK`. 
 For flexible all-or-nothing work that mixes `batch()` with other calls, wrap them in `transaction(...)` (or one of its `deferred`/`immediate`/`exclusive`/`concurrent` variants):
 
 ```js
-const txn = db.transaction(async () => {
-  await db.batch([
+const txn = db.transaction(async (tx) => {
+  await tx.batch([
     { sql: "INSERT INTO users(name) VALUES (?)", args: ["Alice"] },
     { sql: "INSERT INTO users(name) VALUES (?)", args: ["Bob"] },
   ]);
-  await db.exec("UPDATE counters SET n = n + 1");
+  await tx.exec("UPDATE counters SET n = n + 1");
 });
 await txn.immediate();
 ```
@@ -78,7 +78,27 @@ The function returns an object with two properties: `rowsAffected` (the total nu
 
 #### transaction(function) ⇒ function
 
-This function is currently not supported.
+Returns a function that runs the given callback inside a transaction: `BEGIN` before the callback, `COMMIT` on success, `ROLLBACK` on error. The wrapper owns the connection for the whole transaction — concurrent statements and transactions queue until it finishes, so nothing can interleave with the transaction's window.
+
+The callback receives a `Transaction` handle as its first argument, followed by the arguments the wrapped function was called with. All SQL inside the callback must go through the handle (`tx.exec`, `tx.prepare`, `tx.run`, `tx.get`, `tx.all`, `tx.iterate`, `tx.batch`); calls on the `Database` itself wait for the transaction to finish, so awaiting them inside the callback deadlocks it. The handle becomes unusable once the transaction completes. Callbacks that do not declare the handle parameter are rejected.
+
+The returned function exposes `deferred`, `immediate`, `exclusive`, and `concurrent` properties that begin the transaction with the corresponding locking mode.
+
+```js
+const insertMany = db.transaction(async (tx, users) => {
+  const insert = await tx.prepare("INSERT INTO users(name, email) VALUES (?, ?)");
+  for (const user of users) {
+    await insert.run(user.name, user.email);
+  }
+});
+
+await insertMany([
+  { name: "Alice", email: "alice@example.org" },
+  { name: "Bob", email: "bob@example.org" },
+]);
+// or with an explicit locking mode:
+await insertMany.immediate([{ name: "Carol", email: "carol@example.org" }]);
+```
 
 #### pragma(string, [options]) ⇒ results
 

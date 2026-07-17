@@ -1,4 +1,4 @@
-import { DatabasePromise, Transaction, TransactionFunction } from "@tursodatabase/database-common"
+import { DatabasePromise, Transaction, TransactionFunction, assertTransactionCallback } from "@tursodatabase/database-common"
 import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner, RemoteWriter, RemoteWriteStatement } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, Database as NativeDatabase } from "#index";
 import { promises } from "node:fs";
@@ -258,8 +258,7 @@ class Database extends DatabasePromise {
     override transaction<F extends (txn: Transaction, ...args: any[]) => Promise<any>>(
         fn: F,
     ): TransactionFunction<F> {
-        if (typeof fn !== "function")
-            throw new TypeError("Expected first argument to be a function");
+        assertTransactionCallback(fn);
 
         if (!this.#remoteWriter) {
             return super.transaction(fn);

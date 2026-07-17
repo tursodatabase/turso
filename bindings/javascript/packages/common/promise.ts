@@ -129,6 +129,28 @@ function makeResultSet(
 }
 
 /**
+ * Rejects transaction callbacks that cannot be using the `Transaction`
+ * handle. A callback that declares no parameters is the pre-0.8 shape:
+ * its statements target the `Database` and would deadlock against the
+ * lock its own transaction holds. `fn.length` counts declared parameters,
+ * so rest-only signatures (`(...args)`) are rejected too — the handle
+ * parameter must be declared explicitly.
+ */
+function assertTransactionCallback(fn: Function) {
+  if (typeof fn !== "function") {
+    throw new TypeError("Expected first argument to be a function");
+  }
+  if (fn.length === 0) {
+    throw new TypeError(
+      "transaction() callbacks receive a Transaction handle as their first argument " +
+      "and must declare it: db.transaction(async (txn, ...args) => { await txn.run(...) }). " +
+      "Statements inside the callback must go through the handle - database-level calls " +
+      "wait for the transaction to finish and deadlock it if awaited inside the callback.",
+    );
+  }
+}
+
+/**
  * The user-supplied arguments of a transaction callback: everything after
  * the leading `Transaction` handle.
  */
@@ -254,8 +276,7 @@ class Database {
   transaction<F extends (txn: Transaction, ...args: any[]) => Promise<any>>(
     fn: F,
   ): TransactionFunction<F> {
-    if (typeof fn !== "function")
-      throw new TypeError("Expected first argument to be a function");
+    assertTransactionCallback(fn);
 
     const db = this;
     const wrapTxn = (mode) => {
@@ -352,9 +373,9 @@ class Database {
    *
    * @example
    * // Atomic via the transaction() API for mixed workloads.
-   * const txn = db.transaction(async () => {
-   *   await db.batch([{ sql: "INSERT INTO users(name) VALUES (?)", args: ["Eve"] }]);
-   *   await db.exec("UPDATE counters SET n = n + 1");
+   * const txn = db.transaction(async (tx) => {
+   *   await tx.batch([{ sql: "INSERT INTO users(name) VALUES (?)", args: ["Eve"] }]);
+   *   await tx.exec("UPDATE counters SET n = n + 1");
    * });
    * await txn.immediate();
    */
@@ -1121,4 +1142,4 @@ class Statement {
   }
 }
 
-export { Database, Statement, Transaction, maybePromise, maybeValue }
+export { Database, Statement, Transaction, assertTransactionCallback, maybePromise, maybeValue }

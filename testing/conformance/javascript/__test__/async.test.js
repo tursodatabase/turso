@@ -521,7 +521,7 @@ test.serial("Database.inTransaction property", async (t) => {
   // 3. The transaction() helper reports in-transaction inside its callback and
   //    autocommit once it completes.
   let insideTxn;
-  const txn = db.transaction(async () => { insideTxn = db.inTransaction; });
+  const txn = db.transaction(async (tx) => { insideTxn = db.inTransaction; });
   await txn();
   t.true(insideTxn, "in a transaction inside the transaction() callback");
   t.false(db.inTransaction, "autocommit after transaction() completes");

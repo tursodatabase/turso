@@ -430,7 +430,7 @@ test('transaction.concurrent uses BEGIN CONCURRENT', async () => {
     };
 
     try {
-        const txn = db.transaction(async () => {
+        const txn = db.transaction(async (_txn) => {
             calls.push('body');
         }).concurrent;
         await txn();
@@ -439,4 +439,13 @@ test('transaction.concurrent uses BEGIN CONCURRENT', async () => {
         Transaction.prototype.exec = originalExec;
         await db.close();
     }
+})
+
+// A callback that declares no parameters cannot be using the Transaction
+// handle - it is the pre-0.8 shape whose statements would deadlock against
+// the transaction's own lock, so it is rejected upfront.
+test('transaction() rejects callbacks that do not declare the handle', async () => {
+    const db = await connect(':memory:');
+    expect(() => db.transaction(async () => { })).toThrow(/Transaction handle/);
+    expect(() => db.transaction((async (...args: any[]) => { }) as any)).toThrow(/Transaction handle/);
 })

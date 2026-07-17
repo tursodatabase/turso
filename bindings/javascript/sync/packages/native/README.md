@@ -91,8 +91,8 @@ import { connect } from '@tursodatabase/database';
 const db = await connect('transactions.db');
 
 // Using transactions for atomic operations
-const transaction = db.transaction(async (users) => {
-  const insert = db.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
+const transaction = db.transaction(async (txn, users) => {
+  const insert = await txn.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
   for (const user of users) {
     await insert.run(user.name, user.email);
   }
