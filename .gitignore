@@ -103,3 +103,6 @@ dhat-heap.json
 .aristo/critiques/
 .aristo/proofs/*.proof.bak
 .aristo/archive/
+
+# pgregress actual output and diffs
+postgres/regress/results/
