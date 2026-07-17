@@ -156,18 +156,85 @@ pub struct Parser<'a> {
     named_variables: HashMap<&'a [u8], NonZeroU32>,
     /// Tracks STRUCT/UNION nesting depth to prevent stack overflow from deeply nested types
     type_nesting_depth: u32,
-    /// Current expression recursion depth of the parser, bounded by [`MAX_EXPR_DEPTH`]
+    /// Current expression recursion depth of the parser, bounded by
+    /// [`MAX_EXPR_NESTING`]
     expr_nesting_depth: u32,
-    /// Height of the most recently parsed expression (`1 + max(child heights)`,
-    /// like SQLite's `Expr.nHeight`), bounded by [`MAX_EXPR_DEPTH`]
-    last_expr_height: usize,
+    /// Size of the most recently parsed expression, bounded by
+    /// [`MAX_EXPR_DEPTH`] / [`MAX_EXPR_NESTING`]
+    last_expr_height: ExprSize,
 }
 
 /// Maximum query expression depth, our equivalent of SQLite's
-/// `SQLITE_MAX_EXPR_DEPTH` (default 1000). Kept lower because our recursive
-/// translator/optimizer uses larger stack frames per nesting level, so a
-/// 1000-deep tree still overflows a default 8 MiB thread stack in debug builds.
-pub const MAX_EXPR_DEPTH: usize = 100;
+/// `SQLITE_MAX_EXPR_DEPTH`, matching its default of 1000 and counting the same
+/// way (every tree level, including one level per operator in a flat chain
+/// like `a OR b OR c ...`). This bounds the passes that walk the tree with
+/// small per-level state (e.g. derived `Drop`/`Clone`/`PartialEq` glue).
+pub const MAX_EXPR_DEPTH: usize = 1000;
+
+/// Maximum expression *nesting*, a stricter bound than [`MAX_EXPR_DEPTH`] that
+/// does not count contiguous binary-operator chain links: the parser consumes
+/// those iteratively and the translator folds them iteratively, so only truly
+/// nested constructs (parentheses, CASE, subqueries, function calls, ...) add
+/// a recursion level in the fat-frame recursive passes. Those passes overflow
+/// small fixed-size stacks (e.g. coroutine stacks) far below 1000 levels,
+/// hence the lower bound.
+pub const MAX_EXPR_NESTING: usize = 100;
+
+/// Size metrics of a parsed expression tree, tracked during parsing so that
+/// over-sized input is rejected deterministically before any recursive pass
+/// can overflow the native stack.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct ExprSize {
+    /// True tree depth (`1 + max(child depths)`, like SQLite's `Expr.nHeight`),
+    /// counting every binary chain link. Bounded by [`MAX_EXPR_DEPTH`].
+    depth: usize,
+    /// Nesting height: like `depth`, except contiguous `Expr::Binary` spine
+    /// links share one level, mirroring the translator's iterative spine
+    /// traversal. Bounded by [`MAX_EXPR_NESTING`].
+    nesting: usize,
+}
+
+impl ExprSize {
+    const ZERO: ExprSize = ExprSize {
+        depth: 0,
+        nesting: 0,
+    };
+    const LEAF: ExprSize = ExprSize {
+        depth: 1,
+        nesting: 1,
+    };
+
+    /// Memberwise max, for merging sibling subexpression sizes.
+    fn max(self, other: ExprSize) -> ExprSize {
+        ExprSize {
+            depth: self.depth.max(other.depth),
+            nesting: self.nesting.max(other.nesting),
+        }
+    }
+
+    /// The size of a node wrapping children of this merged size.
+    fn add_level(self) -> ExprSize {
+        ExprSize {
+            depth: self.depth + 1,
+            nesting: self.nesting + 1,
+        }
+    }
+
+    /// Reject expressions over either limit.
+    fn check(self) -> Result<()> {
+        if self.depth > MAX_EXPR_DEPTH {
+            return Err(Error::ParseError(format!(
+                "Expression tree is too large (maximum depth {MAX_EXPR_DEPTH})"
+            )));
+        }
+        if self.nesting > MAX_EXPR_NESTING {
+            return Err(Error::ParseError(format!(
+                "Expression tree is too deeply nested (maximum nesting {MAX_EXPR_NESTING})"
+            )));
+        }
+        Ok(())
+    }
+}
 
 impl<'a> Iterator for Parser<'a> {
     type Item = Result<Cmd>;
@@ -193,7 +260,7 @@ impl<'a> Parser<'a> {
             named_variables: HashMap::new(),
             type_nesting_depth: 0,
             expr_nesting_depth: 0,
-            last_expr_height: 0,
+            last_expr_height: ExprSize::ZERO,
         }
     }
 
@@ -1362,7 +1429,7 @@ impl<'a> Parser<'a> {
     fn parse_filter_clause(&mut self) -> Result<Option<Box<Expr>>> {
         // Report height 0 when there is no FILTER clause so callers folding this
         // into their own height are not misled by a stale value.
-        self.last_expr_height = 0;
+        self.last_expr_height = ExprSize::ZERO;
         match self.peek()? {
             None => return Ok(None),
             Some(tok) => match tok.token_type {
@@ -1384,9 +1451,9 @@ impl<'a> Parser<'a> {
     fn parse_frame_opt(&mut self) -> Result<Option<FrameClause>> {
         // Tallest frame-bound expression, reported via `last_expr_height`; the
         // non-expression bounds (`UNBOUNDED`, `CURRENT ROW`) contribute nothing.
-        let mut max_h = 0usize;
+        let mut max_h = ExprSize::ZERO;
         // No frame clause parsed yet: report height 0 for the early returns below.
-        self.last_expr_height = 0;
+        self.last_expr_height = ExprSize::ZERO;
         let range_or_rows = match self.peek()? {
             None => return Ok(None),
             Some(tok) => match tok.token_type {
@@ -1514,7 +1581,7 @@ impl<'a> Parser<'a> {
         // Tallest sub-expression across PARTITION BY / ORDER BY / frame bounds,
         // reported via `last_expr_height` so a function's window clause folds into
         // its height (later passes recurse through the window's expressions).
-        let mut max_h = 0usize;
+        let mut max_h = ExprSize::ZERO;
         let partition_by = match self.peek()? {
             Some(tok) if tok.token_type == TK_PARTITION => {
                 eat_assert!(self, TK_PARTITION);
@@ -1541,7 +1608,7 @@ impl<'a> Parser<'a> {
 
     fn parse_over_clause(&mut self) -> Result<Option<Over>> {
         // Report height 0 unless a window definition with expressions is parsed.
-        self.last_expr_height = 0;
+        self.last_expr_height = ExprSize::ZERO;
         match self.peek()? {
             None => return Ok(None),
             Some(tok) => match tok.token_type {
@@ -1584,7 +1651,7 @@ impl<'a> Parser<'a> {
     fn parse_within_group(&mut self) -> Result<Vec<SortedColumn>> {
         // Report height 0 unless a WITHIN GROUP (ORDER BY ...) is parsed, in which
         // case `parse_order_by` leaves the tallest sort expression's height.
-        self.last_expr_height = 0;
+        self.last_expr_height = ExprSize::ZERO;
         match self.peek()? {
             Some(tok) if tok.token_type == TK_WITHIN => {
                 eat_assert!(self, TK_WITHIN);
@@ -1618,7 +1685,7 @@ impl<'a> Parser<'a> {
         // Height of the operand. Leaves keep this default; branches that recurse
         // into sub-expressions overwrite it with `1 + max(child heights)` so the
         // enclosing chain guard (see `parse_expr_inner`) sees their true depth.
-        self.last_expr_height = 1;
+        self.last_expr_height = ExprSize::LEAF;
 
         let tok = peek_expect!(
             self,
@@ -1657,14 +1724,14 @@ impl<'a> Parser<'a> {
                         let select = self.parse_select()?;
                         eat_expect!(self, TK_RP);
                         // Subquery is compiled separately: a leaf for height.
-                        self.last_expr_height = 1;
+                        self.last_expr_height = ExprSize::LEAF;
                         Ok(Box::new(Expr::Subquery(select)))
                     }
                     _ => {
                         let exprs = self.parse_nexpr_list()?;
                         eat_expect!(self, TK_RP);
                         // `parse_nexpr_list` left the tallest element's height.
-                        self.last_expr_height += 1;
+                        self.last_expr_height = self.last_expr_height.add_level();
                         Ok(Box::new(Expr::Parenthesized(exprs)))
                     }
                 }
@@ -1702,7 +1769,7 @@ impl<'a> Parser<'a> {
                 eat_expect!(self, TK_AS);
                 let typ = self.parse_type()?;
                 eat_expect!(self, TK_RP);
-                self.last_expr_height += 1;
+                self.last_expr_height = self.last_expr_height.add_level();
                 Ok(Box::new(Expr::Cast {
                     expr,
                     type_name: typ,
@@ -1720,25 +1787,25 @@ impl<'a> Parser<'a> {
             TK_NOT => {
                 eat_assert!(self, TK_NOT);
                 let expr = self.parse_expr(2)?; // NOT precedence is 2
-                self.last_expr_height += 1;
+                self.last_expr_height = self.last_expr_height.add_level();
                 Ok(Box::new(Expr::Unary(UnaryOperator::Not, expr)))
             }
             TK_BITNOT => {
                 eat_assert!(self, TK_BITNOT);
                 let expr = self.parse_expr(11)?; // BITNOT precedence is 11
-                self.last_expr_height += 1;
+                self.last_expr_height = self.last_expr_height.add_level();
                 Ok(Box::new(Expr::Unary(UnaryOperator::BitwiseNot, expr)))
             }
             TK_PLUS => {
                 eat_assert!(self, TK_PLUS);
                 let expr = self.parse_expr(11)?; // PLUS precedence is 11
-                self.last_expr_height += 1;
+                self.last_expr_height = self.last_expr_height.add_level();
                 Ok(Box::new(Expr::Unary(UnaryOperator::Positive, expr)))
             }
             TK_MINUS => {
                 eat_assert!(self, TK_MINUS);
                 let expr = self.parse_expr(11)?; // MINUS precedence is 11
-                self.last_expr_height += 1;
+                self.last_expr_height = self.last_expr_height.add_level();
                 Ok(Box::new(Expr::Unary(UnaryOperator::Negative, expr)))
             }
             TK_EXISTS => {
@@ -1747,13 +1814,13 @@ impl<'a> Parser<'a> {
                 let select = self.parse_select()?;
                 eat_expect!(self, TK_RP);
                 // Subquery is compiled separately: a leaf for height.
-                self.last_expr_height = 1;
+                self.last_expr_height = ExprSize::LEAF;
                 Ok(Box::new(Expr::Exists(select)))
             }
             TK_CASE => {
                 eat_assert!(self, TK_CASE);
                 // Tallest of the base/when/then/else sub-expressions.
-                let mut max_h = 0usize;
+                let mut max_h = ExprSize::ZERO;
                 let base = if self.peek_no_eof()?.token_type != TK_WHEN {
                     let base = self.parse_expr(0)?;
                     max_h = max_h.max(self.last_expr_height);
@@ -1798,7 +1865,7 @@ impl<'a> Parser<'a> {
                 };
 
                 eat_expect!(self, TK_END);
-                self.last_expr_height = 1 + max_h;
+                self.last_expr_height = max_h.add_level();
                 Ok(Box::new(Expr::Case {
                     base,
                     when_then_pairs,
@@ -1830,7 +1897,7 @@ impl<'a> Parser<'a> {
 
                 eat_expect!(self, TK_RP);
                 if expr.is_some() {
-                    self.last_expr_height += 1;
+                    self.last_expr_height = self.last_expr_height.add_level();
                 }
                 Ok(Box::new(Expr::Raise(resolve, expr)))
             }
@@ -1875,7 +1942,7 @@ impl<'a> Parser<'a> {
                             let elements = self.parse_expr_list()?;
                             eat_expect!(self, TK_RBRACKET);
                             // `parse_expr_list` left the tallest element's height.
-                            self.last_expr_height += 1;
+                            self.last_expr_height = self.last_expr_height.add_level();
                             // Desugar ARRAY[...] into array(...) function call
                             return Ok(Box::new(Expr::FunctionCall {
                                 name: Name::from_bytes(b"array"),
@@ -1923,7 +1990,7 @@ impl<'a> Parser<'a> {
                                 // No arguments, but later passes still walk any
                                 // FILTER/OVER sub-expressions, so fold their
                                 // height into this node's height.
-                                self.last_expr_height += 1;
+                                self.last_expr_height = self.last_expr_height.add_level();
                                 return Ok(Box::new(Expr::FunctionCallStar {
                                     name: Name::from_bytes(name),
                                     filter_over,
@@ -1943,7 +2010,7 @@ impl<'a> Parser<'a> {
                                 clause_height = clause_height.max(self.last_expr_height);
                                 let filter_over = self.parse_filter_over()?;
                                 clause_height = clause_height.max(self.last_expr_height);
-                                self.last_expr_height = 1 + clause_height;
+                                self.last_expr_height = clause_height.add_level();
                                 return Ok(Box::new(Expr::FunctionCall {
                                     name: Name::from_bytes(name),
                                     distinctness: distinct,
@@ -2008,7 +2075,7 @@ impl<'a> Parser<'a> {
         let mut exprs = vec![];
         // Tallest element, reported via `last_expr_height` so the enclosing node
         // (function call, IN list, ...) can fold it into its own height.
-        let mut max_h = 0usize;
+        let mut max_h = ExprSize::ZERO;
         while let Some(tok) = self.peek()? {
             match tok.token_type.fallback_id_if_ok() {
                 TK_LP | TK_CAST | TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_NULL
@@ -2031,15 +2098,16 @@ impl<'a> Parser<'a> {
         Ok(exprs)
     }
 
-    /// Parse an expression, bounding both the parser's recursion depth and the
-    /// height of the resulting tree by [`MAX_EXPR_DEPTH`]. On return,
-    /// `last_expr_height` holds the height of the returned expression.
+    /// Parse an expression, bounding the parser's recursion depth by
+    /// [`MAX_EXPR_NESTING`] and the size of the resulting tree by
+    /// [`MAX_EXPR_DEPTH`] / [`MAX_EXPR_NESTING`]. On return,
+    /// `last_expr_height` holds the size of the returned expression.
     fn parse_expr(&mut self, precedence: u8) -> Result<Box<Expr>> {
         self.expr_nesting_depth += 1;
-        if self.expr_nesting_depth as usize > MAX_EXPR_DEPTH {
+        if self.expr_nesting_depth as usize > MAX_EXPR_NESTING {
             self.expr_nesting_depth -= 1;
             return Err(Error::ParseError(format!(
-                "Expression tree is too large (maximum depth {MAX_EXPR_DEPTH})"
+                "Expression tree is too deeply nested (maximum nesting {MAX_EXPR_NESTING})"
             )));
         }
         let result = self.parse_expr_inner(precedence);
@@ -2049,16 +2117,17 @@ impl<'a> Parser<'a> {
 
     fn parse_expr_inner(&mut self, precedence: u8) -> Result<Box<Expr>> {
         let mut result = self.parse_expr_operand()?;
-        // Running height of `result`, maintained bottom-up so that a left-deep
+        // Running size of `result`, maintained bottom-up so that a left-deep
         // chain (`a OR b OR c ...`), which this loop consumes iteratively, is
         // bounded too. Check the operand up front: it can already be over the
         // limit on its own without being followed by an operator.
         let mut result_height = self.last_expr_height;
-        if result_height > MAX_EXPR_DEPTH {
-            return Err(Error::ParseError(format!(
-                "Expression tree is too large (maximum depth {MAX_EXPR_DEPTH})"
-            )));
-        }
+        result_height.check()?;
+        // Nesting of the tallest direct component (leftmost operand or any
+        // rhs) of the current contiguous run of `Expr::Binary` links ("spine");
+        // only meaningful while `in_spine` is true.
+        let mut spine_component_nesting = 0usize;
+        let mut in_spine = false;
 
         loop {
             let pre = match self.current_token_precedence()? {
@@ -2180,7 +2249,7 @@ impl<'a> Parser<'a> {
                                     eat_expect!(self, TK_RP);
                                     // The subquery is compiled separately, so it
                                     // counts as a leaf for this expression's height.
-                                    self.last_expr_height = 1;
+                                    self.last_expr_height = ExprSize::LEAF;
                                     Box::new(Expr::InSelect {
                                         lhs: result,
                                         not,
@@ -2458,19 +2527,41 @@ impl<'a> Parser<'a> {
                 }
                 _ => unreachable!(),
             };
-            // Each iteration wraps the previous `result` in a new node, growing
-            // the tree by one level; `last_expr_height` holds the height of the
-            // tallest sub-expression parsed in this iteration.
+            // Each iteration wraps the previous `result` in a new node;
+            // `last_expr_height` holds the size of the tallest sub-expression
+            // parsed in this iteration. `depth` always grows by one level.
+            // `nesting` only grows when the new node is NOT a plain
+            // `Expr::Binary` chain link: the translator folds contiguous
+            // Binary spines iteratively, so links share one recursion level.
+            // `x IS TRUE`-style forms are Binary in the AST but are emitted
+            // through a dedicated non-foldable path, so they count as nesting.
+            let is_spine_link = matches!(
+                result.as_ref(),
+                Expr::Binary(_, op, rhs) if !(matches!(op, Operator::Is | Operator::IsNot)
+                    && matches!(
+                        rhs.as_ref(),
+                        Expr::Literal(Literal::True) | Expr::Literal(Literal::False)
+                    ))
+            );
             result_height = if leaf {
-                1
+                in_spine = false;
+                ExprSize::LEAF
+            } else if is_spine_link {
+                spine_component_nesting = if in_spine {
+                    spine_component_nesting.max(self.last_expr_height.nesting)
+                } else {
+                    result_height.nesting.max(self.last_expr_height.nesting)
+                };
+                in_spine = true;
+                ExprSize {
+                    depth: 1 + result_height.depth.max(self.last_expr_height.depth),
+                    nesting: 1 + spine_component_nesting,
+                }
             } else {
-                1 + result_height.max(self.last_expr_height)
+                in_spine = false;
+                result_height.max(self.last_expr_height).add_level()
             };
-            if result_height > MAX_EXPR_DEPTH {
-                return Err(Error::ParseError(format!(
-                    "Expression tree is too large (maximum depth {MAX_EXPR_DEPTH})"
-                )));
-            }
+            result_height.check()?;
         }
 
         self.last_expr_height = result_height;
@@ -3221,7 +3312,7 @@ impl<'a> Parser<'a> {
     fn parse_order_by(&mut self) -> Result<Vec<SortedColumn>> {
         // No sort expressions parsed yet: report height 0 so callers folding this
         // clause in do not pick up a stale height from an earlier expression.
-        self.last_expr_height = 0;
+        self.last_expr_height = ExprSize::ZERO;
         if let Some(tok) = self.peek()? {
             if tok.token_type == TK_ORDER {
                 eat_assert!(self, TK_ORDER);
