@@ -9548,7 +9548,7 @@ pub fn op_function(
                                 idx_name,
                                 mut where_clause,
                                 using,
-                                with_clause,
+                                mut with_clause,
                             } => {
                                 if table != normalize_ident(tbl_name.as_str()) {
                                     break 'sql None;
@@ -9568,6 +9568,60 @@ pub fn op_function(
                                         &rename_from,
                                         column_def.col_name.as_str(),
                                     );
+                                }
+
+                                // FTS index WITH options can embed column names in their
+                                // string payload (e.g. `WITH (weights='a=1.0,b=2.0')`).
+                                // The column list rewrite above renames the SQL-level
+                                // column references, but leaves these payloads untouched,
+                                // and on reopen `parse_field_weights()` rejects the stale
+                                // key. Rewrite the weights payload here as well.
+                                // See tursodatabase/turso#7519.
+                                if using.as_ref().is_some_and(|u| {
+                                    normalize_ident(u.as_str())
+                                        == crate::index_method::fts::FTS_INDEX_METHOD_NAME
+                                }) {
+                                    for (opt_name, opt_expr) in with_clause.iter_mut() {
+                                        if normalize_ident(opt_name.as_str()) != "weights" {
+                                            continue;
+                                        }
+                                        let ast::Expr::Literal(ast::Literal::String(
+                                            ref mut raw,
+                                        )) = **opt_expr
+                                        else {
+                                            continue;
+                                        };
+                                        let Some((quote, body)) = raw
+                                            .strip_prefix('\'')
+                                            .and_then(|s| s.strip_suffix('\''))
+                                            .map(|inner| ('\'', inner))
+                                            .or_else(|| {
+                                                raw.strip_prefix('"')
+                                                    .and_then(|s| s.strip_suffix('"'))
+                                                    .map(|inner| ('"', inner))
+                                            })
+                                        else {
+                                            continue;
+                                        };
+                                        let rewritten = body
+                                            .split(',')
+                                            .map(|pair| match pair.split_once('=') {
+                                                Some((key, value))
+                                                    if normalize_ident(key.trim())
+                                                        == rename_from =>
+                                                {
+                                                    format!(
+                                                        "{}={}",
+                                                        column_def.col_name.as_str(),
+                                                        value
+                                                    )
+                                                }
+                                                _ => pair.to_string(),
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(",");
+                                        *raw = format!("{quote}{rewritten}{quote}");
+                                    }
                                 }
 
                                 Some(

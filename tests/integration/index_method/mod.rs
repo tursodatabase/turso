@@ -1387,6 +1387,63 @@ fn test_fts_invalid_weights_rejected(tmp_db: TempDatabase) {
     assert!(result.is_err());
 }
 
+/// Regression test for tursodatabase/turso#7519:
+/// `ALTER TABLE ... RENAME COLUMN` must rewrite column names embedded in the
+/// FTS `WITH (weights = ...)` option, not only the indexed column list.
+/// Without the fix the stored `sqlite_schema` SQL references the renamed-away
+/// column and reopen fails because `parse_field_weights()` rejects the stale key.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_rename_column_rewrites_weights_option(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(a TEXT, b TEXT)").unwrap();
+    conn.execute("CREATE INDEX idx ON t USING fts(a, b) WITH (weights='a=1.0,b=2.0')")
+        .unwrap();
+
+    conn.execute("ALTER TABLE t RENAME COLUMN a TO c").unwrap();
+
+    let rows = limbo_exec_rows(&conn, "SELECT sql FROM sqlite_schema WHERE name = 'idx'");
+    assert_eq!(rows.len(), 1);
+    let sql = match &rows[0][0] {
+        rusqlite::types::Value::Text(s) => s.clone(),
+        v => panic!("expected TEXT sql, got {v:?}"),
+    };
+
+    // The indexed column list must reference the new name.
+    assert!(
+        sql.contains(" (c, b)") || sql.contains("(c, b)"),
+        "index column list not rewritten to (c, b): {sql}"
+    );
+    // The weights option must reference the new name, not the renamed-away one.
+    assert!(
+        sql.contains("c=1.0"),
+        "weights option not rewritten to 'c=1.0': {sql}"
+    );
+    assert!(
+        !sql.contains("a=1.0"),
+        "stale weight key 'a=1.0' still present in stored schema: {sql}"
+    );
+    // Unrelated keys must be preserved.
+    assert!(
+        sql.contains("b=2.0"),
+        "unrelated weight key 'b=2.0' lost: {sql}"
+    );
+
+    // End-to-end: the rewritten schema must reopen cleanly by exercising an
+    // FTS-backed insert + read. Without the fix, `parse_field_weights()`
+    // rejects the stale key and any further FTS operation fails.
+    conn.execute("INSERT INTO t VALUES ('hello', 'world')")
+        .unwrap();
+    let matched = limbo_exec_rows(&conn, "SELECT c FROM t WHERE fts_match(c, b, 'hello')");
+    assert_eq!(matched.len(), 1);
+    assert!(matches!(
+        matched[0][0],
+        rusqlite::types::Value::Text(ref s) if s == "hello"
+    ));
+}
+
 /// Regression test: Query -> Insert -> Query should not panic with "dirty pages must be empty"
 /// This tests that FTS cursor caching doesn't share pending_writes between cursors,
 /// which would cause writes from one cursor to affect the Drop behavior of another.
