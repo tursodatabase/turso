@@ -2597,3 +2597,167 @@ fn test_user_sequence_rollback_does_not_pollute_watermark(tmp_db: TempDatabase) 
         rows[0].0
     );
 }
+
+// ============================================================================
+// Regression reproducer: a leaked write transaction surfaces as "Database is
+// busy" (SQLITE_BUSY)
+//
+// A client runs a raw batch that opens an explicit write transaction with
+// `BEGIN IMMEDIATE`, and a later statement in the batch hits a UNIQUE
+// constraint. In SQLite/Turso a constraint violation aborts only that
+// *statement* (ON CONFLICT ABORT); the surrounding write transaction stays
+// open. If the client assumes the failed statement ended the transaction (or
+// otherwise tracks its own transaction state incorrectly), it can skip
+// `ROLLBACK` and hand the connection back to a pool with the write transaction
+// still held. The leaked transaction then holds the single write slot and
+// starves every other writer with `Busy` until it is finally rolled back —
+// even on a database that otherwise looks idle. A connection reused in that
+// state also reports `cannot start a transaction within a transaction`.
+//
+// These tests reproduce the mechanism using only the public Connection API
+// (no engine internals):
+//   1. the constraint error leaves the connection in a transaction
+//      (`get_auto_commit() == false`);
+//   2. reusing that connection to `BEGIN` again fails with
+//      "cannot start a transaction within a transaction";
+//   3. while the transaction is leaked, other connections' writes fail with
+//      `Busy` ("Database is busy"), and recover the moment it is rolled back.
+// ============================================================================
+
+/// Run a single-`i64`-column query to completion, pumping IO. Surfaces a
+/// blocked read as `LimboError::Busy` just like `Connection::execute` does.
+fn drain_query_i64(tmp_db: &TempDatabase, conn: &Arc<Connection>, sql: &str) -> Result<i64> {
+    let mut stmt = conn.query(sql)?.expect("query returns a statement");
+    loop {
+        match stmt.step()? {
+            StepResult::Row => return Ok(stmt.row().unwrap().get::<i64>(0).unwrap()),
+            StepResult::Done => unreachable!("aggregate query yields exactly one row"),
+            StepResult::IO | StepResult::Yield => tmp_db.io.step()?,
+            StepResult::Interrupt | StepResult::Busy => return Err(LimboError::Busy),
+        }
+    }
+}
+
+// Runs against both the default (WAL) backend and MVCC — the single-writer
+// starvation is identical in both.
+#[turso_macros::test(mvcc)]
+fn test_leaked_write_txn_from_constraint_error_starves_writers(tmp_db: TempDatabase) {
+    // Initial schema committed in autocommit, visible to every connection.
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE, v TEXT)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t (id, k, v) VALUES (1, 'a', 'x')")
+        .unwrap();
+
+    let leaker = tmp_db.connect_limbo();
+    let other = tmp_db.connect_limbo();
+
+    // A raw batch: an explicit write transaction, some DML, and then a
+    // statement that violates the UNIQUE index on `k`.
+    leaker.execute("BEGIN IMMEDIATE").unwrap();
+    leaker
+        .execute("INSERT INTO t (id, k, v) VALUES (2, 'b', 'y')")
+        .unwrap();
+    let dup = leaker.execute("INSERT INTO t (id, k, v) VALUES (3, 'a', 'z')");
+    assert!(
+        matches!(dup, Err(LimboError::Constraint(_))),
+        "duplicate key should raise a constraint error, got {dup:?}"
+    );
+
+    // (1) The constraint aborted only the statement. The write transaction is
+    // still open, so the connection is NOT in autocommit. A client that treats
+    // the failed statement as having ended the transaction misreads this state.
+    assert!(
+        !leaker.get_auto_commit(),
+        "constraint abort must leave the explicit write transaction open"
+    );
+
+    // (2) A pooled connection reused as if idle tries to open a new transaction
+    // and hits the same error.
+    let reuse = leaker.execute("BEGIN IMMEDIATE");
+    assert!(
+        matches!(&reuse, Err(LimboError::TxError(msg)) if msg.contains("within a transaction")),
+        "reusing the leaked connection should report 'cannot start a transaction within a transaction', got {reuse:?}"
+    );
+
+    // (3) The leaked write transaction starves every other writer: this is the
+    // user-visible `Database is busy` / SQLITE_BUSY.
+    let autocommit_write = other.execute("INSERT INTO t (id, k, v) VALUES (10, 'j', 'w')");
+    assert!(
+        matches!(autocommit_write, Err(LimboError::Busy)),
+        "autocommit writer must get Busy while the txn is leaked, got {autocommit_write:?}"
+    );
+    let begin_write = other.execute("BEGIN IMMEDIATE");
+    assert!(
+        matches!(begin_write, Err(LimboError::Busy)),
+        "a competing write transaction must get Busy while the txn is leaked, got {begin_write:?}"
+    );
+
+    // A plain (autocommit, non-transactional) read still succeeds against its
+    // snapshot: only writers are starved, which is why the failure only hit
+    // some requests.
+    assert_eq!(
+        drain_query_i64(&tmp_db, &other, "SELECT count(*) FROM t").unwrap(),
+        1,
+        "committed snapshot read should not be blocked by the leaked writer"
+    );
+
+    // Recovery: the fix is to actually roll back. Once the leaked transaction
+    // releases the write slot, writers immediately recover.
+    leaker.execute("ROLLBACK").unwrap();
+    assert!(leaker.get_auto_commit(), "ROLLBACK returns to autocommit");
+    other
+        .execute("INSERT INTO t (id, k, v) VALUES (10, 'j', 'w')")
+        .expect("writes recover once the leaked transaction is rolled back");
+}
+
+/// MVCC nuance: the leaked exclusive `BEGIN IMMEDIATE` starves *writers*, but a
+/// `BEGIN CONCURRENT` transaction (a common way to wrap reads) still starts and
+/// reads its snapshot without a `Busy`. Documents why only some requests
+/// failed, and scopes this reproducer to writer starvation (as opposed to
+/// separate read-side pressure such as queue saturation or blocking
+/// checkpoints).
+#[test]
+fn test_mvcc_leaked_write_txn_leaves_concurrent_readers_unblocked() {
+    let tmp_db = TempDatabase::new_with_mvcc("leaked_write_txn_concurrent_readers");
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE, v TEXT)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t (id, k, v) VALUES (1, 'a', 'x')")
+        .unwrap();
+
+    let leaker = tmp_db.connect_limbo();
+    let reader = tmp_db.connect_limbo();
+
+    leaker.execute("BEGIN IMMEDIATE").unwrap();
+    leaker
+        .execute("INSERT INTO t (id, k, v) VALUES (2, 'b', 'y')")
+        .unwrap();
+    assert!(matches!(
+        leaker.execute("INSERT INTO t (id, k, v) VALUES (3, 'a', 'z')"),
+        Err(LimboError::Constraint(_))
+    ));
+    assert!(!leaker.get_auto_commit(), "write transaction leaked");
+
+    // A concurrent (autocommit) writer is starved...
+    assert!(matches!(
+        reader.execute("INSERT INTO t (id, k, v) VALUES (10, 'j', 'w')"),
+        Err(LimboError::Busy)
+    ));
+
+    // ...but a BEGIN CONCURRENT reader starts and reads its snapshot without a
+    // Busy error.
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        drain_query_i64(&tmp_db, &reader, "SELECT count(*) FROM t").unwrap(),
+        1,
+        "BEGIN CONCURRENT read must see the committed snapshot, not the leaker's uncommitted rows"
+    );
+    reader.execute("ROLLBACK").unwrap();
+
+    leaker.execute("ROLLBACK").unwrap();
+}
