@@ -39,20 +39,20 @@ snapshot my-query-plan {
 make -C test-runner run-cli
 
 # Or directly:
-cargo run --bin test-runner -- run tests/my-test.sqltest
+cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/my-test.sqltest
 ```
 
 ### 3. Accept the Snapshots
 
 ```bash
 # Review and accept all pending snapshots
-cargo run --bin test-runner -- run tests/ --snapshot-mode=always
+cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/ --snapshot-mode=always
 ```
 
 ### 4. Commit the Snapshot Files
 
 ```bash
-git add tests/snapshots/
+git add sqlite/conformance/sqlite-sqltests/snapshots/
 git commit -m "Add query plan snapshots"
 ```
 
@@ -82,7 +82,7 @@ CI detection checks for environment variables: `CI`, `GITHUB_ACTIONS`, `TRAVIS`,
 Creates `.snap.new` files alongside existing snapshots. This allows you to review changes before accepting them:
 
 ```
-tests/snapshots/
+sqlite/conformance/sqlite-sqltests/snapshots/
   my-test__query-plan.snap      # existing
   my-test__query-plan.snap.new  # new/changed
 ```
@@ -143,7 +143,7 @@ addr  opcode       p1  p2  p3  p4          p5  comment
 Snapshot files are stored in a `snapshots/` directory adjacent to the test file:
 
 ```
-tests/
+sqlite/conformance/sqlite-sqltests/
   queries.sqltest
   aggregates.sqltest
   snapshots/
@@ -160,25 +160,25 @@ Naming convention: `{test-file-stem}__{snapshot-name}.snap`
 
 ```bash
 # Default mode (auto)
-cargo run --bin test-runner -- run tests/
+cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/
 
 # Accept all snapshot changes
-cargo run --bin test-runner -- run tests/ --snapshot-mode=always
+cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/ --snapshot-mode=always
 
 # Review mode (create .snap.new files)
-cargo run --bin test-runner -- run tests/ --snapshot-mode=new
+cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/ --snapshot-mode=new
 
 # Read-only mode (CI)
-cargo run --bin test-runner -- run tests/ --snapshot-mode=no
+cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/ --snapshot-mode=no
 
 # Filter specific snapshots
-cargo run --bin test-runner -- run tests/ --snapshot-filter="query-plan*"
+cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/ --snapshot-filter="query-plan*"
 ```
 
 ### Check for Pending Snapshots
 
 ```bash
-cargo run --bin test-runner -- check tests/
+cargo run --bin test-runner -- check sqlite/conformance/sqlite-sqltests/
 ```
 
 This command:
@@ -207,11 +207,11 @@ make -C test-runner check
 # .github/workflows/test.yml
 - name: Run SQL tests
   run: |
-    cargo run --bin test-runner -- run tests/ --snapshot-mode=no
+    cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/ --snapshot-mode=no
 
 - name: Check for pending snapshots
   run: |
-    cargo run --bin test-runner -- check tests/
+    cargo run --bin test-runner -- check sqlite/conformance/sqlite-sqltests/
 ```
 
 The `check` command will fail if any `.snap.new` files exist, ensuring all snapshot changes are committed.
@@ -220,7 +220,7 @@ The `check` command will fail if any `.snap.new` files exist, ensuring all snaps
 
 1. Make changes that affect query plans
 2. Run tests locally (creates `.snap.new` files)
-3. Review the changes: `diff tests/snapshots/*.snap tests/snapshots/*.snap.new`
+3. Review the changes: `diff sqlite/conformance/sqlite-sqltests/snapshots/*.snap sqlite/conformance/sqlite-sqltests/snapshots/*.snap.new`
 4. Accept changes: `--snapshot-mode=always`
 5. Commit the updated `.snap` files
 6. Push to CI
@@ -368,7 +368,7 @@ While the workflow is similar to [cargo-insta](https://insta.rs/), test-runner u
 
 The `check` command found `.snap.new` files. Either:
 - Accept them: run with `--snapshot-mode=always`
-- Delete them: `rm tests/snapshots/*.snap.new`
+- Delete them: `rm sqlite/conformance/sqlite-sqltests/snapshots/*.snap.new`
 
 ### Different plans between runs
 

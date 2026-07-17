@@ -48,7 +48,7 @@ pub(crate) mod thread;
 
 mod assert;
 mod connection;
-mod dialect;
+pub mod dialect;
 mod error;
 mod ext;
 mod fast_lock;
@@ -86,6 +86,7 @@ mod uuid;
 mod vdbe;
 mod vtab;
 
+pub use function::Func;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
 
@@ -112,7 +113,6 @@ use crate::{
     },
     translate::{emitter::TransactionMode, pragma::TURSO_CDC_DEFAULT_TABLE_NAME},
     vdbe::metrics::ConnectionMetrics,
-    vtab::VirtualTable,
 };
 use arc_swap::{ArcSwap, ArcSwapOption};
 use core::str;
@@ -134,10 +134,11 @@ use storage::shared_wal_coordination::MappedSharedWalCoordination;
 use storage::{page_cache::PageCache, sqlite3_ondisk::PageSize};
 use tracing::{instrument, Level};
 use turso_macros::AtomicEnum;
-use turso_parser::{ast, ast::Cmd, parser::Parser};
+use turso_parser::{ast, ast::Cmd};
 
 pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
+pub use dialect::{Dialect, SqliteDialect};
 pub use error::{io_error, CompletionError, LimboError};
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]
@@ -185,7 +186,7 @@ pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     FromValueRow, PrepareContext, PreparedProgram, Program, Register,
 };
-pub use vtab::{InternalVirtualTable, InternalVirtualTableCursor};
+pub use vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable};
 
 /// Database index for the main database (always 0 in SQLite).
 pub const MAIN_DB_ID: usize = 0;
@@ -624,6 +625,11 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
     // in std.
     builtin_syms: parking_lot::RwLock<SymbolTable>,
+    /// SQL dialect this database runs under, interpreting `sqlite_schema`
+    /// SQL rows. Passed explicitly by every open path, fixed at open time,
+    /// and shared by all connections because the parsed [`Schema`] is
+    /// shared per database.
+    dialect: Arc<dyn Dialect>,
     opts: DatabaseOpts,
     n_connections: AtomicUsize,
 
@@ -707,6 +713,7 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         encryption_opts: Option<EncryptionOpts>,
         mv_store_allocator: alloc::DynAllocator,
+        dialect: Arc<dyn Dialect>,
     ) -> Result<Self> {
         let path = path.into();
         let wal_path = wal_path.into();
@@ -737,13 +744,15 @@ impl Database {
             None
         };
 
+        let enable_custom_types = opts.enable_custom_types || dialect.requires_custom_types();
+
         let db = Database {
             mv_store,
             mv_store_allocator,
             path,
             wal_path,
             schema: Arc::new(Mutex::new(Arc::new({
-                let mut s = Schema::with_options(opts.enable_custom_types)?;
+                let mut s = Schema::with_options(enable_custom_types, dialect.as_ref())?;
                 s.generated_columns_enabled = opts.enable_generated_columns;
                 s
             }))),
@@ -753,6 +762,7 @@ impl Database {
             shared_wal_coordination: OnceLock::new(),
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
+            dialect,
             io: io.clone(),
             open_flags: flags,
             init_lock: Arc::new(Mutex::new(())),
@@ -775,32 +785,45 @@ impl Database {
     }
 
     #[cfg(feature = "fs")]
-    pub fn open_file(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
-        Self::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None)
+    pub fn open_file(
+        io: Arc<dyn IO>,
+        path: &str,
+        dialect: Arc<dyn Dialect>,
+    ) -> Result<Arc<Database>> {
+        Self::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            dialect,
+        )
     }
 
     /// Open or retrieve a shared named in-memory database.
     /// Multiple connections to the same `name` share a single `Database`,
     /// matching SQLite's `file:name?mode=memory&cache=shared` semantics.
     #[cfg(feature = "fs")]
-    pub fn open_shared_memory(name: &str) -> Result<Arc<Database>> {
+    pub fn open_shared_memory(name: &str, dialect: Arc<dyn Dialect>) -> Result<Arc<Database>> {
         let key = DatabaseKey::SharedMemory(name.to_string());
 
         {
             let registry = DATABASE_MANAGER.lock();
             if let Some(RegistryEntry::Ready(weak)) = registry.get(&key) {
                 if let Some(db) = weak.upgrade() {
+                    Self::check_registry_dialect(&db, dialect.as_ref())?;
                     return Ok(db);
                 }
             }
         }
         // `:memory:` paths bypass DATABASE_MANAGER internally, so no deadlock.
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Self::open_file(io, ":memory:")?;
+        let db = Self::open_file(io, ":memory:", dialect.clone())?;
 
         let mut registry = DATABASE_MANAGER.lock();
         if let Some(RegistryEntry::Ready(weak)) = registry.get(&key) {
             if let Some(existing) = weak.upgrade() {
+                Self::check_registry_dialect(&existing, dialect.as_ref())?;
                 return Ok(existing);
             }
         }
@@ -935,6 +958,22 @@ impl Database {
         Ok(())
     }
 
+    /// Check that a registry hit was opened with the dialect the caller
+    /// requested. The dialect is fixed at open time and shared by every
+    /// user of the registered instance, so a mismatch is an error rather
+    /// than a silent share.
+    fn check_registry_dialect(db: &Database, requested: &dyn Dialect) -> Result<()> {
+        let requested_name = requested.name();
+        if db.dialect.name() != requested_name {
+            return Err(LimboError::InvalidArgument(format!(
+                "database is already open with dialect '{}'; requested '{}'",
+                db.dialect.name(),
+                requested_name
+            )));
+        }
+        Ok(())
+    }
+
     /// Look up a database in the process-wide registry by file identity.
     /// Returns the cached Database if found, with encryption validation.
     /// This avoids opening a file (and acquiring a file lock) when the
@@ -942,6 +981,7 @@ impl Database {
     fn lookup_in_registry(
         path: &str,
         encryption_opts: &Option<EncryptionOpts>,
+        dialect: &dyn Dialect,
     ) -> Result<Option<Arc<Database>>> {
         if is_memory_like(path) {
             return Ok(None);
@@ -969,6 +1009,8 @@ impl Database {
             ));
         }
 
+        Self::check_registry_dialect(&db, dialect)?;
+
         Ok(Some(db))
     }
 
@@ -979,11 +1021,21 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
+        dialect: Arc<dyn Dialect>,
     ) -> Result<Arc<Database>> {
-        Self::open_file_with_flags_and_durable_storage(io, path, flags, opts, encryption_opts, None)
+        Self::open_file_with_flags_and_durable_storage(
+            io,
+            path,
+            flags,
+            opts,
+            encryption_opts,
+            None,
+            dialect,
+        )
     }
 
     #[cfg(feature = "fs")]
+    #[allow(clippy::too_many_arguments)]
     pub fn open_file_with_flags_and_durable_storage(
         io: Arc<dyn IO>,
         path: &str,
@@ -991,10 +1043,11 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        dialect: Arc<dyn Dialect>,
     ) -> Result<Arc<Database>> {
         // Check the registry before opening the file to avoid acquiring a file
         // lock that would conflict with an already-open Database in this process.
-        if let Some(db) = Self::lookup_in_registry(path, &encryption_opts)? {
+        if let Some(db) = Self::lookup_in_registry(path, &encryption_opts, dialect.as_ref())? {
             if durable_storage.is_some() && db.durable_storage.is_none() {
                 return Err(LimboError::InvalidArgument(
                     "database already open without custom durable storage; \
@@ -1021,7 +1074,7 @@ impl Database {
         //    authority appeared between the initial probe and the actual open
         Self::reject_live_multiprocess_wal_for_legacy_open(&io, path, opts)?;
         let db_file = Arc::new(DatabaseFile::new(file));
-        Self::open_with_flags(
+        Self::open_with_flags_with_allocator(
             io,
             path,
             db_file,
@@ -1029,6 +1082,8 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
+            alloc::DynAllocator::default(),
+            dialect,
         )
     }
 
@@ -1036,6 +1091,7 @@ impl Database {
         io: Arc<dyn IO>,
         path: &str,
         db_file: Arc<dyn DatabaseStorage>,
+        dialect: Arc<dyn Dialect>,
     ) -> Result<Arc<Database>> {
         Self::open_with_flags(
             io,
@@ -1045,6 +1101,7 @@ impl Database {
             DatabaseOpts::new(),
             None,
             None,
+            dialect,
         )
     }
 
@@ -1057,6 +1114,7 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        dialect: Arc<dyn Dialect>,
     ) -> Result<Arc<Database>> {
         Self::open_with_flags_with_allocator(
             io,
@@ -1067,6 +1125,7 @@ impl Database {
             encryption_opts,
             durable_storage,
             alloc::DynAllocator::default(),
+            dialect,
         )
     }
 
@@ -1080,6 +1139,7 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         allocator: alloc::DynAllocator,
+        dialect: Arc<dyn Dialect>,
     ) -> Result<Arc<Database>> {
         let mut state = OpenDbAsyncState::new();
         loop {
@@ -1093,6 +1153,7 @@ impl Database {
                 encryption_opts.clone(),
                 durable_storage.clone(),
                 allocator.clone(),
+                dialect.clone(),
             )? {
                 IOResult::Done(db) => return Ok(db),
                 IOResult::IO(io_completion) => {
@@ -1120,6 +1181,7 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        dialect: Arc<dyn Dialect>,
     ) -> Result<IOResult<Arc<Database>>> {
         // Re-derive lock-mode flags from opts the same way the sync
         // `open_file_with_flags` path does: multiprocess WAL must open the
@@ -1136,6 +1198,7 @@ impl Database {
             encryption_opts,
             durable_storage,
             alloc::DynAllocator::default(),
+            dialect,
         )
     }
 
@@ -1150,6 +1213,7 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         allocator: alloc::DynAllocator,
+        dialect: Arc<dyn Dialect>,
     ) -> Result<IOResult<Arc<Database>>> {
         let result = Self::open_with_flags_async_internal(
             state,
@@ -1161,6 +1225,7 @@ impl Database {
             encryption_opts,
             durable_storage,
             allocator,
+            dialect,
         );
         if result.is_err() {
             // On error, remove the Opening sentinel so other callers can proceed.
@@ -1183,6 +1248,7 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         allocator: alloc::DynAllocator,
+        dialect: Arc<dyn Dialect>,
     ) -> Result<IOResult<Arc<Database>>> {
         // turso-sync-engine creates 2 databases with different names in the same IO if MemoryIO is used
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
@@ -1209,6 +1275,7 @@ impl Database {
                                         .to_string(),
                                 ));
                             }
+                            Self::check_registry_dialect(&db, dialect.as_ref())?;
                             return Ok(IOResult::Done(db));
                         }
                         // Weak ref expired — treat as absent, fall through to insert Opening.
@@ -1244,6 +1311,7 @@ impl Database {
             encryption_opts,
             durable_storage,
             allocator,
+            dialect,
         )?;
 
         if let IOResult::Done(ref db) = result {
@@ -1269,6 +1337,7 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         allocator: alloc::DynAllocator,
+        dialect: Arc<dyn Dialect>,
     ) -> Result<IOResult<Arc<Database>>> {
         let result = Self::open_with_flags_bypass_registry_async_internal(
             state,
@@ -1281,6 +1350,7 @@ impl Database {
             encryption_opts,
             durable_storage,
             allocator,
+            dialect,
         );
         if result.is_err() {
             let _ = state.schema_guard.take();
@@ -1290,6 +1360,7 @@ impl Database {
 
     /// method for tests - for all other code we must use async alternative
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[allow(clippy::too_many_arguments)]
     pub fn open_with_flags_bypass_registry(
         io: Arc<dyn IO>,
         path: &str,
@@ -1298,6 +1369,7 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
+        dialect: Arc<dyn Dialect>,
     ) -> Result<Arc<Database>> {
         let mut state = OpenDbAsyncState::new();
         loop {
@@ -1311,6 +1383,7 @@ impl Database {
                 opts,
                 encryption_opts.clone(),
                 None,
+                dialect.clone(),
             )? {
                 IOResult::Done(db) => return Ok(db),
                 IOResult::IO(io_completion) => {
@@ -1334,6 +1407,7 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        dialect: Arc<dyn Dialect>,
     ) -> Result<IOResult<Arc<Database>>> {
         let result = Self::open_with_flags_bypass_registry_async_internal(
             state,
@@ -1346,6 +1420,7 @@ impl Database {
             encryption_opts,
             durable_storage,
             alloc::DynAllocator::default(),
+            dialect,
         );
         if result.is_err() {
             // schema_guard is set by the open_with_flags_bypass_registry_async_internal - so we release it in case of error
@@ -1367,6 +1442,7 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         allocator: alloc::DynAllocator,
+        dialect: Arc<dyn Dialect>,
     ) -> Result<IOResult<Arc<Database>>> {
         loop {
             tracing::debug!(
@@ -1396,6 +1472,7 @@ impl Database {
                         db_file.clone(),
                         encryption_opts.clone(),
                         allocator.clone(),
+                        dialect.clone(),
                     )?;
                     db.durable_storage.clone_from(&durable_storage);
 
@@ -1500,11 +1577,13 @@ impl Database {
                     // it's not ideal but correctness is OK - before prepare connection call maybe_update_schema and in case of divergence update schema ref from the db + we always check connection cookie in the VDBE program itself
                     let schema = Schema::try_make_mut(guard)?;
 
+                    let dialect = conn.dialect();
                     let result = schema.make_from_btree(
                         &mut state.make_from_btree_state,
                         None,
                         pager,
                         &syms,
+                        dialect.as_ref(),
                     );
 
                     match result {
@@ -1528,11 +1607,11 @@ impl Database {
                     // contents. We need to read the stored type definitions so
                     // that DECODE/ENCODE and affinity metadata are available to
                     // all subsequent connections.
-                    if opts.enable_custom_types {
-                        let conn = state
-                            .conn
-                            .as_ref()
-                            .expect("conn must be initialized in Init phase");
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .expect("conn must be initialized in Init phase");
+                    if conn.experimental_custom_types_enabled() {
                         // Sync the connection's schema from the database so it
                         // can query __turso_internal_types.
                         conn.maybe_update_schema();
@@ -2848,6 +2927,7 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
+        dialect: Arc<dyn Dialect>,
     ) -> Result<(Arc<dyn IO>, Arc<Database>)>
     where
         S: AsRef<str> + std::fmt::Display,
@@ -2857,7 +2937,8 @@ impl Database {
             .or_else(|| Some(Self::io_for_path(path)))
             .transpose()?
             .unwrap();
-        let db = Self::open_file_with_flags(io.clone(), path, flags, opts, encryption_opts)?;
+        let db =
+            Self::open_file_with_flags(io.clone(), path, flags, opts, encryption_opts, dialect)?;
         Ok((io, db))
     }
 
@@ -2898,6 +2979,18 @@ impl Database {
     {
         self.with_schema_mut(|schema| schema.register_internal_vtab(table))
     }
+
+    /// The SQL dialect this database was opened with.
+    pub fn dialect(&self) -> Arc<dyn Dialect> {
+        self.dialect.clone()
+    }
+
+    pub fn register_virtual_table(&self, table: Arc<VirtualTable>) -> Result<String> {
+        let name = table.name.clone();
+        self.with_schema_mut(|schema| schema.add_virtual_table(table))?;
+        Ok(name)
+    }
+
     pub(crate) fn clone_schema(&self) -> Arc<Schema> {
         let schema = self.schema.lock();
         schema.clone()
@@ -2934,7 +3027,7 @@ impl Database {
     }
 
     pub fn experimental_custom_types_enabled(&self) -> bool {
-        self.opts.enable_custom_types
+        self.opts.enable_custom_types || self.dialect.requires_custom_types()
     }
 
     pub fn experimental_encryption_enabled(&self) -> bool {
@@ -3231,18 +3324,27 @@ impl DatabaseCatalog {
 }
 
 pub struct QueryRunner<'a> {
-    parser: Parser<'a>,
     conn: &'a Arc<Connection>,
-    statements: &'a [u8],
+    statements: &'a str,
+    pending_error: Option<LimboError>,
     last_offset: usize,
 }
 
 impl<'a> QueryRunner<'a> {
     pub(crate) fn new(conn: &'a Arc<Connection>, statements: &'a [u8]) -> Self {
+        let (statements, pending_error) = match str::from_utf8(statements) {
+            Ok(statements) => (statements, None),
+            Err(err) => (
+                "",
+                Some(LimboError::ParseError(format!(
+                    "invalid UTF-8 in SQL input: {err}"
+                ))),
+            ),
+        };
         Self {
-            parser: Parser::new(statements),
             conn,
             statements,
+            pending_error,
             last_offset: 0,
         }
     }
@@ -3252,17 +3354,22 @@ impl Iterator for QueryRunner<'_> {
     type Item = Result<Option<Statement>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.parser.next_cmd() {
-            Ok(Some(cmd)) => {
-                let byte_offset_end = self.parser.offset();
-                let input = str::from_utf8(&self.statements[self.last_offset..byte_offset_end])
-                    .unwrap()
-                    .trim();
-                self.last_offset = byte_offset_end;
+        if let Some(err) = self.pending_error.take() {
+            return Some(Err(err));
+        }
+
+        let remaining = &self.statements[self.last_offset..];
+        match self.conn.parse_sql(remaining) {
+            Ok((Some(cmd), byte_offset_end)) => {
+                let input = remaining[..byte_offset_end].trim();
+                self.last_offset += byte_offset_end;
                 Some(self.conn.run_cmd(cmd, input))
             }
-            Ok(None) => None,
-            Err(err) => Some(Result::Err(LimboError::from(err))),
+            Ok((None, _)) => None,
+            Err(err) => {
+                self.last_offset = self.statements.len();
+                Some(Err(err))
+            }
         }
     }
 }

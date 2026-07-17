@@ -844,7 +844,7 @@ mod tests {
         generation::Opts,
         model::table::{Column, ColumnType, Table},
     };
-    use turso_core::{Database, MemoryIO};
+    use turso_core::{Database, MemoryIO, SqliteDialect};
 
     use super::*;
 
@@ -933,7 +933,7 @@ mod tests {
     #[test]
     fn json_workload_variants_execute() {
         let io = Arc::new(MemoryIO::new());
-        let database = Database::open_file(io, ":memory:").unwrap();
+        let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let connection = database.connect().unwrap();
         let document =
             r#"{"id":1,"meta":{"active":true},"items":[1,2,{"value":3}],"nullable":null}"#;

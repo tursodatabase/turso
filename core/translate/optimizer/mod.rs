@@ -774,6 +774,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
     plan.simple_aggregate = detect_simple_aggregate(plan);
     let best_join_order = optimize_table_access(
         schema,
+        resolver.dialect.as_ref(),
         &mut plan.result_columns,
         &mut plan.table_references,
         &available_indexes,
@@ -853,6 +854,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
 
     let _ = optimize_table_access(
         schema,
+        resolver.dialect.as_ref(),
         &mut plan.result_columns,
         &mut plan.table_references,
         &available_indexes,
@@ -914,6 +916,7 @@ fn optimize_update_plan(
     let available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables);
     let optimize_result = optimize_table_access(
         schema,
+        resolver.dialect.as_ref(),
         &mut [],
         &mut target_tables,
         &available_indexes,
@@ -1647,6 +1650,7 @@ fn where_term_is_null_rejecting_for_table(
     expr: &ast::Expr,
     operator: ConstraintOperator,
     table_id: ast::TableInternalId,
+    dialect: &dyn crate::dialect::Dialect,
 ) -> bool {
     if matches!(
         operator,
@@ -1655,7 +1659,7 @@ fn where_term_is_null_rejecting_for_table(
         return false;
     }
 
-    !expr_has_null_masking_for_table(expr, table_id)
+    !expr_has_null_masking_for_table(expr, table_id, dialect)
 }
 
 /// Returns true if an expression references a column from `table_id`.
@@ -1697,15 +1701,17 @@ fn is_null_check_on_table(expr: &ast::Expr, table_id: ast::TableInternalId) -> b
 /// Returns true if an expression uses a NULL-masking construct over columns from `table_id`.
 /// This includes NULL-masking functions (COALESCE, IFNULL) and CASE/IIF expressions
 /// that explicitly handle the NULL case for columns from the target table.
-fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInternalId) -> bool {
+fn expr_has_null_masking_for_table(
+    expr: &ast::Expr,
+    table_id: ast::TableInternalId,
+    dialect: &dyn crate::dialect::Dialect,
+) -> bool {
     use crate::translate::expr::{walk_expr, WalkControl};
     let mut found = false;
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::FunctionCall { name, args, .. } => {
-                if let Ok(Some(func)) =
-                    crate::function::Func::resolve_function(name.as_str(), args.len())
-                {
+                if let Ok(Some(func)) = dialect.resolve_function(name.as_str(), args.len()) {
                     // IIF(cond, then, else) is like CASE WHEN cond THEN then ELSE else END.
                     // If the condition is a null check on the target table, IIF masks nulls.
                     if matches!(
@@ -1833,6 +1839,7 @@ fn enforce_indexed_by_hints(
 #[allow(clippy::too_many_arguments)]
 fn optimize_table_access(
     schema: &Schema,
+    dialect: &dyn crate::dialect::Dialect,
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &AvailableIndexes,
@@ -1988,6 +1995,7 @@ fn optimize_table_access(
                     &where_clause[c.where_clause_pos.0].expr,
                     c.operator,
                     t.internal_id,
+                    dialect,
                 );
                 is_from_where && is_null_rejecting
             }) {
@@ -3739,6 +3747,7 @@ mod tests {
             syms,
             true,
             DoubleQuotedDml::Enabled,
+            crate::sync::Arc::new(crate::dialect::SqliteDialect),
         )
     }
 
@@ -3847,7 +3856,8 @@ mod tests {
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::GreaterEquals.into(),
-            table
+            table,
+            &crate::dialect::SqliteDialect,
         ));
     }
 
@@ -3875,7 +3885,8 @@ mod tests {
         assert!(where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::Greater.into(),
-            target_table
+            target_table,
+            &crate::dialect::SqliteDialect,
         ));
     }
 
@@ -3908,7 +3919,8 @@ mod tests {
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::Equals.into(),
-            table
+            table,
+            &crate::dialect::SqliteDialect,
         ));
     }
 
@@ -3929,7 +3941,8 @@ mod tests {
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::Is.into(),
-            table
+            table,
+            &crate::dialect::SqliteDialect,
         ));
     }
 
@@ -3955,7 +3968,8 @@ mod tests {
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::Is.into(),
-            table
+            table,
+            &crate::dialect::SqliteDialect,
         ));
     }
 
@@ -3976,7 +3990,8 @@ mod tests {
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::Is.into(),
-            table
+            table,
+            &crate::dialect::SqliteDialect,
         ));
     }
 
@@ -3997,7 +4012,8 @@ mod tests {
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::IsNot.into(),
-            table
+            table,
+            &crate::dialect::SqliteDialect,
         ));
     }
 
@@ -4031,7 +4047,8 @@ mod tests {
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::Greater.into(),
-            table
+            table,
+            &crate::dialect::SqliteDialect,
         ));
     }
 
@@ -4070,7 +4087,8 @@ mod tests {
         assert!(where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::Greater.into(),
-            table
+            table,
+            &crate::dialect::SqliteDialect,
         ));
     }
 
@@ -4104,7 +4122,8 @@ mod tests {
         assert!(!where_term_is_null_rejecting_for_table(
             &expr,
             ast::Operator::Greater.into(),
-            table
+            table,
+            &crate::dialect::SqliteDialect,
         ));
     }
 }

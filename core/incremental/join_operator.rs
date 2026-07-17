@@ -58,7 +58,7 @@ fn read_next_join_row(
 
     let seek_result = return_if_io!(cursors
         .index_cursor
-        .seek(SeekKey::IndexKey(&index_record), seek_op));
+        .seek(SeekKey::IndexKey(index_record.as_record_ref()), seek_op));
 
     if !matches!(seek_result, SeekResult::Found) {
         return Ok(IOResult::Done(None));

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Clock, Connection, Database, FromValueRow, Row, IO};
+use turso_core::{Clock, Connection, Database, FromValueRow, Row, SqliteDialect, IO};
 
 pub struct TempDatabase {
     pub path: PathBuf,
@@ -220,6 +220,7 @@ impl TempDatabaseBuilder {
             flags,
             opts,
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
 
@@ -297,7 +298,12 @@ impl TempDatabase {
 
     pub fn limbo_database(&self) -> Arc<turso_core::Database> {
         log::debug!("conneting to limbo");
-        Database::open_file(self.io.clone(), self.path.to_str().unwrap()).unwrap()
+        Database::open_file(
+            self.io.clone(),
+            self.path.to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap()
     }
 
     #[allow(dead_code)]
@@ -672,6 +678,7 @@ impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6, T7: 7
 mod tests {
     use std::{sync::Arc, vec};
     use tempfile::{NamedTempFile, TempDir};
+    use turso_core::SqliteDialect;
     use turso_core::{Database, StepResult, IO};
 
     use crate::common::{do_flush, ExecRows};
@@ -948,7 +955,7 @@ mod tests {
         // Open database
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db = Database::open_file(io, &db_path)?;
+        let db = Database::open_file(io, &db_path, Arc::new(SqliteDialect))?;
 
         const NUM_CONNECTIONS: usize = 5;
         let mut connections = Vec::new();

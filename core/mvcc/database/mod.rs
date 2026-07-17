@@ -177,27 +177,22 @@ impl std::fmt::Display for MVTableId {
 #[derive(Debug, Clone)]
 pub struct SortableIndexKey {
     /// The key as bytes.
-    pub key: ImmutableRecord,
+    pub key: ImmutableRecordRef<'static>,
     /// Index metadata containing sort orders and collations
     pub metadata: Arc<IndexInfo>,
 }
 
 impl SortableIndexKey {
-    pub fn new_from_bytes(key_bytes: crate::ValueBlob, metadata: Arc<IndexInfo>) -> Self {
-        Self {
-            key: ImmutableRecord::from_bin_record(key_bytes),
-            metadata,
-        }
-    }
-
-    pub fn new_from_record(key: ImmutableRecord, metadata: Arc<IndexInfo>) -> Self {
-        Self { key, metadata }
-    }
-
-    pub fn new_from_values(values: Vec<ValueRef>, metadata: Arc<IndexInfo>) -> Result<Self> {
-        let len = values.len();
+    pub fn new_from_payload_in<A: ConcurrentAllocator>(
+        payload: impl AsRef<[u8]>,
+        metadata: Arc<IndexInfo>,
+        alloc: A,
+    ) -> Result<Self, TryReserveError> {
         Ok(Self {
-            key: ImmutableRecord::from_values(values, len)?,
+            key: ImmutableRecordRef::from_shared_record(crate::alloc::try_arc_slice_from_slice_in(
+                payload.as_ref(),
+                alloc,
+            )?),
             metadata,
         })
     }
@@ -277,7 +272,7 @@ impl SortableIndexKey {
 
 impl PartialEq for SortableIndexKey {
     fn eq(&self, other: &Self) -> bool {
-        if self.key == other.key {
+        if self.key.get_payload() == other.key.get_payload() {
             return true;
         }
 
@@ -388,7 +383,7 @@ impl Row {
     pub fn payload(&self) -> &[u8] {
         match self.id.row_id {
             RowKey::Int(_) => self.data.as_deref().expect("table rows should have data"),
-            RowKey::Record(ref sortable_key) => sortable_key.key.as_blob(),
+            RowKey::Record(ref sortable_key) => sortable_key.key.get_payload(),
         }
     }
 }
@@ -3402,7 +3397,7 @@ impl StateTransition for WriteRowStateMachine {
                 // Position the cursor by seeking to the row position
                 let seek_key = match &self.row.id.row_id {
                     RowKey::Int(row_id) => SeekKey::TableRowId(*row_id),
-                    RowKey::Record(record) => SeekKey::IndexKey(&record.key),
+                    RowKey::Record(record) => SeekKey::IndexKey(record.key.reborrow()),
                 };
 
                 match self
@@ -3448,7 +3443,7 @@ impl StateTransition for WriteRowStateMachine {
                 // Insert the record into the B-tree
                 let key = match &self.row.id.row_id {
                     RowKey::Int(row_id) => BTreeKey::new_table_rowid(*row_id, self.record.as_ref()),
-                    RowKey::Record(record) => BTreeKey::new_index_key(&record.key),
+                    RowKey::Record(record) => BTreeKey::new_index_key(record.key.reborrow()),
                 };
 
                 match self
@@ -3509,7 +3504,7 @@ impl StateTransition for DeleteRowStateMachine {
             DeleteRowState::Seek => {
                 let seek_key = match &self.rowid.row_id {
                     RowKey::Int(row_id) => SeekKey::TableRowId(*row_id),
-                    RowKey::Record(record) => SeekKey::IndexKey(&record.key),
+                    RowKey::Record(record) => SeekKey::IndexKey(record.key.reborrow()),
                 };
 
                 match self
@@ -7773,7 +7768,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Row lives only in the B-tree: record a B-tree-resident tombstone so the collection
         // (btree_resident => exists_in_db_file) materializes the physical delete.
         let version_id = self.get_version_id();
-        let row = Row::new_table_row(rowid, &[], num_cols).expect("empty tombstone row");
+        let row = Row::new_table_row_in(rowid, &[], num_cols, self.alloc.clone())
+            .expect("empty tombstone row");
         let _ = self.insert_version_raw(
             &mut versions,
             RowVersion {
@@ -8233,7 +8229,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .block(|| pager.with_header(|header| header.schema_cookie))?
                     .get(),
             );
-        let mut fresh = Schema::new();
+        let mut fresh = Schema::with_options(
+            connection.db.experimental_custom_types_enabled(),
+            connection.db.dialect().as_ref(),
+        )?;
         fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
         let mut from_sql_indexes = crate::alloc::vec![];
@@ -8318,6 +8317,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 &mut dbsp_state_index_roots,
                 &mut materialized_view_info,
                 &attached_resolver,
+                connection.dialect().as_ref(),
             )?;
         }
         fresh.populate_indices(
@@ -9171,7 +9171,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .as_ref()
             .map(|header| header.schema_cookie.get())
             .unwrap_or(fallback_cookie);
-        let mut fresh = Schema::new();
+        let mut fresh = Schema::with_options(
+            connection.db.experimental_custom_types_enabled(),
+            connection.db.dialect().as_ref(),
+        )?;
         fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
         let mut from_sql_indexes =
@@ -9258,6 +9261,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 &mut dbsp_state_index_roots,
                 &mut materialized_view_info,
                 &attached_resolver,
+                connection.dialect().as_ref(),
             )?;
         }
         fresh.populate_indices(

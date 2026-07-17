@@ -5824,6 +5824,7 @@ pub mod test {
     };
     use crate::sync::{atomic::Ordering, Arc};
     use crate::sync::{Mutex, RwLock};
+    use crate::SqliteDialect;
     use crate::{
         io::FileSyncType,
         storage::{
@@ -5874,6 +5875,7 @@ pub mod test {
             crate::OpenFlags::default(),
             crate::DatabaseOpts::new().with_multiprocess_wal(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         // db + tmp directory

@@ -5,15 +5,19 @@ This directory contains documentation for the test-runner crate.
 ## Quick Start
 
 ```bash
-# Build
+# Build (from the repository root)
 cargo build --release
 
 # Check test file syntax
-./target/release/test-runner check tests/
+./target/release/test-runner check sqlite/conformance/sqlite-sqltests/
 
 # Run tests
-./target/release/test-runner run tests/ --binary ./target/release/tursodb
+./target/release/test-runner run sqlite/conformance/sqlite-sqltests/ --binary ./target/release/tursodb
 ```
+
+The `.sqltest` corpora live in `sqlite/conformance/` (`sqlite-sqltests/` for
+SQLite-compatible coverage, `turso-sqltests/` for Turso-specific behavior);
+`make -C sqlite/conformance run` drives the full suite.
 
 ## Documentation Index
 
@@ -72,8 +76,7 @@ test-runner/
 │       ├── pretty.rs       # Colored terminal output
 │       └── json.rs         # JSON output for CI
 ├── docs/                   # Documentation (this directory)
-├── examples/               # Example test files
-└── tests/                  # Integration tests
+└── examples/               # Example test files
 ```
 
 ## Key Concepts

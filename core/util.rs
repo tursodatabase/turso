@@ -203,6 +203,7 @@ pub fn parse_schema_rows(
     schema: &mut Schema,
     syms: &SymbolTable,
     resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
+    dialect: &dyn crate::dialect::Dialect,
 ) -> Result<IOResult<()>> {
     {
         let inner = state
@@ -238,6 +239,7 @@ pub fn parse_schema_rows(
                 dbsp_state_index_roots,
                 materialized_view_info,
                 resolve_attached_db,
+                dialect,
             )
         }));
     }

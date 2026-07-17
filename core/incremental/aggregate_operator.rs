@@ -563,7 +563,7 @@ impl AggregateEvalState {
 
                         // Seek in the index to find if this row exists
                         let seek_result = return_if_io!(cursors.index_cursor.seek(
-                            SeekKey::IndexKey(&index_record),
+                            SeekKey::IndexKey(index_record.as_record_ref()),
                             SeekOp::GE { eq_only: true }
                         ));
 
@@ -2302,7 +2302,7 @@ impl ScanState {
     ) -> Result<IOResult<Option<Value>>> {
         let seek_result = return_if_io!(cursors
             .index_cursor
-            .seek(SeekKey::IndexKey(index_record), seek_op));
+            .seek(SeekKey::IndexKey(index_record.as_record_ref()), seek_op));
         if !matches!(seek_result, SeekResult::Found) {
             return Ok(IOResult::Done(None));
         }
@@ -2733,7 +2733,7 @@ impl FetchDistinctState {
                     let index_record = ImmutableRecord::from_values(&index_key, index_key.len())?;
 
                     let seek_result = return_if_io!(cursors.index_cursor.seek(
-                        SeekKey::IndexKey(&index_record),
+                        SeekKey::IndexKey(index_record.as_record_ref()),
                         SeekOp::GE { eq_only: true }
                     ));
 

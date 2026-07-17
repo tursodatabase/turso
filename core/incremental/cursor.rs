@@ -378,6 +378,7 @@ mod tests {
     use crate::storage::btree::BTreeCursor;
     use crate::sync::Arc;
     use crate::util::IOExt;
+    use crate::SqliteDialect;
     use crate::{Connection, Database, OpenFlags};
 
     /// Helper to create a test connection with a table and materialized view
@@ -404,6 +405,7 @@ mod tests {
                 unsafe_testing: false,
             },
             None,
+            Arc::new(SqliteDialect),
         )?;
         let conn = db.connect()?;
 

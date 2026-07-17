@@ -1,6 +1,7 @@
 use crate::common::{ExecRows, TempDatabase};
 use std::path::Path;
 use std::sync::Arc;
+use turso_core::SqliteDialect;
 use turso_core::{Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags, StepResult};
 
 /// Create a new database file at `path` with MVCC journal mode enabled.
@@ -13,6 +14,7 @@ fn create_mvcc_db(io: &Arc<dyn turso_core::io::IO + Send>, path: &Path) -> anyho
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
+        Arc::new(SqliteDialect),
     )?;
     let conn = db.connect()?;
     conn.pragma_update("journal_mode", "'mvcc'")?;
@@ -189,6 +191,7 @@ fn test_mvcc_custom_durable_storage_injected(tmp_db: TempDatabase) -> anyhow::Re
         DatabaseOpts::new(),
         None,
         Some(recording.clone()),
+        Arc::new(SqliteDialect),
     )?;
     let conn = db.connect()?;
     conn.pragma_update("journal_mode", "'mvcc'")?;
@@ -452,6 +455,7 @@ fn test_attach_rejects_incompatible_journal_mode(tmp_db: TempDatabase) -> anyhow
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
+        Arc::new(SqliteDialect),
     )?;
     let aux_conn = aux_db.connect()?;
     aux_conn.execute("CREATE TABLE t(x INTEGER)")?;
@@ -935,6 +939,7 @@ fn test_attach_memory_db_allowed_on_encrypted_mvcc_main(
         OpenFlags::default(),
         opts,
         enc_opts,
+        Arc::new(SqliteDialect),
     )?;
     let key = EncryptionKey::from_hex_string(hex_key)?;
     let conn = db.connect_with_encryption(Some(key))?;
@@ -973,7 +978,7 @@ fn test_add_then_drop_table_in_same_tx_then_recover(db: TempDatabase) -> anyhow:
     }
     drop(db);
 
-    Database::open_file(io, path.to_str().unwrap())?;
+    Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
 
     Ok(())
 }
@@ -1020,7 +1025,7 @@ fn test_create_insert_drop_checkpoint_recover(db: TempDatabase) -> anyhow::Resul
     drop(db);
 
     // Reopen — triggers bootstrap / log replay
-    Database::open_file(io.clone(), path.to_str().unwrap())?;
+    Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(SqliteDialect))?;
 
     Ok(())
 }
@@ -1044,7 +1049,7 @@ fn test_recover_table_with_create_virtual_substring_in_sql(db: TempDatabase) -> 
     drop(db);
 
     // Reopen — triggers bootstrap / log replay; must not report corruption.
-    let db = Database::open_file(io, path.to_str().unwrap())?;
+    let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
     let conn = db.connect()?;
     let rows: Vec<(String,)> = conn.exec_rows("select x from t");
     assert_eq!(rows, vec![("create virtual".to_string(),)]);
@@ -1073,7 +1078,7 @@ fn test_create_drop_index_same_tx_recover(db: TempDatabase) -> anyhow::Result<()
     }
     drop(db);
 
-    Database::open_file(io, path.to_str().unwrap())?;
+    Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
 
     Ok(())
 }
@@ -1101,14 +1106,14 @@ fn test_create_rename_insert_same_tx_recover_then_checkpoint(
     drop(db);
 
     {
-        let db = Database::open_file(io.clone(), path.to_str().unwrap())?;
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(SqliteDialect))?;
         let conn = db.connect()?;
         let rows: Vec<(i64, String)> = conn.exec_rows("select id, v from t2 order by id");
         assert_eq!(rows, vec![(1, "one".to_string()), (2, "two".to_string())]);
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
     }
 
-    let db = Database::open_file(io, path.to_str().unwrap())?;
+    let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
     let conn = db.connect()?;
     let rows: Vec<(i64, String)> = conn.exec_rows("select id, v from t2 order by id");
     assert_eq!(rows, vec![(1, "one".to_string()), (2, "two".to_string())]);
@@ -1183,7 +1188,11 @@ fn test_mvcc_same_tx_row_and_index_lifecycle_matrix(db: TempDatabase) -> anyhow:
                 );
 
                 {
-                    let db = Database::open_file(io.clone(), path.to_str().unwrap())?;
+                    let db = Database::open_file(
+                        io.clone(),
+                        path.to_str().unwrap(),
+                        Arc::new(SqliteDialect),
+                    )?;
                     let conn = db.connect()?;
                     conn.pragma_update("journal_mode", "'mvcc'")?;
                     conn.execute(format!(
@@ -1197,7 +1206,11 @@ fn test_mvcc_same_tx_row_and_index_lifecycle_matrix(db: TempDatabase) -> anyhow:
                 }
 
                 {
-                    let db = Database::open_file(io.clone(), path.to_str().unwrap())?;
+                    let db = Database::open_file(
+                        io.clone(),
+                        path.to_str().unwrap(),
+                        Arc::new(SqliteDialect),
+                    )?;
                     let conn = db.connect()?;
                     conn.pragma_update("journal_mode", "'mvcc'")?;
 
@@ -1233,7 +1246,11 @@ fn test_mvcc_same_tx_row_and_index_lifecycle_matrix(db: TempDatabase) -> anyhow:
                 }
 
                 for checkpoint_after_recovery in [true, false] {
-                    let db = Database::open_file(io.clone(), path.to_str().unwrap())?;
+                    let db = Database::open_file(
+                        io.clone(),
+                        path.to_str().unwrap(),
+                        Arc::new(SqliteDialect),
+                    )?;
                     let conn = db.connect()?;
 
                     let rows_sql = format!("SELECT id, v FROM {table} ORDER BY id");
@@ -1310,7 +1327,7 @@ fn test_create_insert_drop_same_tx_recover(db: TempDatabase) -> anyhow::Result<(
     }
     drop(db);
 
-    Database::open_file(io, path.to_str().unwrap())?;
+    Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
 
     Ok(())
 }
@@ -1359,7 +1376,7 @@ fn test_multiple_create_drop_cycles_recover(db: TempDatabase) -> anyhow::Result<
     }
     drop(db);
 
-    Database::open_file(io, path.to_str().unwrap())?;
+    Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
 
     Ok(())
 }
@@ -1402,7 +1419,7 @@ fn test_mvcc_update_btree_only_row_after_truncate_checkpoint(
 
     // Phase 2: reopen and UPDATE the btree-only row. Pre-fix this raised
     // a corruption error from MvccLazyCursor::delete().
-    let db = Database::open_file(io, path.to_str().unwrap())?;
+    let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect))?;
     let conn = db.connect()?;
     conn.pragma_update("journal_mode", "'mvcc'")?;
     conn.execute("UPDATE quint_corrupt SET value = zeroblob(32) WHERE key = 'k0'")?;

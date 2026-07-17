@@ -713,7 +713,10 @@ impl HybridBTreeDirectory {
 
         // Blocking seek to first chunk
         loop {
-            match cursor.seek(SeekKey::IndexKey(&seek_key), SeekOp::GE { eq_only: false }) {
+            match cursor.seek(
+                SeekKey::IndexKey(seek_key.as_record_ref()),
+                SeekOp::GE { eq_only: false },
+            ) {
                 Ok(IOResult::Done(SeekResult::Found)) => break,
                 Ok(IOResult::Done(SeekResult::TryAdvance)) => {
                     loop {
@@ -892,7 +895,10 @@ impl HybridBTreeDirectory {
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         loop {
-            match cursor.seek(SeekKey::IndexKey(&seek_key), SeekOp::GE { eq_only: false }) {
+            match cursor.seek(
+                SeekKey::IndexKey(seek_key.as_record_ref()),
+                SeekOp::GE { eq_only: false },
+            ) {
                 Ok(IOResult::Done(SeekResult::Found)) => break,
                 Ok(IOResult::Done(SeekResult::TryAdvance)) => {
                     loop {
@@ -2049,9 +2055,10 @@ impl FtsCursor {
                         3,
                     )?;
 
-                    let seek_result =
-                        return_if_io!(cursor
-                            .seek(SeekKey::IndexKey(&seek_key), SeekOp::GE { eq_only: false }));
+                    let seek_result = return_if_io!(cursor.seek(
+                        SeekKey::IndexKey(seek_key.as_record_ref()),
+                        SeekOp::GE { eq_only: false },
+                    ));
 
                     match seek_result {
                         SeekResult::NotFound => {
@@ -2236,9 +2243,10 @@ impl FtsCursor {
 
                     // Seek to find the correct position using GE (not eq_only)
                     // This positions the cursor at or after where the record should be inserted
-                    let _result = return_if_io!(
-                        cursor.seek(SeekKey::IndexKey(&record), SeekOp::GE { eq_only: false })
-                    );
+                    let _result = return_if_io!(cursor.seek(
+                        SeekKey::IndexKey(record.as_record_ref()),
+                        SeekOp::GE { eq_only: false },
+                    ));
 
                     // don't do insert in same state to avoid re-seeking on IO
                     self.state = FtsState::InsertingWrite {
@@ -2259,7 +2267,7 @@ impl FtsCursor {
                     })?;
 
                     // the cursor should be positioned correctly after seek
-                    return_if_io!(cursor.insert(&BTreeKey::IndexKey(record)));
+                    return_if_io!(cursor.insert(&BTreeKey::IndexKey(record.as_record_ref())));
 
                     // Move to next chunk
                     self.state = FtsState::FlushingWrites {
@@ -2319,9 +2327,10 @@ impl FtsCursor {
                         3,
                     )?;
 
-                    let _result =
-                        return_if_io!(cursor
-                            .seek(SeekKey::IndexKey(&seek_key), SeekOp::GE { eq_only: false }));
+                    let _result = return_if_io!(cursor.seek(
+                        SeekKey::IndexKey(seek_key.as_record_ref()),
+                        SeekOp::GE { eq_only: false },
+                    ));
 
                     self.state = FtsState::DeletingRecord {
                         deletes: std::mem::take(deletes),

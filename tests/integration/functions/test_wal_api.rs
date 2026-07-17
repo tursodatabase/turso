@@ -1,4 +1,5 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use turso_core::SqliteDialect;
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -872,6 +873,7 @@ fn test_db_share_same_file() {
         turso_core::DatabaseOpts::new(),
         None,
         None,
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn1 = db1.connect().unwrap();
@@ -899,6 +901,7 @@ fn test_db_share_same_file() {
         turso_core::OpenFlags::default(),
         turso_core::DatabaseOpts::new(),
         None,
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn2 = db2.connect().unwrap();

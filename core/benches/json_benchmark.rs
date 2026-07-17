@@ -9,7 +9,7 @@ use pprof::{
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{black_box, criterion_group, criterion_main, Criterion};
 use std::sync::Arc;
-use turso_core::{Database, PlatformIO};
+use turso_core::{Database, PlatformIO, SqliteDialect};
 
 // Title: JSONB Function Benchmarking
 
@@ -28,7 +28,8 @@ fn bench(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, "../testing/system/testing.db").unwrap();
+    let db =
+        Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     // Benchmark JSONB with different payload sizes
@@ -497,7 +498,8 @@ fn bench_sequential_jsonb(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, "../testing/system/testing.db").unwrap();
+    let db =
+        Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     // Select a subset of JSON payloads to use in the sequential test
@@ -654,7 +656,8 @@ fn bench_json_patch(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, "../testing/system/testing.db").unwrap();
+    let db =
+        Database::open_file(io, "../testing/system/testing.db", Arc::new(SqliteDialect)).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let json_patch_cases = [

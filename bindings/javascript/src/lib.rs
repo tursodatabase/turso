@@ -24,6 +24,7 @@ use std::{
 };
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
+use turso_core::SqliteDialect;
 
 /// Shared ownership of a `turso_core::Statement` that can be explicitly finalized.
 ///
@@ -332,6 +333,7 @@ fn connect(db: &DatabaseInner) -> napi::Result<Arc<turso_core::Connection>> {
             flags,
             core_opts,
             encryption_opts,
+            Arc::new(SqliteDialect),
         )
         .map_err(|e| to_generic_error(&format!("failed to open database {}", db.path), e))?;
 

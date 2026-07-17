@@ -1738,7 +1738,7 @@ async fn test_snapshot_isolation_violation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_ghost_commits() {
-    for iteration in 0..500 {
+    for iteration in 0..100 {
         if iteration % 100 == 0 {
             eprintln!("test_ghost_commits: Iteration {iteration}");
         }

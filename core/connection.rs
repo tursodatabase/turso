@@ -17,7 +17,7 @@ use crate::util::{OpenMode, OpenOptions};
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::Page;
 use crate::{
-    function,
+    ast, function,
     io::{MemoryIO, IO},
     progress::{ProgressHandler, ProgressHandlerCallback},
     translate,
@@ -27,8 +27,8 @@ use crate::{
     BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IOResult, IndexMethod, LimboError, MvStore, OpenFlags, PageSize,
-    Pager, Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode,
-    TransactionMode, Trigger, Value, VirtualTable, WalAutoActions,
+    Pager, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
+    Trigger, Value, VirtualTable, WalAutoActions,
 };
 use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
@@ -574,8 +574,11 @@ impl Connection {
 
     pub(crate) fn empty_temp_schema(&self) -> Arc<Schema> {
         // with_options only fails if built-in type SQL is malformed (programmer bug).
-        let mut schema = Schema::with_options(self.db.experimental_custom_types_enabled())
-            .expect("built-in type definitions are malformed");
+        let mut schema = Schema::with_options(
+            self.db.experimental_custom_types_enabled(),
+            self.db.dialect().as_ref(),
+        )
+        .expect("built-in type definitions are malformed");
         schema.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         Arc::new(schema)
     }
@@ -617,6 +620,7 @@ impl Connection {
                 OpenFlags::Create,
                 db_opts,
                 None,
+                self.db.dialect(),
             )?;
             let pager = Arc::new(db._init(None)?);
             pager.set_initial_page_size(page_size)?;
@@ -647,6 +651,7 @@ impl Connection {
                 OpenFlags::Create,
                 db_opts,
                 None,
+                self.db.dialect(),
             )?;
             let pager = Arc::new(db._init(None)?);
             pager.set_initial_page_size(page_size)?;
@@ -666,6 +671,7 @@ impl Connection {
                 OpenFlags::Create,
                 db_opts,
                 None,
+                self.db.dialect(),
             )?;
             let pager = Arc::new(db._init(None)?);
             pager.set_initial_page_size(page_size)?;
@@ -682,6 +688,7 @@ impl Connection {
             OpenFlags::Create,
             self.make_temp_database_opts(),
             None,
+            self.db.dialect(),
         )?;
         let pager = Arc::new(db._init(None)?);
         pager.set_initial_page_size(self.get_page_size())?;
@@ -887,6 +894,7 @@ impl Connection {
         self: &Arc<Connection>,
         cmd: Cmd,
         input: &str,
+        origin: StatementOrigin,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
         self.maybe_update_schema();
 
@@ -903,6 +911,7 @@ impl Connection {
             &syms,
             mode,
             input,
+            origin,
         ) {
             Ok(program) => Ok((program, pager, mode)),
             Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
@@ -912,8 +921,8 @@ impl Connection {
                 drop(syms);
                 let cmd = {
                     crate::stack::trace_stack!("schema_retry_parse");
-                    let mut parser = Parser::new(input.as_bytes());
-                    let Some(cmd) = parser.next_cmd()? else {
+                    let (cmd, _) = self.parse_sql(input)?;
+                    let Some(cmd) = cmd else {
                         return Err(err);
                     };
                     cmd
@@ -932,6 +941,7 @@ impl Connection {
                     &syms,
                     mode,
                     input,
+                    origin,
                 )
                 .map(|program| (program, pager, mode))
             }
@@ -943,10 +953,12 @@ impl Connection {
         self._prepare(sql)
     }
 
-    pub(crate) fn prepare_internal(
-        self: &Arc<Connection>,
-        sql: impl AsRef<str>,
-    ) -> Result<Statement> {
+    pub fn prepare_sqlite(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
+        self.prepare_with_origin(sql, StatementOrigin::Root)
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_internal(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self.prepare_with_origin(sql, StatementOrigin::InternalHelper)
     }
 
@@ -956,7 +968,7 @@ impl Connection {
     }
 
     #[turso_macros::trace_stack]
-    fn prepare_with_origin(
+    pub(crate) fn prepare_with_origin(
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
         origin: StatementOrigin,
@@ -993,13 +1005,59 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
 
             Ok(Statement::new_with_origin(
                 program,
                 pager,
                 mode,
                 byte_offset_end,
+                origin,
+                needs_nested_guard,
+            ))
+        })();
+        if result.is_err() && needs_nested_guard {
+            self.end_nested();
+        }
+        result
+    }
+
+    /// Prepare an already-translated statement while keeping the original
+    /// SQL text.
+    ///
+    /// A frontend that already has an engine AST can call this instead of
+    /// parsing through [`Dialect::parse`](crate::Dialect::parse), while the
+    /// original text remains available for schema storage, diagnostics, and
+    /// later re-preparation through the dialect.
+    pub fn prepare_translated_stmt(
+        self: &Arc<Connection>,
+        stmt: ast::Stmt,
+        input: &str,
+    ) -> Result<Statement> {
+        self.prepare_stmt_with_input_and_origin(stmt, input, StatementOrigin::Root)
+    }
+
+    #[turso_macros::trace_stack]
+    fn prepare_stmt_with_input_and_origin(
+        self: &Arc<Connection>,
+        stmt: ast::Stmt,
+        input: &str,
+        origin: StatementOrigin,
+    ) -> Result<Statement> {
+        if self.is_closed() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+        let needs_nested_guard = origin.needs_nested_guard();
+        if needs_nested_guard {
+            self.start_nested();
+        }
+        let result = (|| {
+            let (program, pager, mode) = self.compile_cmd(Cmd::Stmt(stmt), input, origin)?;
+            Ok(Statement::new_with_origin(
+                program,
+                pager,
+                mode,
+                0,
                 origin,
                 needs_nested_guard,
             ))
@@ -1264,7 +1322,10 @@ impl Connection {
         let guard = self.schema_reparse_guard();
         self.pager.load().set_schema_cookie(Some(cookie));
         // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::with_options(self.experimental_custom_types_enabled())?;
+        let mut fresh = Schema::with_options(
+            self.experimental_custom_types_enabled(),
+            self.db.dialect().as_ref(),
+        )?;
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
 
@@ -1341,6 +1402,7 @@ impl Connection {
                         &mut inner.fresh,
                         &self.syms.read(),
                         &attached_resolver,
+                        self.db.dialect().as_ref(),
                     ));
 
                     // Rehydrate built-in table-valued functions captured at init.
@@ -1582,7 +1644,7 @@ impl Connection {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
             Statement::new(program, pager, mode, 0).run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
@@ -1616,7 +1678,7 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+        let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some(stmt))
     }
@@ -1634,17 +1696,17 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        let mut parser = Parser::new(sql.as_bytes());
-        while let Some(cmd) = parser.next_cmd()? {
-            let byte_offset_end = parser.offset();
-            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+        let mut remaining = sql;
+        while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
+            let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
             {
                 crate::stack::trace_stack!("run");
                 Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
             }
+            remaining = &remaining[byte_offset_end..];
         }
         Ok(())
     }
@@ -1661,26 +1723,34 @@ impl Connection {
         let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+        let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some((stmt, byte_offset_end)))
     }
 
-    fn parse_sql(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd()?;
-        let offset = parser.offset();
-        Ok((cmd, offset))
+    pub(crate) fn parse_sql(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+        self.db.dialect().parse(sql)
     }
 
     #[cfg(feature = "fs")]
-    pub fn from_uri(uri: &str, db_opts: DatabaseOpts) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
+    pub fn from_uri(
+        uri: &str,
+        db_opts: DatabaseOpts,
+        dialect: Arc<dyn crate::Dialect>,
+    ) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
         let flags = opts.get_flags()?;
         if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
             let io = Arc::new(MemoryIO::new());
-            let db = Database::open_file_with_flags(io.clone(), MEMORY_PATH, flags, db_opts, None)?;
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                MEMORY_PATH,
+                flags,
+                db_opts,
+                None,
+                dialect,
+            )?;
             let conn = db.connect()?;
             return Ok((io, conn));
         }
@@ -1704,6 +1774,7 @@ impl Connection {
             flags,
             db_opts,
             encryption_opts,
+            dialect,
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
@@ -1726,6 +1797,7 @@ impl Connection {
         mut db_opts: DatabaseOpts,
         main_db_flags: OpenFlags,
         io: Arc<dyn IO>,
+        dialect: Arc<dyn crate::Dialect>,
     ) -> Result<(Arc<Database>, Option<EncryptionOpts>)> {
         let opts = OpenOptions::parse(uri)?;
         let mut flags = opts.get_flags()?;
@@ -1756,6 +1828,7 @@ impl Connection {
             flags,
             db_opts,
             encryption_opts.clone(),
+            dialect,
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
@@ -2578,8 +2651,13 @@ impl Connection {
     }
 
     #[cfg(feature = "fs")]
-    pub fn open_new(&self, path: &str, vfs: &str) -> Result<(Arc<dyn IO>, Arc<Database>)> {
-        Database::open_with_vfs(&self.db, path, vfs)
+    pub fn open_new(
+        &self,
+        path: &str,
+        vfs: &str,
+        dialect: Arc<dyn crate::Dialect>,
+    ) -> Result<(Arc<dyn IO>, Arc<Database>)> {
+        Database::open_with_vfs(&self.db, path, vfs, dialect)
     }
 
     pub fn list_vfs(&self) -> Vec<String> {
@@ -2690,6 +2768,7 @@ impl Connection {
                     &mut dbsp_state_index_roots,
                     &mut materialized_view_info,
                     &attached_resolver,
+                    self.db.dialect().as_ref(),
                 ) {
                     Ok(()) => {}
                     Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
@@ -2745,6 +2824,41 @@ impl Connection {
         let pragma = format!("PRAGMA {pragma_name} = {pragma_value}");
         let mut stmt = self.prepare(pragma)?;
         stmt.run_collect_rows()
+    }
+
+    /// The SQL dialect of the database this connection belongs to.
+    pub fn dialect(&self) -> Arc<dyn crate::Dialect> {
+        self.db.dialect()
+    }
+
+    pub fn register_internal_vtab<T>(&self, table: T) -> Result<String>
+    where
+        T: crate::vtab::InternalVirtualTable + 'static,
+    {
+        let name = self.db.register_internal_vtab(table)?;
+        *self.schema.write() = self.db.clone_schema();
+        self.bump_prepare_context_generation();
+        Ok(name)
+    }
+
+    pub fn register_virtual_table(&self, table: Arc<crate::VirtualTable>) -> Result<String> {
+        let name = self.db.register_virtual_table(table)?;
+        *self.schema.write() = self.db.clone_schema();
+        self.bump_prepare_context_generation();
+        Ok(name)
+    }
+
+    pub fn current_schema(&self) -> Arc<Schema> {
+        self.schema.read().clone()
+    }
+
+    pub fn attached_database_names(&self) -> Vec<String> {
+        self.attached_databases
+            .read()
+            .name_to_index
+            .keys()
+            .cloned()
+            .collect()
     }
 
     pub fn experimental_views_enabled(&self) -> bool {
@@ -3018,7 +3132,7 @@ impl Connection {
         }
     }
 
-    fn is_attached(&self, alias: &str) -> bool {
+    pub(crate) fn is_attached(&self, alias: &str) -> bool {
         self.attached_databases
             .read()
             .name_to_index
@@ -3250,8 +3364,13 @@ impl Connection {
                         self.db.io.clone()
                     };
                     let main_db_flags = self.db.open_flags;
-                    let (db, encryption_opts) =
-                        Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
+                    let (db, encryption_opts) = Self::from_uri_attached(
+                        path,
+                        db_opts,
+                        main_db_flags,
+                        io,
+                        self.db.dialect(),
+                    )?;
                     let attached_is_fresh = !db.initialized();
                     if !is_memory_db {
                         Self::validate_attach_target(&db, attached_is_fresh, alias)?;
@@ -4173,6 +4292,11 @@ impl Connection {
         }
     }
 
+    #[doc(hidden)]
+    pub fn db_file_path(&self) -> &str {
+        &self.db.path
+    }
+
     /// Create a `TempDir` honoring `TURSO_TMPDIR` and `SQLITE_TMPDIR`,
     /// falling back to the OS default (`env::temp_dir()`).
     ///
@@ -4926,6 +5050,7 @@ impl SymbolTable {
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
+    use crate::SqliteDialect;
     use tempfile::TempDir;
 
     fn open_connection_with_opts(path: &std::path::Path, opts: DatabaseOpts) -> Arc<Connection> {
@@ -4936,6 +5061,7 @@ mod tests {
             OpenFlags::default(),
             opts,
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         db.connect().unwrap()
@@ -4995,8 +5121,10 @@ mod tests {
     #[test]
     fn test_named_memory_databases_on_same_io_are_distinct() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let draft_db = Database::open_file(io.clone(), ":memory:sync-draft").unwrap();
-        let synced_db = Database::open_file(io, ":memory:sync-synced").unwrap();
+        let draft_db =
+            Database::open_file(io.clone(), ":memory:sync-draft", Arc::new(SqliteDialect)).unwrap();
+        let synced_db =
+            Database::open_file(io, ":memory:sync-synced", Arc::new(SqliteDialect)).unwrap();
         assert!(!Arc::ptr_eq(&draft_db, &synced_db));
 
         let draft = draft_db.connect().unwrap();
@@ -5025,13 +5153,14 @@ mod tests {
     fn test_named_memory_database_reopened_on_same_io_sees_same_rows() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
 
-        let first_db = Database::open_file(io.clone(), ":memory:reopen").unwrap();
+        let first_db =
+            Database::open_file(io.clone(), ":memory:reopen", Arc::new(SqliteDialect)).unwrap();
         let first = first_db.connect().unwrap();
         first
             .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(99)")
             .unwrap();
 
-        let second_db = Database::open_file(io, ":memory:reopen").unwrap();
+        let second_db = Database::open_file(io, ":memory:reopen", Arc::new(SqliteDialect)).unwrap();
         let second = second_db.connect().unwrap();
         assert_eq!(query_single_i64(&second, "SELECT x FROM t"), 99);
     }
@@ -5066,6 +5195,7 @@ mod tests {
             OpenFlags::default(),
             DatabaseOpts::new().with_attach(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
