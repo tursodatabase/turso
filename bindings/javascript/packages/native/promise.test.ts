@@ -343,8 +343,8 @@ test('example-2', async () => {
     const db = await connect(':memory:');
     await db.exec('CREATE TABLE users (name, email)');
     // Using transactions for atomic operations
-    const transaction = db.transaction(async (txn, users) => {
-        const insert = await txn.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
+    const transaction = db.transaction(async (users) => {
+        const insert = await db.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
         for (const user of users) {
             await insert.run(user.name, user.email);
         }
@@ -372,7 +372,7 @@ test('concurrent transaction() calls must not interleave', async () => {
     const db = await connect(':memory:');
     await db.exec('CREATE TABLE t(tag TEXT, i INTEGER)');
 
-    const insertMany = db.transaction(async (txn, tag: string, fail: boolean) => {
+    const insertMany = db.transactionAsync(async (txn, tag: string, fail: boolean) => {
         for (let i = 0; i < 10; i++) {
             await txn.run('INSERT INTO t VALUES (?, ?)', [tag, i]);
         }
@@ -404,7 +404,7 @@ test('statement racing a transaction() must not be lost to its rollback', async 
     const db = await connect(':memory:');
     await db.exec('CREATE TABLE t(tag TEXT)');
 
-    const failing = db.transaction(async (txn) => {
+    const failing = db.transactionAsync(async (txn) => {
         await txn.run('INSERT INTO t VALUES (?)', ['txn']);
         await new Promise((resolve) => setImmediate(resolve));
         throw new Error('abort transaction');
@@ -423,6 +423,26 @@ test('statement racing a transaction() must not be lost to its rollback', async 
 
 test('transaction.concurrent uses BEGIN CONCURRENT', async () => {
     const db = await connect(':memory:');
+    const originalExec = db.exec;
+    const calls: string[] = [];
+    db.exec = async (sql) => {
+        calls.push(sql);
+    };
+
+    try {
+        const txn = db.transaction(async () => {
+            calls.push('body');
+        }).concurrent;
+        await txn();
+        expect(calls).toEqual(['BEGIN CONCURRENT', 'body', 'COMMIT']);
+    } finally {
+        db.exec = originalExec;
+        await db.close();
+    }
+})
+
+test('transactionAsync.concurrent uses BEGIN CONCURRENT', async () => {
+    const db = await connect(':memory:');
     const originalExec = Transaction.prototype.exec;
     const calls: string[] = [];
     Transaction.prototype.exec = async (sql) => {
@@ -430,7 +450,7 @@ test('transaction.concurrent uses BEGIN CONCURRENT', async () => {
     };
 
     try {
-        const txn = db.transaction(async (_txn) => {
+        const txn = db.transactionAsync(async (_txn) => {
             calls.push('body');
         }).concurrent;
         await txn();
@@ -444,8 +464,8 @@ test('transaction.concurrent uses BEGIN CONCURRENT', async () => {
 // A callback that declares no parameters cannot be using the Transaction
 // handle - it is the pre-0.8 shape whose statements would deadlock against
 // the transaction's own lock, so it is rejected upfront.
-test('transaction() rejects callbacks that do not declare the handle', async () => {
+test('transactionAsync() rejects callbacks that do not declare the handle', async () => {
     const db = await connect(':memory:');
-    expect(() => db.transaction(async () => { })).toThrow(/Transaction handle/);
-    expect(() => db.transaction((async (...args: any[]) => { }) as any)).toThrow(/Transaction handle/);
+    expect(() => db.transactionAsync(async () => { })).toThrow(/Transaction handle/);
+    expect(() => db.transactionAsync((async (...args: any[]) => { }) as any)).toThrow(/Transaction handle/);
 })

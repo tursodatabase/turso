@@ -142,12 +142,33 @@ function assertTransactionCallback(fn: Function) {
   }
   if (fn.length === 0) {
     throw new TypeError(
-      "transaction() callbacks receive a Transaction handle as their first argument " +
-      "and must declare it: db.transaction(async (txn, ...args) => { await txn.run(...) }). " +
+      "transactionAsync() callbacks receive a Transaction handle as their first argument " +
+      "and must declare it: db.transactionAsync(async (txn, ...args) => { await txn.run(...) }). " +
       "Statements inside the callback must go through the handle - database-level calls " +
       "wait for the transaction to finish and deadlock it if awaited inside the callback.",
     );
   }
+}
+
+/**
+ * A wrapped transaction function. Calling it runs the wrapped function inside a
+ * `BEGIN`/`COMMIT` block; the mode properties (`deferred`, `concurrent`, etc.)
+ * return equivalent wrappers that begin the transaction with the corresponding
+ * locking mode.
+ *
+ * @deprecated Returned by the deprecated `Database.transaction()`; use
+ * `Database.transactionAsync()` and {@link AsyncTransactionFunction} instead.
+ */
+export interface TransactionFunction<
+  F extends (...args: any[]) => Promise<any> = (...args: any[]) => Promise<any>,
+> {
+  (...args: Parameters<F>): ReturnType<F>;
+  default: TransactionFunction<F>;
+  deferred: TransactionFunction<F>;
+  concurrent: TransactionFunction<F>;
+  immediate: TransactionFunction<F>;
+  exclusive: TransactionFunction<F>;
+  database: Database;
 }
 
 /**
@@ -157,22 +178,22 @@ function assertTransactionCallback(fn: Function) {
 export type TransactionArgs<F> = F extends (txn: Transaction, ...args: infer A) => any ? A : never;
 
 /**
- * A wrapped transaction function returned by `Database.transaction(fn)`.
+ * A wrapped transaction function returned by `Database.transactionAsync(fn)`.
  * Calling it opens a transaction, invokes `fn` with a `Transaction` handle
  * followed by the call's own arguments, and commits on success or rolls
  * back on error. The mode properties (`deferred`, `concurrent`, etc.)
  * return equivalent wrappers that begin the transaction with the
  * corresponding locking mode.
  */
-export interface TransactionFunction<
+export interface AsyncTransactionFunction<
   F extends (txn: Transaction, ...args: any[]) => Promise<any> = (txn: Transaction, ...args: any[]) => Promise<any>,
 > {
   (...args: TransactionArgs<F>): ReturnType<F>;
-  default: TransactionFunction<F>;
-  deferred: TransactionFunction<F>;
-  concurrent: TransactionFunction<F>;
-  immediate: TransactionFunction<F>;
-  exclusive: TransactionFunction<F>;
+  default: AsyncTransactionFunction<F>;
+  deferred: AsyncTransactionFunction<F>;
+  concurrent: AsyncTransactionFunction<F>;
+  immediate: AsyncTransactionFunction<F>;
+  exclusive: AsyncTransactionFunction<F>;
   database: Database;
 }
 
@@ -259,6 +280,55 @@ class Database {
   /**
    * Returns a function that executes the given function in a transaction.
    *
+   * @deprecated Use {@link transactionAsync} instead. This wrapper only
+   * emits `BEGIN`/`COMMIT` around the callback without owning the
+   * connection, so concurrent statements and transactions can interleave
+   * their own statements into the transaction's window (and be committed
+   * or rolled back with it). `transactionAsync` holds the connection for
+   * the whole transaction and hands the callback a dedicated `Transaction`
+   * handle.
+   *
+   * @param {function} fn - The function to wrap in a transaction.
+   */
+  transaction<F extends (...args: any[]) => Promise<any>>(
+    fn: F,
+  ): TransactionFunction<F> {
+    if (typeof fn !== "function")
+      throw new TypeError("Expected first argument to be a function");
+
+    const db = this;
+    const wrapTxn = (mode) => {
+      return async (...bindParameters) => {
+        await db.exec("BEGIN " + mode);
+        try {
+          const result = await fn(...bindParameters);
+          await db.exec("COMMIT");
+          return result;
+        } catch (err) {
+          await db.exec("ROLLBACK");
+          throw err;
+        }
+      };
+    };
+    const properties = {
+      default: { value: wrapTxn("") },
+      deferred: { value: wrapTxn("DEFERRED") },
+      concurrent: { value: wrapTxn("CONCURRENT") },
+      immediate: { value: wrapTxn("IMMEDIATE") },
+      exclusive: { value: wrapTxn("EXCLUSIVE") },
+      database: { value: this, enumerable: true },
+    };
+    Object.defineProperties(properties.default.value, properties);
+    Object.defineProperties(properties.deferred.value, properties);
+    Object.defineProperties(properties.concurrent.value, properties);
+    Object.defineProperties(properties.immediate.value, properties);
+    Object.defineProperties(properties.exclusive.value, properties);
+    return properties.default.value as TransactionFunction<F>;
+  }
+
+  /**
+   * Returns a function that executes the given function in a transaction.
+   *
    * The wrapper owns the connection for the whole BEGIN..COMMIT window: it
    * acquires the database's execution lock before BEGIN and releases it
    * only after COMMIT/ROLLBACK, so no concurrent statement or transaction
@@ -268,14 +338,15 @@ class Database {
    * SQL inside the callback must go through that handle. Calls on the
    * `Database` itself (or statements prepared from it) are not part of the
    * transaction: they queue on the lock until the transaction finishes, so
-   * awaiting them inside the callback deadlocks the transaction.
+   * awaiting them inside the callback deadlocks the transaction. Callbacks
+   * that do not declare the handle parameter are rejected.
    *
    * @param {function} fn - The function to wrap in a transaction; receives
    *   the `Transaction` handle followed by the caller's arguments.
    */
-  transaction<F extends (txn: Transaction, ...args: any[]) => Promise<any>>(
+  transactionAsync<F extends (txn: Transaction, ...args: any[]) => Promise<any>>(
     fn: F,
-  ): TransactionFunction<F> {
+  ): AsyncTransactionFunction<F> {
     assertTransactionCallback(fn);
 
     const db = this;
@@ -320,7 +391,7 @@ class Database {
     Object.defineProperties(properties.concurrent.value, properties);
     Object.defineProperties(properties.immediate.value, properties);
     Object.defineProperties(properties.exclusive.value, properties);
-    return properties.default.value as TransactionFunction<F>;
+    return properties.default.value as AsyncTransactionFunction<F>;
   }
 
   /**
@@ -372,8 +443,8 @@ class Database {
    * ], "immediate");
    *
    * @example
-   * // Atomic via the transaction() API for mixed workloads.
-   * const txn = db.transaction(async (tx) => {
+   * // Atomic via the transactionAsync() API for mixed workloads.
+   * const txn = db.transactionAsync(async (tx) => {
    *   await tx.batch([{ sql: "INSERT INTO users(name) VALUES (?)", args: ["Eve"] }]);
    *   await tx.exec("UPDATE counters SET n = n + 1");
    * });
@@ -677,8 +748,8 @@ async function executeBatch(
 
 /**
  * A handle to an open transaction, passed as the first argument to the
- * callback of `Database.transaction()`. All SQL of the transaction must go
- * through this handle: the transaction wrapper holds the database's
+ * callback of `Database.transactionAsync()`. All SQL of the transaction
+ * must go through this handle: the transaction wrapper holds the database's
  * execution lock for the whole BEGIN..COMMIT window, so `Database` calls
  * issued inside the callback wait for the transaction to finish (and
  * deadlock it if awaited), while the handle executes on the already-owned

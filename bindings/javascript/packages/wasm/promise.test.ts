@@ -302,8 +302,8 @@ test('example-2', async () => {
     const db = await connect(':memory:');
     await db.exec('CREATE TABLE users (name, email)');
     // Using transactions for atomic operations
-    const transaction = db.transaction(async (txn, users) => {
-        const insert = await txn.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
+    const transaction = db.transaction(async (users) => {
+        const insert = await db.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
         for (const user of users) {
             await insert.run(user.name, user.email);
         }

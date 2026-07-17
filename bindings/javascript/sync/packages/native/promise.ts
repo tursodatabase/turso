@@ -1,4 +1,4 @@
-import { DatabasePromise, Transaction, TransactionFunction, assertTransactionCallback } from "@tursodatabase/database-common"
+import { DatabasePromise, Transaction, TransactionFunction, AsyncTransactionFunction } from "@tursodatabase/database-common"
 import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner, RemoteWriter, RemoteWriteStatement } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, Database as NativeDatabase } from "#index";
 import { promises } from "node:fs";
@@ -254,11 +254,16 @@ class Database extends DatabasePromise {
     /**
      * Returns a function that executes the given function in a transaction.
      * When remoteWrites is enabled, the entire transaction goes to remote.
+     *
+     * @deprecated Use {@link transactionAsync} instead: this wrapper does
+     * not own the connection, so concurrent statements can interleave into
+     * the transaction's window.
      */
-    override transaction<F extends (txn: Transaction, ...args: any[]) => Promise<any>>(
+    override transaction<F extends (...args: any[]) => Promise<any>>(
         fn: F,
     ): TransactionFunction<F> {
-        assertTransactionCallback(fn);
+        if (typeof fn !== "function")
+            throw new TypeError("Expected first argument to be a function");
 
         if (!this.#remoteWriter) {
             return super.transaction(fn);
@@ -270,15 +275,7 @@ class Database extends DatabasePromise {
             return async (...bindParameters: any[]) => {
                 await remoteWriter.beginTransaction(mode);
                 try {
-                    // TODO: the database is passed as the transaction handle.
-                    // It duck-types the handle's statement API and its
-                    // exec/prepare overrides route to the remote while
-                    // remoteWriter is in-transaction, but it is not a real
-                    // Transaction: no lock is held, and the handle stays
-                    // usable after commit. Good enough while remote writes
-                    // are experimental - needs a proper handle before
-                    // stabilization.
-                    const result = await fn(db as unknown as Transaction, ...bindParameters);
+                    const result = await fn(...bindParameters);
                     await remoteWriter.commitTransaction();
                     await db.pull();
                     return result;
@@ -302,6 +299,26 @@ class Database extends DatabasePromise {
         Object.defineProperties(properties.immediate.value, properties);
         Object.defineProperties(properties.exclusive.value, properties);
         return properties.default.value as TransactionFunction<F>;
+    }
+
+    /**
+     * Returns a function that executes the given function in a transaction
+     * on a connection owned for the whole BEGIN..COMMIT window; the callback
+     * receives a {@link Transaction} handle as its first argument.
+     *
+     * Not supported together with {@link DatabaseOpts.remoteWritesExperimental}
+     * yet: remote-writes transactions run on the remote server and have no
+     * local connection to hand out.
+     */
+    override transactionAsync<F extends (txn: Transaction, ...args: any[]) => Promise<any>>(
+        fn: F,
+    ): AsyncTransactionFunction<F> {
+        if (this.#remoteWriter) {
+            throw new Error(
+                "transactionAsync is not supported with remoteWritesExperimental yet; use the deprecated transaction() for now",
+            );
+        }
+        return super.transactionAsync(fn);
     }
 
     /**

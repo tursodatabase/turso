@@ -316,12 +316,12 @@ test.serial("Database.batch() [mixed value types]", async (t) => {
   t.is(bigRow.i, "9007199254740993");
 });
 
-test.serial("Database.batch() [rollback via transaction()]", async (t) => {
+test.serial("Database.batch() [rollback via transactionAsync()]", async (t) => {
   const db = t.context.db;
 
   // batch() itself is not transactional; transaction() provides
   // all-or-nothing semantics around the failing batch.
-  const txn = db.transaction(async (tx) => {
+  const txn = db.transactionAsync(async (tx) => {
     return await tx.batch([
       { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Mallory", "mallory@example.net"] },
       // Duplicate primary key with the row inserted in beforeEach.
@@ -425,10 +425,10 @@ test.serial("Database.batch() [non-insert batch does not expose lastInsertRowid]
 });
 
 
-test.serial("Database.transaction().deferred() [batch]", async (t) => {
+test.serial("Database.transactionAsync().deferred() [batch]", async (t) => {
   const db = t.context.db;
 
-  const insertMany = db.transaction(async (tx) => {
+  const insertMany = db.transactionAsync(async (tx) => {
     t.is(db.inTransaction, true);
     return await tx.batch([
       { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Joey", "joey@example.org"] },
@@ -521,10 +521,10 @@ test.serial("Database.inTransaction property", async (t) => {
   // 3. The transaction() helper reports in-transaction inside its callback and
   //    autocommit once it completes.
   let insideTxn;
-  const txn = db.transaction(async (tx) => { insideTxn = db.inTransaction; });
+  const txn = db.transactionAsync(async (tx) => { insideTxn = db.inTransaction; });
   await txn();
-  t.true(insideTxn, "in a transaction inside the transaction() callback");
-  t.false(db.inTransaction, "autocommit after transaction() completes");
+  t.true(insideTxn, "in a transaction inside the transactionAsync() callback");
+  t.false(db.inTransaction, "autocommit after transactionAsync() completes");
 
   // 4. inTransaction must reflect the real transaction state, so it also tracks
   //    transactions opened with raw BEGIN/COMMIT/ROLLBACK.
@@ -539,10 +539,10 @@ test.serial("Database.inTransaction property", async (t) => {
   t.false(db.inTransaction, "autocommit after raw ROLLBACK");
 });
 
-test.serial("Database.transaction()", async (t) => {
+test.serial("Database.transactionAsync()", async (t) => {
   const db = t.context.db;
 
-  const insertMany = db.transaction(async (tx, users) => {
+  const insertMany = db.transactionAsync(async (tx, users) => {
     t.is(db.inTransaction, true);
     // statements of the transaction must be prepared from its handle: the
     // wrapper owns the connection lock for the whole transaction, so
@@ -567,9 +567,35 @@ test.serial("Database.transaction()", async (t) => {
   t.is((await stmt.get(5)).name, "Junior");
 });
 
-test.serial("Database.transaction().immediate()", async (t) => {
+// The deprecated transaction() keeps the pre-transactionAsync contract: the
+// callback receives the call's own arguments and statements issued on the
+// database (or prepared from it) join the transaction.
+test.serial("Database.transaction() [deprecated]", async (t) => {
   const db = t.context.db;
-  const insertMany = db.transaction(async (tx, users) => {
+
+  const insert = await db.prepare(
+    "INSERT INTO users(name, email) VALUES (:name, :email)"
+  );
+
+  const insertMany = db.transaction(async (users) => {
+    t.is(db.inTransaction, true);
+    for (const user of users) await insert.run(user);
+  });
+
+  await insertMany([
+    { name: "Joey", email: "joey@example.org" },
+    { name: "Sally", email: "sally@example.org" },
+  ]);
+  t.is(db.inTransaction, false);
+
+  const stmt = await db.prepare("SELECT * FROM users WHERE id = ?");
+  t.is((await stmt.get(3)).name, "Joey");
+  t.is((await stmt.get(4)).name, "Sally");
+});
+
+test.serial("Database.transactionAsync().immediate()", async (t) => {
+  const db = t.context.db;
+  const insertMany = db.transactionAsync(async (tx, users) => {
     t.is(db.inTransaction, true);
     const insert = await tx.prepare(
       "INSERT INTO users(name, email) VALUES (:name, :email)"

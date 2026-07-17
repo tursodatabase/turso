@@ -1,5 +1,5 @@
 import test from 'ava';
-import { connect } from '../dist/index.js';
+import { connect, Transaction } from '../dist/index.js';
 
 const client = connect({
   url: process.env.TURSO_DATABASE_URL,
@@ -143,6 +143,28 @@ test.serial('transaction.concurrent uses BEGIN CONCURRENT', async t => {
     await txn();
     t.deepEqual(calls, ['BEGIN CONCURRENT', 'body', 'COMMIT']);
   } finally {
+    await localClient.close();
+  }
+});
+
+test.serial('transactionAsync.concurrent uses BEGIN CONCURRENT', async t => {
+  const localClient = connect({ url: 'http://localhost:0' });
+  const calls = [];
+
+  const originalExec = Transaction.prototype.exec;
+  Transaction.prototype.exec = async sql => {
+    calls.push(sql);
+  };
+  localClient.session.close = async () => {};
+
+  try {
+    const txn = localClient.transactionAsync(async (_tx) => {
+      calls.push('body');
+    }).concurrent;
+    await txn();
+    t.deepEqual(calls, ['BEGIN CONCURRENT', 'body', 'COMMIT']);
+  } finally {
+    Transaction.prototype.exec = originalExec;
     await localClient.close();
   }
 });
