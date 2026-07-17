@@ -40,26 +40,26 @@ test-runner run <PATHS>... [OPTIONS]
 
 ```bash
 # Run all tests in a directory
-test-runner run tests/
+test-runner run sqlite/conformance/sqlite-sqltests/
 
 # Run a specific test file
-test-runner run tests/select.sqltest
+test-runner run sqlite/conformance/sqlite-sqltests/select.sqltest
 
 # Run multiple paths
-test-runner run tests/select.sqltest tests/insert/
+test-runner run sqlite/conformance/sqlite-sqltests/select.sqltest sqlite/conformance/sqlite-sqltests/insert/
 
 # Custom binary path
-test-runner run tests/ --binary ./target/release/tursodb
+test-runner run sqlite/conformance/sqlite-sqltests/ --binary ./target/release/tursodb
 
 # Filter by test name
-test-runner run tests/ -f "select-*"
-test-runner run tests/ -f "*-join-*"
+test-runner run sqlite/conformance/sqlite-sqltests/ -f "select-*"
+test-runner run sqlite/conformance/sqlite-sqltests/ -f "*-join-*"
 
 # Limit concurrent jobs
-test-runner run tests/ -j 4
+test-runner run sqlite/conformance/sqlite-sqltests/ -j 4
 
 # JSON output for CI
-test-runner run tests/ -o json
+test-runner run sqlite/conformance/sqlite-sqltests/ -o json
 ```
 
 ### `check` - Validate Syntax
@@ -74,10 +74,10 @@ test-runner check <PATHS>...
 
 ```bash
 # Check a single file
-test-runner check tests/select.sqltest
+test-runner check sqlite/conformance/sqlite-sqltests/select.sqltest
 
 # Check all files in a directory
-test-runner check tests/
+test-runner check sqlite/conformance/sqlite-sqltests/
 ```
 
 ## Output Formats
@@ -89,7 +89,7 @@ Human-readable colored output with progress indication:
 ```
 Running tests...
 
-tests/select.sqltest
+sqlite/conformance/sqlite-sqltests/select.sqltest
   [PASS] select-const-1                     (2ms)
   [PASS] select-users                       (5ms)
   [FAIL] select-join                        (3ms)
@@ -97,7 +97,7 @@ tests/select.sqltest
          actual:   1|Bob
   [SKIP] select-buggy                       (known issue #123)
 
-tests/insert.sqltest
+sqlite/conformance/sqlite-sqltests/insert.sqltest
   [PASS] insert-basic                       (4ms)
   [ERROR] insert-readonly                   (1ms)
           setup 'users' failed: table users already exists
@@ -115,7 +115,7 @@ Machine-readable output for CI integration:
 {
   "files": [
     {
-      "path": "tests/select.sqltest",
+      "path": "sqlite/conformance/sqlite-sqltests/select.sqltest",
       "results": [
         {
           "name": "select-const-1",
@@ -176,7 +176,7 @@ The `--filter` option supports simple glob patterns:
 ```yaml
 - name: Run SQL tests
   run: |
-    test-runner run tests/ \
+    test-runner run sqlite/conformance/sqlite-sqltests/ \
       --binary ./target/release/tursodb \
       --output json \
       > test-results.json

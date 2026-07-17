@@ -63,15 +63,15 @@ test: build uv-sync-test test-compat test-sqlite3 test-shell test-memory test-wr
 .PHONY: test
 
 test-runner:
-	@make -C testing/sqltests run
+	@make -C sqlite/conformance run
 .PHONY: test-runner
 
 test-runner-js:
-	@make -C testing/sqltests run-js
+	@make -C sqlite/conformance run-js
 .PHONY: test-runner-js
 
 test-runner-cli:
-	@make -C testing/sqltests run-cli
+	@make -C sqlite/conformance run-cli
 .PHONY: test-runner-cli
 
 test-extensions: build uv-sync-test

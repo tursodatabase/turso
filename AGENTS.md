@@ -13,8 +13,8 @@ cargo run -q --bin tursodb -- -q # run the interactive cli. never run with --rel
 
 make test                      # TCL compat + sqlite3 + extensions + MVCC
 make test-single TEST=foo.test # single TCL test
-make -C testing/sqltests run-rust ARGS='--snapshot-filter __never__'  # sqltest runner (preferred for new tests)
-CI=1 make -C testing/sqltests run-rust  # use only if snapshot tests are required
+make -C sqlite/conformance run-rust ARGS='--snapshot-filter __never__'  # sqltest runner (preferred for new tests)
+CI=1 make -C sqlite/conformance run-rust  # use only if snapshot tests are required
 
 scripts/diff.sh "SQL" [label]  # compare sqlite3 vs tursodb output
 ```
@@ -26,14 +26,14 @@ scripts/diff.sh "SQL" [label]  # compare sqlite3 vs tursodb output
 - `cargo test` - Rust unit and integration tests
 - `make test` - broad compatibility suite (TCL, sqlite3, extensions, MVCC)
 - `make test-single TEST=foo.test` - single legacy TCL test
-- `make -C testing/sqltests run-rust ARGS='--snapshot-filter __never__'` - preferred `.sqltest` runner for new coverage
-- `CI=1 make -C testing/sqltests run-rust` - only when snapshot tests are required
+- `make -C sqlite/conformance run-rust ARGS='--snapshot-filter __never__'` - preferred `.sqltest` runner for new coverage
+- `CI=1 make -C sqlite/conformance run-rust` - only when snapshot tests are required
 
 ### Test Organization
 
 Default: add coverage to the narrowest existing test harness that can express the bug. Prefer extending an existing test file or directory over creating a new one.
 
-- `testing/sqltests/tests/` - preferred for SQL conformance coverage. These tests run the same scenario against both Turso and SQLite, so use them first for parser, planner, executor, and SQL semantics work that fits the `.sqltest` DSL.
+- `sqlite/conformance/sqlite-sqltests/` - preferred for SQL conformance coverage. These tests run the same scenario against both Turso and SQLite, so use them first for parser, planner, executor, and SQL semantics work that fits the `.sqltest` DSL.
 - `tests/integration/` - primary fallback when the behavior cannot be expressed cleanly in `.sqltest`. Put API-level regressions, multi-connection orchestration, storage assertions, injected failures, timeout behavior, and other Rust-driven scenarios here.
 - `sqlite/conformance/upstream/` - imported upstream SQLite golden tests. Do not modify these for Turso behavior changes; use them as fixed compatibility coverage, and only touch them for intentional upstream sync or harness maintenance.
 - `testing/cli_tests/` - CLI-focused Python coverage for shell behavior and end-to-end command workflows.
@@ -69,7 +69,7 @@ limbo/
 | Add extension | `extensions/core/` | ExtensionApi, scalar/aggregate/vtab traits |
 | Add binding | `bindings/` | PyO3, NAPI, JNI, FRB, CGO patterns |
 | Deterministic tests | `testing/simulator/` | Fault injection, differential testing |
-| New SQL tests | `testing/sqltests/tests/` | `.sqltest` format preferred |
+| New SQL tests | `sqlite/conformance/sqlite-sqltests/` | `.sqltest` format preferred |
 | Quick sqlite3 diff | `scripts/diff.sh` | Compare sqlite3 vs tursodb output for a query |
 | MVCC testing REPL | `cli/mvcc_repl.rs` | Multi-conn concurrent txn testing REPL        |
 
