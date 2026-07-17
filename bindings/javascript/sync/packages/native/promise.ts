@@ -161,6 +161,8 @@ class Database extends DatabasePromise {
             await super.connect();
         } else {
             await run(this.#runner!, this.#engine.connect());
+            // pick up the connection injected by the sync engine
+            await super.connect();
         }
         this.connected = true;
     }

@@ -1,7 +1,7 @@
 import { AsyncLock } from "./async-lock.js";
 import { bindParams } from "./bind.js";
 import { SqliteError } from "./sqlite-error.js";
-import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, DatabaseOpts } from "./types.js";
+import { NativeConnection, NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, DatabaseOpts, TransactionAsyncContext } from "./types.js";
 
 const convertibleErrorTypes = { TypeError };
 const CONVERTIBLE_ERROR_PREFIX = "[TURSO_CONVERT_TYPE]";
@@ -147,6 +147,20 @@ export interface TransactionFunction<
 }
 
 /**
+ * Options controlling the connection-pool behavior of the promise Database.
+ */
+export interface DatabasePromiseOpts {
+  /** Maximum number of idle pooled transaction connections kept alive (default 1). */
+  poolSize?: number;
+  /**
+   * Async-context tracker (Node's AsyncLocalStorage) used to route statements
+   * issued inside a `transaction()` callback to the transaction's pooled
+   * connection. When absent, `transaction()` runs on the main connection.
+   */
+  asyncContext?: TransactionAsyncContext;
+}
+
+/**
  * Database represents a connection that can prepare and execute SQL statements.
  */
 class Database {
@@ -157,6 +171,8 @@ class Database {
   inTransaction: boolean;
 
   private db: NativeDatabase;
+  private conn: NativeConnection | null = null;
+  private connectPromise: Promise<void> | null = null;
   private ioStep: () => Promise<void>;
   // Serializes native calls on this connection. Subclasses that also drive
   // the same underlying core database from async worker tasks (the sync
@@ -165,18 +181,100 @@ class Database {
   // main-thread native calls must never overlap an in-flight worker task.
   protected execLock: AsyncLock;
   protected connected: boolean = false;
+  // Extra connections dedicated to transaction() calls: element [0] of the
+  // conceptual pool is this database itself (all non-transaction queries),
+  // entries below are lazily created for concurrent transactions.
+  private pool: { db: Database, busy: boolean }[] = [];
+  private poolSize: number;
+  private asyncContext: TransactionAsyncContext | null;
+  // Pooled wrappers share the native database handle with their owner and
+  // must not close it.
+  private ownsDb: boolean = true;
+  private safeIntegersDefault: boolean | undefined = undefined;
 
-  constructor(db: NativeDatabase, ioStep?: () => Promise<void>) {
+  constructor(db: NativeDatabase, ioStep?: () => Promise<void>, opts?: DatabasePromiseOpts) {
     this.db = db;
     this.execLock = new AsyncLock();
     this.ioStep = ioStep ?? (async () => { });
+    this.poolSize = Math.max(0, opts?.poolSize ?? 1);
+    this.asyncContext = opts?.asyncContext ?? null;
     Object.defineProperties(this, {
       name: { get: () => this.db.path },
-      readonly: { get: () => this.db.readonly },
-      open: { get: () => this.db.open },
+      readonly: { get: () => this.mustConn().readonly },
+      open: { get: () => this.conn != null && this.conn.open },
       memory: { get: () => this.db.memory },
-      inTransaction: { get: () => this.db.inTransaction() },
+      inTransaction: { get: () => this.target().mustConn().inTransaction() },
     });
+  }
+
+  private mustConn(): NativeConnection {
+    if (this.conn == null) {
+      throw new Error("database must be connected");
+    }
+    return this.conn;
+  }
+
+  /**
+   * Returns the connection that must execute the current call: inside a
+   * `transaction()` callback this is the transaction's pooled connection,
+   * otherwise this database itself.
+   */
+  private target(): Database {
+    const store = this.asyncContext?.getStore();
+    return store instanceof Database && store !== this ? store : this;
+  }
+
+  /**
+   * Takes an idle pooled connection for a transaction, lazily connecting a
+   * new one when all are busy. Falls back to this database itself when the
+   * platform has no async-context tracking or the native database cannot
+   * open extra connections (e.g. it is managed by the sync engine).
+   */
+  private acquireTransactionConnection(): Database {
+    if (this.asyncContext == null) {
+      return this;
+    }
+    for (const entry of this.pool) {
+      if (!entry.busy) {
+        entry.busy = true;
+        return entry.db;
+      }
+    }
+    let native: NativeConnection;
+    try {
+      native = this.db.connectSync();
+    } catch {
+      return this;
+    }
+    if (this.safeIntegersDefault !== undefined) {
+      native.defaultSafeIntegers(this.safeIntegersDefault);
+    }
+    const pooled = new Database(this.db, this.ioStep);
+    pooled.conn = native;
+    pooled.connected = true;
+    pooled.ownsDb = false;
+    this.pool.push({ db: pooled, busy: true });
+    return pooled;
+  }
+
+  /**
+   * Returns a pooled connection after a transaction ends. Keeps at most
+   * `poolSize` idle connections alive and deallocates the rest.
+   */
+  private async releaseTransactionConnection(pooled: Database) {
+    if (pooled === this) {
+      return;
+    }
+    const entry = this.pool.find(e => e.db === pooled);
+    if (entry === undefined) {
+      return;
+    }
+    entry.busy = false;
+    const idle = this.pool.filter(e => !e.busy).length;
+    if (idle > this.poolSize) {
+      this.pool.splice(this.pool.indexOf(entry), 1);
+      await pooled.close();
+    }
   }
 
   /**
@@ -184,8 +282,20 @@ class Database {
    */
   async connect() {
     if (this.connected) { return; }
-    await this.db.connectAsync();
-    this.connected = true;
+    if (this.connectPromise == null) {
+      this.connectPromise = (async () => {
+        const conn = await this.db.connectAsync();
+        if (this.safeIntegersDefault !== undefined) {
+          conn.defaultSafeIntegers(this.safeIntegersDefault);
+        }
+        this.conn = conn;
+        this.connected = true;
+      })().catch((err) => {
+        this.connectPromise = null;
+        throw err;
+      });
+    }
+    await this.connectPromise;
   }
 
   /**
@@ -194,6 +304,10 @@ class Database {
    * @param {string} sql - The SQL statement string to prepare.
    */
   prepare(sql: string): Promise<Statement> {
+    const target = this.target();
+    if (target !== this) {
+      return target.prepare(sql);
+    }
     // Only throw if we connected before but now the database is closed
     // Allow implicit connection if not connected yet
     if (this.connected && !this.open) {
@@ -205,9 +319,9 @@ class Database {
 
     try {
       if (this.connected) {
-        return new Statement(maybeValue(this.db.prepare(sql)), this.db, this.execLock, this.ioStep) as unknown as Promise<Statement>;
+        return new Statement(maybeValue(this.mustConn().prepare(sql)), () => this.mustConn(), this.execLock, this.ioStep) as unknown as Promise<Statement>;
       } else {
-        return new Statement(maybePromise(() => this.connect().then(() => this.db.prepare(sql))), this.db, this.execLock, this.ioStep) as unknown as Promise<Statement>;
+        return new Statement(maybePromise(() => this.connect().then(() => this.mustConn().prepare(sql))), () => this.mustConn(), this.execLock, this.ioStep) as unknown as Promise<Statement>;
       }
     } catch (err) {
       throw convertError(err);
@@ -216,6 +330,15 @@ class Database {
 
   /**
    * Returns a function that executes the given function in a transaction.
+   *
+   * Each invocation runs on a dedicated pooled connection, so concurrent
+   * transactions (and concurrent non-transaction statements on this
+   * database) never interleave with the transaction's BEGIN..COMMIT window.
+   * Statements issued via this database inside the callback's async context
+   * are routed to that pooled connection; statements prepared *outside* the
+   * callback keep targeting the main connection and do not join the
+   * transaction. On platforms without async-context tracking the transaction
+   * runs directly on the main connection.
    *
    * @param {function} fn - The function to wrap in a transaction.
    */
@@ -228,14 +351,28 @@ class Database {
     const db = this;
     const wrapTxn = (mode) => {
       return async (...bindParameters) => {
-        await db.exec("BEGIN " + mode);
+        if (!db.connected) {
+          await db.connect();
+        }
+        const txn = db.acquireTransactionConnection();
+        const body = async () => {
+          await db.exec("BEGIN " + mode);
+          try {
+            const result = await fn(...bindParameters);
+            await db.exec("COMMIT");
+            return result;
+          } catch (err) {
+            await db.exec("ROLLBACK");
+            throw err;
+          }
+        };
         try {
-          const result = await fn(...bindParameters);
-          await db.exec("COMMIT");
-          return result;
-        } catch (err) {
-          await db.exec("ROLLBACK");
-          throw err;
+          if (txn === db) {
+            return await body();
+          }
+          return await db.asyncContext!.run(txn, body);
+        } finally {
+          await db.releaseTransactionConnection(txn);
         }
       };
     };
@@ -315,6 +452,10 @@ class Database {
     statements: Array<string | { sql: string; args?: any[] | Record<string, any> }>,
     options?: BatchMode | BatchOptions,
   ): Promise<ResultSet[]> {
+    const target = this.target();
+    if (target !== this) {
+      return target.batch(statements, options);
+    }
     if (!Array.isArray(statements)) {
       throw new TypeError("Expected first argument to be an array of statements");
     }
@@ -325,13 +466,14 @@ class Database {
       throw new TypeError("The database connection is not open");
     }
 
+    const conn = this.mustConn();
     // Hold execLock across the entire batch so it is observed as a
     // single unit by other callers on this connection. The helpers
     // below run their own step loops without re-acquiring the lock.
     await this.execLock.acquire();
     try {
       const runRawSql = async (sql: string) => {
-        const exec = this.db.executor(sql);
+        const exec = conn.executor(sql);
         try {
           while (true) {
             const stepResult = exec.stepSync();
@@ -349,7 +491,7 @@ class Database {
       };
 
       const { mode, raw } = normalizeBatchOptions(options);
-      const wrap = mode != null && !this.db.inTransaction();
+      const wrap = mode != null && !conn.inTransaction();
       if (wrap) {
         await runRawSql(`BEGIN ${normalizeBatchMode(mode!)}`);
       }
@@ -362,7 +504,7 @@ class Database {
 
           let nativeStmt: NativeStatement;
           try {
-            nativeStmt = this.db.prepare(sql);
+            nativeStmt = conn.prepare(sql);
           } catch (err) {
             throw convertError(err);
           }
@@ -377,7 +519,7 @@ class Database {
               nativeStmt.raw(raw);
             }
 
-            const totalChangesBefore = this.db.totalChanges();
+            const totalChangesBefore = conn.totalChanges();
             const rows: any[] = [];
             try {
               while (true) {
@@ -393,7 +535,7 @@ class Database {
               }
               const rowsAffected = columnNames.length > 0
                 ? 0
-                : this.db.totalChanges() !== totalChangesBefore ? this.db.changes() : 0;
+                : conn.totalChanges() !== totalChangesBefore ? conn.changes() : 0;
               results.push(
                 makeResultSet(columnNames, columnTypes, rows, rowsAffected),
               );
@@ -535,11 +677,15 @@ class Database {
    * @param {string} sql - The string containing SQL statements to execute
    */
   async exec(sql, queryOptions?: QueryOptions) {
+    const target = this.target();
+    if (target !== this) {
+      return target.exec(sql, queryOptions);
+    }
     if (!this.open) {
       throw new TypeError("The database connection is not open");
     }
     await this.execLock.acquire();
-    const exec = this.db.executor(sql, queryOptions);
+    const exec = this.mustConn().executor(sql, queryOptions);
     try {
       while (true) {
         const stepResult = exec.stepSync();
@@ -574,14 +720,28 @@ class Database {
    * @param {boolean} [toggle] - Whether to use safe integers by default.
    */
   defaultSafeIntegers(toggle) {
-    this.db.defaultSafeIntegers(toggle);
+    this.safeIntegersDefault = toggle === undefined ? true : toggle;
+    if (this.conn != null) {
+      this.conn.defaultSafeIntegers(toggle);
+    }
+    for (const entry of this.pool) {
+      entry.db.defaultSafeIntegers(toggle);
+    }
   }
 
   /**
    * Closes the database connection.
    */
   async close() {
-    this.db.close();
+    for (const entry of this.pool.splice(0)) {
+      await entry.db.close();
+    }
+    if (this.conn != null) {
+      this.conn.close();
+    }
+    if (this.ownsDb) {
+      this.db.close();
+    }
   }
 
   async io() {
@@ -645,13 +805,15 @@ function maybeValue<T>(value: T): MaybeLazy<T> {
  */
 class Statement {
   private stmt: MaybeLazy<NativeStatement>;
-  private db: NativeDatabase;
+  // Accessor rather than a direct reference: for lazily prepared statements
+  // the connection does not exist until the owning database connects.
+  private conn: () => NativeConnection;
   private execLock: AsyncLock;
   private ioStep: () => Promise<void>;
 
-  constructor(stmt: MaybeLazy<NativeStatement>, db: NativeDatabase, execLock: AsyncLock, ioStep: () => Promise<void>) {
+  constructor(stmt: MaybeLazy<NativeStatement>, conn: () => NativeConnection, execLock: AsyncLock, ioStep: () => Promise<void>) {
     this.stmt = stmt;
-    this.db = db;
+    this.conn = conn;
     this.execLock = execLock;
     this.ioStep = ioStep;
   }
@@ -704,7 +866,7 @@ class Statement {
   }
 
   get database() {
-    return this.db;
+    return this.conn();
   }
 
   /**
@@ -717,7 +879,8 @@ class Statement {
     stmt.setQueryTimeout(queryOptions);
     bindParams(stmt, toBindArgs(params));
 
-    const totalChangesBefore = this.db.totalChanges();
+    const conn = this.conn();
+    const totalChangesBefore = conn.totalChanges();
     await this.execLock.acquire();
     try {
       while (true) {
@@ -735,8 +898,8 @@ class Statement {
         }
       }
 
-      const lastInsertRowid = this.db.lastInsertRowid();
-      const changes = this.db.totalChanges() === totalChangesBefore ? 0 : this.db.changes();
+      const lastInsertRowid = conn.lastInsertRowid();
+      const changes = conn.totalChanges() === totalChangesBefore ? 0 : conn.changes();
 
       return { changes, lastInsertRowid };
     } finally {

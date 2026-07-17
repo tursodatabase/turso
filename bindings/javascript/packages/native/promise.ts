@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { DatabasePromise, NativeDatabase, SqliteError, DatabaseOpts, EncryptionCipher } from "@tursodatabase/database-common"
 import { Database as NativeDB, EncryptionCipher as NativeEncryptionCipher } from "#index";
 
@@ -27,7 +28,10 @@ class Database extends DatabasePromise {
                 hexkey: opts.encryption.hexkey,
             };
         }
-        super(new NativeDB(path, nativeOpts) as unknown as NativeDatabase)
+        super(new NativeDB(path, nativeOpts) as unknown as NativeDatabase, undefined, {
+            poolSize: opts.poolSize,
+            asyncContext: new AsyncLocalStorage(),
+        })
     }
 }
 

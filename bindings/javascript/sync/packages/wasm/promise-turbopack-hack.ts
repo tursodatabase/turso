@@ -180,6 +180,8 @@ class Database extends DatabasePromise {
                 ]);
             }
             await run(this.#runner, this.#engine.connect(), this.execLock);
+            // pick up the connection injected by the sync engine
+            await super.connect();
         }
         this.connected = true;
     }

@@ -21,6 +21,26 @@ export interface DatabaseOpts {
     experimental?: ExperimentalFeature[]
     /** Optional local encryption configuration */
     encryption?: EncryptionOpts
+    /**
+     * Maximum number of idle extra connections kept alive for `transaction()`
+     * calls (default 1). Transactions run on dedicated pooled connections so
+     * they never interleave with each other or with queries on the main
+     * connection; the pool grows on demand for concurrent transactions and
+     * shrinks back to this size when they finish.
+     */
+    poolSize?: number
+}
+
+/**
+ * Minimal AsyncLocalStorage-shaped interface used to route statements issued
+ * inside a `transaction()` callback to the transaction's pooled connection.
+ * Platform packages provide it when the runtime supports async context
+ * tracking (Node's AsyncLocalStorage); when absent, `transaction()` falls
+ * back to running on the main connection.
+ */
+export interface TransactionAsyncContext {
+    run<T>(store: unknown, fn: () => T): T;
+    getStore(): unknown;
 }
 
 export interface QueryOptions {
@@ -28,18 +48,34 @@ export interface QueryOptions {
     queryTimeout?: number
 }
 
+/**
+ * The shared per-file database state. All statement execution happens on
+ * `NativeConnection`s created via the single connect path
+ * (`connectSync`/`connectAsync`); the main connection and every pooled
+ * transaction connection are created the same way.
+ */
 export interface NativeDatabase {
     memory: boolean,
     path: string,
-    readonly: boolean;
     open: boolean;
     new(path: string): NativeDatabase;
 
-    connectSync();
-    connectAsync(): Promise<void>;
+    /** Creates a new connection, opening the database on the first call. */
+    connectSync(): NativeConnection;
+    /** Creates a new connection, opening the database on the first call. */
+    connectAsync(): Promise<NativeConnection>;
 
     ioLoopSync();
     ioLoopAsync(): Promise<void>;
+
+    classifySql?(sql: string): string;
+    close();
+}
+
+/** A single connection to a database with its own transaction state. */
+export interface NativeConnection {
+    readonly: boolean;
+    open: boolean;
 
     prepare(sql: string): NativeStatement;
     executor(sql: string, queryOptions?: QueryOptions): NativeExecutor;

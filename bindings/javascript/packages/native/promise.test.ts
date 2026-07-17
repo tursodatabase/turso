@@ -363,13 +363,12 @@ test('example-2', async () => {
     ]);
 })
 
-// The transaction() wrapper must own the connection for the whole
-// BEGIN..COMMIT window. Statements are only serialized individually, so a
-// concurrent caller can currently interleave its statements into an open
-// transaction: its BEGIN fails as nested, and its ROLLBACK then erases the
-// first transaction's in-flight writes while later writes land in autocommit.
+// Each transaction() call runs on its own pooled connection, so concurrent
+// calls must not interleave statements. The busy timeout lets the second
+// write transaction wait for the first one instead of failing fast with
+// "database is locked".
 test('concurrent transaction() calls must not interleave', async () => {
-    const db = await connect(':memory:');
+    const db = await connect(':memory:', { timeout: 5000 });
     await db.exec('CREATE TABLE t(tag TEXT, i INTEGER)');
 
     const insertMany = db.transaction(async (tag: string, fail: boolean) => {
@@ -397,9 +396,10 @@ test('concurrent transaction() calls must not interleave', async () => {
     expect(rows).toEqual([{ tag: 'committed', cnt: 10 }]);
 })
 
-// Same root cause, worst manifestation: an independent autocommit statement
-// racing with a transaction() call slips into the open BEGIN..ROLLBACK window,
-// reports success, and is then silently erased by the transaction's rollback.
+// Transactions run on pooled connections while independent statements stay on
+// the main connection, so an autocommit statement racing with a transaction()
+// call must not slip into the open BEGIN..ROLLBACK window and be silently
+// erased by the transaction's rollback.
 test('statement racing a transaction() must not be lost to its rollback', async () => {
     const db = await connect(':memory:');
     await db.exec('CREATE TABLE t(tag TEXT)');
@@ -419,6 +419,38 @@ test('statement racing a transaction() must not be lost to its rollback', async 
 
     // the transaction rolled back, but the successful independent insert must survive
     expect(await db.all('SELECT tag FROM t')).toEqual([{ tag: 'plain' }]);
+})
+
+// The transaction pool grows by one connection per concurrent transaction and
+// shrinks back to poolSize once they finish.
+test('transaction pool grows on demand and shrinks to poolSize', async () => {
+    const db = await connect(':memory:', { poolSize: 2 });
+    await db.exec('CREATE TABLE t(x)');
+
+    // read transactions so all three can stay open concurrently
+    const gate: { resolve: () => void, promise: Promise<void> }[] = [];
+    const txn = db.transaction(async () => {
+        await db.get('SELECT COUNT(*) AS cnt FROM t');
+        let resolve;
+        const promise = new Promise<void>((r) => { resolve = r; });
+        gate.push({ resolve, promise });
+        await promise;
+    });
+
+    // three transactions suspended mid-body: one pooled connection each
+    const tasks = [txn(), txn(), txn()];
+    while (gate.length < 3) {
+        await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect((db as any).pool.length).toBe(3);
+    expect((db as any).pool.every((entry) => entry.busy)).toBe(true);
+
+    for (const g of gate) { g.resolve(); }
+    await Promise.all(tasks);
+
+    // idle connections beyond poolSize are deallocated
+    expect((db as any).pool.length).toBe(2);
+    expect((db as any).pool.some((entry) => entry.busy)).toBe(false);
 })
 
 test('transaction.concurrent uses BEGIN CONCURRENT', async () => {

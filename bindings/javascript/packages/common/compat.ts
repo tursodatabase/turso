@@ -1,6 +1,6 @@
 import { bindParams } from "./bind.js";
 import { SqliteError } from "./sqlite-error.js";
-import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE } from "./types.js";
+import { NativeConnection, NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE } from "./types.js";
 
 const convertibleErrorTypes = { TypeError };
 const CONVERTIBLE_ERROR_PREFIX = "[TURSO_CONVERT_TYPE]";
@@ -124,6 +124,7 @@ class Database {
   inTransaction: boolean;
 
   private db: NativeDatabase;
+  private conn: NativeConnection;
 
   /**
    * Creates a new database connection. If the database file pointed to by `path` does not exists, it will be created.
@@ -138,14 +139,14 @@ class Database {
    */
   constructor(db: NativeDatabase) {
     this.db = db;
-    this.db.connectSync();
+    this.conn = db.connectSync();
 
     Object.defineProperties(this, {
       name: { get: () => this.db.path },
-      readonly: { get: () => this.db.readonly },
-      open: { get: () => this.db.open },
+      readonly: { get: () => this.conn.readonly },
+      open: { get: () => this.conn.open },
       memory: { get: () => this.db.memory },
-      inTransaction: { get: () => this.db.inTransaction() },
+      inTransaction: { get: () => this.conn.inTransaction() },
     });
   }
 
@@ -163,7 +164,7 @@ class Database {
     }
 
     try {
-      return new Statement(this.db.prepare(sql), this.db);
+      return new Statement(this.conn.prepare(sql), this.db, this.conn);
     } catch (err) {
       throw convertError(err);
     }
@@ -264,7 +265,7 @@ class Database {
     if (!this.open) {
       throw new TypeError("The database connection is not open");
     }
-    const exec = this.db.executor(sql, queryOptions);
+    const exec = this.conn.executor(sql, queryOptions);
     try {
       while (true) {
         const stepResult = exec.stepSync();
@@ -297,7 +298,7 @@ class Database {
     }
 
     const { mode, raw } = normalizeBatchOptions(options);
-    const wrap = mode != null && !this.db.inTransaction();
+    const wrap = mode != null && !this.conn.inTransaction();
     if (wrap) {
       this.exec(`BEGIN ${normalizeBatchMode(mode!)}`);
     }
@@ -307,7 +308,7 @@ class Database {
       for (const statement of statements) {
         const sql = typeof statement === "string" ? statement : statement.sql;
         const args = typeof statement === "string" ? undefined : statement.args;
-        const stmt = this.db.prepare(sql);
+        const stmt = this.conn.prepare(sql);
         try {
           if (args !== undefined) {
             bindParams(stmt, [args]);
@@ -319,7 +320,7 @@ class Database {
             stmt.raw(raw);
           }
 
-          const totalChangesBefore = this.db.totalChanges();
+          const totalChangesBefore = this.conn.totalChanges();
           const rows: any[] = [];
           try {
             while (true) {
@@ -337,7 +338,7 @@ class Database {
             }
             const rowsAffected = columnNames.length > 0
               ? 0
-              : this.db.totalChanges() !== totalChangesBefore ? this.db.changes() : 0;
+              : this.conn.totalChanges() !== totalChangesBefore ? this.conn.changes() : 0;
             results.push(makeResultSet(columnNames, columnTypes, rows, rowsAffected));
           } finally {
             stmt.reset();
@@ -376,13 +377,14 @@ class Database {
    * @param {boolean} [toggle] - Whether to use safe integers by default.
    */
   defaultSafeIntegers(toggle) {
-    this.db.defaultSafeIntegers(toggle);
+    this.conn.defaultSafeIntegers(toggle);
   }
 
   /**
    * Closes the database connection.
    */
   close() {
+    this.conn.close();
     this.db.close();
   }
 }
@@ -393,10 +395,12 @@ class Database {
 class Statement {
   stmt: NativeStatement;
   db: NativeDatabase;
+  conn: NativeConnection;
 
-  constructor(stmt: NativeStatement, db: NativeDatabase) {
+  constructor(stmt: NativeStatement, db: NativeDatabase, conn: NativeConnection) {
     this.stmt = stmt;
     this.db = db;
+    this.conn = conn;
   }
 
   /**
@@ -454,7 +458,7 @@ class Statement {
    * Executes the SQL statement and returns an info object.
    */
   run(...bindParameters) {
-    const totalChangesBefore = this.db.totalChanges();
+    const totalChangesBefore = this.conn.totalChanges();
 
     const { params, queryOptions } = splitBindParameters(bindParameters);
     this.stmt.reset();
@@ -475,8 +479,8 @@ class Statement {
       }
     }
 
-    const lastInsertRowid = this.db.lastInsertRowid();
-    const changes = this.db.totalChanges() === totalChangesBefore ? 0 : this.db.changes();
+    const lastInsertRowid = this.conn.lastInsertRowid();
+    const changes = this.conn.totalChanges() === totalChangesBefore ? 0 : this.conn.changes();
 
     return { changes, lastInsertRowid };
   }

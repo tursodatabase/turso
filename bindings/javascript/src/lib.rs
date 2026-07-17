@@ -16,7 +16,7 @@ pub mod browser;
 use napi::bindgen_prelude::*;
 use napi::{Env, Task};
 use napi_derive::napi;
-use std::sync::{Mutex, OnceLock, Weak};
+use std::sync::{OnceLock, Weak};
 use std::{
     cell::{Cell, RefCell},
     num::NonZeroUsize,
@@ -27,8 +27,8 @@ use tracing_subscriber::fmt::format::FmtSpan;
 
 /// Shared ownership of a `turso_core::Statement` that can be explicitly finalized.
 ///
-/// Both `Statement`/`BatchExecutor` and `DatabaseInner` hold an `Arc` to this
-/// handle. When `Database::close()` is called it sets every live handle to
+/// Both `Statement`/`BatchExecutor` and `Connection` hold an `Arc` to this
+/// handle. When `Connection::close()` is called it sets every live handle to
 /// `None`, which drops the `turso_core::Statement` and — crucially — releases the
 /// `Arc<Connection>` held inside `Program`, breaking the reference chain that
 /// would otherwise keep the `turso_core::Database` alive in the
@@ -48,7 +48,9 @@ enum PresentationMode {
     Pluck,
 }
 
-/// A database connection.
+/// A database: the shared per-file state from which connections are created.
+/// All per-connection operations live on [`Connection`], returned by
+/// `connectSync()`/`connectAsync()`.
 #[napi]
 #[derive(Clone)]
 pub struct Database {
@@ -61,19 +63,25 @@ pub struct DatabaseInner {
     path: String,
     opts: Option<DatabaseOpts>,
     io: Arc<dyn turso_core::IO>,
-    connect: OnceLock<DatabaseConnect>,
-    default_safe_integers: Mutex<bool>,
-    /// Weak refs to every shared statement handle created by this database.
-    /// `close()` upgrades each live handle and sets it to `None`, which
-    /// finalizes the statement and releases its `Arc<Connection>`.
-    stmts: Mutex<Vec<Weak<RefCell<Option<turso_core::Statement>>>>>,
+    /// The core database, opened lazily by the first connect. Empty for
+    /// externally managed databases, which never open the file themselves.
+    core: OnceLock<Arc<turso_core::Database>>,
+    /// Connection injected by an external owner (the sync engine). Externally
+    /// managed databases hand out exactly this one connection: the first
+    /// connect returns it, further connects fail.
+    external: OnceLock<Arc<turso_core::Connection>>,
+    external_taken: std::sync::atomic::AtomicBool,
 }
 
-pub struct DatabaseConnect {
-    // hold db reference in order to keep it alive
-    // _db can be None if DB is controlled externally (for example, by sync-engine)
-    _db: Option<Arc<turso_core::Database>>,
-    conn: Arc<turso_core::Connection>,
+/// A single connection to a database with its own transaction state.
+#[napi]
+pub struct Connection {
+    conn: Option<Arc<turso_core::Connection>>,
+    default_safe_integers: Cell<bool>,
+    /// Weak refs to every shared statement handle created by this connection.
+    /// `close()` upgrades each live handle and sets it to `None`, which
+    /// finalizes the statement and releases its `Arc<Connection>`.
+    stmts: RefCell<Vec<Weak<RefCell<Option<turso_core::Statement>>>>>,
 }
 
 pub(crate) fn is_memory(path: &str) -> bool {
@@ -106,25 +114,26 @@ pub(crate) fn init_tracing(level_filter: &Option<String>) {
 // for now we make DbTask unsound as turso_core::Database and turso_core::Connection are not fully thread-safe
 unsafe impl Send for DbTask {}
 
+/// Connection created on the connect worker thread and carried to `resolve`.
+pub struct ConnHandle(Arc<turso_core::Connection>);
+unsafe impl Send for ConnHandle {}
+
 pub enum DbTask {
     Connect { db: Arc<DatabaseInner> },
 }
 
 impl Task for DbTask {
-    type Output = u32;
-    type JsValue = u32;
+    type Output = ConnHandle;
+    type JsValue = Connection;
 
     fn compute(&mut self) -> Result<Self::Output> {
         match self {
-            DbTask::Connect { db } => {
-                connect_sync(db)?;
-                Ok(0)
-            }
+            DbTask::Connect { db } => Ok(ConnHandle(connect(db)?)),
         }
     }
 
     fn resolve(&mut self, _: Env, output: Self::Output) -> Result<Self::JsValue> {
-        Ok(output)
+        Ok(Connection::create(output.0))
     }
 }
 
@@ -275,65 +284,88 @@ pub fn apply_experimental_features(
     opts
 }
 
-fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
-    if db.connect.get().is_some() {
-        return Ok(());
+/// Creates a new connection to the database, opening the core database on the
+/// first call. This is the single connect path: the main connection and every
+/// pooled connection are created here. Externally managed databases (sync
+/// engine) return their injected connection exactly once.
+fn connect(db: &DatabaseInner) -> napi::Result<Arc<turso_core::Connection>> {
+    if let Some(conn) = db.external.get() {
+        if db
+            .external_taken
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(create_generic_error(
+                "externally managed database supports a single connection",
+            ));
+        }
+        return Ok(conn.clone());
     }
 
-    let mut flags = turso_core::OpenFlags::Create;
+    if db.core.get().is_none() {
+        let mut flags = turso_core::OpenFlags::Create;
+        let mut core_opts = turso_core::DatabaseOpts::new();
+        let mut encryption_opts = None;
+        if let Some(opts) = &db.opts {
+            if opts.readonly == Some(true) {
+                flags.set(turso_core::OpenFlags::ReadOnly, true);
+                flags.set(turso_core::OpenFlags::Create, false);
+            }
+            if opts.file_must_exist == Some(true) {
+                flags.set(turso_core::OpenFlags::Create, false);
+            }
+            if let Some(experimental) = &opts.experimental {
+                core_opts = apply_experimental_features(core_opts, experimental);
+            }
+            if let Some(encryption) = &opts.encryption {
+                encryption_opts = Some(turso_core::EncryptionOpts {
+                    cipher: encryption.cipher.as_str().to_string(),
+                    hexkey: encryption.hexkey.clone(),
+                });
+                // Ensure encryption is enabled if encryption opts are provided
+                core_opts = core_opts.with_encryption(true);
+            }
+        }
+
+        let db_core = turso_core::Database::open_file_with_flags(
+            db.io.clone(),
+            &db.path,
+            flags,
+            core_opts,
+            encryption_opts,
+        )
+        .map_err(|e| to_generic_error(&format!("failed to open database {}", db.path), e))?;
+
+        // there can be races between concurrent connects - the loser drops its
+        // database and connects to the winner's (DATABASE_MANAGER dedupes
+        // file-backed databases anyway)
+        let _ = db.core.set(db_core);
+    }
+    connect_to_core(db.core.get().unwrap(), &db.opts)
+}
+
+/// Creates a connection to an already opened core database, applying the
+/// per-connection settings (encryption key, busy/query timeouts) from opts.
+fn connect_to_core(
+    db_core: &Arc<turso_core::Database>,
+    opts: &Option<DatabaseOpts>,
+) -> napi::Result<Arc<turso_core::Connection>> {
     let mut busy_timeout = None;
     let mut query_timeout = None;
-    let mut core_opts = turso_core::DatabaseOpts::new();
-    let mut encryption_opts = None;
-    if let Some(opts) = &db.opts {
-        if opts.readonly == Some(true) {
-            flags.set(turso_core::OpenFlags::ReadOnly, true);
-            flags.set(turso_core::OpenFlags::Create, false);
-        }
-        if opts.file_must_exist == Some(true) {
-            flags.set(turso_core::OpenFlags::Create, false);
-        }
+    let mut encryption_key = None;
+    if let Some(opts) = opts {
         if let Some(timeout) = opts.timeout {
             busy_timeout = Some(std::time::Duration::from_millis(timeout as u64));
         }
         if let Some(timeout) = opts.default_query_timeout {
             query_timeout = query_timeout_duration(timeout);
         }
-        if let Some(experimental) = &opts.experimental {
-            core_opts = apply_experimental_features(core_opts, experimental);
-        }
         if let Some(encryption) = &opts.encryption {
-            encryption_opts = Some(turso_core::EncryptionOpts {
-                cipher: encryption.cipher.as_str().to_string(),
-                hexkey: encryption.hexkey.clone(),
-            });
-            // Ensure encryption is enabled if encryption opts are provided
-            core_opts = core_opts.with_encryption(true);
-        }
-    }
-    let io = &db.io;
-    // Parse encryption key if encryption options are provided
-    let encryption_key = if let Some(opts) = &db.opts {
-        if let Some(encryption) = &opts.encryption {
-            Some(
+            encryption_key = Some(
                 turso_core::EncryptionKey::from_hex_string(&encryption.hexkey)
                     .map_err(|e| to_generic_error("invalid encryption key", e))?,
-            )
-        } else {
-            None
+            );
         }
-    } else {
-        None
-    };
-
-    let db_core = turso_core::Database::open_file_with_flags(
-        io.clone(),
-        &db.path,
-        flags,
-        core_opts,
-        encryption_opts,
-    )
-    .map_err(|e| to_generic_error(&format!("failed to open database {}", db.path), e))?;
+    }
 
     // Use connect_with_encryption to properly set up encryption context
     // before the pager reads page 1. This is required for encrypted databases.
@@ -347,14 +379,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
     if let Some(query_timeout) = query_timeout {
         conn.set_query_timeout(query_timeout);
     }
-
-    let connect = DatabaseConnect {
-        _db: Some(db_core),
-        conn,
-    };
-    // there can be races between concurrent connect - so let's ignore error in case of
-    let _ = db.connect.set(connect);
-    Ok(())
+    Ok(conn)
 }
 
 #[napi]
@@ -397,18 +422,21 @@ impl Database {
                 path,
                 opts,
                 io,
-                connect: OnceLock::new(),
-                default_safe_integers: Mutex::new(false),
-                stmts: Mutex::new(Vec::new()),
+                core: OnceLock::new(),
+                external: OnceLock::new(),
+                external_taken: std::sync::atomic::AtomicBool::new(false),
             })),
         })
     }
 
+    /// Marks the database as externally managed and injects its single
+    /// connection (used by the sync engine). The first connect returns this
+    /// connection, further connects fail.
     pub fn set_connected(&self, conn: Arc<turso_core::Connection>) -> napi::Result<()> {
         let inner = self.inner()?;
         inner
-            .connect
-            .set(DatabaseConnect { _db: None, conn })
+            .external
+            .set(conn)
             .map_err(|_| create_generic_error("database was already connected"))?;
 
         Ok(())
@@ -421,33 +449,20 @@ impl Database {
         Ok(inner)
     }
 
-    /// Connect the database synchronously
-    /// This method is idempotent and can be called multiple times safely until the database will be closed
+    /// Creates a new connection synchronously, opening the database on the
+    /// first call.
     #[napi]
-    pub fn connect_sync(&self) -> napi::Result<()> {
-        connect_sync(self.inner()?)
+    pub fn connect_sync(&self) -> napi::Result<Connection> {
+        Ok(Connection::create(connect(self.inner()?)?))
     }
 
-    /// Connect the database asynchronously
-    /// This method is idempotent and can be called multiple times safely until the database will be closed
-    #[napi(ts_return_type = "Promise<void>")]
+    /// Creates a new connection asynchronously, opening the database on the
+    /// first call.
+    #[napi(ts_return_type = "Promise<Connection>")]
     pub fn connect_async(&self) -> napi::Result<AsyncTask<DbTask>> {
         Ok(AsyncTask::new(DbTask::Connect {
             db: self.inner()?.clone(),
         }))
-    }
-
-    fn conn(&self) -> Result<Arc<turso_core::Connection>> {
-        let Some(DatabaseConnect { conn, .. }) = self.inner()?.connect.get() else {
-            return Err(create_generic_error("database must be connected"));
-        };
-        Ok(conn.clone())
-    }
-
-    /// Returns whether the database is in readonly-only mode.
-    #[napi(getter)]
-    pub fn readonly(&self) -> napi::Result<bool> {
-        Ok(self.conn()?.is_readonly(0))
     }
 
     /// Returns whether the database is in memory-only mode.
@@ -462,13 +477,93 @@ impl Database {
         Ok(self.inner()?.path.clone())
     }
 
-    /// Returns whether the database connection is open.
+    /// Returns whether the database has been opened.
     #[napi(getter)]
     pub fn open(&self) -> napi::Result<bool> {
-        if self.inner.is_none() {
+        let Some(inner) = &self.inner else {
             return Ok(false);
+        };
+        Ok(inner.core.get().is_some() || inner.external.get().is_some())
+    }
+
+    /// Closes the database handle. Connections are closed individually via
+    /// `Connection::close()`.
+    #[napi]
+    pub fn close(&mut self) -> napi::Result<()> {
+        self.inner.take();
+        Ok(())
+    }
+
+    /// Runs the I/O loop synchronously.
+    #[napi]
+    pub fn io_loop_sync(&self) -> napi::Result<()> {
+        let io = &self.inner()?.io;
+        io.step().map_err(|e| to_generic_error("IO error", e))?;
+        Ok(())
+    }
+
+    /// Runs the I/O loop asynchronously, returning a Promise.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn io_loop_async(&self) -> napi::Result<AsyncTask<IoLoopTask>> {
+        let io = self.inner()?.io.clone();
+        Ok(AsyncTask::new(IoLoopTask { io }))
+    }
+
+    /// Classify SQL statement. Returns "read", "write", "begin", "commit", or "rollback".
+    #[napi(js_name = "classifySql")]
+    pub fn classify_sql(&self, sql: String) -> napi::Result<String> {
+        use turso_parser::{ast::Stmt, parser::Parser};
+        let mut parser = Parser::new(sql.as_bytes());
+        match parser.next_cmd() {
+            Ok(Some(cmd)) => {
+                if cmd.is_explain() {
+                    return Ok("read".to_string());
+                }
+                let category = match cmd.stmt() {
+                    Stmt::Select(..)
+                    | Stmt::Pragma { .. }
+                    | Stmt::Attach { .. }
+                    | Stmt::Detach { .. } => "read",
+                    Stmt::Begin { .. } | Stmt::Savepoint { .. } => "begin",
+                    Stmt::Commit { .. } | Stmt::Release { .. } => "commit",
+                    Stmt::Rollback { .. } => "rollback",
+                    _ => "write",
+                };
+                Ok(category.to_string())
+            }
+            Ok(None) => Ok("read".to_string()),
+            Err(e) => Err(napi::Error::from_reason(format!("classify failed: {e}"))),
         }
-        Ok(self.inner()?.connect.get().is_some())
+    }
+}
+
+#[napi]
+impl Connection {
+    fn create(conn: Arc<turso_core::Connection>) -> Self {
+        Self {
+            conn: Some(conn),
+            default_safe_integers: Cell::new(false),
+            stmts: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn conn(&self) -> Result<&Arc<turso_core::Connection>> {
+        let Some(conn) = &self.conn else {
+            return Err(create_generic_error("connection is closed"));
+        };
+        Ok(conn)
+    }
+
+    /// Returns whether the connection is open.
+    #[napi(getter)]
+    pub fn open(&self) -> bool {
+        self.conn.is_some()
+    }
+
+    /// Returns whether the connection is in readonly-only mode.
+    #[napi(getter)]
+    pub fn readonly(&self) -> napi::Result<bool> {
+        Ok(self.conn()?.is_readonly(0))
     }
 
     /// Prepares a statement for execution.
@@ -482,7 +577,6 @@ impl Database {
     /// A promise resolving to a `Statement` instance.
     #[napi(ts_return_type = "Promise<Statement>")]
     pub fn prepare(&self, sql: String) -> napi::Result<Statement> {
-        let inner = self.inner()?;
         let stmt = self
             .conn()?
             .prepare(&sql)
@@ -492,12 +586,12 @@ impl Database {
             .collect();
         #[allow(clippy::arc_with_non_send_sync)]
         let stmt: StatementHandle = Arc::new(RefCell::new(Some(stmt)));
-        inner.stmts.lock().unwrap().push(Arc::downgrade(&stmt));
+        self.stmts.borrow_mut().push(Arc::downgrade(&stmt));
         Ok(Statement {
             stmt,
             column_names,
             mode: RefCell::new(PresentationMode::Expanded),
-            safe_integers: Cell::new(*inner.default_safe_integers.lock().unwrap()),
+            safe_integers: Cell::new(self.default_safe_integers.get()),
         })
     }
 
@@ -508,7 +602,7 @@ impl Database {
         query_options: Option<QueryOptions>,
     ) -> napi::Result<BatchExecutor> {
         Ok(BatchExecutor {
-            conn: Some(self.conn()?),
+            conn: Some(self.conn()?.clone()),
             sql,
             position: 0,
             stmt: None,
@@ -560,80 +654,33 @@ impl Database {
         Ok(!self.conn()?.get_auto_commit())
     }
 
-    /// Closes the database connection.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if the database is closed successfully.
-    #[napi]
-    pub fn close(&mut self) -> napi::Result<()> {
-        if let Some(inner) = self.inner.take() {
-            // Finalize all outstanding statements.  Each turso_core::Statement
-            // holds Program { connection: Arc<Connection> } which in turn holds
-            // Arc<Database>.  If we don't clear them, the Weak in
-            // DATABASE_MANAGER can still be upgraded after the file is renamed,
-            // causing a stale Database to be returned on the next open().
-            let mut stmts = inner.stmts.lock().unwrap();
-            for weak in stmts.drain(..) {
-                if let Some(stmt) = weak.upgrade() {
-                    *stmt.borrow_mut() = None;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Sets the default safe integers mode for all statements from this database.
+    /// Sets the default safe integers mode for all statements from this connection.
     ///
     /// # Arguments
     ///
     /// * `toggle` - Whether to use safe integers by default.
     #[napi(js_name = "defaultSafeIntegers")]
     pub fn default_safe_integers(&self, toggle: Option<bool>) -> napi::Result<()> {
-        *self.inner()?.default_safe_integers.lock().unwrap() = toggle.unwrap_or(true);
+        self.default_safe_integers.set(toggle.unwrap_or(true));
         Ok(())
     }
 
-    /// Runs the I/O loop synchronously.
+    /// Closes the connection.
     #[napi]
-    pub fn io_loop_sync(&self) -> napi::Result<()> {
-        let io = &self.inner()?.io;
-        io.step().map_err(|e| to_generic_error("IO error", e))?;
-        Ok(())
-    }
-
-    /// Runs the I/O loop asynchronously, returning a Promise.
-    #[napi(ts_return_type = "Promise<void>")]
-    pub fn io_loop_async(&self) -> napi::Result<AsyncTask<IoLoopTask>> {
-        let io = self.inner()?.io.clone();
-        Ok(AsyncTask::new(IoLoopTask { io }))
-    }
-
-    /// Classify SQL statement. Returns "read", "write", "begin", "commit", or "rollback".
-    #[napi(js_name = "classifySql")]
-    pub fn classify_sql(&self, sql: String) -> napi::Result<String> {
-        use turso_parser::{ast::Stmt, parser::Parser};
-        let mut parser = Parser::new(sql.as_bytes());
-        match parser.next_cmd() {
-            Ok(Some(cmd)) => {
-                if cmd.is_explain() {
-                    return Ok("read".to_string());
+    pub fn close(&mut self) -> napi::Result<()> {
+        if self.conn.take().is_some() {
+            // Finalize all outstanding statements.  Each turso_core::Statement
+            // holds Program { connection: Arc<Connection> } which in turn holds
+            // Arc<Database>.  If we don't clear them, the Weak in
+            // DATABASE_MANAGER can still be upgraded after the file is renamed,
+            // causing a stale Database to be returned on the next open().
+            for weak in self.stmts.borrow_mut().drain(..) {
+                if let Some(stmt) = weak.upgrade() {
+                    *stmt.borrow_mut() = None;
                 }
-                let category = match cmd.stmt() {
-                    Stmt::Select(..)
-                    | Stmt::Pragma { .. }
-                    | Stmt::Attach { .. }
-                    | Stmt::Detach { .. } => "read",
-                    Stmt::Begin { .. } | Stmt::Savepoint { .. } => "begin",
-                    Stmt::Commit { .. } | Stmt::Release { .. } => "commit",
-                    Stmt::Rollback { .. } => "rollback",
-                    _ => "write",
-                };
-                Ok(category.to_string())
             }
-            Ok(None) => Ok("read".to_string()),
-            Err(e) => Err(napi::Error::from_reason(format!("classify failed: {e}"))),
         }
+        Ok(())
     }
 }
 
