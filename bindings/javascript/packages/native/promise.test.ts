@@ -1,6 +1,6 @@
 import { unlinkSync } from "node:fs";
 import { expect, test } from 'vitest'
-import { Database, connect } from './promise.js'
+import { Database, connect, Transaction } from './promise.js'
 import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 
@@ -343,8 +343,8 @@ test('example-2', async () => {
     const db = await connect(':memory:');
     await db.exec('CREATE TABLE users (name, email)');
     // Using transactions for atomic operations
-    const transaction = db.transaction(async (users) => {
-        const insert = await db.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
+    const transaction = db.transaction(async (txn, users) => {
+        const insert = await txn.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
         for (const user of users) {
             await insert.run(user.name, user.email);
         }
@@ -372,9 +372,9 @@ test('concurrent transaction() calls must not interleave', async () => {
     const db = await connect(':memory:');
     await db.exec('CREATE TABLE t(tag TEXT, i INTEGER)');
 
-    const insertMany = db.transaction(async (tag: string, fail: boolean) => {
+    const insertMany = db.transaction(async (txn, tag: string, fail: boolean) => {
         for (let i = 0; i < 10; i++) {
-            await db.run('INSERT INTO t VALUES (?, ?)', [tag, i]);
+            await txn.run('INSERT INTO t VALUES (?, ?)', [tag, i]);
         }
         if (fail) {
             throw new Error('abort transaction');
@@ -404,8 +404,8 @@ test('statement racing a transaction() must not be lost to its rollback', async 
     const db = await connect(':memory:');
     await db.exec('CREATE TABLE t(tag TEXT)');
 
-    const failing = db.transaction(async () => {
-        await db.run('INSERT INTO t VALUES (?)', ['txn']);
+    const failing = db.transaction(async (txn) => {
+        await txn.run('INSERT INTO t VALUES (?)', ['txn']);
         await new Promise((resolve) => setImmediate(resolve));
         throw new Error('abort transaction');
     });
@@ -423,9 +423,9 @@ test('statement racing a transaction() must not be lost to its rollback', async 
 
 test('transaction.concurrent uses BEGIN CONCURRENT', async () => {
     const db = await connect(':memory:');
-    const originalExec = db.exec;
+    const originalExec = Transaction.prototype.exec;
     const calls: string[] = [];
-    db.exec = async (sql) => {
+    Transaction.prototype.exec = async (sql) => {
         calls.push(sql);
     };
 
@@ -436,7 +436,7 @@ test('transaction.concurrent uses BEGIN CONCURRENT', async () => {
         await txn();
         expect(calls).toEqual(['BEGIN CONCURRENT', 'body', 'COMMIT']);
     } finally {
-        db.exec = originalExec;
+        Transaction.prototype.exec = originalExec;
         await db.close();
     }
 })

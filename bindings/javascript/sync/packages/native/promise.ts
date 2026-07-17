@@ -1,4 +1,4 @@
-import { DatabasePromise, TransactionFunction } from "@tursodatabase/database-common"
+import { DatabasePromise, Transaction, TransactionFunction } from "@tursodatabase/database-common"
 import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner, RemoteWriter, RemoteWriteStatement } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, Database as NativeDatabase } from "#index";
 import { promises } from "node:fs";
@@ -255,7 +255,7 @@ class Database extends DatabasePromise {
      * Returns a function that executes the given function in a transaction.
      * When remoteWrites is enabled, the entire transaction goes to remote.
      */
-    override transaction<F extends (...args: any[]) => Promise<any>>(
+    override transaction<F extends (txn: Transaction, ...args: any[]) => Promise<any>>(
         fn: F,
     ): TransactionFunction<F> {
         if (typeof fn !== "function")
@@ -271,7 +271,11 @@ class Database extends DatabasePromise {
             return async (...bindParameters: any[]) => {
                 await remoteWriter.beginTransaction(mode);
                 try {
-                    const result = await fn(...bindParameters);
+                    // remote-writes transactions route statements through the
+                    // database's own exec/prepare overrides (remoteWriter is
+                    // in-transaction), so the database acts as the handle -
+                    // there is no connection-level lock to bypass here
+                    const result = await fn(db as unknown as Transaction, ...bindParameters);
                     await remoteWriter.commitTransaction();
                     await db.pull();
                     return result;

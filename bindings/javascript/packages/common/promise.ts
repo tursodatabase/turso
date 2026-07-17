@@ -129,21 +129,41 @@ function makeResultSet(
 }
 
 /**
- * A wrapped transaction function. Calling it runs the wrapped function inside a
- * `BEGIN`/`COMMIT` block; the mode properties (`deferred`, `concurrent`, etc.)
- * return equivalent wrappers that begin the transaction with the corresponding
- * locking mode.
+ * The user-supplied arguments of a transaction callback: everything after
+ * the leading `Transaction` handle.
+ */
+export type TransactionArgs<F> = F extends (txn: Transaction, ...args: infer A) => any ? A : never;
+
+/**
+ * A wrapped transaction function returned by `Database.transaction(fn)`.
+ * Calling it opens a transaction, invokes `fn` with a `Transaction` handle
+ * followed by the call's own arguments, and commits on success or rolls
+ * back on error. The mode properties (`deferred`, `concurrent`, etc.)
+ * return equivalent wrappers that begin the transaction with the
+ * corresponding locking mode.
  */
 export interface TransactionFunction<
-  F extends (...args: any[]) => Promise<any> = (...args: any[]) => Promise<any>,
+  F extends (txn: Transaction, ...args: any[]) => Promise<any> = (txn: Transaction, ...args: any[]) => Promise<any>,
 > {
-  (...args: Parameters<F>): ReturnType<F>;
+  (...args: TransactionArgs<F>): ReturnType<F>;
   default: TransactionFunction<F>;
   deferred: TransactionFunction<F>;
   concurrent: TransactionFunction<F>;
   immediate: TransactionFunction<F>;
   exclusive: TransactionFunction<F>;
   database: Database;
+}
+
+/**
+ * The subset of the `AsyncLock` interface statement execution serializes on.
+ * Statements created from a `Database` use the database's real `AsyncLock`;
+ * statements created from a `Transaction` use a gate that never locks (the
+ * transaction wrapper already holds the database's lock for its whole
+ * duration) and only rejects use of a completed transaction.
+ */
+interface ExecLock {
+  acquire(): Promise<void>;
+  release(): void;
 }
 
 /**
@@ -217,9 +237,21 @@ class Database {
   /**
    * Returns a function that executes the given function in a transaction.
    *
-   * @param {function} fn - The function to wrap in a transaction.
+   * The wrapper owns the connection for the whole BEGIN..COMMIT window: it
+   * acquires the database's execution lock before BEGIN and releases it
+   * only after COMMIT/ROLLBACK, so no concurrent statement or transaction
+   * can interleave its own statements into the transaction's window. The
+   * callback receives a `Transaction` handle as its first argument,
+   * followed by the arguments the wrapped function was called with — all
+   * SQL inside the callback must go through that handle. Calls on the
+   * `Database` itself (or statements prepared from it) are not part of the
+   * transaction: they queue on the lock until the transaction finishes, so
+   * awaiting them inside the callback deadlocks the transaction.
+   *
+   * @param {function} fn - The function to wrap in a transaction; receives
+   *   the `Transaction` handle followed by the caller's arguments.
    */
-  transaction<F extends (...args: any[]) => Promise<any>>(
+  transaction<F extends (txn: Transaction, ...args: any[]) => Promise<any>>(
     fn: F,
   ): TransactionFunction<F> {
     if (typeof fn !== "function")
@@ -228,14 +260,29 @@ class Database {
     const db = this;
     const wrapTxn = (mode) => {
       return async (...bindParameters) => {
-        await db.exec("BEGIN " + mode);
+        if (!db.connected) {
+          await db.connect();
+        }
+        if (!db.open) {
+          throw new TypeError("The database connection is not open");
+        }
+        // own the connection for the whole transaction: everything else
+        // queues on execLock until COMMIT/ROLLBACK releases it
+        await db.execLock.acquire();
+        const txn = new Transaction(db.db, () => db.io());
         try {
-          const result = await fn(...bindParameters);
-          await db.exec("COMMIT");
-          return result;
-        } catch (err) {
-          await db.exec("ROLLBACK");
-          throw err;
+          await txn.exec("BEGIN " + mode);
+          try {
+            const result = await fn(txn, ...bindParameters);
+            await txn.exec("COMMIT");
+            return result;
+          } catch (err) {
+            await txn.exec("ROLLBACK");
+            throw err;
+          }
+        } finally {
+          txn.finish();
+          db.execLock.release();
         }
       };
     };
@@ -326,95 +373,11 @@ class Database {
     }
 
     // Hold execLock across the entire batch so it is observed as a
-    // single unit by other callers on this connection. The helpers
-    // below run their own step loops without re-acquiring the lock.
+    // single unit by other callers on this connection. The helper
+    // runs its own step loops without re-acquiring the lock.
     await this.execLock.acquire();
     try {
-      const runRawSql = async (sql: string) => {
-        const exec = this.db.executor(sql);
-        try {
-          while (true) {
-            const stepResult = exec.stepSync();
-            if (stepResult === STEP_IO) {
-              await this.io();
-              continue;
-            }
-            if (stepResult === STEP_DONE) {
-              break;
-            }
-          }
-        } finally {
-          exec.reset();
-        }
-      };
-
-      const { mode, raw } = normalizeBatchOptions(options);
-      const wrap = mode != null && !this.db.inTransaction();
-      if (wrap) {
-        await runRawSql(`BEGIN ${normalizeBatchMode(mode!)}`);
-      }
-
-      const results: ResultSet[] = [];
-      try {
-        for (const statement of statements) {
-          const sql = typeof statement === "string" ? statement : statement.sql;
-          const args = typeof statement === "string" ? undefined : statement.args;
-
-          let nativeStmt: NativeStatement;
-          try {
-            nativeStmt = this.db.prepare(sql);
-          } catch (err) {
-            throw convertError(err);
-          }
-          try {
-            if (args !== undefined) {
-              bindParams(nativeStmt, [args]);
-            }
-            const cols = nativeStmt.columns();
-            const columnNames = cols.map((c) => c.name);
-            const columnTypes = cols.map((c) => c.type ?? "");
-            if (columnNames.length > 0) {
-              nativeStmt.raw(raw);
-            }
-
-            const totalChangesBefore = this.db.totalChanges();
-            const rows: any[] = [];
-            try {
-              while (true) {
-                const stepResult = await nativeStmt.stepSync();
-                if (stepResult === STEP_IO) {
-                  await this.io();
-                  continue;
-                }
-                if (stepResult === STEP_DONE) {
-                  break;
-                }
-                rows.push(nativeStmt.row());
-              }
-              const rowsAffected = columnNames.length > 0
-                ? 0
-                : this.db.totalChanges() !== totalChangesBefore ? this.db.changes() : 0;
-              results.push(
-                makeResultSet(columnNames, columnTypes, rows, rowsAffected),
-              );
-            } finally {
-              nativeStmt.reset();
-            }
-          } finally {
-            nativeStmt.finalize();
-          }
-        }
-
-        if (wrap) {
-          await runRawSql("COMMIT");
-        }
-      } catch (err) {
-        if (wrap) {
-          try { await runRawSql("ROLLBACK"); } catch { /* ignore */ }
-        }
-        throw err;
-      }
-      return results;
+      return await executeBatch(this.db, () => this.io(), statements, options);
     } finally {
       this.execLock.release();
     }
@@ -592,6 +555,275 @@ class Database {
   }
 }
 
+/**
+ * Runs a batch over a connection whose execution lock is already owned by
+ * the caller: `Database.batch()` calls it while holding `execLock`,
+ * `Transaction.batch()` while the transaction wrapper holds the lock for
+ * the whole transaction.
+ */
+async function executeBatch(
+  native: NativeDatabase,
+  io: () => Promise<void>,
+  statements: Array<string | { sql: string; args?: any[] | Record<string, any> }>,
+  options?: BatchMode | BatchOptions,
+): Promise<ResultSet[]> {
+  const runRawSql = async (sql: string) => {
+    const exec = native.executor(sql);
+    try {
+      while (true) {
+        const stepResult = exec.stepSync();
+        if (stepResult === STEP_IO) {
+          await io();
+          continue;
+        }
+        if (stepResult === STEP_DONE) {
+          break;
+        }
+      }
+    } finally {
+      exec.reset();
+    }
+  };
+
+  const { mode, raw } = normalizeBatchOptions(options);
+  const wrap = mode != null && !native.inTransaction();
+  if (wrap) {
+    await runRawSql(`BEGIN ${normalizeBatchMode(mode!)}`);
+  }
+
+  const results: ResultSet[] = [];
+  try {
+    for (const statement of statements) {
+      const sql = typeof statement === "string" ? statement : statement.sql;
+      const args = typeof statement === "string" ? undefined : statement.args;
+
+      let nativeStmt: NativeStatement;
+      try {
+        nativeStmt = native.prepare(sql);
+      } catch (err) {
+        throw convertError(err);
+      }
+      try {
+        if (args !== undefined) {
+          bindParams(nativeStmt, [args]);
+        }
+        const cols = nativeStmt.columns();
+        const columnNames = cols.map((c) => c.name);
+        const columnTypes = cols.map((c) => c.type ?? "");
+        if (columnNames.length > 0) {
+          nativeStmt.raw(raw);
+        }
+
+        const totalChangesBefore = native.totalChanges();
+        const rows: any[] = [];
+        try {
+          while (true) {
+            const stepResult = await nativeStmt.stepSync();
+            if (stepResult === STEP_IO) {
+              await io();
+              continue;
+            }
+            if (stepResult === STEP_DONE) {
+              break;
+            }
+            rows.push(nativeStmt.row());
+          }
+          const rowsAffected = columnNames.length > 0
+            ? 0
+            : native.totalChanges() !== totalChangesBefore ? native.changes() : 0;
+          results.push(
+            makeResultSet(columnNames, columnTypes, rows, rowsAffected),
+          );
+        } finally {
+          nativeStmt.reset();
+        }
+      } finally {
+        nativeStmt.finalize();
+      }
+    }
+
+    if (wrap) {
+      await runRawSql("COMMIT");
+    }
+  } catch (err) {
+    if (wrap) {
+      try { await runRawSql("ROLLBACK"); } catch { /* ignore */ }
+    }
+    throw err;
+  }
+  return results;
+}
+
+/**
+ * A handle to an open transaction, passed as the first argument to the
+ * callback of `Database.transaction()`. All SQL of the transaction must go
+ * through this handle: the transaction wrapper holds the database's
+ * execution lock for the whole BEGIN..COMMIT window, so `Database` calls
+ * issued inside the callback wait for the transaction to finish (and
+ * deadlock it if awaited), while the handle executes on the already-owned
+ * connection. Once the transaction commits or rolls back the handle is
+ * closed and every method throws.
+ */
+class Transaction {
+  private db: NativeDatabase;
+  private ioStep: () => Promise<void>;
+  private active: boolean = true;
+  // Statement execution gate: the transaction wrapper already holds the
+  // database's execLock, so statements of this transaction never lock; the
+  // gate only rejects use of a completed transaction.
+  private gate: ExecLock;
+
+  constructor(db: NativeDatabase, ioStep: () => Promise<void>) {
+    this.db = db;
+    this.ioStep = ioStep;
+    this.gate = {
+      acquire: async () => { this.assertActive(); },
+      release: () => { },
+    };
+  }
+
+  /** Whether the transaction is still open (COMMIT/ROLLBACK not executed yet). */
+  get open(): boolean {
+    return this.active;
+  }
+
+  private assertActive() {
+    if (!this.active) {
+      throw new TypeError("The transaction has already completed");
+    }
+  }
+
+  /** @internal Marks the transaction completed; called by the wrapper. */
+  finish() {
+    this.active = false;
+  }
+
+  /**
+   * Executes the given SQL string inside the transaction.
+   * Unlike prepared statements, this can execute strings that contain multiple SQL statements.
+   *
+   * @param {string} sql - The string containing SQL statements to execute
+   */
+  async exec(sql: string, queryOptions?: QueryOptions) {
+    this.assertActive();
+    const exec = this.db.executor(sql, queryOptions);
+    try {
+      while (true) {
+        const stepResult = exec.stepSync();
+        if (stepResult === STEP_IO) {
+          await this.ioStep();
+          continue;
+        }
+        if (stepResult === STEP_DONE) {
+          break;
+        }
+        if (stepResult === STEP_ROW) {
+          continue;
+        }
+      }
+    } finally {
+      exec.reset();
+    }
+  }
+
+  /**
+   * Prepares a SQL statement scoped to the transaction. The statement runs
+   * on the transaction's connection without re-acquiring the database lock
+   * and becomes unusable once the transaction completes.
+   *
+   * @param {string} sql - The SQL statement string to prepare.
+   */
+  prepare(sql: string): Promise<Statement> {
+    this.assertActive();
+    if (!sql) {
+      throw new RangeError("The supplied SQL string contains no statements");
+    }
+    try {
+      return new Statement(maybeValue(this.db.prepare(sql)), this.db, this.gate, this.ioStep) as unknown as Promise<Statement>;
+    } catch (err) {
+      throw convertError(err);
+    }
+  }
+
+  /**
+   * Prepares the SQL and executes it as `Statement.run`, returning the run info.
+   *
+   * @param {string} sql - The SQL statement string.
+   * @param {...any} bindParameters - Bind parameters, optionally followed by a query options object.
+   */
+  async run(sql, ...bindParameters) {
+    const stmt = await this.prepare(sql);
+    try {
+      return await stmt.run(...bindParameters);
+    } finally {
+      await stmt.close();
+    }
+  }
+
+  /**
+   * Prepares the SQL and executes it as `Statement.get`, returning the first row.
+   *
+   * @param {string} sql - The SQL statement string.
+   * @param {...any} bindParameters - Bind parameters, optionally followed by a query options object.
+   */
+  async get(sql, ...bindParameters) {
+    const stmt = await this.prepare(sql);
+    try {
+      return await stmt.get(...bindParameters);
+    } finally {
+      await stmt.close();
+    }
+  }
+
+  /**
+   * Prepares the SQL and executes it as `Statement.all`, returning all rows.
+   *
+   * @param {string} sql - The SQL statement string.
+   * @param {...any} bindParameters - Bind parameters, optionally followed by a query options object.
+   */
+  async all(sql, ...bindParameters) {
+    const stmt = await this.prepare(sql);
+    try {
+      return await stmt.all(...bindParameters);
+    } finally {
+      await stmt.close();
+    }
+  }
+
+  /**
+   * Prepares the SQL and executes it as `Statement.iterate`, yielding each row.
+   *
+   * @param {string} sql - The SQL statement string.
+   * @param {...any} bindParameters - Bind parameters, optionally followed by a query options object.
+   */
+  async *iterate(sql, ...bindParameters) {
+    const stmt = await this.prepare(sql);
+    try {
+      yield* stmt.iterate(...bindParameters);
+    } finally {
+      await stmt.close();
+    }
+  }
+
+  /**
+   * Executes a batch of SQL statements inside the transaction. The batch
+   * joins the surrounding transaction: any `mode` option is ignored since
+   * the connection is already inside `BEGIN`.
+   *
+   * @param statements - An array of SQL strings or `{ sql, args }` objects.
+   */
+  async batch(
+    statements: Array<string | { sql: string; args?: any[] | Record<string, any> }>,
+    options?: BatchMode | BatchOptions,
+  ): Promise<ResultSet[]> {
+    this.assertActive();
+    if (!Array.isArray(statements)) {
+      throw new TypeError("Expected first argument to be an array of statements");
+    }
+    return await executeBatch(this.db, this.ioStep, statements, options);
+  }
+}
+
 interface MaybeLazy<T> {
   apply(fn: (value: T) => void);
   resolve(): Promise<T>,
@@ -646,10 +878,10 @@ function maybeValue<T>(value: T): MaybeLazy<T> {
 class Statement {
   private stmt: MaybeLazy<NativeStatement>;
   private db: NativeDatabase;
-  private execLock: AsyncLock;
+  private execLock: ExecLock;
   private ioStep: () => Promise<void>;
 
-  constructor(stmt: MaybeLazy<NativeStatement>, db: NativeDatabase, execLock: AsyncLock, ioStep: () => Promise<void>) {
+  constructor(stmt: MaybeLazy<NativeStatement>, db: NativeDatabase, execLock: ExecLock, ioStep: () => Promise<void>) {
     this.stmt = stmt;
     this.db = db;
     this.execLock = execLock;
@@ -889,4 +1121,4 @@ class Statement {
   }
 }
 
-export { Database, Statement, maybePromise, maybeValue }
+export { Database, Statement, Transaction, maybePromise, maybeValue }
