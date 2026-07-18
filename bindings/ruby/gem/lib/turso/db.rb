@@ -25,9 +25,15 @@ module Turso
       ResultSet.new(stmt)
     end
 
-    def transaction(&block)
+    VALID_TRANSACTION_MODES = %i[deferred immediate exclusive concurrent].freeze
+
+    def transaction(mode = :immediate, &block)
+      unless VALID_TRANSACTION_MODES.include?(mode)
+        fail ArgumentError, "Invalid transaction mode: #{mode.inspect}. Valid modes: #{VALID_TRANSACTION_MODES.inspect}"
+      end
+
       if block
-        execute("BEGIN")
+        execute("BEGIN #{mode.to_s.upcase}")
         begin
           result = block.call(self)
           execute("COMMIT")
@@ -37,7 +43,7 @@ module Turso
           raise
         end
       else
-        Transaction.new(self)
+        Transaction.new(self, mode)
       end
     end
 
