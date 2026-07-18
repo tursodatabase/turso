@@ -61,6 +61,10 @@ impl Connection {
         self.inner.interrupt();
     }
 
+    pub fn total_changes(&self) -> i64 {
+        self.inner.total_changes()
+    }
+
     pub fn close(&self) -> Result<(), Error> {
         let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
         self.inner

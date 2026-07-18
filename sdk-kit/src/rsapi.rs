@@ -956,6 +956,14 @@ impl TursoConnection {
         self.connection.last_insert_rowid()
     }
 
+    pub fn changes(&self) -> i64 {
+        self.connection.changes()
+    }
+
+    pub fn total_changes(&self) -> i64 {
+        self.connection.total_changes()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn register_external_scalar_function(
         &self,

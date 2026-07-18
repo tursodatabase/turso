@@ -109,6 +109,10 @@ impl Database {
         !self.inner.conn.get_auto_commit()
     }
 
+    pub fn total_changes(&self) -> i64 {
+        self.inner.conn.total_changes()
+    }
+
     pub fn connection(&self) -> magnus::typed_data::Obj<crate::connection::Connection> {
         let ruby = unsafe { Ruby::get_unchecked() };
         ruby.obj_wrap(crate::connection::Connection::from_arc(

@@ -41,6 +41,14 @@ module Turso
       end
     end
 
+    def total_changes
+      @database.total_changes
+    end
+
+    def changes
+      query("SELECT changes()").first&.values&.first.to_i
+    end
+
     def close
       @database.close
     end

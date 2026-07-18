@@ -54,6 +54,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     database_class.define_method("last_insert_rowid", method!(Database::last_insert_rowid, 0))?;
     database_class.define_method("in_transaction?", method!(Database::in_transaction, 0))?;
     database_class.define_method("connection", method!(Database::connection, 0))?;
+    database_class.define_method("total_changes", method!(Database::total_changes, 0))?;
     database_class.undef_default_alloc_func();
 
     let connection_class = module.define_class("Connection", ruby.class_object())?;
@@ -67,6 +68,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     connection_class.define_method("busy_timeout=", method!(Connection::set_busy_timeout, 1))?;
     connection_class.define_method("query_timeout=", method!(Connection::set_query_timeout, 1))?;
     connection_class.define_method("interrupt", method!(Connection::interrupt, 0))?;
+    connection_class.define_method("total_changes", method!(Connection::total_changes, 0))?;
     connection_class.define_method("close", method!(Connection::close, 0))?;
     connection_class.undef_default_alloc_func();
 
