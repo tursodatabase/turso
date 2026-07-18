@@ -20,7 +20,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let _ = ERROR_CLASSES.set(classes);
 
     let database_class = module.define_class("Database", ruby.class_object())?;
-    database_class.define_singleton_method("new", function!(Database::new, 1))?;
+    database_class.define_singleton_method("new", function!(Database::new, 2))?;
     database_class.define_method("close", method!(Database::close, 0))?;
     database_class.define_method("path", method!(Database::path, 0))?;
     database_class.define_method("open?", method!(Database::is_open, 0))?;

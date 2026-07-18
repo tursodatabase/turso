@@ -1,4 +1,4 @@
-use magnus::{typed_data::Obj, DataType, DataTypeFunctions, Error, Ruby, TypedData};
+use magnus::{typed_data::Obj, DataType, DataTypeFunctions, Error, RHash, Ruby, TypedData};
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{TursoConnection, TursoDatabase, TursoDatabaseConfig};
 use turso_sdk_kit::IoBackend;
@@ -33,12 +33,28 @@ unsafe impl TypedData for Database {
 }
 
 impl Database {
-    pub fn new(ruby: &Ruby, path: String) -> Result<Obj<Self>, Error> {
+    pub fn new(ruby: &Ruby, path: String, opts: Option<RHash>) -> Result<Obj<Self>, Error> {
         let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+
+        let mut experimental_features: Option<String> = None;
+        let mut busy_timeout_ms: Option<u64> = None;
+        let mut query_timeout_ms: Option<u64> = None;
+
+        if let Some(opts) = opts {
+            if let Ok(Some(val)) = opts.fetch::<_, String>("experimental_features") {
+                experimental_features = Some(val);
+            }
+            if let Ok(Some(val)) = opts.fetch::<_, u64>("busy_timeout") {
+                busy_timeout_ms = Some(val);
+            }
+            if let Ok(Some(val)) = opts.fetch::<_, u64>("query_timeout") {
+                query_timeout_ms = Some(val);
+            }
+        }
 
         let config = TursoDatabaseConfig {
             path: path.clone(),
-            experimental_features: None,
+            experimental_features,
             async_io: false,
             encryption: None,
             vfs: IoBackend::Default,
@@ -49,6 +65,14 @@ impl Database {
         let result = db.open().map_err(|e| from_turso_error(e, classes))?;
         debug_assert!(!result.is_io());
         let conn = db.connect().map_err(|e| from_turso_error(e, classes))?;
+
+        if let Some(ms) = busy_timeout_ms {
+            conn.set_busy_timeout(std::time::Duration::from_millis(ms));
+        }
+        if let Some(ms) = query_timeout_ms {
+            conn.set_query_timeout(std::time::Duration::from_millis(ms));
+        }
+
         let inner = DatabaseInner {
             _db: db,
             conn,
