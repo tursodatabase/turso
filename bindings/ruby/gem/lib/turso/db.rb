@@ -47,6 +47,16 @@ module Turso
       end
     end
 
+    def execute_batch(sql)
+      transaction do
+        sql.split(/;\s*$/).each do |statement|
+          stripped = statement.strip
+          execute(stripped) unless stripped.empty?
+        end
+      end
+      nil
+    end
+
     def total_changes
       @database.total_changes
     end

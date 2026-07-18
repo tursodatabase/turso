@@ -11,6 +11,17 @@ class TestExecute < Turso::TestCase
     assert_equal 1, count
   end
 
+  def test_execute_batch_runs_multiple_statements
+    db = in_memory_db
+    db.execute_batch(<<~SQL)
+      CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+      INSERT INTO users (name) VALUES ('Alice');
+      INSERT INTO users (name) VALUES ('Bob');
+    SQL
+    rows = db.query("SELECT name FROM users ORDER BY name").to_a
+    assert_equal ["Alice", "Bob"], rows.map { |r| r["name"] }
+  end
+
   def test_boolean_params_are_bound_as_integers
     db = in_memory_db
     db.execute("CREATE TABLE users (name TEXT, active INTEGER)")
