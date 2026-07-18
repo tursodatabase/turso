@@ -60,10 +60,8 @@ impl Statement {
         let result = {
             let mut guard = self.inner.borrow_mut();
             let stmt = guard.as_deref_mut().ok_or_else(|| {
-                magnus::Error::new(
-                    unsafe { Ruby::get_unchecked() }.exception_runtime_error(),
-                    "statement has been finalized",
-                )
+                let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+                magnus::Error::new(classes.base(), "statement has been finalized")
             })?;
             f(stmt)
         };

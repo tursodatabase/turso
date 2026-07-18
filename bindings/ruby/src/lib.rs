@@ -82,6 +82,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     statement_class.define_method("execute", method!(Statement::execute, 0))?;
     statement_class.define_method("row", method!(Statement::row, 0))?;
     statement_class.define_method("finalize", method!(Statement::finalize, 0))?;
+    statement_class.define_method("close", method!(Statement::finalize, 0))?;
     statement_class.define_method("reset", method!(Statement::reset, 0))?;
     statement_class.define_method("n_change", method!(Statement::n_change, 0))?;
     statement_class.undef_default_alloc_func();

@@ -18,4 +18,14 @@ class TestQuery < Turso::TestCase
     rows = db.query("SELECT name FROM users").to_a
     assert_empty rows
   end
+
+  def test_statement_can_be_closed
+    db = in_memory_db
+    db.execute("CREATE TABLE users (name TEXT)")
+    conn = db.instance_variable_get(:@database).connection
+    stmt = conn.prepare("SELECT * FROM users")
+    assert_respond_to stmt, :close
+    stmt.close
+    assert_raises(Turso::Error) { stmt.step }
+  end
 end
