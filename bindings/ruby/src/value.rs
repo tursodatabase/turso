@@ -2,6 +2,7 @@ use magnus::{
     encoding::EncodingCapable, value::ReprValue, Error, Float, Integer, IntoValue, RString, Ruby,
     Value,
 };
+use magnus::value::{Qfalse, Qtrue};
 use turso_core::types::Text;
 use turso_core::{NonNan, Numeric, Value as TursoValue};
 
@@ -30,6 +31,13 @@ pub fn to_turso_value(ruby: &Ruby, value: Value) -> Result<TursoValue, Error> {
             let str = s.to_string()?;
             return Ok(TursoValue::Text(Text::new(str)));
         }
+    }
+
+    if Qtrue::from_value(value).is_some() {
+        return Ok(TursoValue::Numeric(Numeric::Integer(1)));
+    }
+    if Qfalse::from_value(value).is_some() {
+        return Ok(TursoValue::Numeric(Numeric::Integer(0)));
     }
 
     Err(Error::new(
