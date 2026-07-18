@@ -2638,19 +2638,18 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         coro: &Coro<Ctx>,
     ) -> Result<Arc<turso_core::Connection>> {
         let db = {
+            let options = turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                .storage(self.db_file.clone())
+                .wal_path(self.revert_db_wal_path.clone())
+                .flags(OpenFlags::Create)
+                .db_opts(self.opts.db_opts);
             let mut state = OpenDbAsyncState::new();
             loop {
-                match turso_core::Database::open_with_flags_bypass_registry_async(
+                match turso_core::Database::do_open_async(
                     &mut state,
                     self.io.clone(),
                     &self.main_db_path,
-                    Some(&self.revert_db_wal_path),
-                    self.db_file.clone(),
-                    OpenFlags::Create,
-                    self.opts.db_opts,
-                    None,
-                    None,
-                    Arc::new(SqliteDialect),
+                    &options,
                 )? {
                     turso_core::IOResult::Done(db) => break db,
                     turso_core::IOResult::IO(io_completion) => {

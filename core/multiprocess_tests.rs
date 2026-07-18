@@ -137,9 +137,9 @@ fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
 }
 
 /// Mimic the sdk-kit async open path: the caller pre-opens the DB file with
-/// NoLock but hands `OpenFlags::default()` to `open_with_flags_async`, so the
-/// async entrypoint itself must re-derive the multiprocess lock mode before
-/// the WAL file is opened.
+/// NoLock but hands `OpenFlags::default()` to `open_async`, so the async
+/// entrypoint itself must re-derive the multiprocess lock mode before the WAL
+/// file is opened.
 fn open_multiprocess_db_async(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
     let file = io.open_file(path, OpenFlags::default() | OpenFlags::NoLock, true)?;
     let db_file = Arc::new(DatabaseFile::new(file));

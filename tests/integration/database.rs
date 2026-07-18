@@ -201,3 +201,85 @@ fn test_database_open_with_options() {
         "expected InvalidArgument about missing storage, got {err:?}"
     );
 }
+
+/// The registry-aware Database::open rejects a custom WAL path: the process
+/// registry keys on the default WAL, so a nonstandard WAL must go through the
+/// raw do_open path instead.
+#[test]
+fn test_open_rejects_wal_path() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("reject-wal.db");
+    let path = path.to_str().unwrap();
+
+    let io: Arc<dyn turso_core::IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let file = io.open_file(path, OpenFlags::Create, false).unwrap();
+    let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
+
+    let err = Database::open(
+        io,
+        path,
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(db_file)
+            .flags(OpenFlags::Create)
+            .wal_path(format!("{path}-wal-override")),
+    )
+    .expect_err("Database::open must reject a custom wal_path");
+    assert!(
+        matches!(err, turso_core::LimboError::InvalidArgument(ref m) if m.contains("wal_path")),
+        "expected InvalidArgument about wal_path, got {err:?}"
+    );
+}
+
+/// do_open skips the process-wide registry: opening the same path first
+/// through the registry-aware open and then through do_open yields two
+/// distinct Database instances, and do_open does not register itself (so a
+/// later open() does not observe the do_open instance).
+#[test]
+fn test_do_open_skips_registry() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("do-open-distinct.db");
+    let path = path.to_str().unwrap();
+
+    let io: Arc<dyn turso_core::IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let file = io.open_file(path, OpenFlags::Create, false).unwrap();
+    let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
+
+    // Register a canonical instance via the registry-aware open.
+    let registered = Database::open(
+        io.clone(),
+        path,
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(db_file.clone())
+            .flags(OpenFlags::Create),
+    )
+    .unwrap();
+
+    // do_open must NOT return the registered instance.
+    let detached = Database::do_open(
+        io.clone(),
+        path,
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(db_file.clone())
+            .flags(OpenFlags::Create),
+    )
+    .unwrap();
+    assert!(
+        !Arc::ptr_eq(&registered, &detached),
+        "do_open must open a fresh Database instance, not the registered one"
+    );
+
+    // A registry-aware open still returns the originally registered instance,
+    // proving do_open did not register itself over it.
+    let registered_again = Database::open(
+        io,
+        path,
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(db_file)
+            .flags(OpenFlags::Create),
+    )
+    .unwrap();
+    assert!(
+        Arc::ptr_eq(&registered, &registered_again),
+        "open() must still return the registered instance; do_open must not replace it"
+    );
+}
