@@ -106,3 +106,4 @@ dhat-heap.json
 
 # pgregress actual output and diffs
 postgres/regress/results/
+.worktrees/
