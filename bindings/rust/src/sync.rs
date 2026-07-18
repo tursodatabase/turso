@@ -1020,6 +1020,7 @@ mod tests {
         db_url: String,
         host: String,
         server: Option<Child>,
+        _temp_dir: Option<TempDir>,
         client: Client,
     }
 
@@ -1060,11 +1061,16 @@ mod tests {
                     db_url: format!("{}://{}--{}--{}.{}", tokens[0], name, name, name, tokens[1]),
                     host: format!("{name}--{name}--{name}.localhost"),
                     server: None,
+                    _temp_dir: None,
                     client,
                 })
             } else {
                 let port: u16 = rand::rng().random_range(10_000..=65_535);
                 let server_bin = env::var("LOCAL_SYNC_SERVER").unwrap();
+                let temp_dir = TempDir::new().context("failed to create local sync server db dir")?;
+                let db_path = temp_dir.path().join("remote.db");
+                let db_path_arg = db_path.to_string_lossy().into_owned();
+                let address = format!("0.0.0.0:{port}");
 
                 // IMPORTANT: do not use Stdio::piped() here. Nothing reads from
                 // those pipes, so once the kernel pipe buffer (~64 KiB on Linux)
@@ -1072,7 +1078,8 @@ mod tests {
                 // servicing HTTP requests, deadlocking sync operations in
                 // long-running tests like test_sync_parallel_writes_with_sync_ops.
                 let child = Command::new(server_bin)
-                    .args(["--sync-server", &format!("0.0.0.0:{port}")])
+                    .arg(&db_path_arg)
+                    .args(["--sync-server", &address])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()
@@ -1093,6 +1100,7 @@ mod tests {
                     db_url: user_url,
                     host: String::new(),
                     server: Some(child),
+                    _temp_dir: Some(temp_dir),
                     client,
                 })
             }
