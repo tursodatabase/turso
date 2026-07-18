@@ -8,6 +8,7 @@ use connection::Connection;
 use database::Database;
 use error::ErrorClasses;
 use magnus::{define_module, function, method, prelude::*, Error, Module, Ruby};
+use statement::Statement;
 use std::sync::OnceLock;
 
 pub(crate) static ERROR_CLASSES: OnceLock<ErrorClasses> = OnceLock::new();
@@ -36,6 +37,18 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     connection_class.define_method("query_timeout=", method!(Connection::set_query_timeout, 1))?;
     connection_class.define_method("interrupt", method!(Connection::interrupt, 0))?;
     connection_class.define_method("close", method!(Connection::close, 0))?;
+
+    let statement_class = module.define_class("Statement", ruby.class_object())?;
+    statement_class.define_method("parameter_count", method!(Statement::parameter_count, 0))?;
+    statement_class.define_method("column_count", method!(Statement::column_count, 0))?;
+    statement_class.define_method("column_name", method!(Statement::column_name, 1))?;
+    statement_class.define_method("bind_positional", method!(Statement::bind_positional, 1))?;
+    statement_class.define_method("step", method!(Statement::step, 0))?;
+    statement_class.define_method("execute", method!(Statement::execute, 0))?;
+    statement_class.define_method("row", method!(Statement::row, 0))?;
+    statement_class.define_method("finalize", method!(Statement::finalize, 0))?;
+    statement_class.define_method("reset", method!(Statement::reset, 0))?;
+    statement_class.define_method("n_change", method!(Statement::n_change, 0))?;
 
     Ok(())
 }

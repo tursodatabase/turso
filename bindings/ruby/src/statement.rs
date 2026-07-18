@@ -1,8 +1,22 @@
-use magnus::TypedData;
+use magnus::{typed_data::Obj, DataType, DataTypeFunctions, Error, Ruby, TypedData, Value};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use turso_sdk_kit::rsapi::TursoStatement;
 
+use crate::error::from_turso_error;
+use crate::ERROR_CLASSES;
+
 pub struct Statement {
-    _inner: Box<TursoStatement>,
+    inner: RefCell<Option<Box<TursoStatement>>>,
+    busy: AtomicBool,
+}
+
+unsafe impl DataTypeFunctions for Statement {
+    fn free(&mut self) {
+        if let Some(stmt) = self.inner.borrow_mut().take() {
+            let _ = stmt.finalize(None);
+        }
+    }
 }
 
 unsafe impl TypedData for Statement {
@@ -10,13 +24,143 @@ unsafe impl TypedData for Statement {
         "Turso::Statement"
     }
 
-    fn data_type() -> magnus::DataType {
-        magnus::DataType::new(Self::class_name())
+    fn data_type() -> DataType {
+        DataType::new(Self::class_name()).free_immediately(true)
     }
 }
 
 impl Statement {
     pub fn new(inner: Box<TursoStatement>) -> Self {
-        Self { _inner: inner }
+        Self {
+            inner: RefCell::new(Some(inner)),
+            busy: AtomicBool::new(false),
+        }
+    }
+
+    fn with_guard<T>(
+        &self,
+        f: impl FnOnce(&mut TursoStatement) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+            return Err(magnus::Error::new(
+                classes.busy.clone(),
+                "statement is already in use",
+            ));
+        }
+
+        let result = {
+            let mut guard = self.inner.borrow_mut();
+            let stmt = guard.as_deref_mut().ok_or_else(|| {
+                magnus::Error::new(
+                    unsafe { Ruby::get_unchecked() }.exception_runtime_error(),
+                    "statement has been finalized",
+                )
+            })?;
+            f(stmt)
+        };
+
+        self.busy.store(false, Ordering::Release);
+        result
+    }
+
+    pub fn parameter_count(&self) -> Result<u32, Error> {
+        self.with_guard(|stmt| Ok(stmt.parameters_count() as u32))
+    }
+
+    pub fn column_count(&self) -> Result<u32, Error> {
+        self.with_guard(|stmt| Ok(stmt.column_count() as u32))
+    }
+
+    pub fn column_name(&self, index: u32) -> Result<String, Error> {
+        self.with_guard(|stmt| {
+            stmt.column_name(index as usize).map_err(|e| {
+                let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+                from_turso_error(e, classes)
+            })
+        })
+    }
+
+    pub fn bind_positional(&self, values: Vec<Value>) -> Result<(), Error> {
+        self.with_guard(|stmt| {
+            for (idx, value) in values.into_iter().enumerate() {
+                let turso_value =
+                    crate::value::to_turso_value(unsafe { &Ruby::get_unchecked() }, value)?;
+                stmt.bind_positional(idx + 1, turso_value).map_err(|e| {
+                    let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+                    from_turso_error(e, classes)
+                })?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn step(&self) -> Result<u32, Error> {
+        self.with_guard(|stmt| {
+            stmt.step(None)
+                .map(|status| match status {
+                    turso_sdk_kit::rsapi::TursoStatusCode::Done => 0,
+                    turso_sdk_kit::rsapi::TursoStatusCode::Row => 1,
+                    turso_sdk_kit::rsapi::TursoStatusCode::Io => 2,
+                })
+                .map_err(|e| {
+                    let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+                    from_turso_error(e, classes)
+                })
+        })
+    }
+
+    pub fn execute(&self) -> Result<i64, Error> {
+        self.with_guard(|stmt| {
+            stmt.execute(None)
+                .map(|result| result.rows_changed as i64)
+                .map_err(|e| {
+                    let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+                    from_turso_error(e, classes)
+                })
+        })
+    }
+
+    pub fn row(&self, ruby: &Ruby) -> Result<magnus::RArray, Error> {
+        self.with_guard(|stmt| {
+            let count = stmt.column_count();
+            let ary = ruby.ary_new();
+            for i in 0..count {
+                let value = stmt.row_value(i).map_err(|e| {
+                    let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+                    from_turso_error(e, classes)
+                })?;
+                let rv = crate::value::to_ruby_value(ruby, &value)?;
+                ary.push(rv)?;
+            }
+            Ok(ary)
+        })
+    }
+
+    pub fn finalize(&self) -> Result<(), Error> {
+        let mut guard = self.inner.borrow_mut();
+        if let Some(stmt) = guard.take() {
+            let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+            stmt.finalize(None).map_err(|e| from_turso_error(e, classes))?;
+        }
+        Ok(())
+    }
+
+    pub fn reset(&self) -> Result<(), Error> {
+        self.with_guard(|stmt| {
+            stmt.reset().map_err(|e| {
+                let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+                from_turso_error(e, classes)
+            })
+        })
+    }
+
+    pub fn n_change(&self) -> i64 {
+        let guard = self.inner.borrow();
+        guard.as_ref().map(|s| s.n_change()).unwrap_or(0)
     }
 }
