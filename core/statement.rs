@@ -467,6 +467,17 @@ impl Statement {
         self.state.io_completions.take()
     }
 
+    /// Clone pending IO completions without clearing them so the next step can
+    /// still observe completion errors and run statement cleanup.
+    pub fn pending_io_completions(&self) -> Option<crate::types::IOCompletions> {
+        self.state.io_completions.clone()
+    }
+
+    /// Clone the IO backend handle used by this statement's pager.
+    pub fn clone_io(&self) -> Arc<dyn crate::IO> {
+        self.pager.io.clone()
+    }
+
     fn arm_query_timeout_if_needed(&mut self) {
         if !matches!(self.state.execution_state, ProgramExecutionState::Init)
             || self.state.query_deadline.is_some()

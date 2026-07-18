@@ -3179,7 +3179,7 @@ impl Cursor {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[must_use]
 pub enum IOCompletions {
     Single(Completion),
@@ -3213,6 +3213,15 @@ impl IOCompletions {
     pub fn wait<I: ?Sized + IO>(self, io: &I) -> Result<()> {
         match self {
             IOCompletions::Single(c) => io.wait_for_completion(c),
+        }
+    }
+
+    /// Drive the IO backend until these completions finish without observing
+    /// their result. The operation that owns the completions remains
+    /// responsible for error handling and cleanup on re-entry.
+    pub fn wait_for_finish<I: ?Sized + IO>(self, io: &I) -> Result<()> {
+        match self {
+            IOCompletions::Single(c) => io.drain_completions(&[c]),
         }
     }
 

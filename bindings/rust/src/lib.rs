@@ -344,6 +344,7 @@ impl Database {
 pub struct Statement {
     conn: Connection,
     inner: Arc<Mutex<Box<turso_sdk_kit::rsapi::TursoStatement>>>,
+    local_io_wait: Arc<Mutex<Option<LocalIoWait>>>,
 }
 
 struct Execute {
@@ -351,6 +352,102 @@ struct Execute {
 }
 
 assert_send_sync!(Execute);
+
+// Local file IO backends such as IOCP need an external waiter to wake Rust
+// futures after the first nonblocking run_io() iteration.
+struct LocalIoWait {
+    state: Arc<Mutex<LocalIoWaitState>>,
+}
+
+struct LocalIoWaitState {
+    result: Option<Result<()>>,
+    waker: Option<std::task::Waker>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LocalIoWait {
+    fn spawn(
+        io_completions: turso_core::types::IOCompletions,
+        io: Arc<dyn turso_core::IO>,
+        waker: std::task::Waker,
+    ) -> Result<Self> {
+        let state = Arc::new(Mutex::new(LocalIoWaitState {
+            result: None,
+            waker: Some(waker),
+            handle: None,
+        }));
+        let thread_state = state.clone();
+        let handle = std::thread::Builder::new()
+            .name("turso-local-io".to_string())
+            .spawn(move || {
+                let wait_result = io_completions
+                    .wait_for_finish(io.as_ref())
+                    .map_err(turso_sdk_kit::rsapi::TursoError::from)
+                    .map_err(Error::from);
+                let waker = {
+                    let mut state = thread_state.lock().unwrap();
+                    state.result = Some(wait_result);
+                    state.waker.take()
+                };
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            })
+            .map_err(|err| {
+                Error::Error(format!("failed to spawn local IO waiter thread: {err}"))
+            })?;
+        state.lock().unwrap().handle = Some(handle);
+        Ok(Self { state })
+    }
+
+    fn poll(&self, waker: &std::task::Waker) -> Poll<Result<()>> {
+        let mut state = self.state.lock().unwrap();
+        match state.result.take() {
+            Some(result) => {
+                let handle = state.handle.take();
+                drop(state);
+                if let Some(handle) = handle {
+                    if let Err(err) = join_local_io_waiter(handle) {
+                        return Poll::Ready(Err(err));
+                    }
+                }
+                Poll::Ready(result)
+            }
+            None => {
+                match state.waker.as_mut() {
+                    Some(current) if current.will_wake(waker) => {}
+                    Some(current) => {
+                        *current = waker.clone();
+                    }
+                    None => {
+                        state.waker = Some(waker.clone());
+                    }
+                }
+                Poll::Pending
+            }
+        }
+    }
+
+    fn wait_blocking(self) -> Result<()> {
+        let handle = self.state.lock().unwrap().handle.take();
+        if let Some(handle) = handle {
+            join_local_io_waiter(handle)?;
+        }
+        self.state.lock().unwrap().result.take().unwrap_or_else(|| {
+            Err(Error::Error(
+                "local IO waiter finished without result".into(),
+            ))
+        })
+    }
+}
+
+assert_send_sync!(LocalIoWait);
+
+fn join_local_io_waiter(handle: std::thread::JoinHandle<()>) -> Result<()> {
+    handle
+        .join()
+        .map_err(|_| Error::Error("local IO waiter thread panicked".into()))
+}
 
 impl Future for Execute {
     type Output = Result<u64>;
@@ -370,11 +467,35 @@ impl Future for Execute {
 }
 
 impl Statement {
+    fn wait_for_local_io(&self) -> Result<()> {
+        let wait = self.local_io_wait.lock().unwrap().take();
+        if let Some(wait) = wait {
+            wait.wait_blocking()?;
+        }
+        Ok(())
+    }
+
     fn step(
         &self,
         columns: Option<usize>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<Option<Row>>> {
+        {
+            let mut wait = self.local_io_wait.lock().unwrap();
+            if let Some(local_io_wait) = wait.as_ref() {
+                match local_io_wait.poll(cx.waker()) {
+                    Poll::Ready(Ok(())) => {
+                        wait.take();
+                    }
+                    Poll::Ready(Err(err)) => {
+                        wait.take();
+                        return Poll::Ready(Err(err));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+
         let mut stmt = self.inner.lock().unwrap();
         match stmt.step(Some(cx.waker()))? {
             turso_sdk_kit::rsapi::TursoStatusCode::Row => {
@@ -396,6 +517,13 @@ impl Statement {
                 stmt.run_io()?;
                 if let Some(extra_io) = &self.conn.extra_io {
                     extra_io(cx.waker().clone())?;
+                } else if let Some((io_completions, io)) = stmt.pending_io()? {
+                    if io_completions.finished() {
+                        cx.waker().wake_by_ref();
+                    } else {
+                        *self.local_io_wait.lock().unwrap() =
+                            Some(LocalIoWait::spawn(io_completions, io, cx.waker().clone())?);
+                    }
                 }
                 Poll::Pending
             }
@@ -427,10 +555,7 @@ impl Statement {
 
     /// Execute this prepared statement.
     pub async fn execute(&mut self, params: impl IntoParams) -> Result<u64> {
-        {
-            // Reset the statement before executing
-            self.inner.lock().unwrap().reset()?;
-        }
+        self.reset()?;
         let params = params.into_params()?;
         match params {
             params::Params::None => (),
@@ -522,6 +647,7 @@ impl Statement {
 
     /// Reset internal statement state after previous execution so it can be reused again
     pub fn reset(&self) -> Result<()> {
+        self.wait_for_local_io()?;
         let mut stmt = self.inner.lock().unwrap();
         stmt.reset()?;
         Ok(())

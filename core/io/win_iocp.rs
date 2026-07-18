@@ -85,7 +85,7 @@ use windows_sys::Win32::System::Memory::{
     PAGE_READWRITE,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
-use windows_sys::Win32::System::Threading::CreateEventW;
+use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE};
 use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus, OVERLAPPED,
     OVERLAPPED_0, OVERLAPPED_0_0,
@@ -417,7 +417,7 @@ impl IO for WindowsIOCP {
     fn step(&self) -> Result<()> {
         trace!("I/O Step..");
 
-        match self.instance.process_packet_from_iocp() {
+        match self.instance.process_packet_from_iocp(0) {
             Err(GetIOCPPacketError::SystemError(code)) => {
                 Err(get_generic_limboerror_from_os_err(code))
             }
@@ -426,6 +426,29 @@ impl IO for WindowsIOCP {
             | Err(GetIOCPPacketError::InvalidIO)
             | Ok(()) => Ok(()),
         }
+    }
+
+    fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
+        while completions.iter().any(|c| !c.finished()) {
+            match self.instance.process_packet_from_iocp(INFINITE) {
+                Err(GetIOCPPacketError::SystemError(code)) => {
+                    return Err(get_generic_limboerror_from_os_err(code));
+                }
+                Err(GetIOCPPacketError::Aborted)
+                | Err(GetIOCPPacketError::Empty)
+                | Err(GetIOCPPacketError::InvalidIO)
+                | Ok(()) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_for_completion(&self, c: Completion) -> Result<()> {
+        self.drain_completions(std::slice::from_ref(&c))?;
+        if let Some(err) = c.get_error() {
+            return Err(err.into());
+        }
+        Ok(())
     }
 }
 
@@ -571,7 +594,7 @@ impl InnerWindowsIOCP {
         None
     }
 
-    fn process_packet_from_iocp(&self) -> Result<(), GetIOCPPacketError> {
+    fn process_packet_from_iocp(&self, timeout_ms: u32) -> Result<(), GetIOCPPacketError> {
         let mut overlapped_ptr = ptr::null_mut();
         let mut bytes_received = 0;
         let mut iocp_key = 0;
@@ -582,7 +605,7 @@ impl InnerWindowsIOCP {
                 &raw mut bytes_received,
                 &raw mut iocp_key,
                 &raw mut overlapped_ptr,
-                0,
+                timeout_ms,
             )
         };
 
@@ -654,7 +677,7 @@ impl InnerWindowsIOCP {
 
     fn drain(&self) -> Result<()> {
         loop {
-            match self.process_packet_from_iocp() {
+            match self.process_packet_from_iocp(0) {
                 Err(GetIOCPPacketError::Empty | GetIOCPPacketError::Aborted) => {
                     break;
                 }

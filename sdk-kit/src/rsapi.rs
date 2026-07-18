@@ -1449,6 +1449,20 @@ impl TursoStatement {
         stmt._io().step()?;
         Ok(())
     }
+
+    /// Return pending VDBE completions and their IO backend without clearing
+    /// them; the next statement step still owns completion error handling.
+    pub fn pending_io(
+        &self,
+    ) -> Result<Option<(turso_core::types::IOCompletions, Arc<dyn IO>)>, TursoError> {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle
+            .as_ref()
+            .ok_or_else(|| TursoError::Misuse(FINALIZED_ERR.to_string()))?;
+        Ok(stmt
+            .pending_io_completions()
+            .map(|completions| (completions, stmt.clone_io())))
+    }
     /// get row value as an owned Value
     #[inline]
     pub fn row_value(&self, index: usize) -> Result<turso_core::Value, TursoError> {
