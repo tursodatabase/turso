@@ -1091,6 +1091,12 @@ fn emit_ctas_insert(
     program.preassign_label_to_next_insn(loop_end);
     program.preassign_label_to_next_insn(halt_label);
 
+    // The source SELECT set program.result_columns as a side effect, but
+    // its rows feed the insert coroutine and are never returned; CTAS
+    // reports zero columns. Mirror INSERT ... SELECT, which resets
+    // result_columns after emitting its source.
+    program.result_columns.clear();
+
     Ok(())
 }
 
