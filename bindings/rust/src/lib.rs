@@ -417,7 +417,7 @@ impl LocalIoWait {
                 match state.waker.as_mut() {
                     Some(current) if current.will_wake(waker) => {}
                     Some(current) => {
-                        *current = waker.clone();
+                        current.clone_from(waker);
                     }
                     None => {
                         state.waker = Some(waker.clone());
