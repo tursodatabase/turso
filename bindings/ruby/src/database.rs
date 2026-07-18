@@ -88,4 +88,8 @@ impl Database {
     pub fn in_transaction(&self) -> bool {
         !self.inner.conn.get_auto_commit()
     }
+
+    pub fn connection(&self) -> Obj<crate::connection::Connection> {
+        Obj::wrap(unsafe { Ruby::get_unchecked() }, crate::connection::Connection::from_arc(self.inner.conn.clone()))
+    }
 }
