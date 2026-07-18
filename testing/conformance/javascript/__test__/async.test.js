@@ -171,7 +171,12 @@ test.serial("Database.batch() [SELECT rows expose Statement.all() object shape]"
   t.is(rs.rows.length, 1);
 
   const row = rs.rows[0];
-  t.false(Array.isArray(row));
+  // batch() rows must expose the same dual access as execute()/Statement.all()
+  // rows: both positional (row[0]) and named (row.name). This is the contract
+  // the embedded driver honours, and serverless must match it.
+  t.is(row[0], 1);
+  t.is(row[1], "Alice");
+  t.is(row[2], "alice@example.org");
   t.is(row.id, 1);
   t.is(row.name, "Alice");
   t.is(row.email, "alice@example.org");

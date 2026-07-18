@@ -419,14 +419,6 @@ export class Session {
     return row;
   }
 
-  createObjectRow(values: any[], columns: string[]): any {
-    const row: any = {};
-    columns.forEach((column, index) => {
-      row[column] = values[index];
-    });
-    return row;
-  }
-
   /**
    * Execute multiple SQL statements in a batch.
    *
@@ -585,7 +577,7 @@ export class Session {
             const decodedRow = entry.row.map(value => decodeValue(value, safeIntegers));
             const row = raw
               ? decodedRow
-              : this.createObjectRow(decodedRow, results[currentResultIdx].columns);
+              : this.createRowObject(decodedRow, results[currentResultIdx].columns);
             results[currentResultIdx].rows.push(row);
           }
           break;
