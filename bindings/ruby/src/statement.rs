@@ -1,4 +1,4 @@
-use magnus::{typed_data::Obj, DataType, DataTypeFunctions, Error, Ruby, TypedData, Value};
+use magnus::{data_type_builder, DataType, DataTypeFunctions, Error, Ruby, TypedData, Value};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use turso_sdk_kit::rsapi::TursoStatement;
@@ -11,21 +11,25 @@ pub struct Statement {
     busy: AtomicBool,
 }
 
-unsafe impl DataTypeFunctions for Statement {
-    fn free(&mut self) {
-        if let Some(stmt) = self.inner.borrow_mut().take() {
+impl DataTypeFunctions for Statement {
+    fn free(self: Box<Self>) {
+        if let Some(mut stmt) = self.inner.borrow_mut().take() {
             let _ = stmt.finalize(None);
         }
     }
 }
 
 unsafe impl TypedData for Statement {
-    fn class_name() -> &'static str {
-        "Turso::Statement"
+    fn class(_ruby: &Ruby) -> magnus::RClass {
+        let raw = crate::statement_class();
+        magnus::RClass::from_value(unsafe { std::mem::transmute::<usize, Value>(raw) }).unwrap()
     }
 
-    fn data_type() -> DataType {
-        DataType::new(Self::class_name()).free_immediately(true)
+    fn data_type() -> &'static DataType {
+        static DATA_TYPE: DataType = data_type_builder!(Statement, "statement")
+            .free_immediately()
+            .build();
+        &DATA_TYPE
     }
 }
 
@@ -48,7 +52,7 @@ impl Statement {
         {
             let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
             return Err(magnus::Error::new(
-                classes.busy.clone(),
+                classes.busy(),
                 "statement is already in use",
             ));
         }
@@ -85,9 +89,11 @@ impl Statement {
         })
     }
 
-    pub fn bind_positional(&self, values: Vec<Value>) -> Result<(), Error> {
+    pub fn bind_positional(&self, args: magnus::RArray) -> Result<(), Error> {
         self.with_guard(|stmt| {
-            for (idx, value) in values.into_iter().enumerate() {
+            let len = args.len();
+            for idx in 0..len {
+                let value: Value = args.entry(idx as isize)?;
                 let turso_value =
                     crate::value::to_turso_value(unsafe { &Ruby::get_unchecked() }, value)?;
                 stmt.bind_positional(idx + 1, turso_value).map_err(|e| {
@@ -125,8 +131,9 @@ impl Statement {
         })
     }
 
-    pub fn row(&self, ruby: &Ruby) -> Result<magnus::RArray, Error> {
+    pub fn row(&self) -> Result<magnus::RArray, Error> {
         self.with_guard(|stmt| {
+            let ruby = unsafe { Ruby::get_unchecked() };
             let count = stmt.column_count();
             let ary = ruby.ary_new();
             for i in 0..count {
@@ -134,7 +141,7 @@ impl Statement {
                     let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
                     from_turso_error(e, classes)
                 })?;
-                let rv = crate::value::to_ruby_value(ruby, &value)?;
+                let rv = crate::value::to_ruby_value(&ruby, &value)?;
                 ary.push(rv)?;
             }
             Ok(ary)
@@ -143,9 +150,10 @@ impl Statement {
 
     pub fn finalize(&self) -> Result<(), Error> {
         let mut guard = self.inner.borrow_mut();
-        if let Some(stmt) = guard.take() {
+        if let Some(mut stmt) = guard.take() {
             let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
-            stmt.finalize(None).map_err(|e| from_turso_error(e, classes))?;
+            stmt.finalize(None)
+                .map_err(|e| from_turso_error(e, classes))?;
         }
         Ok(())
     }

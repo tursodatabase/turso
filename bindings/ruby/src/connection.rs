@@ -1,4 +1,4 @@
-use magnus::{typed_data::Obj, DataType, DataTypeFunctions, Error, Ruby, TypedData};
+use magnus::{data_type_builder, DataType, DataTypeFunctions, Error, Ruby, TypedData, Value};
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::TursoConnection;
 
@@ -10,15 +10,17 @@ pub struct Connection {
     inner: Arc<TursoConnection>,
 }
 
-unsafe impl DataTypeFunctions for Connection {}
+impl DataTypeFunctions for Connection {}
 
 unsafe impl TypedData for Connection {
-    fn class_name() -> &'static str {
-        "Turso::Connection"
+    fn class(_ruby: &Ruby) -> magnus::RClass {
+        let raw = crate::connection_class();
+        magnus::RClass::from_value(unsafe { std::mem::transmute::<usize, Value>(raw) }).unwrap()
     }
 
-    fn data_type() -> DataType {
-        DataType::new(Self::class_name())
+    fn data_type() -> &'static DataType {
+        static DATA_TYPE: DataType = data_type_builder!(Connection, "connection").build();
+        &DATA_TYPE
     }
 }
 
@@ -27,19 +29,18 @@ impl Connection {
         Self { inner }
     }
 
-    pub fn prepare_single(&self, sql: String) -> Result<Obj<Statement>, Error> {
+    pub fn prepare_single(&self, sql: String) -> Result<magnus::typed_data::Obj<Statement>, Error> {
         let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
-        let stmt = self.inner.prepare_single(&sql)
+        let stmt = self
+            .inner
+            .prepare_single(&sql)
             .map_err(|e| from_turso_error(e, classes))?;
-        Ok(Obj::wrap(unsafe { Ruby::get_unchecked() }, Statement::new(stmt)))
+        let ruby = unsafe { Ruby::get_unchecked() };
+        Ok(ruby.obj_wrap(Statement::new(stmt)))
     }
 
     pub fn get_auto_commit(&self) -> bool {
         self.inner.get_auto_commit()
-    }
-
-    pub fn is_readonly(&self) -> bool {
-        self.inner.is_readonly(0)
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -47,11 +48,13 @@ impl Connection {
     }
 
     pub fn set_busy_timeout(&self, ms: u32) {
-        self.inner.set_busy_timeout(std::time::Duration::from_millis(ms as u64));
+        self.inner
+            .set_busy_timeout(std::time::Duration::from_millis(ms as u64));
     }
 
     pub fn set_query_timeout(&self, ms: u32) {
-        self.inner.set_query_timeout(std::time::Duration::from_millis(ms as u64));
+        self.inner
+            .set_query_timeout(std::time::Duration::from_millis(ms as u64));
     }
 
     pub fn interrupt(&self) {
@@ -60,7 +63,9 @@ impl Connection {
 
     pub fn close(&self) -> Result<(), Error> {
         let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
-        self.inner.close().map_err(|e| from_turso_error(e, classes))?;
+        self.inner
+            .close()
+            .map_err(|e| from_turso_error(e, classes))?;
         Ok(())
     }
 }

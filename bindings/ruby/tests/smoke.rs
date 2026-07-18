@@ -37,7 +37,7 @@ fn test_smoke_create_and_query() {
         .unwrap();
     assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
     let name = stmt.row_value(0).unwrap();
-    assert_eq!(name.to_text(), Some("hello".to_string()));
+    assert_eq!(name.to_text(), Some("hello"));
 
     // No more rows
     assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Done);

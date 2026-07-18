@@ -1,4 +1,6 @@
-use magnus::{typed_data::Obj, DataType, DataTypeFunctions, Error, RHash, Ruby, TypedData};
+use magnus::{
+    data_type_builder, DataType, DataTypeFunctions, Error, RHash, Ruby, TypedData, Value,
+};
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{TursoConnection, TursoDatabase, TursoDatabaseConfig};
 use turso_sdk_kit::IoBackend;
@@ -16,41 +18,37 @@ struct DatabaseInner {
     path: String,
 }
 
-unsafe impl DataTypeFunctions for Database {
-    fn free(&mut self) {
+impl DataTypeFunctions for Database {
+    fn free(self: Box<Self>) {
         let _ = self.inner.conn.close();
     }
 }
 
 unsafe impl TypedData for Database {
-    fn class_name() -> &'static str {
-        "Turso::Database"
+    fn class(_ruby: &Ruby) -> magnus::RClass {
+        let raw = crate::database_class();
+        magnus::RClass::from_value(unsafe { std::mem::transmute::<usize, Value>(raw) }).unwrap()
     }
 
-    fn data_type() -> DataType {
-        DataType::new(Self::class_name()).free_immediately(true)
+    fn data_type() -> &'static DataType {
+        static DATA_TYPE: DataType = data_type_builder!(Database, "database")
+            .free_immediately()
+            .build();
+        &DATA_TYPE
     }
 }
 
 impl Database {
-    pub fn new(ruby: &Ruby, path: String, opts: Option<RHash>) -> Result<Obj<Self>, Error> {
+    pub fn new(
+        ruby: &Ruby,
+        path: String,
+        opts: RHash,
+    ) -> Result<magnus::typed_data::Obj<Self>, Error> {
         let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
 
-        let mut experimental_features: Option<String> = None;
-        let mut busy_timeout_ms: Option<u64> = None;
-        let mut query_timeout_ms: Option<u64> = None;
-
-        if let Some(opts) = opts {
-            if let Ok(Some(val)) = opts.fetch::<_, String>("experimental_features") {
-                experimental_features = Some(val);
-            }
-            if let Ok(Some(val)) = opts.fetch::<_, u64>("busy_timeout") {
-                busy_timeout_ms = Some(val);
-            }
-            if let Ok(Some(val)) = opts.fetch::<_, u64>("query_timeout") {
-                query_timeout_ms = Some(val);
-            }
-        }
+        let experimental_features: Option<String> = opts.aref("experimental_features")?;
+        let busy_timeout_ms: Option<u64> = opts.aref("busy_timeout")?;
+        let query_timeout_ms: Option<u64> = opts.aref("query_timeout")?;
 
         let config = TursoDatabaseConfig {
             path: path.clone(),
@@ -78,14 +76,17 @@ impl Database {
             conn,
             path,
         };
-        Ok(Obj::wrap(ruby, Self {
+        Ok(ruby.obj_wrap(Self {
             inner: Arc::new(inner),
         }))
     }
 
     pub fn close(&self) -> Result<(), Error> {
         let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
-        self.inner.conn.close().map_err(|e| from_turso_error(e, classes))?;
+        self.inner
+            .conn
+            .close()
+            .map_err(|e| from_turso_error(e, classes))?;
         Ok(())
     }
 
@@ -101,19 +102,14 @@ impl Database {
         self.inner.conn.last_insert_rowid()
     }
 
-    pub fn changes(&self) -> i64 {
-        0
-    }
-
-    pub fn total_changes(&self) -> i64 {
-        0
-    }
-
     pub fn in_transaction(&self) -> bool {
         !self.inner.conn.get_auto_commit()
     }
 
-    pub fn connection(&self) -> Obj<crate::connection::Connection> {
-        Obj::wrap(unsafe { Ruby::get_unchecked() }, crate::connection::Connection::from_arc(self.inner.conn.clone()))
+    pub fn connection(&self) -> magnus::typed_data::Obj<crate::connection::Connection> {
+        let ruby = unsafe { Ruby::get_unchecked() };
+        ruby.obj_wrap(crate::connection::Connection::from_arc(
+            self.inner.conn.clone(),
+        ))
     }
 }

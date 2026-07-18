@@ -1,6 +1,6 @@
 use magnus::{
-    encoding::{EncodingCapable, RbEncoding},
-    Error, Float, Integer, IntoValue, Ruby, RString, Value,
+    encoding::EncodingCapable, value::ReprValue, Error, Float, Integer, IntoValue, RString, Ruby,
+    Value,
 };
 use turso_core::types::Text;
 use turso_core::{NonNan, Numeric, Value as TursoValue};
@@ -11,24 +11,24 @@ pub fn to_turso_value(ruby: &Ruby, value: Value) -> Result<TursoValue, Error> {
     }
 
     if let Some(i) = Integer::from_value(value) {
-        let n = i.to_i64();
+        let n = i.to_i64()?;
         return Ok(TursoValue::Numeric(Numeric::Integer(n)));
     }
 
     if let Some(f) = Float::from_value(value) {
-        let nn =
-            NonNan::new(f.to_f64()).ok_or_else(|| Error::new(ruby.exception_type_error(), "NaN"))?;
+        let nn = NonNan::new(f.to_f64())
+            .ok_or_else(|| Error::new(ruby.exception_type_error(), "NaN"))?;
         return Ok(TursoValue::Numeric(Numeric::Float(nn)));
     }
 
     if let Some(s) = RString::from_value(value) {
         let encoding = s.enc_get();
-        let bytes = unsafe { s.as_slice() };
-        if encoding == ruby.ascii8bit_encoding() {
-            return Ok(TursoValue::Blob(bytes.to_vec()));
+        if encoding == ruby.ascii8bit_encoding().into() {
+            let bytes = unsafe { s.as_slice() }.to_vec();
+            return Ok(TursoValue::Blob(bytes));
         } else {
-            let str = unsafe { s.to_str() }?;
-            return Ok(TursoValue::Text(Text::new(str.to_string())));
+            let str = s.to_string()?;
+            return Ok(TursoValue::Text(Text::new(str)));
         }
     }
 
@@ -51,11 +51,9 @@ pub fn to_ruby_value(ruby: &Ruby, value: &TursoValue) -> Result<Value, Error> {
         }
         TursoValue::Text(s) => Ok(ruby.str_new(s.as_str()).into_value_with(ruby)),
         TursoValue::Blob(b) => {
-            let s = RString::buf_new(b.len());
-            unsafe {
-                s.append(b.as_slice())?;
-                s.enc_set(ruby.ascii8bit_encoding())?;
-            }
+            let s = ruby.str_buf_new(b.len());
+            s.cat(b.as_slice());
+            s.enc_set(ruby.ascii8bit_encoding())?;
             Ok(s.into_value_with(ruby))
         }
     }

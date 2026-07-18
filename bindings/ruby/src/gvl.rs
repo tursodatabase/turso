@@ -11,33 +11,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// For now, this provides:
 /// 1. Panic catching - Rust panics are caught and returned as errors
 /// 2. Interruption support via the `cancelled` flag
+#[allow(dead_code)]
 pub fn without_gvl<F, R>(cancelled: &AtomicBool, f: F) -> Result<R, String>
 where
     F: FnOnce() -> R,
 {
-    // TODO: Replace with rb_thread_call_without_gvl2 once the extension
-    // compiles. This requires accessing the Ruby C API through rb-sys.
-    //
-    // let result_ptr = unsafe {
-    //     rb_sys::rb_thread_call_without_gvl2(
-    //         Some(trampoline::<F, R>),
-    //         data,
-    //         Some(unblock_trampoline),
-    //         std::ptr::null_mut(),
-    //     )
-    // };
-
-    // Check if cancelled before starting
     if cancelled.load(Ordering::Acquire) {
         return Err("operation was cancelled".to_string());
     }
 
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let result = f();
-        result
-    }));
-
-    match result {
+    match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
         Ok(val) => Ok(val),
         Err(e) => {
             let msg = if let Some(s) = e.downcast_ref::<String>() {
