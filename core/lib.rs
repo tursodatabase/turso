@@ -974,6 +974,7 @@ impl Database {
     fn reject_live_multiprocess_wal_for_legacy_open(
         io: &Arc<dyn IO>,
         path: &str,
+        wal_path: Option<&str>,
         opts: DatabaseOpts,
     ) -> Result<()> {
         if opts.enable_multiprocess_wal
@@ -984,8 +985,13 @@ impl Database {
             return Ok(());
         }
 
-        let coordination_path =
-            storage::wal::coordination_path_for_wal_path(&format!("{path}-wal"));
+        // The coordination file is derived from the WAL path, so probe the
+        // configured WAL (not a hard-coded `{path}-wal`) or a custom-WAL open
+        // would check the wrong coordination file and miss a live authority.
+        let wal_path = wal_path
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{path}-wal"));
+        let coordination_path = storage::wal::coordination_path_for_wal_path(&wal_path);
         let Some(authority) =
             MappedSharedWalCoordination::open_existing(io, Path::new(&coordination_path), 64)?
         else {
@@ -1009,6 +1015,7 @@ impl Database {
     fn reject_live_multiprocess_wal_for_legacy_open(
         _io: &Arc<dyn IO>,
         _path: &str,
+        _wal_path: Option<&str>,
         _opts: DatabaseOpts,
     ) -> Result<()> {
         Ok(())
@@ -1112,39 +1119,44 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         dialect: Arc<dyn Dialect>,
     ) -> Result<Arc<Database>> {
-        Self::open_file_with_flags_and_durable_storage(
+        Self::open(
             io,
             path,
-            flags,
-            opts,
-            encryption_opts,
-            None,
-            dialect,
+            OpenOptions::new(dialect)
+                .flags(flags)
+                .db_opts(opts)
+                .encryption(encryption_opts),
         )
     }
 
+    /// Resolve `OpenOptions::storage` for a file-backed open when the caller
+    /// did not supply pre-opened storage: optionally consult the registry, run
+    /// the legacy/multiprocess WAL probes, open the file, and fill in
+    /// `options.storage` and the effective flags in place. Returns `Some(db)`
+    /// when a registry hit short-circuits the open (only possible when
+    /// `use_registry` is set).
     #[cfg(feature = "fs")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_file_with_flags_and_durable_storage(
-        io: Arc<dyn IO>,
+    fn resolve_default_storage(
+        io: &Arc<dyn IO>,
         path: &str,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<Arc<Database>> {
+        options: &mut OpenOptions,
+        use_registry: bool,
+    ) -> Result<Option<Arc<Database>>> {
         // Check the registry before opening the file to avoid acquiring a file
         // lock that would conflict with an already-open Database in this process.
-        if let Some(db) = Self::lookup_in_registry(path, &encryption_opts, dialect.as_ref())? {
-            if durable_storage.is_some() && db.durable_storage.is_none() {
-                return Err(LimboError::InvalidArgument(
-                    "database already open without custom durable storage; \
-                     close the existing instance before reopening with a custom DurableStorage"
-                        .to_string(),
-                ));
+        if use_registry {
+            if let Some(db) =
+                Self::lookup_in_registry(path, &options.encryption, options.dialect.as_ref())?
+            {
+                if options.durable_storage.is_some() && db.durable_storage.is_none() {
+                    return Err(LimboError::InvalidArgument(
+                        "database already open without custom durable storage; \
+                         close the existing instance before reopening with a custom DurableStorage"
+                            .to_string(),
+                    ));
+                }
+                return Ok(Some(db));
             }
-            return Ok(db);
         }
         // Mixed legacy/multiprocess opens are incompatible, but the two modes
         // advertise themselves through different lock domains (`.tshm` vs DB
@@ -1152,33 +1164,79 @@ impl Database {
         // open to narrow the TOCTOU window:
         //
         // 1. legacy open rejects an already-live multiprocess authority
-        Self::reject_live_multiprocess_wal_for_legacy_open(&io, path, opts)?;
-        let effective_flags = Self::effective_open_flags_for_path(&io, path, flags, opts)?;
+        Self::reject_live_multiprocess_wal_for_legacy_open(
+            io,
+            path,
+            options.wal_path.as_deref(),
+            options.db_opts,
+        )?;
+        let effective_flags =
+            Self::effective_open_flags_for_path(io, path, options.flags, options.db_opts)?;
 
         // 2. multiprocess open rejects an already-live legacy DB-file lock
-        Self::reject_live_legacy_wal_for_multiprocess_open(&io, path, flags, opts)?;
+        Self::reject_live_legacy_wal_for_multiprocess_open(
+            io,
+            path,
+            options.flags,
+            options.db_opts,
+        )?;
         let file = io.open_file(path, effective_flags, true)?;
 
         // 3. legacy open re-checks after `open_file()` in case a multiprocess
         //    authority appeared between the initial probe and the actual open
-        Self::reject_live_multiprocess_wal_for_legacy_open(&io, path, opts)?;
-        let db_file = Arc::new(DatabaseFile::new(file));
-        Self::open(
+        Self::reject_live_multiprocess_wal_for_legacy_open(
             io,
             path,
-            OpenOptions::new(dialect)
-                .storage(db_file)
-                .flags(effective_flags)
-                .db_opts(opts)
-                .encryption(encryption_opts)
-                .durable_storage(durable_storage),
-        )
+            options.wal_path.as_deref(),
+            options.db_opts,
+        )?;
+        options.flags = effective_flags;
+        options.storage = Some(Arc::new(DatabaseFile::new(file)));
+        Ok(None)
+    }
+
+    #[cfg(not(feature = "fs"))]
+    fn resolve_default_storage(
+        _io: &Arc<dyn IO>,
+        _path: &str,
+        _options: &mut OpenOptions,
+        _use_registry: bool,
+    ) -> Result<Option<Arc<Database>>> {
+        Err(LimboError::InvalidArgument(
+            "OpenOptions::storage is required to open a database without the `fs` feature"
+                .to_string(),
+        ))
+    }
+
+    /// The registry-aware entry points reject a custom WAL path: the
+    /// process-wide registry keys on the default WAL, so an instance reading a
+    /// nonstandard WAL must go through [`Database::do_open`]/
+    /// [`Database::do_open_async`] instead.
+    fn reject_wal_path_for_registry_open(options: &OpenOptions) -> Result<()> {
+        if options.wal_path.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "OpenOptions::wal_path is only supported by Database::do_open/do_open_async, \
+                 which skip the process-wide registry; the registry keys on the default WAL path"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Open a database with the given [`OpenOptions`].
     ///
-    /// Drives the IO loop internally. `OpenOptions::storage` must be set.
-    pub fn open(io: Arc<dyn IO>, path: &str, options: OpenOptions) -> Result<Arc<Database>> {
+    /// Drives the IO loop internally. When `OpenOptions::storage` is unset,
+    /// opens the file at `path` (consulting the process-wide registry first).
+    pub fn open(io: Arc<dyn IO>, path: &str, mut options: OpenOptions) -> Result<Arc<Database>> {
+        // Reject before resolving default storage: a registry hit there would
+        // otherwise return the cached default-WAL instance and silently ignore
+        // the custom wal_path before open_async runs its own check.
+        Self::reject_wal_path_for_registry_open(&options)?;
+        if options.storage.is_none() {
+            if let Some(db) = Self::resolve_default_storage(&io, path, &mut options, true)? {
+                return Ok(db);
+            }
+        }
         let mut state = OpenDbAsyncState::new();
         loop {
             match Self::open_async(&mut state, io.clone(), path, &options)? {
@@ -1211,13 +1269,7 @@ impl Database {
         path: &str,
         options: &OpenOptions,
     ) -> Result<IOResult<Arc<Database>>> {
-        if options.wal_path.is_some() {
-            return Err(LimboError::InvalidArgument(
-                "OpenOptions::wal_path is only supported by Database::do_open/do_open_async, \
-                 which skip the process-wide registry; the registry keys on the default WAL path"
-                    .to_string(),
-            ));
-        }
+        Self::reject_wal_path_for_registry_open(options)?;
         let Some(storage) = options.storage.clone() else {
             return Err(LimboError::InvalidArgument(
                 "OpenOptions::storage is required for Database::open_async".to_string(),
@@ -1322,7 +1374,12 @@ impl Database {
     /// Database instance for one file (e.g. reading through a copied WAL);
     /// production code uses the registry-aware [`Database::open`].
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
-    pub fn do_open(io: Arc<dyn IO>, path: &str, options: OpenOptions) -> Result<Arc<Database>> {
+    pub fn do_open(io: Arc<dyn IO>, path: &str, mut options: OpenOptions) -> Result<Arc<Database>> {
+        if options.storage.is_none() {
+            // `use_registry = false`: the raw path never consults the registry,
+            // so this only opens the file and never returns a cached Database.
+            Self::resolve_default_storage(&io, path, &mut options, false)?;
+        }
         let mut state = OpenDbAsyncState::new();
         loop {
             match Self::do_open_async(&mut state, io.clone(), path, &options)? {

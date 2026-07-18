@@ -166,8 +166,8 @@ fn test_sdk_close_finalizes_leaked_statements() {
     );
 }
 
-/// Database::open with OpenOptions: opening through the unified entry point
-/// works with pre-opened storage, and storage is required.
+/// Database::open with OpenOptions: works with pre-opened storage, and — when
+/// no storage is supplied — resolves the default file storage at `path`.
 #[test]
 fn test_database_open_with_options() {
     let tmp_dir = tempfile::TempDir::new().unwrap();
@@ -190,12 +190,38 @@ fn test_database_open_with_options() {
     conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
-    let err = Database::open(
+    // With no storage supplied, open resolves the default file storage at
+    // `path` and returns the same registered instance.
+    let db_default = Database::open(
         io,
         path,
-        turso_core::OpenOptions::new(Arc::new(SqliteDialect)),
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect)).flags(OpenFlags::Create),
     )
-    .expect_err("open without storage must fail until default storage resolution exists");
+    .unwrap();
+    assert!(
+        Arc::ptr_eq(&db, &db_default),
+        "open without storage must resolve default storage and hit the registered instance"
+    );
+}
+
+/// Database::open_async still requires storage: default-storage resolution is
+/// synchronous (registry lookup, file probes, file open) and only runs in the
+/// synchronous Database::open entry point.
+#[test]
+fn test_open_async_requires_storage() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("async-needs-storage.db");
+    let path = path.to_str().unwrap();
+
+    let io: Arc<dyn turso_core::IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
+    let mut state = turso_core::OpenDbAsyncState::new();
+    let err = Database::open_async(
+        &mut state,
+        io,
+        path,
+        &turso_core::OpenOptions::new(Arc::new(SqliteDialect)),
+    )
+    .expect_err("open_async without storage must fail");
     assert!(
         matches!(err, turso_core::LimboError::InvalidArgument(ref m) if m.contains("storage")),
         "expected InvalidArgument about missing storage, got {err:?}"
@@ -216,7 +242,7 @@ fn test_open_rejects_wal_path() {
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
 
     let err = Database::open(
-        io,
+        io.clone(),
         path,
         turso_core::OpenOptions::new(Arc::new(SqliteDialect))
             .storage(db_file)
@@ -227,6 +253,28 @@ fn test_open_rejects_wal_path() {
     assert!(
         matches!(err, turso_core::LimboError::InvalidArgument(ref m) if m.contains("wal_path")),
         "expected InvalidArgument about wal_path, got {err:?}"
+    );
+
+    // Register a canonical instance, then repeat with no pre-opened storage:
+    // the rejection must fire before default-storage resolution, so a registry
+    // hit cannot silently return the cached default-WAL instance.
+    let _registered = Database::open(
+        io.clone(),
+        path,
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect)).flags(OpenFlags::Create),
+    )
+    .unwrap();
+    let err = Database::open(
+        io,
+        path,
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .flags(OpenFlags::Create)
+            .wal_path(format!("{path}-wal-override")),
+    )
+    .expect_err("Database::open must reject a custom wal_path even with a registry hit");
+    assert!(
+        matches!(err, turso_core::LimboError::InvalidArgument(ref m) if m.contains("wal_path")),
+        "expected InvalidArgument about wal_path on the registry-hit path, got {err:?}"
     );
 }
 

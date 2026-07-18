@@ -17933,14 +17933,11 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
         None,
     ));
     let busy_storage = BusyOnLogTxStorage::new(inner_storage);
-    let db = Database::open_file_with_flags_and_durable_storage(
+    let db = Database::open(
         io,
         &path_str,
-        OpenFlags::default(),
-        DatabaseOpts::new(),
-        None,
-        Some(busy_storage.clone() as Arc<dyn DurableStorage>),
-        Arc::new(SqliteDialect),
+        crate::OpenOptions::new(Arc::new(SqliteDialect))
+            .durable_storage(busy_storage.clone() as Arc<dyn DurableStorage>),
     )
     .unwrap();
 
