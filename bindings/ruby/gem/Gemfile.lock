@@ -1,0 +1,43 @@
+PATH
+  remote: .
+  specs:
+    turso (0.1.0)
+      rb_sys (~> 0.9)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    drb (2.2.3)
+    minitest (6.0.6)
+      drb (~> 2.0)
+      prism (~> 1.5)
+    prism (1.9.0)
+    rake (13.4.2)
+    rake-compiler (1.3.1)
+      rake
+    rake-compiler-dock (1.12.0)
+    rb_sys (0.9.128)
+      rake-compiler-dock (= 1.12.0)
+
+PLATFORMS
+  ruby
+  x86_64-linux
+
+DEPENDENCIES
+  minitest
+  rake-compiler
+  turso!
+
+CHECKSUMS
+  bundler (4.0.15) sha256=a4ceb882fe94a0e0ac63cd0813932bbfd631a14e5ac0b7975189b19a4d28d9e7
+  drb (2.2.3) sha256=0b00d6fdb50995fe4a45dea13663493c841112e4068656854646f418fda13373
+  minitest (6.0.6) sha256=153ea36d1d987a62942382b61075745042a2b3123b1cd48f4c3675af9cc7d6f1
+  prism (1.9.0) sha256=7b530c6a9f92c24300014919c9dcbc055bf4cdf51ec30aed099b06cd6674ef85
+  rake (13.4.2) sha256=cb825b2bd5f1f8e91ca37bddb4b9aaf345551b4731da62949be002fa89283701
+  rake-compiler (1.3.1) sha256=6b351612b6e2d73ddd5563ee799bb58685176e05363db6758504bd11573d670a
+  rake-compiler-dock (1.12.0) sha256=f13205c2738f3d2053afcd03491a9e4541b22a59a0bfc53fc8bc883bd8188023
+  rb_sys (0.9.128) sha256=9ab81f4d6d4e1895de18762232362d1264475aa7035756b50441e442130538fd
+  turso (0.1.0)
+
+BUNDLED WITH
+  4.0.15
