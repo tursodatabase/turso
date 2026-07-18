@@ -1296,6 +1296,9 @@ pub struct TursoStatement {
     stmts: StmtRegistry,
 }
 
+/// Pending VDBE completions together with the IO backend that must drive them.
+pub type PendingIo = (turso_core::types::IOCompletions, Arc<dyn IO>);
+
 impl Drop for TursoStatement {
     fn drop(&mut self) {
         self.stmts.lock().unwrap().remove(&self.stmt_id);
@@ -1452,9 +1455,7 @@ impl TursoStatement {
 
     /// Return pending VDBE completions and their IO backend without clearing
     /// them; the next statement step still owns completion error handling.
-    pub fn pending_io(
-        &self,
-    ) -> Result<Option<(turso_core::types::IOCompletions, Arc<dyn IO>)>, TursoError> {
+    pub fn pending_io(&self) -> Result<Option<PendingIo>, TursoError> {
         let handle = self.handle.lock().unwrap();
         let stmt = handle
             .as_ref()
