@@ -34,7 +34,7 @@ test.serial('execute() method queries data correctly', async t => {
 });
 
 test.serial('prepare() method creates statement', async t => {
-  const stmt = client.prepare('SELECT * FROM test_users WHERE name = ?');
+  const stmt = await client.prepare('SELECT * FROM test_users WHERE name = ?');
   
   const row = await stmt.get(['John Doe']);
   t.is(row[1], 'John Doe');
@@ -46,7 +46,7 @@ test.serial('prepare() method creates statement', async t => {
 });
 
 test.serial('Statement.run()', async t => {
-  const stmt = client.prepare('INSERT INTO test_users (name, email) VALUES (?, ?)');
+  const stmt = await client.prepare('INSERT INTO test_users (name, email) VALUES (?, ?)');
   const row = await stmt.run(['Jane Doe', 'jane@example.com']);
   t.is(row.lastInsertRowid, 2);
 });
@@ -56,7 +56,7 @@ test.serial('statement iterate() method works', async t => {
   await client.execute('CREATE TABLE IF NOT EXISTS test_users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)');
   await client.execute('INSERT OR IGNORE INTO test_users (name, email) VALUES (?, ?)', ['John Doe', 'john@example.com']);
   
-  const stmt = client.prepare('SELECT * FROM test_users');
+  const stmt = await client.prepare('SELECT * FROM test_users');
   
   const rows = [];
   for await (const row of stmt.iterate()) {
