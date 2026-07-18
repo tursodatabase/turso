@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "turso_ruby"
 version = "0.1.0"
@@ -5,8 +7,9 @@ edition = "2021"
 
 [lib]
 crate-type = ["cdylib"]
+path = "../../../src/lib.rs"
 
 [dependencies]
 magnus = { version = "0.8", features = ["rb-sys"] }
-turso_sdk_kit = { path = "../../../../sdk-kit" }
-turso_core = { path = "../../../../core" }
+turso_sdk_kit = { path = "../../../../../sdk-kit" }
+turso_core = { path = "../../../../../core" }

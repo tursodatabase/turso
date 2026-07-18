@@ -14,4 +14,23 @@ Rake::TestTask.new do |t|
   t.test_files = FileList["test/test_*.rb"]
 end
 
+desc "Build native extension and install gem for development"
+task :dev_install do
+  Rake::Task[:compile].invoke
+
+  require "rubygems/package"
+
+  spec = Gem::Specification.load("turso.gemspec")
+  orig_extensions = spec.extensions.dup
+  spec.extensions = []
+
+  pkg_dir = File.expand_path("pkg", __dir__)
+  mkdir_p pkg_dir unless Dir.exist?(pkg_dir)
+
+  path = Gem::Package.build(spec)
+  FileUtils.mv(path, File.join(pkg_dir, File.basename(path)))
+
+  system("gem install #{File.join(pkg_dir, File.basename(path))}")
+end
+
 task default: %i[compile test]
