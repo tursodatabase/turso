@@ -1,0 +1,16 @@
+# frozen_string_literal: true
+
+require "rake/testtask"
+require "rake/extensiontask"
+
+Rake::ExtensionTask.new("turso_ruby") do |ext|
+  ext.ext_dir = "ext/turso_ruby"
+  ext.lib_dir = "lib/turso"
+end
+
+Rake::TestTask.new do |t|
+  t.libs << "lib"
+  t.test_files = FileList["test/test_*.rb"]
+end
+
+task default: %i[compile test]
