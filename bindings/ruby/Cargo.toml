@@ -12,3 +12,6 @@ crate-type = ["cdylib"]
 magnus = { version = "0.8", features = ["rb-sys"] }
 turso_sdk_kit = { workspace = true, features = ["fts"] }
 turso_core = { workspace = true }
+
+[dev-dependencies]
+turso_sdk_kit = { workspace = true, features = ["fts"] }
