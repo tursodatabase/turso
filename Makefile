@@ -59,8 +59,12 @@ uv-sync-test:
 	uv sync --all-extras --dev --package turso_test
 .PHONE: uv-sync
 
-test: build uv-sync-test test-compat test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-runner test-runner-js test-runner-cli
+test: build uv-sync-test test-compat test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-runner test-runner-js test-runner-cli test-format
 .PHONY: test
+
+test-format: build
+	cd testing/sqlite3-format && ./all
+.PHONY: test-format
 
 test-runner:
 	@make -C sqlite/conformance run
