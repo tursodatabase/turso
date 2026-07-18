@@ -1,6 +1,7 @@
 mod connection;
 mod database;
 mod error;
+mod gvl;
 mod statement;
 mod value;
 
