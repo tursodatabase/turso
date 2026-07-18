@@ -1,4 +1,5 @@
 mod error;
+mod value;
 
 use error::ErrorClasses;
 use magnus::{define_module, function, prelude::*, Error, Ruby};
