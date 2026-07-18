@@ -863,10 +863,9 @@ impl Statement {
                 to_js_value(env, value, safe_integers)?
             }
             PresentationMode::Expanded => {
-                let mut row = Object::new(env)?;
+                let row = Object::new(env)?;
                 let raw_row = row.raw();
                 let raw_env = env.raw();
-                let mut positional_properties = Vec::with_capacity(row_data.len());
                 for idx in 0..row_data.len() {
                     let value = row_data.get_value(idx);
                     let column_name = &self.column_names[idx];
@@ -879,16 +878,7 @@ impl Statement {
                             js_value.raw(),
                         )
                     })?;
-                    positional_properties.push(
-                        Property::new()
-                            .with_utf8_name(&idx.to_string())?
-                            .with_value(&js_value)
-                            .with_property_attributes(
-                                PropertyAttributes::Writable | PropertyAttributes::Configurable,
-                            ),
-                    );
                 }
-                row.define_properties(&positional_properties)?;
                 row.to_unknown()
             }
         };
