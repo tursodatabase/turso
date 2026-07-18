@@ -7,6 +7,7 @@ members = [
     "bindings/javascript",
     "bindings/javascript/sync",
     "bindings/python",
+    "bindings/ruby",
     "bindings/rust",
     "cli",
     "core",
@@ -56,6 +57,7 @@ default-members = [
     "bindings/javascript",
     "bindings/javascript/sync",
     "bindings/python",
+    "bindings/ruby",
     "bindings/rust",
     "cli",
     "core",
@@ -101,6 +103,7 @@ repository = "https://github.com/tursodatabase/turso"
 [workspace.dependencies]
 turso = { path = "bindings/rust", version = "0.7.0" }
 turso_node = { path = "bindings/javascript", version = "0.7.0" }
+turso_ruby = { path = "bindings/ruby" }
 turso_sdk_kit = { path = "sdk-kit", version = "0.7.0" }
 turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.7.0" }
 turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.7.0" }
