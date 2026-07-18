@@ -16,6 +16,7 @@ struct DatabaseInner {
     _db: Arc<TursoDatabase>,
     conn: Arc<TursoConnection>,
     path: String,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl DataTypeFunctions for Database {
@@ -75,6 +76,7 @@ impl Database {
             _db: db,
             conn,
             path,
+            closed: std::sync::atomic::AtomicBool::new(false),
         };
         Ok(ruby.obj_wrap(Self {
             inner: Arc::new(inner),
@@ -87,6 +89,7 @@ impl Database {
             .conn
             .close()
             .map_err(|e| from_turso_error(e, classes))?;
+        self.inner.closed.store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -95,7 +98,7 @@ impl Database {
     }
 
     pub fn is_open(&self) -> bool {
-        true
+        !self.inner.closed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
