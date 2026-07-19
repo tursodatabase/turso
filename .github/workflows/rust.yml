@@ -114,7 +114,7 @@ jobs:
           echo "::group::Coverage Summary"
           cargo llvm-cov report | tee coverage/summary.txt
           echo "::endgroup::"
-        timeout-minutes: 20
+        timeout-minutes: 30
       - name: Test (nextest)
         if: runner.os != 'Linux'
         env:
