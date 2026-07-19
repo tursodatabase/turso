@@ -77,6 +77,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     statement_class.define_method("parameter_count", method!(Statement::parameter_count, 0))?;
     statement_class.define_method("column_count", method!(Statement::column_count, 0))?;
     statement_class.define_method("column_name", method!(Statement::column_name, 1))?;
+    statement_class.define_method("column_decltype", method!(Statement::column_decltype, 1))?;
     statement_class.define_method("bind_positional", method!(Statement::bind_positional, 1))?;
     statement_class.define_method("step", method!(Statement::step, 0))?;
     statement_class.define_method("execute", method!(Statement::execute, 0))?;

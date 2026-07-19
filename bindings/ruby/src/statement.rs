@@ -169,4 +169,10 @@ impl Statement {
         let guard = self.inner.borrow();
         guard.as_ref().map(|s| s.n_change()).unwrap_or(0)
     }
+
+    pub fn column_decltype(&self, index: u32) -> Result<Option<String>, Error> {
+        self.with_guard(|stmt| {
+            Ok(stmt.column_decltype(index as usize))
+        })
+    }
 }

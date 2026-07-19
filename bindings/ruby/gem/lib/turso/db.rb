@@ -72,5 +72,17 @@ module Turso
     def closed?
       !@database.open?
     end
+
+    def busy_timeout=(ms)
+      @database.connection.busy_timeout = ms
+    end
+
+    def query_timeout=(ms)
+      @database.connection.query_timeout = ms
+    end
+
+    def interrupt
+      @database.connection.interrupt
+    end
   end
 end
