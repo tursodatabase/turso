@@ -1067,7 +1067,8 @@ mod tests {
             } else {
                 let port: u16 = rand::rng().random_range(10_000..=65_535);
                 let server_bin = env::var("LOCAL_SYNC_SERVER").unwrap();
-                let temp_dir = TempDir::new().context("failed to create local sync server db dir")?;
+                let temp_dir =
+                    TempDir::new().context("failed to create local sync server db dir")?;
                 let db_path = temp_dir.path().join("remote.db");
                 let db_path_arg = db_path.to_string_lossy().into_owned();
                 let address = format!("0.0.0.0:{port}");
