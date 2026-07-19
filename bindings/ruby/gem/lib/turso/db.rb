@@ -3,7 +3,8 @@
 module Turso
   class DB
     def initialize(path, **opts)
-      @database = Database.new(path, opts)
+      opts[:experimental_features] = normalize_experimental_features(opts[:experimental_features])
+      @database = Database.new(path, opts.transform_keys(&:to_s))
     end
 
     def execute(sql, params = [])
@@ -23,6 +24,10 @@ module Turso
       stmt = @database.connection.prepare(sql)
       stmt.bind_positional(params) unless params.empty?
       ResultSet.new(stmt)
+    end
+
+    def prepare(sql)
+      @database.connection.prepare(sql)
     end
 
     VALID_TRANSACTION_MODES = %i[deferred immediate exclusive concurrent].freeze
@@ -83,6 +88,14 @@ module Turso
 
     def interrupt
       @database.connection.interrupt
+    end
+
+    private
+
+    def normalize_experimental_features(features)
+      return nil if features.nil? || features.empty?
+
+      Array(features).join(",")
     end
   end
 end
