@@ -475,8 +475,20 @@ jobs:
           cache-on-failure: true
       - name: Run Windows concurrent simulator multiprocess regressions
         run: cargo test -q -p turso_whopper --test regression_tests
+      - name: Reclaim Windows runner disk space
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem
+          if (Get-Command docker -ErrorAction SilentlyContinue) {
+            docker system prune --all --force
+          }
+          Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) -Force -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Get-PSDrive -PSProvider FileSystem
       - name: Run Windows concurrent simulator cross-platform regression
-        run: cargo test -q -p turso_whopper --test regression_tests_cross_platform
+        # Each test preallocates 8 GiB backing files. Run serially to stay below
+        # the Windows runner's per-job allocation limit.
+        run: cargo test -q -p turso_whopper --test regression_tests_cross_platform -- --test-threads=1
       - name: Run Windows CLI multiprocess VFS regression
         run: cargo test -q -p turso_cli input::tests::experimental_win_iocp_backend_is_available_for_path_databases -- --exact
       - name: Run Windows core multiprocess regressions

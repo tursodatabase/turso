@@ -67,6 +67,9 @@ struct Args {
     /// Enable database encryption
     #[arg(long)]
     enable_encryption: bool,
+    /// Enable the external page codec simulation (in-process mode only)
+    #[arg(long)]
+    enable_page_codec: bool,
     /// Enable Elle consistency checking with specified model (uses only Elle workloads)
     #[arg(long, value_enum)]
     elle: Option<ElleModel>,
@@ -150,6 +153,11 @@ fn main() -> anyhow::Result<()> {
     if args.enable_experimental_mvcc_passive_checkpoint && !args.enable_mvcc {
         return Err(anyhow::anyhow!(
             "--enable-experimental-mvcc-passive-checkpoint requires --enable-mvcc"
+        ));
+    }
+    if args.multiprocess && args.enable_page_codec {
+        return Err(anyhow::anyhow!(
+            "--enable-page-codec is only supported in in-process simulator mode"
         ));
     }
 
@@ -508,6 +516,7 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_enable_mvcc(args.enable_mvcc || is_schema_clone_fault_mode(&args.mode))
         .with_experimental_mvcc_passive_checkpoint(args.enable_experimental_mvcc_passive_checkpoint)
         .with_enable_encryption(args.enable_encryption)
+        .with_enable_page_codec(args.enable_page_codec)
         .with_elle_tables(elle_tables)
         .with_workloads(workloads)
         .with_properties(properties)

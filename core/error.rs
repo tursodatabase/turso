@@ -185,6 +185,8 @@ pub enum CompletionError {
     Aborted,
     #[error("Decryption failed for page={page_idx}")]
     DecryptionError { page_idx: usize },
+    #[error("Page codec failed for page={page_idx}")]
+    PageCodecError { page_idx: usize },
     #[error("I/O error: partial write")]
     ShortWrite,
     #[error("I/O error: short read on page {page_idx}: expected {expected} bytes, got {actual}")]

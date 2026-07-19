@@ -27,7 +27,7 @@ use crate::{
     io::CompletionGroup, return_if_io, types::WalFrameInfo, Completion, Connection, IOResult,
     LimboError, Result, TransactionState,
 };
-use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, SyncMode, IO};
+use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, PageCodec, SyncMode, IO};
 #[allow(unused_imports)]
 use crate::{
     turso_assert, turso_assert_eq, turso_assert_greater_than, turso_assert_greater_than_or_equal,
@@ -2768,6 +2768,17 @@ impl Pager {
     /// Set the initial page size for the database. Should only be called before the database is initialized
     pub fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
         turso_assert!(!self.db_initialized());
+        let reserved_space = self
+            .get_reserved_space()
+            .unwrap_or_else(|| self.io_ctx.read().get_reserved_space_bytes());
+        if !size.has_valid_reserved_space(reserved_space) {
+            return Err(LimboError::InvalidArgument(format!(
+                "page size {} with reserved space {} leaves less than {} usable bytes",
+                size.get(),
+                reserved_space,
+                PageSize::MIN_USABLE_SPACE
+            )));
+        }
         let IOResult::Done(mut header) = self.with_header(|header| *header)? else {
             panic!("DB should not be initialized and should not do any IO");
         };
@@ -2845,7 +2856,7 @@ impl Pager {
     }
 
     /// Set the page size. Used internally when page size is determined.
-    pub fn set_page_size(&self, size: PageSize) {
+    pub(crate) fn set_page_size(&self, size: PageSize) {
         self.page_size.store(size.get(), Ordering::SeqCst);
     }
 
@@ -2860,7 +2871,7 @@ impl Pager {
     }
 
     /// Set the reserved space. Must fit in u8.
-    pub fn set_reserved_space(&self, space: u8) {
+    fn set_reserved_space(&self, space: u8) {
         self.reserved_space.store(space as u16, Ordering::SeqCst);
     }
 
@@ -3682,6 +3693,12 @@ impl Pager {
         completion: Completion,
     ) -> Result<CacheFlushStep> {
         if !completion.succeeded() {
+            if completion.finished() {
+                let err = completion
+                    .get_error()
+                    .expect("finished unsuccessful cacheflush read must have an error");
+                return Err(err.into());
+            }
             return Ok(CacheFlushStep::Yield(
                 CacheFlushState::WaitingForRead {
                     state,
@@ -4535,7 +4552,9 @@ impl Pager {
                 clear_page_cache,
                 read: PendingCheckpointDbIdentityRead {
                     max_frame: result.wal_total_backfilled,
-                    header_buf: Arc::new(Buffer::new_temporary(PageSize::MIN as usize)),
+                    header_buf: Arc::new(Buffer::new_temporary(
+                        self.get_page_size_unchecked().get() as usize,
+                    )),
                     bytes_read: Arc::new(AtomicUsize::new(usize::MAX)),
                     read_sent: false,
                 },
@@ -4766,14 +4785,19 @@ impl Pager {
                     if !read.read_sent {
                         let header_buf = read.header_buf.clone();
                         let bytes_read = read.bytes_read.clone();
-                        let c = self.db_file.read_header(Completion::new_read(header_buf, {
-                            Box::new(move |res| {
-                                if let Ok((_buf, count)) = res {
-                                    bytes_read.store(count as usize, Ordering::Release);
-                                }
-                                None
-                            })
-                        }))?;
+                        let io_ctx = self.io_ctx.read();
+                        let c = self.db_file.read_page(
+                            1,
+                            &io_ctx,
+                            Completion::new_read(header_buf, {
+                                Box::new(move |res| {
+                                    if let Ok((_buf, count)) = res {
+                                        bytes_read.store(count as usize, Ordering::Release);
+                                    }
+                                    None
+                                })
+                            }),
+                        )?;
                         read.read_sent = true;
                         self.checkpoint_state.write().phase = CheckpointPhase::ReadDbIdentity {
                             clear_page_cache,
@@ -5641,8 +5665,28 @@ impl Pager {
         Ok(IOResult::Done(result))
     }
 
+    pub fn has_encryption(&self) -> bool {
+        self.io_ctx.read().has_encryption()
+    }
+
+    pub fn encryption_reserved_space(&self) -> Option<u8> {
+        self.io_ctx
+            .read()
+            .encryption_context()
+            .map(EncryptionContext::required_reserved_bytes)
+    }
+
+    #[deprecated(note = "renamed to has_encryption")]
     pub fn is_encryption_ctx_set(&self) -> bool {
-        self.io_ctx.read().encryption_context().is_some()
+        self.has_encryption()
+    }
+
+    pub fn has_page_codec(&self) -> bool {
+        self.io_ctx.read().has_page_codec()
+    }
+
+    pub fn page_codec(&self) -> Option<Arc<dyn PageCodec>> {
+        self.io_ctx.read().page_codec()
     }
 
     pub fn is_encryption_enabled(&self) -> bool {
@@ -5658,6 +5702,12 @@ impl Pager {
         if !self.enable_encryption.load(Ordering::SeqCst) {
             return Err(LimboError::InvalidArgument(
                 "encryption is an opt in feature. enable it via passing `--experimental-encryption`"
+                    .into(),
+            ));
+        }
+        if self.has_page_codec() {
+            return Err(LimboError::InvalidArgument(
+                "cannot configure built-in encryption while an external page codec is installed"
                     .into(),
             ));
         }
@@ -5682,6 +5732,46 @@ impl Pager {
         Ok(())
     }
 
+    pub(crate) fn set_page_codec(&self, codec: Arc<dyn PageCodec>) -> Result<()> {
+        if self.has_encryption() {
+            return Err(LimboError::InvalidArgument(
+                "cannot install an external page codec while built-in encryption is configured"
+                    .into(),
+            ));
+        }
+        let required_reserved_space = codec.required_reserved_bytes();
+        if let Some(reserved_space) = self.get_reserved_space() {
+            if reserved_space != required_reserved_space {
+                return Err(LimboError::InvalidArgument(format!(
+                    "page codec requires exactly {required_reserved_space} reserved bytes, but database provides {reserved_space}"
+                )));
+            }
+        } else {
+            if let Some(page_size) = self.get_page_size() {
+                if !page_size.has_valid_reserved_space(required_reserved_space) {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "page codec requires {} reserved bytes, which leaves less than {} usable bytes for page size {}",
+                        required_reserved_space,
+                        PageSize::MIN_USABLE_SPACE,
+                        page_size.get()
+                    )));
+                }
+            }
+            self.set_reserved_space(required_reserved_space);
+        }
+        {
+            let mut io_ctx = self.io_ctx.write();
+            io_ctx.set_page_codec(codec);
+        }
+        if let Some(wal) = self.wal.as_ref() {
+            let io_ctx = self.io_ctx.read().clone();
+            wal.set_io_context(io_ctx);
+        }
+        self.clear_page_cache(false);
+        self.set_schema_cookie(None);
+        Ok(())
+    }
+
     pub fn reset_checksum_context(&self) {
         {
             let mut io_ctx = self.io_ctx.write();
@@ -5691,7 +5781,7 @@ impl Pager {
         wal.set_io_context(self.io_ctx.read().clone())
     }
 
-    pub fn set_reserved_space_bytes(&self, value: u8) {
+    pub(crate) fn set_reserved_space_bytes(&self, value: u8) {
         self.set_reserved_space(value);
     }
 
@@ -5965,7 +6055,8 @@ mod tests {
     use crate::util::IOExt;
     use arc_swap::ArcSwapOption;
 
-    use super::{default_page1, Page, PageRef, Pager};
+    use super::{default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager};
+    use crate::{Buffer, Completion, CompletionError, LimboError};
 
     fn pager_with_cache_capacity(cache_capacity: usize, database_pages: u32) -> Arc<Pager> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -6074,6 +6165,32 @@ mod tests {
             pager.page_cache.read().len() > CAP,
             "page must have been admitted over capacity"
         );
+    }
+
+    #[test]
+    fn cacheflush_propagates_failed_page_codec_reread() {
+        let pager = pager_with_cache_capacity(5, 2);
+        let page = Arc::new(Page::new(2));
+        page.set_loaded();
+        let completion =
+            Completion::new_read(Arc::new(Buffer::new_temporary(4096)), Box::new(|_| None));
+        completion.error(CompletionError::PageCodecError { page_idx: 2 });
+        *pager.cacheflush_state.write() = CacheFlushState::WaitingForRead {
+            state: CollectingState::default(),
+            page_id: 2,
+            page,
+            completion,
+        };
+
+        let err = pager.cacheflush().unwrap_err();
+        assert!(matches!(
+            err,
+            LimboError::CompletionError(CompletionError::PageCodecError { page_idx: 2 })
+        ));
+        assert!(matches!(
+            *pager.cacheflush_state.read(),
+            CacheFlushState::Init
+        ));
     }
 
     #[test]
@@ -6504,7 +6621,9 @@ mod ptrmap_tests {
 #[cfg(all(test, feature = "fs", host_shared_wal))]
 mod checkpoint_phase_tests {
     use super::*;
-    use crate::io::{PlatformIO, IO};
+    #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+    use crate::io::PlatformIO;
+    use crate::io::IO;
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::storage::wal::CheckpointMode;
     use crate::sync::atomic::Ordering;
