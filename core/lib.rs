@@ -873,20 +873,17 @@ impl Database {
         Ok(db)
     }
 
+    /// Deprecated convenience shim: prefer [`Database::open`] with
+    /// [`OpenOptions`]. Equivalent to
+    /// `Database::open(io, path, OpenOptions::new(dialect))`. Kept for existing
+    /// callers; new code should not use it.
     #[cfg(feature = "fs")]
     pub fn open_file(
         io: Arc<dyn IO>,
         path: &str,
         dialect: Arc<dyn Dialect>,
     ) -> Result<Arc<Database>> {
-        Self::open_file_with_flags(
-            io,
-            path,
-            OpenFlags::default(),
-            DatabaseOpts::new(),
-            None,
-            dialect,
-        )
+        Self::open(io, path, OpenOptions::new(dialect))
     }
 
     /// Open or retrieve a shared named in-memory database.
@@ -1110,6 +1107,10 @@ impl Database {
         Ok(Some(db))
     }
 
+    /// Deprecated convenience shim: prefer [`Database::open`] with
+    /// [`OpenOptions`]. Equivalent to `Database::open(io, path,
+    /// OpenOptions::new(dialect).flags(flags).db_opts(opts).encryption(enc))`.
+    /// Kept for existing callers; new code should not use it.
     #[cfg(feature = "fs")]
     pub fn open_file_with_flags(
         io: Arc<dyn IO>,
