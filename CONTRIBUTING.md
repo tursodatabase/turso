@@ -305,7 +305,7 @@ When working on a new feature, please consider adding a test case for it.
 
 ## SQL Test Runner
 
-The `test-runner` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
+The `sqltest` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
 Tests should be added to `sqlite/conformance/sqlite-sqltests/` using the `.sqltest` format.
 
 To run tests:
@@ -314,7 +314,7 @@ To run tests:
 make -C sqlite/conformance run
 ```
 
-For full documentation on the DSL syntax and CLI usage, see the [test-runner docs](testing/sqltests/docs/).
+For full documentation on the DSL syntax and CLI usage, see the [sqltest docs](testing/sqltest/docs/).
 
 ## TPC-H
 

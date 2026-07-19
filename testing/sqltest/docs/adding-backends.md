@@ -400,7 +400,7 @@ mod tests {
 Create test files and run with your backend:
 
 ```bash
-test-runner run sqlite/conformance/sqlite-sqltests/ --backend python --python /usr/bin/python3
+sqltest run sqlite/conformance/sqlite-sqltests/ --backend python --python /usr/bin/python3
 ```
 
 ## Checklist for New Backends

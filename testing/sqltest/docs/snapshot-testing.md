@@ -1,6 +1,6 @@
 # Snapshot Testing Guide
 
-This guide covers how to use snapshot testing in the test-runner to capture and validate SQL query execution plans.
+This guide covers how to use snapshot testing in the sqltest to capture and validate SQL query execution plans.
 
 ## Overview
 
@@ -36,17 +36,17 @@ snapshot my-query-plan {
 
 ```bash
 # First run creates .snap.new files for review
-make -C test-runner run-cli
+make -C sqlite/conformance run-cli
 
 # Or directly:
-cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/my-test.sqltest
+cargo run --bin sqltest -- run sqlite/conformance/sqlite-sqltests/my-test.sqltest
 ```
 
 ### 3. Accept the Snapshots
 
 ```bash
 # Review and accept all pending snapshots
-cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/ --snapshot-mode=always
+cargo run --bin sqltest -- run sqlite/conformance/sqlite-sqltests/ --snapshot-mode=always
 ```
 
 ### 4. Commit the Snapshot Files
@@ -160,25 +160,25 @@ Naming convention: `{test-file-stem}__{snapshot-name}.snap`
 
 ```bash
 # Default mode (auto)
-cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/
+cargo run --bin sqltest -- run sqlite/conformance/sqlite-sqltests/
 
 # Accept all snapshot changes
-cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/ --snapshot-mode=always
+cargo run --bin sqltest -- run sqlite/conformance/sqlite-sqltests/ --snapshot-mode=always
 
 # Review mode (create .snap.new files)
-cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/ --snapshot-mode=new
+cargo run --bin sqltest -- run sqlite/conformance/sqlite-sqltests/ --snapshot-mode=new
 
 # Read-only mode (CI)
-cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/ --snapshot-mode=no
+cargo run --bin sqltest -- run sqlite/conformance/sqlite-sqltests/ --snapshot-mode=no
 
 # Filter specific snapshots
-cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/ --snapshot-filter="query-plan*"
+cargo run --bin sqltest -- run sqlite/conformance/sqlite-sqltests/ --snapshot-filter="query-plan*"
 ```
 
 ### Check for Pending Snapshots
 
 ```bash
-cargo run --bin test-runner -- check sqlite/conformance/sqlite-sqltests/
+cargo run --bin sqltest -- check sqlite/conformance/sqlite-sqltests/
 ```
 
 This command:
@@ -190,13 +190,13 @@ This command:
 
 ```bash
 # Run all tests including snapshots
-make -C test-runner run-cli
+make -C sqlite/conformance run-cli
 
 # Run examples (includes snapshot examples)
-make -C test-runner run-examples
+make -C sqlite/conformance run-examples
 
 # Check syntax and pending snapshots
-make -C test-runner check
+make -C sqlite/conformance check
 ```
 
 ## CI Integration
@@ -207,11 +207,11 @@ make -C test-runner check
 # .github/workflows/test.yml
 - name: Run SQL tests
   run: |
-    cargo run --bin test-runner -- run sqlite/conformance/sqlite-sqltests/ --snapshot-mode=no
+    cargo run --bin sqltest -- run sqlite/conformance/sqlite-sqltests/ --snapshot-mode=no
 
 - name: Check for pending snapshots
   run: |
-    cargo run --bin test-runner -- check sqlite/conformance/sqlite-sqltests/
+    cargo run --bin sqltest -- check sqlite/conformance/sqlite-sqltests/
 ```
 
 The `check` command will fail if any `.snap.new` files exist, ensuring all snapshot changes are committed.
@@ -345,9 +345,9 @@ addr  opcode       p1  p2  p3  p4          p5  comment
 
 ## Differences from cargo-insta
 
-While the workflow is similar to [cargo-insta](https://insta.rs/), test-runner uses a custom snapshot implementation:
+While the workflow is similar to [cargo-insta](https://insta.rs/), sqltest uses a custom snapshot implementation:
 
-| Feature | test-runner | cargo-insta |
+| Feature | sqltest | cargo-insta |
 |---------|-------------------|-------------|
 | File format | YAML frontmatter + content | YAML frontmatter + content |
 | Review tool | Manual diff / `--snapshot-mode` | `cargo insta review` |
