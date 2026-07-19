@@ -21,8 +21,8 @@ use tracing_subscriber::{
 };
 use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, QueryMode,
-    Statement, StepResult, IO,
+    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions,
+    QueryMode, Statement, StepResult, IO,
 };
 
 use crate::{
@@ -791,16 +791,16 @@ impl TursoDatabase {
                     let opts = state.opts.expect("opts must be initialized in Init phase");
                     let open_flags = state.open_flags;
 
-                    match Database::open_with_flags_async(
+                    let options = OpenOptions::new(Arc::new(SqliteDialect))
+                        .storage(db_file)
+                        .flags(open_flags)
+                        .db_opts(opts)
+                        .encryption(self.config.encryption.clone());
+                    match Database::open_async(
                         &mut state.open_db_state,
                         io.clone(),
                         &self.config.path,
-                        db_file,
-                        open_flags,
-                        opts,
-                        self.config.encryption.clone(),
-                        None,
-                        Arc::new(SqliteDialect),
+                        &options,
                     )? {
                         IOResult::Done(db) => {
                             let mut inner_db = self.db.lock().unwrap();

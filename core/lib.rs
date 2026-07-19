@@ -349,6 +349,95 @@ impl EncryptionOpts {
     }
 }
 
+/// Options for opening a [`Database`].
+///
+/// Mirrors the `std::fs::OpenOptions` idiom: configure, then open.
+///
+/// ```ignore
+/// let db = Database::open(
+///     io,
+///     "app.db",
+///     OpenOptions::new(Arc::new(SqliteDialect)).flags(OpenFlags::ReadOnly),
+/// )?;
+/// ```
+#[derive(Clone)]
+pub struct OpenOptions {
+    /// Pre-opened database storage for the file at the database path.
+    storage: Option<Arc<dyn DatabaseStorage>>,
+    /// WAL file path override. Defaults to `"{path}-wal"`. Only honored by
+    /// [`Database::do_open`]/[`Database::do_open_async`]; the registry-aware
+    /// [`Database::open`]/[`Database::open_async`] reject it, because the
+    /// process-wide registry keys on the default WAL for a path.
+    wal_path: Option<String>,
+    flags: OpenFlags,
+    db_opts: DatabaseOpts,
+    encryption: Option<EncryptionOpts>,
+    durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+    allocator: alloc::DynAllocator,
+    /// SQL dialect the database is opened with. The dialect is fixed at open
+    /// time and shared by every user of the registered instance; a registry
+    /// hit with a different dialect is an error.
+    dialect: Arc<dyn Dialect>,
+}
+
+impl OpenOptions {
+    /// The dialect has no default: it is fixed at open time and shared by
+    /// every user of the instance, so the caller must choose it explicitly.
+    pub fn new(dialect: Arc<dyn Dialect>) -> Self {
+        Self {
+            storage: None,
+            wal_path: None,
+            flags: OpenFlags::default(),
+            db_opts: DatabaseOpts::default(),
+            encryption: None,
+            durable_storage: None,
+            allocator: alloc::DynAllocator::default(),
+            dialect,
+        }
+    }
+
+    pub fn storage(mut self, storage: Arc<dyn DatabaseStorage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// Override the WAL file path (defaults to `"{path}-wal"`). Only honored
+    /// by [`Database::do_open`]/[`Database::do_open_async`]; passing it to the
+    /// registry-aware entry points is an error.
+    pub fn wal_path(mut self, wal_path: impl Into<String>) -> Self {
+        self.wal_path = Some(wal_path.into());
+        self
+    }
+
+    pub fn flags(mut self, flags: OpenFlags) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    pub fn db_opts(mut self, db_opts: DatabaseOpts) -> Self {
+        self.db_opts = db_opts;
+        self
+    }
+
+    pub fn encryption(mut self, encryption: impl Into<Option<EncryptionOpts>>) -> Self {
+        self.encryption = encryption.into();
+        self
+    }
+
+    pub fn durable_storage(
+        mut self,
+        durable_storage: impl Into<Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>>,
+    ) -> Self {
+        self.durable_storage = durable_storage.into();
+        self
+    }
+
+    pub fn allocator(mut self, allocator: alloc::DynAllocator) -> Self {
+        self.allocator = allocator;
+        self
+    }
+}
+
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
 
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
@@ -784,20 +873,17 @@ impl Database {
         Ok(db)
     }
 
+    /// Deprecated convenience shim: prefer [`Database::open`] with
+    /// [`OpenOptions`]. Equivalent to
+    /// `Database::open(io, path, OpenOptions::new(dialect))`. Kept for existing
+    /// callers; new code should not use it.
     #[cfg(feature = "fs")]
     pub fn open_file(
         io: Arc<dyn IO>,
         path: &str,
         dialect: Arc<dyn Dialect>,
     ) -> Result<Arc<Database>> {
-        Self::open_file_with_flags(
-            io,
-            path,
-            OpenFlags::default(),
-            DatabaseOpts::new(),
-            None,
-            dialect,
-        )
+        Self::open(io, path, OpenOptions::new(dialect))
     }
 
     /// Open or retrieve a shared named in-memory database.
@@ -885,6 +971,7 @@ impl Database {
     fn reject_live_multiprocess_wal_for_legacy_open(
         io: &Arc<dyn IO>,
         path: &str,
+        wal_path: Option<&str>,
         opts: DatabaseOpts,
     ) -> Result<()> {
         if opts.enable_multiprocess_wal
@@ -895,8 +982,13 @@ impl Database {
             return Ok(());
         }
 
-        let coordination_path =
-            storage::wal::coordination_path_for_wal_path(&format!("{path}-wal"));
+        // The coordination file is derived from the WAL path, so probe the
+        // configured WAL (not a hard-coded `{path}-wal`) or a custom-WAL open
+        // would check the wrong coordination file and miss a live authority.
+        let wal_path = wal_path
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{path}-wal"));
+        let coordination_path = storage::wal::coordination_path_for_wal_path(&wal_path);
         let Some(authority) =
             MappedSharedWalCoordination::open_existing(io, Path::new(&coordination_path), 64)?
         else {
@@ -920,6 +1012,7 @@ impl Database {
     fn reject_live_multiprocess_wal_for_legacy_open(
         _io: &Arc<dyn IO>,
         _path: &str,
+        _wal_path: Option<&str>,
         _opts: DatabaseOpts,
     ) -> Result<()> {
         Ok(())
@@ -1014,6 +1107,10 @@ impl Database {
         Ok(Some(db))
     }
 
+    /// Deprecated convenience shim: prefer [`Database::open`] with
+    /// [`OpenOptions`]. Equivalent to `Database::open(io, path,
+    /// OpenOptions::new(dialect).flags(flags).db_opts(opts).encryption(enc))`.
+    /// Kept for existing callers; new code should not use it.
     #[cfg(feature = "fs")]
     pub fn open_file_with_flags(
         io: Arc<dyn IO>,
@@ -1023,39 +1120,44 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         dialect: Arc<dyn Dialect>,
     ) -> Result<Arc<Database>> {
-        Self::open_file_with_flags_and_durable_storage(
+        Self::open(
             io,
             path,
-            flags,
-            opts,
-            encryption_opts,
-            None,
-            dialect,
+            OpenOptions::new(dialect)
+                .flags(flags)
+                .db_opts(opts)
+                .encryption(encryption_opts),
         )
     }
 
+    /// Resolve `OpenOptions::storage` for a file-backed open when the caller
+    /// did not supply pre-opened storage: optionally consult the registry, run
+    /// the legacy/multiprocess WAL probes, open the file, and fill in
+    /// `options.storage` and the effective flags in place. Returns `Some(db)`
+    /// when a registry hit short-circuits the open (only possible when
+    /// `use_registry` is set).
     #[cfg(feature = "fs")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_file_with_flags_and_durable_storage(
-        io: Arc<dyn IO>,
+    fn resolve_default_storage(
+        io: &Arc<dyn IO>,
         path: &str,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<Arc<Database>> {
+        options: &mut OpenOptions,
+        use_registry: bool,
+    ) -> Result<Option<Arc<Database>>> {
         // Check the registry before opening the file to avoid acquiring a file
         // lock that would conflict with an already-open Database in this process.
-        if let Some(db) = Self::lookup_in_registry(path, &encryption_opts, dialect.as_ref())? {
-            if durable_storage.is_some() && db.durable_storage.is_none() {
-                return Err(LimboError::InvalidArgument(
-                    "database already open without custom durable storage; \
-                     close the existing instance before reopening with a custom DurableStorage"
-                        .to_string(),
-                ));
+        if use_registry {
+            if let Some(db) =
+                Self::lookup_in_registry(path, &options.encryption, options.dialect.as_ref())?
+            {
+                if options.durable_storage.is_some() && db.durable_storage.is_none() {
+                    return Err(LimboError::InvalidArgument(
+                        "database already open without custom durable storage; \
+                         close the existing instance before reopening with a custom DurableStorage"
+                            .to_string(),
+                    ));
+                }
+                return Ok(Some(db));
             }
-            return Ok(db);
         }
         // Mixed legacy/multiprocess opens are incompatible, but the two modes
         // advertise themselves through different lock domains (`.tshm` vs DB
@@ -1063,98 +1165,82 @@ impl Database {
         // open to narrow the TOCTOU window:
         //
         // 1. legacy open rejects an already-live multiprocess authority
-        Self::reject_live_multiprocess_wal_for_legacy_open(&io, path, opts)?;
-        let effective_flags = Self::effective_open_flags_for_path(&io, path, flags, opts)?;
+        Self::reject_live_multiprocess_wal_for_legacy_open(
+            io,
+            path,
+            options.wal_path.as_deref(),
+            options.db_opts,
+        )?;
+        let effective_flags =
+            Self::effective_open_flags_for_path(io, path, options.flags, options.db_opts)?;
 
         // 2. multiprocess open rejects an already-live legacy DB-file lock
-        Self::reject_live_legacy_wal_for_multiprocess_open(&io, path, flags, opts)?;
+        Self::reject_live_legacy_wal_for_multiprocess_open(
+            io,
+            path,
+            options.flags,
+            options.db_opts,
+        )?;
         let file = io.open_file(path, effective_flags, true)?;
 
         // 3. legacy open re-checks after `open_file()` in case a multiprocess
         //    authority appeared between the initial probe and the actual open
-        Self::reject_live_multiprocess_wal_for_legacy_open(&io, path, opts)?;
-        let db_file = Arc::new(DatabaseFile::new(file));
-        Self::open_with_flags_with_allocator(
+        Self::reject_live_multiprocess_wal_for_legacy_open(
             io,
             path,
-            db_file,
-            effective_flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            alloc::DynAllocator::default(),
-            dialect,
-        )
+            options.wal_path.as_deref(),
+            options.db_opts,
+        )?;
+        options.flags = effective_flags;
+        options.storage = Some(Arc::new(DatabaseFile::new(file)));
+        Ok(None)
     }
 
-    pub fn open(
-        io: Arc<dyn IO>,
-        path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<Arc<Database>> {
-        Self::open_with_flags(
-            io,
-            path,
-            db_file,
-            OpenFlags::default(),
-            DatabaseOpts::new(),
-            None,
-            None,
-            dialect,
-        )
+    #[cfg(not(feature = "fs"))]
+    fn resolve_default_storage(
+        _io: &Arc<dyn IO>,
+        _path: &str,
+        _options: &mut OpenOptions,
+        _use_registry: bool,
+    ) -> Result<Option<Arc<Database>>> {
+        Err(LimboError::InvalidArgument(
+            "OpenOptions::storage is required to open a database without the `fs` feature"
+                .to_string(),
+        ))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_with_flags(
-        io: Arc<dyn IO>,
-        path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<Arc<Database>> {
-        Self::open_with_flags_with_allocator(
-            io,
-            path,
-            db_file,
-            flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            alloc::DynAllocator::default(),
-            dialect,
-        )
+    /// The registry-aware entry points reject a custom WAL path: the
+    /// process-wide registry keys on the default WAL, so an instance reading a
+    /// nonstandard WAL must go through [`Database::do_open`]/
+    /// [`Database::do_open_async`] instead.
+    fn reject_wal_path_for_registry_open(options: &OpenOptions) -> Result<()> {
+        if options.wal_path.is_some() {
+            return Err(LimboError::InvalidArgument(
+                "OpenOptions::wal_path is only supported by Database::do_open/do_open_async, \
+                 which skip the process-wide registry; the registry keys on the default WAL path"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_with_flags_with_allocator(
-        io: Arc<dyn IO>,
-        path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        allocator: alloc::DynAllocator,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<Arc<Database>> {
+    /// Open a database with the given [`OpenOptions`].
+    ///
+    /// Drives the IO loop internally. When `OpenOptions::storage` is unset,
+    /// opens the file at `path` (consulting the process-wide registry first).
+    pub fn open(io: Arc<dyn IO>, path: &str, mut options: OpenOptions) -> Result<Arc<Database>> {
+        // Reject before resolving default storage: a registry hit there would
+        // otherwise return the cached default-WAL instance and silently ignore
+        // the custom wal_path before open_async runs its own check.
+        Self::reject_wal_path_for_registry_open(&options)?;
+        if options.storage.is_none() {
+            if let Some(db) = Self::resolve_default_storage(&io, path, &mut options, true)? {
+                return Ok(db);
+            }
+        }
         let mut state = OpenDbAsyncState::new();
         loop {
-            match Self::open_with_flags_async_with_allocator(
-                &mut state,
-                io.clone(),
-                path,
-                db_file.clone(),
-                flags,
-                opts,
-                encryption_opts.clone(),
-                durable_storage.clone(),
-                allocator.clone(),
-                dialect.clone(),
-            )? {
+            match Self::open_async(&mut state, io.clone(), path, &options)? {
                 IOResult::Done(db) => return Ok(db),
                 IOResult::IO(io_completion) => {
                     io_completion.wait(&*io)?;
@@ -1163,97 +1249,46 @@ impl Database {
         }
     }
 
-    /// async flow of opening the database
-    /// this is important to have open async, otherwise sync-engine will not work properly for cases when schema table span multiple pages
-    /// (so, potentially network IO is needed to load them)
+    /// IOResult-driven twin of [`Database::open`]: the caller drives the IO
+    /// loop and passes `state` between calls. `OpenOptions::storage` must be
+    /// set.
     ///
-    /// Uses the database registry to ensure single Database instance per file within a process.
-    /// Caller must drive the IO loop and pass state between calls.
-    /// An `Opening` sentinel in the registry prevents concurrent opens of the same path
-    /// without holding the mutex across I/O yields.
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_with_flags_async(
+    /// This matters for the sync engine, which must yield on IO when the
+    /// schema table spans multiple pages (potentially needing network IO to
+    /// load them).
+    ///
+    /// Uses the database registry to ensure a single Database instance per
+    /// file within a process; an `Opening` sentinel prevents concurrent opens
+    /// of the same path without holding the mutex across I/O yields. Callers
+    /// that need a second Database instance for one file (e.g. a copied or
+    /// revert WAL) use [`Database::do_open_async`] with `OpenOptions::wal_path`;
+    /// passing `wal_path` here is an error, because the registry keys on the
+    /// default WAL path.
+    pub fn open_async(
         state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
         path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        dialect: Arc<dyn Dialect>,
+        options: &OpenOptions,
     ) -> Result<IOResult<Arc<Database>>> {
-        // Re-derive lock-mode flags from opts the same way the sync
-        // `open_file_with_flags` path does: multiprocess WAL must open the
+        Self::reject_wal_path_for_registry_open(options)?;
+        let Some(storage) = options.storage.clone() else {
+            return Err(LimboError::InvalidArgument(
+                "OpenOptions::storage is required for Database::open_async".to_string(),
+            ));
+        };
+        // Re-derive lock-mode flags from opts: multiprocess WAL must open the
         // WAL file with NoLock or the second process fails to lock `-wal`.
+        // Callers may hand us default flags on every poll, so this runs each
+        // time; the rewrite is idempotent. The raw do_open_async path does not
+        // do this — it is reserved for the registry-aware entry point.
         #[cfg(feature = "fs")]
-        let flags = Self::effective_open_flags_for_path(&io, path, flags, opts)?;
-        Self::open_with_flags_async_with_allocator(
-            state,
-            io,
-            path,
-            db_file,
-            flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            alloc::DynAllocator::default(),
-            dialect,
-        )
-    }
+        let flags = Self::effective_open_flags_for_path(&io, path, options.flags, options.db_opts)?;
+        #[cfg(not(feature = "fs"))]
+        let flags = options.flags;
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_with_flags_async_with_allocator(
-        state: &mut OpenDbAsyncState,
-        io: Arc<dyn IO>,
-        path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        allocator: alloc::DynAllocator,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<IOResult<Arc<Database>>> {
-        let result = Self::open_with_flags_async_internal(
-            state,
-            io,
-            path,
-            db_file,
-            flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            allocator,
-            dialect,
-        );
-        if result.is_err() {
-            // On error, remove the Opening sentinel so other callers can proceed.
-            if let Some(registry_key) = state.registry_key.take() {
-                let mut registry = DATABASE_MANAGER.lock();
-                registry.remove(&registry_key);
-            }
-        }
-        result
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn open_with_flags_async_internal(
-        state: &mut OpenDbAsyncState,
-        io: Arc<dyn IO>,
-        path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        allocator: alloc::DynAllocator,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<IOResult<Arc<Database>>> {
         // turso-sync-engine creates 2 databases with different names in the same IO if MemoryIO is used
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
         // so, we bypass registry for all in memory dbs (i.e. db paths which starts with ":memory:")
-
         if matches!(state.phase, OpenDbAsyncPhase::Init) && !is_memory_like(path) {
             // Briefly lock the registry to check/reserve — never hold across I/O yields.
             let mut registry = DATABASE_MANAGER.lock();
@@ -1269,13 +1304,13 @@ impl Database {
 
                             let db_is_encrypted =
                                 !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-                            if db_is_encrypted && encryption_opts.is_none() {
+                            if db_is_encrypted && options.encryption.is_none() {
                                 return Err(LimboError::InvalidArgument(
                                     "Database is encrypted but no encryption options provided"
                                         .to_string(),
                                 ));
                             }
-                            Self::check_registry_dialect(&db, dialect.as_ref())?;
+                            Self::check_registry_dialect(&db, options.dialect.as_ref())?;
                             return Ok(IOResult::Done(db));
                         }
                         // Weak ref expired — treat as absent, fall through to insert Opening.
@@ -1299,92 +1334,56 @@ impl Database {
             // of the same path without holding the mutex across yields.
         }
 
-        // Open the database asynchronously (no registry lock held).
-        let result = Self::open_with_flags_bypass_registry_async_with_allocator(
+        // Open the database (no registry lock held; never re-consults it).
+        let result = Self::do_open_async_guarded(
             state,
             io.clone(),
             path,
             None,
-            db_file,
+            storage,
             flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            allocator,
-            dialect,
-        )?;
-
-        if let IOResult::Done(ref db) = result {
-            // Register the opened database and remove the Opening sentinel.
-            if let Some(registry_key) = state.registry_key.take() {
-                let mut registry = DATABASE_MANAGER.lock();
-                registry.insert(registry_key, RegistryEntry::Ready(Arc::downgrade(db)));
-            }
-        }
-
-        Ok(result)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn open_with_flags_bypass_registry_async_with_allocator(
-        state: &mut OpenDbAsyncState,
-        io: Arc<dyn IO>,
-        path: &str,
-        wal_path: Option<&str>,
-        db_file: Arc<dyn DatabaseStorage>,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-        durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-        allocator: alloc::DynAllocator,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<IOResult<Arc<Database>>> {
-        let result = Self::open_with_flags_bypass_registry_async_internal(
-            state,
-            io,
-            path,
-            wal_path,
-            db_file,
-            flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            allocator,
-            dialect,
+            options.db_opts,
+            options.encryption.clone(),
+            options.durable_storage.clone(),
+            options.allocator.clone(),
+            options.dialect.clone(),
         );
-        if result.is_err() {
-            let _ = state.schema_guard.take();
+
+        match &result {
+            Ok(IOResult::Done(db)) => {
+                // Register the opened database and remove the Opening sentinel.
+                if let Some(registry_key) = state.registry_key.take() {
+                    let mut registry = DATABASE_MANAGER.lock();
+                    registry.insert(registry_key, RegistryEntry::Ready(Arc::downgrade(db)));
+                }
+            }
+            Err(_) => {
+                // On error, remove the Opening sentinel so other callers can proceed.
+                if let Some(registry_key) = state.registry_key.take() {
+                    let mut registry = DATABASE_MANAGER.lock();
+                    registry.remove(&registry_key);
+                }
+            }
+            Ok(IOResult::IO(_)) => {}
         }
         result
     }
 
-    /// method for tests - for all other code we must use async alternative
+    /// Synchronous [`Database::do_open_async`] that drives the IO loop.
+    ///
+    /// Test-only helper for scenarios that intentionally open a second
+    /// Database instance for one file (e.g. reading through a copied WAL);
+    /// production code uses the registry-aware [`Database::open`].
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_with_flags_bypass_registry(
-        io: Arc<dyn IO>,
-        path: &str,
-        wal_path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<Arc<Database>> {
+    pub fn do_open(io: Arc<dyn IO>, path: &str, mut options: OpenOptions) -> Result<Arc<Database>> {
+        if options.storage.is_none() {
+            // `use_registry = false`: the raw path never consults the registry,
+            // so this only opens the file and never returns a cached Database.
+            Self::resolve_default_storage(&io, path, &mut options, false)?;
+        }
         let mut state = OpenDbAsyncState::new();
         loop {
-            match Self::open_with_flags_bypass_registry_async(
-                &mut state,
-                io.clone(),
-                path,
-                Some(wal_path),
-                db_file.clone(),
-                flags,
-                opts,
-                encryption_opts.clone(),
-                None,
-                dialect.clone(),
-            )? {
+            match Self::do_open_async(&mut state, io.clone(), path, &options)? {
                 IOResult::Done(db) => return Ok(db),
                 IOResult::IO(io_completion) => {
                     io_completion.wait(&*io)?;
@@ -1393,11 +1392,42 @@ impl Database {
         }
     }
 
-    /// Async version of database opening that returns IOResult.
-    /// Caller must drive the IO loop and pass state between calls.
-    /// This is useful for sync engine which needs to yield on IO.
+    /// Raw open that never consults the process-wide registry, driven by the
+    /// caller's IO loop. This is the only entry point that honors
+    /// `OpenOptions::wal_path`. Prefer [`Database::open_async`] unless you
+    /// deliberately need a second Database instance for a file (e.g. the sync
+    /// engine's revert WAL).
+    pub fn do_open_async(
+        state: &mut OpenDbAsyncState,
+        io: Arc<dyn IO>,
+        path: &str,
+        options: &OpenOptions,
+    ) -> Result<IOResult<Arc<Database>>> {
+        let Some(storage) = options.storage.clone() else {
+            return Err(LimboError::InvalidArgument(
+                "OpenOptions::storage is required for Database::do_open_async".to_string(),
+            ));
+        };
+        Self::do_open_async_guarded(
+            state,
+            io,
+            path,
+            options.wal_path.as_deref(),
+            storage,
+            options.flags,
+            options.db_opts,
+            options.encryption.clone(),
+            options.durable_storage.clone(),
+            options.allocator.clone(),
+            options.dialect.clone(),
+        )
+    }
+
+    /// Run the open state machine and release the schema guard if it fails.
+    /// Never touches the registry; both the registry-aware and raw entry
+    /// points funnel through here.
     #[allow(clippy::too_many_arguments)]
-    pub fn open_with_flags_bypass_registry_async(
+    fn do_open_async_guarded(
         state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
         path: &str,
@@ -1407,9 +1437,10 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        allocator: alloc::DynAllocator,
         dialect: Arc<dyn Dialect>,
     ) -> Result<IOResult<Arc<Database>>> {
-        let result = Self::open_with_flags_bypass_registry_async_internal(
+        let result = Self::do_open_async_internal(
             state,
             io,
             path,
@@ -1419,19 +1450,17 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
-            alloc::DynAllocator::default(),
+            allocator,
             dialect,
         );
         if result.is_err() {
-            // schema_guard is set by the open_with_flags_bypass_registry_async_internal - so we release it in case of error
-            // registry_guard is not managed by this function - so we don't touch it here and reset in the appropriate place
             let _ = state.schema_guard.take();
         }
         result
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn open_with_flags_bypass_registry_async_internal(
+    fn do_open_async_internal(
         state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
         path: &str,
@@ -1445,10 +1474,7 @@ impl Database {
         dialect: Arc<dyn Dialect>,
     ) -> Result<IOResult<Arc<Database>>> {
         loop {
-            tracing::debug!(
-                "open_with_flags_bypass_registry_async: state.phase={:?}",
-                state.phase
-            );
+            tracing::debug!("do_open_async_internal: state.phase={:?}", state.phase);
             match &state.phase {
                 OpenDbAsyncPhase::Init => {
                     // Parse encryption key from encryption_opts if provided
@@ -1570,7 +1596,7 @@ impl Database {
                         .schema_guard
                         .as_mut()
                         .expect("schema_guard must be acquired in Init phase");
-                    // while we logically exclusively own schema as we hold DATABASE_MANAGER lock in the top level `open_with_flags_async_internal` function
+                    // while we logically exclusively own schema as we hold DATABASE_MANAGER lock in the top level `open_async` function
                     // at the moment we already created connection which cloned the schema internally
                     // so, we can't use get_mut here for now
                     //
@@ -1675,7 +1701,7 @@ impl Database {
                 }
 
                 OpenDbAsyncPhase::Done => {
-                    panic!("open_with_flags_bypass_registry_async called after completion");
+                    panic!("do_open_async_internal called after completion");
                 }
             }
         }

@@ -31,6 +31,8 @@ const MULTIPROCESS_SHM_EXPECT_OPEN_FAILURE_CHILD_TEST: &str =
 const DEFAULT_LOCKED_DB_CHILD_TEST: &str = "multiprocess_tests::default_locked_db_child_process";
 const MULTIPROCESS_ASYNC_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_async_open_child_process";
+const MULTIPROCESS_HOLD_OPEN_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_hold_open_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
@@ -137,25 +139,18 @@ fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
 }
 
 /// Mimic the sdk-kit async open path: the caller pre-opens the DB file with
-/// NoLock but hands `OpenFlags::default()` to `open_with_flags_async`, so the
-/// async entrypoint itself must re-derive the multiprocess lock mode before
-/// the WAL file is opened.
+/// NoLock but hands `OpenFlags::default()` to `open_async`, so the async
+/// entrypoint itself must re-derive the multiprocess lock mode before the WAL
+/// file is opened.
 fn open_multiprocess_db_async(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
     let file = io.open_file(path, OpenFlags::default() | OpenFlags::NoLock, true)?;
     let db_file = Arc::new(DatabaseFile::new(file));
+    let options = OpenOptions::new(Arc::new(SqliteDialect))
+        .storage(db_file)
+        .db_opts(multiprocess_wal_db_opts());
     let mut state = OpenDbAsyncState::new();
     loop {
-        match Database::open_with_flags_async(
-            &mut state,
-            io.clone(),
-            path,
-            db_file.clone(),
-            OpenFlags::default(),
-            multiprocess_wal_db_opts(),
-            None,
-            None,
-            Arc::new(SqliteDialect),
-        )? {
+        match Database::open_async(&mut state, io.clone(), path, &options)? {
             IOResult::Done(db) => return Ok(db),
             IOResult::IO(io_completion) => io_completion.wait(&*io)?,
         }
@@ -473,6 +468,100 @@ fn multiprocess_async_open_child_process() {
     let db = open_multiprocess_db_async(io, db_path.to_str().unwrap()).unwrap();
     let conn = db.connect().unwrap();
     assert_eq!(count_test_rows(&conn), 1);
+}
+
+/// Child half of `reject_live_multiprocess_probe_uses_configured_wal_path`:
+/// open the multiprocess database, hold it open (keeping the authority in
+/// multiprocess mode), signal readiness, and wait for release before exiting.
+#[test]
+fn multiprocess_hold_open_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let release_file = std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let last = db.shared_wal.read().last_checksum_and_max_frame();
+    let wal = db.build_wal(last, db.buffer_pool.clone()).unwrap();
+    let wal_file = wal.as_any().downcast_ref::<WalFile>().unwrap();
+    assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
+
+    std::fs::write(&ready_file, b"ready").unwrap();
+    wait_for_file(&release_file);
+}
+
+/// The legacy/multiprocess probe keys the coordination file off the configured
+/// WAL path, not a hard-coded `{path}-wal`. With a live multiprocess authority
+/// held open by a child process, the probe rejects a legacy open only when it
+/// inspects the WAL path that actually backs the authority; a probe pointed at
+/// a different WAL path finds nothing. Before the fix, the probe hard-coded
+/// `{path}-wal` and so missed the authority whenever a custom WAL path was in
+/// use.
+#[test]
+fn reject_live_multiprocess_probe_uses_configured_wal_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("probe-wal-path.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    // Parent keeps the multiprocess database open so a second (child) opener
+    // flips the authority into multiprocess mode.
+    let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_HOLD_OPEN_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready_file);
+
+    // Probing the WAL path that actually backs the authority finds it and
+    // rejects a legacy open.
+    let default_wal = format!("{db_path_str}-wal");
+    let err = Database::reject_live_multiprocess_wal_for_legacy_open(
+        &io,
+        db_path_str,
+        Some(&default_wal),
+        DatabaseOpts::new(),
+    )
+    .expect_err("legacy open over a live multiprocess authority must be rejected");
+    assert!(
+        matches!(err, LimboError::LockingError(_)),
+        "expected LockingError from the multiprocess probe, got {err:?}"
+    );
+
+    // Probing an unrelated WAL path must NOT reject: the coordination file is
+    // keyed on the WAL path, so the probe must honor its argument.
+    let other_wal = format!("{db_path_str}-other-wal");
+    Database::reject_live_multiprocess_wal_for_legacy_open(
+        &io,
+        db_path_str,
+        Some(&other_wal),
+        DatabaseOpts::new(),
+    )
+    .expect("probe over an unrelated wal path must not reject");
+
+    std::fs::write(&release_file, b"release").unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "hold-open child should exit cleanly after release"
+    );
 }
 
 #[test]
