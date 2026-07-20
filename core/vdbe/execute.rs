@@ -14422,9 +14422,9 @@ pub fn op_integrity_check(
                     freelist_trunk_page as i64,
                     PageCategory::FreeListTrunk,
                     &mut errors,
-                );
+                )?;
             } else if !roots.is_empty() {
-                integrity_check_state.start(roots[0], PageCategory::Normal, &mut errors);
+                integrity_check_state.start(roots[0], PageCategory::Normal, &mut errors)?;
                 current_root_idx += 1;
             }
 
@@ -14461,7 +14461,11 @@ pub fn op_integrity_check(
             }
 
             if *current_root_idx < roots.len() {
-                integrity_check_state.start(roots[*current_root_idx], PageCategory::Normal, errors);
+                integrity_check_state.start(
+                    roots[*current_root_idx],
+                    PageCategory::Normal,
+                    errors,
+                )?;
                 *current_root_idx += 1;
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -14475,7 +14479,7 @@ pub fn op_integrity_check(
                 {
                     continue;
                 }
-                integrity_check_state.start(dropped_root, PageCategory::Normal, errors);
+                integrity_check_state.start(dropped_root, PageCategory::Normal, errors)?;
                 return Ok(InsnFunctionStepResult::Step);
             }
 
