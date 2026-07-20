@@ -10,7 +10,7 @@ Gem::Specification.new do |spec|
   spec.license = "MIT"
   spec.files = Dir["lib/**/*", "ext/**/*", "README.md"]
   spec.extensions = ["ext/turso_ruby/extconf.rb"]
-  spec.required_ruby_version = ">= 3.0.0"
+  spec.required_ruby_version = ">= 3.2.0"
   spec.add_dependency "rb_sys", "~> 0.9"
   spec.add_development_dependency "irb"
 end
