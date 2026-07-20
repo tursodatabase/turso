@@ -656,6 +656,15 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("CREATE INDEX")
     } else if upper.starts_with("CREATE SCHEMA") {
         Tag::new("CREATE SCHEMA")
+    } else if is_create_table_as(&upper) {
+        // PostgreSQL reports CREATE TABLE AS completion as `SELECT n` (the
+        // rows inserted), except WITH NO DATA which skips the insert and
+        // keeps the plain tag.
+        if ends_with_with_no_data(&upper) {
+            Tag::new("CREATE TABLE AS")
+        } else {
+            Tag::new("SELECT").with_rows(affected_rows)
+        }
     } else if upper.starts_with("CREATE") {
         Tag::new("CREATE TABLE")
     } else if upper.starts_with("DROP VIEW") {
@@ -682,9 +691,65 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("SET")
     } else if upper.starts_with("COPY") {
         Tag::new("COPY").with_rows(affected_rows)
+    } else if upper.starts_with("SELECT") || upper.starts_with("WITH") {
+        // Row-returning SELECTs never reach command_tag (they take the
+        // query-response path), so a zero-column SELECT- or WITH-prefixed
+        // statement is SELECT ... INTO (writable CTEs are unsupported),
+        // which PostgreSQL reports as `SELECT n` like CREATE TABLE AS.
+        Tag::new("SELECT").with_rows(affected_rows)
     } else {
         Tag::new("OK")
     }
+}
+
+/// Whether the statement ends with `WITH NO DATA`, token-wise (ignoring
+/// trailing whitespace and statement terminators).
+fn ends_with_with_no_data(upper: &str) -> bool {
+    let mut tokens = upper
+        .trim_end()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .rev();
+    tokens.next() == Some("DATA") && tokens.next() == Some("NO") && tokens.next() == Some("WITH")
+}
+
+/// Best-effort detection of `CREATE [TEMP|UNLOGGED] TABLE [IF NOT EXISTS]
+/// <name> AS ...` from the statement text, in the same spirit as the prefix
+/// matching in `command_tag`. Quoted table names containing whitespace are
+/// not recognized and fall back to the plain CREATE TABLE tag.
+fn is_create_table_as(upper: &str) -> bool {
+    let mut tokens = upper.split_whitespace();
+    if tokens.next() != Some("CREATE") {
+        return false;
+    }
+    let mut tok = tokens.next();
+    while matches!(
+        tok,
+        Some("TEMP" | "TEMPORARY" | "UNLOGGED" | "GLOBAL" | "LOCAL")
+    ) {
+        tok = tokens.next();
+    }
+    if tok != Some("TABLE") {
+        return false;
+    }
+    tok = tokens.next();
+    if tok == Some("IF") {
+        if tokens.next() != Some("NOT") || tokens.next() != Some("EXISTS") {
+            return false;
+        }
+        tok = tokens.next();
+    }
+    // `tok` is the table name; AS must follow it (possibly fused with an
+    // opening parenthesis, as in `AS(SELECT 1)`).
+    let Some(name) = tok else {
+        return false;
+    };
+    // A quoted name that opens without closing in the same token spans
+    // whitespace, so the next token is part of the name, not AS.
+    if name.starts_with('"') && (name.len() == 1 || !name.ends_with('"')) {
+        return false;
+    }
+    matches!(tokens.next(), Some(t) if t == "AS" || t.starts_with("AS("))
 }
 
 fn error_info(message: &str) -> ErrorInfo {
@@ -830,5 +895,37 @@ mod tests {
         // UNKNOWN type should keep text for non-numeric strings
         let val = pg_bytes_to_value(b"hello", &Type::UNKNOWN).unwrap();
         assert!(matches!(val, Value::Text(_)));
+    }
+
+    #[test]
+    fn test_is_create_table_as() {
+        assert!(is_create_table_as("CREATE TABLE T AS SELECT 1"));
+        assert!(is_create_table_as("CREATE TEMP TABLE T AS SELECT 1"));
+        assert!(is_create_table_as("CREATE UNLOGGED TABLE T AS SELECT 1"));
+        assert!(is_create_table_as(
+            "CREATE TABLE IF NOT EXISTS T AS SELECT 1"
+        ));
+        assert!(is_create_table_as("CREATE TABLE S.T AS SELECT 1"));
+        assert!(is_create_table_as("CREATE TABLE T AS(SELECT 1)"));
+        assert!(is_create_table_as("CREATE TABLE \"T\" AS SELECT 1"));
+
+        assert!(!is_create_table_as("CREATE TABLE T (X INT)"));
+        assert!(!is_create_table_as("CREATE INDEX I ON T (X)"));
+        assert!(!is_create_table_as("CREATE VIEW V AS SELECT 1"));
+        // Quoted name containing whitespace: `AS` is part of the name.
+        assert!(!is_create_table_as("CREATE TABLE \"A AS B\" (X INT)"));
+    }
+
+    #[test]
+    fn test_ends_with_with_no_data() {
+        assert!(ends_with_with_no_data(
+            "CREATE TABLE T AS SELECT 1 WITH NO DATA"
+        ));
+        assert!(ends_with_with_no_data(
+            "CREATE TABLE T AS SELECT 1 WITH  NO\nDATA ; "
+        ));
+
+        assert!(!ends_with_with_no_data("CREATE TABLE T AS SELECT 1"));
+        assert!(!ends_with_with_no_data("SELECT 'WITH NO DATA'"));
     }
 }

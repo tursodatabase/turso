@@ -12,7 +12,7 @@ Sorted by implementation difficulty.
 
 ## Easy (a day or two)
 
-6. **CREATE TABLE AS / SELECT INTO** — translate to `CREATE TABLE ... AS SELECT` which Turso already supports
+6. ~~**CREATE TABLE AS / SELECT INTO**~~ — DONE (translates to `CREATE TABLE ... AS SELECT`; WITH NO DATA supported, explicit column list rejected)
 7. **ALTER COLUMN SET/DROP DEFAULT, SET/DROP NOT NULL** — Turso's ALTER TABLE is limited but these map to SQLite operations
 8. **CONCURRENTLY on CREATE INDEX** — just ignore the keyword (SQLite doesn't do concurrent DDL anyway)
 9. **COPY ... FROM/TO with simple CSV** — implement as INSERT loop or SELECT output (not the wire protocol COPY)

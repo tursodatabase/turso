@@ -750,6 +750,55 @@ fn refresh_materialized_view_is_noop() {
 }
 
 // ---------------------------------------------------------------------------
+// CREATE TABLE AS / SELECT INTO
+// ---------------------------------------------------------------------------
+
+#[test]
+fn create_table_as_is_snapshot_not_view() {
+    let output = run_tursopg(
+        b"CREATE TABLE src(id INT);\n\
+          INSERT INTO src VALUES (1), (2);\n\
+          CREATE TABLE snapshot AS SELECT * FROM src;\n\
+          INSERT INTO src VALUES (3);\n\
+          SELECT 'count:' || COUNT(*) FROM snapshot;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(
+        out.contains("count:2"),
+        "snapshot must not see later inserts: {out}"
+    );
+}
+
+#[test]
+fn wire_create_table_as_returns_select_n() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE src(id INT)");
+        c.query_command_tags("INSERT INTO src VALUES (1), (2), (3)");
+
+        // PostgreSQL reports CREATE TABLE AS / SELECT INTO completion as
+        // `SELECT n` where n is the number of rows inserted.
+        let tags = c.query_command_tags("CREATE TABLE dst AS SELECT * FROM src WHERE id > 1");
+        assert!(
+            tags.iter().any(|t| t == "SELECT 2"),
+            "expected 'SELECT 2' tag for CTAS, got: {tags:?}"
+        );
+
+        let tags = c.query_command_tags("SELECT id INTO dst2 FROM src");
+        assert!(
+            tags.iter().any(|t| t == "SELECT 3"),
+            "expected 'SELECT 3' tag for SELECT INTO, got: {tags:?}"
+        );
+
+        let tags = c.query_command_tags("CREATE TABLE dst3 AS SELECT * FROM src WITH NO DATA");
+        assert!(
+            tags.iter().any(|t| t == "CREATE TABLE AS"),
+            "expected 'CREATE TABLE AS' tag for WITH NO DATA, got: {tags:?}"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Named windows (WINDOW clause)
 // ---------------------------------------------------------------------------
 
