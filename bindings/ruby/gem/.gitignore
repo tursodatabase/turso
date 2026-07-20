@@ -1,3 +1,4 @@
 /pkg
 /tmp
+/Gemfile.lock
 /ext/turso_ruby/target

@@ -1,8 +1,10 @@
 # frozen_string_literal: true
 
+require_relative "lib/turso/version"
+
 Gem::Specification.new do |spec|
   spec.name = "turso"
-  spec.version = "0.1.0"
+  spec.version = Turso::VERSION
   spec.summary = "Ruby bindings for Turso"
   spec.authors = ["Turso Team"]
   spec.license = "MIT"
