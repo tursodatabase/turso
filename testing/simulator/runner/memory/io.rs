@@ -117,7 +117,11 @@ impl Operation {
             OperationType::Truncate { completion, len } => {
                 let file = files.get(fd.as_str()).unwrap();
                 let mut file_buf = file.buffer.borrow_mut();
-                file_buf.truncate(len);
+                if len > file_buf.len() {
+                    file_buf.resize(len, 0);
+                } else {
+                    file_buf.truncate(len);
+                }
                 completion.complete(0);
             }
         }

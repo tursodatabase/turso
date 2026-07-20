@@ -2276,6 +2276,8 @@ impl Pager {
             cache.truncate(db_size as usize)?;
         }
 
+        self.max_page_count.store(db_size, Ordering::SeqCst);
+
         // No WAL position: the transaction never upgraded to a write
         // transaction, so there are no frames to rewind.
         if let (Some(wal), Some(wal_pos)) = (&self.wal, savepoint.wal_pos) {

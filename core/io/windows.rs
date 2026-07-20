@@ -265,6 +265,9 @@ impl File for WindowsFile {
 
         if result == FALSE {
             let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(158) { // ERROR_NOT_LOCKED
+                return Ok(());
+            }
             return Err(LimboError::LockingError(format!(
                 "Failed to release file lock: {err}"
             )));
