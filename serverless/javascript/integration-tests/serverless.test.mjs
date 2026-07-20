@@ -86,6 +86,23 @@ test.serial('batch() method executes multiple statements', async t => {
   t.is(queryResult.rows[0][0], 3);
 });
 
+test.serial('atomic batch() rolls back entirely on failure', async t => {
+  await client.execute('DROP TABLE IF EXISTS test_batch_fail');
+  await client.execute('CREATE TABLE test_batch_fail (v INTEGER)');
+
+  // The third statement fails (wrong arity); an atomic batch (mode set) must
+  // roll the whole thing back via its BEGIN/COMMIT/ROLLBACK condition chain.
+  await t.throwsAsync(() => client.batch([
+    'INSERT INTO test_batch_fail VALUES (10)',
+    'INSERT INTO test_batch_fail VALUES (20)',
+    'INSERT INTO test_batch_fail VALUES (1, 2, 3)',
+    'INSERT INTO test_batch_fail VALUES (30)',
+  ], 'immediate'));
+
+  const rs = await client.execute('SELECT COUNT(*) FROM test_batch_fail');
+  t.is(rs.rows[0][0], 0);
+});
+
 test.serial('execute() method queries a single value', async t => {
   const rs = await client.execute('SELECT 42');
   
