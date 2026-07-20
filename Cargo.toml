@@ -48,6 +48,9 @@ members = [
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
     "testing/sqltest",
+    "testing/rust-shared",
+    "testing/hegel/rust",
+    "testing/hegel/proxy",
     "serverless/rust",
     "remote/protocol"
 ]

@@ -1,0 +1,19 @@
+# Copyright 2025 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_shared_tests"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared integration tests for turso and turso_serverless crates"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+turso = { workspace = true }
+turso_serverless = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
