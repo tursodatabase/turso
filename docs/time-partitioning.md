@@ -28,7 +28,7 @@ connection.register_partitioned_table(
         Box::new(VideoAnalyticsPathResolver::daily(
             archive_directory,
             "line_crossing".to_string(),
-        )),
+        )?),
         "CREATE TABLE events (
             id INTEGER PRIMARY KEY,
             ts INTEGER NOT NULL,
@@ -55,6 +55,9 @@ persisted in the database.
 `DefaultPathResolver::daily` writes `events_YYYY-MM-DD.db` files.
 `VideoAnalyticsPathResolver::daily` writes
 `YYYY-MM-DD/<plugin-id>.bin` files.
+Plugin identifiers must contain only ASCII letters, digits, `-`, and `_`, must
+fit within 128 bytes, and must not be reserved Windows device names. Validation
+is performed when the resolver is constructed, before any filesystem access.
 
 ## SQL behavior
 
@@ -101,8 +104,17 @@ are reconciled before the next statement. Applications should still use the
 API when they need active-reader protection and portable Windows behavior.
 
 New files are assembled under a private temporary name, checkpointed, and then
-published without overwriting an existing path. Concurrent creators therefore
-see one complete file rather than a partially initialized database.
+explicitly flushed before being published without overwriting an existing path.
+On Unix, the containing directory is flushed after publication and checked
+deletion so the directory entry survives a successful operation followed by a
+crash. Concurrent creators therefore see one complete file rather than a
+partially initialized database.
+
+One recorder process must own SQL access and checked retention for an archive.
+The no-clobber publication protocol makes simultaneous file creation safe, but
+it does not make ordinary WAL reads, writes, or deletion coordination safe
+across independent processes. External importers should publish only closed,
+checkpointed files and must not keep them open after publication.
 
 An external importer that atomically replaces a file at an existing path must
 follow the same rule: checkpoint and close the replacement before publishing

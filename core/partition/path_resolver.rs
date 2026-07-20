@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
 
+use super::error::PartitionError;
+
 const DAY_MICROS: i64 = 86_400_000_000;
 
 fn interval_range_start(timestamp_micros: i64, interval_micros: i64) -> Option<i64> {
@@ -87,7 +89,7 @@ pub trait PartitionPathResolver: Send + Sync {
         let date = micros_to_date(timestamp_micros);
         match date {
             Some(d) => format!("{}_{}", table, d.format("%Y%m%d")),
-            None => format!("{}_{}", table, timestamp_micros),
+            None => format!("{table}_{timestamp_micros}"),
         }
     }
 }
@@ -199,21 +201,69 @@ impl VideoAnalyticsPathResolver {
     /// * `base_dir` - Base directory for partition files
     /// * `plugin_id` - Plugin identifier (used as filename without extension)
     /// * `interval_seconds` - Partition interval in seconds
-    pub fn new(base_dir: PathBuf, plugin_id: String, interval_seconds: u64) -> Self {
-        Self {
+    pub fn new(
+        base_dir: PathBuf,
+        plugin_id: String,
+        interval_seconds: u64,
+    ) -> Result<Self, PartitionError> {
+        validate_plugin_id(&plugin_id)?;
+        Ok(Self {
             base_dir,
             plugin_id,
             interval_micros: i64::try_from(interval_seconds)
                 .ok()
                 .and_then(|seconds| seconds.checked_mul(1_000_000))
                 .unwrap_or(0),
-        }
+        })
     }
 
     /// Create a daily partition resolver for video analytics.
-    pub fn daily(base_dir: PathBuf, plugin_id: String) -> Self {
+    pub fn daily(base_dir: PathBuf, plugin_id: String) -> Result<Self, PartitionError> {
         Self::new(base_dir, plugin_id, 86400)
     }
+}
+
+fn validate_plugin_id(plugin_id: &str) -> Result<(), PartitionError> {
+    const MAX_PLUGIN_ID_LEN: usize = 128;
+
+    if plugin_id.is_empty() {
+        return Err(PartitionError::InvalidPluginId {
+            plugin_id: plugin_id.to_string(),
+            reason: "the id must not be empty".to_string(),
+        });
+    }
+    if plugin_id.len() > MAX_PLUGIN_ID_LEN {
+        return Err(PartitionError::InvalidPluginId {
+            plugin_id: plugin_id.to_string(),
+            reason: format!("the id must not exceed {MAX_PLUGIN_ID_LEN} bytes"),
+        });
+    }
+    if !plugin_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(PartitionError::InvalidPluginId {
+            plugin_id: plugin_id.to_string(),
+            reason: "use only ASCII letters, digits, '-' and '_'".to_string(),
+        });
+    }
+
+    let uppercase = plugin_id.to_ascii_uppercase();
+    let reserved = matches!(uppercase.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || uppercase.strip_prefix("COM").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        })
+        || uppercase.strip_prefix("LPT").is_some_and(|suffix| {
+            matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        });
+    if reserved {
+        return Err(PartitionError::InvalidPluginId {
+            plugin_id: plugin_id.to_string(),
+            reason: "the id is a reserved Windows device name".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 impl PartitionPathResolver for VideoAnalyticsPathResolver {
@@ -304,7 +354,7 @@ mod tests {
         let resolver = DefaultPathResolver::daily(PathBuf::from("/data"));
 
         // 2025-01-22 12:00:00 UTC in microseconds
-        let timestamp = 1737547200_000_000i64;
+        let timestamp = 1_737_547_200_000_000_i64;
         let path = resolver.resolve_path("events", timestamp);
 
         assert!(path.to_str().unwrap().contains("events_2025-01-22.db"));
@@ -333,9 +383,10 @@ mod tests {
     #[test]
     fn test_video_analytics_resolver_resolve_path() {
         let resolver =
-            VideoAnalyticsPathResolver::daily(PathBuf::from("/data"), "lpr_plugin".to_string());
+            VideoAnalyticsPathResolver::daily(PathBuf::from("/data"), "lpr_plugin".to_string())
+                .unwrap();
 
-        let timestamp = 1737547200_000_000i64; // 2025-01-22
+        let timestamp = 1_737_547_200_000_000_i64; // 2025-01-22
         let path = resolver.resolve_path("events", timestamp);
 
         let path_str = path.to_str().unwrap();
@@ -346,7 +397,8 @@ mod tests {
     #[test]
     fn test_video_analytics_resolver_parse_path() {
         let resolver =
-            VideoAnalyticsPathResolver::daily(PathBuf::from("/data"), "lpr_plugin".to_string());
+            VideoAnalyticsPathResolver::daily(PathBuf::from("/data"), "lpr_plugin".to_string())
+                .unwrap();
 
         let path = PathBuf::from("/data/2025-01-22/lpr_plugin.bin");
         let result = resolver.parse_path(&path);
@@ -357,7 +409,8 @@ mod tests {
     #[test]
     fn test_video_analytics_resolver_wrong_plugin() {
         let resolver =
-            VideoAnalyticsPathResolver::daily(PathBuf::from("/data"), "lpr_plugin".to_string());
+            VideoAnalyticsPathResolver::daily(PathBuf::from("/data"), "lpr_plugin".to_string())
+                .unwrap();
 
         let path = PathBuf::from("/data/2025-01-22/other_plugin.bin");
         let result = resolver.parse_path(&path);
@@ -369,7 +422,7 @@ mod tests {
     fn test_generate_alias() {
         let resolver = DefaultPathResolver::daily(PathBuf::from("/data"));
 
-        let timestamp = 1737547200_000_000i64; // 2025-01-22
+        let timestamp = 1_737_547_200_000_000_i64; // 2025-01-22
         let alias = resolver.generate_alias("events", timestamp);
 
         assert_eq!(alias, "events_20250122");
@@ -377,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_micros_to_date() {
-        let timestamp = 1737547200_000_000i64; // 2025-01-22 12:00:00 UTC
+        let timestamp = 1_737_547_200_000_000_i64; // 2025-01-22 12:00:00 UTC
         let date = micros_to_date(timestamp);
 
         assert!(date.is_some());
@@ -408,10 +461,7 @@ mod tests {
             PathBuf::from("/data/[camera]*"),
             "plugin[0]*".to_string(),
         );
-        assert_eq!(
-            video.glob_pattern("events"),
-            "/data/[[]camera[]][*]/*/plugin[[]0[]][*].bin"
-        );
+        assert!(matches!(video, Err(PartitionError::InvalidPluginId { .. })));
     }
 
     #[test]
@@ -431,7 +481,8 @@ mod tests {
         );
 
         let video =
-            VideoAnalyticsPathResolver::new(PathBuf::from("/data"), "plugin".to_string(), 3_600);
+            VideoAnalyticsPathResolver::new(PathBuf::from("/data"), "plugin".to_string(), 3_600)
+                .unwrap();
         let first = video.resolve_path("events", 1_000);
         let second = video.resolve_path("events", 3_600_000_000 + 1_000);
         assert_ne!(first, second);
@@ -440,5 +491,42 @@ mod tests {
             video.parse_path(&second),
             Some((3_600_000_000, 7_200_000_000))
         );
+    }
+
+    #[test]
+    fn test_video_analytics_resolver_rejects_non_portable_plugin_ids() {
+        for plugin_id in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "subdir/plugin",
+            r"subdir\plugin",
+            "plugin.bin",
+            "plugin name",
+            "NUL",
+            "com1",
+            "LPT9",
+        ] {
+            let result =
+                VideoAnalyticsPathResolver::daily(PathBuf::from("/data"), plugin_id.to_string());
+            assert!(
+                matches!(result, Err(PartitionError::InvalidPluginId { .. })),
+                "plugin id should be rejected: {plugin_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_video_analytics_resolver_accepts_portable_plugin_ids() {
+        for plugin_id in ["line_crossing", "lpr-2", "Plugin42"] {
+            let resolver =
+                VideoAnalyticsPathResolver::daily(PathBuf::from("/data"), plugin_id.to_string())
+                    .unwrap();
+            assert_eq!(
+                resolver.resolve_path("events", 0),
+                PathBuf::from(format!("/data/1970-01-01/{plugin_id}.bin"))
+            );
+        }
     }
 }

@@ -51,10 +51,12 @@ pub mod error;
 pub mod file;
 pub mod manager;
 pub mod path_resolver;
+#[cfg(feature = "test_helper")]
+pub(crate) mod test_hooks;
 
 pub use error::PartitionError;
 #[cfg(feature = "fs")]
-pub(crate) use file::{remove_partition_sidecars, with_partition_path_lock};
+pub(crate) use file::{remove_partition_sidecars, sync_parent_directory, with_partition_path_lock};
 pub use file::{PartitionFile, PartitionInfo};
 pub use manager::{PartitionConfig, PartitionManager};
 pub use path_resolver::{DefaultPathResolver, PartitionPathResolver, VideoAnalyticsPathResolver};

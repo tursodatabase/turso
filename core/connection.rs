@@ -2495,8 +2495,7 @@ impl Connection {
         physical_connection.close()?;
         if contains_out_of_range_row {
             return Err(LimboError::InvalidArgument(format!(
-                "partition '{}' contains rows outside [{range_start}, {range_end}) for '{}.{}'",
-                alias, table_name, partition_column
+                "partition '{alias}' contains rows outside [{range_start}, {range_end}) for '{table_name}.{partition_column}'"
             )));
         }
         Ok(())
@@ -2554,14 +2553,25 @@ impl Connection {
         }
         self.detach_partition(table_name, path)?;
 
+        #[cfg(feature = "test_helper")]
+        crate::partition::test_hooks::pause_if_requested("after_partition_detach_before_delete");
+
         crate::partition::with_partition_path_lock(path, || -> Result<()> {
             if path.exists() {
                 self.db.io.remove_file(path.to_string_lossy().as_ref())?;
             }
             crate::partition::remove_partition_sidecars(path)
                 .map_err(|error| LimboError::InternalError(error.to_string()))?;
+            crate::partition::sync_parent_directory(path)
+                .map_err(|error| LimboError::InternalError(error.to_string()))?;
             Ok(())
         })?;
+
+        #[cfg(feature = "test_helper")]
+        crate::partition::test_hooks::pause_if_requested(
+            "after_partition_delete_before_catalog_update",
+        );
+
         self.partition_manager
             .write()
             .remove_partition(table_name, path)

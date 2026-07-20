@@ -35,19 +35,54 @@ pub(crate) fn with_partition_path_lock<T>(path: &Path, operation: impl FnOnce() 
 }
 
 #[cfg(feature = "fs")]
-fn remove_file_if_present(path: &Path) -> Result<(), PartitionError> {
+fn remove_file_if_present(path: &Path) -> Result<bool, PartitionError> {
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(PartitionError::IoError(error)),
     }
 }
 
 #[cfg(feature = "fs")]
 pub(crate) fn remove_partition_sidecars(path: &Path) -> Result<(), PartitionError> {
+    let mut removed = false;
     for suffix in ["-wal", "-tshm"] {
         let sidecar = PathBuf::from(format!("{}{suffix}", path.to_string_lossy()));
-        remove_file_if_present(&sidecar)?;
+        removed |= remove_file_if_present(&sidecar)?;
+    }
+    if removed {
+        sync_parent_directory(path)?;
+    }
+    Ok(())
+}
+
+/// Make a published or removed directory entry durable on platforms where
+/// directories can be flushed through the standard filesystem API.
+#[cfg(all(feature = "fs", unix))]
+pub(crate) fn sync_parent_directory(path: &Path) -> Result<(), PartitionError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(all(feature = "fs", not(unix)))]
+pub(crate) fn sync_parent_directory(_path: &Path) -> Result<(), PartitionError> {
+    Ok(())
+}
+
+#[cfg(feature = "fs")]
+fn create_parent_directories(parent: &Path) -> Result<(), PartitionError> {
+    let missing = parent
+        .ancestors()
+        .take_while(|directory| !directory.as_os_str().is_empty() && !directory.exists())
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    std::fs::create_dir_all(parent)?;
+    for directory in missing.iter().rev() {
+        sync_parent_directory(directory)?;
     }
     Ok(())
 }
@@ -192,7 +227,7 @@ fn micros_to_iso(timestamp_micros: i64) -> String {
     let nsecs = timestamp_micros.rem_euclid(1_000_000).saturating_mul(1_000) as u32;
     match DateTime::from_timestamp(secs, nsecs) {
         Some(dt) => dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        None => format!("{}", timestamp_micros),
+        None => format!("{timestamp_micros}"),
     }
 }
 
@@ -228,7 +263,7 @@ pub fn create_partition_file(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
+    create_parent_directories(parent)?;
 
     // Build the database under a private name and publish it only after the
     // complete schema is durable. Readers therefore never discover a
@@ -277,6 +312,13 @@ pub fn create_partition_file(
     drop(conn);
     drop(db);
     let _ = std::fs::remove_file(&temporary_wal_path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&temporary_path)?
+        .sync_all()?;
+
+    #[cfg(feature = "test_helper")]
+    super::test_hooks::pause_if_requested("before_partition_publish");
 
     with_partition_path_lock(path, || {
         if path.exists() {
@@ -284,7 +326,7 @@ pub fn create_partition_file(
         }
         remove_partition_sidecars(path)?;
         match temporary_path.persist_noclobber(path) {
-            Ok(()) => Ok(()),
+            Ok(()) => sync_parent_directory(path),
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
                 // A creator in another process finished first. Its final path
                 // is never overwritten.
@@ -293,6 +335,9 @@ pub fn create_partition_file(
             Err(error) => Err(PartitionError::IoError(error.error)),
         }
     })?;
+
+    #[cfg(feature = "test_helper")]
+    super::test_hooks::pause_if_requested("after_partition_publish");
 
     Ok(PartitionFile::new(
         path.to_path_buf(),
@@ -354,24 +399,24 @@ mod tests {
         let file = PartitionFile::new(
             PathBuf::from("/data/test.db"),
             "test_20250122".to_string(),
-            1737504000_000_000, // 2025-01-22 00:00:00 UTC
-            1737590400_000_000, // 2025-01-23 00:00:00 UTC
+            1_737_504_000_000_000, // 2025-01-22 00:00:00 UTC
+            1_737_590_400_000_000, // 2025-01-23 00:00:00 UTC
         );
 
         // Timestamp in range
-        assert!(file.contains(1737547200_000_000)); // 2025-01-22 12:00:00
+        assert!(file.contains(1_737_547_200_000_000)); // 2025-01-22 12:00:00
 
         // Timestamp at start (inclusive)
-        assert!(file.contains(1737504000_000_000));
+        assert!(file.contains(1_737_504_000_000_000));
 
         // Timestamp at end (exclusive)
-        assert!(!file.contains(1737590400_000_000));
+        assert!(!file.contains(1_737_590_400_000_000));
 
         // Timestamp before range
-        assert!(!file.contains(1737417600_000_000)); // 2025-01-21
+        assert!(!file.contains(1_737_417_600_000_000)); // 2025-01-21
 
         // Timestamp after range
-        assert!(!file.contains(1737676800_000_000)); // 2025-01-24
+        assert!(!file.contains(1_737_676_800_000_000)); // 2025-01-24
     }
 
     #[test]
@@ -379,27 +424,27 @@ mod tests {
         let file = PartitionFile::new(
             PathBuf::from("/data/test.db"),
             "test_20250122".to_string(),
-            1737504000_000_000, // 2025-01-22 00:00:00
-            1737590400_000_000, // 2025-01-23 00:00:00
+            1_737_504_000_000_000, // 2025-01-22 00:00:00
+            1_737_590_400_000_000, // 2025-01-23 00:00:00
         );
 
         // Range fully inside
-        assert!(file.overlaps(1737540000_000_000, 1737560000_000_000));
+        assert!(file.overlaps(1_737_540_000_000_000, 1_737_560_000_000_000));
 
         // Range overlapping start
-        assert!(file.overlaps(1737400000_000_000, 1737540000_000_000));
+        assert!(file.overlaps(1_737_400_000_000_000, 1_737_540_000_000_000));
 
         // Range overlapping end
-        assert!(file.overlaps(1737540000_000_000, 1737700000_000_000));
+        assert!(file.overlaps(1_737_540_000_000_000, 1_737_700_000_000_000));
 
         // Range fully outside (before)
-        assert!(!file.overlaps(1737300000_000_000, 1737400000_000_000));
+        assert!(!file.overlaps(1_737_300_000_000_000, 1_737_400_000_000_000));
 
         // Range fully outside (after)
-        assert!(!file.overlaps(1737700000_000_000, 1737800000_000_000));
+        assert!(!file.overlaps(1_737_700_000_000_000, 1_737_800_000_000_000));
 
         // Range touching at boundary (no overlap)
-        assert!(!file.overlaps(1737590400_000_000, 1737700000_000_000));
+        assert!(!file.overlaps(1_737_590_400_000_000, 1_737_700_000_000_000));
     }
 
     #[test]
@@ -407,8 +452,8 @@ mod tests {
         let mut file = PartitionFile::new(
             PathBuf::from("/data/test.db"),
             "test_20250122".to_string(),
-            1737504000_000_000,
-            1737590400_000_000,
+            1_737_504_000_000_000,
+            1_737_590_400_000_000,
         );
 
         assert!(!file.attached);
@@ -428,8 +473,8 @@ mod tests {
         let info = PartitionInfo {
             file_path: "/data/test.db".to_string(),
             db_alias: "test_20250122".to_string(),
-            range_start: 1737504000_000_000,
-            range_end: 1737590400_000_000,
+            range_start: 1_737_504_000_000_000,
+            range_end: 1_737_590_400_000_000,
             range_start_iso: "2025-01-22T00:00:00Z".to_string(),
             range_end_iso: "2025-01-23T00:00:00Z".to_string(),
             attached: false,
@@ -441,7 +486,7 @@ mod tests {
 
     #[test]
     fn test_micros_to_iso() {
-        let timestamp = 1737504000_000_000i64; // 2025-01-22 00:00:00 UTC
+        let timestamp = 1_737_504_000_000_000_i64; // 2025-01-22 00:00:00 UTC
         let iso = micros_to_iso(timestamp);
         assert_eq!(iso, "2025-01-22T00:00:00Z");
     }

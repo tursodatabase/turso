@@ -18,6 +18,8 @@ pub enum PartitionError {
     InvalidTimestamp { value: i64, reason: String },
     /// Partition interval must be a positive number of microseconds.
     InvalidInterval { table: String, interval_micros: i64 },
+    /// Video analytics plugin identifier cannot be mapped to a portable file name.
+    InvalidPluginId { plugin_id: String, reason: String },
     /// Partition file not found
     FileNotFound(PathBuf),
     /// A file parses as a range but is not the resolver's canonical path.
@@ -62,11 +64,7 @@ impl fmt::Display for PartitionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ColumnNotFound { column, table } => {
-                write!(
-                    f,
-                    "partition column '{}' not found in table '{}'",
-                    column, table
-                )
+                write!(f, "partition column '{column}' not found in table '{table}'")
             }
             Self::InvalidColumnType {
                 column,
@@ -75,21 +73,22 @@ impl fmt::Display for PartitionError {
             } => {
                 write!(
                     f,
-                    "partition column '{}' has invalid type: expected {}, got {}",
-                    column, expected, actual
+                    "partition column '{column}' has invalid type: expected {expected}, got {actual}"
                 )
             }
             Self::InvalidTimestamp { value, reason } => {
-                write!(f, "invalid timestamp {}: {}", value, reason)
+                write!(f, "invalid timestamp {value}: {reason}")
             }
             Self::InvalidInterval {
                 table,
                 interval_micros,
             } => write!(
                 f,
-                "partition interval for table '{}' must be positive, got {} microseconds",
-                table, interval_micros
+                "partition interval for table '{table}' must be positive, got {interval_micros} microseconds"
             ),
+            Self::InvalidPluginId { plugin_id, reason } => {
+                write!(f, "invalid video analytics plugin id '{plugin_id}': {reason}")
+            }
             Self::FileNotFound(path) => {
                 write!(f, "partition file not found: {}", path.display())
             }
@@ -110,8 +109,7 @@ impl fmt::Display for PartitionError {
             Self::NotAttached { table, partition } => {
                 write!(
                     f,
-                    "partition '{}' is not attached for table '{}'",
-                    partition, table
+                    "partition '{partition}' is not attached for table '{table}'"
                 )
             }
             Self::CrossPartitionWrite {
@@ -121,19 +119,14 @@ impl fmt::Display for PartitionError {
             } => {
                 write!(
                     f,
-                    "cross-partition write not allowed: table '{}' writes to both '{}' and '{}'",
-                    table, partition1, partition2
+                    "cross-partition write not allowed: table '{table}' writes to both '{partition1}' and '{partition2}'"
                 )
             }
             Self::TableNotPartitioned(table) => {
-                write!(f, "table '{}' is not configured for partitioning", table)
+                write!(f, "table '{table}' is not configured for partitioning")
             }
             Self::TableAlreadyRegistered(table) => {
-                write!(
-                    f,
-                    "table '{}' is already registered for partitioning",
-                    table
-                )
+                write!(f, "table '{table}' is already registered for partitioning")
             }
             Self::OverlappingRange {
                 table,
@@ -141,8 +134,7 @@ impl fmt::Display for PartitionError {
                 candidate,
             } => write!(
                 f,
-                "partition files overlap for table '{}': '{}' and '{}'",
-                table,
+                "partition files overlap for table '{table}': '{}' and '{}'",
                 existing.display(),
                 candidate.display()
             ),
@@ -152,16 +144,15 @@ impl fmt::Display for PartitionError {
                 candidate,
             } => write!(
                 f,
-                "partition resolver collision for table '{}': '{}' and '{}' identify different ranges",
-                table,
+                "partition resolver collision for table '{table}': '{}' and '{}' identify different ranges",
                 existing.display(),
                 candidate.display()
             ),
             Self::IoError(e) => {
-                write!(f, "partition I/O error: {}", e)
+                write!(f, "partition I/O error: {e}")
             }
             Self::DatabaseError(msg) => {
-                write!(f, "partition database error: {}", msg)
+                write!(f, "partition database error: {msg}")
             }
         }
     }

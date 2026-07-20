@@ -291,6 +291,7 @@ impl PostgreSQLTranslator {
                     without_rowid_text: None,
                     strict_text: Some("STRICT".to_string()),
                 },
+                partition: None,
             },
         };
         Ok((stmt, serial_sequences))

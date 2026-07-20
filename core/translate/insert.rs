@@ -82,8 +82,8 @@ fn extract_partition_values(
             })
             .ok_or_else(|| {
                 LimboError::ParseError(format!(
-                    "partition column '{}' not found in table '{}'",
-                    partition_col_name, table.name
+                    "partition column '{partition_col_name}' not found in table '{}'",
+                    table.name
                 ))
             })?
     } else {
@@ -92,8 +92,7 @@ fn extract_partition_values(
             .position(|c| normalize_ident(c.as_str()) == partition_col_name)
             .ok_or_else(|| {
                 LimboError::ParseError(format!(
-                    "partition column '{}' must be included in INSERT column list",
-                    partition_col_name
+                    "partition column '{partition_col_name}' must be included in INSERT column list"
                 ))
             })?
     };
@@ -105,8 +104,7 @@ fn extract_partition_values(
                 .map(|row| {
                     let expr = row.get(partition_col_idx).ok_or_else(|| {
                         LimboError::ParseError(format!(
-                            "partition column index {} out of bounds in VALUES",
-                            partition_col_idx
+                            "partition column index {partition_col_idx} out of bounds in VALUES"
                         ))
                     })?;
                     extract_partition_value(program, expr)
@@ -184,8 +182,7 @@ fn resolve_partition_values(
                 };
                 let Some(timestamp) = value.as_int() else {
                     return Err(LimboError::InvalidArgument(format!(
-                        "partition timestamp parameter {} must be a non-NULL integer",
-                        index
+                        "partition timestamp parameter {index} must be a non-NULL integer"
                     )));
                 };
                 timestamps.push(timestamp);

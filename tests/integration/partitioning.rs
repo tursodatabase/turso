@@ -1,5 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use turso_core::partition::{
@@ -9,6 +11,15 @@ use turso_core::{Connection, Database, PlatformIO, SqliteDialect, Value};
 
 const DAY_MICROS: i64 = 86_400_000_000;
 const FIRST_DAY: i64 = 1_735_689_600_000_000;
+const PARTITION_CRASH_CHILD_ENV: &str = "TURSO_PARTITION_CRASH_TEST_CHILD";
+const PARTITION_CRASH_ROOT_ENV: &str = "TURSO_PARTITION_CRASH_TEST_ROOT";
+const PARTITION_CRASH_TEST_NAME: &str =
+    "partitioning::recorder_recovers_from_interrupted_partition_publication";
+const PARTITION_DELETE_CRASH_TEST_NAME: &str =
+    "partitioning::recorder_recovers_from_interrupted_partition_deletion";
+const PARTITION_CREATE_RACE_CHILD_ENV: &str = "TURSO_PARTITION_CREATE_RACE_TEST_CHILD";
+const PARTITION_CREATE_RACE_TEST_NAME: &str =
+    "partitioning::recorder_concurrent_processes_publish_one_complete_daily_file";
 const EVENTS_SCHEMA: &str = "CREATE TABLE events(\
     id INTEGER PRIMARY KEY,\
     ts INTEGER NOT NULL,\
@@ -136,6 +147,343 @@ fn query_rows(connection: &Arc<Connection>, sql: &str) -> anyhow::Result<Vec<Str
         Ok(())
     })?;
     Ok(rows)
+}
+
+fn wait_for_crash_marker(child: &mut Child, marker: &Path) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if marker.exists() {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("partition crash-test child exited before the pause point: {status}");
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for partition crash-test pause point");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn run_partition_crash_child() -> anyhow::Result<()> {
+    let root =
+        PathBuf::from(std::env::var_os(PARTITION_CRASH_ROOT_ENV).ok_or_else(|| {
+            anyhow::anyhow!("partition crash-test child requires a scenario root")
+        })?);
+    let database_path = root.join("main.db");
+    let partitions_directory = root.join("partitions");
+    let io = Arc::new(PlatformIO::new()?);
+    let database = Database::open_file(
+        io,
+        database_path.to_string_lossy().as_ref(),
+        Arc::new(SqliteDialect),
+    )?;
+    let connection = database.connect()?;
+    connection.execute(format!("{EVENTS_SCHEMA} PARTITION BY (ts)"))?;
+    register_events(&connection, partitions_directory)?;
+    connection.execute(format!(
+        "INSERT INTO events VALUES (1, {}, 'gate-a', 'motion', 0.8)",
+        FIRST_DAY + 1_000
+    ))?;
+    anyhow::bail!("partition crash-test child passed its requested pause point")
+}
+
+fn run_partition_delete_crash_child() -> anyhow::Result<()> {
+    let root =
+        PathBuf::from(std::env::var_os(PARTITION_CRASH_ROOT_ENV).ok_or_else(|| {
+            anyhow::anyhow!("partition crash-test child requires a scenario root")
+        })?);
+    let database_path = root.join("main.db");
+    let partitions_directory = root.join("partitions");
+    let first_path = DefaultPathResolver::daily(partitions_directory.clone())
+        .resolve_path("events", FIRST_DAY + 1_000);
+    let io = Arc::new(PlatformIO::new()?);
+    let database = Database::open_file(
+        io,
+        database_path.to_string_lossy().as_ref(),
+        Arc::new(SqliteDialect),
+    )?;
+    let connection = database.connect()?;
+    connection.execute(format!("{EVENTS_SCHEMA} PARTITION BY (ts)"))?;
+    register_events(&connection, partitions_directory)?;
+    connection.execute(format!(
+        "INSERT INTO events VALUES (1, {}, 'gate-a', 'motion', 0.8)",
+        FIRST_DAY + 1_000
+    ))?;
+    connection.execute(format!(
+        "INSERT INTO events VALUES (2, {}, 'gate-b', 'plate', 0.9)",
+        FIRST_DAY + DAY_MICROS + 1_000
+    ))?;
+    connection.delete_partition("events", &first_path)?;
+    anyhow::bail!("partition delete crash-test child passed its requested pause point")
+}
+
+fn run_partition_create_race_child() -> anyhow::Result<()> {
+    let root = PathBuf::from(std::env::var_os(PARTITION_CRASH_ROOT_ENV).ok_or_else(|| {
+        anyhow::anyhow!("partition creation race child requires a scenario root")
+    })?);
+    let partitions_directory = root.join("partitions");
+    let mut manager = turso_core::partition::PartitionManager::new();
+    manager.register_table(
+        "events",
+        PartitionConfig::new(
+            Box::new(DefaultPathResolver::daily(partitions_directory)),
+            EVENTS_PARTITION_SCHEMA.to_string(),
+            "ts".to_string(),
+        ),
+    )?;
+    manager.ensure_partition("events", FIRST_DAY + 1_000)?;
+    Ok(())
+}
+
+#[test]
+fn recorder_recovers_from_interrupted_partition_publication() -> anyhow::Result<()> {
+    if std::env::var_os(PARTITION_CRASH_CHILD_ENV).is_some() {
+        return run_partition_crash_child();
+    }
+
+    let current_exe = std::env::current_exe()?;
+    for (pause_point, should_be_published) in [
+        ("before_partition_publish", false),
+        ("after_partition_publish", true),
+    ] {
+        let scenario = tempfile::tempdir()?;
+        let marker = scenario.path().join("pause-marker");
+        let mut child = Command::new(&current_exe)
+            .arg(PARTITION_CRASH_TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(PARTITION_CRASH_CHILD_ENV, "1")
+            .env(PARTITION_CRASH_ROOT_ENV, scenario.path())
+            .env("TURSO_PARTITION_TEST_PAUSE_POINT", pause_point)
+            .env("TURSO_PARTITION_TEST_PAUSE_MARKER", &marker)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        if let Err(error) = wait_for_crash_marker(&mut child, &marker) {
+            let _ = child.kill();
+            let output = child.wait_with_output()?;
+            anyhow::bail!(
+                "{error}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        child.kill()?;
+        let output = child.wait_with_output()?;
+        assert!(
+            !output.status.success(),
+            "partition crash-test child should be terminated at {pause_point}"
+        );
+
+        let database_path = scenario.path().join("main.db");
+        let partitions_directory = scenario.path().join("partitions");
+        let partition_path = DefaultPathResolver::daily(partitions_directory.clone())
+            .resolve_path("events", FIRST_DAY + 1_000);
+        assert_eq!(
+            partition_path.exists(),
+            should_be_published,
+            "unexpected publication state after {pause_point}"
+        );
+
+        let io = Arc::new(PlatformIO::new()?);
+        let database = Database::open_file(
+            io,
+            database_path.to_string_lossy().as_ref(),
+            Arc::new(SqliteDialect),
+        )?;
+        let connection = database.connect()?;
+        register_events(&connection, partitions_directory)?;
+        connection.execute(format!(
+            "INSERT INTO events VALUES (1, {}, 'gate-a', 'motion', 0.8)",
+            FIRST_DAY + 1_000
+        ))?;
+        assert_eq!(query_rows(&connection, "SELECT id FROM events")?, vec!["1"]);
+        assert_eq!(connection.list_partitions("events")?.len(), 1);
+
+        let physical_io = Arc::new(PlatformIO::new()?);
+        let physical_database = Database::open_file(
+            physical_io,
+            partition_path.to_string_lossy().as_ref(),
+            Arc::new(SqliteDialect),
+        )?;
+        let physical_connection = physical_database.connect()?;
+        assert_eq!(
+            query_rows(&physical_connection, "PRAGMA integrity_check")?,
+            vec!["ok"]
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn recorder_recovers_from_interrupted_partition_deletion() -> anyhow::Result<()> {
+    if std::env::var_os(PARTITION_CRASH_CHILD_ENV).is_some() {
+        return run_partition_delete_crash_child();
+    }
+
+    let current_exe = std::env::current_exe()?;
+    for (pause_point, first_partition_survives) in [
+        ("after_partition_detach_before_delete", true),
+        ("after_partition_delete_before_catalog_update", false),
+    ] {
+        let scenario = tempfile::tempdir()?;
+        let marker = scenario.path().join("pause-marker");
+        let mut child = Command::new(&current_exe)
+            .arg(PARTITION_DELETE_CRASH_TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(PARTITION_CRASH_CHILD_ENV, "1")
+            .env(PARTITION_CRASH_ROOT_ENV, scenario.path())
+            .env("TURSO_PARTITION_TEST_PAUSE_POINT", pause_point)
+            .env("TURSO_PARTITION_TEST_PAUSE_MARKER", &marker)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        if let Err(error) = wait_for_crash_marker(&mut child, &marker) {
+            let _ = child.kill();
+            let output = child.wait_with_output()?;
+            anyhow::bail!(
+                "{error}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        child.kill()?;
+        let output = child.wait_with_output()?;
+        assert!(
+            !output.status.success(),
+            "partition delete crash-test child should be terminated at {pause_point}"
+        );
+
+        let database_path = scenario.path().join("main.db");
+        let partitions_directory = scenario.path().join("partitions");
+        let first_path = DefaultPathResolver::daily(partitions_directory.clone())
+            .resolve_path("events", FIRST_DAY + 1_000);
+        assert_eq!(
+            first_path.exists(),
+            first_partition_survives,
+            "unexpected deletion state after {pause_point}"
+        );
+
+        let io = Arc::new(PlatformIO::new()?);
+        let database = Database::open_file(
+            io,
+            database_path.to_string_lossy().as_ref(),
+            Arc::new(SqliteDialect),
+        )?;
+        let connection = database.connect()?;
+        register_events(&connection, partitions_directory)?;
+        let expected = if first_partition_survives {
+            vec!["1", "2"]
+        } else {
+            vec!["2"]
+        };
+        assert_eq!(
+            query_rows(&connection, "SELECT id FROM events ORDER BY id")?,
+            expected
+        );
+
+        if first_partition_survives {
+            connection.delete_partition("events", &first_path)?;
+        }
+        assert_eq!(
+            query_rows(&connection, "SELECT id FROM events ORDER BY id")?,
+            vec!["2"]
+        );
+        assert_eq!(connection.list_partitions("events")?.len(), 1);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn recorder_concurrent_processes_publish_one_complete_daily_file() -> anyhow::Result<()> {
+    if std::env::var_os(PARTITION_CREATE_RACE_CHILD_ENV).is_some() {
+        return run_partition_create_race_child();
+    }
+
+    let scenario = tempfile::tempdir()?;
+    let release = scenario.path().join("release-marker");
+    let current_exe = std::env::current_exe()?;
+    let mut children = Vec::new();
+    for child_index in 0..2 {
+        let marker = scenario.path().join(format!("pause-marker-{child_index}"));
+        let child = Command::new(&current_exe)
+            .arg(PARTITION_CREATE_RACE_TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(PARTITION_CREATE_RACE_CHILD_ENV, "1")
+            .env(PARTITION_CRASH_ROOT_ENV, scenario.path())
+            .env(
+                "TURSO_PARTITION_TEST_PAUSE_POINT",
+                "before_partition_publish",
+            )
+            .env("TURSO_PARTITION_TEST_PAUSE_MARKER", &marker)
+            .env("TURSO_PARTITION_TEST_RELEASE_MARKER", &release)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        children.push((child, marker));
+    }
+
+    let mut barrier_error = None;
+    for (child, marker) in &mut children {
+        if let Err(error) = wait_for_crash_marker(child, marker) {
+            barrier_error = Some(error);
+            break;
+        }
+    }
+    if let Some(error) = barrier_error {
+        for (child, _) in &mut children {
+            let _ = child.kill();
+        }
+        anyhow::bail!("partition creation race did not reach its barrier: {error}");
+    }
+    std::fs::write(&release, b"release")?;
+
+    for (child, _) in children {
+        let output = child.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "partition creation race child failed: stdout={}; stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let partitions_directory = scenario.path().join("partitions");
+    let partition_path = DefaultPathResolver::daily(partitions_directory.clone())
+        .resolve_path("events", FIRST_DAY + 1_000);
+    assert!(partition_path.exists());
+    let entries = std::fs::read_dir(&partitions_directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(entries, vec![partition_path.clone()]);
+
+    let io = Arc::new(PlatformIO::new()?);
+    let database = Database::open_file(
+        io,
+        partition_path.to_string_lossy().as_ref(),
+        Arc::new(SqliteDialect),
+    )?;
+    let connection = database.connect()?;
+    assert_eq!(
+        query_rows(&connection, "PRAGMA integrity_check")?,
+        vec!["ok"]
+    );
+    assert_eq!(
+        query_rows(
+            &connection,
+            "SELECT name FROM sqlite_schema WHERE type IN ('table', 'index') ORDER BY name"
+        )?,
+        vec!["events", "idx_events_ts", "idx_events_type_ts"]
+    );
+
+    Ok(())
 }
 
 #[test]
@@ -1662,7 +2010,7 @@ fn video_analytics_layout_creates_discovers_and_recreates_daily_files() -> anyho
             Box::new(VideoAnalyticsPathResolver::daily(
                 archive_path.clone(),
                 "line_crossing".to_string(),
-            )),
+            )?),
             EVENTS_PARTITION_SCHEMA.to_string(),
             "ts".to_string(),
         ),
@@ -1678,7 +2026,7 @@ fn video_analytics_layout_creates_discovers_and_recreates_daily_files() -> anyho
     ))?;
 
     let resolver =
-        VideoAnalyticsPathResolver::daily(archive_path.clone(), "line_crossing".to_string());
+        VideoAnalyticsPathResolver::daily(archive_path.clone(), "line_crossing".to_string())?;
     let first_path = resolver.resolve_path("events", FIRST_DAY);
     let second_path = resolver.resolve_path("events", FIRST_DAY + DAY_MICROS);
     assert!(first_path.exists());

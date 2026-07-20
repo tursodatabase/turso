@@ -194,7 +194,7 @@ impl PartitionManager {
         // No attached partition found for this timestamp
         Err(PartitionError::NotAttached {
             table: table_name.to_string(),
-            partition: format!("timestamp {}", timestamp_micros),
+            partition: format!("timestamp {timestamp_micros}"),
         })
     }
 
@@ -743,7 +743,7 @@ mod tests {
             .register_table("events", create_test_config())
             .unwrap();
 
-        let result = manager.route_insert("events", 1737547200_000_000);
+        let result = manager.route_insert("events", 1_737_547_200_000_000);
         assert!(matches!(result, Err(PartitionError::NotAttached { .. })));
     }
 
@@ -759,16 +759,16 @@ mod tests {
         let mut p1 = PartitionFile::new(
             PathBuf::from("/tmp/p1.db"),
             "events_20250121".to_string(),
-            1737417600_000_000, // 2025-01-21
-            1737504000_000_000, // 2025-01-22
+            1_737_417_600_000_000, // 2025-01-21
+            1_737_504_000_000_000, // 2025-01-22
         );
         p1.mark_attached(1);
 
         let mut p2 = PartitionFile::new(
             PathBuf::from("/tmp/p2.db"),
             "events_20250122".to_string(),
-            1737504000_000_000, // 2025-01-22
-            1737590400_000_000, // 2025-01-23
+            1_737_504_000_000_000, // 2025-01-22
+            1_737_590_400_000_000, // 2025-01-23
         );
         p2.mark_attached(2);
 
@@ -778,8 +778,8 @@ mod tests {
         // Test filtering
         let filtered = manager.filter_by_range(
             "events",
-            Some(1737460000_000_000), // Jan 21 midday
-            Some(1737547200_000_000), // Jan 22 midday
+            Some(1_737_460_000_000_000), // Jan 21 midday
+            Some(1_737_547_200_000_000), // Jan 22 midday
         );
 
         assert_eq!(filtered.len(), 2);
@@ -797,20 +797,20 @@ mod tests {
         let mut p1 = PartitionFile::new(
             PathBuf::from("/tmp/p1.db"),
             "events_20250122".to_string(),
-            1737504000_000_000, // 2025-01-22 00:00:00 UTC
-            1737590400_000_000, // 2025-01-23 00:00:00 UTC
+            1_737_504_000_000_000, // 2025-01-22 00:00:00 UTC
+            1_737_590_400_000_000, // 2025-01-23 00:00:00 UTC
         );
         p1.mark_attached(1);
         partitions.push(p1);
 
         // Route should succeed for timestamp in range
-        let result = manager.route_insert("events", 1737547200_000_000); // Jan 22 midday
+        let result = manager.route_insert("events", 1_737_547_200_000_000); // Jan 22 midday
         assert!(result.is_ok());
         let partition = result.unwrap();
         assert_eq!(partition.db_alias, "events_20250122");
 
         // Route should fail for timestamp outside range
-        let result = manager.route_insert("events", 1737417600_000_000); // Jan 21
+        let result = manager.route_insert("events", 1_737_417_600_000_000); // Jan 21
         assert!(matches!(result, Err(PartitionError::NotAttached { .. })));
     }
 
@@ -830,16 +830,16 @@ mod tests {
         let mut p1 = PartitionFile::new(
             PathBuf::from("/tmp/p1.db"),
             "events_20250121".to_string(),
-            1737417600_000_000,
-            1737504000_000_000,
+            1_737_417_600_000_000,
+            1_737_504_000_000_000,
         );
         p1.mark_attached(1);
 
         let p2 = PartitionFile::new(
             PathBuf::from("/tmp/p2.db"),
             "events_20250122".to_string(),
-            1737504000_000_000,
-            1737590400_000_000,
+            1_737_504_000_000_000,
+            1_737_590_400_000_000,
         );
         // p2 is not attached
 
@@ -863,12 +863,12 @@ mod tests {
         let partitions = manager.partitions.get_mut("events").unwrap();
         for i in 21usize..=25 {
             let day_offset = (i - 20) as i64;
-            let start = 1737331200_000_000 + day_offset * 86400_000_000;
+            let start = 1_737_331_200_000_000 + day_offset * 86_400_000_000;
             let mut p = PartitionFile::new(
                 PathBuf::from(format!("/tmp/p{}.db", i)),
                 format!("events_202501{}", i),
                 start,
-                start + 86400_000_000,
+                start + 86_400_000_000,
             );
             p.mark_attached(i);
             partitions.push(p);
@@ -879,11 +879,11 @@ mod tests {
         assert_eq!(all.len(), 5);
 
         // Filter with only start bound
-        let from_22 = manager.filter_by_range("events", Some(1737504000_000_000), None);
+        let from_22 = manager.filter_by_range("events", Some(1_737_504_000_000_000), None);
         assert_eq!(from_22.len(), 4); // Jan 22, 23, 24, 25
 
         // Filter with only end bound
-        let before_24 = manager.filter_by_range("events", None, Some(1737676800_000_000));
+        let before_24 = manager.filter_by_range("events", None, Some(1_737_676_800_000_000));
         assert_eq!(before_24.len(), 3); // Jan 21, 22, 23
     }
 
@@ -972,5 +972,61 @@ mod tests {
             manager.attach_partition("events", &path),
             Err(PartitionError::NonCanonicalPath { .. })
         ));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn failed_directory_creation_does_not_publish_or_register_partition() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocking_file = directory.path().join("not-a-directory");
+        std::fs::write(&blocking_file, b"block partition directory creation").unwrap();
+        let target_directory = blocking_file.join("partitions");
+        let target_path =
+            DefaultPathResolver::daily(target_directory.clone()).resolve_path("events", 0);
+        let mut manager = PartitionManager::new();
+        manager
+            .register_table(
+                "events",
+                PartitionConfig::new(
+                    Box::new(DefaultPathResolver::daily(target_directory)),
+                    "CREATE TABLE events(ts INTEGER NOT NULL)".to_string(),
+                    "ts".to_string(),
+                ),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            manager.ensure_partition("events", 0),
+            Err(PartitionError::IoError(_))
+        ));
+        assert!(!target_path.exists());
+        assert!(manager.list_partitions("events").unwrap().is_empty());
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn failed_schema_initialization_leaves_no_partition_candidate() {
+        let directory = tempfile::tempdir().unwrap();
+        let target_path =
+            DefaultPathResolver::daily(directory.path().to_path_buf()).resolve_path("events", 0);
+        let mut manager = PartitionManager::new();
+        manager
+            .register_table(
+                "events",
+                PartitionConfig::new(
+                    Box::new(DefaultPathResolver::daily(directory.path().to_path_buf())),
+                    "CREATE TABLE events(".to_string(),
+                    "ts".to_string(),
+                ),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            manager.ensure_partition("events", 0),
+            Err(PartitionError::DatabaseError(_))
+        ));
+        assert!(!target_path.exists());
+        assert!(manager.list_partitions("events").unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 }
