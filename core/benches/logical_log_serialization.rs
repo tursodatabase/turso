@@ -34,6 +34,15 @@ fn cold_buffer(bencher: Bencher, payload_len: usize) {
 fn transaction_batch(bencher: Bencher, op_count: usize) {
     let row_version = table_upsert(128);
 
+    // CodSpeed instruments a single iteration, unlike Divan's wall-time runner.
+    // Prime mimalloc's size classes so segment setup is not charged to whichever
+    // batch size happens to request a fresh allocator page first.
+    let mut warm_buffer = Vec::new();
+    for _ in 0..op_count {
+        benchmark_serialize_op_entry(&mut warm_buffer, &row_version, None).unwrap();
+    }
+    black_box(warm_buffer);
+
     bencher
         .with_inputs(Vec::new)
         .bench_local_values(|mut buffer| {

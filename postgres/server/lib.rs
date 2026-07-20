@@ -640,6 +640,7 @@ fn is_pg_non_query(sql: &str) -> bool {
         || upper.starts_with("CREATE SCHEMA")
         || upper.starts_with("DROP SCHEMA")
         || upper.starts_with("REFRESH MATERIALIZED VIEW")
+        || upper.starts_with("COMMENT")
 }
 
 fn command_tag(query: &str, affected_rows: usize) -> Tag {
@@ -682,6 +683,8 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("SET")
     } else if upper.starts_with("COPY") {
         Tag::new("COPY").with_rows(affected_rows)
+    } else if upper.starts_with("COMMENT") {
+        Tag::new("COMMENT")
     } else {
         Tag::new("OK")
     }

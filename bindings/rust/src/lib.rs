@@ -47,6 +47,7 @@ pub mod sync;
 
 pub use connection::Connection;
 use turso_sdk_kit::rsapi::TursoError;
+pub use turso_sdk_kit::IoBackend;
 pub use value::Value;
 
 pub use params::params_from_iter;
@@ -149,7 +150,7 @@ pub struct Builder {
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
     enable_mvcc_passive_checkpoint: bool,
-    vfs: Option<String>,
+    vfs: IoBackend,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
     io: Option<Arc<dyn turso_core::IO>>,
 }
@@ -169,7 +170,7 @@ impl Builder {
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
             enable_mvcc_passive_checkpoint: false,
-            vfs: None,
+            vfs: IoBackend::Default,
             encryption_opts: None,
             io: None,
         }
@@ -240,8 +241,8 @@ impl Builder {
         self
     }
 
-    pub fn with_io(mut self, vfs: String) -> Self {
-        self.vfs = Some(vfs);
+    pub fn with_io(mut self, vfs: impl Into<IoBackend>) -> Self {
+        self.vfs = vfs.into();
         self
     }
 

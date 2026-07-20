@@ -285,14 +285,14 @@ fn test_fresh_mvcc_attach_rejects_custom_durable_storage_without_attached_backen
         None,
     ));
 
-    let db = Database::open_file_with_flags_and_durable_storage(
+    let db = Database::open(
         tmp_db.io.clone(),
         db_path.to_str().unwrap(),
-        OpenFlags::default(),
-        DatabaseOpts::new().with_attach(true),
-        None,
-        Some(durable_storage),
-        Arc::new(SqliteDialect),
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(DatabaseOpts::new().with_attach(true))
+            .durable_storage(
+                durable_storage as Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>,
+            ),
     )?;
     let conn = db.connect()?;
     conn.pragma_update("journal_mode", "'mvcc'")?;

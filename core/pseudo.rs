@@ -1,4 +1,4 @@
-use crate::{types::ImmutableRecord, Result, Value};
+use crate::types::ImmutableRecord;
 
 pub struct PseudoCursor {
     current: Option<ImmutableRecord>,
@@ -20,14 +20,5 @@ impl PseudoCursor {
     #[inline]
     pub fn insert(&mut self, record: ImmutableRecord) {
         self.current = Some(record);
-    }
-
-    #[inline]
-    pub fn get_value(&self, column: usize) -> Result<Value> {
-        if let Some(record) = self.current.as_ref() {
-            Ok(record.get_value(column)?.to_owned()?)
-        } else {
-            Ok(Value::Null)
-        }
     }
 }

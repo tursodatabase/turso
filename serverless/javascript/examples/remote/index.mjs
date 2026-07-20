@@ -15,9 +15,9 @@ await client.batch(
     "write",
 );
 
-// Using execute method
-const result = await client.execute("SELECT * FROM users");
-console.log("Users (execute):", result.rows);
+// Using the connection-level all method
+const users = await client.all("SELECT * FROM users");
+console.log("Users (all):", users);
 
 // Using prepare and get method
 const stmt = client.prepare("SELECT * FROM users LIMIT 1");

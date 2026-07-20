@@ -1774,6 +1774,17 @@ pub fn op_column(
         },
         insn
     );
+    // Fast path: no deferred seek pending and no suspended state machine. The
+    // column fetch either completes or yields IO with nothing persisted, so the
+    // op-state slot (enum write + drop on clear) is bypassed entirely. On IO
+    // resume the slot is still idle and this path re-executes.
+    if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
+        let result = op_column_fetch(program, state, *cursor_id, *column, *dest, default)?;
+        if matches!(result, InsnFunctionStepResult::Step) {
+            state.pc += 1;
+        }
+        return Ok(result);
+    }
     'outer: loop {
         match *state.active_op_state.column() {
             OpColumnState::Start => {
@@ -1833,140 +1844,162 @@ pub fn op_column(
                 *state.active_op_state.column() = OpColumnState::GetColumn;
             }
             OpColumnState::GetColumn => {
-                let (active_cursor_id, active_column) = (*cursor_id, *column);
-                // First check if this is a MaterializedViewCursor
-                {
-                    let cursor = state.get_cursor(active_cursor_id);
-                    if let Cursor::MaterializedView(mv_cursor) = cursor {
-                        // Handle materialized view column access
-                        let value = return_if_io!(mv_cursor.column(active_column));
-                        state.registers[*dest].set_value(value);
-                        break 'outer;
-                    }
-                    // Fall back to normal handling
+                let result = op_column_fetch(program, state, *cursor_id, *column, *dest, default)?;
+                if !matches!(result, InsnFunctionStepResult::Step) {
+                    // IO yield: the slot stays at GetColumn so the resume
+                    // re-enters this arm.
+                    return Ok(result);
                 }
-
-                let (_, cursor_type) = program
-                    .cursor_ref
-                    .get(active_cursor_id)
-                    .expect("cursor_id should exist in cursor_ref");
-                match cursor_type {
-                    CursorType::BTreeTable(_)
-                    | CursorType::BTreeIndex(_)
-                    | CursorType::MaterializedView(_, _) => {
-                        {
-                            let cursor_ref = must_be_btree_cursor!(
-                                active_cursor_id,
-                                program.cursor_ref,
-                                state,
-                                "Column"
-                            );
-                            let cursor = cursor_ref.as_btree_mut();
-
-                            if cursor.get_null_flag() {
-                                tracing::trace!("op_column(null_flag)");
-                                state.registers[*dest].set_null();
-                                break 'outer;
-                            }
-
-                            let record_result = return_if_io!(cursor.record());
-                            let Some(record) = record_result else {
-                                // Cursor is not positioned on a valid row (e.g., empty table).
-                                // Return NULL, not the column's default value.
-                                // DEFAULT handling below is for when record exists
-                                // but has fewer columns than expected.
-                                state.registers[*dest].set_null();
-                                break 'outer;
-                            };
-
-                            let mut payload_iterator = record.iter()?;
-
-                            // Parse the header for serial types incrementally until we have the target column
-                            // Use nth_into_register to write directly to the register without
-                            // creating intermediate ValueRef allocations
-
-                            match payload_iterator
-                                .nth_into_register(*column, &mut state.registers[*dest])
-                            {
-                                Some(result) => {
-                                    result?;
-                                    break 'outer;
-                                }
-                                None => {
-                                    branches::mark_unlikely();
-                                    // record has fewer columns than expected
-                                }
-                            };
-
-                            //break;
-                        };
-
-                        // DEFAULT handling
-                        let Some(ref default) = default else {
-                            state.registers[*dest].set_null();
-                            break;
-                        };
-                        match (default, &mut state.registers[*dest]) {
-                            (
-                                Value::Text(new_text),
-                                Register::Value(Value::Text(existing_text)),
-                            ) => {
-                                existing_text.do_extend(new_text)?;
-                            }
-                            (
-                                Value::Blob(new_blob),
-                                Register::Value(Value::Blob(existing_blob)),
-                            ) => {
-                                existing_blob.do_extend(new_blob)?;
-                            }
-                            _ => {
-                                state.registers[*dest].set_value(default.clone());
-                            }
-                        }
-                        break;
-                    }
-                    CursorType::Sorter => {
-                        let record = {
-                            let cursor = state.get_cursor(*cursor_id);
-                            let cursor = cursor.as_sorter_mut();
-                            cursor.record().cloned()
-                        };
-                        if let Some(record) = record {
-                            state.registers[*dest].set_value(match record.get_value_opt(*column) {
-                                Some(val) => val.to_owned()?,
-                                None => default.clone().unwrap_or(Value::Null),
-                            });
-                        } else {
-                            state.registers[*dest].set_null();
-                        }
-                    }
-                    CursorType::Pseudo(_) => {
-                        let value = {
-                            let cursor = state.get_cursor(*cursor_id);
-                            let cursor = cursor.as_pseudo_mut();
-                            cursor.get_value(*column)?
-                        };
-                        state.registers[*dest].set_value(value);
-                    }
-                    CursorType::IndexMethod(..) => {
-                        let cursor = state.cursors[*cursor_id]
-                            .as_mut()
-                            .expect("cursor should exist");
-                        let cursor = cursor.as_index_method_mut();
-                        let value = return_if_io!(cursor.query_column(*column));
-                        state.registers[*dest].set_value(value);
-                    }
-                    CursorType::VirtualTable(_) => {
-                        panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
-                    }
-                }
-                break;
+                break 'outer;
             }
         }
     }
 
     state.active_op_state.clear();
     state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Fetches one column of the cursor's current row into a register. Returns
+/// `Step` on completion; any IO is propagated without persisting state, so
+/// callers can safely re-invoke after the completion finishes.
+fn op_column_fetch(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    column: usize,
+    dest: usize,
+    default: &Option<Value>,
+) -> Result<InsnFunctionStepResult> {
+    // First check if this is a MaterializedViewCursor
+    {
+        let cursor = state.get_cursor(cursor_id);
+        if let Cursor::MaterializedView(mv_cursor) = cursor {
+            // Handle materialized view column access
+            let value = return_if_io!(mv_cursor.column(column));
+            state.registers[dest].set_value(value);
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        // Fall back to normal handling
+    }
+
+    let (_, cursor_type) = program
+        .cursor_ref
+        .get(cursor_id)
+        .expect("cursor_id should exist in cursor_ref");
+    match cursor_type {
+        CursorType::BTreeTable(_)
+        | CursorType::BTreeIndex(_)
+        | CursorType::MaterializedView(_, _) => {
+            {
+                let cursor_ref =
+                    must_be_btree_cursor!(cursor_id, program.cursor_ref, state, "Column");
+                let cursor = cursor_ref.as_btree_mut();
+
+                if cursor.get_null_flag() {
+                    tracing::trace!("op_column(null_flag)");
+                    state.registers[dest].set_null();
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+
+                let record_result = return_if_io!(cursor.record());
+                let Some(record) = record_result else {
+                    // Cursor is not positioned on a valid row (e.g., empty table).
+                    // Return NULL, not the column's default value.
+                    // DEFAULT handling below is for when record exists
+                    // but has fewer columns than expected.
+                    state.registers[dest].set_null();
+                    return Ok(InsnFunctionStepResult::Step);
+                };
+
+                let mut payload_iterator = record.iter()?;
+
+                // Parse the header for serial types incrementally until we have the target column
+                // Use nth_into_register to write directly to the register without
+                // creating intermediate ValueRef allocations
+
+                match payload_iterator.nth_into_register(column, &mut state.registers[dest]) {
+                    Some(result) => {
+                        result?;
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                    None => {
+                        branches::mark_unlikely();
+                        // record has fewer columns than expected
+                    }
+                };
+            };
+
+            // DEFAULT handling
+            let Some(ref default) = default else {
+                state.registers[dest].set_null();
+                return Ok(InsnFunctionStepResult::Step);
+            };
+            match (default, &mut state.registers[dest]) {
+                (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
+                    existing_text.do_extend(new_text)?;
+                }
+                (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
+                    existing_blob.do_extend(new_blob)?;
+                }
+                _ => {
+                    state.registers[dest].set_value(default.clone());
+                }
+            }
+        }
+        CursorType::Sorter => {
+            let record = {
+                let cursor = state.get_cursor(cursor_id);
+                let cursor = cursor.as_sorter_mut();
+                cursor.record().cloned()
+            };
+            if let Some(record) = record {
+                state.registers[dest].set_value(match record.get_value_opt(column) {
+                    Some(val) => val.to_owned()?,
+                    None => default.clone().unwrap_or(Value::Null),
+                });
+            } else {
+                state.registers[dest].set_null();
+            }
+        }
+        CursorType::Pseudo(_) => {
+            let cursor = crate::get_cursor!(state, cursor_id);
+            let cursor = cursor.as_pseudo_mut();
+            match cursor.record() {
+                Some(record) => {
+                    // Decode straight into the register; going through an owned
+                    // Value would allocate for every TEXT/BLOB column on every row.
+                    let mut payload_iterator = record.iter()?;
+                    match payload_iterator.nth_into_register(column, &mut state.registers[dest]) {
+                        Some(result) => result?,
+                        // A pseudo cursor is opened with num_fields matching the
+                        // record built for it, so every emitted Column index is in
+                        // range. NULL on a missing column matches the b-tree arm.
+                        None => {
+                            turso_debug_assert!(
+                                false,
+                                "pseudo-cursor column out of range for record",
+                                { "column": column }
+                            );
+                            state.registers[dest].set_null();
+                        }
+                    }
+                }
+                None => state.registers[dest].set_null(),
+            }
+        }
+        CursorType::IndexMethod(..) => {
+            let cursor = state.cursors[cursor_id]
+                .as_mut()
+                .expect("cursor should exist");
+            let cursor = cursor.as_index_method_mut();
+            let value = return_if_io!(cursor.query_column(column));
+            state.registers[dest].set_value(value);
+        }
+        CursorType::VirtualTable(_) => {
+            panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
+        }
+    }
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -6742,6 +6775,44 @@ fn op_window_step(
             };
             *counter += 1;
         }
+        // rank() — mirrors SQLite's CallCount-based rankStepFunc.
+        //
+        // State (payload):
+        //   [0] = current rank value (what AggValue returns; cleared to 0 by
+        //         AggValue so the next step can detect that AggValue just ran).
+        //   [1] = rows-seen counter for the partition (always increments).
+        //
+        // The "latch on zero" trick: AggValue clears payload[0] every time it
+        // runs, and a flush only happens at peer-group / partition boundaries.
+        // So when this step observes payload[0] == 0, it knows AggValue just
+        // fired on the prior peer group — meaning this row begins a fresh peer
+        // group, and the current row position (rows_seen) is the new rank.
+        // Subsequent rows in the same peer group see payload[0] != 0 and leave
+        // the rank value untouched, so every peer reads the same rank.
+        WindowFunc::Rank => {
+            if let Register::Value(Value::Null) = state.registers[acc_reg] {
+                state.registers[acc_reg] =
+                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
+                        Value::from_i64(0),
+                        Value::from_i64(0),
+                    ]?));
+            }
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                unreachable!("rank accumulator must be a Builtin payload");
+            };
+            let Value::Numeric(Numeric::Integer(rows_seen)) = &mut payload[1] else {
+                unreachable!("rank rows_seen counter must be Integer");
+            };
+            *rows_seen += 1;
+            let rows_seen = *rows_seen;
+            let Value::Numeric(Numeric::Integer(rank)) = &mut payload[0] else {
+                unreachable!("rank current value must be Integer");
+            };
+            if *rank == 0 {
+                *rank = rows_seen;
+            }
+        }
         other => {
             return Err(LimboError::InternalError(format!(
                 "window function {other} reached runtime dispatch but has no handler"
@@ -6768,6 +6839,18 @@ fn op_window_value(
                 )))
             }
         },
+        WindowFunc::Rank => {
+            // Read current rank, then clear it so the next peer group's first
+            // AggStep latches a fresh value (matches SQLite's rankValueFunc).
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                return Err(LimboError::InternalError(format!(
+                    "rank accumulator in unexpected register state: {:?}",
+                    state.registers[acc_reg]
+                )));
+            };
+            std::mem::replace(&mut payload[0], Value::from_i64(0))
+        }
         other => {
             return Err(LimboError::InternalError(format!(
                 "window function {other} reached runtime dispatch but has no handler"
@@ -16396,6 +16479,24 @@ fn op_journal_mode_inner(
                 // Check if database is readonly - cannot change journal mode on readonly databases
                 if program.connection.is_readonly(*db) {
                     return Err(LimboError::ReadOnly);
+                }
+
+                // CDC capture is connection-level state that feeds off the
+                // current journal mode's write path. Changing the mode while
+                // capture is active silently stops capture while the capture
+                // pragma still reports it as on. Reject the change loudly
+                // (0.6 rejected it with "cannot enable MVCC while CDC is
+                // active"; that guard was lost in the logical log v3
+                // redesign). A no-op re-run of the current mode is fine —
+                // the same-mode early return above already handled it.
+                if program.connection.get_capture_data_changes_info().is_some() {
+                    let prev: &'static str = prev_mode.into();
+                    let new: &'static str = new_mode.into();
+                    return Err(LimboError::InvalidArgument(format!(
+                        "cannot change journal_mode (from {prev} to {new}) while CDC capture is active: \
+                         capture would silently stop; disable capture first with \
+                         PRAGMA capture_data_changes_conn('off')"
+                    )));
                 }
 
                 // MVCC has no cross-process coordination: commit

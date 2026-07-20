@@ -533,6 +533,12 @@ impl ActiveOpStateSlot {
         self.state = ActiveOpState::None;
     }
 
+    /// True when no multi-step opcode is suspended. Hot opcodes use this to
+    /// bypass the slot entirely on their non-yielding fast path.
+    fn is_idle(&self) -> bool {
+        matches!(self.state, ActiveOpState::None)
+    }
+
     fn cleanup_journal_mode_checkpoint(&mut self) -> Result<()> {
         match &mut self.state {
             ActiveOpState::JournalMode(state) => state.cleanup_checkpoint(),

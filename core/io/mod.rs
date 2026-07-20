@@ -30,6 +30,7 @@ cfg_block! {
     }
 
     #[cfg(all(target_os = "windows", not(miri)))] {
+        mod windows_lock;
         mod windows;
         #[cfg(feature = "fs")]
         pub use windows::WindowsIO;
@@ -233,6 +234,39 @@ pub trait File: Send + Sync {
         Err(crate::LimboError::InternalError(
             "shared WAL coordination byte locking is not supported for this file".into(),
         ))
+    }
+
+    /// Probe whether the caller could hold an exclusive lock without leaving
+    /// any lock state changed on return.
+    fn shared_wal_probe_exclusive_byte(
+        &self,
+        offset: u64,
+        kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        let locked = self.shared_wal_try_lock_byte(offset, true, kind)?;
+        if locked {
+            self.shared_wal_unlock_byte(offset, kind)?;
+        }
+        Ok(locked)
+    }
+
+    /// Probe whether the caller's existing shared lock can become exclusive,
+    /// restoring that shared lock before returning.
+    fn shared_wal_probe_exclusive_while_shared_byte(
+        &self,
+        offset: u64,
+        kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        self.shared_wal_unlock_byte(offset, kind)?;
+        let probe = match self.shared_wal_probe_exclusive_byte(offset, kind) {
+            Ok(probe) => probe,
+            Err(err) => {
+                self.shared_wal_lock_byte(offset, false, kind)?;
+                return Err(err);
+            }
+        };
+        self.shared_wal_lock_byte(offset, false, kind)?;
+        Ok(probe)
     }
 
     fn shared_wal_unlock_byte(&self, _offset: u64, _kind: SharedWalLockKind) -> Result<()> {

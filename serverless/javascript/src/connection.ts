@@ -10,7 +10,7 @@ export type { BatchMode } from './session.js';
 /**
  * Configuration options for connecting to a Turso database.
  */
-export interface Config extends SessionConfig {}
+export interface Config extends SessionConfig { }
 
 export type BatchStatement = string | {
   sql: string;
@@ -64,14 +64,14 @@ function toResultSet(result: any): any {
  * and corrupt the stream. This is the same model as SQLite itself (one execution
  * at a time per connection).
  *
- * If you call `execute()` while another is in flight, the call automatically
+ * If you call `all()` while another statement is in flight, the call automatically
  * waits for the previous one to finish — just like the native
  * `@tursodatabase/database` binding.
  *
  * ## Parallel queries
  *
  * For parallelism, create multiple connections. `connect()` is cheap — it just
- * allocates a config object. No TCP connection is opened until the first `execute()`,
+ * allocates a config object. No TCP connection is opened until the first query,
  * and the underlying `fetch()` runtime automatically pools and reuses TCP/TLS
  * connections to the same origin.
  *
@@ -82,14 +82,14 @@ function toResultSet(result: any): any {
  *
  * // Option 1: one connection per parallel query
  * const [users, orders] = await Promise.all([
- *   connect(config).execute("SELECT * FROM users WHERE active = 1"),
- *   connect(config).execute("SELECT * FROM orders WHERE status = 'pending'"),
+ *   connect(config).all("SELECT * FROM users WHERE active = 1"),
+ *   connect(config).all("SELECT * FROM orders WHERE status = 'pending'"),
  * ]);
  *
  * // Option 2: reusable pool for repeated parallel work
  * const pool = Array.from({ length: 4 }, () => connect(config));
  * const results = await Promise.all(
- *   queries.map((sql, i) => pool[i % pool.length].execute(sql))
+ *   queries.map((sql, i) => pool[i % pool.length].all(sql))
  * );
  * ```
  */
@@ -146,7 +146,7 @@ export class Connection {
     if (!this.isOpen) {
       throw new TypeError("The database connection is not open");
     }
-    
+
     // Describe on the existing session so it sees uncommitted DDL
     // (e.g. CREATE TABLE in the same transaction).
     await this.execLock.acquire();
@@ -156,7 +156,7 @@ export class Connection {
     } finally {
       this.execLock.release();
     }
-    
+
     const stmt = Statement.fromSession(this.session, sql, description.cols, this.execLock);
     if (this.defaultSafeIntegerMode) {
       stmt.safeIntegers(true);
@@ -220,31 +220,6 @@ export class Connection {
    */
   async *iterate(sql: string, ...bindParameters: any[]): AsyncGenerator<any> {
     for (const row of await this.all(sql, ...bindParameters)) yield row;
-  }
-
-  /**
-   * Execute a SQL statement and return all results.
-   *
-   * @param sql - The SQL statement to execute
-   * @param args - Optional array of parameter values
-   * @returns Promise resolving to the complete result set
-   *
-   * @example
-   * ```typescript
-   * const result = await client.execute("SELECT * FROM users WHERE id = ?", [123]);
-   * console.log(result.rows);
-   * ```
-   */
-  async execute(sql: string, args?: any[], queryOptions?: QueryOptions): Promise<any> {
-    if (!this.isOpen) {
-      throw new TypeError("The database connection is not open");
-    }
-    await this.execLock.acquire();
-    try {
-      return await this.session.execute(sql, args || [], this.defaultSafeIntegerMode, queryOptions);
-    } finally {
-      this.execLock.release();
-    }
   }
 
   /**
@@ -326,7 +301,7 @@ export class Connection {
    * // Atomic via the transactionAsync() API for mixed workloads.
    * const txn = db.transactionAsync(async (tx) => {
    *   await tx.batch([{ sql: "INSERT INTO users(name) VALUES (?)", args: ["Eve"] }]);
-   *   await tx.execute("UPDATE counters SET n = n + 1");
+   *   await tx.run("UPDATE counters SET n = n + 1");
    * });
    * await txn.immediate();
    */
@@ -728,13 +703,13 @@ export class Transaction {
  *
  * // Sequential (single connection is fine)
  * const conn = connect(config);
- * const a = await conn.execute("SELECT 1");
- * const b = await conn.execute("SELECT 2");
+ * const a = await conn.all("SELECT 1");
+ * const b = await conn.all("SELECT 2");
  *
  * // Parallel (use separate connections)
  * const [x, y] = await Promise.all([
- *   connect(config).execute("SELECT 1"),
- *   connect(config).execute("SELECT 2"),
+ *   connect(config).all("SELECT 1"),
+ *   connect(config).all("SELECT 2"),
  * ]);
  * ```
  *

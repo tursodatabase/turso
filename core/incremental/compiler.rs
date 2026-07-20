@@ -1926,8 +1926,18 @@ impl DbspCompiler {
             // These simple cases don't need projection
             LogicalExpr::Column(_) | LogicalExpr::Literal(_) => false,
 
+            // `<col> IS [NOT] NULL` is handled natively by `compile_filter_predicate`
+            // as `FilterPredicate::IsNull`/`IsNotNull`. Routing it through the
+            // projection-rewrite path is wrong: that path only carries a single
+            // complex sub-expression as a temp column and then rewrites *both*
+            // sides of an AND/OR to reference that one temp column — silently
+            // dropping every other null-check predicate in a compound WHERE.
+            LogicalExpr::IsNull { expr, .. } if matches!(expr.as_ref(), LogicalExpr::Column(_)) => {
+                false
+            }
+
             // Default: assume we need projection for safety
-            // This includes: Between, InList, Like, IsNull, Cast, ScalarFunction, Case,
+            // This includes: Between, InList, Like, Cast, ScalarFunction, Case,
             // InSubquery, Exists, ScalarSubquery, and any future expression types
             _ => true,
         }

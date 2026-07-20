@@ -4697,6 +4697,7 @@ impl WalFile {
         Ok(())
     }
 
+    #[aristo::intent("Checkpoint backfill copies a log frame into the main database file only after that frame is durable in the log, so a crash can never recover a database torn between persisted backfill pages and dropped log frames", id = "aristos:wal_checkpoint_backfill_crash_atomic", verify = "full", parent = "wal_protocol_correctness")]
     fn checkpoint_inner(
         &self,
         pager: &Pager,
@@ -6051,8 +6052,8 @@ pub mod test {
 
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "shutdown checkpoint does not truncate the WAL file to zero on Windows"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shutdown_checkpoint_truncates_after_restart() {
         let (db, path) = get_database();
@@ -7086,8 +7087,8 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "Windows file locks are mandatory; opening the same WAL twice in one process clashes"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shm_coordination_uses_shared_authority() {
         let dir = tempfile::tempdir().unwrap();
@@ -7320,8 +7321,8 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "Windows file locks are mandatory; opening the same WAL twice in one process clashes"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shm_coordination_shared_index_grows_past_old_fixed_limit() {
         const OLD_FIXED_LIMIT: u64 = 65_536;
@@ -8286,8 +8287,8 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "Windows file locks are mandatory; opening the same WAL twice in one process clashes"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shm_coordination_secondary_disk_scan_does_not_reseed_authority_while_writer_active() {
         let dir = tempfile::tempdir().unwrap();
@@ -8363,8 +8364,8 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "Windows file locks are mandatory; opening the same WAL twice in one process clashes"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shm_coordination_disk_scan_matching_authority_keeps_frame_index() {
         let dir = tempfile::tempdir().unwrap();
@@ -8441,8 +8442,8 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "Windows file locks are mandatory; opening the same WAL twice in one process clashes"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shm_coordination_disk_scan_matching_snapshot_rebuilds_stale_frame_index() {
         let dir = tempfile::tempdir().unwrap();
@@ -8572,8 +8573,8 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "Windows file locks are mandatory; opening the same WAL twice in one process clashes"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shm_coordination_empty_disk_scan_does_not_clobber_positive_authority() {
         let dir = tempfile::tempdir().unwrap();
@@ -8757,8 +8758,8 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "Windows file locks are mandatory; opening the same WAL twice in one process clashes"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shm_prepare_wal_header_does_not_clobber_zero_frame_authority_snapshot() {
         let dir = tempfile::tempdir().unwrap();

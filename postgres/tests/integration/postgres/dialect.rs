@@ -42,6 +42,89 @@ fn test_postgres_simple_select_literal(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_comment_on_supported_object_forms_are_noops(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    // COMMENT ON is intentionally accepted without validating or storing the
+    // referenced object, so cover the distinct PostgreSQL grammar forms here.
+    for (object_kind, sql) in [
+        ("table", "COMMENT ON TABLE comment_docs IS 'documentation'"),
+        (
+            "column",
+            "COMMENT ON COLUMN comment_docs.title IS 'column documentation'",
+        ),
+        (
+            "constraint",
+            "COMMENT ON CONSTRAINT comment_docs_pkey ON comment_docs IS 'constraint documentation'",
+        ),
+        (
+            "database",
+            "COMMENT ON DATABASE main IS 'database documentation'",
+        ),
+        (
+            "domain",
+            "COMMENT ON DOMAIN email IS 'domain documentation'",
+        ),
+        ("type", "COMMENT ON TYPE status IS 'type documentation'"),
+        (
+            "index",
+            "COMMENT ON INDEX comment_docs_idx IS 'index documentation'",
+        ),
+        (
+            "view",
+            "COMMENT ON VIEW comment_view IS 'view documentation'",
+        ),
+        (
+            "materialized view",
+            "COMMENT ON MATERIALIZED VIEW comment_matview IS 'materialized view documentation'",
+        ),
+        (
+            "schema",
+            "COMMENT ON SCHEMA accounting IS 'schema documentation'",
+        ),
+        (
+            "sequence",
+            "COMMENT ON SEQUENCE comment_docs_id_seq IS 'sequence documentation'",
+        ),
+        (
+            "trigger",
+            "COMMENT ON TRIGGER audit_changes ON comment_docs IS 'trigger documentation'",
+        ),
+        (
+            "function",
+            "COMMENT ON FUNCTION format_comment(integer) IS 'function documentation'",
+        ),
+        (
+            "cast",
+            "COMMENT ON CAST (text AS integer) IS 'cast documentation'",
+        ),
+        (
+            "operator",
+            "COMMENT ON OPERATOR + (integer, integer) IS 'operator documentation'",
+        ),
+        (
+            "operator class",
+            "COMMENT ON OPERATOR CLASS int4_ops USING btree IS 'operator class documentation'",
+        ),
+        (
+            "policy",
+            "COMMENT ON POLICY access_policy ON comment_docs IS 'policy documentation'",
+        ),
+        (
+            "rule",
+            "COMMENT ON RULE update_rule ON comment_docs IS 'rule documentation'",
+        ),
+        (
+            "language",
+            "COMMENT ON LANGUAGE plpgsql IS 'language documentation'",
+        ),
+    ] {
+        conn.execute(sql)
+            .unwrap_or_else(|err| panic!("COMMENT ON {object_kind} should be accepted: {err}"));
+    }
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_arithmetic_expression(db: TempDatabase) {
     let conn = db.connect_postgres();
 

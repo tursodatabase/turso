@@ -15,6 +15,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
+  # Capture stack traces when a test panics so CI failure reports are actionable.
+  RUST_BACKTRACE: 1
   # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
   # crate's clang-cl preference fails; force the MSVC compiler instead.
   CC_x86_64_pc_windows_msvc: cl.exe
@@ -59,7 +61,7 @@ jobs:
           fi
 
   build-native:
-    timeout-minutes: ${{ matrix.os == 'blacksmith-8vcpu-windows-2025' && 120 || 30 }}
+    timeout-minutes: 60
     strategy:
       matrix:
         os:

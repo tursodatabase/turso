@@ -372,7 +372,7 @@ impl SimValue {
                         } else {
                             fl as i64
                         };
-                        if (int_val as f64) == fl && int_val != i64::MIN {
+                        if (int_val as f64) == fl && int_val != i64::MIN && int_val != i64::MAX {
                             return SimValue(types::Value::from_i64(int_val));
                         }
                     }

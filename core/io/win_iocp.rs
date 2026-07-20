@@ -43,12 +43,18 @@ use crate::io::common;
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::{Clock, Completion, CompletionError, File, LimboError, OpenFlags, Result, IO};
+use super::windows_lock::{
+    acquire_process_file_lock, release_shared_wal_locks_on_drop, shared_wal_lock_byte,
+    shared_wal_probe_exclusive_byte, shared_wal_try_lock_byte, shared_wal_unlock_byte,
+    stable_lock_path_for_handle, ProcessFileLockGuard, SharedWalLockState,
+};
 
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use windows_sys::core::BOOL;
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -337,9 +343,27 @@ impl IO for WindowsIOCP {
                 return Err(io_error(io::Error::last_os_error(), "open"));
             };
 
+            let process_lock = if ENABLE_LOCK_ON_OPEN
+                && !open_flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
+                && std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
+            {
+                match acquire_process_file_lock(file_path) {
+                    Ok(guard) => Some(guard),
+                    Err(err) => {
+                        CloseHandle(file_handle);
+                        return Err(err);
+                    }
+                }
+            } else {
+                None
+            };
+
             let windows_file = Arc::new(WindowsFile {
                 file_handle,
                 parent_io: self.instance.clone(),
+                path: stable_lock_path_for_handle(file_handle, Path::new(file_path)),
+                _process_lock: process_lock,
+                shared_wal_locks: Mutex::new(SharedWalLockState::default()),
             });
 
             // Bind file to IOCP
@@ -351,13 +375,6 @@ impl IO for WindowsIOCP {
                     "associate file with iocp",
                 ));
             };
-
-            if ENABLE_LOCK_ON_OPEN
-                && !open_flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
-                && std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
-            {
-                windows_file.lock_file(true)?;
-            }
 
             Ok(windows_file)
         }
@@ -677,6 +694,9 @@ impl Drop for InnerWindowsIOCP {
 pub struct WindowsFile {
     file_handle: HANDLE,
     parent_io: Arc<InnerWindowsIOCP>,
+    path: PathBuf,
+    _process_lock: Option<ProcessFileLockGuard>,
+    shared_wal_locks: Mutex<SharedWalLockState>,
 }
 
 impl WindowsFile {
@@ -1004,14 +1024,7 @@ impl File for WindowsFile {
         exclusive: bool,
         _kind: SharedWalLockKind,
     ) -> Result<()> {
-        match self.lock_range(offset, 1, exclusive, false) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(LimboError::LockingError(
-                "Failed locking shared WAL coordination file. File is locked by another process"
-                    .into(),
-            )),
-            Err(err) => Err(err),
-        }
+        shared_wal_lock_byte(&self.path, &self.shared_wal_locks, offset, exclusive)
     }
 
     fn shared_wal_try_lock_byte(
@@ -1020,11 +1033,27 @@ impl File for WindowsFile {
         exclusive: bool,
         _kind: SharedWalLockKind,
     ) -> Result<bool> {
-        self.lock_range(offset, 1, exclusive, true)
+        shared_wal_try_lock_byte(&self.path, &self.shared_wal_locks, offset, exclusive)
+    }
+
+    fn shared_wal_probe_exclusive_byte(
+        &self,
+        offset: u64,
+        _kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        shared_wal_probe_exclusive_byte(&self.path, &self.shared_wal_locks, offset)
+    }
+
+    fn shared_wal_probe_exclusive_while_shared_byte(
+        &self,
+        offset: u64,
+        _kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        shared_wal_probe_exclusive_byte(&self.path, &self.shared_wal_locks, offset)
     }
 
     fn shared_wal_unlock_byte(&self, offset: u64, _kind: SharedWalLockKind) -> Result<()> {
-        self.unlock_range(offset, 1)
+        shared_wal_unlock_byte(&self.path, &self.shared_wal_locks, offset)
     }
 
     fn shared_wal_set_len(&self, len: u64) -> Result<()> {
@@ -1129,10 +1158,7 @@ impl File for WindowsFile {
 impl Drop for WindowsFile {
     fn drop(&mut self) {
         trace!("dropping handle {:08X}", self.file_handle.addr());
-
-        if ENABLE_LOCK_ON_OPEN {
-            let _ = self.unlock_file();
-        }
+        release_shared_wal_locks_on_drop(&self.path, &self.shared_wal_locks);
 
         unsafe {
             CancelIoEx(self.file_handle, ptr::null());
@@ -1146,7 +1172,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
-        io::{win_iocp::get_generic_limboerror_from_os_err, TempFile},
+        io::{common, win_iocp::get_generic_limboerror_from_os_err, OpenFlags, TempFile},
         Buffer, Completion, IO,
     };
 
@@ -1219,5 +1245,25 @@ mod tests {
         drop(file.pwrite(0, buffer, comp).unwrap());
         drop(iocp);
         drop(file);
+    }
+
+    #[test]
+    fn test_duplicate_opens_share_process_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same.db");
+        let path = path.to_str().unwrap();
+        let io = WindowsIOCP::new().unwrap();
+
+        let first = io.open_file(path, OpenFlags::Create, false).unwrap();
+        let second = io.open_file(path, OpenFlags::Create, false).unwrap();
+        drop(first);
+        drop(second);
+
+        io.open_file(path, OpenFlags::Create, false).unwrap();
+    }
+
+    #[test]
+    fn test_multiple_processes_cannot_open_file() {
+        common::tests::test_multiple_processes_cannot_open_file(WindowsIOCP::new);
     }
 }

@@ -612,3 +612,30 @@ expect {
     0|0
     0|0
 }
+
+test cte-schema-qualified-table-reference {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(1),(2),(3);
+
+    WITH t AS (SELECT a * 10 AS a FROM main.t)
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    10
+    20
+    30
+}
+
+test cte-schema-qualified-reference-bypasses-inner-shadow {
+    CREATE TABLE t1 AS SELECT 1 AS x;
+    CREATE TABLE t2 AS SELECT 2 AS x;
+
+    WITH x AS (
+        WITH t3 AS (SELECT * FROM t2)
+        SELECT * FROM main.t1
+    )
+    SELECT * FROM x;
+}
+expect {
+    1
+}
