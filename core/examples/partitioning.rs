@@ -25,17 +25,20 @@ fn main() -> Result<()> {
     println!("=== Turso Partitioning: Sin/Cos Verification Example ===\n");
 
     // Create a temporary directory for our example
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
+    let temp_dir = tempfile::tempdir().map_err(|error| {
+        LimboError::InternalError(format!("failed to create temporary directory: {error}"))
+    })?;
     let db_path = temp_dir.path().join("sincos.db");
     let partitions_dir = temp_dir.path().join("partitions");
-    std::fs::create_dir_all(&partitions_dir).expect("Failed to create partitions directory");
+    std::fs::create_dir_all(&partitions_dir).map_err(|error| {
+        LimboError::InternalError(format!("failed to create partition directory: {error}"))
+    })?;
 
-    println!("Database path: {}", db_path.display());
-    println!("Partitions directory: {}", partitions_dir.display());
-    println!(
-        "Simulation: {} days, {} data points\n",
-        SIMULATION_DAYS, TOTAL_POINTS
-    );
+    let db_path_display = db_path.display();
+    let partitions_dir_display = partitions_dir.display();
+    println!("Database path: {db_path_display}");
+    println!("Partitions directory: {partitions_dir_display}");
+    println!("Simulation: {SIMULATION_DAYS} days, {TOTAL_POINTS} data points\n");
 
     // =========================================================================
     // PART 1: Create Database and Partitioned Table
@@ -43,11 +46,8 @@ fn main() -> Result<()> {
     println!("--- Part 1: Creating Database and Partitioned Table ---\n");
 
     let io = Arc::new(PlatformIO::new()?);
-    let db = Database::open_file(
-        io.clone(),
-        db_path.to_str().unwrap(),
-        Arc::new(SqliteDialect),
-    )?;
+    let db_path_string = db_path.to_string_lossy();
+    let db = Database::open_file(io, &db_path_string, Arc::new(SqliteDialect))?;
     let conn = db.connect()?;
 
     // Create a partitioned table for trigonometric data
@@ -59,7 +59,7 @@ fn main() -> Result<()> {
         cos_value REAL NOT NULL
     )";
 
-    conn.execute(&format!("{} PARTITION BY (timestamp)", table_schema))?;
+    conn.execute(format!("{table_schema} PARTITION BY (timestamp)"))?;
     println!("Created partitioned table: trig_data");
     println!("  Columns: id, timestamp, angle_rad, sin_value, cos_value");
 
@@ -68,7 +68,7 @@ fn main() -> Result<()> {
     // =========================================================================
     println!("\n--- Part 2: Configuring Partition Manager ---\n");
 
-    let resolver = Box::new(DefaultPathResolver::daily(partitions_dir.clone()));
+    let resolver = Box::new(DefaultPathResolver::daily(partitions_dir));
     let config = PartitionConfig::new(resolver, table_schema.to_string(), "timestamp".to_string());
 
     conn.register_partitioned_table("trig_data", config)?;
@@ -80,12 +80,9 @@ fn main() -> Result<()> {
     println!("\n--- Part 3: Inserting Data ---\n");
 
     // Start timestamp: 2025-01-01 00:00:00 UTC
-    let start_timestamp: i64 = 1735689600_000_000;
+    let start_timestamp: i64 = 1_735_689_600_000_000;
 
-    println!(
-        "Inserting {} data points (1 per minute for {} days)...",
-        TOTAL_POINTS, SIMULATION_DAYS
-    );
+    println!("Inserting {TOTAL_POINTS} data points (1 per minute for {SIMULATION_DAYS} days)...");
     let insert_start = std::time::Instant::now();
 
     let mut inserted_count = 0;
@@ -99,7 +96,7 @@ fn main() -> Result<()> {
         if day != current_day {
             current_day = day;
             if day > 0 && day % 5 == 0 {
-                println!("  Day {}/{} completed...", day, SIMULATION_DAYS);
+                println!("  Day {day}/{SIMULATION_DAYS} completed...");
             }
         }
 
@@ -112,12 +109,8 @@ fn main() -> Result<()> {
 
         let insert_sql = format!(
             "INSERT INTO trig_data (id, timestamp, angle_rad, sin_value, cos_value) \
-             VALUES ({}, {}, {}, {}, {})",
-            i + 1,
-            timestamp,
-            angle_rad,
-            sin_value,
-            cos_value
+             VALUES ({}, {timestamp}, {angle_rad}, {sin_value}, {cos_value})",
+            i + 1
         );
 
         conn.execute(&insert_sql)?;
@@ -125,10 +118,7 @@ fn main() -> Result<()> {
     }
 
     let insert_duration = insert_start.elapsed();
-    println!(
-        "\nInserted {} rows in {:.2?}",
-        inserted_count, insert_duration
-    );
+    println!("\nInserted {inserted_count} rows in {insert_duration:.2?}");
     println!(
         "  Rate: {:.0} inserts/sec",
         inserted_count as f64 / insert_duration.as_secs_f64()
@@ -214,8 +204,7 @@ fn main() -> Result<()> {
         if deviation > EPSILON {
             if verification_errors < 5 {
                 println!(
-                    "  ERROR at id={}: angle={:.6}, sin={:.10}, cos={:.10}, sin²+cos²={:.15}",
-                    id, angle, sin_val, cos_val, identity
+                    "  ERROR at id={id}: angle={angle:.6}, sin={sin_val:.10}, cos={cos_val:.10}, sin²+cos²={identity:.15}"
                 );
             }
             verification_errors += 1;
@@ -230,8 +219,9 @@ fn main() -> Result<()> {
 
         if sin_diff > EPSILON || cos_diff > EPSILON {
             if verification_errors < 5 {
-                println!("  ERROR at id={}: sin mismatch ({:.10} vs {:.10}) or cos mismatch ({:.10} vs {:.10})",
-                    id, sin_val, expected_sin, cos_val, expected_cos);
+                println!(
+                    "  ERROR at id={id}: sin mismatch ({sin_val:.10} vs {expected_sin:.10}) or cos mismatch ({cos_val:.10} vs {expected_cos:.10})"
+                );
             }
             verification_errors += 1;
         }
@@ -244,12 +234,12 @@ fn main() -> Result<()> {
         0.0
     };
 
-    println!("\nVerification completed in {:.2?}", verify_duration);
+    println!("\nVerification completed in {verify_duration:.2?}");
     println!("  Total points verified: {}", all_rows.len());
-    println!("  Expected points: {}", TOTAL_POINTS);
-    println!("  Verification errors: {}", verification_errors);
-    println!("  Max deviation from identity: {:.2e}", max_deviation);
-    println!("  Avg deviation from identity: {:.2e}", avg_deviation);
+    println!("  Expected points: {TOTAL_POINTS}");
+    println!("  Verification errors: {verification_errors}");
+    println!("  Max deviation from identity: {max_deviation:.2e}");
+    println!("  Avg deviation from identity: {avg_deviation:.2e}");
 
     // =========================================================================
     // PART 7: Final Summary
@@ -259,10 +249,7 @@ fn main() -> Result<()> {
     let success = verification_errors == 0 && all_rows.len() as i64 == TOTAL_POINTS;
 
     if success {
-        println!(
-            "SUCCESS: All {} data points verified correctly!",
-            TOTAL_POINTS
-        );
+        println!("SUCCESS: All {TOTAL_POINTS} data points verified correctly!");
         println!("  - {} daily partitions created", partitions.len());
         println!("  - Total storage: {} KB", total_size / 1024);
         println!("  - sin²(x) + cos²(x) = 1 verified for all points");
@@ -276,7 +263,7 @@ fn main() -> Result<()> {
             );
         }
         if verification_errors > 0 {
-            println!("  - {} verification errors", verification_errors);
+            println!("  - {verification_errors} verification errors");
         }
     }
 
