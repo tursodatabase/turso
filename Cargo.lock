@@ -7413,6 +7413,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_remote_protocol"
+version = "0.7.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "prost 0.13.5",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "turso_sdk_kit"
 version = "0.7.0"
 dependencies = [
@@ -7497,6 +7508,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_parser",
+ "turso_remote_protocol",
  "uuid",
 ]
 

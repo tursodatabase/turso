@@ -7,6 +7,8 @@ cargo publish -p turso_pg_parser
 cargo publish -p turso_core
 cargo publish -p turso_sdk_kit_macros
 cargo publish -p turso_sdk_kit
+cargo publish -p turso_remote_protocol
 cargo publish -p turso_sync_engine
 cargo publish -p turso_sync_sdk_kit
 cargo publish -p turso
+cargo publish -p turso_serverless
