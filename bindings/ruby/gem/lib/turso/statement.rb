@@ -56,6 +56,14 @@ module Turso
       @native.column_count > 0
     end
 
+    def step
+      @native.step
+    end
+
+    def reset
+      @native.reset
+    end
+
     def close
       @native.finalize
     end
