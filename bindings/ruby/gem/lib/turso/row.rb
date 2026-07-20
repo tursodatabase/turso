@@ -4,40 +4,39 @@ module Turso
   class Row
     include Enumerable
 
-    def initialize(native_statement)
-      @native = native_statement
+    def initialize(values, column_names)
+      @values = values
+      @column_names = column_names
     end
 
     def to_a
-      (0...@native.column_count).map { |i| @native.row_value(i) }
+      @values.dup
     end
 
     def [](key)
       case key
       when Integer
-        @native.row_value(key)
+        @values[key]
       when String, Symbol
-        @native.row_value(column_index(key.to_s))
+        @values[column_index(key.to_s)]
       else
         raise ArgumentError, "invalid key type: #{key.class}"
       end
     end
 
     def each(&block)
-      to_a.each(&block)
+      @values.each(&block)
     end
 
     def length
-      @native.column_count
+      @values.length
     end
     alias size length
 
     private
 
     def column_index(name)
-      (0...@native.column_count).find do |i|
-        @native.column_name(i) == name
-      end || raise(IndexError, "column #{name} not found")
+      @column_names.index(name) || raise(IndexError, "column #{name} not found")
     end
   end
 end

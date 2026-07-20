@@ -2,10 +2,21 @@
 
 module Turso
   class Database
-    def initialize(path, **options)
-      @native = NativeDatabase.new(path, **options)
+    def initialize(path = ":memory:", **options)
+      options[:experimental_features] = normalize_experimental_features(options[:experimental_features])
+      @native = NativeDatabase.new(path, options)
       @closed = false
     end
+
+    private
+
+    def normalize_experimental_features(features)
+      return nil if features.nil? || features.empty?
+
+      Array(features).join(",")
+    end
+
+    public
 
     def closed?
       @closed || !@native.open?
@@ -19,7 +30,7 @@ module Turso
 
     def prepare(sql)
       raise Turso::Exception, "database is closed" if closed?
-      Statement.new(@native.connection.prepare(sql), @native)
+      Statement.new(@native.connection.prepare(sql), @native.connection)
     end
 
     def execute(sql, *bind_args)
@@ -65,7 +76,7 @@ module Turso
         result = yield self
         execute("COMMIT")
         result
-      rescue Exception
+      rescue ::Exception
         execute("ROLLBACK")
         raise
       end

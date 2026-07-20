@@ -2443,9 +2443,10 @@ dependencies = [
 
 [[package]]
 name = "turso_ruby"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "magnus",
+ "rb-sys",
  "turso_core",
  "turso_sdk_kit",
 ]

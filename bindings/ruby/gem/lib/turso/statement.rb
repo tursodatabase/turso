@@ -5,9 +5,11 @@ module Turso
     def initialize(native_statement, native_database)
       @native = native_statement
       @database = native_database
+      @owner = Thread.current
     end
 
     def bind(*args)
+      check_owner!
       return self if args.empty?
 
       if args.size == 1 && args.first.is_a?(Hash)
@@ -21,12 +23,14 @@ module Turso
     end
 
     def run(*bind_args)
+      check_owner!
       bind(*bind_args) unless bind_args.empty?
       step_loop(consume_rows: false)
       { changes: @database.changes, last_insert_rowid: @database.last_insert_rowid }
     end
 
     def get(*bind_args)
+      check_owner!
       bind(*bind_args) unless bind_args.empty?
       row = nil
       step_loop(consume_rows: true) { |r| row ||= r; false }
@@ -34,6 +38,7 @@ module Turso
     end
 
     def all(*bind_args)
+      check_owner!
       bind(*bind_args) unless bind_args.empty?
       rows = []
       step_loop(consume_rows: true) { |r| rows << r; true }
@@ -42,11 +47,13 @@ module Turso
 
     def each(*bind_args)
       return to_enum(:each, *bind_args) unless block_given?
+      check_owner!
       bind(*bind_args) unless bind_args.empty?
       step_loop(consume_rows: true) { |r| yield r; true }
     end
 
     def columns
+      check_owner!
       (1..@native.column_count).map do |i|
         { name: @native.column_name(i - 1), type: @native.column_decltype(i - 1) }
       end
@@ -57,10 +64,12 @@ module Turso
     end
 
     def step
+      check_owner!
       @native.step
     end
 
     def reset
+      check_owner!
       @native.reset
     end
 
@@ -69,6 +78,12 @@ module Turso
     end
 
     private
+
+    def check_owner!
+      unless Thread.current.equal?(@owner)
+        raise Turso::Exception, "statement is already in use by another thread"
+      end
+    end
 
     def bind_hash(hash)
       hash.each do |key, value|
@@ -123,7 +138,9 @@ module Turso
     end
 
     def build_row
-      Row.new(@native)
+      values = (0...@native.column_count).map { |i| @native.row_value(i) }
+      column_names = (0...@native.column_count).map { |i| @native.column_name(i) }
+      Row.new(values, column_names)
     end
   end
 end

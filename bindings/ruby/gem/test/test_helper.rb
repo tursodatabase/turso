@@ -8,7 +8,7 @@ require "turso"
 module Turso
   class TestCase < Minitest::Test
     def in_memory_db
-      DB.new(":memory:")
+      Database.new(":memory:")
     end
   end
 end
