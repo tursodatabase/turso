@@ -573,3 +573,171 @@ fn test_pragma_vtab_query_with_limit_then_write(db: TempDatabase) {
         "insert after LIMITed pragma vtab query must be committed"
     );
 }
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_foreign_key_check_clean_database_returns_no_rows(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1), (2)").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 1), (11, NULL)")
+        .unwrap();
+
+    let rows = limbo_exec_rows(&conn, "PRAGMA foreign_key_check");
+    assert_eq!(
+        rows,
+        Vec::<Vec<RValue>>::new(),
+        "no violations and a NULL fk column must not be reported"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_foreign_key_check_detects_rowid_violation(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("PRAGMA foreign_keys=OFF").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 1), (11, 99)")
+        .unwrap();
+    conn.execute("PRAGMA foreign_keys=ON").unwrap();
+
+    let rows = limbo_exec_rows(&conn, "PRAGMA foreign_key_check");
+    assert_eq!(
+        rows,
+        vec![vec![
+            RValue::Text("child".to_string()),
+            RValue::Integer(11),
+            RValue::Text("parent".to_string()),
+            RValue::Integer(0),
+        ]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_foreign_key_check_single_table_form(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child_a(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE child_b(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+    )
+    .unwrap();
+    conn.execute("PRAGMA foreign_keys=OFF").unwrap();
+    conn.execute("INSERT INTO child_a VALUES (1, 99)").unwrap();
+    conn.execute("INSERT INTO child_b VALUES (1, 99)").unwrap();
+    conn.execute("PRAGMA foreign_keys=ON").unwrap();
+
+    let rows = limbo_exec_rows(&conn, "PRAGMA foreign_key_check(child_a)");
+    assert_eq!(
+        rows,
+        vec![vec![
+            RValue::Text("child_a".to_string()),
+            RValue::Integer(1),
+            RValue::Text("parent".to_string()),
+            RValue::Integer(0),
+        ]],
+        "single-table form must not report violations from other tables"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_foreign_key_check_unique_index_parent(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE parent(code TEXT UNIQUE)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_code TEXT REFERENCES parent(code))",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES ('a')").unwrap();
+    conn.execute("PRAGMA foreign_keys=OFF").unwrap();
+    conn.execute("INSERT INTO child VALUES (1, 'a'), (2, 'missing')")
+        .unwrap();
+    conn.execute("PRAGMA foreign_keys=ON").unwrap();
+
+    let rows = limbo_exec_rows(&conn, "PRAGMA foreign_key_check");
+    assert_eq!(
+        rows,
+        vec![vec![
+            RValue::Text("child".to_string()),
+            RValue::Integer(2),
+            RValue::Text("parent".to_string()),
+            RValue::Integer(0),
+        ]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_foreign_key_check_composite_key(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE parent(a INTEGER, b INTEGER, UNIQUE(a, b))")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pa INTEGER, pb INTEGER, \
+         FOREIGN KEY(pa, pb) REFERENCES parent(a, b))",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1, 2)").unwrap();
+    conn.execute("PRAGMA foreign_keys=OFF").unwrap();
+    // (1, NULL): one column NULL means the whole key is not checked.
+    // (1, 3): fully non-NULL but no matching parent row -> violation.
+    conn.execute("INSERT INTO child VALUES (1, 1, 2), (2, 1, NULL), (3, 1, 3)")
+        .unwrap();
+    conn.execute("PRAGMA foreign_keys=ON").unwrap();
+
+    let rows = limbo_exec_rows(&conn, "PRAGMA foreign_key_check");
+    assert_eq!(
+        rows,
+        vec![vec![
+            RValue::Text("child".to_string()),
+            RValue::Integer(3),
+            RValue::Text("parent".to_string()),
+            RValue::Integer(0),
+        ]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_foreign_key_check_fkid_matches_foreign_key_list(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE parent_a(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE parent_b(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, a_id INTEGER REFERENCES parent_a(id), \
+         b_id INTEGER REFERENCES parent_b(id))",
+    )
+    .unwrap();
+    conn.execute("PRAGMA foreign_keys=OFF").unwrap();
+    conn.execute("INSERT INTO child VALUES (1, 99, 1)").unwrap();
+    conn.execute("INSERT INTO parent_b VALUES (1)").unwrap();
+    conn.execute("PRAGMA foreign_keys=ON").unwrap();
+
+    let list_rows = limbo_exec_rows(&conn, "PRAGMA foreign_key_list(child)");
+    let expected_fkid = list_rows
+        .iter()
+        .find(|row| row[2] == RValue::Text("parent_a".to_string()))
+        .map(|row| row[0].clone())
+        .expect("foreign_key_list must report the parent_a constraint");
+
+    let check_rows = limbo_exec_rows(&conn, "PRAGMA foreign_key_check(child)");
+    assert_eq!(check_rows.len(), 1);
+    assert_eq!(
+        check_rows[0][3], expected_fkid,
+        "foreign_key_check's fkid must match foreign_key_list's id for the same constraint"
+    );
+}

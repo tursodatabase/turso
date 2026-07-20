@@ -9,6 +9,7 @@ use turso_macros::{match_ignore_ascii_case, turso_debug_assert};
 use turso_parser::ast::PragmaName;
 use turso_parser::ast::{self, Expr, Literal};
 
+use super::foreign_key_check::translate_foreign_key_check;
 use super::integrity_check::{
     translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
 };
@@ -249,6 +250,7 @@ pub fn translate_pragma(
             PragmaName::IndexInfo
             | PragmaName::IndexXinfo
             | PragmaName::IndexList
+            | PragmaName::ForeignKeyCheck
             | PragmaName::ForeignKeyList
             | PragmaName::TableList
             | PragmaName::TableInfo
@@ -610,6 +612,7 @@ fn update_pragma(
         PragmaName::IndexInfo => unreachable!("index_info cannot be set"),
         PragmaName::IndexXinfo => unreachable!("index_xinfo cannot be set"),
         PragmaName::IndexList => unreachable!("index_list cannot be set"),
+        PragmaName::ForeignKeyCheck => unreachable!("foreign_key_check cannot be set"),
         PragmaName::ForeignKeyList => unreachable!("foreign_key_list cannot be set"),
         PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
@@ -1181,6 +1184,29 @@ fn query_pragma(
                 program.add_pragma_result_column(col_name.to_string());
             }
             Ok(TransactionMode::None)
+        }
+        PragmaName::ForeignKeyCheck => {
+            let table_name = match value {
+                Some(ast::Expr::Name(ref name)) => Some(name.as_str()),
+                _ => None,
+            };
+
+            // Scans actual row data, so (like integrity_check) it must see this
+            // connection's just-committed schema rather than a possibly-stale
+            // MVCC tx-snapshot.
+            let main_schema = (database_id == 0 && connection.mvcc_enabled())
+                .then(|| connection.db.schema.lock().clone());
+            let schema = main_schema.as_deref().unwrap_or(schema);
+
+            let base_reg = register;
+            program.alloc_registers(3);
+            translate_foreign_key_check(schema, program, database_id, table_name, base_reg)?;
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok(TransactionMode::Read)
         }
         PragmaName::ForeignKeyList => {
             let table_name = match value {
