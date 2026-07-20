@@ -17,6 +17,15 @@ pub struct PartitionConfig {
     pub partition_column: String,
 }
 
+/// Resolver output used to validate routing before creating or attaching a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PartitionTarget {
+    pub path: std::path::PathBuf,
+    pub db_alias: String,
+    pub range_start: i64,
+    pub range_end: i64,
+}
+
 impl PartitionConfig {
     /// Create a new partition configuration.
     pub fn new(
@@ -78,6 +87,14 @@ impl PartitionManager {
             ));
         }
 
+        let interval_micros = config.path_resolver.interval_micros();
+        if interval_micros <= 0 {
+            return Err(PartitionError::InvalidInterval {
+                table: table_name.to_string(),
+                interval_micros,
+            });
+        }
+
         self.configs.insert(table_name.to_string(), config);
         self.partitions.insert(table_name.to_string(), Vec::new());
         Ok(())
@@ -103,6 +120,11 @@ impl PartitionManager {
     /// Check if a table is registered for partitioning.
     pub fn is_partitioned(&self, table_name: &str) -> bool {
         self.configs.contains_key(table_name)
+    }
+
+    /// List registered logical tables without exposing their configurations.
+    pub(crate) fn registered_tables(&self) -> Vec<String> {
+        self.configs.keys().cloned().collect()
     }
 
     /// Get partition configuration for a table.
@@ -132,6 +154,17 @@ impl PartitionManager {
             .get(table_name)
             .map(|parts| parts.iter().filter(|p| p.attached).collect())
             .unwrap_or_default()
+    }
+
+    /// Return a stable snapshot of every known partition for a table.
+    pub(crate) fn partition_files(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<PartitionFile>, PartitionError> {
+        self.partitions
+            .get(table_name)
+            .cloned()
+            .ok_or_else(|| PartitionError::TableNotPartitioned(table_name.to_string()))
     }
 
     /// Route an insert to the correct partition based on timestamp.
@@ -181,23 +214,13 @@ impl PartitionManager {
         table_name: &str,
         timestamp_micros: i64,
     ) -> Result<&PartitionFile, PartitionError> {
-        let config = self
+        let target = self.target_for_timestamp(table_name, timestamp_micros)?;
+        let schema_sql = self
             .configs
             .get(table_name)
-            .ok_or_else(|| PartitionError::TableNotPartitioned(table_name.to_string()))?;
-
-        // Calculate partition range
-        let interval = config.path_resolver.interval_micros();
-        let range_start = (timestamp_micros / interval) * interval;
-        let range_end = range_start + interval;
-
-        // Generate path and alias
-        let path = config
-            .path_resolver
-            .resolve_path(table_name, timestamp_micros);
-        let alias = config
-            .path_resolver
-            .generate_alias(table_name, timestamp_micros);
+            .ok_or_else(|| PartitionError::TableNotPartitioned(table_name.to_string()))?
+            .schema_sql
+            .clone();
 
         // Check if partition already exists in our list
         let partitions = self
@@ -206,16 +229,43 @@ impl PartitionManager {
             .ok_or_else(|| PartitionError::TableNotPartitioned(table_name.to_string()))?;
 
         // Check if we already have this partition
-        if let Some(idx) = partitions.iter().position(|p| p.range_start == range_start) {
-            return Ok(&partitions[idx]);
+        if let Some(idx) = partitions
+            .iter()
+            .position(|partition| partition.range_start == target.range_start)
+        {
+            return partitions.get(idx).ok_or_else(|| {
+                PartitionError::DatabaseError(format!(
+                    "partition descriptor disappeared for timestamp {timestamp_micros}"
+                ))
+            });
+        }
+
+        if let Some(existing) = partitions.iter().find(|partition| {
+            partition.path == target.path || partition.db_alias == target.db_alias
+        }) {
+            return Err(PartitionError::ResolverCollision {
+                table: table_name.to_string(),
+                existing: existing.path.clone(),
+                candidate: target.path,
+            });
         }
 
         // Create or open the partition file
-        let partition = if path.exists() {
-            open_partition_file(&path, alias, range_start, range_end)?
+        let partition = if target.path.exists() {
+            open_partition_file(
+                &target.path,
+                target.db_alias,
+                target.range_start,
+                target.range_end,
+            )?
         } else {
-            let schema_sql = config.schema_sql.clone();
-            create_partition_file(&path, alias, range_start, range_end, &schema_sql)?
+            create_partition_file(
+                &target.path,
+                target.db_alias,
+                target.range_start,
+                target.range_end,
+                &schema_sql,
+            )?
         };
 
         partitions.push(partition);
@@ -226,9 +276,62 @@ impl PartitionManager {
         // Return reference to the newly added partition
         let idx = partitions
             .iter()
-            .position(|p| p.range_start == range_start)
-            .unwrap();
-        Ok(&partitions[idx])
+            .position(|partition| partition.range_start == target.range_start)
+            .ok_or_else(|| {
+                PartitionError::DatabaseError(format!(
+                    "partition descriptor disappeared after insertion for timestamp {timestamp_micros}"
+                ))
+            })?;
+        partitions.get(idx).ok_or_else(|| {
+            PartitionError::DatabaseError(format!(
+                "partition descriptor disappeared after insertion for timestamp {timestamp_micros}"
+            ))
+        })
+    }
+
+    /// Resolve a timestamp without creating a file or mutating the catalog.
+    pub(crate) fn target_for_timestamp(
+        &self,
+        table_name: &str,
+        timestamp_micros: i64,
+    ) -> Result<PartitionTarget, PartitionError> {
+        let config = self
+            .configs
+            .get(table_name)
+            .ok_or_else(|| PartitionError::TableNotPartitioned(table_name.to_string()))?;
+        let interval = config.path_resolver.interval_micros();
+        if interval <= 0 {
+            return Err(PartitionError::InvalidInterval {
+                table: table_name.to_string(),
+                interval_micros: interval,
+            });
+        }
+
+        let range_start = timestamp_micros
+            .div_euclid(interval)
+            .checked_mul(interval)
+            .ok_or_else(|| PartitionError::InvalidTimestamp {
+                value: timestamp_micros,
+                reason: "partition range start overflowed".to_string(),
+            })?;
+        let range_end =
+            range_start
+                .checked_add(interval)
+                .ok_or_else(|| PartitionError::InvalidTimestamp {
+                    value: timestamp_micros,
+                    reason: "partition range end overflowed".to_string(),
+                })?;
+
+        Ok(PartitionTarget {
+            path: config
+                .path_resolver
+                .resolve_path(table_name, timestamp_micros),
+            db_alias: config
+                .path_resolver
+                .generate_alias(table_name, timestamp_micros),
+            range_start,
+            range_end,
+        })
     }
 
     /// Attach a partition file.
@@ -254,35 +357,52 @@ impl PartitionManager {
             .path_resolver
             .parse_path(path)
             .ok_or_else(|| PartitionError::FileNotFound(path.to_path_buf()))?;
+        let expected_path = config.path_resolver.resolve_path(table_name, range_start);
+        if expected_path != path {
+            return Err(PartitionError::NonCanonicalPath {
+                table: table_name.to_string(),
+                expected: expected_path,
+                actual: path.to_path_buf(),
+            });
+        }
 
         // Generate alias
         let alias = config.path_resolver.generate_alias(table_name, range_start);
 
-        // Open the partition file
-        let mut partition = open_partition_file(path, alias, range_start, range_end)?;
-
-        // TODO: Actually ATTACH the database
-        // For now, just mark as attached
-        partition.mark_attached(0);
-
-        let info = partition.to_info();
-
-        // Add to our list
+        let partition = open_partition_file(path, alias, range_start, range_end)?;
         let partitions = self
             .partitions
             .get_mut(table_name)
             .ok_or_else(|| PartitionError::TableNotPartitioned(table_name.to_string()))?;
 
-        // Check if already in list
         if let Some(existing) = partitions.iter_mut().find(|p| p.path == path.to_path_buf()) {
-            existing.mark_attached(0);
             return Ok(existing.to_info());
+        }
+
+        if let Some(existing) = partitions
+            .iter()
+            .find(|existing| existing.overlaps(range_start, range_end))
+        {
+            return Err(PartitionError::OverlappingRange {
+                table: table_name.to_string(),
+                existing: existing.path.clone(),
+                candidate: path.to_path_buf(),
+            });
         }
 
         partitions.push(partition);
         partitions.sort_by_key(|p| p.range_start);
 
-        Ok(info)
+        let partition = partitions
+            .iter()
+            .find(|partition| partition.path == path)
+            .ok_or_else(|| {
+                PartitionError::DatabaseError(format!(
+                    "partition descriptor disappeared after insertion: {}",
+                    path.display()
+                ))
+            })?;
+        Ok(partition.to_info())
     }
 
     /// Detach a partition file.
@@ -307,6 +427,33 @@ impl PartitionManager {
 
         partition.mark_detached();
 
+        Ok(())
+    }
+
+    /// Forget a detached partition while preserving its file on disk.
+    pub(crate) fn remove_partition(
+        &mut self,
+        table_name: &str,
+        path: &Path,
+    ) -> Result<(), PartitionError> {
+        let partitions = self
+            .partitions
+            .get_mut(table_name)
+            .ok_or_else(|| PartitionError::TableNotPartitioned(table_name.to_string()))?;
+        let position = partitions
+            .iter()
+            .position(|partition| partition.path == path)
+            .ok_or_else(|| PartitionError::FileNotFound(path.to_path_buf()))?;
+        if partitions
+            .get(position)
+            .is_some_and(|partition| partition.attached)
+        {
+            return Err(PartitionError::DatabaseError(format!(
+                "cannot forget attached partition: {}",
+                path.display()
+            )));
+        }
+        partitions.remove(position);
         Ok(())
     }
 
@@ -380,6 +527,19 @@ impl PartitionManager {
         })
     }
 
+    /// Resolve an attached database ID back to its managed logical table.
+    pub(crate) fn get_partition_table_by_database_id(
+        &self,
+        database_id: usize,
+    ) -> Option<(&str, &PartitionFile)> {
+        self.partitions.iter().find_map(|(table_name, partitions)| {
+            partitions
+                .iter()
+                .find(|partition| partition.database_id == Some(database_id))
+                .map(|partition| (table_name.as_str(), partition))
+        })
+    }
+
     /// Filter partitions by time range.
     ///
     /// Used for partition pruning in SELECT queries.
@@ -421,9 +581,20 @@ impl PartitionManager {
     /// # Returns
     /// List of discovered partition infos
     pub fn discover_partitions(
-        &mut self,
+        &self,
         table_name: &str,
     ) -> Result<Vec<PartitionInfo>, PartitionError> {
+        Ok(self
+            .discover_partition_files(table_name)?
+            .iter()
+            .map(PartitionFile::to_info)
+            .collect())
+    }
+
+    pub(crate) fn discover_partition_files(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<PartitionFile>, PartitionError> {
         let config = self
             .configs
             .get(table_name)
@@ -432,22 +603,40 @@ impl PartitionManager {
         let pattern = config.path_resolver.glob_pattern(table_name);
         let mut discovered = Vec::new();
 
-        // Use glob to find matching files
-        if let Ok(paths) = glob::glob(&pattern) {
-            for entry in paths.flatten() {
-                if let Some((range_start, range_end)) = config.path_resolver.parse_path(&entry) {
-                    let alias = config.path_resolver.generate_alias(table_name, range_start);
-
-                    if let Ok(partition) =
-                        open_partition_file(&entry, alias, range_start, range_end)
-                    {
-                        discovered.push(partition.to_info());
-                    }
-                }
+        let paths = glob::glob(&pattern).map_err(|error| {
+            PartitionError::DatabaseError(format!(
+                "invalid partition discovery pattern '{pattern}': {error}"
+            ))
+        })?;
+        for entry in paths {
+            let path = entry.map_err(|error| {
+                PartitionError::DatabaseError(format!(
+                    "failed to inspect partition candidate: {error}"
+                ))
+            })?;
+            let Some((range_start, range_end)) = config.path_resolver.parse_path(&path) else {
+                continue;
+            };
+            if config.path_resolver.resolve_path(table_name, range_start) != path {
+                continue;
             }
+            let alias = config.path_resolver.generate_alias(table_name, range_start);
+            discovered.push(open_partition_file(&path, alias, range_start, range_end)?);
         }
 
-        discovered.sort_by_key(|p| p.range_start);
+        discovered.sort_by_key(|partition| partition.range_start);
+        for pair in discovered.windows(2) {
+            let [left, right] = pair else {
+                continue;
+            };
+            if left.overlaps(right.range_start, right.range_end) {
+                return Err(PartitionError::OverlappingRange {
+                    table: table_name.to_string(),
+                    existing: left.path.clone(),
+                    candidate: right.path.clone(),
+                });
+            }
+        }
         Ok(discovered)
     }
 }
@@ -456,7 +645,33 @@ impl PartitionManager {
 mod tests {
     use super::*;
     use crate::partition::path_resolver::DefaultPathResolver;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    struct CollidingResolver {
+        path: PathBuf,
+    }
+
+    impl PartitionPathResolver for CollidingResolver {
+        fn resolve_path(&self, _table: &str, _timestamp_micros: i64) -> PathBuf {
+            self.path.clone()
+        }
+
+        fn parse_path(&self, _path: &Path) -> Option<(i64, i64)> {
+            Some((0, 10))
+        }
+
+        fn glob_pattern(&self, _table: &str) -> String {
+            self.path.to_string_lossy().into_owned()
+        }
+
+        fn interval_micros(&self) -> i64 {
+            10
+        }
+
+        fn generate_alias(&self, _table: &str, _timestamp_micros: i64) -> String {
+            "events_collision".to_string()
+        }
+    }
 
     fn create_test_config() -> PartitionConfig {
         let resolver = Box::new(DefaultPathResolver::daily(PathBuf::from(
@@ -681,6 +896,81 @@ mod tests {
         assert!(matches!(
             result,
             Err(PartitionError::TableNotPartitioned(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_nonpositive_or_overflowing_interval() {
+        let mut manager = PartitionManager::new();
+        let config = PartitionConfig::new(
+            Box::new(DefaultPathResolver::new(
+                PathBuf::from("/tmp/test_partitions"),
+                u64::MAX,
+            )),
+            "CREATE TABLE events(ts INTEGER)".to_string(),
+            "ts".to_string(),
+        );
+
+        assert!(matches!(
+            manager.register_table("events", config),
+            Err(PartitionError::InvalidInterval { .. })
+        ));
+    }
+
+    #[test]
+    fn target_uses_euclidean_ranges_and_checks_overflow() {
+        let mut manager = PartitionManager::new();
+        manager
+            .register_table("events", create_test_config())
+            .unwrap();
+
+        let negative = manager.target_for_timestamp("events", -1).unwrap();
+        assert_eq!(negative.range_start, -86_400_000_000);
+        assert_eq!(negative.range_end, 0);
+        assert!(matches!(
+            manager.target_for_timestamp("events", i64::MAX),
+            Err(PartitionError::InvalidTimestamp { .. })
+        ));
+    }
+
+    #[test]
+    fn detects_resolver_path_or_alias_collisions() {
+        let mut manager = PartitionManager::new();
+        let path = PathBuf::from("/tmp/colliding-partition.db");
+        let config = PartitionConfig::new(
+            Box::new(CollidingResolver { path: path.clone() }),
+            "CREATE TABLE events(ts INTEGER)".to_string(),
+            "ts".to_string(),
+        );
+        manager.register_table("events", config).unwrap();
+        manager
+            .partitions
+            .get_mut("events")
+            .unwrap()
+            .push(PartitionFile::new(
+                path,
+                "events_collision".to_string(),
+                0,
+                10,
+            ));
+
+        assert!(matches!(
+            manager.ensure_partition("events", 15),
+            Err(PartitionError::ResolverCollision { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_noncanonical_manual_attach_path() {
+        let mut manager = PartitionManager::new();
+        manager
+            .register_table("events", create_test_config())
+            .unwrap();
+        let path = PathBuf::from("/tmp/test_partitions/other_2025-01-22.db");
+
+        assert!(matches!(
+            manager.attach_partition("events", &path),
+            Err(PartitionError::NonCanonicalPath { .. })
         ));
     }
 }

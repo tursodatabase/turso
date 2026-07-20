@@ -511,6 +511,24 @@ impl Statement {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && self.origin != StatementOrigin::InternalHelper
         {
+            // BEGIN/SAVEPOINT statements reconcile while still in autocommit.
+            // Once a transaction is active, keep its attached-file set stable
+            // so external retention or publication cannot change the logical
+            // snapshot between statements in that transaction.
+            if self.program.connection.get_auto_commit() {
+                if let Err(error) = self.program.connection.refresh_all_partitioned_tables() {
+                    self.release_active_root_if_counted();
+                    return Err(error);
+                }
+            }
+            if let Err(error) = self.refresh_partition_pruning() {
+                self.release_active_root_if_counted();
+                return Err(error);
+            }
+            if let Err(error) = self.route_partitioned_insert() {
+                self.release_active_root_if_counted();
+                return Err(error);
+            }
             if self.program.connection.mvcc_enabled() {
                 // MVCC checkpoints can publish internal schema roots without changing
                 // SQLite's schema cookie, so refresh before deciding whether to reprepare.
@@ -645,6 +663,86 @@ impl Statement {
         }
 
         res
+    }
+
+    fn refresh_partition_pruning(&mut self) -> Result<()> {
+        let bindings_changed =
+            self.program
+                .prepared
+                .partition_pruning_bindings
+                .iter()
+                .any(|(index, compiled)| {
+                    let current = self
+                        .state
+                        .parameters
+                        .get(index.get() - 1)
+                        .and_then(Value::as_int);
+                    current != *compiled
+                });
+        if bindings_changed {
+            self.reprepare()?;
+        }
+        Ok(())
+    }
+
+    fn route_partitioned_insert(&mut self) -> Result<()> {
+        use crate::partition::PartitionInsertValue;
+
+        let Some(insert) = self.program.prepared.partitioned_insert.clone() else {
+            return Ok(());
+        };
+
+        let mut timestamps = Vec::with_capacity(insert.values.len());
+        for value in &insert.values {
+            match value {
+                PartitionInsertValue::Literal(timestamp) => timestamps.push(*timestamp),
+                PartitionInsertValue::Parameter(index) => {
+                    let value = self.state.parameters.get(index.get() - 1).ok_or_else(|| {
+                        LimboError::InvalidArgument(format!(
+                            "partition timestamp parameter {index} is not bound"
+                        ))
+                    })?;
+                    let timestamp = value.as_int().ok_or_else(|| {
+                        LimboError::InvalidArgument(format!(
+                            "partition timestamp parameter {index} must be a non-NULL integer"
+                        ))
+                    })?;
+                    timestamps.push(timestamp);
+                }
+            }
+        }
+
+        let first_timestamp = timestamps.first().copied().ok_or_else(|| {
+            LimboError::InternalError("partitioned INSERT has no routing values".to_string())
+        })?;
+        let connection = self.program.connection.clone();
+        let first_target = connection.partition_target(&insert.table_name, first_timestamp)?;
+        for timestamp in timestamps.iter().copied().skip(1) {
+            let target = connection.partition_target(&insert.table_name, timestamp)?;
+            if target.range_start != first_target.range_start {
+                return Err(LimboError::InvalidArgument(format!(
+                    "one INSERT statement cannot write table '{}' to both '{}' and '{}'",
+                    insert.table_name, first_target.db_alias, target.db_alias
+                )));
+            }
+        }
+        connection.track_partition_write(
+            &insert.table_name,
+            &first_target.db_alias,
+            first_target.range_start,
+        )?;
+
+        let partition = connection.ensure_partition(&insert.table_name, first_timestamp)?;
+        if !partition.attached {
+            connection.attach_partition(
+                &insert.table_name,
+                std::path::Path::new(&partition.file_path),
+            )?;
+        }
+        if insert.compiled_range_start == Some(first_target.range_start) {
+            return Ok(());
+        }
+        self.reprepare()
     }
 
     #[inline]
@@ -846,6 +944,9 @@ impl Statement {
             if db_id == crate::TEMP_DB_ID || !conn.get_auto_commit() {
                 continue;
             }
+            if conn.get_database_name_by_index(db_id).is_none() {
+                continue;
+            }
             // Discard any connection-local schema changes for this attached DB
             // so the re-translate reads the committed schema.
             conn.database_schemas().write().remove(&db_id);
@@ -871,7 +972,7 @@ impl Statement {
             crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let schema = conn.schema.read().clone();
-            translate::translate(
+            translate::translate_with_bindings(
                 &schema,
                 stmt,
                 self.pager.clone(),
@@ -879,6 +980,7 @@ impl Statement {
                 &syms,
                 mode,
                 &self.program.sql,
+                Some(&self.state.parameters),
             )?
         };
 

@@ -209,6 +209,9 @@ pub struct ProgramBuilder {
     // map of instruction index to manual comment (used in EXPLAIN only)
     comments: Vec<(InsnReference, &'static str)>,
     pub parameters: Parameters,
+    partition_bindings: Option<Vec<crate::Value>>,
+    partitioned_insert: Option<crate::partition::PartitionedInsert>,
+    partition_pruning_bindings: Vec<(NonZeroUsize, Option<i64>)>,
     pub result_columns: Vec<ResultSetColumn>,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
@@ -585,6 +588,35 @@ macro_rules! emit_explain {
 }
 
 impl ProgramBuilder {
+    pub(crate) fn set_partition_bindings(&mut self, bindings: Option<&[crate::Value]>) {
+        self.partition_bindings = bindings.map(<[crate::Value]>::to_vec);
+    }
+
+    pub(crate) fn partition_binding(&self, index: NonZeroUsize) -> Option<&crate::Value> {
+        self.partition_bindings
+            .as_deref()
+            .and_then(|bindings| bindings.get(index.get() - 1))
+    }
+
+    pub(crate) fn set_partitioned_insert(
+        &mut self,
+        partitioned_insert: crate::partition::PartitionedInsert,
+    ) {
+        self.partitioned_insert = Some(partitioned_insert);
+    }
+
+    pub(crate) fn record_partition_pruning_parameter(&mut self, index: NonZeroUsize) {
+        if self
+            .partition_pruning_bindings
+            .iter()
+            .any(|(existing, _)| *existing == index)
+        {
+            return;
+        }
+        let value = self.partition_binding(index).and_then(crate::Value::as_int);
+        self.partition_pruning_bindings.push((index, value));
+    }
+
     /// Register an `ast::Variable` in the parameter list. Returns the
     /// `NonZeroUsize` index for use in `Insn::Variable`.
     pub fn register_variable(&mut self, variable: &ast::Variable) -> NonZeroUsize {
@@ -662,6 +694,9 @@ impl ProgramBuilder {
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
             comments: Vec::new(),
             parameters: Parameters::new(),
+            partition_bindings: None,
+            partitioned_insert: None,
+            partition_pruning_bindings: Vec::new(),
             result_columns: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
             collation: None,
@@ -1976,6 +2011,8 @@ impl ProgramBuilder {
             cursor_ref: self.cursor_ref,
             comments: self.comments,
             parameters: self.parameters,
+            partitioned_insert: self.partitioned_insert,
+            partition_pruning_bindings: self.partition_pruning_bindings,
             change_cnt_on,
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,

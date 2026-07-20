@@ -82,6 +82,11 @@ pub fn translate_delete(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(tbl_name)?;
+    if let Some((logical_table, alias)) = connection.managed_partition_database(database_id) {
+        crate::bail_parse_error!(
+            "direct writes to managed partition '{alias}' are not supported; delete whole partitions for logical table '{logical_table}' through the partition API"
+        );
+    }
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
     let table = validate_delete(
         resolver,
@@ -90,6 +95,15 @@ pub fn translate_delete(
         program,
         connection,
     )?;
+    if table
+        .btree()
+        .is_some_and(|table| table.partition_spec.is_some())
+    {
+        crate::bail_parse_error!(
+            "DELETE from partitioned table '{}' is not supported; delete whole partitions through the partition API",
+            normalized_table_name
+        );
+    }
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;

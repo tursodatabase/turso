@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 use turso_core::partition::{DefaultPathResolver, PartitionConfig};
-use turso_core::{Database, PlatformIO, Result, Value};
+use turso_core::{Database, LimboError, Numeric, PlatformIO, Result, Value};
 
 /// Microseconds per minute
 const MICROS_PER_MINUTE: i64 = 60 * 1_000_000;
@@ -153,51 +153,24 @@ fn main() -> Result<()> {
     // =========================================================================
     println!("\n--- Part 5: Querying and Verifying Data ---\n");
 
-    // For multiple partitions, we need to query each one and aggregate results
     let query_start = std::time::Instant::now();
-
     let mut all_rows: Vec<(i64, i64, f64, f64, f64)> = Vec::new();
-    let mut query_errors = 0;
 
-    for partition in &partitions {
-        // Ensure partition is attached (it should already be from INSERT)
-        if !partition.attached {
-            let path = std::path::PathBuf::from(&partition.file_path);
-            if let Err(e) = conn.attach_partition("trig_data", &path) {
-                println!("  Warning: Could not attach {}: {}", partition.db_alias, e);
-                continue;
-            }
-        }
-
-        // Query this partition using qualified table name
-        let query_sql = format!(
-            "SELECT id, timestamp, angle_rad, sin_value, cos_value FROM {}.trig_data",
-            partition.db_alias
-        );
-
-        match conn.prepare(&query_sql) {
-            Ok(mut stmt) => match stmt.run_collect_rows() {
-                Ok(rows) => {
-                    for row in rows {
-                        if row.len() >= 5 {
-                            let id = extract_integer(&row[0]);
-                            let ts = extract_integer(&row[1]);
-                            let angle = extract_float(&row[2]);
-                            let sin_val = extract_float(&row[3]);
-                            let cos_val = extract_float(&row[4]);
-                            all_rows.push((id, ts, angle, sin_val, cos_val));
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("  Error querying {}: {}", partition.db_alias, e);
-                    query_errors += 1;
-                }
-            },
-            Err(e) => {
-                println!("  Error preparing query for {}: {}", partition.db_alias, e);
-                query_errors += 1;
-            }
+    // The logical table is queried exactly like a regular table. The planner
+    // reads every relevant daily file and applies ordering globally.
+    let mut statement = conn.prepare(
+        "SELECT id, timestamp, angle_rad, sin_value, cos_value \
+         FROM trig_data ORDER BY timestamp",
+    )?;
+    for row in statement.run_collect_rows()? {
+        if let [id, timestamp, angle, sin_value, cos_value] = row.as_slice() {
+            all_rows.push((
+                extract_integer(id)?,
+                extract_integer(timestamp)?,
+                extract_float(angle)?,
+                extract_float(sin_value)?,
+                extract_float(cos_value)?,
+            ));
         }
     }
 
@@ -208,10 +181,6 @@ fn main() -> Result<()> {
         partitions.len(),
         query_duration
     );
-
-    if query_errors > 0 {
-        println!("  ({} partition query errors)", query_errors);
-    }
 
     // =========================================================================
     // PART 6: Mathematical Verification
@@ -321,18 +290,22 @@ fn main() -> Result<()> {
 }
 
 /// Extract integer from Value
-fn extract_integer(value: &Value) -> i64 {
+fn extract_integer(value: &Value) -> Result<i64> {
     match value {
-        Value::Integer(i) => *i,
-        _ => 0,
+        Value::Numeric(Numeric::Integer(integer)) => Ok(*integer),
+        _ => Err(LimboError::ConversionError(
+            "expected an integer query result".to_string(),
+        )),
     }
 }
 
 /// Extract float from Value
-fn extract_float(value: &Value) -> f64 {
+fn extract_float(value: &Value) -> Result<f64> {
     match value {
-        Value::Float(f) => *f,
-        Value::Integer(i) => *i as f64,
-        _ => 0.0,
+        Value::Numeric(Numeric::Float(float)) => Ok((*float).into()),
+        Value::Numeric(Numeric::Integer(integer)) => Ok(*integer as f64),
+        _ => Err(LimboError::ConversionError(
+            "expected a numeric query result".to_string(),
+        )),
     }
 }

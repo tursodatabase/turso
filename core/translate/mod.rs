@@ -67,9 +67,6 @@ use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast;
 use update::translate_update;
 
-#[instrument(skip_all, level = Level::DEBUG)]
-#[allow(clippy::too_many_arguments)]
-#[turso_macros::trace_stack]
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
@@ -78,6 +75,24 @@ pub fn translate(
     syms: &SymbolTable,
     query_mode: QueryMode,
     input: &str,
+) -> Result<Program> {
+    translate_with_bindings(
+        schema, stmt, pager, connection, syms, query_mode, input, None,
+    )
+}
+
+#[instrument(skip_all, level = Level::DEBUG)]
+#[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
+pub(crate) fn translate_with_bindings(
+    schema: &Schema,
+    stmt: ast::Stmt,
+    pager: Arc<Pager>,
+    connection: Arc<Connection>,
+    syms: &SymbolTable,
+    query_mode: QueryMode,
+    input: &str,
+    partition_bindings: Option<&[crate::Value]>,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
@@ -100,6 +115,7 @@ pub fn translate(
         // These options will be extended whithin each translate program
         ProgramBuilderOpts::new(1, 32, 2),
     ));
+    program.set_partition_bindings(partition_bindings);
     program.set_mvcc_enabled(connection.mvcc_enabled());
 
     program.prologue();
@@ -243,6 +259,7 @@ pub fn translate_inner(
                 sql,
                 &commands,
                 when_clause.as_deref(),
+                connection,
             )?
         }
         ast::Stmt::CreateView {
@@ -258,6 +275,7 @@ pub fn translate_inner(
             &columns,
             if_not_exists,
             program,
+            connection,
         )?,
         ast::Stmt::CreateMaterializedView {
             view_name,
@@ -310,7 +328,7 @@ pub fn translate_inner(
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
+        } => translate_drop_index(&idx_name, resolver, if_exists, program, connection)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
@@ -318,11 +336,17 @@ pub fn translate_inner(
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
-        } => trigger::translate_drop_trigger(resolver, &trigger_name, if_exists, program)?,
+        } => trigger::translate_drop_trigger(
+            resolver,
+            &trigger_name,
+            if_exists,
+            program,
+            connection,
+        )?,
         ast::Stmt::DropView {
             if_exists,
             view_name,
-        } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        } => view::translate_drop_view(resolver, &view_name, if_exists, program, connection)?,
         ast::Stmt::CreateType {
             if_not_exists,
             type_name,

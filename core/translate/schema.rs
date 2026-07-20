@@ -24,6 +24,7 @@ use crate::util::{
     escape_sql_string_literal, normalize_ident, quote_identifier,
     PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
     to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
@@ -1130,6 +1131,59 @@ pub fn translate_create_table(
     } else {
         resolver.resolve_database_id(&tbl_name)?
     };
+    if let Some((logical_table, alias)) = connection.managed_partition_database(database_id) {
+        bail_parse_error!(
+            "direct schema changes to managed partition '{alias}' are not supported; configure logical table '{logical_table}' through PartitionConfig::schema_sql"
+        );
+    }
+    let partitioned_definition = match &body {
+        ast::CreateTableBody::ColumnsAndConstraints {
+            partition: Some(_), ..
+        } => Some(create_table(tbl_name.name.as_str(), &body, 0)?),
+        _ => None,
+    };
+    if let Some(partitioned_definition) = partitioned_definition {
+        let partition = partitioned_definition
+            .partition_spec
+            .as_ref()
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(
+                    "partition specification disappeared while validating CREATE TABLE".to_string(),
+                )
+            })?;
+        if database_id != crate::MAIN_DB_ID {
+            bail_parse_error!("partitioned tables can only be created in the main database");
+        }
+        let (_, column) = partitioned_definition
+            .get_column(partition.column.as_str())
+            .ok_or_else(|| {
+                crate::LimboError::ParseError(format!(
+                    "partition column '{}' not found in table '{}'",
+                    partition.column.as_str(),
+                    tbl_name.name.as_str()
+                ))
+            })?;
+        if column.affinity() != Affinity::Integer {
+            bail_parse_error!(
+                "partition column '{}.{}' must have INTEGER affinity",
+                tbl_name.name.as_str(),
+                partition.column.as_str()
+            );
+        }
+        if column.is_generated() {
+            bail_parse_error!("a generated column cannot be used as a partition key");
+        }
+        if !column.notnull() {
+            bail_parse_error!(
+                "partition column '{}.{}' must be NOT NULL",
+                tbl_name.name.as_str(),
+                partition.column.as_str()
+            );
+        }
+        if !partitioned_definition.foreign_keys.is_empty() {
+            bail_parse_error!("foreign keys are not supported on partitioned tables");
+        }
+    }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
@@ -1819,6 +1873,11 @@ pub fn translate_drop_table(
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let name = tbl_name.name.as_str();
+    if let Some((logical_table, alias)) = connection.managed_partition_database(database_id) {
+        bail_parse_error!(
+            "direct schema changes to managed partition '{alias}' are not supported; remove files for logical table '{logical_table}' through the partition API"
+        );
+    }
     let opts = ProgramBuilderOpts::new(4, 40, 4);
     program.extend(&opts);
 
@@ -1831,6 +1890,14 @@ pub fn translate_drop_table(
         }
         bail_parse_error!("No such table: {name}");
     };
+    if table
+        .btree()
+        .is_some_and(|table| table.partition_spec.is_some())
+    {
+        bail_parse_error!(
+            "DROP TABLE on partitioned table '{name}' is not supported; remove partitions explicitly before dropping the logical schema"
+        );
+    }
     validate_drop_table(resolver, database_id, name, connection)?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)

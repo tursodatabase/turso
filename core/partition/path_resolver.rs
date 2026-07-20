@@ -8,6 +8,17 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
 
+const DAY_MICROS: i64 = 86_400_000_000;
+
+fn interval_range_start(timestamp_micros: i64, interval_micros: i64) -> Option<i64> {
+    if interval_micros <= 0 {
+        return None;
+    }
+    timestamp_micros
+        .div_euclid(interval_micros)
+        .checked_mul(interval_micros)
+}
+
 /// Trait for generating paths to partition files.
 ///
 /// Implement this trait to customize how partition files are named and organized.
@@ -101,7 +112,10 @@ impl DefaultPathResolver {
     pub fn new(directory: PathBuf, interval_seconds: u64) -> Self {
         Self {
             directory,
-            interval_micros: (interval_seconds as i64) * 1_000_000,
+            interval_micros: i64::try_from(interval_seconds)
+                .ok()
+                .and_then(|seconds| seconds.checked_mul(1_000_000))
+                .unwrap_or(0),
         }
     }
 
@@ -113,30 +127,54 @@ impl DefaultPathResolver {
 
 impl PartitionPathResolver for DefaultPathResolver {
     fn resolve_path(&self, table: &str, timestamp_micros: i64) -> PathBuf {
-        let date_str = match micros_to_date(timestamp_micros) {
-            Some(date) => date.format("%Y-%m-%d").to_string(),
-            None => "invalid".to_string(),
+        let suffix = if self.interval_micros == DAY_MICROS {
+            match micros_to_date(timestamp_micros) {
+                Some(date) => date.format("%Y-%m-%d").to_string(),
+                None => "invalid".to_string(),
+            }
+        } else {
+            interval_range_start(timestamp_micros, self.interval_micros)
+                .map_or_else(|| "invalid".to_string(), |start| start.to_string())
         };
-        self.directory.join(format!("{}_{}.db", table, date_str))
+        self.directory.join(format!("{table}_{suffix}.db"))
     }
 
     fn parse_path(&self, path: &Path) -> Option<(i64, i64)> {
         let filename = path.file_stem()?.to_str()?;
-        // Parse "events_2025-01-22" -> extract date
-        let date_part = filename.rsplit('_').next()?;
-        let date = NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()?;
-
-        let start = date_to_micros(date)?;
-        let end = start + self.interval_micros;
+        let suffix = filename.rsplit('_').next()?;
+        let start = if self.interval_micros == DAY_MICROS {
+            let date = NaiveDate::parse_from_str(suffix, "%Y-%m-%d").ok()?;
+            date_to_micros(date)?
+        } else {
+            suffix.parse::<i64>().ok()?
+        };
+        let end = start.checked_add(self.interval_micros)?;
         Some((start, end))
     }
 
     fn glob_pattern(&self, table: &str) -> String {
-        format!("{}/{}_*.db", self.directory.display(), table)
+        format!(
+            "{}/{}_*.db",
+            glob::Pattern::escape(self.directory.to_string_lossy().as_ref()),
+            glob::Pattern::escape(table)
+        )
     }
 
     fn interval_micros(&self) -> i64 {
         self.interval_micros
+    }
+
+    fn generate_alias(&self, table: &str, timestamp_micros: i64) -> String {
+        if self.interval_micros == DAY_MICROS {
+            return match micros_to_date(timestamp_micros) {
+                Some(date) => format!("{}_{}", table, date.format("%Y%m%d")),
+                None => format!("{table}_{timestamp_micros}"),
+            };
+        }
+        match interval_range_start(timestamp_micros, self.interval_micros) {
+            Some(start) => format!("{table}_range_{start}"),
+            None => format!("{table}_invalid"),
+        }
     }
 }
 
@@ -165,7 +203,10 @@ impl VideoAnalyticsPathResolver {
         Self {
             base_dir,
             plugin_id,
-            interval_micros: (interval_seconds as i64) * 1_000_000,
+            interval_micros: i64::try_from(interval_seconds)
+                .ok()
+                .and_then(|seconds| seconds.checked_mul(1_000_000))
+                .unwrap_or(0),
         }
     }
 
@@ -177,14 +218,18 @@ impl VideoAnalyticsPathResolver {
 
 impl PartitionPathResolver for VideoAnalyticsPathResolver {
     fn resolve_path(&self, _table: &str, timestamp_micros: i64) -> PathBuf {
-        let date_str = match micros_to_date(timestamp_micros) {
-            Some(date) => date.format("%Y-%m-%d").to_string(),
-            None => "invalid".to_string(),
+        let range_directory = if self.interval_micros == DAY_MICROS {
+            match micros_to_date(timestamp_micros) {
+                Some(date) => date.format("%Y-%m-%d").to_string(),
+                None => "invalid".to_string(),
+            }
+        } else {
+            interval_range_start(timestamp_micros, self.interval_micros)
+                .map_or_else(|| "invalid".to_string(), |start| start.to_string())
         };
 
-        // /data/2025-01-05/plugin_lpr.bin
         self.base_dir
-            .join(&date_str)
+            .join(&range_directory)
             .join(format!("{}.bin", self.plugin_id))
     }
 
@@ -195,18 +240,24 @@ impl PartitionPathResolver for VideoAnalyticsPathResolver {
             return None;
         }
 
-        // Parse date from parent directory
         let parent = path.parent()?;
-        let date_str = parent.file_name()?.to_str()?;
-        let date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d").ok()?;
-
-        let start = date_to_micros(date)?;
-        let end = start + self.interval_micros;
+        let range = parent.file_name()?.to_str()?;
+        let start = if self.interval_micros == DAY_MICROS {
+            let date = NaiveDate::parse_from_str(range, "%Y-%m-%d").ok()?;
+            date_to_micros(date)?
+        } else {
+            range.parse::<i64>().ok()?
+        };
+        let end = start.checked_add(self.interval_micros)?;
         Some((start, end))
     }
 
     fn glob_pattern(&self, _table: &str) -> String {
-        format!("{}/*/{}.bin", self.base_dir.display(), self.plugin_id)
+        format!(
+            "{}/*/{}.bin",
+            glob::Pattern::escape(self.base_dir.to_string_lossy().as_ref()),
+            glob::Pattern::escape(&self.plugin_id)
+        )
     }
 
     fn interval_micros(&self) -> i64 {
@@ -214,18 +265,23 @@ impl PartitionPathResolver for VideoAnalyticsPathResolver {
     }
 
     fn generate_alias(&self, _table: &str, timestamp_micros: i64) -> String {
-        let date = micros_to_date(timestamp_micros);
-        match date {
-            Some(d) => format!("{}_{}", self.plugin_id, d.format("%Y%m%d")),
-            None => format!("{}_{}", self.plugin_id, timestamp_micros),
+        if self.interval_micros == DAY_MICROS {
+            return match micros_to_date(timestamp_micros) {
+                Some(date) => format!("{}_{}", self.plugin_id, date.format("%Y%m%d")),
+                None => format!("{}_{timestamp_micros}", self.plugin_id),
+            };
+        }
+        match interval_range_start(timestamp_micros, self.interval_micros) {
+            Some(start) => format!("{}_range_{start}", self.plugin_id),
+            None => format!("{}_invalid", self.plugin_id),
         }
     }
 }
 
 /// Convert microseconds to NaiveDate (UTC).
 fn micros_to_date(timestamp_micros: i64) -> Option<NaiveDate> {
-    let secs = timestamp_micros / 1_000_000;
-    let nsecs = ((timestamp_micros % 1_000_000) * 1_000) as u32;
+    let secs = timestamp_micros.div_euclid(1_000_000);
+    let nsecs = timestamp_micros.rem_euclid(1_000_000).checked_mul(1_000)? as u32;
     let dt = DateTime::from_timestamp(secs, nsecs)?;
     Some(dt.date_naive())
 }
@@ -329,5 +385,60 @@ mod tests {
         assert_eq!(date.year(), 2025);
         assert_eq!(date.month(), 1);
         assert_eq!(date.day(), 22);
+    }
+
+    #[test]
+    fn test_pre_epoch_timestamp_uses_previous_utc_day() {
+        let resolver = DefaultPathResolver::daily(PathBuf::from("/data"));
+        let path = resolver.resolve_path("events", -1);
+        assert_eq!(path, PathBuf::from("/data/events_1969-12-31.db"));
+        assert_eq!(resolver.parse_path(&path), Some((-86_400_000_000, 0)));
+        assert_eq!(resolver.generate_alias("events", -1), "events_19691231");
+    }
+
+    #[test]
+    fn test_discovery_patterns_escape_user_supplied_names() {
+        let default = DefaultPathResolver::daily(PathBuf::from("/data/[camera]*"));
+        assert_eq!(
+            default.glob_pattern("events[0]*"),
+            "/data/[[]camera[]][*]/events[[]0[]][*]_*.db"
+        );
+
+        let video = VideoAnalyticsPathResolver::daily(
+            PathBuf::from("/data/[camera]*"),
+            "plugin[0]*".to_string(),
+        );
+        assert_eq!(
+            video.glob_pattern("events"),
+            "/data/[[]camera[]][*]/*/plugin[[]0[]][*].bin"
+        );
+    }
+
+    #[test]
+    fn test_subdaily_resolvers_generate_unique_roundtrippable_ranges() {
+        let default = DefaultPathResolver::new(PathBuf::from("/data"), 3_600);
+        let first = default.resolve_path("events", 1_000);
+        let second = default.resolve_path("events", 3_600_000_000 + 1_000);
+        assert_ne!(first, second);
+        assert_eq!(default.parse_path(&first), Some((0, 3_600_000_000)));
+        assert_eq!(
+            default.parse_path(&second),
+            Some((3_600_000_000, 7_200_000_000))
+        );
+        assert_ne!(
+            default.generate_alias("events", 1_000),
+            default.generate_alias("events", 3_600_000_000 + 1_000)
+        );
+
+        let video =
+            VideoAnalyticsPathResolver::new(PathBuf::from("/data"), "plugin".to_string(), 3_600);
+        let first = video.resolve_path("events", 1_000);
+        let second = video.resolve_path("events", 3_600_000_000 + 1_000);
+        assert_ne!(first, second);
+        assert_eq!(video.parse_path(&first), Some((0, 3_600_000_000)));
+        assert_eq!(
+            video.parse_path(&second),
+            Some((3_600_000_000, 7_200_000_000))
+        );
     }
 }

@@ -16,8 +16,16 @@ pub enum PartitionError {
     },
     /// Invalid timestamp value for partitioning
     InvalidTimestamp { value: i64, reason: String },
+    /// Partition interval must be a positive number of microseconds.
+    InvalidInterval { table: String, interval_micros: i64 },
     /// Partition file not found
     FileNotFound(PathBuf),
+    /// A file parses as a range but is not the resolver's canonical path.
+    NonCanonicalPath {
+        table: String,
+        expected: PathBuf,
+        actual: PathBuf,
+    },
     /// Partition file already exists
     FileAlreadyExists(PathBuf),
     /// Partition is not attached
@@ -32,6 +40,18 @@ pub enum PartitionError {
     TableNotPartitioned(String),
     /// Table already registered for partitioning
     TableAlreadyRegistered(String),
+    /// Two files claim overlapping timestamp ranges.
+    OverlappingRange {
+        table: String,
+        existing: PathBuf,
+        candidate: PathBuf,
+    },
+    /// The resolver mapped two distinct ranges to the same path or alias.
+    ResolverCollision {
+        table: String,
+        existing: PathBuf,
+        candidate: PathBuf,
+    },
     /// I/O error during partition operations
     IoError(std::io::Error),
     /// Database error during partition operations
@@ -62,9 +82,28 @@ impl fmt::Display for PartitionError {
             Self::InvalidTimestamp { value, reason } => {
                 write!(f, "invalid timestamp {}: {}", value, reason)
             }
+            Self::InvalidInterval {
+                table,
+                interval_micros,
+            } => write!(
+                f,
+                "partition interval for table '{}' must be positive, got {} microseconds",
+                table, interval_micros
+            ),
             Self::FileNotFound(path) => {
                 write!(f, "partition file not found: {}", path.display())
             }
+            Self::NonCanonicalPath {
+                table,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "non-canonical partition path for table '{}': expected '{}', got '{}'",
+                table,
+                expected.display(),
+                actual.display()
+            ),
             Self::FileAlreadyExists(path) => {
                 write!(f, "partition file already exists: {}", path.display())
             }
@@ -96,6 +135,28 @@ impl fmt::Display for PartitionError {
                     table
                 )
             }
+            Self::OverlappingRange {
+                table,
+                existing,
+                candidate,
+            } => write!(
+                f,
+                "partition files overlap for table '{}': '{}' and '{}'",
+                table,
+                existing.display(),
+                candidate.display()
+            ),
+            Self::ResolverCollision {
+                table,
+                existing,
+                candidate,
+            } => write!(
+                f,
+                "partition resolver collision for table '{}': '{}' and '{}' identify different ranges",
+                table,
+                existing.display(),
+                candidate.display()
+            ),
             Self::IoError(e) => {
                 write!(f, "partition I/O error: {}", e)
             }

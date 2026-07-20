@@ -112,6 +112,11 @@ pub fn translate_create_index(
     } else {
         resolver.resolve_existing_table_database_id(tbl_name.as_str())?
     };
+    if let Some((logical_table, alias)) = connection.managed_partition_database(database_id) {
+        bail_parse_error!(
+            "direct schema changes to managed partition '{alias}' are not supported; declare indexes for logical table '{logical_table}' in PartitionConfig::schema_sql"
+        );
+    }
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(tbl_name.as_str());
 
@@ -146,6 +151,11 @@ pub fn translate_create_index(
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
+    if tbl.partition_spec.is_some() {
+        crate::bail_parse_error!(
+            "CREATE INDEX on partitioned table '{tbl_name}' is not supported; declare per-partition indexes in PartitionConfig::schema_sql"
+        );
+    }
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
@@ -1176,8 +1186,14 @@ pub fn translate_drop_index(
     resolver: &Resolver,
     if_exists: bool,
     program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
     let database_id = resolver.resolve_existing_index_database_id(qualified_name)?;
+    if let Some((logical_table, alias)) = connection.managed_partition_database(database_id) {
+        bail_parse_error!(
+            "direct schema changes to managed partition '{alias}' are not supported; configure indexes for logical table '{logical_table}' through PartitionConfig::schema_sql"
+        );
+    }
     let idx_name = normalize_ident(qualified_name.name.as_str());
     let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);

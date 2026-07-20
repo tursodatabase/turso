@@ -248,10 +248,24 @@ fn prepare_update_plan(
     let database_id = resolver.resolve_existing_table_database_id_qualified(&body.tbl_name)?;
     let schema = resolver.schema();
     let target_name = &body.tbl_name.name;
+    if let Some((logical_table, alias)) = connection.managed_partition_database(database_id) {
+        bail_parse_error!(
+            "direct writes to managed partition '{alias}' are not supported; UPDATE logical table '{logical_table}' is not supported"
+        );
+    }
     let table = match resolver.with_schema(database_id, |s| s.get_table(target_name.as_str())) {
         Some(table) => table,
         None => bail_parse_error!("Parse error: no such table: {}", target_name),
     };
+    if table
+        .btree()
+        .is_some_and(|table| table.partition_spec.is_some())
+    {
+        bail_parse_error!(
+            "UPDATE of partitioned table '{}' is not supported",
+            target_name
+        );
+    }
     if program.trigger.is_some() && table.virtual_table().is_some() {
         bail_parse_error!(
             "unsafe use of virtual table \"{}\"",
@@ -299,6 +313,7 @@ fn prepare_update_plan(
         program,
         with,
         true,
+        None,
         &mut where_clause,
         &mut vtab_predicates,
         &mut from_tables,

@@ -834,6 +834,7 @@ pub fn plan_ctes_as_outer_refs(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_from_clause_table(
     table: ast::SelectTable,
     resolver: &Resolver,
@@ -842,6 +843,8 @@ fn parse_from_clause_table(
     vtab_predicates: &mut Vec<Expr>,
     cte_definitions: &[CteDefinition],
     connection: &Arc<crate::Connection>,
+    partition_predicate: Option<&Expr>,
+    allow_unqualified_partition_predicate: bool,
 ) -> Result<()> {
     match table {
         ast::SelectTable::Table(qualified_name, maybe_alias, indexed) => parse_table(
@@ -855,6 +858,8 @@ fn parse_from_clause_table(
             &[],
             indexed,
             connection,
+            partition_predicate,
+            allow_unqualified_partition_predicate,
         ),
         ast::SelectTable::Select(subselect, maybe_alias) => {
             // For inline subqueries, we plan all CTEs once and pass them as outer_query_refs.
@@ -944,11 +949,346 @@ fn parse_from_clause_table(
             &args,
             None, // table-valued functions don't support INDEXED BY
             connection,
+            partition_predicate,
+            allow_unqualified_partition_predicate,
         ),
         ast::SelectTable::Sub(..) => {
             crate::bail_parse_error!("Parenthesized FROM clause subqueries are not supported")
         }
     }
+}
+
+#[derive(Default)]
+struct PartitionPredicateInfo {
+    start: Option<i64>,
+    end: Option<i64>,
+    has_range: bool,
+    pushdown_terms: Vec<Expr>,
+}
+
+impl PartitionPredicateInfo {
+    fn constrain_start(&mut self, start: i64) {
+        self.start = Some(self.start.map_or(start, |current| current.max(start)));
+        self.has_range = true;
+    }
+
+    fn constrain_end(&mut self, end: i64) {
+        self.end = Some(self.end.map_or(end, |current| current.min(end)));
+        self.has_range = true;
+    }
+
+    fn constrain_comparison(&mut self, operator: ast::Operator, value: i64) {
+        match operator {
+            ast::Operator::Equals => {
+                self.constrain_start(value);
+                if let Some(end) = value.checked_add(1) {
+                    self.constrain_end(end);
+                }
+            }
+            ast::Operator::Greater => match value.checked_add(1) {
+                Some(start) => self.constrain_start(start),
+                None => {
+                    self.constrain_start(i64::MAX);
+                    self.constrain_end(i64::MAX);
+                }
+            },
+            ast::Operator::GreaterEquals => self.constrain_start(value),
+            ast::Operator::Less => self.constrain_end(value),
+            ast::Operator::LessEquals => {
+                if let Some(end) = value.checked_add(1) {
+                    self.constrain_end(end);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn partition_column_matches(
+    expr: &Expr,
+    column_name: &str,
+    table_identifier: &str,
+    allow_unqualified: bool,
+) -> bool {
+    match expr {
+        Expr::Id(name) | Expr::Name(name) => {
+            allow_unqualified && normalize_ident(name.as_str()) == column_name
+        }
+        Expr::Qualified(table, column) => {
+            normalize_ident(table.as_str()) == table_identifier
+                && normalize_ident(column.as_str()) == column_name
+        }
+        Expr::Parenthesized(expressions) if expressions.len() == 1 => {
+            expressions.first().is_some_and(|expression| {
+                partition_column_matches(
+                    expression,
+                    column_name,
+                    table_identifier,
+                    allow_unqualified,
+                )
+            })
+        }
+        _ => false,
+    }
+}
+
+/// `Some(None)` means a routing parameter was recognized but is not an integer
+/// in the current compilation. That keeps the predicate safe without pruning.
+fn partition_bound_value(expr: &Expr, program: &mut ProgramBuilder) -> Option<Option<i64>> {
+    match expr {
+        Expr::Literal(ast::Literal::Numeric(value)) => Some(
+            crate::util::parse_numeric_literal(value)
+                .ok()
+                .and_then(|value| value.as_int()),
+        ),
+        Expr::Unary(
+            operator @ (ast::UnaryOperator::Negative | ast::UnaryOperator::Positive),
+            inner,
+        ) => {
+            let Expr::Literal(ast::Literal::Numeric(value)) = inner.as_ref() else {
+                return None;
+            };
+            let signed = if matches!(operator, ast::UnaryOperator::Negative) {
+                format!("-{value}")
+            } else {
+                value.to_string()
+            };
+            Some(
+                crate::util::parse_numeric_literal(&signed)
+                    .ok()
+                    .and_then(|value| value.as_int()),
+            )
+        }
+        Expr::Variable(variable) => {
+            let index = program.register_variable(variable);
+            program.record_partition_pruning_parameter(index);
+            Some(
+                program
+                    .partition_binding(index)
+                    .and_then(crate::Value::as_int),
+            )
+        }
+        Expr::Parenthesized(expressions) if expressions.len() == 1 => expressions
+            .first()
+            .and_then(|expression| partition_bound_value(expression, program)),
+        _ => None,
+    }
+}
+
+fn reverse_partition_comparison(operator: ast::Operator) -> Option<ast::Operator> {
+    match operator {
+        ast::Operator::Equals => Some(ast::Operator::Equals),
+        ast::Operator::Greater => Some(ast::Operator::Less),
+        ast::Operator::GreaterEquals => Some(ast::Operator::LessEquals),
+        ast::Operator::Less => Some(ast::Operator::Greater),
+        ast::Operator::LessEquals => Some(ast::Operator::GreaterEquals),
+        _ => None,
+    }
+}
+
+fn collect_partition_predicates(
+    expr: &Expr,
+    column_name: &str,
+    table_identifier: &str,
+    allow_unqualified: bool,
+    program: &mut ProgramBuilder,
+    info: &mut PartitionPredicateInfo,
+) {
+    match expr {
+        Expr::Binary(left, ast::Operator::And, right) => {
+            collect_partition_predicates(
+                left,
+                column_name,
+                table_identifier,
+                allow_unqualified,
+                program,
+                info,
+            );
+            collect_partition_predicates(
+                right,
+                column_name,
+                table_identifier,
+                allow_unqualified,
+                program,
+                info,
+            );
+        }
+        Expr::Binary(left, operator, right) => {
+            let comparison =
+                if partition_column_matches(left, column_name, table_identifier, allow_unqualified)
+                {
+                    partition_bound_value(right, program).map(|value| (*operator, value))
+                } else if partition_column_matches(
+                    right,
+                    column_name,
+                    table_identifier,
+                    allow_unqualified,
+                ) {
+                    reverse_partition_comparison(*operator)
+                        .zip(partition_bound_value(left, program))
+                } else {
+                    None
+                };
+            if let Some((operator, value)) = comparison {
+                if let Some(value) = value {
+                    info.constrain_comparison(operator, value);
+                }
+                info.pushdown_terms.push(expr.clone());
+            }
+        }
+        Expr::Between {
+            lhs,
+            not: false,
+            start,
+            end,
+        } if partition_column_matches(lhs, column_name, table_identifier, allow_unqualified) => {
+            let start = partition_bound_value(start, program);
+            let end = partition_bound_value(end, program);
+            if start.is_some() && end.is_some() {
+                if let Some(start) = start.flatten() {
+                    info.constrain_start(start);
+                }
+                if let Some(end) = end.flatten().and_then(|value| value.checked_add(1)) {
+                    info.constrain_end(end);
+                }
+                info.pushdown_terms.push(expr.clone());
+            }
+        }
+        Expr::InList {
+            lhs,
+            not: false,
+            rhs,
+        } if partition_column_matches(lhs, column_name, table_identifier, allow_unqualified) => {
+            let values = rhs
+                .iter()
+                .map(|value| partition_bound_value(value, program))
+                .collect::<Option<Vec<_>>>();
+            if let Some(values) = values {
+                let known_values = values.iter().copied().collect::<Option<Vec<_>>>();
+                if let Some(known_values) = known_values {
+                    if let Some(minimum) = known_values.iter().min().copied() {
+                        info.constrain_start(minimum);
+                    }
+                    if let Some(maximum) = known_values
+                        .iter()
+                        .max()
+                        .copied()
+                        .and_then(|value| value.checked_add(1))
+                    {
+                        info.constrain_end(maximum);
+                    }
+                }
+                info.pushdown_terms.push(expr.clone());
+            }
+        }
+        Expr::Parenthesized(expressions) if expressions.len() == 1 => {
+            if let Some(expression) = expressions.first() {
+                collect_partition_predicates(
+                    expression,
+                    column_name,
+                    table_identifier,
+                    allow_unqualified,
+                    program,
+                    info,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn partition_predicate_info(
+    predicate: Option<&Expr>,
+    column_name: &str,
+    table_identifier: &str,
+    allow_unqualified: bool,
+    program: &mut ProgramBuilder,
+) -> PartitionPredicateInfo {
+    let mut info = PartitionPredicateInfo::default();
+    if let Some(predicate) = predicate {
+        collect_partition_predicates(
+            predicate,
+            &normalize_ident(column_name),
+            &normalize_ident(table_identifier),
+            allow_unqualified,
+            program,
+            &mut info,
+        );
+    }
+    info
+}
+
+fn partition_select_arm(
+    table_name: &ast::Name,
+    database_alias: &str,
+    logical_identifier: &str,
+    predicate: Option<&Expr>,
+    indexed: Option<&ast::Indexed>,
+) -> ast::OneSelect {
+    ast::OneSelect::Select {
+        distinctness: None,
+        columns: vec![ast::ResultColumn::Star],
+        from: Some(ast::FromClause {
+            select: Box::new(ast::SelectTable::Table(
+                ast::QualifiedName::fullname(
+                    ast::Name::exact(database_alias.to_string()),
+                    table_name.clone(),
+                ),
+                Some(ast::As::As(ast::Name::exact(
+                    logical_identifier.to_string(),
+                ))),
+                indexed.cloned(),
+            )),
+            joins: Vec::new(),
+        }),
+        where_clause: predicate.cloned().map(Box::new),
+        group_by: None,
+        window_clause: Vec::new(),
+    }
+}
+
+fn partition_select(
+    table_name: &ast::Name,
+    partitions: &[crate::partition::PartitionInfo],
+    logical_identifier: &str,
+    predicate: Option<&Expr>,
+    indexed: Option<&ast::Indexed>,
+) -> Result<ast::Select> {
+    let (first_partition, remaining_partitions) = partitions.split_first().ok_or_else(|| {
+        crate::LimboError::InternalError(
+            "cannot build a partition UNION without partitions".to_string(),
+        )
+    })?;
+    let first = partition_select_arm(
+        table_name,
+        &first_partition.db_alias,
+        logical_identifier,
+        predicate,
+        indexed,
+    );
+    let compounds = remaining_partitions
+        .iter()
+        .map(|partition| ast::CompoundSelect {
+            operator: ast::CompoundOperator::UnionAll,
+            select: partition_select_arm(
+                table_name,
+                &partition.db_alias,
+                logical_identifier,
+                predicate,
+                indexed,
+            ),
+        })
+        .collect();
+
+    Ok(ast::Select {
+        with: None,
+        body: ast::SelectBody {
+            select: first,
+            compounds,
+        },
+        order_by: Vec::new(),
+        limit: None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -963,6 +1303,8 @@ fn parse_table(
     args: &[Box<Expr>],
     indexed: Option<ast::Indexed>,
     connection: &Arc<crate::Connection>,
+    partition_predicate: Option<&Expr>,
+    allow_unqualified_partition_predicate: bool,
 ) -> Result<()> {
     let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
     let database_id = resolver.resolve_existing_table_database_id_qualified(qualified_name)?;
@@ -1096,7 +1438,7 @@ fn parse_table(
     if let Some(table) = table {
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         let internal_id = program.table_reference_counter.next();
-        let mut joined_database_id = database_id;
+        let joined_database_id = database_id;
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
             Table::Virtual(tbl.clone())
@@ -1110,40 +1452,62 @@ fn parse_table(
                     );
                 }
 
-                let attached_partitions = connection.get_attached_partitions(&table.name);
-                if attached_partitions.is_empty() {
-                    crate::bail_parse_error!("no partitions attached for table '{}'", table.name);
+                if connection.get_auto_commit() {
+                    connection.refresh_partitioned_table(&table.name)?;
                 }
-                if attached_partitions.len() > 1 {
-                    let partition_names = attached_partitions
-                        .iter()
-                        .map(|p| p.db_alias.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    crate::bail_parse_error!(
-                        "SELECT from partitioned table '{}' with multiple attached partitions requires explicit UNION ALL. Attached partitions: [{}]",
-                        table.name,
-                        partition_names
+                let logical_identifier = alias
+                    .clone()
+                    .unwrap_or_else(|| normalized_qualified_name.clone());
+                let PartitionPredicateInfo {
+                    start,
+                    end,
+                    has_range,
+                    pushdown_terms,
+                } = partition_predicate_info(
+                    partition_predicate,
+                    partition_spec.column.as_str(),
+                    &logical_identifier,
+                    allow_unqualified_partition_predicate,
+                    program,
+                );
+                let attached_partitions = if has_range {
+                    connection.filter_partitions_by_range(&table.name, start, end)
+                } else {
+                    connection.get_attached_partitions(&table.name)
+                };
+                if !attached_partitions.is_empty() {
+                    let pushdown = pushdown_terms.into_iter().reduce(|left, right| {
+                        Expr::Binary(Box::new(left), ast::Operator::And, Box::new(right))
+                    });
+                    let subquery = partition_select(
+                        table_name,
+                        &attached_partitions,
+                        &logical_identifier,
+                        pushdown.as_ref(),
+                        indexed.as_ref(),
+                    )?;
+                    let subquery_alias = maybe_alias
+                        .cloned()
+                        .or_else(|| Some(ast::As::As(table_name.clone())));
+                    return parse_from_clause_table(
+                        ast::SelectTable::Select(subquery, subquery_alias),
+                        resolver,
+                        program,
+                        table_references,
+                        vtab_predicates,
+                        cte_definitions,
+                        connection,
+                        None,
+                        false,
                     );
                 }
 
-                let partition = attached_partitions.first().ok_or_else(|| {
-                    crate::LimboError::ParseError(format!(
-                        "no partitions attached for table '{}'",
+                if database_id != crate::MAIN_DB_ID {
+                    crate::bail_parse_error!(
+                        "partitioned table '{}' must be resolved from the main database",
                         table.name
-                    ))
-                })?;
-                joined_database_id = connection
-                    .partition_manager
-                    .read()
-                    .get_partition_by_alias(&table.name, &partition.db_alias)
-                    .and_then(|p| p.database_id)
-                    .ok_or_else(|| {
-                        crate::LimboError::ParseError(format!(
-                            "partition {} database_id not found",
-                            partition.db_alias
-                        ))
-                    })?;
+                    );
+                }
             }
             Table::BTree(table.clone())
         } else {
@@ -1205,6 +1569,8 @@ fn parse_table(
             vtab_predicates,
             &[],
             connection,
+            None,
+            false,
         );
         program.restore_ctes_being_defined(saved_ctes);
         view.done();
@@ -1408,6 +1774,7 @@ pub fn parse_from(
     program: &mut ProgramBuilder,
     with: Option<With>,
     preplan_ctes_for_non_from_subqueries: bool,
+    partition_predicate: Option<&Expr>,
     out_where_clause: &mut Vec<WhereTerm>,
     vtab_predicates: &mut Vec<Expr>,
     table_references: &mut TableReferences,
@@ -1502,6 +1869,7 @@ pub fn parse_from(
     if let Some(from_owned) = from {
         let select_owned = from_owned.select;
         let joins_owned = from_owned.joins;
+        let allow_unqualified_partition_predicate = joins_owned.is_empty();
         parse_from_clause_table(
             *select_owned,
             resolver,
@@ -1510,6 +1878,8 @@ pub fn parse_from(
             vtab_predicates,
             &cte_definitions,
             connection,
+            partition_predicate,
+            allow_unqualified_partition_predicate,
         )?;
 
         for join in joins_owned.into_iter() {
@@ -1522,6 +1892,7 @@ pub fn parse_from(
                 vtab_predicates,
                 table_references,
                 connection,
+                partition_predicate,
             )?;
         }
     }
@@ -1856,6 +2227,7 @@ fn parse_join(
     vtab_predicates: &mut Vec<Expr>,
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
+    partition_predicate: Option<&Expr>,
 ) -> Result<()> {
     let ast::JoinedSelectTable {
         operator: join_operator,
@@ -1871,6 +2243,8 @@ fn parse_join(
         vtab_predicates,
         cte_definitions,
         connection,
+        partition_predicate,
+        false,
     )?;
 
     let is_cross = matches!(join_operator, ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(JoinType::CROSS));

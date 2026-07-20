@@ -4024,6 +4024,7 @@ pub fn op_auto_commit(
             Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
         ) {
             conn.clear_named_savepoints();
+            conn.clear_partition_write_target();
         }
         return res;
     }
@@ -4081,6 +4082,7 @@ pub fn op_auto_commit(
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_cdc_transaction_id(-1);
+                conn.clear_partition_write_target();
             }
             TxOp::Commit => {
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
@@ -4088,6 +4090,7 @@ pub fn op_auto_commit(
                 conn.auto_commit.store(true, Ordering::SeqCst);
             }
             TxOp::Begin => {
+                conn.clear_partition_write_target();
                 conn.auto_commit.store(false, Ordering::SeqCst);
                 return Ok(InsnFunctionStepResult::Done);
             }
@@ -4151,6 +4154,7 @@ pub fn op_auto_commit(
     // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
     conn.set_cdc_transaction_id(-1);
     conn.clear_named_savepoints();
+    conn.clear_partition_write_target();
 
     Ok(res)
 }
@@ -4221,6 +4225,7 @@ pub fn op_savepoint(
                         main_schema_snapshot,
                         temp_schema_snapshot,
                         staged_schema_snapshot,
+                        partition_write_target: conn.partition_write_target_snapshot(),
                     };
                     // Mirror onto attached/temp pagers. If any pager fails
                     // mid-flight, earlier ones already opened a savepoint
@@ -4254,6 +4259,7 @@ pub fn op_savepoint(
                     }
                     conn.push_named_savepoint(frame);
                     if starts_transaction {
+                        conn.clear_partition_write_target();
                         conn.auto_commit.store(false, Ordering::SeqCst);
                     }
 
@@ -4348,6 +4354,7 @@ pub fn op_savepoint(
                     }
                 }
                 *conn.database_schemas().write() = info.staged_schema_snapshot;
+                conn.restore_partition_write_target(info.partition_write_target);
                 conn.bump_prepare_context_generation();
             }
 

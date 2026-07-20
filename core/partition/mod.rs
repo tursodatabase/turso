@@ -26,7 +26,7 @@
 //! let resolver = Box::new(DefaultPathResolver::daily(PathBuf::from("/data")));
 //! let config = PartitionConfig::new(
 //!     resolver,
-//!     "CREATE TABLE events (id INTEGER, ts INTEGER, data TEXT)".to_string(),
+//!     "CREATE TABLE events (id INTEGER, ts INTEGER NOT NULL, data TEXT)".to_string(),
 //!     "ts".to_string(),
 //! );
 //!
@@ -44,7 +44,8 @@
 //! - Cross-partition writes in a single transaction are not supported
 //! - Global unique indexes across partitions are not supported
 //! - TTL/rotation must be handled externally
-//! - SQL API can be disabled at runtime (Rust API only)
+//! - Recorder tables are append-oriented; row-level UPDATE and DELETE are not supported
+//! - Catalog reconciliation and first-file creation currently use synchronous filesystem I/O
 
 pub mod error;
 pub mod file;
@@ -52,6 +53,30 @@ pub mod manager;
 pub mod path_resolver;
 
 pub use error::PartitionError;
+#[cfg(feature = "fs")]
+pub(crate) use file::{remove_partition_sidecars, with_partition_path_lock};
 pub use file::{PartitionFile, PartitionInfo};
 pub use manager::{PartitionConfig, PartitionManager};
 pub use path_resolver::{DefaultPathResolver, PartitionPathResolver, VideoAnalyticsPathResolver};
+
+/// Source of a partition key in a prepared INSERT statement.
+#[derive(Clone, Debug)]
+pub(crate) enum PartitionInsertValue {
+    Literal(i64),
+    Parameter(std::num::NonZeroUsize),
+}
+
+/// Routing contract captured while compiling a partitioned INSERT.
+#[derive(Clone, Debug)]
+pub(crate) struct PartitionedInsert {
+    pub table_name: String,
+    pub values: Vec<PartitionInsertValue>,
+    pub compiled_range_start: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PartitionWriteTarget {
+    pub table_name: String,
+    pub db_alias: String,
+    pub range_start: i64,
+}

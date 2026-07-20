@@ -6,6 +6,52 @@ use chrono::DateTime;
 
 use super::error::PartitionError;
 
+#[cfg(feature = "fs")]
+type PartitionPathMutex = parking_lot::Mutex<()>;
+
+#[cfg(feature = "fs")]
+static PARTITION_PATH_LOCKS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<PartitionPathMutex>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(feature = "fs")]
+pub(crate) fn with_partition_path_lock<T>(path: &Path, operation: impl FnOnce() -> T) -> T {
+    let lock = {
+        let mut locks = PARTITION_PATH_LOCKS.lock();
+        if locks.len() > 1_024 {
+            locks.retain(|_, lock| lock.strong_count() > 0);
+        }
+        match locks.get(path).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = std::sync::Arc::new(PartitionPathMutex::new(()));
+                locks.insert(path.to_path_buf(), std::sync::Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    let _guard = lock.lock();
+    operation()
+}
+
+#[cfg(feature = "fs")]
+fn remove_file_if_present(path: &Path) -> Result<(), PartitionError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(PartitionError::IoError(error)),
+    }
+}
+
+#[cfg(feature = "fs")]
+pub(crate) fn remove_partition_sidecars(path: &Path) -> Result<(), PartitionError> {
+    for suffix in ["-wal", "-tshm"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", path.to_string_lossy()));
+        remove_file_if_present(&sidecar)?;
+    }
+    Ok(())
+}
+
 /// Represents a single partition file.
 ///
 /// A partition file contains data for a specific time range and can be
@@ -136,14 +182,14 @@ pub struct PartitionInfo {
 impl PartitionInfo {
     /// Get the duration of this partition in seconds.
     pub fn duration_seconds(&self) -> i64 {
-        (self.range_end - self.range_start) / 1_000_000
+        self.range_end.saturating_sub(self.range_start) / 1_000_000
     }
 }
 
 /// Convert microseconds to ISO 8601 string.
 fn micros_to_iso(timestamp_micros: i64) -> String {
-    let secs = timestamp_micros / 1_000_000;
-    let nsecs = ((timestamp_micros % 1_000_000) * 1_000) as u32;
+    let secs = timestamp_micros.div_euclid(1_000_000);
+    let nsecs = timestamp_micros.rem_euclid(1_000_000).saturating_mul(1_000) as u32;
     match DateTime::from_timestamp(secs, nsecs) {
         Some(dt) => dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         None => format!("{}", timestamp_micros),
@@ -174,18 +220,25 @@ pub fn create_partition_file(
     use crate::sync::Arc;
     use crate::{Database, PlatformIO};
 
-    // Check if file already exists
     if path.exists() {
         return Err(PartitionError::FileAlreadyExists(path.to_path_buf()));
     }
 
-    // Create parent directories if needed
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
 
-    // Create a new database file with the schema
-    let path_str = path.to_string_lossy();
+    // Build the database under a private name and publish it only after the
+    // complete schema is durable. Readers therefore never discover a
+    // half-initialized daily file, and concurrent creators cannot overwrite
+    // each other.
+    let temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let temporary_path = temporary.into_temp_path();
+    let temporary_wal_path = PathBuf::from(format!("{}-wal", temporary_path.to_string_lossy()));
+
+    let path_str = temporary_path.to_string_lossy();
     let io = Arc::new(PlatformIO::new().map_err(|e| PartitionError::DatabaseError(e.to_string()))?);
     let db = Database::open_file(io, &path_str)
         .map_err(|e| PartitionError::DatabaseError(e.to_string()))?;
@@ -193,9 +246,53 @@ pub fn create_partition_file(
         .connect()
         .map_err(|e| PartitionError::DatabaseError(e.to_string()))?;
 
-    // Execute the schema SQL to create the table
-    conn.execute(schema_sql)
-        .map_err(|e| PartitionError::DatabaseError(format!("Failed to create table: {}", e)))?;
+    // Execute the complete schema so callers can include local indexes alongside
+    // the physical table definition.
+    if let Err(error) = conn.execute(schema_sql) {
+        let _ = conn.close();
+        drop(conn);
+        drop(db);
+        let _ = std::fs::remove_file(&temporary_wal_path);
+        return Err(PartitionError::DatabaseError(format!(
+            "failed to initialize partition schema: {error}"
+        )));
+    }
+    if let Err(error) = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
+        let _ = conn.close();
+        drop(conn);
+        drop(db);
+        let _ = std::fs::remove_file(&temporary_wal_path);
+        return Err(PartitionError::DatabaseError(format!(
+            "failed to checkpoint new partition schema: {error}"
+        )));
+    }
+    if let Err(error) = conn.close() {
+        drop(conn);
+        drop(db);
+        let _ = std::fs::remove_file(&temporary_wal_path);
+        return Err(PartitionError::DatabaseError(format!(
+            "failed to close new partition: {error}"
+        )));
+    }
+    drop(conn);
+    drop(db);
+    let _ = std::fs::remove_file(&temporary_wal_path);
+
+    with_partition_path_lock(path, || {
+        if path.exists() {
+            return Ok(());
+        }
+        remove_partition_sidecars(path)?;
+        match temporary_path.persist_noclobber(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A creator in another process finished first. Its final path
+                // is never overwritten.
+                Ok(())
+            }
+            Err(error) => Err(PartitionError::IoError(error.error)),
+        }
+    })?;
 
     Ok(PartitionFile::new(
         path.to_path_buf(),
@@ -214,9 +311,10 @@ pub fn create_partition_file(
     range_end: i64,
     _schema_sql: &str,
 ) -> Result<PartitionFile, PartitionError> {
-    Err(PartitionError::IoError(
-        "create_partition_file not available in this build (no-fs)".to_string(),
-    ))
+    Err(PartitionError::IoError(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "create_partition_file not available in this build (no-fs)",
+    )))
 }
 
 /// Open an existing partition file and read its metadata.
@@ -346,5 +444,10 @@ mod tests {
         let timestamp = 1737504000_000_000i64; // 2025-01-22 00:00:00 UTC
         let iso = micros_to_iso(timestamp);
         assert_eq!(iso, "2025-01-22T00:00:00Z");
+    }
+
+    #[test]
+    fn test_negative_micros_to_iso() {
+        assert_eq!(micros_to_iso(-1), "1969-12-31T23:59:59Z");
     }
 }

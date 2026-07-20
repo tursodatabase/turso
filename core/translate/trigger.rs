@@ -1,3 +1,4 @@
+use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
@@ -96,6 +97,7 @@ pub fn translate_create_trigger(
     sql: String,
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
+    connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
@@ -109,6 +111,13 @@ pub fn translate_create_trigger(
     } else {
         database_id
     };
+    if let Some((logical_table, alias)) =
+        connection.managed_partition_database(target_table_database_id)
+    {
+        bail_parse_error!(
+            "direct schema changes to managed partition '{alias}' are not supported; triggers on logical table '{logical_table}' are not supported"
+        );
+    }
     // Temp triggers are allowed to reference tables in other databases.
     if target_table_database_id != database_id && database_id != crate::TEMP_DB_ID {
         let table_db_name = tbl_name
@@ -163,6 +172,12 @@ pub fn translate_create_trigger(
     };
     if table.virtual_table().is_some() {
         bail_parse_error!("cannot create triggers on virtual tables");
+    }
+    if table
+        .btree()
+        .is_some_and(|table| table.partition_spec.is_some())
+    {
+        bail_parse_error!("cannot create triggers on partitioned tables");
     }
 
     if time
@@ -472,8 +487,14 @@ pub fn translate_drop_trigger(
     trigger_name: &ast::QualifiedName,
     if_exists: bool,
     program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_trigger_database_id(trigger_name)?;
+    if let Some((logical_table, alias)) = connection.managed_partition_database(database_id) {
+        bail_parse_error!(
+            "direct schema changes to managed partition '{alias}' are not supported; triggers on logical table '{logical_table}' are not supported"
+        );
+    }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;

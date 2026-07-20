@@ -307,6 +307,7 @@ fn prepare_one_select_plan(
                     program,
                     with,
                     preplan_ctes_for_non_from_subqueries,
+                    where_clause.as_deref(),
                     &mut where_predicates,
                     &mut vtab_predicates,
                     &mut table_references,
