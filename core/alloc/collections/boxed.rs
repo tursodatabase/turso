@@ -1,6 +1,11 @@
 use super::{TryClone, TursoBoxExt, TursoFromIterator, TursoNewExt, TursoTryNewExt};
 use crate::alloc::{AllocError, Box, TryReserveError};
 
+#[cfg(not(nightly))]
+pub type DynBoxedSlice<T> = std::boxed::Box<[T]>;
+#[cfg(nightly)]
+pub type DynBoxedSlice<T> = std::boxed::Box<[T], crate::alloc::DynAllocator>;
+
 fn boxed<T>(value: T) -> Box<T> {
     Box::new(value)
 }

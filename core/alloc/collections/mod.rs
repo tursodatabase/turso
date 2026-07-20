@@ -12,6 +12,7 @@ mod traits;
 mod vec;
 mod vec_deque;
 
+pub use boxed::DynBoxedSlice;
 pub(crate) use traits::impl_try_clone_via_clone;
 #[cfg(nightly)]
 pub use traits::TursoFromIteratorIn;
@@ -20,3 +21,4 @@ pub use traits::{
     TursoHashSetExt, TursoIteratorExt, TursoNewExt, TursoSliceExt, TursoTryNewExt,
     TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt, TursoVecInExt,
 };
+pub use vec::DynVec;

@@ -27,9 +27,10 @@ pub(crate) use collections::impl_try_clone_via_clone;
 #[cfg(nightly)]
 pub use collections::TursoFromIteratorIn;
 pub use collections::{
-    TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt, TursoFromIterator, TursoHashMapExt,
-    TursoHashSetExt, TursoIteratorExt, TursoNewExt, TursoSliceExt, TursoTryNewExt,
-    TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt, TursoVecInExt,
+    DynBoxedSlice, DynVec, TryClone, TursoAllocExt, TursoBinaryHeapExt, TursoBoxExt,
+    TursoFromIterator, TursoHashMapExt, TursoHashSetExt, TursoIteratorExt, TursoNewExt,
+    TursoSliceExt, TursoTryNewExt, TursoTryWithCapacityExt, TursoVecDequeExt, TursoVecExt,
+    TursoVecInExt,
 };
 
 pub const ALLOC_ERR_MSG: &str = "fallible allocations";
@@ -181,6 +182,24 @@ macro_rules! __turso_alloc_try_vec {
             <$crate::alloc::Vec<_> as $crate::alloc::TursoAllocExt>::new(),
         )
     };
+    ($element:expr; $count:expr; $alloc:expr) => {{
+        (|| {
+            let count = $count;
+            let alloc = $alloc;
+            #[cfg(not(nightly))]
+            let mut values =
+                <$crate::alloc::Vec<_> as $crate::alloc::TursoVecInExt<_, _>>::try_with_capacity_in(
+                    count, alloc,
+                )?;
+            #[cfg(nightly)]
+            let mut values = <$crate::alloc::Vec<_, _> as $crate::alloc::TursoVecInExt<
+                _,
+                _,
+            >>::try_with_capacity_in(count, alloc)?;
+            values.resize(count, $element);
+            Ok::<_, $crate::alloc::TryReserveError>(values)
+        })()
+    }};
     ($element:expr; $count:expr) => {{
         (|| {
             let count = $count;
