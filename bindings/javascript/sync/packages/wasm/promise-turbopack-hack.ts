@@ -1,5 +1,5 @@
 import { registerFileAtWorker, unregisterFileAtWorker, ioNotifier } from "@tursodatabase/database-wasm-common"
-import { DatabasePromise, Transaction, TransactionFunction } from "@tursodatabase/database-common"
+import { DatabasePromise, Transaction, TransactionFunction, AsyncTransactionFunction } from "@tursodatabase/database-common"
 import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner, RemoteWriter, RemoteWriteStatement } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, initThreadPool, MainWorker, Database as NativeDatabase } from "./index-turbopack-hack.js";
 
@@ -314,6 +314,26 @@ class Database extends DatabasePromise {
         Object.defineProperties(properties.immediate.value, properties);
         Object.defineProperties(properties.exclusive.value, properties);
         return properties.default.value as TransactionFunction<F>;
+    }
+
+    /**
+     * Returns a function that executes the given function in a transaction
+     * on a connection owned for the whole BEGIN..COMMIT window; the callback
+     * receives a {@link Transaction} handle as its first argument.
+     *
+     * Not supported together with {@link DatabaseOpts.remoteWritesExperimental}
+     * yet: remote-writes transactions run on the remote server and have no
+     * local connection to hand out.
+     */
+    override transactionAsync<F extends (txn: Transaction, ...args: any[]) => Promise<any>>(
+        fn: F,
+    ): AsyncTransactionFunction<F> {
+        if (this.#remoteWriter) {
+            throw new Error(
+                "transactionAsync is not supported with remoteWritesExperimental yet; use the deprecated transaction() for now",
+            );
+        }
+        return super.transactionAsync(fn);
     }
 
     /**

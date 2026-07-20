@@ -200,9 +200,12 @@ export interface AsyncTransactionFunction<
 /**
  * The subset of the `AsyncLock` interface statement execution serializes on.
  * Statements created from a `Database` use the database's real `AsyncLock`;
- * statements created from a `Transaction` use a gate that never locks (the
- * transaction wrapper already holds the database's lock for its whole
- * duration) and only rejects use of a completed transaction.
+ * statements created from a `Transaction` use a per-transaction gate that
+ * serializes native calls within the transaction (so concurrent statements
+ * in the callback cannot interleave on the shared connection) and rejects
+ * use of a completed transaction. The transaction wrapper already holds the
+ * database's lock for the whole transaction, so this gate never contends
+ * with other transactions or database-level calls.
  */
 interface ExecLock {
   acquire(): Promise<void>;
@@ -760,17 +763,22 @@ class Transaction {
   private db: NativeDatabase;
   private ioStep: () => Promise<void>;
   private active: boolean = true;
-  // Statement execution gate: the transaction wrapper already holds the
-  // database's execLock, so statements of this transaction never lock; the
-  // gate only rejects use of a completed transaction.
+  // Per-transaction execution gate. The wrapper already holds the database's
+  // execLock for the whole transaction, so this never contends with other
+  // transactions or database-level calls; it serializes native calls *within*
+  // this transaction — the same invariant the database's execLock enforces on
+  // the connection — so statements issued concurrently in the callback cannot
+  // interleave their step loops on the shared connection. It also rejects use
+  // of a completed transaction.
   private gate: ExecLock;
 
   constructor(db: NativeDatabase, ioStep: () => Promise<void>) {
     this.db = db;
     this.ioStep = ioStep;
+    const lock = new AsyncLock();
     this.gate = {
-      acquire: async () => { this.assertActive(); },
-      release: () => { },
+      acquire: async () => { this.assertActive(); await lock.acquire(); },
+      release: () => { lock.release(); },
     };
   }
 
@@ -797,24 +805,28 @@ class Transaction {
    * @param {string} sql - The string containing SQL statements to execute
    */
   async exec(sql: string, queryOptions?: QueryOptions) {
-    this.assertActive();
-    const exec = this.db.executor(sql, queryOptions);
+    await this.gate.acquire();
     try {
-      while (true) {
-        const stepResult = exec.stepSync();
-        if (stepResult === STEP_IO) {
-          await this.ioStep();
-          continue;
+      const exec = this.db.executor(sql, queryOptions);
+      try {
+        while (true) {
+          const stepResult = exec.stepSync();
+          if (stepResult === STEP_IO) {
+            await this.ioStep();
+            continue;
+          }
+          if (stepResult === STEP_DONE) {
+            break;
+          }
+          if (stepResult === STEP_ROW) {
+            continue;
+          }
         }
-        if (stepResult === STEP_DONE) {
-          break;
-        }
-        if (stepResult === STEP_ROW) {
-          continue;
-        }
+      } finally {
+        exec.reset();
       }
     } finally {
-      exec.reset();
+      this.gate.release();
     }
   }
 
@@ -912,7 +924,12 @@ class Transaction {
     if (!Array.isArray(statements)) {
       throw new TypeError("Expected first argument to be an array of statements");
     }
-    return await executeBatch(this.db, this.ioStep, statements, options);
+    await this.gate.acquire();
+    try {
+      return await executeBatch(this.db, this.ioStep, statements, options);
+    } finally {
+      this.gate.release();
+    }
   }
 }
 

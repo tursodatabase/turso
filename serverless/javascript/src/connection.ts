@@ -571,18 +571,32 @@ export class Transaction {
   private session: Session;
   private defaultSafeIntegerMode: boolean;
   private active: boolean = true;
-  // Statement execution gate: the transaction wrapper already holds the
-  // connection's execLock, so statements of this transaction never lock;
-  // the gate only rejects use of a completed transaction.
+  // Per-transaction execution gate. The wrapper already holds the connection's
+  // execLock for the whole transaction, so this never contends with other
+  // transactions or connection-level calls; it serializes native calls *within*
+  // this transaction — the same invariant the connection's execLock enforces on
+  // the session — so statements issued concurrently in the callback cannot
+  // interleave on the shared session. It also rejects use of a completed
+  // transaction.
   private gate: Lock;
 
   constructor(session: Session, defaultSafeIntegerMode: boolean) {
     this.session = session;
     this.defaultSafeIntegerMode = defaultSafeIntegerMode;
+    const lock = new AsyncLock();
     this.gate = {
-      acquire: async () => { this.assertActive(); },
-      release: () => { },
+      acquire: async () => { this.assertActive(); await lock.acquire(); },
+      release: () => { lock.release(); },
     };
+  }
+
+  private async withGate<T>(fn: () => Promise<T>): Promise<T> {
+    await this.gate.acquire();
+    try {
+      return await fn();
+    } finally {
+      this.gate.release();
+    }
   }
 
   /** Whether the transaction is still open (COMMIT/ROLLBACK not executed yet). */
@@ -607,8 +621,7 @@ export class Transaction {
    * and becomes unusable once the transaction completes.
    */
   async prepare(sql: string): Promise<Statement> {
-    this.assertActive();
-    const description = await this.session.describe(sql);
+    const description = await this.withGate(() => this.session.describe(sql));
     const stmt = Statement.fromSession(this.session, sql, description.cols, this.gate);
     if (this.defaultSafeIntegerMode) {
       stmt.safeIntegers(true);
@@ -620,32 +633,35 @@ export class Transaction {
    * Like `prepare(sql).run(args)` but in a single round trip.
    */
   async run(sql: string, ...bindParameters: any[]): Promise<any> {
-    this.assertActive();
     const { params, queryOptions } = splitBindParameters(bindParameters);
-    const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
-    return { changes: result.rowsAffected, lastInsertRowid: result.lastInsertRowid };
+    return await this.withGate(async () => {
+      const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
+      return { changes: result.rowsAffected, lastInsertRowid: result.lastInsertRowid };
+    });
   }
 
   /**
    * Like `prepare(sql).get(args)` but in a single round trip.
    */
   async get(sql: string, ...bindParameters: any[]): Promise<any> {
-    this.assertActive();
     const { params, queryOptions } = splitBindParameters(bindParameters);
-    const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
-    const row = result.rows[0];
-    if (!row) return undefined;
-    return createExpandedRow(row, result.columns);
+    return await this.withGate(async () => {
+      const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
+      const row = result.rows[0];
+      if (!row) return undefined;
+      return createExpandedRow(row, result.columns);
+    });
   }
 
   /**
    * Like `prepare(sql).all(args)` but in a single round trip.
    */
   async all(sql: string, ...bindParameters: any[]): Promise<any[]> {
-    this.assertActive();
     const { params, queryOptions } = splitBindParameters(bindParameters);
-    const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
-    return result.rows.map((row: any) => createExpandedRow(row, result.columns));
+    return await this.withGate(async () => {
+      const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
+      return result.rows.map((row: any) => createExpandedRow(row, result.columns));
+    });
   }
 
   /**
@@ -660,8 +676,7 @@ export class Transaction {
    * Execute a SQL statement and return all results.
    */
   async execute(sql: string, args?: any[], queryOptions?: QueryOptions): Promise<any> {
-    this.assertActive();
-    return await this.session.execute(sql, args || [], this.defaultSafeIntegerMode, queryOptions);
+    return await this.withGate(() => this.session.execute(sql, args || [], this.defaultSafeIntegerMode, queryOptions));
   }
 
   /**
@@ -669,8 +684,7 @@ export class Transaction {
    * Unlike prepared statements, this can execute strings that contain multiple SQL statements.
    */
   async exec(sql: string, queryOptions?: QueryOptions): Promise<any> {
-    this.assertActive();
-    return await this.session.sequence(sql, queryOptions);
+    return await this.withGate(() => this.session.sequence(sql, queryOptions));
   }
 
   /**
@@ -679,19 +693,20 @@ export class Transaction {
    * the stream is already inside `BEGIN`.
    */
   async batch(statements: BatchStatement[], options?: BatchMode | BatchOptions, queryOptions?: QueryOptions): Promise<any> {
-    this.assertActive();
     if (!Array.isArray(statements)) {
       throw new TypeError("Expected first argument to be an array of statements");
     }
     const { raw } = normalizeBatchOptions(options);
-    const results = await this.session.batch(
-      statements,
-      undefined,
-      queryOptions,
-      this.defaultSafeIntegerMode,
-      raw,
-    );
-    return results.map((result: any) => toResultSet(result));
+    return await this.withGate(async () => {
+      const results = await this.session.batch(
+        statements,
+        undefined,
+        queryOptions,
+        this.defaultSafeIntegerMode,
+        raw,
+      );
+      return results.map((result: any) => toResultSet(result));
+    });
   }
 }
 
