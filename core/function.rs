@@ -518,7 +518,10 @@ impl WindowFunc {
     /// drifts ahead of the resolver and users get "no such function" when
     /// they try to call them.
     pub fn is_implemented(&self) -> bool {
-        matches!(self, Self::RowNumber | Self::Rank | Self::DenseRank)
+        matches!(
+            self,
+            Self::RowNumber | Self::Rank | Self::DenseRank | Self::FirstValue | Self::LastValue
+        )
     }
 
     /// The hardcoded frame this built-in evaluates over, overriding any
@@ -584,8 +587,8 @@ impl WindowFunc {
     ///   before the loop over buffered rows, reading the accumulator into a
     ///   result register. The loop then writes that one register's contents
     ///   into the output for every buffered row in the group.
-    /// * false (row_number, ntile, lag, lead, first/last/nth_value): nothing
-    ///   is emitted in `emit_aggregation_step`. Both `AggStep` and `AggValue`
+    /// * false (row_number, ntile, lag, lead, nth_value): nothing is
+    ///   emitted in `emit_aggregation_step`. Both `AggStep` and `AggValue`
     ///   are emitted inside the per-row loop in `emit_peer_group_flush`,
     ///   so they run once per buffered row and produce a distinct value for
     ///   each output row.
@@ -612,19 +615,25 @@ impl WindowFunc {
     ///
     /// Functions returning true: `rank`, `dense_rank`, `percent_rank`,
     /// `cume_dist` — their value is determined entirely by where the peer
-    /// group sits in the partition's ordering.
+    /// group sits in the partition's ordering — plus `first_value` and
+    /// `last_value`, whose default frame (`RANGE UNBOUNDED PRECEDING TO
+    /// CURRENT ROW`) ends at the current peer group, so every row in the
+    /// group sees the same frame contents.
     /// Functions returning false: `row_number`, `ntile`, `lag`, `lead`,
-    /// `first_value`, `last_value`, `nth_value` — all depend on a row's
-    /// position within the partition/frame, not just its peer group.
+    /// `nth_value` — all depend on a row's position within the
+    /// partition/frame, not just its peer group.
     pub fn one_value_per_peer_group(&self) -> bool {
         match self {
-            Self::Rank | Self::DenseRank | Self::PercentRank | Self::CumeDist => true,
+            Self::Rank
+            | Self::DenseRank
+            | Self::PercentRank
+            | Self::CumeDist
+            | Self::FirstValue
+            | Self::LastValue => true,
             Self::RowNumber
             | Self::Ntile
             | Self::Lag
             | Self::Lead
-            | Self::FirstValue
-            | Self::LastValue
             | Self::NthValue
             | Self::External(_) => false,
         }
