@@ -2100,6 +2100,7 @@ impl Program {
                                 root_page,
                                 num_view_columns,
                                 crate::incremental::vdbe_maintenance::MaintenanceInput::TransactionDelta,
+                                crate::incremental::vdbe_maintenance::MaintenanceOutput::ViewBtree,
                                 &schema,
                                 &self.connection,
                             )?;

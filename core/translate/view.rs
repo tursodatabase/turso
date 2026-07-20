@@ -1,4 +1,4 @@
-use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, view::IncrementalView};
+use crate::incremental::view::{IncrementalView, DBSP_CIRCUIT_VERSION};
 use crate::schema::{
     BTreeCharacteristics, BTreeTable, SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES,
 };
@@ -469,7 +469,7 @@ pub fn translate_drop_view(
         }
 
         // Construct the DBSP state table name
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        use crate::incremental::view::DBSP_CIRCUIT_VERSION;
         Some(format!(
             "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"
         ))

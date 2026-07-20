@@ -1878,10 +1878,6 @@ fn test_matview_rejected_create_leaves_database_intact(tmp_db: TempDatabase) -> 
     assert!(conn
         .execute("CREATE MATERIALIZED VIEW bad1 AS SELECT count(*) FROM t")
         .is_err());
-    // Rejected by the DBSP circuit dry-run (negative literal in WHERE).
-    assert!(conn
-        .execute("CREATE MATERIALIZED VIEW bad2 AS SELECT a, b FROM t WHERE a < -2")
-        .is_err());
 
     conn.execute("CREATE MATERIALIZED VIEW v AS SELECT a, b FROM t")?;
     conn.execute("INSERT INTO t VALUES (2,'y')")?;
@@ -1892,8 +1888,48 @@ fn test_matview_rejected_create_leaves_database_intact(tmp_db: TempDatabase) -> 
         vec![vec![RValue::Integer(1)], vec![RValue::Integer(2)]]
     );
 
+    // Negative literals in WHERE were rejected by the retired circuit
+    // compiler; the VDBE codegen supports them.
+    conn.execute("CREATE MATERIALIZED VIEW v_neg AS SELECT a, b FROM t WHERE a < -2")?;
+    conn.execute("INSERT INTO t VALUES (-5,'neg'), (3,'pos')")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a FROM v_neg");
+    assert_eq!(rows, vec![vec![RValue::Integer(-5)]]);
+
     let rows = limbo_exec_rows(&conn, "PRAGMA integrity_check");
     assert_eq!(rows, vec![vec![RValue::Text("ok".into())]]);
+
+    Ok(())
+}
+
+/// Same-transaction reads of a materialized view must see the transaction's
+/// own uncommitted changes: the view's maintenance program runs in emit mode
+/// over the captured deltas and overlays the committed btree contents.
+#[turso_macros::test(views)]
+fn test_matview_read_your_own_writes(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")?;
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT a, b + 1 AS b1 FROM t WHERE b >= 20")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (3, 30)")?;
+    conn.execute("UPDATE t SET b = 25 WHERE a = 1")?;
+    conn.execute("DELETE FROM t WHERE a = 2")?;
+
+    // Uncommitted state: rows (1,25) and (3,30) match the filter.
+    let rows = limbo_exec_rows(&conn, "SELECT a, b1 FROM v ORDER BY a");
+    assert_eq!(
+        rows,
+        vec![
+            vec![RValue::Integer(1), RValue::Integer(26)],
+            vec![RValue::Integer(3), RValue::Integer(31)],
+        ]
+    );
+
+    conn.execute("ROLLBACK")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a, b1 FROM v ORDER BY a");
+    assert_eq!(rows, vec![vec![RValue::Integer(2), RValue::Integer(21)]]);
 
     Ok(())
 }
