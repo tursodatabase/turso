@@ -50,6 +50,7 @@ if tuple(int(n) for n in re.findall(r"\d+", sqlalchemy.__version__)[:3]) < _MIN_
 from .dialect import (  # noqa: E402
     AioTursoDialect,
     TursoDialect,
+    TursoServerlessDialect,
     TursoSyncDialect,
     get_sync_connection,
 )
@@ -57,6 +58,7 @@ from .dialect import (  # noqa: E402
 __all__ = [
     "AioTursoDialect",
     "TursoDialect",
+    "TursoServerlessDialect",
     "TursoSyncDialect",
     "get_sync_connection",
 ]
