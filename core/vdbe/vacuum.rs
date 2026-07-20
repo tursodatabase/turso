@@ -648,7 +648,7 @@ pub(crate) fn vacuum_target_build_step(
                     crate::StepResult::IO | crate::StepResult::Yield => {
                         let io = schema_stmt
                             .take_io_completions()
-                            .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                            .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
                         state.phase = VacuumTargetBuildPhase::CollectSchemaRows { schema_stmt };
                         return Ok(crate::IOResult::IO(io));
                     }
@@ -709,7 +709,7 @@ pub(crate) fn vacuum_target_build_step(
                 crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_schema_stmt
                         .take_io_completions()
-                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                        .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepCreateTable {
                         target_schema_stmt,
                         idx,
@@ -843,7 +843,7 @@ pub(crate) fn vacuum_target_build_step(
                 crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = select_stmt
                         .take_io_completions()
-                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                        .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::CopyRows {
                         select_stmt,
                         target_insert_stmt,
@@ -876,7 +876,7 @@ pub(crate) fn vacuum_target_build_step(
                 crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_insert_stmt
                         .take_io_completions()
-                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                        .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepTargetInsert {
                         select_stmt,
                         target_insert_stmt,
@@ -925,7 +925,7 @@ pub(crate) fn vacuum_target_build_step(
                 crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_schema_stmt
                         .take_io_completions()
-                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                        .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                         target_schema_stmt,
                         idx,
@@ -969,7 +969,7 @@ pub(crate) fn vacuum_target_build_step(
                 crate::StepResult::IO | crate::StepResult::Yield => {
                     let io = target_schema_stmt
                         .take_io_completions()
-                        .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                        .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
                     state.phase = VacuumTargetBuildPhase::StepPostData {
                         target_schema_stmt,
                         idx,
@@ -1947,7 +1947,7 @@ fn vacuum_in_place_step(
                 fsync_phase,
             } => {
                 if !completion.finished() {
-                    return Ok(IOResult::IO(IOCompletions::Single(completion.clone())));
+                    return Ok(IOResult::IO(IOCompletions(completion.clone())));
                 }
                 if !completion.succeeded() {
                     return Err(vacuum_completion_error(completion, "WAL header init"));
@@ -2014,7 +2014,7 @@ fn vacuum_in_place_step(
                 );
                 // Wait for every run in this batch to finish.
                 if !read_completion.finished() {
-                    return Ok(IOResult::IO(IOCompletions::Single(read_completion.clone())));
+                    return Ok(IOResult::IO(IOCompletions(read_completion.clone())));
                 }
                 if !read_completion.succeeded() {
                     return Err(vacuum_completion_error(read_completion, "temp batch read"));
@@ -2090,7 +2090,7 @@ fn vacuum_in_place_step(
                 // unfinished completion; re-entry will re-check them all.
                 let pending = completions.iter().find(|c| !c.finished()).cloned();
                 if let Some(pending) = pending {
-                    return Ok(IOResult::IO(IOCompletions::Single(pending)));
+                    return Ok(IOResult::IO(IOCompletions(pending)));
                 }
 
                 // Check for write errors.
@@ -2166,7 +2166,7 @@ fn vacuum_in_place_step(
 
             VacuumInPlacePhase::SyncSourceWal { sync_completion } => {
                 if !sync_completion.finished() {
-                    return Ok(IOResult::IO(IOCompletions::Single(sync_completion.clone())));
+                    return Ok(IOResult::IO(IOCompletions(sync_completion.clone())));
                 }
                 if !sync_completion.succeeded() {
                     return Err(vacuum_completion_error(sync_completion, "WAL fsync"));

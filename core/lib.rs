@@ -1319,7 +1319,7 @@ impl Database {
                     Some(RegistryEntry::Opening) => {
                         // Another caller is already opening this path. Yield so the
                         // event loop can make progress and we retry later.
-                        return Ok(IOResult::IO(types::IOCompletions::Single(
+                        return Ok(IOResult::IO(types::IOCompletions(
                             io::Completion::new_yield(),
                         )));
                     }

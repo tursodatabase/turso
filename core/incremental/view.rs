@@ -1338,9 +1338,7 @@ impl IncrementalView {
                                 };
                                 // TODO: Get the actual I/O completion from the statement
                                 let completion = crate::io::Completion::new_yield();
-                                return Ok(IOResult::IO(crate::types::IOCompletions::Single(
-                                    completion,
-                                )));
+                                return Ok(IOResult::IO(crate::types::IOCompletions(completion)));
                             }
                         }
                     }

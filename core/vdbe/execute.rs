@@ -4929,9 +4929,9 @@ pub fn op_program(
                         Ok(step_result) => match step_result {
                             StepResult::Done => break,
                             StepResult::IO | StepResult::Yield => {
-                                let io = statement.take_io_completions().unwrap_or_else(|| {
-                                    IOCompletions::Single(Completion::new_yield())
-                                });
+                                let io = statement
+                                    .take_io_completions()
+                                    .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
                                 *state.active_op_state.program() = OpProgramState::Step {
                                     is_trigger,
                                     statement,
@@ -13078,7 +13078,7 @@ fn op_parse_schema_step(
                 let io = inner
                     .stmt
                     .take_io_completions()
-                    .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                    .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
                 return Ok(InsnFunctionStepResult::IO(io));
             }
             StepResult::Row => {
@@ -13338,7 +13338,7 @@ fn drive_init_cdc_version(
                 let io = inner
                     .stmt
                     .take_io_completions()
-                    .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
+                    .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
                 return Ok(InsnFunctionStepResult::IO(io));
             }
             StepResult::Row => match &inner.phase {
@@ -16749,9 +16749,7 @@ fn op_journal_mode_inner(
                     .expect("page_ref should be set");
                 let completion = begin_write_btree_page(pager, page)?;
                 state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::Finalize;
-                return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
-                    completion,
-                )));
+                return Ok(InsnFunctionStepResult::IO(IOCompletions(completion)));
             }
 
             OpJournalModeSubState::Finalize => {

@@ -730,7 +730,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         let locked = allocator.lock();
         if !locked {
             // Yield, some other cursor is generating new rowid
-            return Ok(IOResult::IO(IOCompletions::Single(Completion::new_yield())));
+            return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
         }
 
         self.creating_new_rowid = true;
