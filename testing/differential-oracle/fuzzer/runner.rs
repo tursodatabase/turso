@@ -23,6 +23,7 @@ use rand_chacha::ChaCha8Rng;
 use turso_core::Database;
 
 use crate::generate::{GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator, WeightProfile};
+use crate::ivm::{IvmCreateOutcome, IvmState};
 use crate::memory::{MemorySimIO, SimIO};
 use crate::oracle::{DifferentialOracle, OracleResult, QueryResult, check_differential};
 use crate::schema::SchemaIntrospector;
@@ -202,6 +203,10 @@ pub struct SimConfig {
     pub recursive_cte_focus: bool,
     /// Named statement-weight mix to generate with.
     pub weight_profile: WeightProfile,
+    /// Whether to enable IVM mode: create materialized views (Turso-only) and
+    /// verify after every statement that each view equals a fresh evaluation
+    /// of its defining query.
+    pub ivm: bool,
 }
 
 impl Default for SimConfig {
@@ -220,6 +225,7 @@ impl Default for SimConfig {
             window_function_probability: 0.0,
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
+            ivm: false,
         }
     }
 }
@@ -354,9 +360,17 @@ impl Fuzzer {
             std::fs::create_dir_all(&out_dir)?;
         }
 
+        if config.ivm && config.mvcc {
+            bail!(
+                "IVM mode is incompatible with MVCC (materialized views are not supported in MVCC mode)"
+            );
+        }
+
         // Create Turso in-memory database using MemorySimIO
         let io = Arc::new(MemorySimIO::new(config.seed));
-        let opts = turso_core::DatabaseOpts::new().with_attach(true);
+        let opts = turso_core::DatabaseOpts::new()
+            .with_attach(true)
+            .with_views(config.ivm);
 
         let turso_db = Database::open_file_with_flags(
             io.clone(),
@@ -555,10 +569,11 @@ impl Fuzzer {
         let mut generator: Box<dyn SqlGenerator> = match self.config.generator {
             GeneratorKind::SqlGen => {
                 let seed: u64 = self.rng.borrow_mut().next_u64();
-                Box::new(SqlGenBackend::new_with_window_weight(
+                Box::new(SqlGenBackend::new_with_options(
                     seed,
                     self.config.window_function_probability,
                     self.config.weight_profile,
+                    self.config.ivm,
                 ))
             }
             GeneratorKind::SqlGenProp => {
@@ -567,16 +582,54 @@ impl Fuzzer {
                     self.rng.borrow_mut().fill_bytes(&mut bytes);
                     bytes
                 };
-                Box::new(PropTestBackend::new(
+                Box::new(PropTestBackend::new_with_options(
                     seed_bytes,
                     self.config.recursive_cte_focus,
+                    self.config.ivm,
                 ))
             }
         };
 
         let mut schema = self.introspect_and_verify_schemas()?;
+        let mut ivm_state = self.config.ivm.then(IvmState::new);
 
         for i in 0..self.config.num_statements {
+            // In IVM mode, periodically create a materialized view over the
+            // current schema. Turso-only: SQLite has no materialized views.
+            // Only in autocommit, so a generated ROLLBACK can never undo a
+            // view we keep checking for the rest of the run.
+            if let Some(ivm) = ivm_state.as_mut() {
+                if ivm.wants_view(i) && self.turso_conn.get_auto_commit() {
+                    let outcome = {
+                        let mut rng = self.rng.borrow_mut();
+                        ivm.try_create_view(&self.turso_conn, &schema, &mut rng)
+                    };
+                    match outcome {
+                        Some(IvmCreateOutcome::Created { sql }) => {
+                            tracing::info!("IVM: created view: {sql}");
+                            executed_sql.push("-- IVM (turso-only)".to_string());
+                            executed_sql.push(sql.clone());
+                            // Check immediately so an initial-population bug is
+                            // attributed to the creation, not to the next statement.
+                            if let OracleResult::Fail(reason) = ivm.check_views(&self.turso_conn) {
+                                stats.oracle_failures += 1;
+                                executed_sql
+                                    .push(format!("-- IVM FAILED (initial population): {sql}"));
+                                tracing::error!("IVM initial population failure: {reason}");
+                                return Err(anyhow::anyhow!(
+                                    "IVM initial population failure after: {sql}\n{reason}"
+                                ));
+                            }
+                        }
+                        Some(IvmCreateOutcome::Rejected { sql, error }) => {
+                            tracing::warn!("IVM: view creation rejected: {sql}: {error}");
+                            executed_sql.push(format!("-- IVM view rejected ({error}): {sql}"));
+                        }
+                        None => {}
+                    }
+                }
+            }
+
             let stmt = generator.generate(&schema)?;
 
             // A generated expression can branch into several subqueries at
@@ -611,8 +664,23 @@ impl Fuzzer {
                 *ctx.lock() = Some(format!("{info}\n{bt}"));
             }));
 
+            let ivm_ref = ivm_state.as_ref();
             let oracle_result = std::panic::catch_unwind(|| {
-                check_differential(&self.turso_conn, &self.sqlite_conn, &schema, &stmt)
+                let result =
+                    check_differential(&self.turso_conn, &self.sqlite_conn, &schema, &stmt);
+                if result.is_fail() {
+                    return result;
+                }
+                // The IVM invariant is checked after every statement: view
+                // maintenance runs at commit, but mid-transaction reads must
+                // also agree with the defining query (same uncommitted snapshot).
+                if let Some(ivm) = ivm_ref {
+                    let ivm_result = ivm.check_views(&self.turso_conn);
+                    if ivm_result.is_fail() {
+                        return ivm_result;
+                    }
+                }
+                result
             });
 
             std::panic::set_hook(prev_hook);
@@ -933,6 +1001,7 @@ mod tests {
             window_function_probability: 0.0,
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
+            ivm: false,
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());

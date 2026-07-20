@@ -148,8 +148,25 @@ impl SqlGenBackend {
         window_function_probability: f64,
         profile: WeightProfile,
     ) -> Self {
+        Self::new_with_options(seed, window_function_probability, profile, false)
+    }
+
+    pub fn new_with_options(
+        seed: u64,
+        window_function_probability: f64,
+        profile: WeightProfile,
+        ivm: bool,
+    ) -> Self {
         let ctx = sql_gen::Context::new_with_seed(seed);
-        let stmt_weights = profile.stmt_weights();
+        let mut stmt_weights = profile.stmt_weights();
+        if ivm {
+            // Schema changes under a table with dependent materialized views
+            // diverge from SQLite by design: Turso rejects ALTER TABLE
+            // outright, and DROP TABLE would orphan the view. Disable both so
+            // IVM runs exercise maintenance, not that asymmetry.
+            stmt_weights.drop_table = 0;
+            stmt_weights.alter_table = 0;
+        }
         tracing::info!("Statement weight profile {profile:?}: {stmt_weights:?}");
         let mut policy = Policy::default()
             .with_stmt_weights(stmt_weights)
@@ -250,6 +267,10 @@ pub struct PropTestBackend {
 
 impl PropTestBackend {
     pub fn new(seed_bytes: [u8; 32], recursive_cte_focus: bool) -> Self {
+        Self::new_with_options(seed_bytes, recursive_cte_focus, false)
+    }
+
+    pub fn new_with_options(seed_bytes: [u8; 32], recursive_cte_focus: bool, ivm: bool) -> Self {
         let test_runner = TestRunner::new_with_rng(
             proptest::test_runner::Config::default(),
             proptest::test_runner::TestRng::from_seed(
@@ -273,6 +294,12 @@ impl PropTestBackend {
             cte.cte_count_range = 1..=3;
             cte.recursive_weight = 100;
             cte.non_recursive_weight = 0;
+        }
+        if ivm {
+            // See SqlGenBackend::new_with_options: DROP/ALTER TABLE on base tables of
+            // materialized views diverge from SQLite by design.
+            profile.drop_table_weight = 0;
+            profile.alter_table = sql_gen_prop::WeightedProfile::new(0);
         }
         Self {
             test_runner,
