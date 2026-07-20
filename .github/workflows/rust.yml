@@ -61,7 +61,7 @@ jobs:
           fi
 
   build-native:
-    timeout-minutes: ${{ matrix.os == 'blacksmith-8vcpu-windows-2025' && 120 || 30 }}
+    timeout-minutes: 60
     strategy:
       matrix:
         os:
