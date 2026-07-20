@@ -284,11 +284,18 @@ expect {
     row_number|w|0
 }
 
+test pragma-function-list-window-rank {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'rank';
+}
+expect {
+    rank|w|0
+}
+
 @skip-if sqlite "sqlite implements these window functions; we don't yet, so they must not be advertised in pragma_function_list"
 test pragma-function-list-omits-unimplemented-window-functions {
     SELECT COUNT(*) FROM pragma_function_list
     WHERE name IN (
-        'rank','dense_rank','percent_rank','cume_dist','ntile',
+        'dense_rank','percent_rank','cume_dist','ntile',
         'lag','lead','first_value','last_value','nth_value'
     );
 }

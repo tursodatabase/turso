@@ -518,7 +518,116 @@ impl WindowFunc {
     /// drifts ahead of the resolver and users get "no such function" when
     /// they try to call them.
     pub fn is_implemented(&self) -> bool {
-        matches!(self, Self::RowNumber)
+        matches!(self, Self::RowNumber | Self::Rank)
+    }
+
+    /// The hardcoded frame this built-in evaluates over, overriding any
+    /// user-written FRAME clause.
+    /// - `Some(frame)` = even if the user provides an explicit frame, it's ignored in favor of this hardcoded frame.
+    /// - `None` = the function honors the user's frame, falling back to Frame::default() when user hasn't specified one.
+    ///
+    /// This is taken from SQLite's `sqlite3WindowUpdate` table at `window.c:699-708`.
+    pub fn coerced_frame(&self) -> Option<crate::translate::plan::Frame> {
+        use crate::translate::plan::{Frame, FrameBoundary};
+        use turso_parser::ast::{Expr, FrameMode, Literal};
+        match self {
+            Self::RowNumber | Self::Lag => Some(Frame {
+                mode: FrameMode::Rows,
+                start: FrameBoundary::UnboundedPreceding,
+                end: FrameBoundary::CurrentRow,
+            }),
+            Self::Rank | Self::DenseRank => Some(Frame {
+                mode: FrameMode::Range,
+                start: FrameBoundary::UnboundedPreceding,
+                end: FrameBoundary::CurrentRow,
+            }),
+            Self::PercentRank => Some(Frame {
+                mode: FrameMode::Groups,
+                start: FrameBoundary::CurrentRow,
+                end: FrameBoundary::UnboundedFollowing,
+            }),
+            Self::CumeDist => Some(Frame {
+                mode: FrameMode::Groups,
+                start: FrameBoundary::Following(Box::new(Expr::Literal(Literal::Numeric(
+                    "1".to_string(),
+                )))),
+                end: FrameBoundary::UnboundedFollowing,
+            }),
+            Self::Ntile => Some(Frame {
+                mode: FrameMode::Rows,
+                start: FrameBoundary::CurrentRow,
+                end: FrameBoundary::UnboundedFollowing,
+            }),
+            Self::Lead => Some(Frame {
+                mode: FrameMode::Rows,
+                start: FrameBoundary::UnboundedPreceding,
+                end: FrameBoundary::UnboundedFollowing,
+            }),
+            Self::FirstValue | Self::LastValue | Self::NthValue => None,
+            Self::External(_) => unreachable!(
+                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
+            ),
+        }
+    }
+
+    /// Whether the function produces a single value shared by every row in a
+    /// peer group (true) or a distinct value per row (false).
+    ///
+    /// This controls where `emit_aggregation_step` and
+    /// `emit_peer_group_flush` emit the function's `AggStep` and
+    /// `AggValue` opcodes:
+    ///
+    /// * true (rank-family): `AggStep` is emitted inside the input-scan loop
+    ///   in `emit_aggregation_step`, so it runs once for every row read from
+    ///   the subquery and advances the function's internal counter. `AggValue`
+    ///   is emitted once per peer-group flush in `emit_peer_group_flush`,
+    ///   before the loop over buffered rows, reading the accumulator into a
+    ///   result register. The loop then writes that one register's contents
+    ///   into the output for every buffered row in the group.
+    /// * false (row_number, ntile, lag, lead, first/last/nth_value): nothing
+    ///   is emitted in `emit_aggregation_step`. Both `AggStep` and `AggValue`
+    ///   are emitted inside the per-row loop in `emit_peer_group_flush`,
+    ///   so they run once per buffered row and produce a distinct value for
+    ///   each output row.
+    ///
+    /// Concrete example. Given `scores(name, score)`:
+    ///
+    ///   alice  100
+    ///   bob    100
+    ///   carol   90
+    ///
+    /// `rank() OVER (ORDER BY score DESC)` returns true — alice and bob are
+    /// peers on score=100 and share the same rank:
+    ///
+    ///   alice  100  1
+    ///   bob    100  1
+    ///   carol   90  3
+    ///
+    /// `row_number() OVER (ORDER BY score DESC)` returns false — every row
+    /// gets a distinct number even within the score=100 peer group:
+    ///
+    ///   alice  100  1
+    ///   bob    100  2
+    ///   carol   90  3
+    ///
+    /// Functions returning true: `rank`, `dense_rank`, `percent_rank`,
+    /// `cume_dist` — their value is determined entirely by where the peer
+    /// group sits in the partition's ordering.
+    /// Functions returning false: `row_number`, `ntile`, `lag`, `lead`,
+    /// `first_value`, `last_value`, `nth_value` — all depend on a row's
+    /// position within the partition/frame, not just its peer group.
+    pub fn one_value_per_peer_group(&self) -> bool {
+        match self {
+            Self::Rank | Self::DenseRank | Self::PercentRank | Self::CumeDist => true,
+            Self::RowNumber
+            | Self::Ntile
+            | Self::Lag
+            | Self::Lead
+            | Self::FirstValue
+            | Self::LastValue
+            | Self::NthValue
+            | Self::External(_) => false,
+        }
     }
 }
 
