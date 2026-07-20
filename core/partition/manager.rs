@@ -123,6 +123,7 @@ impl PartitionManager {
     }
 
     /// List registered logical tables without exposing their configurations.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn registered_tables(&self) -> Vec<String> {
         self.configs.keys().cloned().collect()
     }

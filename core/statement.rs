@@ -515,6 +515,7 @@ impl Statement {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && self.origin != StatementOrigin::InternalHelper
         {
+            #[cfg(not(target_family = "wasm"))]
             if let Err(error) = self.prepare_partition_lifecycle() {
                 self.release_active_root_if_counted();
                 return Err(error);
@@ -659,9 +660,9 @@ impl Statement {
         res
     }
 
-    // Keep the partition state machine out of the cross-platform `_step` frame.
-    // Browser sync exercises that frame across its main/worker boundary; the
-    // concurrent browser regression test covers this code-generation boundary.
+    // Time partitioning relies on native filesystem lifecycle operations and is
+    // intentionally excluded from WebAssembly builds.
+    #[cfg(not(target_family = "wasm"))]
     #[inline(never)]
     fn prepare_partition_lifecycle(&mut self) -> Result<()> {
         // BEGIN/SAVEPOINT statements reconcile while still in autocommit.
@@ -683,6 +684,7 @@ impl Statement {
         self.route_partitioned_insert()
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn refresh_partition_pruning(&mut self) -> Result<()> {
         let bindings_changed =
             self.program
@@ -703,6 +705,7 @@ impl Statement {
         Ok(())
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn route_partitioned_insert(&mut self) -> Result<()> {
         use crate::partition::PartitionInsertValue;
 

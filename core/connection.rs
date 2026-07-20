@@ -1993,6 +1993,19 @@ impl Connection {
     }
 
     /// Register a table for time-based partitioning.
+    #[cfg(target_family = "wasm")]
+    pub fn register_partitioned_table(
+        &self,
+        _table_name: &str,
+        _config: crate::partition::PartitionConfig,
+    ) -> Result<()> {
+        Err(LimboError::InvalidArgument(
+            "time partitioning is not supported on WebAssembly".to_string(),
+        ))
+    }
+
+    /// Register a table for time-based partitioning.
+    #[cfg(not(target_family = "wasm"))]
     pub fn register_partitioned_table(
         &self,
         table_name: &str,
@@ -2018,6 +2031,7 @@ impl Connection {
         Ok(())
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn validate_partition_config(
         &self,
         table_name: &str,
@@ -2277,6 +2291,7 @@ impl Connection {
         Ok(())
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn track_partition_write(
         &self,
         table_name: &str,
@@ -2776,14 +2791,14 @@ impl Connection {
     }
 
     /// Reconcile every registered table before a root statement starts.
-    #[cfg(feature = "fs")]
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
     pub(crate) fn refresh_all_partitioned_tables(&self) -> Result<()> {
         let tables = self.partition_manager.read().registered_tables();
         self.refresh_partitioned_tables(&tables)
     }
 
     /// Reconcile only the logical tables referenced by the statement being run.
-    #[cfg(feature = "fs")]
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
     pub(crate) fn refresh_partitioned_tables(&self, tables: &[String]) -> Result<()> {
         for table in tables {
             if !self.partition_manager.read().is_partitioned(table) {
@@ -2794,12 +2809,12 @@ impl Connection {
         Ok(())
     }
 
-    #[cfg(not(feature = "fs"))]
+    #[cfg(all(not(feature = "fs"), not(target_family = "wasm")))]
     pub(crate) fn refresh_all_partitioned_tables(&self) -> Result<()> {
         Ok(())
     }
 
-    #[cfg(not(feature = "fs"))]
+    #[cfg(all(not(feature = "fs"), not(target_family = "wasm")))]
     pub(crate) fn refresh_partitioned_tables(&self, _tables: &[String]) -> Result<()> {
         Ok(())
     }
