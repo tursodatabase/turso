@@ -515,30 +515,7 @@ impl Statement {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && self.origin != StatementOrigin::InternalHelper
         {
-            // BEGIN/SAVEPOINT statements reconcile while still in autocommit.
-            // Once a transaction is active, keep its attached-file set stable
-            // so external retention or publication cannot change the logical
-            // snapshot between statements in that transaction.
-            if self.program.connection.get_auto_commit()
-                && self.program.prepared.partitioned_insert.is_none()
-            {
-                let refresh_result = if self.program.prepared.refresh_all_partitions {
-                    self.program.connection.refresh_all_partitioned_tables()
-                } else {
-                    self.program
-                        .connection
-                        .refresh_partitioned_tables(&self.program.prepared.partitioned_tables)
-                };
-                if let Err(error) = refresh_result {
-                    self.release_active_root_if_counted();
-                    return Err(error);
-                }
-            }
-            if let Err(error) = self.refresh_partition_pruning() {
-                self.release_active_root_if_counted();
-                return Err(error);
-            }
-            if let Err(error) = self.route_partitioned_insert() {
+            if let Err(error) = self.prepare_partition_lifecycle() {
                 self.release_active_root_if_counted();
                 return Err(error);
             }
@@ -680,6 +657,30 @@ impl Statement {
         }
 
         res
+    }
+
+    // Keep the partition state machine out of the cross-platform `_step` frame.
+    // Browser sync exercises that frame across its main/worker boundary; the
+    // concurrent browser regression test covers this code-generation boundary.
+    #[inline(never)]
+    fn prepare_partition_lifecycle(&mut self) -> Result<()> {
+        // BEGIN/SAVEPOINT statements reconcile while still in autocommit.
+        // Once a transaction is active, keep its attached-file set stable
+        // so external retention or publication cannot change the logical
+        // snapshot between statements in that transaction.
+        if self.program.connection.get_auto_commit()
+            && self.program.prepared.partitioned_insert.is_none()
+        {
+            if self.program.prepared.refresh_all_partitions {
+                self.program.connection.refresh_all_partitioned_tables()?;
+            } else {
+                self.program
+                    .connection
+                    .refresh_partitioned_tables(&self.program.prepared.partitioned_tables)?;
+            }
+        }
+        self.refresh_partition_pruning()?;
+        self.route_partitioned_insert()
     }
 
     fn refresh_partition_pruning(&mut self) -> Result<()> {
