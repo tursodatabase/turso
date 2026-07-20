@@ -1,0 +1,18 @@
+[package]
+name = "turso_ruby"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+magnus = { version = "0.8", features = ["rb-sys"] }
+rb-sys = "0.9"
+turso_sdk_kit = { workspace = true, features = ["fts"] }
+turso_core = { workspace = true }
+
+[dev-dependencies]
+turso_sdk_kit = { workspace = true, features = ["fts"] }

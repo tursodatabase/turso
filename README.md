@@ -50,6 +50,7 @@ See the [FAQ](#faq) for where the project stands on its way to 1.0.
   * [Java](bindings/java)
   * [.NET](bindings/dotnet)
   * [Python](bindings/python)
+  * [Ruby](bindings/ruby)
   * [Rust](bindings/rust)
   * [WebAssembly](bindings/javascript)
 * **Asynchronous I/O** support on Linux with `io_uring`
