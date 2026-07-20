@@ -16481,6 +16481,24 @@ fn op_journal_mode_inner(
                     return Err(LimboError::ReadOnly);
                 }
 
+                // CDC capture is connection-level state that feeds off the
+                // current journal mode's write path. Changing the mode while
+                // capture is active silently stops capture while the capture
+                // pragma still reports it as on. Reject the change loudly
+                // (0.6 rejected it with "cannot enable MVCC while CDC is
+                // active"; that guard was lost in the logical log v3
+                // redesign). A no-op re-run of the current mode is fine —
+                // the same-mode early return above already handled it.
+                if program.connection.get_capture_data_changes_info().is_some() {
+                    let prev: &'static str = prev_mode.into();
+                    let new: &'static str = new_mode.into();
+                    return Err(LimboError::InvalidArgument(format!(
+                        "cannot change journal_mode (from {prev} to {new}) while CDC capture is active: \
+                         capture would silently stop; disable capture first with \
+                         PRAGMA capture_data_changes_conn('off')"
+                    )));
+                }
+
                 // MVCC has no cross-process coordination: commit
                 // serialization, the logical-log append offset, and
                 // checkpoint exclusion are all process-local, so switching a

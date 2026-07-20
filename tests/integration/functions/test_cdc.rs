@@ -4,7 +4,7 @@ use rusqlite::types::Value;
 use turso_core::types::ImmutableRecord;
 use turso_core::CDC_VERSION_CURRENT;
 
-use crate::common::{limbo_exec_rows, TempDatabase};
+use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
 
 fn replace_column_with_null(rows: Vec<Vec<Value>>, column: usize) -> Vec<Vec<Value>> {
     rows.into_iter()
@@ -1832,4 +1832,95 @@ fn test_cdc_drop_turso_cdc_version(db: TempDatabase) {
         "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'turso_cdc_version'",
     );
     assert_eq!(rows, vec![vec![Value::Integer(0)]]);
+}
+
+/// Count rows in the CDC table.
+fn cdc_row_count(conn: &std::sync::Arc<turso_core::Connection>) -> i64 {
+    let rows = limbo_exec_rows(conn, "SELECT COUNT(*) FROM turso_cdc");
+    match rows[0][0] {
+        Value::Integer(n) => n,
+        ref other => panic!("expected integer count, got {other:?}"),
+    }
+}
+
+/// Changing journal_mode while CDC capture is active must fail loudly.
+///
+/// Regression guard: 0.6-era commit 34a110181 ("block CDC in MVCC mode")
+/// rejected `PRAGMA journal_mode = 'mvcc'` under active capture with
+/// "cannot enable MVCC while CDC is active". That check was dropped in
+/// c04b2c209 (logical log v3 redesign); the engine then accepted the
+/// switch and silently stopped capturing while the capture pragma still
+/// reported active.
+#[turso_macros::test]
+fn test_cdc_journal_mode_change_rejected_while_capture_active(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let captured_before = cdc_row_count(&conn);
+    assert!(
+        captured_before > 0,
+        "capture must be live before the switch attempt"
+    );
+
+    // Re-running the CURRENT mode is a no-op and must stay allowed under CDC.
+    let rows = limbo_exec_rows(&conn, "PRAGMA journal_mode = 'wal'");
+    assert_eq!(rows, vec![vec![Value::Text("wal".to_string())]]);
+
+    // An actual mode CHANGE must be rejected loudly.
+    let err = limbo_exec_rows_fallible(&db, &conn, "PRAGMA journal_mode = 'mvcc'")
+        .expect_err("journal_mode change must be rejected while CDC capture is active");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("CDC") && msg.contains("capture_data_changes"),
+        "error must name CDC capture: {msg}"
+    );
+
+    // The mode did not change and capture still works after the rejection.
+    let rows = limbo_exec_rows(&conn, "PRAGMA journal_mode");
+    assert_eq!(rows, vec![vec![Value::Text("wal".to_string())]]);
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    let captured_after = cdc_row_count(&conn);
+    assert!(
+        captured_after > captured_before,
+        "capture must still record changes after the rejected switch \
+         ({captured_before} -> {captured_after})"
+    );
+}
+
+/// The qualified spelling must hit the same guard.
+#[turso_macros::test]
+fn test_cdc_qualified_journal_mode_change_rejected(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let captured_before = cdc_row_count(&conn);
+
+    let err = limbo_exec_rows_fallible(&db, &conn, "PRAGMA main.journal_mode = 'mvcc'")
+        .expect_err("qualified journal_mode change must be rejected while CDC capture is active");
+    assert!(
+        err.to_string().contains("CDC"),
+        "error must name CDC capture: {err}"
+    );
+
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    assert!(cdc_row_count(&conn) > captured_before);
+}
+
+/// Without CDC capture the mvcc switch must keep working.
+#[turso_macros::test]
+fn test_journal_mode_mvcc_switch_allowed_without_cdc(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    let rows = limbo_exec_rows(&conn, "PRAGMA journal_mode = 'mvcc'");
+    assert_eq!(rows, vec![vec![Value::Text("mvcc".to_string())]]);
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM t");
+    assert_eq!(rows, vec![vec![Value::Integer(1)]]);
 }
