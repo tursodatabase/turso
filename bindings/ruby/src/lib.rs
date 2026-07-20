@@ -1,3 +1,4 @@
+mod blocking_op;
 mod connection;
 mod database;
 mod error;
