@@ -88,6 +88,17 @@ synchronous local-filesystem operations. Partitioned tables should therefore be
 driven through the synchronous statement APIs; fully nonblocking
 `step_with_waker` integration is not part of the current contract.
 
+An operational lifecycle soak is available as:
+
+```sh
+cargo run -p turso_core --example partitioning_soak
+```
+
+It simulates daily rotation, checked retention, prepared recorder inserts,
+logical queries, and periodic full reopens. Its duration and data volume can be
+scaled through the `TURSO_PARTITION_SOAK_*` environment variables listed in the
+example source.
+
 ## Retention
 
 Prefer the checked API for retention:
