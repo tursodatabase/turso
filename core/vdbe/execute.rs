@@ -3883,6 +3883,19 @@ pub fn op_transaction_inner(
                             begin_w_tx_res,
                             Err(LimboError::Busy | LimboError::BusySnapshot)
                         ) {
+                            // Classify why the upgrade failed so a surfaced
+                            // SQLITE_BUSY can be told apart later: `Busy` means
+                            // the shared single-writer lock is held by another
+                            // connection (an exclusive writer is active now),
+                            // while `BusySnapshot` means our read snapshot went
+                            // stale under a writer that has already committed and
+                            // released the lock.
+                            conn.set_write_busy_origin(match begin_w_tx_res {
+                                Err(LimboError::BusySnapshot) => {
+                                    crate::connection::WriteBusyOrigin::StaleSnapshot
+                                }
+                                _ => crate::connection::WriteBusyOrigin::LockContention,
+                            });
                             // We failed to upgrade to write transaction so put the transaction into its original state.
                             // That is, if the transaction had not started, end the read transaction so that next time we
                             // start a new one.

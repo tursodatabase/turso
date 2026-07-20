@@ -337,6 +337,45 @@ pub enum SyncRowStep {
     Upsert { stmt: Box<Statement> },
 }
 
+/// Why the connection's most recent attempt to open a write transaction was
+/// rejected with a busy result. Distinguishes genuine single-writer lock
+/// contention (an exclusive writer is active *right now*) from an optimistic
+/// snapshot conflict (a concurrent writer already committed and released its
+/// lock, so no writer need still be active).
+///
+/// Reset to [`WriteBusyOrigin::None`] at the start of every statement step, set
+/// only on the write-transaction path in `op_transaction`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum WriteBusyOrigin {
+    #[default]
+    None,
+    /// Failed to acquire the shared single-writer WAL lock — another connection
+    /// holds it. `LimboError::Busy` from `begin_write_tx`.
+    LockContention,
+    /// Acquired the write lock but the read snapshot was stale because a
+    /// concurrent writer committed; the write lock was released before the busy
+    /// was surfaced. `LimboError::BusySnapshot` from `begin_write_tx`.
+    StaleSnapshot,
+}
+
+impl WriteBusyOrigin {
+    const fn to_u8(self) -> u8 {
+        match self {
+            WriteBusyOrigin::None => 0,
+            WriteBusyOrigin::LockContention => 1,
+            WriteBusyOrigin::StaleSnapshot => 2,
+        }
+    }
+
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => WriteBusyOrigin::LockContention,
+            2 => WriteBusyOrigin::StaleSnapshot,
+            _ => WriteBusyOrigin::None,
+        }
+    }
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -352,6 +391,11 @@ pub struct Connection {
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
     pub(super) transaction_state: AtomicTransactionState,
+    /// Origin of the connection's most recent write-transaction busy, encoded as
+    /// a [`WriteBusyOrigin`]. Reset at the start of every statement step; lets a
+    /// surfaced `SQLITE_BUSY` be classified as lock contention vs snapshot
+    /// conflict without threading the reason through `StepResult`.
+    pub(super) write_busy_origin: AtomicU8,
     /// True when an unfinished write statement inside an explicit transaction
     /// was reset or dropped and there was no statement savepoint to undo only
     /// that statement. COMMIT must roll back the whole transaction.
@@ -4568,6 +4612,30 @@ impl Connection {
         self.mv_store()
             .as_ref()
             .is_some_and(|mv_store| mv_store.has_exclusive_tx())
+    }
+
+    /// Record why the most recent write-transaction attempt was rejected as
+    /// busy. Called from the write-transaction path in `op_transaction`.
+    pub(crate) fn set_write_busy_origin(&self, origin: WriteBusyOrigin) {
+        self.write_busy_origin
+            .store(origin.to_u8(), Ordering::Release);
+    }
+
+    /// Reset the recorded write-busy origin. Called at the start of each
+    /// statement step so the classification only reflects the current step.
+    pub(crate) fn clear_write_busy_origin(&self) {
+        self.write_busy_origin
+            .store(WriteBusyOrigin::None.to_u8(), Ordering::Release);
+    }
+
+    /// True if the connection's most recent write-transaction busy was caused by
+    /// failing to acquire the shared single-writer WAL lock (as opposed to an
+    /// optimistic snapshot conflict, where the offending writer already
+    /// committed and released). A lock-contention busy implies an exclusive
+    /// writer is active right now; a snapshot conflict does not.
+    pub(crate) fn last_write_busy_was_lock_contention(&self) -> bool {
+        WriteBusyOrigin::from_u8(self.write_busy_origin.load(Ordering::Acquire))
+            == WriteBusyOrigin::LockContention
     }
 
     pub(crate) fn get_mv_tx_id(&self) -> Option<u64> {

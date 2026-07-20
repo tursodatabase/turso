@@ -502,6 +502,10 @@ impl Statement {
     }
 
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        // Reset the write-busy classification so it only ever reflects a busy
+        // produced by this step. A surfaced `StepResult::Busy` is inspected by
+        // the caller immediately after this returns.
+        self.program.connection.clear_write_busy_origin();
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
             self.program
                 .connection
@@ -1475,6 +1479,20 @@ impl Statement {
     /// contention.
     pub fn database_has_active_writer(&self) -> bool {
         self.program.connection.has_active_writer()
+    }
+
+    /// True if the most recent write-transaction busy on this statement's
+    /// connection was caused by failing to acquire the shared single-writer WAL
+    /// lock (genuine lock contention), rather than by an optimistic snapshot
+    /// conflict where the offending writer already committed and released.
+    ///
+    /// Only for a lock-contention busy is a concurrently-active exclusive writer
+    /// guaranteed: the caller can pair this with [`Statement::database_has_active_writer`]
+    /// to assert that invariant.
+    pub fn last_write_busy_was_lock_contention(&self) -> bool {
+        self.program
+            .connection
+            .last_write_busy_was_lock_contention()
     }
 
     /// Internal method to get IO from a statement.
