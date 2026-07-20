@@ -1,5 +1,6 @@
 use magnus::{
-    data_type_builder, DataType, DataTypeFunctions, Error, RHash, RString, Ruby, Symbol, TypedData, Value,
+    data_type_builder, DataType, DataTypeFunctions, Error, RHash, RString, Ruby, Symbol, TypedData,
+    Value,
 };
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{TursoConnection, TursoDatabase, TursoDatabaseConfig};
@@ -119,7 +120,9 @@ impl Database {
             .conn
             .close()
             .map_err(|e| from_turso_error(e, classes))?;
-        self.inner.closed.store(true, std::sync::atomic::Ordering::Release);
+        self.inner
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 

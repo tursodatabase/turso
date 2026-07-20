@@ -82,12 +82,10 @@ impl Statement {
 
     pub fn named_position(&self, name: String) -> Result<i64, Error> {
         self.with_guard(|stmt| {
-            stmt.named_position(&name)
-                .map(|i| i as i64)
-                .map_err(|e| {
-                    let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
-                    from_turso_error(e, classes)
-                })
+            stmt.named_position(&name).map(|i| i as i64).map_err(|e| {
+                let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+                from_turso_error(e, classes)
+            })
         })
     }
 
@@ -115,7 +113,10 @@ impl Statement {
         self.with_guard(|stmt| {
             let nn = NonNan::new(value).ok_or_else(|| {
                 magnus::Error::new(
-                    ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized").base(),
+                    ERROR_CLASSES
+                        .get()
+                        .expect("ERROR_CLASSES not initialized")
+                        .base(),
                     "NaN is not supported",
                 )
             })?;
@@ -255,8 +256,6 @@ impl Statement {
     }
 
     pub fn column_decltype(&self, index: u32) -> Result<Option<String>, Error> {
-        self.with_guard(|stmt| {
-            Ok(stmt.column_decltype(index as usize))
-        })
+        self.with_guard(|stmt| Ok(stmt.column_decltype(index as usize)))
     }
 }

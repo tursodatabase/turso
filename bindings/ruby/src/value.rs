@@ -1,8 +1,8 @@
+use magnus::value::{Qfalse, Qtrue};
 use magnus::{
     encoding::EncodingCapable, value::ReprValue, Error, Float, Integer, IntoValue, RString, Ruby,
     Value,
 };
-use magnus::value::{Qfalse, Qtrue};
 use turso_core::types::Text;
 use turso_core::{NonNan, Numeric, Value as TursoValue};
 

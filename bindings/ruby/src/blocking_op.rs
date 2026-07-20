@@ -6,6 +6,7 @@ use std::ptr;
 use crate::error::{from_turso_error, ErrorClasses};
 use turso_sdk_kit::rsapi::TursoError;
 
+#[allow(dead_code)]
 trait Callable {
     fn call(self: Box<Self>) -> Result<Box<dyn Any + Send + 'static>, TursoError>;
 }
@@ -20,10 +21,8 @@ where
     }
 }
 
-pub fn run_blocking<F, T>(
-    classes: &ErrorClasses,
-    f: F,
-) -> Result<T, magnus::Error>
+#[allow(dead_code)]
+pub fn run_blocking<F, T>(classes: &ErrorClasses, f: F) -> Result<T, magnus::Error>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, TursoError> + Send + 'static,
@@ -44,12 +43,11 @@ where
         let slot = arg as *mut Slot;
         let slot_ref = unsafe { &mut *slot };
         let closure = slot_ref.closure.take().unwrap();
-        let res = catch_unwind(AssertUnwindSafe(|| closure.call())).unwrap_or_else(|_| {
-            Err(TursoError::Error(
-                "panic in blocking operation".to_string(),
-            ))
-        });
-        unsafe { *slot_ref.result = Some(res); }
+        let res = catch_unwind(AssertUnwindSafe(|| closure.call()))
+            .unwrap_or_else(|_| Err(TursoError::Error("panic in blocking operation".to_string())));
+        unsafe {
+            *slot_ref.result = Some(res);
+        }
         ptr::null_mut()
     }
 
@@ -64,6 +62,10 @@ where
 
     result
         .unwrap()
-        .map(|boxed| *boxed.downcast::<T>().expect("type mismatch in run_blocking"))
+        .map(|boxed| {
+            *boxed
+                .downcast::<T>()
+                .expect("type mismatch in run_blocking")
+        })
         .map_err(|e| from_turso_error(e, classes))
 }
