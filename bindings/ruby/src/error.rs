@@ -18,7 +18,7 @@ pub struct ErrorClasses {
 
 impl ErrorClasses {
     pub fn define(ruby: &Ruby, module: &impl Module) -> Result<Self, magnus::Error> {
-        let base = module.define_error("Error", ruby.exception_standard_error())?;
+        let base = module.define_error("Exception", ruby.exception_standard_error())?;
         let base_val = val_to_usize(base.as_value());
         let sub = |name: &str| -> Result<usize, magnus::Error> {
             let class = module.define_error(
@@ -29,16 +29,16 @@ impl ErrorClasses {
         };
         Ok(ErrorClasses {
             base: base_val,
-            busy: sub("BusyError")?,
-            busy_snapshot: sub("BusySnapshotError")?,
-            interrupt: sub("InterruptError")?,
-            constraint: sub("ConstraintError")?,
-            readonly: sub("ReadonlyError")?,
-            misuse: sub("MisuseError")?,
-            database_full: sub("DatabaseFullError")?,
-            not_a_database: sub("NotADatabaseError")?,
-            corrupt: sub("CorruptError")?,
-            io: sub("IoError")?,
+            busy: sub("BusyException")?,
+            busy_snapshot: sub("BusySnapshotException")?,
+            interrupt: sub("InterruptException")?,
+            constraint: sub("ConstraintException")?,
+            readonly: sub("ReadonlyException")?,
+            misuse: sub("MisuseException")?,
+            database_full: sub("DatabaseFullException")?,
+            not_a_database: sub("NotADatabaseException")?,
+            corrupt: sub("CorruptException")?,
+            io: sub("IoException")?,
         })
     }
 
