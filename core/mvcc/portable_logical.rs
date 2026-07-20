@@ -90,15 +90,15 @@ pub(crate) fn is_portable_schema_row(row: &PortableSchemaRow) -> bool {
             || row.row_type.eq_ignore_ascii_case("view"))
 }
 
-pub(crate) struct PortableLogicalBuilder {
-    strings: Vec<String>,
-    string_refs: HashMap<String, u64>,
+pub(crate) struct PortableLogicalBuilder<'a> {
+    strings: Vec<&'a str>,
+    string_refs: HashMap<&'a str, u64>,
     object_maps: Vec<Vec<u8>>,
     object_map_ids: HashSet<i64>,
     metadata: Vec<Vec<u8>>,
 }
 
-impl Default for PortableLogicalBuilder {
+impl Default for PortableLogicalBuilder<'_> {
     fn default() -> Self {
         Self {
             strings: crate::alloc::vec![],
@@ -115,22 +115,22 @@ pub(crate) struct PortableObjectMapEntry<'a> {
     pub(crate) name: &'a str,
 }
 
-impl PortableLogicalBuilder {
+impl<'a> PortableLogicalBuilder<'a> {
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    fn intern_string(&mut self, value: &str) -> Result<u64> {
+    fn intern_string(&mut self, value: &'a str) -> Result<u64> {
         if let Some(idx) = self.string_refs.get(value) {
             return Ok(*idx);
         }
         let idx = self.strings.len() as u64;
-        self.strings.try_push(value.to_string())?;
-        self.string_refs.insert(value.to_string(), idx);
+        self.strings.try_push(value)?;
+        self.string_refs.insert(value, idx);
         Ok(idx)
     }
 
-    pub(crate) fn add_object_map(&mut self, entry: PortableObjectMapEntry<'_>) -> Result<bool> {
+    pub(crate) fn add_object_map(&mut self, entry: PortableObjectMapEntry<'a>) -> Result<bool> {
         if !is_portable_logical_name(entry.name) || !self.object_map_ids.insert(entry.mv_table_id) {
             return Ok(false);
         }
@@ -150,7 +150,7 @@ impl PortableLogicalBuilder {
         Ok(true)
     }
 
-    pub(crate) fn add_metadata(&mut self, key: &str, value: &str) -> Result<()> {
+    pub(crate) fn add_metadata(&mut self, key: &'a str, value: &'a str) -> Result<()> {
         let key_ref = self.intern_string(key)?;
         let value_ref = self.intern_string(value)?;
         let mut meta = crate::alloc::vec![];

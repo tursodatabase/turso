@@ -2426,8 +2426,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 .into_iter()
                 .collect();
             metadata.sort_by(|a, b| a.0.cmp(&b.0));
-            for (key, value) in metadata {
-                builder.add_metadata(&key, &value)?;
+            for (key, value) in &metadata {
+                builder.add_metadata(key, value)?;
             }
 
             // The recovery payload is the single durable operation stream.
