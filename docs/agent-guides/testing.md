@@ -69,6 +69,9 @@ fn test_something() {
 - Prefer in-memory DBs: `:memory:` (sqltest) or `{:memory:}` (TCL)
 - Don't invent new test formats. Follow existing patterns
 - Write tests first when possible
+- If tasked with identifying a reproducer for a bug, strongly prefer using only user-facing APIs. Manipulating DB internals to artificially trigger a condition, or asserting internal state, is a bad reproducer.
+- A reproducer must serve as a regression test once the bug is fixed.
+
 
 ## Test Database Schema
 
