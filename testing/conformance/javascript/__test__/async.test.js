@@ -1256,7 +1256,7 @@ test.serial("Concurrent writes over same connection", async (t) => {
   t.is(rows[0][0], 22);
 });
 
-test.serial("Statement.iterate() with nested execute() on same connection does not deadlock", async (t) => {
+test.serial("Statement.iterate() with a nested query on same connection does not deadlock", async (t) => {
   if (process.env.PROVIDER !== "serverless") {
     t.pass("Skipping serverless-only deadlock reproduction");
     return;
@@ -1272,12 +1272,12 @@ test.serial("Statement.iterate() with nested execute() on same connection does n
   const run = (async () => {
     for await (const row of stmt.iterate()) {
       const id = row.id ?? row[0];
-      await db.execute("SELECT ? as echoed_id", [id]);
+      await db.all("SELECT ? as echoed_id", [id]);
     }
   })();
 
   await t.notThrowsAsync(async () => {
-    await withTimeout(run, 2000, "nested iterate/execute");
+    await withTimeout(run, 2000, "nested iterate/query");
   });
 });
 
@@ -1433,7 +1433,7 @@ test.serial("defaultQueryTimeout interrupts long-running query", async (t) => {
   });
 
   const error = await t.throwsAsync(async () => {
-    await db.execute(
+    await db.all(
       "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r;"
     );
   });
@@ -1456,9 +1456,9 @@ test.serial("defaultQueryTimeout allows short-running query", async (t) => {
     defaultQueryTimeout: 5000,
   });
 
-  const result = await db.execute("SELECT 1 AS value");
-  t.is(result.rows.length, 1);
-  t.is(result.rows[0].value, 1);
+  const rows = await db.all("SELECT 1 AS value");
+  t.is(rows.length, 1);
+  t.is(rows[0].value, 1);
 
   await db.close();
 });
@@ -1475,9 +1475,8 @@ test.serial("Per-query queryTimeout interrupts long-running query", async (t) =>
   });
 
   const error = await t.throwsAsync(async () => {
-    await db.execute(
+    await db.all(
       "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r;",
-      [],
       { queryTimeout: 100 }
     );
   });
