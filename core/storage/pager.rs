@@ -5657,7 +5657,9 @@ impl Pager {
         // we will set the encryption context only if the encryption is opted-in.
         if !self.enable_encryption.load(Ordering::SeqCst) {
             return Err(LimboError::InvalidArgument(
-                "encryption is an opt in feature. enable it via passing `--experimental-encryption`"
+                "encryption is an opt-in feature. Enable it with the `--experimental-encryption` \
+                 CLI flag, or when using an SDK by passing the `encryption` option (or \
+                 `experimental: ['encryption']`) when opening the database."
                     .into(),
             ));
         }

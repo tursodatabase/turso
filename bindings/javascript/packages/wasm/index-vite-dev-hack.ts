@@ -8,6 +8,7 @@ let napiModule = {
     OpfsFile: {} as any,
     Statement: {} as any,
     initThreadPool: {} as any,
+    EncryptionCipher: {} as any,
   }
 };
 
@@ -37,3 +38,4 @@ export const Opfs = napiModule.exports.Opfs
 export const OpfsFile = napiModule.exports.OpfsFile
 export const Statement = napiModule.exports.Statement
 export const initThreadPool = napiModule.exports.initThreadPool
+export const EncryptionCipher = napiModule.exports.EncryptionCipher
