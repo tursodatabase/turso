@@ -52,13 +52,22 @@ pub struct SqlGenBackend {
 }
 
 impl SqlGenBackend {
-    pub fn new(seed: u64) -> Self {
+    pub fn new(seed: u64, ivm: bool) -> Self {
         let ctx = sql_gen::Context::new_with_seed(seed);
+        let mut stmt_weights = sql_gen::StmtWeights {
+            update: 30,
+            ..sql_gen::StmtWeights::default()
+        };
+        if ivm {
+            // Schema changes under a table with dependent materialized views
+            // diverge from SQLite by design: Turso rejects ALTER TABLE
+            // outright, and DROP TABLE would orphan the view. Disable both so
+            // IVM runs exercise maintenance, not that asymmetry.
+            stmt_weights.drop_table = 0;
+            stmt_weights.alter_table = 0;
+        }
         let mut policy = Policy::default()
-            .with_stmt_weights(sql_gen::StmtWeights {
-                update: 30,
-                ..sql_gen::StmtWeights::default()
-            })
+            .with_stmt_weights(stmt_weights)
             .with_function_config(
                 sql_gen::FunctionConfig::deterministic().disable(&["LIKELY", "UNLIKELY"]),
             );
@@ -122,7 +131,7 @@ pub struct PropTestBackend {
 }
 
 impl PropTestBackend {
-    pub fn new(seed_bytes: [u8; 32]) -> Self {
+    pub fn new(seed_bytes: [u8; 32], ivm: bool) -> Self {
         let test_runner = TestRunner::new_with_rng(
             proptest::test_runner::Config::default(),
             proptest::test_runner::TestRng::from_seed(
@@ -136,6 +145,12 @@ impl PropTestBackend {
             .expression
             .base
             .order_by_allow_integer_positions = false;
+        if ivm {
+            // See SqlGenBackend::new: DROP/ALTER TABLE on base tables of
+            // materialized views diverge from SQLite by design.
+            profile.drop_table_weight = 0;
+            profile.alter_table = sql_gen_prop::WeightedProfile::new(0);
+        }
         Self {
             test_runner,
             profile,

@@ -58,6 +58,12 @@ struct Args {
     /// Enable experimental MVCC mode.
     #[arg(long)]
     mvcc: bool,
+
+    /// Enable IVM mode: create materialized views (Turso-only) and verify
+    /// after every statement that each view equals a fresh evaluation of its
+    /// defining query.
+    #[arg(long, conflicts_with = "mvcc")]
+    ivm: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -94,6 +100,7 @@ struct ConfigRecord {
     num_statements: usize,
     generator: String,
     mvcc: bool,
+    ivm: bool,
 }
 
 /// Summary written to the JSON report file.
@@ -112,6 +119,7 @@ impl ConfigRecord {
             num_statements: args.num_statements,
             generator: format!("{:?}", args.generator),
             mvcc: args.mvcc,
+            ivm: args.ivm,
         }
     }
 }
@@ -240,6 +248,7 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
             TreeMode::Simplified
         },
         mvcc: args.mvcc,
+        ivm: args.ivm,
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);
