@@ -6,7 +6,7 @@ use super::*;
 /// serializer reserve for the complete stream once, then bulk-copy each slice.
 /// Flattening the same chain to `Iterator<Item = u8>` loses those slice
 /// boundaries and makes `Vec::extend` copy the payload one byte at a time.
-pub(super) trait LogChunkStream: Sized {
+pub(crate) trait LogChunkStream: Sized {
     fn encoded_len(&self) -> Option<usize>;
 
     fn copy_to(self, writer: &mut LogChunkWriter) -> Result<()>;
@@ -17,7 +17,7 @@ pub(super) trait LogChunkStream: Sized {
     }
 }
 
-pub(super) struct ChainedLogChunks<L, R> {
+pub(crate) struct ChainedLogChunks<L, R> {
     left: L,
     right: R,
 }
@@ -84,11 +84,11 @@ impl LogChunkStream for BorrowedLogChunk<'_> {
     }
 }
 
-pub(super) trait LogBufferWrite {
+pub(crate) trait LogBufferWrite {
     fn into_chunks(self) -> impl LogChunkStream;
 }
 
-pub(super) struct LogChunkWriter {
+pub(crate) struct LogChunkWriter {
     output: *mut u8,
     capacity: usize,
     written: usize,
@@ -116,40 +116,52 @@ impl LogChunkWriter {
     }
 }
 
-trait LogBufferExt {
+pub(crate) trait LogBufferExt: std::ops::DerefMut<Target = [u8]> {
     fn try_extend_chunks(&mut self, chunks: impl LogChunkStream) -> Result<()>;
 }
 
-impl LogBufferExt for Vec<u8> {
-    #[inline(always)]
-    fn try_extend_chunks(&mut self, chunks: impl LogChunkStream) -> Result<()> {
-        let encoded_len = chunks.encoded_len().ok_or_else(log_buffer_len_overflow)?;
-        let new_len = self
-            .len()
-            .checked_add(encoded_len)
-            .ok_or_else(log_buffer_len_overflow)?;
-        self.try_reserve(encoded_len)?;
+macro_rules! impl_try_extend_chunks {
+    () => {
+        #[inline(always)]
+        fn try_extend_chunks(&mut self, chunks: impl LogChunkStream) -> Result<()> {
+            let encoded_len = chunks.encoded_len().ok_or_else(log_buffer_len_overflow)?;
+            let new_len = self
+                .len()
+                .checked_add(encoded_len)
+                .ok_or_else(log_buffer_len_overflow)?;
+            self.try_reserve(encoded_len)?;
 
-        let original_len = self.len();
-        // SAFETY: `try_reserve` above guarantees space for `encoded_len`
-        // additional bytes, so the first spare byte is within the allocation.
-        let output = unsafe { self.as_mut_ptr().add(original_len) };
-        let mut writer = LogChunkWriter {
-            output,
-            capacity: encoded_len,
-            written: 0,
-        };
-        chunks.copy_to(&mut writer)?;
-        if writer.written != encoded_len {
-            return Err(log_buffer_len_mismatch());
+            let original_len = self.len();
+            // SAFETY: `try_reserve` above guarantees space for `encoded_len`
+            // additional bytes, so the first spare byte is within the allocation.
+            let output = unsafe { self.as_mut_ptr().add(original_len) };
+            let mut writer = LogChunkWriter {
+                output,
+                capacity: encoded_len,
+                written: 0,
+            };
+            chunks.copy_to(&mut writer)?;
+            if writer.written != encoded_len {
+                return Err(log_buffer_len_mismatch());
+            }
+            // SAFETY: every byte between the old and new lengths was initialized by
+            // the checked chunk copies above.
+            unsafe {
+                self.set_len(new_len);
+            }
+            Ok(())
         }
-        // SAFETY: every byte between the old and new lengths was initialized by
-        // the checked chunk copies above.
-        unsafe {
-            self.set_len(new_len);
-        }
-        Ok(())
-    }
+    };
+}
+
+#[cfg(not(nightly))]
+impl LogBufferExt for std::vec::Vec<u8> {
+    impl_try_extend_chunks!();
+}
+
+#[cfg(nightly)]
+impl<A: crate::alloc::ApiAllocator> LogBufferExt for std::vec::Vec<u8, A> {
+    impl_try_extend_chunks!();
 }
 
 macro_rules! log_write {
@@ -168,26 +180,32 @@ macro_rules! log_write {
             log_write!($serializer, [$first $(, $rest)*])
         }
     }};
-    ($serializer:expr, [$first:expr $(, $rest:expr)* $(,)?]) => {{
+    ($serializer:expr, [$value:expr $(,)?]) => {{
+        use $crate::mvcc::persistent_storage::logical_log::LogBufferWrite;
+        $serializer.write(LogBufferWrite::into_chunks($value))
+    }};
+    ($serializer:expr, [$first:expr, $($rest:expr),+ $(,)?]) => {{
+        use $crate::mvcc::persistent_storage::logical_log::{LogBufferWrite, LogChunkStream};
         $serializer.write(
             LogBufferWrite::into_chunks($first)
-                $(.chain(LogBufferWrite::into_chunks($rest)))*
+                $(.chain(LogBufferWrite::into_chunks($rest)))+
         )
     }};
 }
+pub(crate) use log_write;
 
-pub(crate) struct LogSerializer<'a> {
-    buffer: &'a mut Vec<u8>,
+pub(crate) struct LogSerializer<'a, B: ?Sized = Vec<u8>> {
+    buffer: &'a mut B,
 }
 
-impl<'a> LogSerializer<'a> {
+impl<'a, B: LogBufferExt + ?Sized> LogSerializer<'a, B> {
     #[inline(always)]
-    pub(crate) fn new(buffer: &'a mut Vec<u8>) -> Self {
+    pub(crate) fn new(buffer: &'a mut B) -> Self {
         Self { buffer }
     }
 
     #[inline(always)]
-    fn write(&mut self, chunks: impl LogChunkStream) -> Result<()> {
+    pub(crate) fn write(&mut self, chunks: impl LogChunkStream) -> Result<()> {
         self.buffer.try_extend_chunks(chunks)
     }
 
@@ -363,46 +381,9 @@ impl<'a> LogSerializer<'a> {
     pub(crate) fn serialize_tx_trailer(&mut self, crc: u32) -> Result<()> {
         log_write!(self, [crc.to_le_bytes(), END_MAGIC.to_le_bytes()])
     }
+}
 
-    pub(crate) fn encode_delete_portable_extension(
-        identity_record: Option<&[u8]>,
-        pk_record: Option<&[u8]>,
-        rowid: Option<i64>,
-    ) -> Result<Vec<u8>> {
-        let mut extension = Vec::new();
-        let mut serializer = LogSerializer::new(&mut extension);
-        if let Some(identity_record) = identity_record.filter(|record| !record.is_empty()) {
-            log_write!(
-                serializer,
-                [
-                    ProtoKey::new(
-                        OP_EXT_FIELD_DELETE_IDENTITY_RECORD,
-                        PROTO_WIRE_LENGTH_DELIMITED
-                    ),
-                    ProtoVarint(identity_record.len() as u64),
-                    identity_record,
-                ]
-            )?;
-        }
-        if let Some(pk_record) = pk_record.filter(|record| !record.is_empty()) {
-            log_write!(
-                serializer,
-                [
-                    ProtoKey::new(OP_EXT_FIELD_DELETE_PK_RECORD, PROTO_WIRE_LENGTH_DELIMITED),
-                    ProtoVarint(pk_record.len() as u64),
-                    pk_record,
-                ]
-            )?;
-        }
-        if let Some(rowid) = rowid {
-            log_write!(
-                serializer,
-                [ProtoSint64::new(OP_EXT_FIELD_DELETE_ROWID, rowid)]
-            )?;
-        }
-        Ok(extension)
-    }
-
+impl LogSerializer<'_, Vec<u8>> {
     pub(crate) fn encrypt_payload_in_place(&mut self, payload: EncryptedPayload<'_>) -> Result<()> {
         let tag_size = payload.enc_ctx.tag_size();
         let nonce_size = payload.enc_ctx.nonce_size();
@@ -487,6 +468,45 @@ impl<'a> LogSerializer<'a> {
         );
         Ok(())
     }
+
+    pub(crate) fn encode_delete_portable_extension(
+        identity_record: Option<&[u8]>,
+        pk_record: Option<&[u8]>,
+        rowid: Option<i64>,
+    ) -> Result<Vec<u8>> {
+        let mut extension = Vec::new();
+        let mut serializer = LogSerializer::new(&mut extension);
+        if let Some(identity_record) = identity_record.filter(|record| !record.is_empty()) {
+            log_write!(
+                serializer,
+                [
+                    ProtoKey::new(
+                        OP_EXT_FIELD_DELETE_IDENTITY_RECORD,
+                        PROTO_WIRE_LENGTH_DELIMITED
+                    ),
+                    ProtoVarint(identity_record.len() as u64),
+                    identity_record,
+                ]
+            )?;
+        }
+        if let Some(pk_record) = pk_record.filter(|record| !record.is_empty()) {
+            log_write!(
+                serializer,
+                [
+                    ProtoKey::new(OP_EXT_FIELD_DELETE_PK_RECORD, PROTO_WIRE_LENGTH_DELIMITED),
+                    ProtoVarint(pk_record.len() as u64),
+                    pk_record,
+                ]
+            )?;
+        }
+        if let Some(rowid) = rowid {
+            log_write!(
+                serializer,
+                [ProtoSint64::new(OP_EXT_FIELD_DELETE_ROWID, rowid)]
+            )?;
+        }
+        Ok(extension)
+    }
 }
 
 struct SqliteVarint(u64);
@@ -500,7 +520,7 @@ impl LogBufferWrite for SqliteVarint {
     }
 }
 
-struct ProtoVarint(u64);
+pub(crate) struct ProtoVarint(pub(crate) u64);
 
 impl LogBufferWrite for ProtoVarint {
     #[inline(always)]
@@ -521,16 +541,16 @@ impl LogBufferWrite for ProtoVarint {
     }
 }
 
-const PROTO_WIRE_VARINT: u64 = 0;
-const PROTO_WIRE_LENGTH_DELIMITED: u64 = 2;
+pub(crate) const PROTO_WIRE_VARINT: u64 = 0;
+pub(crate) const PROTO_WIRE_LENGTH_DELIMITED: u64 = 2;
 
-struct ProtoKey {
+pub(crate) struct ProtoKey {
     field: u64,
     wire_type: u64,
 }
 
 impl ProtoKey {
-    fn new(field: u64, wire_type: u64) -> Self {
+    pub(crate) fn new(field: u64, wire_type: u64) -> Self {
         Self { field, wire_type }
     }
 }
@@ -541,13 +561,13 @@ impl LogBufferWrite for ProtoKey {
     }
 }
 
-struct ProtoSint64 {
+pub(crate) struct ProtoSint64 {
     field: u64,
     value: i64,
 }
 
 impl ProtoSint64 {
-    fn new(field: u64, value: i64) -> Self {
+    pub(crate) fn new(field: u64, value: i64) -> Self {
         Self { field, value }
     }
 

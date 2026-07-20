@@ -1,3 +1,8 @@
+use crate::alloc::{TursoVecExt, Vec};
+use crate::mvcc::persistent_storage::logical_log::{
+    log_write, LogSerializer, ProtoKey, ProtoSint64, ProtoVarint, PROTO_WIRE_LENGTH_DELIMITED,
+    PROTO_WIRE_VARINT,
+};
 use crate::types::{ImmutableRecordRef, ValueRef};
 use crate::{LimboError, Numeric, Result};
 use std::collections::{HashMap, HashSet};
@@ -17,42 +22,6 @@ const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 const TURSO_SYNC_PREFIX: &str = "turso_sync_";
 const TURSO_CDC_TABLE_NAME: &str = "turso_cdc";
 const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
-
-// Minimal protobuf-style encoder for core-owned portable MVCC logical changes.
-// Keeping this local avoids making turso_core depend on the sync engine or
-// server proto crate. Raw-log consumers can decode this envelope into their own
-// replay representation.
-fn write_proto_varint(mut value: u64, out: &mut Vec<u8>) {
-    while value >= 0x80 {
-        out.push((value as u8) | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
-}
-
-fn write_proto_key(field: u64, wire_type: u64, out: &mut Vec<u8>) {
-    write_proto_varint((field << 3) | wire_type, out);
-}
-
-fn write_proto_uint64(field: u64, value: u64, out: &mut Vec<u8>) {
-    write_proto_key(field, 0, out);
-    write_proto_varint(value, out);
-}
-
-fn write_proto_sint64(field: u64, value: i64, out: &mut Vec<u8>) {
-    let zigzag = ((value << 1) ^ (value >> 63)) as u64;
-    write_proto_uint64(field, zigzag, out);
-}
-
-fn write_proto_bytes(field: u64, value: &[u8], out: &mut Vec<u8>) {
-    write_proto_key(field, 2, out);
-    write_proto_varint(value.len() as u64, out);
-    out.extend_from_slice(value);
-}
-
-fn write_proto_string(field: u64, value: &str, out: &mut Vec<u8>) {
-    write_proto_bytes(field, value.as_bytes(), out);
-}
 
 pub(crate) fn is_portable_logical_name(name: &str) -> bool {
     !name.starts_with(SQLITE_INTERNAL_PREFIX)
@@ -121,13 +90,24 @@ pub(crate) fn is_portable_schema_row(row: &PortableSchemaRow) -> bool {
             || row.row_type.eq_ignore_ascii_case("view"))
 }
 
-#[derive(Default)]
 pub(crate) struct PortableLogicalBuilder {
     strings: Vec<String>,
     string_refs: HashMap<String, u64>,
     object_maps: Vec<Vec<u8>>,
     object_map_ids: HashSet<i64>,
     metadata: Vec<Vec<u8>>,
+}
+
+impl Default for PortableLogicalBuilder {
+    fn default() -> Self {
+        Self {
+            strings: crate::alloc::vec![],
+            string_refs: HashMap::default(),
+            object_maps: crate::alloc::vec![],
+            object_map_ids: HashSet::default(),
+            metadata: crate::alloc::vec![],
+        }
+    }
 }
 
 pub(crate) struct PortableObjectMapEntry<'a> {
@@ -140,53 +120,87 @@ impl PortableLogicalBuilder {
         Self::default()
     }
 
-    fn intern_string(&mut self, value: &str) -> u64 {
+    fn intern_string(&mut self, value: &str) -> Result<u64> {
         if let Some(idx) = self.string_refs.get(value) {
-            return *idx;
+            return Ok(*idx);
         }
         let idx = self.strings.len() as u64;
-        self.strings.push(value.to_string());
+        self.strings.try_push(value.to_string())?;
         self.string_refs.insert(value.to_string(), idx);
-        idx
+        Ok(idx)
     }
 
-    pub(crate) fn add_object_map(&mut self, entry: PortableObjectMapEntry<'_>) -> bool {
+    pub(crate) fn add_object_map(&mut self, entry: PortableObjectMapEntry<'_>) -> Result<bool> {
         if !is_portable_logical_name(entry.name) || !self.object_map_ids.insert(entry.mv_table_id) {
-            return false;
+            return Ok(false);
         }
-        let name_ref = self.intern_string(entry.name);
+        let name_ref = self.intern_string(entry.name)?;
 
-        let mut object = Vec::new();
-        write_proto_sint64(OBJECT_FIELD_MV_TABLE_ID, entry.mv_table_id, &mut object);
-        write_proto_uint64(OBJECT_FIELD_NAME_REF, name_ref, &mut object);
-        self.object_maps.push(object);
-        true
+        let mut object = crate::alloc::vec![];
+        let mut serializer = LogSerializer::new(&mut object);
+        log_write!(
+            serializer,
+            [
+                ProtoSint64::new(OBJECT_FIELD_MV_TABLE_ID, entry.mv_table_id),
+                ProtoKey::new(OBJECT_FIELD_NAME_REF, PROTO_WIRE_VARINT),
+                ProtoVarint(name_ref),
+            ]
+        )?;
+        self.object_maps.try_push(object)?;
+        Ok(true)
     }
 
-    pub(crate) fn add_metadata(&mut self, key: &str, value: &str) {
-        let key_ref = self.intern_string(key);
-        let value_ref = self.intern_string(value);
-        let mut meta = Vec::new();
-        write_proto_uint64(META_FIELD_KEY_REF, key_ref, &mut meta);
-        write_proto_uint64(META_FIELD_VALUE_REF, value_ref, &mut meta);
-        self.metadata.push(meta);
+    pub(crate) fn add_metadata(&mut self, key: &str, value: &str) -> Result<()> {
+        let key_ref = self.intern_string(key)?;
+        let value_ref = self.intern_string(value)?;
+        let mut meta = crate::alloc::vec![];
+        let mut serializer = LogSerializer::new(&mut meta);
+        log_write!(
+            serializer,
+            [
+                ProtoKey::new(META_FIELD_KEY_REF, PROTO_WIRE_VARINT),
+                ProtoVarint(key_ref),
+                ProtoKey::new(META_FIELD_VALUE_REF, PROTO_WIRE_VARINT),
+                ProtoVarint(value_ref),
+            ]
+        )?;
+        self.metadata.try_push(meta)?;
+        Ok(())
     }
 
-    pub(crate) fn finish(self) -> Vec<u8> {
-        let mut txn_fields = Vec::new();
+    pub(crate) fn finish(self) -> Result<Vec<u8>> {
+        let mut txn_fields = crate::alloc::vec![];
+        let mut serializer = LogSerializer::new(&mut txn_fields);
         for value in &self.strings {
-            write_proto_string(TX_FIELD_STRING_TABLE, value, &mut txn_fields);
+            log_write!(
+                serializer,
+                [
+                    ProtoKey::new(TX_FIELD_STRING_TABLE, PROTO_WIRE_LENGTH_DELIMITED),
+                    ProtoVarint(value.len() as u64),
+                    value.as_bytes(),
+                ]
+            )?;
         }
         for object_map in self.object_maps {
-            write_proto_key(TX_FIELD_OBJECT_MAP, 2, &mut txn_fields);
-            write_proto_varint(object_map.len() as u64, &mut txn_fields);
-            txn_fields.extend_from_slice(&object_map);
+            log_write!(
+                serializer,
+                [
+                    ProtoKey::new(TX_FIELD_OBJECT_MAP, PROTO_WIRE_LENGTH_DELIMITED),
+                    ProtoVarint(object_map.len() as u64),
+                    object_map.as_slice(),
+                ]
+            )?;
         }
         for meta in self.metadata {
-            write_proto_key(TX_FIELD_META, 2, &mut txn_fields);
-            write_proto_varint(meta.len() as u64, &mut txn_fields);
-            txn_fields.extend_from_slice(&meta);
+            log_write!(
+                serializer,
+                [
+                    ProtoKey::new(TX_FIELD_META, PROTO_WIRE_LENGTH_DELIMITED),
+                    ProtoVarint(meta.len() as u64),
+                    meta.as_slice(),
+                ]
+            )?;
         }
-        txn_fields
+        Ok(txn_fields)
     }
 }
