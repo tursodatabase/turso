@@ -4845,6 +4845,10 @@ impl Connection {
         self.rollback_attached_wal_txns();
         self.set_tx_state(TransactionState::None);
         self.clear_tx_poison();
+        // The entire transaction is being rolled back, so every materialized
+        // view delta captured within it is void. Leaving them behind would
+        // apply phantom changes to the views at the next successful commit.
+        self.view_transaction_states.clear();
     }
 
     /// Roll back transaction state for helpers that start a manual `BEGIN`

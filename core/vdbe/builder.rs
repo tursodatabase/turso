@@ -473,6 +473,13 @@ pub enum CursorType {
         Arc<BTreeTable>,
         Arc<crate::sync::Mutex<crate::incremental::view::IncrementalView>>,
     ),
+    /// Read-only cursor over the transaction's captured delta for one base
+    /// table of a materialized view. Rows are the base columns plus a
+    /// trailing weight column; opened by maintenance programs at commit time.
+    ViewDelta {
+        view_name: String,
+        table: Arc<BTreeTable>,
+    },
 }
 
 impl CursorType {
