@@ -1,4 +1,4 @@
-import { AsyncLock } from './async-lock.js';
+import { AsyncLock, type Lock } from './async-lock.js';
 import { Session, type SessionConfig, type BatchMode } from './session.js';
 import { Statement } from './statement.js';
 import { type QueryOptions } from './protocol.js';
@@ -10,7 +10,7 @@ export type { BatchMode } from './session.js';
 /**
  * Configuration options for connecting to a Turso database.
  */
-export interface Config extends SessionConfig {}
+export interface Config extends SessionConfig { }
 
 export type BatchStatement = string | {
   sql: string;
@@ -146,7 +146,7 @@ export class Connection {
     if (!this.isOpen) {
       throw new TypeError("The database connection is not open");
     }
-    
+
     // Describe on the existing session so it sees uncommitted DDL
     // (e.g. CREATE TABLE in the same transaction).
     await this.execLock.acquire();
@@ -156,7 +156,7 @@ export class Connection {
     } finally {
       this.execLock.release();
     }
-    
+
     const stmt = Statement.fromSession(this.session, sql, description.cols, this.execLock);
     if (this.defaultSafeIntegerMode) {
       stmt.safeIntegers(true);
@@ -298,10 +298,10 @@ export class Connection {
    * ], "immediate");
    *
    * @example
-   * // Atomic via the transaction() API for mixed workloads.
-   * const txn = db.transaction(async () => {
-   *   await db.batch([{ sql: "INSERT INTO users(name) VALUES (?)", args: ["Eve"] }]);
-   *   await db.run("UPDATE counters SET n = n + 1");
+   * // Atomic via the transactionAsync() API for mixed workloads.
+   * const txn = db.transactionAsync(async (tx) => {
+   *   await tx.batch([{ sql: "INSERT INTO users(name) VALUES (?)", args: ["Eve"] }]);
+   *   await tx.run("UPDATE counters SET n = n + 1");
    * });
    * await txn.immediate();
    */
@@ -362,10 +362,16 @@ export class Connection {
 
   /**
    * Returns a function that executes the given function in a transaction.
-   * 
+   *
+   * @deprecated Use {@link transactionAsync} instead. This wrapper only
+   * emits `BEGIN`/`COMMIT` around the callback without owning the
+   * connection, so concurrent statements and transactions can interleave
+   * their own statements into the transaction's window (and be committed
+   * or rolled back with it).
+   *
    * @param fn - The function to wrap in a transaction
    * @returns A function that will execute fn within a transaction
-   * 
+   *
    * @example
    * ```typescript
    * const insert = await client.prepare("INSERT INTO users (name) VALUES (?)");
@@ -374,7 +380,7 @@ export class Connection {
    *     insert.run([user]);
    *   }
    * });
-   * 
+   *
    * await insertMany(['Alice', 'Bob', 'Charlie']);
    * ```
    */
@@ -412,7 +418,94 @@ export class Connection {
     Object.defineProperties(properties.concurrent.value, properties);
     Object.defineProperties(properties.immediate.value, properties);
     Object.defineProperties(properties.exclusive.value, properties);
-    
+
+    return properties.default.value;
+  }
+
+  /**
+   * Returns a function that executes the given function in a transaction.
+   *
+   * The wrapper owns the connection for the whole BEGIN..COMMIT window: it
+   * acquires the connection's execution lock before BEGIN and releases it
+   * only after COMMIT/ROLLBACK, so no concurrent statement or transaction
+   * can interleave its own statements into the transaction's window. The
+   * callback receives a {@link Transaction} handle as its first argument,
+   * followed by the arguments the wrapped function was called with — all
+   * SQL inside the callback must go through that handle. Calls on the
+   * `Connection` itself (or statements prepared from it) queue on the lock
+   * until the transaction finishes, so awaiting them inside the callback
+   * deadlocks the transaction. Callbacks that do not declare the handle
+   * parameter are rejected.
+   *
+   * @param fn - The function to wrap in a transaction; receives the
+   *   transaction handle followed by the caller's arguments
+   * @returns A function that will execute fn within a transaction
+   *
+   * @example
+   * ```typescript
+   * const insertMany = client.transactionAsync(async (tx, users) => {
+   *   const insert = await tx.prepare("INSERT INTO users (name) VALUES (?)");
+   *   for (const user of users) {
+   *     await insert.run([user]);
+   *   }
+   * });
+   *
+   * await insertMany(['Alice', 'Bob', 'Charlie']);
+   * ```
+   */
+  transactionAsync(fn: (tx: Transaction, ...args: any[]) => any): any {
+    if (typeof fn !== "function") {
+      throw new TypeError("Expected first argument to be a function");
+    }
+    if (fn.length === 0) {
+      throw new TypeError(
+        "transactionAsync() callbacks receive a Transaction handle as their first argument " +
+        "and must declare it: db.transactionAsync(async (tx, ...args) => { await tx.run(...) }).",
+      );
+    }
+
+    const db = this;
+    const wrapTxn = (mode: string) => {
+      return async (...bindParameters: any[]) => {
+        if (!db.isOpen) {
+          throw new TypeError("The database connection is not open");
+        }
+        // own the session for the whole transaction: everything else
+        // queues on execLock until COMMIT/ROLLBACK releases it
+        await db.execLock.acquire();
+        const txn = new Transaction(db.session, db.defaultSafeIntegerMode);
+        try {
+          await txn.exec("BEGIN " + mode);
+          try {
+            const result = await fn(txn, ...bindParameters);
+            await txn.exec("COMMIT");
+            return result;
+          } catch (err) {
+            await txn.exec("ROLLBACK");
+            throw err;
+          }
+        } finally {
+          txn.finish();
+          db.execLock.release();
+        }
+      };
+    };
+
+    const properties = {
+      default: { value: wrapTxn("") },
+      deferred: { value: wrapTxn("DEFERRED") },
+      concurrent: { value: wrapTxn("CONCURRENT") },
+      immediate: { value: wrapTxn("IMMEDIATE") },
+      exclusive: { value: wrapTxn("EXCLUSIVE") },
+      database: { value: this, enumerable: true },
+    };
+
+    Object.defineProperties(properties.default.value, properties);
+    Object.defineProperties(properties.deferred.value, properties);
+    Object.defineProperties(properties.concurrent.value, properties);
+    Object.defineProperties(properties.immediate.value, properties);
+    Object.defineProperties(properties.exclusive.value, properties);
+
     return properties.default.value;
   }
 
@@ -437,6 +530,159 @@ export class Connection {
     }
   }
 
+}
+
+/**
+ * A handle to an open transaction, passed as the first argument to the
+ * callback of `Connection.transactionAsync()`. All SQL of the transaction
+ * must go through this handle: the transaction wrapper holds the
+ * connection's execution lock for the whole BEGIN..COMMIT window, so
+ * `Connection` calls issued inside the callback wait for the transaction
+ * to finish (and deadlock it if awaited), while the handle executes on the
+ * already-owned session. Once the transaction commits or rolls back the
+ * handle is closed and every method throws.
+ */
+export class Transaction {
+  private session: Session;
+  private defaultSafeIntegerMode: boolean;
+  private active: boolean = true;
+  // Per-transaction execution gate. The wrapper already holds the connection's
+  // execLock for the whole transaction, so this never contends with other
+  // transactions or connection-level calls; it serializes native calls *within*
+  // this transaction — the same invariant the connection's execLock enforces on
+  // the session — so statements issued concurrently in the callback cannot
+  // interleave on the shared session. It also rejects use of a completed
+  // transaction.
+  private gate: Lock;
+
+  constructor(session: Session, defaultSafeIntegerMode: boolean) {
+    this.session = session;
+    this.defaultSafeIntegerMode = defaultSafeIntegerMode;
+    const lock = new AsyncLock();
+    this.gate = {
+      acquire: async () => { this.assertActive(); await lock.acquire(); },
+      release: () => { lock.release(); },
+    };
+  }
+
+  private async withGate<T>(fn: () => Promise<T>): Promise<T> {
+    await this.gate.acquire();
+    try {
+      return await fn();
+    } finally {
+      this.gate.release();
+    }
+  }
+
+  /** Whether the transaction is still open (COMMIT/ROLLBACK not executed yet). */
+  get open(): boolean {
+    return this.active;
+  }
+
+  private assertActive() {
+    if (!this.active) {
+      throw new TypeError("The transaction has already completed");
+    }
+  }
+
+  /** @internal Marks the transaction completed; called by the wrapper. */
+  finish() {
+    this.active = false;
+  }
+
+  /**
+   * Prepares a SQL statement scoped to the transaction. The statement runs
+   * on the transaction's session without re-acquiring the connection lock
+   * and becomes unusable once the transaction completes.
+   */
+  async prepare(sql: string): Promise<Statement> {
+    const description = await this.withGate(() => this.session.describe(sql));
+    const stmt = Statement.fromSession(this.session, sql, description.cols, this.gate);
+    if (this.defaultSafeIntegerMode) {
+      stmt.safeIntegers(true);
+    }
+    return stmt;
+  }
+
+  /**
+   * Like `prepare(sql).run(args)` but in a single round trip.
+   */
+  async run(sql: string, ...bindParameters: any[]): Promise<any> {
+    const { params, queryOptions } = splitBindParameters(bindParameters);
+    return await this.withGate(async () => {
+      const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
+      return { changes: result.rowsAffected, lastInsertRowid: result.lastInsertRowid };
+    });
+  }
+
+  /**
+   * Like `prepare(sql).get(args)` but in a single round trip.
+   */
+  async get(sql: string, ...bindParameters: any[]): Promise<any> {
+    const { params, queryOptions } = splitBindParameters(bindParameters);
+    return await this.withGate(async () => {
+      const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
+      const row = result.rows[0];
+      if (!row) return undefined;
+      return createExpandedRow(row, result.columns);
+    });
+  }
+
+  /**
+   * Like `prepare(sql).all(args)` but in a single round trip.
+   */
+  async all(sql: string, ...bindParameters: any[]): Promise<any[]> {
+    const { params, queryOptions } = splitBindParameters(bindParameters);
+    return await this.withGate(async () => {
+      const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
+      return result.rows.map((row: any) => createExpandedRow(row, result.columns));
+    });
+  }
+
+  /**
+   * Like `prepare(sql).iterate(args)` but buffered, matching
+   * `Connection.iterate()`.
+   */
+  async *iterate(sql: string, ...bindParameters: any[]): AsyncGenerator<any> {
+    for (const row of await this.all(sql, ...bindParameters)) yield row;
+  }
+
+  /**
+   * Execute a SQL statement and return all results.
+   */
+  async execute(sql: string, args?: any[], queryOptions?: QueryOptions): Promise<any> {
+    return await this.withGate(() => this.session.execute(sql, args || [], this.defaultSafeIntegerMode, queryOptions));
+  }
+
+  /**
+   * Executes the given SQL string inside the transaction.
+   * Unlike prepared statements, this can execute strings that contain multiple SQL statements.
+   */
+  async exec(sql: string, queryOptions?: QueryOptions): Promise<any> {
+    return await this.withGate(() => this.session.sequence(sql, queryOptions));
+  }
+
+  /**
+   * Executes a batch of SQL statements inside the transaction. The batch
+   * joins the surrounding transaction: any `mode` option is ignored since
+   * the stream is already inside `BEGIN`.
+   */
+  async batch(statements: BatchStatement[], options?: BatchMode | BatchOptions, queryOptions?: QueryOptions): Promise<any> {
+    if (!Array.isArray(statements)) {
+      throw new TypeError("Expected first argument to be an array of statements");
+    }
+    const { raw } = normalizeBatchOptions(options);
+    return await this.withGate(async () => {
+      const results = await this.session.batch(
+        statements,
+        undefined,
+        queryOptions,
+        this.defaultSafeIntegerMode,
+        raw,
+      );
+      return results.map((result: any) => toResultSet(result));
+    });
+  }
 }
 
 /**

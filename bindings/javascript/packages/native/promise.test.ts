@@ -1,6 +1,6 @@
 import { unlinkSync } from "node:fs";
 import { expect, test } from 'vitest'
-import { Database, connect } from './promise.js'
+import { Database, connect, Transaction } from './promise.js'
 import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 
@@ -363,6 +363,64 @@ test('example-2', async () => {
     ]);
 })
 
+// The transaction() wrapper must own the connection for the whole
+// BEGIN..COMMIT window. Statements are only serialized individually, so a
+// concurrent caller can currently interleave its statements into an open
+// transaction: its BEGIN fails as nested, and its ROLLBACK then erases the
+// first transaction's in-flight writes while later writes land in autocommit.
+test('concurrent transaction() calls must not interleave', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE t(tag TEXT, i INTEGER)');
+
+    const insertMany = db.transactionAsync(async (txn, tag: string, fail: boolean) => {
+        for (let i = 0; i < 10; i++) {
+            await txn.run('INSERT INTO t VALUES (?, ?)', [tag, i]);
+        }
+        if (fail) {
+            throw new Error('abort transaction');
+        }
+    });
+
+    const [committed, aborted] = await Promise.allSettled([
+        insertMany('committed', false),
+        insertMany('rolled-back', true),
+    ]);
+
+    // the first transaction commits; the second fails only with its own error
+    expect(committed).toEqual({ status: 'fulfilled', value: undefined });
+    expect(aborted.status).toBe('rejected');
+    expect((aborted as PromiseRejectedResult).reason.message).toBe('abort transaction');
+
+    // atomicity: every row of the committed transaction survives and no row
+    // of the rolled-back transaction does
+    const rows = await db.all('SELECT tag, COUNT(*) AS cnt FROM t GROUP BY tag ORDER BY tag');
+    expect(rows).toEqual([{ tag: 'committed', cnt: 10 }]);
+})
+
+// Same root cause, worst manifestation: an independent autocommit statement
+// racing with a transaction() call slips into the open BEGIN..ROLLBACK window,
+// reports success, and is then silently erased by the transaction's rollback.
+test('statement racing a transaction() must not be lost to its rollback', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE t(tag TEXT)');
+
+    const failing = db.transactionAsync(async (txn) => {
+        await txn.run('INSERT INTO t VALUES (?)', ['txn']);
+        await new Promise((resolve) => setImmediate(resolve));
+        throw new Error('abort transaction');
+    });
+
+    const [txnResult, plainResult] = await Promise.allSettled([
+        failing(),
+        db.run('INSERT INTO t VALUES (?)', ['plain']),
+    ]);
+    expect(txnResult.status).toBe('rejected');
+    expect(plainResult.status).toBe('fulfilled');
+
+    // the transaction rolled back, but the successful independent insert must survive
+    expect(await db.all('SELECT tag FROM t')).toEqual([{ tag: 'plain' }]);
+})
+
 test('transaction.concurrent uses BEGIN CONCURRENT', async () => {
     const db = await connect(':memory:');
     const originalExec = db.exec;
@@ -381,4 +439,33 @@ test('transaction.concurrent uses BEGIN CONCURRENT', async () => {
         db.exec = originalExec;
         await db.close();
     }
+})
+
+test('transactionAsync.concurrent uses BEGIN CONCURRENT', async () => {
+    const db = await connect(':memory:');
+    const originalExec = Transaction.prototype.exec;
+    const calls: string[] = [];
+    Transaction.prototype.exec = async (sql) => {
+        calls.push(sql);
+    };
+
+    try {
+        const txn = db.transactionAsync(async (_txn) => {
+            calls.push('body');
+        }).concurrent;
+        await txn();
+        expect(calls).toEqual(['BEGIN CONCURRENT', 'body', 'COMMIT']);
+    } finally {
+        Transaction.prototype.exec = originalExec;
+        await db.close();
+    }
+})
+
+// A callback that declares no parameters cannot be using the Transaction
+// handle - it is the pre-0.8 shape whose statements would deadlock against
+// the transaction's own lock, so it is rejected upfront.
+test('transactionAsync() rejects callbacks that do not declare the handle', async () => {
+    const db = await connect(':memory:');
+    expect(() => db.transactionAsync(async () => { })).toThrow(/Transaction handle/);
+    expect(() => db.transactionAsync((async (...args: any[]) => { }) as any)).toThrow(/Transaction handle/);
 })

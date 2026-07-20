@@ -1,4 +1,4 @@
-import { DatabasePromise, TransactionFunction } from "@tursodatabase/database-common"
+import { DatabasePromise, Transaction, TransactionFunction, AsyncTransactionFunction } from "@tursodatabase/database-common"
 import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner, RemoteWriter, RemoteWriteStatement } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, Database as NativeDatabase } from "#index";
 import { promises } from "node:fs";
@@ -254,6 +254,10 @@ class Database extends DatabasePromise {
     /**
      * Returns a function that executes the given function in a transaction.
      * When remoteWrites is enabled, the entire transaction goes to remote.
+     *
+     * @deprecated Use {@link transactionAsync} instead: this wrapper does
+     * not own the connection, so concurrent statements can interleave into
+     * the transaction's window.
      */
     override transaction<F extends (...args: any[]) => Promise<any>>(
         fn: F,
@@ -298,6 +302,26 @@ class Database extends DatabasePromise {
     }
 
     /**
+     * Returns a function that executes the given function in a transaction
+     * on a connection owned for the whole BEGIN..COMMIT window; the callback
+     * receives a {@link Transaction} handle as its first argument.
+     *
+     * Not supported together with {@link DatabaseOpts.remoteWritesExperimental}
+     * yet: remote-writes transactions run on the remote server and have no
+     * local connection to hand out.
+     */
+    override transactionAsync<F extends (txn: Transaction, ...args: any[]) => Promise<any>>(
+        fn: F,
+    ): AsyncTransactionFunction<F> {
+        if (this.#remoteWriter) {
+            throw new Error(
+                "transactionAsync is not supported with remoteWritesExperimental yet; use the deprecated transaction() for now",
+            );
+        }
+        return super.transactionAsync(fn);
+    }
+
+    /**
      * close the database
      */
     override async close(): Promise<void> {
@@ -323,7 +347,7 @@ async function connect(opts: DatabaseOpts): Promise<Database> {
     return db;
 }
 
-export { connect, Database }
+export { connect, Database, Transaction }
 export { retryFetch } from "@tursodatabase/sync-common"
 export type { DatabaseOpts, EncryptionOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult }
 export type { RetryFetchOpts } from "@tursodatabase/sync-common"
