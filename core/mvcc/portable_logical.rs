@@ -131,9 +131,11 @@ impl<'a> PortableLogicalBuilder<'a> {
     }
 
     pub(crate) fn add_object_map(&mut self, entry: PortableObjectMapEntry<'a>) -> Result<bool> {
-        if !is_portable_logical_name(entry.name) || !self.object_map_ids.insert(entry.mv_table_id) {
+        if !is_portable_logical_name(entry.name) || self.object_map_ids.contains(&entry.mv_table_id)
+        {
             return Ok(false);
         }
+        let mv_table_id = entry.mv_table_id;
         let name_ref = self.intern_string(entry.name)?;
 
         let mut object = crate::alloc::vec![];
@@ -147,6 +149,10 @@ impl<'a> PortableLogicalBuilder<'a> {
             ]
         )?;
         self.object_maps.try_push(object)?;
+        assert!(
+            self.object_map_ids.insert(mv_table_id),
+            "portable object map id changed while building its payload"
+        );
         Ok(true)
     }
 
