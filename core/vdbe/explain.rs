@@ -42,6 +42,7 @@ pub fn insn_to_row(
             CursorType::Pseudo(_) => "pseudo",
             CursorType::VirtualTable(virtual_table) => virtual_table.name.as_str(),
             CursorType::MaterializedView(table, _) => table.name.as_str(),
+            CursorType::ViewDelta { view_name, .. } => view_name.as_str(),
             CursorType::Sorter => "sorter",
         };
         if ephemeral_cursors.contains(&cursor_id) {
@@ -590,6 +591,10 @@ pub fn insn_to_row(
                     CursorType::MaterializedView(table, _) => {
                         let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
                         name
+                    }
+                    CursorType::ViewDelta { table, .. } => {
+                        // The trailing weight column has no schema entry.
+                        table.columns().get(*column).and_then(|v| v.name.as_ref())
                     }
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,

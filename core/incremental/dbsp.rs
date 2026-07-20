@@ -231,6 +231,12 @@ impl Delta {
         self.changes.len()
     }
 
+    /// Drop all changes recorded after the first `len` entries. Used to
+    /// rewind captures made by an aborted statement subtransaction.
+    pub fn truncate(&mut self, len: usize) {
+        self.changes.truncate(len);
+    }
+
     /// Merge another delta into this one
     /// This preserves the order of operations - no consolidation is done
     /// to maintain the full history of changes

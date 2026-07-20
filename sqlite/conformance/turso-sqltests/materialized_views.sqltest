@@ -1,6 +1,7 @@
 @database :memory:
 @requires-file materialized_views ""
 @skip-file-if mvcc "materialized_views not supported with mvcc"
+@skip-file "IVM is being rewritten to compile to VDBE bytecode; aggregate/join/DISTINCT view shapes are rejected at CREATE until their codegen lands. Re-enable tests per shape as support returns. Filter/project coverage lives in matview_vdbe_maintenance.sqltest."
 
 # Test that INSERT with reused primary keys maintains correct aggregate counts
 # When a row is deleted and a new row is inserted with the same primary key
