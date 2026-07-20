@@ -1,0 +1,77 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# Materialized views are maintained by compiled VDBE programs (filter/project
+# shapes). These tests pin the maintenance semantics: population, insert,
+# delete, update (including across the filter boundary), and — critically —
+# that captured deltas from aborted statements and rolled-back transactions
+# never reach the view.
+
+test matview-vdbe-populate-and-maintain {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    INSERT INTO t1 VALUES (1,'x'),(2,'y'),(3,'z');
+    CREATE MATERIALIZED VIEW v1 AS SELECT a, b FROM t1 WHERE a >= 2;
+    INSERT INTO t1 VALUES (4,'w');
+    DELETE FROM t1 WHERE a = 2;
+    UPDATE t1 SET a = 10 WHERE a = 3;
+    SELECT * FROM v1 ORDER BY a;
+}
+expect {
+    4|w
+    10|z
+}
+
+test matview-vdbe-update-across-filter-boundary {
+    CREATE TABLE t2(a INTEGER, b TEXT);
+    INSERT INTO t2 VALUES (1,'in'),(5,'out');
+    CREATE MATERIALIZED VIEW v2 AS SELECT a, b FROM t2 WHERE a >= 3;
+    UPDATE t2 SET a = 7 WHERE b = 'in';
+    UPDATE t2 SET a = 0 WHERE b = 'out';
+    SELECT * FROM v2 ORDER BY a;
+}
+expect {
+    7|in
+}
+
+test matview-vdbe-expression-projection {
+    CREATE TABLE t3(a INTEGER, b INTEGER);
+    INSERT INTO t3 VALUES (1, 10), (2, 20);
+    CREATE MATERIALIZED VIEW v3 AS SELECT a + b AS s FROM t3 WHERE b IS NOT NULL;
+    INSERT INTO t3 VALUES (3, NULL), (4, 40);
+    SELECT * FROM v3 ORDER BY s;
+}
+expect {
+    11
+    22
+    44
+}
+
+test matview-vdbe-transaction-rollback {
+    CREATE TABLE t6(a INTEGER, b TEXT);
+    CREATE MATERIALIZED VIEW v6 AS SELECT a, b FROM t6;
+    BEGIN;
+    INSERT INTO t6 VALUES (1,'x');
+    ROLLBACK;
+    SELECT COUNT(*) FROM v6;
+}
+expect {
+    0
+}
+
+# Shapes the VDBE codegen cannot maintain yet are rejected at translate time,
+# before the CREATE program allocates any btree pages.
+test matview-vdbe-rejected-create-is-clean {
+    CREATE TABLE t7(a INTEGER, b TEXT);
+    INSERT INTO t7 VALUES (1,'x');
+    CREATE MATERIALIZED VIEW bad7 AS SELECT count(*) FROM t7;
+}
+expect error {
+    materialized views with aggregate functions are not yet supported
+}
+
+# Post-error state assertions (aborted statements must not leak captured
+# deltas into views; a rejected CREATE must leave the database intact) live
+# in tests/integration/query_processing/test_write_path.rs — each sqltest
+# block runs against a fresh database, so state after an expected error
+# cannot be asserted here.

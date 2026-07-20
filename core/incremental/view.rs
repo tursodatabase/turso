@@ -129,7 +129,30 @@ impl ViewTransactionState {
     pub fn len(&self) -> usize {
         self.table_deltas.borrow().values().map(|d| d.len()).sum()
     }
+
+    /// Per-table delta lengths, recorded at statement start so a statement
+    /// rollback can rewind captures made by the aborted statement.
+    pub fn table_delta_lens(&self) -> HashMap<String, usize> {
+        self.table_deltas
+            .borrow()
+            .iter()
+            .map(|(table, delta)| (table.clone(), delta.len()))
+            .collect()
+    }
+
+    /// Rewind each table's delta to the length recorded in `marks` (zero for
+    /// tables that had no delta when the marks were taken).
+    pub fn rewind_to_marks(&self, marks: &HashMap<String, usize>) {
+        let mut deltas = self.table_deltas.borrow_mut();
+        for (table, delta) in deltas.iter_mut() {
+            delta.truncate(marks.get(table).copied().unwrap_or(0));
+        }
+    }
 }
+
+/// Per-view, per-table delta lengths recorded at statement start, used to
+/// rewind captures made by an aborted statement subtransaction.
+pub type ViewDeltaMarks = HashMap<String, HashMap<String, usize>>;
 
 /// Container for all view transaction states within a connection
 /// Provides interior mutability for the map of view states
@@ -183,6 +206,30 @@ impl AllViewsTxState {
     /// Get all view names that have transaction states
     pub fn get_view_names(&self) -> Vec<String> {
         self.states.borrow().keys().cloned().collect()
+    }
+
+    /// Snapshot per-view, per-table delta lengths at statement start.
+    ///
+    /// Delta capture happens inside `op_insert`/`op_delete` as rows are
+    /// written, so when a statement subtransaction rolls back, captures made
+    /// by the aborted statement must be rewound or they would be applied to
+    /// the views at commit as phantom changes.
+    pub fn delta_marks(&self) -> ViewDeltaMarks {
+        self.states
+            .borrow()
+            .iter()
+            .map(|(view, state)| (view.clone(), state.table_delta_lens()))
+            .collect()
+    }
+
+    /// Rewind all captured deltas to the recorded statement-start marks.
+    pub fn rewind_to_marks(&self, marks: &ViewDeltaMarks) {
+        static EMPTY: std::sync::LazyLock<HashMap<String, usize>> =
+            std::sync::LazyLock::new(HashMap::default);
+        for (view, state) in self.states.borrow().iter() {
+            let view_marks = marks.get(view).unwrap_or(&EMPTY);
+            state.rewind_to_marks(view_marks);
+        }
     }
 }
 
@@ -293,6 +340,18 @@ impl IncrementalView {
         schema: &Schema,
     ) -> Result<ViewColumnSchema> {
         crate::util::validate_select_for_unsupported_features(select)?;
+        // Views are maintained by compiled VDBE programs; shapes the codegen
+        // cannot maintain yet are rejected at CREATE rather than silently
+        // mis-maintained. The supported set grows as operator codegen lands.
+        crate::incremental::vdbe_maintenance::validate_vdbe_maintainable(select)?;
+        // Dry-run the DBSP circuit compilation (still needed for uncommitted
+        // same-transaction reads) with dummy roots. A definition the circuit
+        // compiler cannot handle must fail HERE, at translate time: failing
+        // later inside the CREATE program's ParseSchema step aborts the
+        // statement after btree pages were allocated and leaves stale
+        // in-memory schema entries behind, which corrupts the database once
+        // those pages are reused.
+        Self::try_compile_circuit(select, schema, 0, 0, 0)?;
         // Use the shared function to extract columns with full table context
         extract_view_columns(select, schema)
     }

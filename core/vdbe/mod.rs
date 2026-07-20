@@ -106,15 +106,30 @@ use tracing::{instrument, Level};
 
 type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
 
-/// State machine for committing view deltas with I/O handling
-#[derive(Debug, Clone)]
+/// State machine for committing view deltas with I/O handling.
+///
+/// Each touched materialized view is maintained by stepping a compiled VDBE
+/// maintenance program to completion; the parked statement makes the state
+/// machine re-entrant across I/O yields.
+#[derive(Debug)]
 pub enum ViewDeltaCommitState {
     NotStarted,
     Processing {
         views: Vec<String>, // view names (all materialized views have storage)
         current_index: usize,
+        /// The maintenance statement currently being stepped for
+        /// `views[current_index]`, parked across I/O yields.
+        stmt: Option<Box<crate::statement::Statement>>,
     },
     Done,
+}
+
+/// Parked state for materialized-view initial population
+/// (Insn::PopulateMaterializedViews).
+#[derive(Debug)]
+pub struct PopulateMatViewsState {
+    pub view_idx: usize,
+    pub stmt: Option<Box<crate::statement::Statement>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -754,6 +769,13 @@ pub struct ProgramState {
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
+    /// Parked state for Insn::PopulateMaterializedViews: the population
+    /// statement currently being stepped, re-entrant across I/O yields.
+    pub(crate) populate_matviews_state: Option<PopulateMatViewsState>,
+    /// Per-view delta capture marks taken at statement start; on statement
+    /// rollback, captures past the marks are rewound (they belong to the
+    /// aborted statement).
+    view_delta_marks: Option<crate::incremental::view::ViewDeltaMarks>,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
@@ -849,6 +871,8 @@ impl ProgramState {
             current_collation: None,
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
+            populate_matviews_state: None,
+            view_delta_marks: None,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
@@ -977,6 +1001,7 @@ impl ProgramState {
         self.sequence_inner_commit = None;
         self.op_vacuum_state = VacuumOpState::None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
+        self.populate_matviews_state = None;
         self.auto_txn_cleanup = TxnCleanup::None;
         self.fk_immediate_violations_during_stmt
             .store(0, Ordering::SeqCst);
@@ -1162,6 +1187,12 @@ impl ProgramState {
 
         self.has_stmt_transaction = true;
 
+        // Record per-view delta capture marks so a statement rollback can
+        // rewind captures made by the aborted statement: delta capture
+        // happens in op_insert/op_delete as rows are written, and the pager
+        // savepoint rollback does not undo it.
+        self.view_delta_marks = Some(connection.view_transaction_states.delta_marks());
+
         // Store the deferred foreign key violations counter at the start of the statement.
         // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
         // the deferred FK violations are not lost.
@@ -1200,6 +1231,19 @@ impl ProgramState {
             return Ok(());
         }
         self.has_stmt_transaction = false;
+
+        // Statement-scoped view delta captures: keep them on release, rewind
+        // them on rollback (the btree writes they mirror are being undone).
+        match end_statement {
+            EndStatement::ReleaseSavepoint => {
+                self.view_delta_marks = None;
+            }
+            EndStatement::RollbackSavepoint => {
+                if let Some(marks) = self.view_delta_marks.take() {
+                    connection.view_transaction_states.rewind_to_marks(&marks);
+                }
+            }
+        }
 
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
@@ -1910,7 +1954,7 @@ impl Program {
         use crate::types::IOResult;
 
         loop {
-            match &state.view_delta_state {
+            match &mut state.view_delta_state {
                 ViewDeltaCommitState::NotStarted => {
                     if self.connection.view_transaction_states.is_empty() {
                         return Ok(IOResult::Done(()));
@@ -1946,12 +1990,14 @@ impl Program {
                     state.view_delta_state = ViewDeltaCommitState::Processing {
                         views,
                         current_index: 0,
+                        stmt: None,
                     };
                 }
 
                 ViewDeltaCommitState::Processing {
                     views,
                     current_index,
+                    stmt,
                 } => {
                     // At this point we know it's not a rollback
                     if *current_index >= views.len() {
@@ -1963,37 +2009,65 @@ impl Program {
 
                     let view_name = &views[*current_index];
 
-                    let table_deltas = self
-                        .connection
-                        .view_transaction_states
-                        .get(view_name)
-                        .expect("view should have transaction state")
-                        .get_table_deltas();
+                    if stmt.is_none() {
+                        // Compile the maintenance program for this view. The
+                        // program reads the transaction's captured deltas via
+                        // a ViewDelta cursor and merges them into the view's
+                        // btree; it is a subprogram, so its Halt does not
+                        // re-enter the commit path.
+                        let schema = self.connection.schema.read();
+                        let Some(view_mutex) = schema.get_materialized_view(view_name) else {
+                            *current_index += 1;
+                            continue;
+                        };
+                        let (select, root_page, num_view_columns) = {
+                            let view = view_mutex.lock();
+                            (
+                                view.select_stmt.clone(),
+                                view.get_root_page(),
+                                view.column_schema.flat_columns().len(),
+                            )
+                        };
+                        let program =
+                            crate::incremental::vdbe_maintenance::compile_maintenance_program(
+                                view_name,
+                                &select,
+                                root_page,
+                                num_view_columns,
+                                crate::incremental::vdbe_maintenance::MaintenanceInput::TransactionDelta,
+                                &schema,
+                                &self.connection,
+                            )?;
+                        *stmt = Some(Box::new(crate::statement::Statement::new_with_origin(
+                            program,
+                            pager.clone(),
+                            crate::QueryMode::Normal,
+                            0,
+                            crate::statement::StatementOrigin::Subprogram,
+                            false,
+                        )));
+                    }
 
-                    let schema = self.connection.schema.read();
-                    if let Some(view_mutex) = schema.get_materialized_view(view_name) {
-                        let mut view = view_mutex.lock();
-
-                        // Create a DeltaSet from the per-table deltas
-                        let mut delta_set = crate::incremental::compiler::DeltaSet::new();
-                        for (table_name, delta) in table_deltas {
-                            delta_set.insert(table_name, delta);
+                    let statement = stmt.as_mut().expect("maintenance statement was just built");
+                    match statement.step_subprogram()? {
+                        StepResult::Done => {
+                            *stmt = None;
+                            *current_index += 1;
                         }
-
-                        // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
-                        match view.merge_delta(delta_set, pager.clone())? {
-                            IOResult::Done(_) => {
-                                // Move to next view
-                                state.view_delta_state = ViewDeltaCommitState::Processing {
-                                    views: views.clone(),
-                                    current_index: current_index + 1,
-                                };
-                            }
-                            IOResult::IO(io) => {
-                                // Return I/O, will resume at same index
-                                return Ok(IOResult::IO(io));
-                            }
+                        StepResult::IO | StepResult::Yield => {
+                            let Some(io) = statement.take_io_completions() else {
+                                continue;
+                            };
+                            // Return I/O; resume re-enters with the parked statement.
+                            return Ok(IOResult::IO(io));
                         }
+                        StepResult::Row => {
+                            return Err(LimboError::InternalError(
+                                "materialized view maintenance program produced a row".to_string(),
+                            ));
+                        }
+                        StepResult::Busy => return Err(LimboError::Busy),
+                        StepResult::Interrupt => return Err(LimboError::Interrupt),
                     }
                 }
 

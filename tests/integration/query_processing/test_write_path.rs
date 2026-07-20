@@ -1828,6 +1828,76 @@ fn test_matview_row_loss_during_btree_split(tmp_db: TempDatabase) -> anyhow::Res
     Ok(())
 }
 
+/// View deltas are captured in op_insert/op_delete as rows are written, so an
+/// aborted statement must rewind its captures: the statement's btree writes
+/// roll back, and any delta left behind would be applied to the view at the
+/// next successful commit as a phantom change.
+#[turso_macros::test(views)]
+fn test_matview_aborted_statement_deltas_are_rewound(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1,'x')")?;
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT a, b FROM t")?;
+
+    // Multi-row INSERT that aborts on the second row's UNIQUE violation:
+    // the first row's captured insert must not survive.
+    assert!(conn
+        .execute("INSERT INTO t VALUES (2,'ok'), (1,'conflict')")
+        .is_err());
+    let rows = limbo_exec_rows(&conn, "SELECT a FROM v ORDER BY a");
+    assert_eq!(rows, vec![vec![RValue::Integer(1)]]);
+
+    // Rowid-alias UPDATE that aborts after already relocating the first row:
+    // the captured delete+insert pair must not survive.
+    conn.execute("INSERT INTO t VALUES (3,'y')")?;
+    assert!(conn.execute("UPDATE t SET a = 100 WHERE 1").is_err());
+    let rows = limbo_exec_rows(&conn, "SELECT a FROM v ORDER BY a");
+    assert_eq!(
+        rows,
+        vec![vec![RValue::Integer(1)], vec![RValue::Integer(3)]]
+    );
+
+    Ok(())
+}
+
+/// A CREATE MATERIALIZED VIEW whose definition is rejected must fail at
+/// translate time, before the CREATE program allocates btree pages. Failing
+/// later (inside ParseSchema) aborts the statement after pages were allocated
+/// and leaves stale in-memory schema entries behind; when those pages are
+/// reused by the next view, integrity_check reports pages referenced multiple
+/// times.
+#[turso_macros::test(views)]
+fn test_matview_rejected_create_leaves_database_intact(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (a INTEGER, b TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1,'x')")?;
+
+    // Rejected by the VDBE maintenance gate.
+    assert!(conn
+        .execute("CREATE MATERIALIZED VIEW bad1 AS SELECT count(*) FROM t")
+        .is_err());
+    // Rejected by the DBSP circuit dry-run (negative literal in WHERE).
+    assert!(conn
+        .execute("CREATE MATERIALIZED VIEW bad2 AS SELECT a, b FROM t WHERE a < -2")
+        .is_err());
+
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT a, b FROM t")?;
+    conn.execute("INSERT INTO t VALUES (2,'y')")?;
+
+    let rows = limbo_exec_rows(&conn, "SELECT a FROM v ORDER BY a");
+    assert_eq!(
+        rows,
+        vec![vec![RValue::Integer(1)], vec![RValue::Integer(2)]]
+    );
+
+    let rows = limbo_exec_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows, vec![vec![RValue::Text("ok".into())]]);
+
+    Ok(())
+}
+
 /// Regression test for simulator seed 867: UPDATE on an attached database table
 /// that changes the primary key (rowid) while a UNIQUE index exists would use
 /// the wrong database_id (0 instead of the attached db) for OpenWrite cursors,

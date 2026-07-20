@@ -1196,6 +1196,7 @@ pub fn op_open_read(
         CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
         CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
         CursorType::MaterializedView(table_rc, _) => table_rc.columns().len(),
+        CursorType::ViewDelta { table, .. } => table.columns().len(),
         _ => unreachable!("This should not have happened"),
     };
 
@@ -1221,6 +1222,30 @@ pub fn op_open_read(
     };
 
     match cursor_type {
+        CursorType::ViewDelta { view_name, table } => {
+            // In-memory cursor over the transaction's captured delta for one
+            // base table of a materialized view. Opened by maintenance
+            // programs at commit time; the snapshot is taken here.
+            let delta_cursor = match program.connection.view_transaction_states.get(view_name) {
+                Some(tx_state) => {
+                    let delta = tx_state
+                        .get_table_deltas()
+                        .remove(table.name.as_str())
+                        .unwrap_or_default();
+                    crate::incremental::vdbe_maintenance::DeltaCursor::new(
+                        delta,
+                        table.columns().len(),
+                    )
+                }
+                None => {
+                    crate::incremental::vdbe_maintenance::DeltaCursor::empty(table.columns().len())
+                }
+            };
+            cursors
+                .get_mut(*cursor_id)
+                .expect("cursor_id should be valid")
+                .replace(Cursor::new_delta(delta_cursor));
+        }
         CursorType::MaterializedView(_, view_mutex) => {
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
@@ -1702,6 +1727,7 @@ pub fn op_rewind(
                 return_if_io!(mv_cursor.rewind());
                 !mv_cursor.is_valid()?
             }
+            Cursor::Delta(delta_cursor) => !delta_cursor.rewind(),
             _ => panic!("Rewind on non-btree/materialized-view cursor"),
         }
     };
@@ -1880,6 +1906,11 @@ fn op_column_fetch(
             state.registers[dest].set_value(value);
             return Ok(InsnFunctionStepResult::Step);
         }
+        if let Cursor::Delta(delta_cursor) = cursor {
+            let value = delta_cursor.column(column);
+            state.registers[dest].set_value(value);
+            return Ok(InsnFunctionStepResult::Step);
+        }
         // Fall back to normal handling
     }
 
@@ -1998,6 +2029,9 @@ fn op_column_fetch(
         }
         CursorType::VirtualTable(_) => {
             panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
+        }
+        CursorType::ViewDelta { .. } => {
+            unreachable!("Cursor::Delta columns are handled before cursor_type dispatch");
         }
     }
     Ok(InsnFunctionStepResult::Step)
@@ -3026,6 +3060,7 @@ pub fn op_next(
                 let has_more = return_if_io!(mv_cursor.next());
                 !has_more
             }
+            Cursor::Delta(delta_cursor) => !delta_cursor.next(),
             Cursor::IndexMethod(_) => {
                 let cursor = cursor.as_index_method_mut();
                 let has_more = return_if_io!(cursor.query_next());
@@ -5211,6 +5246,11 @@ pub fn op_row_id(
                     } else {
                         state.registers[*dest].set_null();
                     }
+                } else if let Some(Cursor::Delta(delta_cursor)) = cursors
+                    .get_mut(*cursor_id)
+                    .expect("cursor_id should be valid")
+                {
+                    state.registers[*dest].set_int(delta_cursor.rowid());
                 } else {
                     mark_unlikely();
                     return Err(LimboError::InternalError(
@@ -13442,21 +13482,41 @@ pub fn op_populate_materialized_views(
 
     let conn = program.connection.clone();
 
-    // For each view, get its cursor and root page
-    let mut view_info = Vec::new();
-    {
-        let cursors_ref = &state.cursors;
-        for (view_name, cursor_id) in cursors {
-            // Get the cursor to find the root page
-            let cursor = cursors_ref
-                .get(*cursor_id)
-                .and_then(|c| c.as_ref())
-                .ok_or_else(|| {
-                    LimboError::InternalError(format!("Cursor {cursor_id} not found"))
-                })?;
+    // Each view is populated by its maintenance program compiled with the
+    // base table as input (every row weight +1); the statement is parked in
+    // ProgramState across I/O yields. The write cursor opened by the CREATE
+    // program is only used to learn the view btree's root page — the
+    // population program opens its own cursor.
+    loop {
+        if state.populate_matviews_state.is_none() {
+            state.populate_matviews_state = Some(crate::vdbe::PopulateMatViewsState {
+                view_idx: 0,
+                stmt: None,
+            });
+        }
+        let view_idx = state
+            .populate_matviews_state
+            .as_ref()
+            .expect("populate state was just initialized")
+            .view_idx;
 
-            let root_page = match cursor {
-                crate::types::Cursor::BTree(btree_cursor) => btree_cursor.root_page(),
+        if view_idx >= cursors.len() {
+            state.populate_matviews_state = None;
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+
+        let (view_name, cursor_id) = &cursors[view_idx];
+
+        let needs_build = state
+            .populate_matviews_state
+            .as_ref()
+            .expect("populate state exists")
+            .stmt
+            .is_none();
+        if needs_build {
+            let root_page = match state.cursors.get(*cursor_id).and_then(|c| c.as_ref()) {
+                Some(crate::types::Cursor::BTree(btree_cursor)) => btree_cursor.root_page(),
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view".into(),
@@ -13464,48 +13524,71 @@ pub fn op_populate_materialized_views(
                 }
             };
 
-            view_info.push((view_name.clone(), root_page, *cursor_id));
-        }
-    }
-
-    // Now populate the views (after releasing the schema borrow)
-    for (view_name, _root_page, cursor_id) in view_info {
-        let schema = conn.schema.read();
-        if let Some(view) = schema.get_materialized_view(&view_name) {
-            let mut view = view.lock();
-            // Drop the schema borrow before calling populate_from_table
-            drop(schema);
-
-            // Get the cursor for writing
-            // Get a mutable reference to the cursor
-            let cursors_ref = &mut state.cursors;
-            let cursor = cursors_ref
-                .get_mut(cursor_id)
-                .and_then(|c| c.as_mut())
-                .ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "Cursor {cursor_id} not found for population"
-                    ))
-                })?;
-
-            // Extract the BTreeCursor
-            let btree_cursor = match cursor {
-                crate::types::Cursor::BTree(btree_cursor) => btree_cursor,
-                _ => {
-                    return Err(LimboError::InternalError(
-                        "Expected BTree cursor for materialized view population".into(),
-                    ));
-                }
+            let schema = conn.schema.read();
+            let Some(view_mutex) = schema.get_materialized_view(view_name) else {
+                return Err(LimboError::InternalError(format!(
+                    "materialized view {view_name} missing from schema during population"
+                )));
             };
+            let (select, num_view_columns) = {
+                let view = view_mutex.lock();
+                (
+                    view.select_stmt.clone(),
+                    view.column_schema.flat_columns().len(),
+                )
+            };
+            let populate_program =
+                crate::incremental::vdbe_maintenance::compile_maintenance_program(
+                    view_name,
+                    &select,
+                    root_page,
+                    num_view_columns,
+                    crate::incremental::vdbe_maintenance::MaintenanceInput::BaseTable,
+                    &schema,
+                    &conn,
+                )?;
+            state
+                .populate_matviews_state
+                .as_mut()
+                .expect("populate state exists")
+                .stmt = Some(Box::new(crate::statement::Statement::new_with_origin(
+                populate_program,
+                pager.clone(),
+                crate::QueryMode::Normal,
+                0,
+                crate::statement::StatementOrigin::Subprogram,
+                false,
+            )));
+        }
 
-            // Now populate it with the cursor for writing
-            return_if_io!(view.populate_from_table(&conn, pager, btree_cursor.as_mut()));
+        let populate_state = state
+            .populate_matviews_state
+            .as_mut()
+            .expect("populate state exists");
+        let statement = populate_state
+            .stmt
+            .as_mut()
+            .expect("population statement was just built");
+        match statement.step_subprogram()? {
+            StepResult::Done => {
+                populate_state.stmt = None;
+                populate_state.view_idx += 1;
+            }
+            StepResult::IO | StepResult::Yield => {
+                let Some(io) = statement.take_io_completions() else {
+                    continue;
+                };
+                return Ok(InsnFunctionStepResult::IO(io));
+            }
+            StepResult::Row => {
+                return Err(LimboError::InternalError(
+                    "materialized view population program produced a row".to_string(),
+                ));
+            }
+            StepResult::Busy => return Err(LimboError::Busy),
+            StepResult::Interrupt => return Err(LimboError::Interrupt),
         }
     }
-
-    // All views populated, advance to next instruction
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_read_cookie(
@@ -14066,6 +14149,9 @@ pub fn op_open_ephemeral(
                 }
                 CursorType::MaterializedView(_, _) => {
                     panic!("OpenEphemeral on materialized view cursor");
+                }
+                CursorType::ViewDelta { .. } => {
+                    panic!("OpenEphemeral on view delta cursor");
                 }
             }
 

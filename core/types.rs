@@ -3068,6 +3068,8 @@ pub enum Cursor {
     Sorter(Box<Sorter>),
     Virtual(VirtualTableCursor),
     MaterializedView(Box<crate::incremental::cursor::MaterializedViewCursor>),
+    /// In-memory cursor over a transaction's captured materialized-view delta.
+    Delta(Box<crate::incremental::vdbe_maintenance::DeltaCursor>),
 }
 
 impl Debug for Cursor {
@@ -3079,6 +3081,7 @@ impl Debug for Cursor {
             Self::Sorter(..) => f.debug_tuple("Sorter").finish(),
             Self::Virtual(..) => f.debug_tuple("Virtual").finish(),
             Self::MaterializedView(..) => f.debug_tuple("MaterializedView").finish(),
+            Self::Delta(..) => f.debug_tuple("Delta").finish(),
         }
     }
 }
@@ -3102,6 +3105,20 @@ impl Cursor {
         cursor: crate::incremental::cursor::MaterializedViewCursor,
     ) -> Self {
         Self::MaterializedView(Box::new(cursor))
+    }
+
+    pub fn new_delta(cursor: crate::incremental::vdbe_maintenance::DeltaCursor) -> Self {
+        Self::Delta(Box::new(cursor))
+    }
+
+    pub fn as_delta_mut(&mut self) -> &mut crate::incremental::vdbe_maintenance::DeltaCursor {
+        match self {
+            Self::Delta(cursor) => cursor,
+            _ => {
+                mark_unlikely();
+                panic!("Cursor is not a delta cursor");
+            }
+        }
     }
 
     pub fn as_btree_mut(&mut self) -> &mut dyn CursorTrait {

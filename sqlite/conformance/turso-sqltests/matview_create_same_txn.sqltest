@@ -9,11 +9,11 @@ test matview-create-same-txn-as-table {
     BEGIN;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
     INSERT INTO t1 VALUES (1, 'hello'), (2, 'world');
-    CREATE MATERIALIZED VIEW v AS SELECT val, COUNT(*) as cnt FROM t1 GROUP BY val;
+    CREATE MATERIALIZED VIEW v AS SELECT id, val FROM t1;
     COMMIT;
     SELECT * FROM v ORDER BY val;
 }
 expect {
-    hello|1
-    world|1
+    1|hello
+    2|world
 }
