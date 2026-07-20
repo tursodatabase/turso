@@ -7500,6 +7500,7 @@ name = "turso_ruby"
 version = "0.7.0"
 dependencies = [
  "magnus",
+ "rb-sys",
  "turso_core",
  "turso_sdk_kit",
 ]

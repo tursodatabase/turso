@@ -1,5 +1,5 @@
 use magnus::{
-    data_type_builder, DataType, DataTypeFunctions, Error, RHash, Ruby, Symbol, TypedData, Value,
+    data_type_builder, DataType, DataTypeFunctions, Error, RHash, RString, Ruby, Symbol, TypedData, Value,
 };
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{TursoConnection, TursoDatabase, TursoDatabaseConfig};
@@ -50,28 +50,31 @@ impl Database {
         let experimental_features: Option<String> = opts.aref("experimental_features")?;
         let busy_timeout_ms: Option<u64> = opts.aref("busy_timeout")?;
         let query_timeout_ms: Option<u64> = opts.aref("query_timeout")?;
-        let readonly: Option<bool> = opts.aref("readonly")?;
-        let file_must_exist: Option<bool> = opts.aref("file_must_exist")?;
 
         let vfs: Option<Value> = opts.aref("vfs")?;
-        let vfs = vfs.and_then(|v| {
+        let vfs: Option<String> = vfs.and_then(|v| {
             if let Some(sym) = Symbol::from_value(v) {
-                sym.name().ok()
+                sym.name().ok().map(|s| s.to_string())
             } else {
-                String::try_convert(v).ok()
+                RString::from_value(v).and_then(|s| s.to_string().ok())
             }
         });
 
         let encryption: Option<RHash> = opts.aref("encryption")?;
-        let encryption = encryption.map(|e| -> Result<turso_sdk_kit::rsapi::EncryptionOpts, magnus::Error> {
-            let cipher: String = e.aref("cipher").ok_or_else(|| {
-                magnus::Error::new(ruby.exception_arg_error(), "encryption requires cipher")
-            })?;
-            let hexkey: String = e.aref("hexkey").ok_or_else(|| {
-                magnus::Error::new(ruby.exception_arg_error(), "encryption requires hexkey")
-            })?;
-            Ok(turso_sdk_kit::rsapi::EncryptionOpts { cipher, hexkey })
-        }).transpose()?;
+        let encryption = match encryption {
+            Some(e) => {
+                let cipher: Option<String> = e.aref("cipher")?;
+                let hexkey: Option<String> = e.aref("hexkey")?;
+                let cipher = cipher.ok_or_else(|| {
+                    magnus::Error::new(ruby.exception_arg_error(), "encryption requires cipher")
+                })?;
+                let hexkey = hexkey.ok_or_else(|| {
+                    magnus::Error::new(ruby.exception_arg_error(), "encryption requires hexkey")
+                })?;
+                Some(turso_sdk_kit::rsapi::EncryptionOpts { cipher, hexkey })
+            }
+            None => None,
+        };
 
         let config = TursoDatabaseConfig {
             path: path.clone(),
@@ -86,8 +89,6 @@ impl Database {
             },
             io: None,
             db_file: None,
-            readonly: readonly.unwrap_or(false),
-            file_must_exist: file_must_exist.unwrap_or(false),
         };
         let db = TursoDatabase::new(config);
         let result = db.open().map_err(|e| from_turso_error(e, classes))?;

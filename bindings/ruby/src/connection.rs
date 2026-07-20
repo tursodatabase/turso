@@ -41,7 +41,8 @@ impl Connection {
 
     pub fn execute_batch(&self, sql: String) -> Result<RArray, Error> {
         let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
-        let mut results = RArray::new();
+        let ruby = unsafe { Ruby::get_unchecked() };
+        let results = ruby.ary_new();
         let mut offset: usize = 0;
         loop {
             match self

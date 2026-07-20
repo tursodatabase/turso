@@ -11,5 +11,6 @@ path = "../../../src/lib.rs"
 
 [dependencies]
 magnus = { version = "0.8", features = ["rb-sys"] }
+rb-sys = "0.9"
 turso_sdk_kit = { path = "../../../../../sdk-kit", features = ["fts"] }
 turso_core = { path = "../../../../../core", features = ["fts"] }

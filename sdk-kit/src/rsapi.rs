@@ -180,12 +180,6 @@ pub struct TursoDatabaseConfig {
     /// optional custom DatabaseStorage provided by the caller
     /// if provided, caller must guarantee that IO used by the TursoDatabase will be consistent with underlying DatabaseStorage IO
     pub db_file: Option<Arc<dyn DatabaseStorage>>,
-
-    /// if true, open the database in read-only mode
-    pub readonly: bool,
-
-    /// if true, fail if the database file does not exist (no implicit creation)
-    pub file_must_exist: bool,
 }
 
 impl TursoDatabaseConfig {
@@ -360,8 +354,6 @@ impl TursoDatabaseConfig {
             },
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         })
     }
 }
@@ -404,8 +396,6 @@ impl TursoDatabaseOpenState {
             phase: TursoDatabaseOpenPhase::Init,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
             opts: None,
             open_flags: OpenFlags::default(),
             open_db_state: OpenDbAsyncState::new(),
@@ -770,17 +760,8 @@ impl TursoDatabase {
                     }
 
                     let mut open_flags = OpenFlags::default();
-                    if self.config.readonly {
-                        open_flags = OpenFlags::ReadOnly;
-                    }
-                    if self.config.file_must_exist {
-                        open_flags &= !OpenFlags::Create;
-                    }
                     if opts.enable_multiprocess_wal {
                         open_flags |= OpenFlags::NoLock;
-                    }
-                    if self.config.readonly && self.config.file_must_exist {
-                        open_flags = OpenFlags::ReadOnly;
                     }
                     let db_file = if let Some(db_file) = &self.config.db_file {
                         db_file.clone()
@@ -1623,8 +1604,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         }
     }
 
@@ -1675,8 +1654,6 @@ mod tests {
                 vfs: IoBackend::Default,
                 io: None,
                 db_file: None,
-            readonly: false,
-            file_must_exist: false,
             });
             let result = db.open().unwrap();
             assert!(!result.is_io());
@@ -1738,8 +1715,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1760,8 +1735,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1792,8 +1765,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1817,8 +1788,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1869,8 +1838,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1930,8 +1897,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1964,8 +1929,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -1995,8 +1958,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2022,8 +1983,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2050,8 +2009,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2102,8 +2059,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2192,8 +2147,6 @@ mod tests {
                     vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
-            readonly: false,
-            file_must_exist: false,
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -2234,8 +2187,6 @@ mod tests {
                     vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
-            readonly: false,
-            file_must_exist: false,
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -2262,8 +2213,6 @@ mod tests {
                     vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
-            readonly: false,
-            file_must_exist: false,
                 });
                 assert!(db.open().is_err(), "Opening with wrong key should fail");
             }
@@ -2278,8 +2227,6 @@ mod tests {
                     vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
-            readonly: false,
-            file_must_exist: false,
                 });
                 let result = db.open();
                 println!("result: {result:?}");
@@ -2315,8 +2262,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         });
         let _ = db_a.open().unwrap();
         let conn_a = db_a.connect().unwrap();
@@ -2354,8 +2299,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         });
         let _ = db_a2.open().unwrap();
         let conn_a2 = db_a2.connect().unwrap();
@@ -2390,8 +2333,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2426,8 +2367,6 @@ mod tests {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
-            readonly: false,
-            file_must_exist: false,
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());

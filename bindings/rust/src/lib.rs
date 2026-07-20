@@ -303,8 +303,6 @@ impl Builder {
                 vfs: self.vfs,
                 io: self.io,
                 db_file: None,
-                readonly: false,
-                file_must_exist: false,
             });
         while let Some(io_c) = db.open()?.io() {
             // At this point IO must already be created

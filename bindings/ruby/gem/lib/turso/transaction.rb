@@ -1,10 +1,12 @@
 # frozen_string_literal: true
 
 module Turso
+  VALID_TRANSACTION_MODES = %i[deferred immediate exclusive concurrent].freeze
+
   class Transaction
     def initialize(db, mode = :immediate)
-      unless DB::VALID_TRANSACTION_MODES.include?(mode)
-        fail ArgumentError, "Invalid transaction mode: #{mode.inspect}. Valid modes: #{DB::VALID_TRANSACTION_MODES.inspect}"
+      unless VALID_TRANSACTION_MODES.include?(mode)
+        fail ArgumentError, "Invalid transaction mode: #{mode.inspect}. Valid modes: #{VALID_TRANSACTION_MODES.inspect}"
       end
       @db = db
       @mode = mode

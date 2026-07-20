@@ -37,6 +37,12 @@ module Turso
       @native.connection.execute_batch(sql)
     end
 
+    def query(sql, *bind_args)
+      stmt = prepare(sql)
+      stmt.bind(*bind_args) unless bind_args.empty?
+      ResultSet.new(stmt)
+    end
+
     def get_first_row(sql, *bind_args)
       stmt = prepare(sql)
       begin

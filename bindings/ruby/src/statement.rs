@@ -1,6 +1,8 @@
 use magnus::{data_type_builder, DataType, DataTypeFunctions, Error, Ruby, TypedData, Value};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
+use turso_core::types::Text;
+use turso_core::{NonNan, Numeric};
 use turso_sdk_kit::rsapi::TursoStatement;
 
 use crate::error::from_turso_error;
@@ -72,6 +74,88 @@ impl Statement {
 
     pub fn parameter_count(&self) -> Result<u32, Error> {
         self.with_guard(|stmt| Ok(stmt.parameters_count() as u32))
+    }
+
+    pub fn parameter_name(&self, index: u32) -> Result<Option<String>, Error> {
+        self.with_guard(|stmt| Ok(stmt.parameter_name(index as usize)))
+    }
+
+    pub fn named_position(&self, name: String) -> Result<i64, Error> {
+        self.with_guard(|stmt| {
+            stmt.named_position(&name)
+                .map(|i| i as i64)
+                .map_err(|e| {
+                    let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+                    from_turso_error(e, classes)
+                })
+        })
+    }
+
+    pub fn bind_null(&self, index: u32) -> Result<(), Error> {
+        self.with_guard(|stmt| {
+            let tv = turso_sdk_kit::rsapi::Value::Null;
+            stmt.bind_positional(index as usize, tv).map_err(|e| {
+                let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+                from_turso_error(e, classes)
+            })
+        })
+    }
+
+    pub fn bind_int(&self, index: u32, value: i64) -> Result<(), Error> {
+        self.with_guard(|stmt| {
+            let tv = turso_sdk_kit::rsapi::Value::Numeric(Numeric::Integer(value));
+            stmt.bind_positional(index as usize, tv).map_err(|e| {
+                let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+                from_turso_error(e, classes)
+            })
+        })
+    }
+
+    pub fn bind_double(&self, index: u32, value: f64) -> Result<(), Error> {
+        self.with_guard(|stmt| {
+            let nn = NonNan::new(value).ok_or_else(|| {
+                magnus::Error::new(
+                    ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized").base(),
+                    "NaN is not supported",
+                )
+            })?;
+            let tv = turso_sdk_kit::rsapi::Value::Numeric(Numeric::Float(nn));
+            stmt.bind_positional(index as usize, tv).map_err(|e| {
+                let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+                from_turso_error(e, classes)
+            })
+        })
+    }
+
+    pub fn bind_text(&self, index: u32, value: String) -> Result<(), Error> {
+        self.with_guard(|stmt| {
+            let tv = turso_sdk_kit::rsapi::Value::Text(Text::new(value));
+            stmt.bind_positional(index as usize, tv).map_err(|e| {
+                let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+                from_turso_error(e, classes)
+            })
+        })
+    }
+
+    pub fn bind_blob(&self, index: u32, value: Vec<u8>) -> Result<(), Error> {
+        self.with_guard(|stmt| {
+            let tv = turso_sdk_kit::rsapi::Value::Blob(value);
+            stmt.bind_positional(index as usize, tv).map_err(|e| {
+                let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+                from_turso_error(e, classes)
+            })
+        })
+    }
+
+    pub fn row_value(&self, index: u32) -> Result<Value, Error> {
+        self.with_guard(|stmt| {
+            let value = stmt.row_value(index as usize).map_err(|e| {
+                let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+                from_turso_error(e, classes)
+            })?;
+            let ruby = unsafe { Ruby::get_unchecked() };
+            crate::value::to_ruby_value(&ruby, &value)
+        })
     }
 
     pub fn column_count(&self) -> Result<u32, Error> {

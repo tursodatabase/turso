@@ -75,16 +75,24 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     connection_class.define_method("close", method!(Connection::close, 0))?;
     connection_class.undef_default_alloc_func();
 
-    let statement_class = module.define_class("Statement", ruby.class_object())?;
+    let statement_class = module.define_class("NativeStatement", ruby.class_object())?;
     let _ = RAW_STATEMENT_CLASS.set(val_to_usize(statement_class.as_value()));
     statement_class.define_method("parameter_count", method!(Statement::parameter_count, 0))?;
+    statement_class.define_method("parameter_name", method!(Statement::parameter_name, 1))?;
+    statement_class.define_method("named_position", method!(Statement::named_position, 1))?;
     statement_class.define_method("column_count", method!(Statement::column_count, 0))?;
     statement_class.define_method("column_name", method!(Statement::column_name, 1))?;
     statement_class.define_method("column_decltype", method!(Statement::column_decltype, 1))?;
     statement_class.define_method("bind_positional", method!(Statement::bind_positional, 1))?;
+    statement_class.define_method("bind_null", method!(Statement::bind_null, 1))?;
+    statement_class.define_method("bind_int", method!(Statement::bind_int, 2))?;
+    statement_class.define_method("bind_double", method!(Statement::bind_double, 2))?;
+    statement_class.define_method("bind_text", method!(Statement::bind_text, 2))?;
+    statement_class.define_method("bind_blob", method!(Statement::bind_blob, 2))?;
     statement_class.define_method("step", method!(Statement::step, 0))?;
     statement_class.define_method("execute", method!(Statement::execute, 0))?;
     statement_class.define_method("row", method!(Statement::row, 0))?;
+    statement_class.define_method("row_value", method!(Statement::row_value, 1))?;
     statement_class.define_method("finalize", method!(Statement::finalize, 0))?;
     statement_class.define_method("close", method!(Statement::finalize, 0))?;
     statement_class.define_method("reset", method!(Statement::reset, 0))?;
