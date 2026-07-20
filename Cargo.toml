@@ -48,6 +48,7 @@ members = [
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
     "testing/sqltest",
+    "serverless/rust",
     "remote/protocol"
 ]
 exclude = ["perf/latency/limbo"]
@@ -110,6 +111,7 @@ limbo_completion = { path = "extensions/completion", version = "0.7.0" }
 turso_core = { path = "core", version = "0.7.0" }
 turso_sync_engine = { path = "sync/engine", version = "0.7.0" }
 turso_ext = { path = "extensions/core", version = "0.7.0" }
+turso_serverless = { path = "serverless/rust", version = "0.7.0" }
 turso_remote_protocol = { path = "remote/protocol", version = "0.7.0" }
 turso_macros = { path = "macros", version = "0.7.0" }
 turso_parser = { path = "sqlite/parser", version = "0.7.0" }
