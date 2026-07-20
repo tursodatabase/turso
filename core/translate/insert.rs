@@ -57,11 +57,14 @@ use gencol::compute_virtual_columns;
 use std::num::NonZeroUsize;
 use turso_macros::turso_assert;
 use turso_parser::ast::{
-    self, Expr, InsertBody, Literal, OneSelect, PartitionSpec, QualifiedName, ResolveType,
-    ResultColumn, TriggerEvent, TriggerTime, Upsert, UpsertDo, With,
+    self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
+    TriggerTime, Upsert, UpsertDo, With,
 };
+#[cfg(not(target_family = "wasm"))]
+use turso_parser::ast::{Literal, PartitionSpec};
 
 /// Capture every partition key used by an INSERT body.
+#[cfg(not(target_family = "wasm"))]
 fn extract_partition_values(
     program: &mut ProgramBuilder,
     body: &InsertBody,
@@ -120,6 +123,7 @@ fn extract_partition_values(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn extract_partition_value(
     program: &mut ProgramBuilder,
     expr: &Expr,
@@ -155,6 +159,7 @@ fn extract_partition_value(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn parse_partition_integer(value: &str) -> Result<i64> {
     crate::util::parse_numeric_literal(value)
         .ok()
@@ -166,6 +171,7 @@ fn parse_partition_integer(value: &str) -> Result<i64> {
         })
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn resolve_partition_values(
     program: &ProgramBuilder,
     values: &[crate::partition::PartitionInsertValue],
@@ -352,6 +358,7 @@ impl<'a> InsertEmitCtx<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(target_family = "wasm", allow(unused_mut))]
 #[turso_macros::trace_stack]
 pub fn translate_insert(
     resolver: &mut Resolver,
@@ -434,102 +441,106 @@ pub fn translate_insert(
         crate::bail_parse_error!("no such table: {}", table_name);
     };
 
-    if let Some(partition_spec) = &btree_table.partition_spec {
-        if !connection.is_table_partitioned(table_name.as_str()) {
-            crate::bail_parse_error!(
-                "INSERT into partitioned table '{}' requires partition configuration",
-                table_name
-            );
-        }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        if let Some(partition_spec) = &btree_table.partition_spec {
+            if !connection.is_table_partitioned(table_name.as_str()) {
+                crate::bail_parse_error!(
+                    "INSERT into partitioned table '{}' requires partition configuration",
+                    table_name
+                );
+            }
 
-        let partition_values =
-            extract_partition_values(program, &body, &columns, &btree_table, partition_spec)?;
-        if partition_values.is_empty() {
-            crate::bail_parse_error!("VALUES clause is empty");
-        }
+            let partition_values =
+                extract_partition_values(program, &body, &columns, &btree_table, partition_spec)?;
+            if partition_values.is_empty() {
+                crate::bail_parse_error!("VALUES clause is empty");
+            }
 
-        let timestamps = resolve_partition_values(program, &partition_values)?;
-        let mut compiled_range_start = None;
-        if let Some(timestamps) = timestamps {
-            let first_timestamp = timestamps
-                .first()
-                .copied()
-                .ok_or_else(|| LimboError::ParseError("VALUES clause is empty".to_string()))?;
-            let first_target = connection.partition_target(table_name.as_str(), first_timestamp)?;
-            for timestamp in timestamps.iter().copied().skip(1) {
-                let target = connection.partition_target(table_name.as_str(), timestamp)?;
-                if target.range_start != first_target.range_start {
-                    return Err(LimboError::InvalidArgument(format!(
-                        "one INSERT statement cannot write table '{}' to both '{}' and '{}'",
-                        table_name, first_target.db_alias, target.db_alias
-                    )));
+            let timestamps = resolve_partition_values(program, &partition_values)?;
+            let mut compiled_range_start = None;
+            if let Some(timestamps) = timestamps {
+                let first_timestamp = timestamps
+                    .first()
+                    .copied()
+                    .ok_or_else(|| LimboError::ParseError("VALUES clause is empty".to_string()))?;
+                let first_target =
+                    connection.partition_target(table_name.as_str(), first_timestamp)?;
+                for timestamp in timestamps.iter().copied().skip(1) {
+                    let target = connection.partition_target(table_name.as_str(), timestamp)?;
+                    if target.range_start != first_target.range_start {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "one INSERT statement cannot write table '{}' to both '{}' and '{}'",
+                            table_name, first_target.db_alias, target.db_alias
+                        )));
+                    }
                 }
-            }
-            if connection.get_auto_commit() {
-                connection.refresh_partition_target(table_name.as_str(), &first_target)?;
-            }
-            connection.check_partition_write_target(
-                table_name.as_str(),
-                &first_target.db_alias,
-                first_target.range_start,
-            )?;
+                if connection.get_auto_commit() {
+                    connection.refresh_partition_target(table_name.as_str(), &first_target)?;
+                }
+                connection.check_partition_write_target(
+                    table_name.as_str(),
+                    &first_target.db_alias,
+                    first_target.range_start,
+                )?;
 
-            let partition_info = connection
-                .ensure_partition(table_name.as_str(), first_timestamp)
-                .map_err(|error| {
-                    LimboError::ParseError(format!(
-                        "failed to ensure partition for timestamp {first_timestamp}: {error}"
-                    ))
-                })?;
-            let partition_path = std::path::PathBuf::from(&partition_info.file_path);
-            if !partition_info.attached {
-                connection
-                    .attach_partition(table_name.as_str(), &partition_path)
+                let partition_info = connection
+                    .ensure_partition(table_name.as_str(), first_timestamp)
                     .map_err(|error| {
                         LimboError::ParseError(format!(
-                            "failed to attach partition {}: {error}",
+                            "failed to ensure partition for timestamp {first_timestamp}: {error}"
+                        ))
+                    })?;
+                let partition_path = std::path::PathBuf::from(&partition_info.file_path);
+                if !partition_info.attached {
+                    connection
+                        .attach_partition(table_name.as_str(), &partition_path)
+                        .map_err(|error| {
+                            LimboError::ParseError(format!(
+                                "failed to attach partition {}: {error}",
+                                partition_info.db_alias
+                            ))
+                        })?;
+                }
+
+                database_id = connection
+                    .partition_manager
+                    .read()
+                    .route_insert(table_name.as_str(), first_timestamp)
+                    .map_err(|error| {
+                        LimboError::ParseError(format!("failed to route INSERT: {error}"))
+                    })?
+                    .database_id
+                    .ok_or_else(|| {
+                        LimboError::ParseError(format!(
+                            "partition {} is not attached",
                             partition_info.db_alias
                         ))
                     })?;
-            }
+                compiled_range_start = Some(first_target.range_start);
 
-            database_id = connection
-                .partition_manager
-                .read()
-                .route_insert(table_name.as_str(), first_timestamp)
-                .map_err(|error| {
-                    LimboError::ParseError(format!("failed to route INSERT: {error}"))
-                })?
-                .database_id
-                .ok_or_else(|| {
+                table = resolver
+                    .with_schema(database_id, |schema| schema.get_table(table_name.as_str()))
+                    .ok_or_else(|| {
+                        LimboError::ParseError(format!(
+                            "partition {} does not contain table '{}'",
+                            partition_info.db_alias, table_name
+                        ))
+                    })?;
+                btree_table = table.btree().ok_or_else(|| {
                     LimboError::ParseError(format!(
-                        "partition {} is not attached",
-                        partition_info.db_alias
-                    ))
-                })?;
-            compiled_range_start = Some(first_target.range_start);
-
-            table = resolver
-                .with_schema(database_id, |schema| schema.get_table(table_name.as_str()))
-                .ok_or_else(|| {
-                    LimboError::ParseError(format!(
-                        "partition {} does not contain table '{}'",
+                        "partition {} table '{}' is not a B-tree table",
                         partition_info.db_alias, table_name
                     ))
                 })?;
-            btree_table = table.btree().ok_or_else(|| {
-                LimboError::ParseError(format!(
-                    "partition {} table '{}' is not a B-tree table",
-                    partition_info.db_alias, table_name
-                ))
-            })?;
-        }
+            }
 
-        program.set_partitioned_insert(crate::partition::PartitionedInsert {
-            table_name: table_name.as_str().to_string(),
-            values: partition_values,
-            compiled_range_start,
-        });
+            program.set_partitioned_insert(crate::partition::PartitionedInsert {
+                table_name: table_name.as_str().to_string(),
+                values: partition_values,
+                compiled_range_start,
+            });
+        }
     }
 
     let BoundInsertResult {

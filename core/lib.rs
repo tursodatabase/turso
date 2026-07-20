@@ -64,6 +64,7 @@ mod json;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod numeric;
 mod parameters;
+#[cfg(not(target_family = "wasm"))]
 pub mod partition;
 #[cfg(feature = "percentile")]
 mod percentile;
@@ -695,6 +696,7 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
     pub path: String,
+    #[cfg(not(target_family = "wasm"))]
     file_id: Option<io::FileId>,
     wal_path: String,
     pub io: Arc<dyn IO>,
@@ -794,6 +796,7 @@ impl Database {
         is_memory_like(&self.path)
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn file_id(&self) -> Option<io::FileId> {
         self.file_id
     }
@@ -812,6 +815,7 @@ impl Database {
     ) -> Result<Self> {
         let path = path.into();
         let wal_path = wal_path.into();
+        #[cfg(not(target_family = "wasm"))]
         let file_id = if is_memory_like(&path) {
             None
         } else {
@@ -850,6 +854,7 @@ impl Database {
             mv_store,
             mv_store_allocator,
             path,
+            #[cfg(not(target_family = "wasm"))]
             file_id,
             wal_path,
             schema: Arc::new(Mutex::new(Arc::new({
@@ -2357,8 +2362,11 @@ impl Database {
             n_active_root_statements: AtomicI32::new(0),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
+            #[cfg(not(target_family = "wasm"))]
             partition_manager: RwLock::new(partition::PartitionManager::new()),
+            #[cfg(not(target_family = "wasm"))]
             partition_index_requirements: RwLock::new(HashMap::default()),
+            #[cfg(not(target_family = "wasm"))]
             partition_write_target: RwLock::new(None),
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),

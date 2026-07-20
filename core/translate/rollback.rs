@@ -9,6 +9,7 @@ use turso_parser::ast::Name;
 
 /// Emits bytecode for `SAVEPOINT <name>`.
 pub fn translate_savepoint(program: &mut ProgramBuilder, name: Name) -> Result<()> {
+    #[cfg(not(target_family = "wasm"))]
     program.require_full_partition_refresh();
     program.emit_insn(Insn::Savepoint {
         op: SavepointOp::Begin,

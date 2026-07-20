@@ -2,6 +2,8 @@ use crate::alloc::TryClone;
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
+#[cfg(not(target_family = "wasm"))]
+use crate::partition::PartitionManager;
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
@@ -19,7 +21,6 @@ use crate::Page;
 use crate::{
     ast, function,
     io::{MemoryIO, IO},
-    partition::PartitionManager,
     progress::{ProgressHandler, ProgressHandlerCallback},
     translate,
     translate::collate::CollationSeq,
@@ -147,6 +148,7 @@ pub(crate) struct NamedSavepointFrame {
     /// to restore staged DDL on attached databases.
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
     /// Partition write target selected before this savepoint began.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) partition_write_target: Option<crate::partition::PartitionWriteTarget>,
 }
 
@@ -156,6 +158,7 @@ pub(crate) struct RollbackFrameInfo {
     pub(crate) main_schema_snapshot: Arc<Schema>,
     pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) partition_write_target: Option<crate::partition::PartitionWriteTarget>,
 }
 
@@ -484,11 +487,14 @@ pub struct Connection {
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
     /// Partition manager for handling time-partitioned tables.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) partition_manager: RwLock<PartitionManager>,
     /// Explicit physical indexes required by each partition configuration.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) partition_index_requirements:
         RwLock<HashMap<String, Vec<Arc<crate::schema::Index>>>>,
     /// Physical partition selected by the first write in an explicit transaction.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) partition_write_target: RwLock<Option<crate::partition::PartitionWriteTarget>>,
     /// Connection-level named savepoint stack used to mirror savepoint state
     /// onto temp/attached databases that start participating after SAVEPOINT.
@@ -512,6 +518,7 @@ pub struct Connection {
 // See: https://github.com/tursodatabase/turso/issues/1552
 crate::assert::assert_send_sync!(Connection);
 
+#[cfg(not(target_family = "wasm"))]
 fn partition_table_schemas_match(
     logical: &crate::schema::BTreeTable,
     physical: &crate::schema::BTreeTable,
@@ -585,6 +592,7 @@ fn partition_table_schemas_match(
     compatible_table && compatible_columns && compatible_checks && compatible_foreign_keys
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn partition_index_schemas_match(
     expected: &crate::schema::Index,
     actual: &crate::schema::Index,
@@ -1992,20 +2000,18 @@ impl Connection {
         self.fk_deferred_violations.fetch_add(v, Ordering::AcqRel);
     }
 
-    /// Register a table for time-based partitioning.
     #[cfg(target_family = "wasm")]
-    pub fn register_partitioned_table(
+    pub(crate) fn managed_partition_database(
         &self,
-        _table_name: &str,
-        _config: crate::partition::PartitionConfig,
-    ) -> Result<()> {
-        Err(LimboError::InvalidArgument(
-            "time partitioning is not supported on WebAssembly".to_string(),
-        ))
+        _database_id: usize,
+    ) -> Option<(String, String)> {
+        None
     }
+}
 
+#[cfg(not(target_family = "wasm"))]
+impl Connection {
     /// Register a table for time-based partitioning.
-    #[cfg(not(target_family = "wasm"))]
     pub fn register_partitioned_table(
         &self,
         table_name: &str,
@@ -2846,7 +2852,9 @@ impl Connection {
             .map(|p| p.to_info())
             .collect()
     }
+}
 
+impl Connection {
     /// Query the CREATE TYPE SQL definitions stored in __turso_internal_types.
     /// The connection's schema must already contain the table definitions so
     /// that `prepare` can resolve the table name. Returns an empty Vec if the
@@ -5796,6 +5804,7 @@ impl Connection {
             main_schema_snapshot: frame.main_schema_snapshot.clone(),
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
             staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
+            #[cfg(not(target_family = "wasm"))]
             partition_write_target: frame.partition_write_target.clone(),
         };
         // ROLLBACK TO keeps the target savepoint itself on the stack;
@@ -5832,6 +5841,7 @@ impl Connection {
         }
         self.rollback_attached_wal_txns();
         self.set_tx_state(TransactionState::None);
+        #[cfg(not(target_family = "wasm"))]
         self.clear_partition_write_target();
         self.clear_tx_poison();
     }
@@ -5868,6 +5878,7 @@ impl Connection {
         self.set_cdc_transaction_id(-1);
         self.clear_named_savepoints();
         self.clear_deferred_foreign_key_violations();
+        #[cfg(not(target_family = "wasm"))]
         self.clear_partition_write_target();
     }
 

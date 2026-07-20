@@ -41,7 +41,7 @@
 //!
 //! # Limitations
 //!
-//! - Time partitioning is available only in native builds, not WebAssembly
+//! - Time partitioning is compiled only into native builds, not WebAssembly
 //! - Cross-partition writes in a single transaction are not supported
 //! - Global unique indexes across partitions are not supported
 //! - TTL/rotation must be handled externally
@@ -63,7 +63,6 @@ pub use manager::{PartitionConfig, PartitionManager};
 pub use path_resolver::{DefaultPathResolver, PartitionPathResolver, VideoAnalyticsPathResolver};
 
 /// Source of a partition key in a prepared INSERT statement.
-#[cfg_attr(target_family = "wasm", allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(crate) enum PartitionInsertValue {
     Literal(i64),
@@ -71,7 +70,6 @@ pub(crate) enum PartitionInsertValue {
 }
 
 /// Routing contract captured while compiling a partitioned INSERT.
-#[cfg_attr(target_family = "wasm", allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(crate) struct PartitionedInsert {
     pub table_name: String,

@@ -4292,6 +4292,7 @@ pub fn op_auto_commit(
         ) {
             conn.clear_tx_poison();
             conn.clear_named_savepoints();
+            #[cfg(not(target_family = "wasm"))]
             conn.clear_partition_write_target();
         }
         return res;
@@ -4354,6 +4355,7 @@ pub fn op_auto_commit(
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_cdc_transaction_id(-1);
+                #[cfg(not(target_family = "wasm"))]
                 conn.clear_partition_write_target();
             }
             TxOp::Commit => {
@@ -4377,6 +4379,7 @@ pub fn op_auto_commit(
                     !conn.tx_is_poisoned(),
                     "rollback-only marker leaked outside an explicit transaction"
                 );
+                #[cfg(not(target_family = "wasm"))]
                 conn.clear_partition_write_target();
                 conn.auto_commit.store(false, Ordering::SeqCst);
                 return Ok(InsnFunctionStepResult::Done);
@@ -4442,6 +4445,7 @@ pub fn op_auto_commit(
     conn.set_cdc_transaction_id(-1);
     conn.clear_tx_poison();
     conn.clear_named_savepoints();
+    #[cfg(not(target_family = "wasm"))]
     conn.clear_partition_write_target();
 
     Ok(res)
@@ -4531,6 +4535,7 @@ pub fn op_savepoint(
                         main_schema_snapshot,
                         temp_schema_snapshot,
                         staged_schema_snapshot,
+                        #[cfg(not(target_family = "wasm"))]
                         partition_write_target: conn.partition_write_target_snapshot(),
                     };
                     // Mirror onto attached/temp pagers. If any pager fails
@@ -4569,6 +4574,7 @@ pub fn op_savepoint(
                             !conn.tx_is_poisoned(),
                             "rollback-only marker leaked outside an explicit transaction"
                         );
+                        #[cfg(not(target_family = "wasm"))]
                         conn.clear_partition_write_target();
                         conn.auto_commit.store(false, Ordering::SeqCst);
                     }
@@ -4664,6 +4670,7 @@ pub fn op_savepoint(
                     }
                 }
                 *conn.database_schemas().write() = info.staged_schema_snapshot;
+                #[cfg(not(target_family = "wasm"))]
                 conn.restore_partition_write_target(info.partition_write_target);
                 conn.bump_prepare_context_generation();
             }

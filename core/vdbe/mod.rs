@@ -1433,13 +1433,13 @@ pub struct PreparedProgram {
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) partitioned_insert: Option<crate::partition::PartitionedInsert>,
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) partitioned_tables: Vec<String>,
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) partition_pruning_bindings: Vec<(std::num::NonZeroUsize, Option<i64>)>,
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) refresh_all_partitions: bool,
     pub change_cnt_on: bool,
     /// Flag that detect if the sqlite statement will directly manipulate the database file.\

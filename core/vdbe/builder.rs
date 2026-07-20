@@ -209,10 +209,15 @@ pub struct ProgramBuilder {
     // map of instruction index to manual comment (used in EXPLAIN only)
     comments: Vec<(InsnReference, &'static str)>,
     pub parameters: Parameters,
+    #[cfg(not(target_family = "wasm"))]
     partition_bindings: Option<Vec<crate::Value>>,
+    #[cfg(not(target_family = "wasm"))]
     partitioned_insert: Option<crate::partition::PartitionedInsert>,
+    #[cfg(not(target_family = "wasm"))]
     partitioned_tables: Vec<String>,
+    #[cfg(not(target_family = "wasm"))]
     partition_pruning_bindings: Vec<(NonZeroUsize, Option<i64>)>,
+    #[cfg(not(target_family = "wasm"))]
     refresh_all_partitions: bool,
     pub result_columns: Vec<ResultSetColumn>,
     /// Instruction, the function to execute it with, and its original index in the vector.
@@ -592,16 +597,19 @@ macro_rules! emit_explain {
 }
 
 impl ProgramBuilder {
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn set_partition_bindings(&mut self, bindings: Option<&[crate::Value]>) {
         self.partition_bindings = bindings.map(<[crate::Value]>::to_vec);
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn partition_binding(&self, index: NonZeroUsize) -> Option<&crate::Value> {
         self.partition_bindings
             .as_deref()
             .and_then(|bindings| bindings.get(index.get() - 1))
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn set_partitioned_insert(
         &mut self,
         partitioned_insert: crate::partition::PartitionedInsert,
@@ -610,6 +618,7 @@ impl ProgramBuilder {
         self.partitioned_insert = Some(partitioned_insert);
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn record_partitioned_table(&mut self, table_name: &str) {
         if !self
             .partitioned_tables
@@ -620,10 +629,12 @@ impl ProgramBuilder {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn require_full_partition_refresh(&mut self) {
         self.refresh_all_partitions = true;
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn record_partition_pruning_parameter(&mut self, index: NonZeroUsize) {
         if self
             .partition_pruning_bindings
@@ -713,10 +724,15 @@ impl ProgramBuilder {
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
             comments: Vec::new(),
             parameters: Parameters::new(),
+            #[cfg(not(target_family = "wasm"))]
             partition_bindings: None,
+            #[cfg(not(target_family = "wasm"))]
             partitioned_insert: None,
+            #[cfg(not(target_family = "wasm"))]
             partitioned_tables: Vec::new(),
+            #[cfg(not(target_family = "wasm"))]
             partition_pruning_bindings: Vec::new(),
+            #[cfg(not(target_family = "wasm"))]
             refresh_all_partitions: false,
             result_columns: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
@@ -2045,9 +2061,13 @@ impl ProgramBuilder {
             cursor_ref: self.cursor_ref,
             comments: self.comments,
             parameters: self.parameters,
+            #[cfg(not(target_family = "wasm"))]
             partitioned_insert: self.partitioned_insert,
+            #[cfg(not(target_family = "wasm"))]
             partitioned_tables: self.partitioned_tables,
+            #[cfg(not(target_family = "wasm"))]
             partition_pruning_bindings: self.partition_pruning_bindings,
+            #[cfg(not(target_family = "wasm"))]
             refresh_all_partitions: self.refresh_all_partitions,
             change_cnt_on,
             readonly: self.flags.readonly(),

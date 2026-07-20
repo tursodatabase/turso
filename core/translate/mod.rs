@@ -120,7 +120,10 @@ pub(crate) fn translate_with_bindings(
         // These options will be extended whithin each translate program
         ProgramBuilderOpts::new(1, 32, 2),
     ));
+    #[cfg(not(target_family = "wasm"))]
     program.set_partition_bindings(partition_bindings);
+    #[cfg(target_family = "wasm")]
+    let _ = partition_bindings;
     program.set_mvcc_enabled(connection.mvcc_enabled());
 
     program.prologue();

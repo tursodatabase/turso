@@ -893,10 +893,13 @@ pub fn translate_alter_table(
     let Some(original_btree) = table.btree() else {
         crate::bail_parse_error!("ALTER TABLE is only supported for BTree tables");
     };
-    if original_btree.partition_spec.is_some() {
-        crate::bail_parse_error!(
-            "ALTER TABLE on partitioned table '{table_name}' is not supported"
-        );
+    #[cfg(not(target_family = "wasm"))]
+    {
+        if original_btree.partition_spec.is_some() {
+            crate::bail_parse_error!(
+                "ALTER TABLE on partitioned table '{table_name}' is not supported"
+            );
+        }
     }
 
     // Check if this table has dependent materialized views

@@ -173,11 +173,14 @@ pub fn translate_create_trigger(
     if table.virtual_table().is_some() {
         bail_parse_error!("cannot create triggers on virtual tables");
     }
-    if table
-        .btree()
-        .is_some_and(|table| table.partition_spec.is_some())
+    #[cfg(not(target_family = "wasm"))]
     {
-        bail_parse_error!("cannot create triggers on partitioned tables");
+        if table
+            .btree()
+            .is_some_and(|table| table.partition_spec.is_some())
+        {
+            bail_parse_error!("cannot create triggers on partitioned tables");
+        }
     }
 
     if time

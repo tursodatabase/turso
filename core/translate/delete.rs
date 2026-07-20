@@ -95,14 +95,17 @@ pub fn translate_delete(
         program,
         connection,
     )?;
-    if table
-        .btree()
-        .is_some_and(|table| table.partition_spec.is_some())
+    #[cfg(not(target_family = "wasm"))]
     {
-        crate::bail_parse_error!(
-            "DELETE from partitioned table '{}' is not supported; delete whole partitions through the partition API",
-            normalized_table_name
-        );
+        if table
+            .btree()
+            .is_some_and(|table| table.partition_spec.is_some())
+        {
+            crate::bail_parse_error!(
+                "DELETE from partitioned table '{}' is not supported; delete whole partitions through the partition API",
+                normalized_table_name
+            );
+        }
     }
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);

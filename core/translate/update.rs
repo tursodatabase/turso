@@ -257,14 +257,17 @@ fn prepare_update_plan(
         Some(table) => table,
         None => bail_parse_error!("Parse error: no such table: {}", target_name),
     };
-    if table
-        .btree()
-        .is_some_and(|table| table.partition_spec.is_some())
+    #[cfg(not(target_family = "wasm"))]
     {
-        bail_parse_error!(
-            "UPDATE of partitioned table '{}' is not supported",
-            target_name
-        );
+        if table
+            .btree()
+            .is_some_and(|table| table.partition_spec.is_some())
+        {
+            bail_parse_error!(
+                "UPDATE of partitioned table '{}' is not supported",
+                target_name
+            );
+        }
     }
     if program.trigger.is_some() && table.virtual_table().is_some() {
         bail_parse_error!(

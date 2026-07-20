@@ -151,10 +151,13 @@ pub fn translate_create_index(
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
-    if tbl.partition_spec.is_some() {
-        crate::bail_parse_error!(
-            "CREATE INDEX on partitioned table '{tbl_name}' is not supported; declare per-partition indexes in PartitionConfig::schema_sql"
-        );
+    #[cfg(not(target_family = "wasm"))]
+    {
+        if tbl.partition_spec.is_some() {
+            crate::bail_parse_error!(
+                "CREATE INDEX on partitioned table '{tbl_name}' is not supported; declare per-partition indexes in PartitionConfig::schema_sql"
+            );
+        }
     }
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");

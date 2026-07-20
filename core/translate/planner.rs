@@ -1016,6 +1016,7 @@ fn parse_from_clause_table(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[derive(Default)]
 struct PartitionPredicateInfo {
     start: Option<i64>,
@@ -1024,6 +1025,7 @@ struct PartitionPredicateInfo {
     pushdown_terms: Vec<Expr>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl PartitionPredicateInfo {
     fn constrain_start(&mut self, start: i64) {
         self.start = Some(self.start.map_or(start, |current| current.max(start)));
@@ -1062,6 +1064,7 @@ impl PartitionPredicateInfo {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn partition_column_matches(
     expr: &Expr,
     column_name: &str,
@@ -1092,6 +1095,7 @@ fn partition_column_matches(
 
 /// `Some(None)` means a routing parameter was recognized but is not an integer
 /// in the current compilation. That keeps the predicate safe without pruning.
+#[cfg(not(target_family = "wasm"))]
 fn partition_bound_value(expr: &Expr, program: &mut ProgramBuilder) -> Option<Option<i64>> {
     match expr {
         Expr::Literal(ast::Literal::Numeric(value)) => Some(
@@ -1133,6 +1137,7 @@ fn partition_bound_value(expr: &Expr, program: &mut ProgramBuilder) -> Option<Op
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn reverse_partition_comparison(operator: ast::Operator) -> Option<ast::Operator> {
     match operator {
         ast::Operator::Equals => Some(ast::Operator::Equals),
@@ -1144,6 +1149,7 @@ fn reverse_partition_comparison(operator: ast::Operator) -> Option<ast::Operator
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn collect_partition_predicates(
     expr: &Expr,
     column_name: &str,
@@ -1255,6 +1261,7 @@ fn collect_partition_predicates(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn partition_predicate_info(
     predicate: Option<&Expr>,
     column_name: &str,
@@ -1276,6 +1283,7 @@ fn partition_predicate_info(
     info
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn partition_select_arm(
     table_name: &ast::Name,
     database_alias: &str,
@@ -1305,6 +1313,7 @@ fn partition_select_arm(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn partition_select(
     table_name: &ast::Name,
     partitions: &[crate::partition::PartitionInfo],
@@ -1350,6 +1359,7 @@ fn partition_select(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(target_family = "wasm", allow(unused_variables))]
 fn parse_table(
     table_references: &mut TableReferences,
     resolver: &Resolver,
@@ -1505,71 +1515,74 @@ fn parse_table(
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
             Table::Virtual(tbl.clone())
         } else if let Table::BTree(table) = table.as_ref() {
-            if let Some(partition_spec) = &table.partition_spec {
-                program.record_partitioned_table(&table.name);
-                if !connection.is_table_partitioned(&table.name) {
-                    crate::bail_parse_error!(
+            #[cfg(not(target_family = "wasm"))]
+            {
+                if let Some(partition_spec) = &table.partition_spec {
+                    program.record_partitioned_table(&table.name);
+                    if !connection.is_table_partitioned(&table.name) {
+                        crate::bail_parse_error!(
                         "SELECT from partitioned table '{}' requires partition configuration for column '{}'",
                         table.name,
                         partition_spec.column.as_str()
                     );
-                }
+                    }
 
-                if connection.get_auto_commit() {
-                    connection.refresh_partitioned_table(&table.name)?;
-                }
-                let logical_identifier = alias
-                    .clone()
-                    .unwrap_or_else(|| normalized_qualified_name.clone());
-                let PartitionPredicateInfo {
-                    start,
-                    end,
-                    has_range,
-                    pushdown_terms,
-                } = partition_predicate_info(
-                    partition_predicate,
-                    partition_spec.column.as_str(),
-                    &logical_identifier,
-                    allow_unqualified_partition_predicate,
-                    program,
-                );
-                let attached_partitions = if has_range {
-                    connection.filter_partitions_by_range(&table.name, start, end)
-                } else {
-                    connection.get_attached_partitions(&table.name)
-                };
-                if !attached_partitions.is_empty() {
-                    let pushdown = pushdown_terms.into_iter().reduce(|left, right| {
-                        Expr::Binary(Box::new(left), ast::Operator::And, Box::new(right))
-                    });
-                    let subquery = partition_select(
-                        table_name,
-                        &attached_partitions,
+                    if connection.get_auto_commit() {
+                        connection.refresh_partitioned_table(&table.name)?;
+                    }
+                    let logical_identifier = alias
+                        .clone()
+                        .unwrap_or_else(|| normalized_qualified_name.clone());
+                    let PartitionPredicateInfo {
+                        start,
+                        end,
+                        has_range,
+                        pushdown_terms,
+                    } = partition_predicate_info(
+                        partition_predicate,
+                        partition_spec.column.as_str(),
                         &logical_identifier,
-                        pushdown.as_ref(),
-                        indexed.as_ref(),
-                    )?;
-                    let subquery_alias = maybe_alias
-                        .cloned()
-                        .or_else(|| Some(ast::As::As(table_name.clone())));
-                    return parse_from_clause_table(
-                        ast::SelectTable::Select(subquery, subquery_alias),
-                        resolver,
+                        allow_unqualified_partition_predicate,
                         program,
-                        table_references,
-                        vtab_predicates,
-                        cte_definitions,
-                        connection,
-                        None,
-                        false,
                     );
-                }
+                    let attached_partitions = if has_range {
+                        connection.filter_partitions_by_range(&table.name, start, end)
+                    } else {
+                        connection.get_attached_partitions(&table.name)
+                    };
+                    if !attached_partitions.is_empty() {
+                        let pushdown = pushdown_terms.into_iter().reduce(|left, right| {
+                            Expr::Binary(Box::new(left), ast::Operator::And, Box::new(right))
+                        });
+                        let subquery = partition_select(
+                            table_name,
+                            &attached_partitions,
+                            &logical_identifier,
+                            pushdown.as_ref(),
+                            indexed.as_ref(),
+                        )?;
+                        let subquery_alias = maybe_alias
+                            .cloned()
+                            .or_else(|| Some(ast::As::As(table_name.clone())));
+                        return parse_from_clause_table(
+                            ast::SelectTable::Select(subquery, subquery_alias),
+                            resolver,
+                            program,
+                            table_references,
+                            vtab_predicates,
+                            cte_definitions,
+                            connection,
+                            None,
+                            false,
+                        );
+                    }
 
-                if database_id != crate::MAIN_DB_ID {
-                    crate::bail_parse_error!(
-                        "partitioned table '{}' must be resolved from the main database",
-                        table.name
-                    );
+                    if database_id != crate::MAIN_DB_ID {
+                        crate::bail_parse_error!(
+                            "partitioned table '{}' must be resolved from the main database",
+                            table.name
+                        );
+                    }
                 }
             }
             Table::BTree(table.clone())
