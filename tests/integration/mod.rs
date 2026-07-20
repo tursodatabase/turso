@@ -1,4 +1,5 @@
 mod abandoned_create_index;
+mod abandoned_statement_pager;
 mod assert_details;
 mod attach;
 mod common;

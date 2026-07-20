@@ -551,8 +551,8 @@ impl AggregateEvalState {
                         // Create index key values
                         let index_key_values = vec![
                             Value::from_i64(operator_storage_id),
-                            zset_hash.to_value(),
-                            element_id.to_value(),
+                            zset_hash.to_value()?,
+                            element_id.to_value()?,
                         ];
 
                         // Create an immutable record for the index key
@@ -563,7 +563,7 @@ impl AggregateEvalState {
 
                         // Seek in the index to find if this row exists
                         let seek_result = return_if_io!(cursors.index_cursor.seek(
-                            SeekKey::IndexKey(&index_record),
+                            SeekKey::IndexKey(index_record.as_record_ref()),
                             SeekOp::GE { eq_only: true }
                         ));
 
@@ -1001,7 +1001,11 @@ impl AggregateState {
         Ok(state)
     }
 
-    fn to_blob(&self, aggregates: &[AggregateFunction], group_key: &[Value]) -> Result<Vec<u8>> {
+    fn to_blob(
+        &self,
+        aggregates: &[AggregateFunction],
+        group_key: &[Value],
+    ) -> Result<crate::ValueBlob> {
         let mut all_values = Vec::new();
         // Store the group key size first
         all_values.push(Value::from_i64(group_key.len() as i64));
@@ -1009,7 +1013,7 @@ impl AggregateState {
         all_values.extend(self.to_value_vector(aggregates));
 
         let record = ImmutableRecord::from_values(&all_values, all_values.len())?;
-        Ok(record.as_blob().clone())
+        Ok(record.into_payload())
     }
 
     pub fn from_blob(blob: &[u8]) -> Result<(Self, Vec<Value>)> {
@@ -1906,8 +1910,8 @@ impl IncrementalOperator for AggregateOperator {
 
                         // Build the aggregate storage format: [operator_id, zset_hash, element_id, value, weight]
                         let operator_id_val = Value::from_i64(operator_storage_id);
-                        let zset_hash_val = zset_hash.to_value();
-                        let element_id_val = element_id.to_value();
+                        let zset_hash_val = zset_hash.to_value()?;
+                        let element_id_val = element_id.to_value()?;
                         let blob_val = blob_value.clone();
 
                         // Create index key - the first 3 columns of our primary key
@@ -2298,7 +2302,7 @@ impl ScanState {
     ) -> Result<IOResult<Option<Value>>> {
         let seek_result = return_if_io!(cursors
             .index_cursor
-            .seek(SeekKey::IndexKey(index_record), seek_op));
+            .seek(SeekKey::IndexKey(index_record.as_record_ref()), seek_op));
         if !matches!(seek_result, SeekResult::Found) {
             return Ok(IOResult::Done(None));
         }
@@ -2347,7 +2351,7 @@ impl ScanState {
         };
 
         // Get the value (3rd element)
-        Ok(IOResult::Done(Some(third?.to_owned())))
+        Ok(IOResult::Done(Some(third?.to_owned()?)))
     }
 
     pub fn new_for_max(
@@ -2469,7 +2473,7 @@ impl ScanState {
                     // Seek to the next value in the index
                     let index_key = vec![
                         Value::from_i64(*storage_id),
-                        zset_hash.to_value(),
+                        zset_hash.to_value()?,
                         current_candidate.clone(),
                     ];
                     let index_record = ImmutableRecord::from_values(&index_key, index_key.len())?;
@@ -2723,13 +2727,13 @@ impl FetchDistinctState {
                     // First, seek in the index cursor
                     let index_key = vec![
                         Value::from_i64(storage_id),
-                        zset_hash.to_value(),
-                        element_id.to_value(),
+                        zset_hash.to_value()?,
+                        element_id.to_value()?,
                     ];
                     let index_record = ImmutableRecord::from_values(&index_key, index_key.len())?;
 
                     let seek_result = return_if_io!(cursors.index_cursor.seek(
-                        SeekKey::IndexKey(&index_record),
+                        SeekKey::IndexKey(index_record.as_record_ref()),
                         SeekOp::GE { eq_only: true }
                     ));
 
@@ -2791,7 +2795,7 @@ impl FetchDistinctState {
                         // The weight is at index 4
                         if let Some(weight) = r.get_value_opt(4) {
                             // Get the weight directly from column 5(index 4)
-                            let weight = match weight.to_owned() {
+                            let weight = match weight.to_owned()? {
                                 Value::Numeric(Numeric::Integer(w)) => w,
                                 _ => 0,
                             };
@@ -2979,8 +2983,8 @@ impl DistinctPersistState {
                     // Create index key
                     let index_key = vec![
                         Value::from_i64(storage_id),
-                        zset_hash.to_value(),
-                        element_id.to_value(),
+                        zset_hash.to_value()?,
+                        element_id.to_value()?,
                     ];
 
                     // Record values (operator_id, zset_hash, element_id, weight_blob)
@@ -2993,8 +2997,8 @@ impl DistinctPersistState {
 
                     let record_values = vec![
                         Value::from_i64(storage_id),
-                        zset_hash.to_value(),
-                        element_id.to_value(),
+                        zset_hash.to_value()?,
+                        element_id.to_value()?,
                         Value::Blob(weight_blob),
                     ];
 
@@ -3129,7 +3133,7 @@ impl MinMaxPersistState {
                     // Create index key
                     let index_key = vec![
                         Value::from_i64(storage_id),
-                        zset_hash.to_value(),
+                        zset_hash.to_value()?,
                         element_id_val.clone(),
                     ];
 
@@ -3137,7 +3141,7 @@ impl MinMaxPersistState {
                     // For MIN/MAX, the element_id IS the value, so we use NULL for the 4th column
                     let record_values = vec![
                         Value::from_i64(storage_id),
-                        zset_hash.to_value(),
+                        zset_hash.to_value()?,
                         element_id_val.clone(),
                         Value::Null, // Placeholder - not used for MIN/MAX
                     ];

@@ -127,7 +127,12 @@ jobs:
     timeout-minutes: 15
     steps:
     - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@nightly
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        # Pinned so upstream nightly regressions can't break this job
+        # independently of our changes; bump deliberately when needed.
+        # Keep in sync with nightly-cfg.yml.
+        toolchain: nightly-2025-12-17
     - name: Setup mold linker
       uses: rui314/setup-mold@v1
     - uses: Swatinem/rust-cache@v2
@@ -137,4 +142,4 @@ jobs:
     - name: Install cargo-fuzz
       run: cargo install cargo-fuzz@0.13.0
     - name: Run scalar_func fuzzer
-      run: cargo +nightly fuzz run scalar_func -- -max_total_time=300
+      run: cargo +nightly-2025-12-17 fuzz run scalar_func -- -max_total_time=300

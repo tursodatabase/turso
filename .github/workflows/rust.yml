@@ -15,6 +15,11 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
+  # Capture stack traces when a test panics so CI failure reports are actionable.
+  RUST_BACKTRACE: 1
+  # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
+  # crate's clang-cl preference fails; force the MSVC compiler instead.
+  CC_x86_64_pc_windows_msvc: cl.exe
 
 jobs:
   license-check:
@@ -56,14 +61,14 @@ jobs:
           fi
 
   build-native:
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 120 || 30 }}
+    timeout-minutes: ${{ matrix.os == 'blacksmith-8vcpu-windows-2025' && 120 || 30 }}
     strategy:
       matrix:
         os:
           [
             blacksmith-4vcpu-ubuntu-2404,
             blacksmith-6vcpu-macos-latest,
-            windows-latest,
+            blacksmith-8vcpu-windows-2025,
           ]
 
     runs-on: ${{ matrix.os }}
@@ -85,6 +90,13 @@ jobs:
       - name: Install cargo-llvm-cov
         if: runner.os == 'Linux'
         uses: taiki-e/install-action@cargo-llvm-cov
+      # Blacksmith Windows images ship no LLVM; the all-features build pulls in
+      # pg_query, whose bindgen needs libclang.dll.
+      - name: Install LLVM (libclang for bindgen)
+        if: runner.os == 'Windows'
+        run: |
+          choco install llvm -y --no-progress
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
       - name: Set up Python 3.10
         uses: useblacksmith/setup-python@v6
         with:
@@ -110,9 +122,6 @@ jobs:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests)' --failure-output=final
         timeout-minutes: 30
-      - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
-        run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check) | test(short_read)' --failure-output=final
-        timeout-minutes: 5
       - name: Test doctests
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
@@ -125,7 +134,32 @@ jobs:
           path: coverage/
           retention-days: 14
 
+  # Runs without --all-features because the corruption and short-read tests
+  # are compile-gated on the "checksum" feature being disabled: with page
+  # checksums active, byte-level corruption is caught at the pager layer
+  # before integrity_check's structural validation ever runs. The tests
+  # exercise platform-independent core logic, so one Linux runner suffices.
+  integrity-corruption-tests:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
+        run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check) | test(short_read)' --failure-output=final
+        timeout-minutes: 5
+
   build-windows-arm64-cli:
+    # Stays on GitHub-hosted: Blacksmith Windows images lack the MSVC ARM64
+    # cross tools (Microsoft.VisualStudio.Component.VC.Tools.ARM64).
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
@@ -410,14 +444,27 @@ jobs:
       - name: Run turso_whopper (${{ matrix.toolchain.label }}, ${{ matrix.profile.name }})
         env:
           RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
+          WHOPPER_ARGS: ${{ matrix.profile.args }}
         run: |
           cargo +${{ matrix.toolchain.version }} build -p turso_whopper --release
-          for i in $(seq 1 ${{ matrix.profile.iterations }}); do
-            ./target/release/turso_whopper ${{ matrix.profile.args }} || exit 1
-          done
+          # A single whopper run drives its connections serially (one blocking
+          # step at a time), so it only keeps about one core busy. Run
+          # iterations concurrently to use the whole runner; per-iteration log
+          # files keep output readable and preserve the failing seed.
+          seq 1 ${{ matrix.profile.iterations }} | xargs -P 4 -n 1 bash -c '
+            i="$1"
+            log="whopper-run-$i.log"
+            if ./target/release/turso_whopper $WHOPPER_ARGS >"$log" 2>&1; then
+              echo "iteration $i ok: $(grep -m1 "^seed = " "$log")"
+            else
+              echo "iteration $i FAILED ($(grep -m1 "^seed = " "$log")):"
+              cat "$log"
+              exit 255
+            fi
+          ' _
 
   concurrent-simulator-windows:
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

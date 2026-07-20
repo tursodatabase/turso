@@ -1,5 +1,6 @@
 use crate::alloc::{
-    DynAllocator, TursoIteratorExt, TursoSliceExt, TursoTryWithCapacityExt, TursoVecExt,
+    DynAllocator, TursoAllocExt, TursoIteratorExt, TursoSliceExt, TursoTryWithCapacityExt,
+    TursoVecExt,
 };
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
@@ -150,7 +151,7 @@ use crate::{
     json::json_from_raw_bytes_agg, json::json_insert, json::json_object, json::json_patch,
     json::json_quote, json::json_remove, json::json_replace, json::json_set, json::json_type,
     json::jsonb, json::jsonb_array, json::jsonb_extract, json::jsonb_insert, json::jsonb_object,
-    json::jsonb_patch, json::jsonb_remove, json::jsonb_replace, json::jsonb_set,
+    json::jsonb_patch, json::jsonb_remove, json::jsonb_replace, json::jsonb_set, json::Conv,
 };
 
 use super::{make_record, Program, ProgramState, Register};
@@ -235,8 +236,8 @@ fn make_sort_comparator(
                     (_, ValueRef::Null) => Ordering::Greater,
                     _ => {
                         // Decode from ValueRef to Value for value_to_bigdecimal
-                        let a_val = a.to_owned();
-                        let b_val = b.to_owned();
+                        let a_val = a.to_owned()?;
+                        let b_val = b.to_owned()?;
                         match (value_to_bigdecimal(&a_val), value_to_bigdecimal(&b_val)) {
                             (Ok(a_dec), Ok(b_dec)) => a_dec.cmp(&b_dec),
                             _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
@@ -616,12 +617,9 @@ pub fn op_checkpoint(
     // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "mvcc"`).
     let mv_store = program.connection.mv_store_for_db(*database);
     if let Some(mv_store) = mv_store.as_ref() {
-        if !matches!(checkpoint_mode, CheckpointMode::Truncate { .. }) {
-            return Err(LimboError::InvalidArgument(
-                "Only TRUNCATE checkpoint mode is supported for MVCC".to_string(),
-            ));
-        }
         use crate::state_machine::{StateTransition, TransitionResult};
+        // MVCC honors the requested checkpoint mode: Truncate/Restart reset the WAL
+        // file, Passive/Full backfill and leave it (relying on restart-on-write).
         let mut ckpt_sm = CheckpointStateMachine::new(
             pager.clone(),
             mv_store.clone(),
@@ -629,6 +627,7 @@ pub fn op_checkpoint(
             true,
             program.connection.get_sync_mode(),
             *database,
+            *checkpoint_mode,
         );
         let CheckpointResult {
             wal_max_frame,
@@ -1065,15 +1064,15 @@ pub fn op_comparison(
 
     match (new_lhs, new_rhs) {
         (Some(new_lhs), None) => {
-            state.registers[lhs].set_value(new_lhs.as_value_ref().to_owned());
+            state.registers[lhs].set_value(new_lhs.as_value_ref().to_owned()?);
         }
         (None, Some(new_rhs)) => {
-            state.registers[rhs].set_value(new_rhs.as_value_ref().to_owned());
+            state.registers[rhs].set_value(new_rhs.as_value_ref().to_owned()?);
         }
         (Some(new_lhs), Some(new_rhs)) => {
             let (new_lhs, new_rhs) = (
-                new_lhs.as_value_ref().to_owned(),
-                new_rhs.as_value_ref().to_owned(),
+                new_lhs.as_value_ref().to_owned()?,
+                new_rhs.as_value_ref().to_owned()?,
             );
             state.registers[lhs].set_value(new_lhs);
             state.registers[rhs].set_value(new_rhs);
@@ -1775,6 +1774,17 @@ pub fn op_column(
         },
         insn
     );
+    // Fast path: no deferred seek pending and no suspended state machine. The
+    // column fetch either completes or yields IO with nothing persisted, so the
+    // op-state slot (enum write + drop on clear) is bypassed entirely. On IO
+    // resume the slot is still idle and this path re-executes.
+    if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
+        let result = op_column_fetch(program, state, *cursor_id, *column, *dest, default)?;
+        if matches!(result, InsnFunctionStepResult::Step) {
+            state.pc += 1;
+        }
+        return Ok(result);
+    }
     'outer: loop {
         match *state.active_op_state.column() {
             OpColumnState::Start => {
@@ -1834,140 +1844,162 @@ pub fn op_column(
                 *state.active_op_state.column() = OpColumnState::GetColumn;
             }
             OpColumnState::GetColumn => {
-                let (active_cursor_id, active_column) = (*cursor_id, *column);
-                // First check if this is a MaterializedViewCursor
-                {
-                    let cursor = state.get_cursor(active_cursor_id);
-                    if let Cursor::MaterializedView(mv_cursor) = cursor {
-                        // Handle materialized view column access
-                        let value = return_if_io!(mv_cursor.column(active_column));
-                        state.registers[*dest].set_value(value);
-                        break 'outer;
-                    }
-                    // Fall back to normal handling
+                let result = op_column_fetch(program, state, *cursor_id, *column, *dest, default)?;
+                if !matches!(result, InsnFunctionStepResult::Step) {
+                    // IO yield: the slot stays at GetColumn so the resume
+                    // re-enters this arm.
+                    return Ok(result);
                 }
-
-                let (_, cursor_type) = program
-                    .cursor_ref
-                    .get(active_cursor_id)
-                    .expect("cursor_id should exist in cursor_ref");
-                match cursor_type {
-                    CursorType::BTreeTable(_)
-                    | CursorType::BTreeIndex(_)
-                    | CursorType::MaterializedView(_, _) => {
-                        {
-                            let cursor_ref = must_be_btree_cursor!(
-                                active_cursor_id,
-                                program.cursor_ref,
-                                state,
-                                "Column"
-                            );
-                            let cursor = cursor_ref.as_btree_mut();
-
-                            if cursor.get_null_flag() {
-                                tracing::trace!("op_column(null_flag)");
-                                state.registers[*dest].set_null();
-                                break 'outer;
-                            }
-
-                            let record_result = return_if_io!(cursor.record());
-                            let Some(record) = record_result else {
-                                // Cursor is not positioned on a valid row (e.g., empty table).
-                                // Return NULL, not the column's default value.
-                                // DEFAULT handling below is for when record exists
-                                // but has fewer columns than expected.
-                                state.registers[*dest].set_null();
-                                break 'outer;
-                            };
-
-                            let mut payload_iterator = record.iter()?;
-
-                            // Parse the header for serial types incrementally until we have the target column
-                            // Use nth_into_register to write directly to the register without
-                            // creating intermediate ValueRef allocations
-
-                            match payload_iterator
-                                .nth_into_register(*column, &mut state.registers[*dest])
-                            {
-                                Some(result) => {
-                                    result?;
-                                    break 'outer;
-                                }
-                                None => {
-                                    branches::mark_unlikely();
-                                    // record has fewer columns than expected
-                                }
-                            };
-
-                            //break;
-                        };
-
-                        // DEFAULT handling
-                        let Some(ref default) = default else {
-                            state.registers[*dest].set_null();
-                            break;
-                        };
-                        match (default, &mut state.registers[*dest]) {
-                            (
-                                Value::Text(new_text),
-                                Register::Value(Value::Text(existing_text)),
-                            ) => {
-                                existing_text.do_extend(new_text)?;
-                            }
-                            (
-                                Value::Blob(new_blob),
-                                Register::Value(Value::Blob(existing_blob)),
-                            ) => {
-                                existing_blob.do_extend(new_blob)?;
-                            }
-                            _ => {
-                                state.registers[*dest].set_value(default.clone());
-                            }
-                        }
-                        break;
-                    }
-                    CursorType::Sorter => {
-                        let record = {
-                            let cursor = state.get_cursor(*cursor_id);
-                            let cursor = cursor.as_sorter_mut();
-                            cursor.record().cloned()
-                        };
-                        if let Some(record) = record {
-                            state.registers[*dest].set_value(match record.get_value_opt(*column) {
-                                Some(val) => val.to_owned(),
-                                None => default.clone().unwrap_or(Value::Null),
-                            });
-                        } else {
-                            state.registers[*dest].set_null();
-                        }
-                    }
-                    CursorType::Pseudo(_) => {
-                        let value = {
-                            let cursor = state.get_cursor(*cursor_id);
-                            let cursor = cursor.as_pseudo_mut();
-                            cursor.get_value(*column)?
-                        };
-                        state.registers[*dest].set_value(value);
-                    }
-                    CursorType::IndexMethod(..) => {
-                        let cursor = state.cursors[*cursor_id]
-                            .as_mut()
-                            .expect("cursor should exist");
-                        let cursor = cursor.as_index_method_mut();
-                        let value = return_if_io!(cursor.query_column(*column));
-                        state.registers[*dest].set_value(value);
-                    }
-                    CursorType::VirtualTable(_) => {
-                        panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
-                    }
-                }
-                break;
+                break 'outer;
             }
         }
     }
 
     state.active_op_state.clear();
     state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Fetches one column of the cursor's current row into a register. Returns
+/// `Step` on completion; any IO is propagated without persisting state, so
+/// callers can safely re-invoke after the completion finishes.
+fn op_column_fetch(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: usize,
+    column: usize,
+    dest: usize,
+    default: &Option<Value>,
+) -> Result<InsnFunctionStepResult> {
+    // First check if this is a MaterializedViewCursor
+    {
+        let cursor = state.get_cursor(cursor_id);
+        if let Cursor::MaterializedView(mv_cursor) = cursor {
+            // Handle materialized view column access
+            let value = return_if_io!(mv_cursor.column(column));
+            state.registers[dest].set_value(value);
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        // Fall back to normal handling
+    }
+
+    let (_, cursor_type) = program
+        .cursor_ref
+        .get(cursor_id)
+        .expect("cursor_id should exist in cursor_ref");
+    match cursor_type {
+        CursorType::BTreeTable(_)
+        | CursorType::BTreeIndex(_)
+        | CursorType::MaterializedView(_, _) => {
+            {
+                let cursor_ref =
+                    must_be_btree_cursor!(cursor_id, program.cursor_ref, state, "Column");
+                let cursor = cursor_ref.as_btree_mut();
+
+                if cursor.get_null_flag() {
+                    tracing::trace!("op_column(null_flag)");
+                    state.registers[dest].set_null();
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+
+                let record_result = return_if_io!(cursor.record());
+                let Some(record) = record_result else {
+                    // Cursor is not positioned on a valid row (e.g., empty table).
+                    // Return NULL, not the column's default value.
+                    // DEFAULT handling below is for when record exists
+                    // but has fewer columns than expected.
+                    state.registers[dest].set_null();
+                    return Ok(InsnFunctionStepResult::Step);
+                };
+
+                let mut payload_iterator = record.iter()?;
+
+                // Parse the header for serial types incrementally until we have the target column
+                // Use nth_into_register to write directly to the register without
+                // creating intermediate ValueRef allocations
+
+                match payload_iterator.nth_into_register(column, &mut state.registers[dest]) {
+                    Some(result) => {
+                        result?;
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                    None => {
+                        branches::mark_unlikely();
+                        // record has fewer columns than expected
+                    }
+                };
+            };
+
+            // DEFAULT handling
+            let Some(ref default) = default else {
+                state.registers[dest].set_null();
+                return Ok(InsnFunctionStepResult::Step);
+            };
+            match (default, &mut state.registers[dest]) {
+                (Value::Text(new_text), Register::Value(Value::Text(existing_text))) => {
+                    existing_text.do_extend(new_text)?;
+                }
+                (Value::Blob(new_blob), Register::Value(Value::Blob(existing_blob))) => {
+                    existing_blob.do_extend(new_blob)?;
+                }
+                _ => {
+                    state.registers[dest].set_value(default.clone());
+                }
+            }
+        }
+        CursorType::Sorter => {
+            let record = {
+                let cursor = state.get_cursor(cursor_id);
+                let cursor = cursor.as_sorter_mut();
+                cursor.record().cloned()
+            };
+            if let Some(record) = record {
+                state.registers[dest].set_value(match record.get_value_opt(column) {
+                    Some(val) => val.to_owned()?,
+                    None => default.clone().unwrap_or(Value::Null),
+                });
+            } else {
+                state.registers[dest].set_null();
+            }
+        }
+        CursorType::Pseudo(_) => {
+            let cursor = crate::get_cursor!(state, cursor_id);
+            let cursor = cursor.as_pseudo_mut();
+            match cursor.record() {
+                Some(record) => {
+                    // Decode straight into the register; going through an owned
+                    // Value would allocate for every TEXT/BLOB column on every row.
+                    let mut payload_iterator = record.iter()?;
+                    match payload_iterator.nth_into_register(column, &mut state.registers[dest]) {
+                        Some(result) => result?,
+                        // A pseudo cursor is opened with num_fields matching the
+                        // record built for it, so every emitted Column index is in
+                        // range. NULL on a missing column matches the b-tree arm.
+                        None => {
+                            turso_debug_assert!(
+                                false,
+                                "pseudo-cursor column out of range for record",
+                                { "column": column }
+                            );
+                            state.registers[dest].set_null();
+                        }
+                    }
+                }
+                None => state.registers[dest].set_null(),
+            }
+        }
+        CursorType::IndexMethod(..) => {
+            let cursor = state.cursors[cursor_id]
+                .as_mut()
+                .expect("cursor should exist");
+            let cursor = cursor.as_index_method_mut();
+            let value = return_if_io!(cursor.query_column(column));
+            state.registers[dest].set_value(value);
+        }
+        CursorType::VirtualTable(_) => {
+            panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
+        }
+    }
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -2293,11 +2325,12 @@ pub fn op_array_element(
                         if t.value.as_bytes().iter().any(|&b| b > 0x7F)
                             && std::str::from_utf8(t.value.as_bytes()).is_err()
                         {
-                            return Value::Blob(t.value.as_bytes().to_vec());
+                            return Value::from_slice(t.value.as_bytes());
                         }
                     }
                     vref.to_owned()
                 })
+                .transpose()?
                 .unwrap_or(Value::Null),
             Err(_) => Value::Null,
         },
@@ -2466,7 +2499,7 @@ pub fn op_union_pack(
     let record_bytes = record.into_payload();
 
     // Format: [tag_index: 1 byte][record bytes]
-    let mut blob = Vec::with_capacity(1 + record_bytes.len());
+    let mut blob = <crate::ValueBlob as TursoVecExt<u8>>::with_capacity(1 + record_bytes.len());
     blob.push(*tag_index);
     blob.extend_from_slice(&record_bytes);
     state.registers[*dest].set_value(Value::Blob(blob));
@@ -2809,6 +2842,139 @@ pub fn op_mem_max(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Read a non-negative integer offset/length from a register for the blob opcodes.
+fn blob_reg_usize(state: &ProgramState, reg: usize, opcode: &str, what: &str) -> Result<usize> {
+    match state.registers[reg].get_value() {
+        Value::Numeric(Numeric::Integer(n)) if *n >= 0 => Ok(*n as usize),
+        other => Err(LimboError::InternalError(format!(
+            "{opcode}: {what} register must hold a non-negative integer, got {other:?}"
+        ))),
+    }
+}
+
+/// Resolve `cursor` to the b-tree cursor the blob opcodes require, or error. Only
+/// table-row cursors expose byte-level column access, so this is the single gate all
+/// three opcodes (BlobRead/BlobWrite/BlobLen) share.
+fn blob_btree_cursor<'a>(
+    state: &'a mut ProgramState,
+    cursor: usize,
+    opcode: &str,
+) -> Result<&'a mut dyn crate::storage::btree::CursorTrait> {
+    match state.get_cursor(cursor) {
+        Cursor::BTree(btree) => Ok(btree.as_mut()),
+        _ => Err(LimboError::InternalError(format!(
+            "{opcode} requires a b-tree cursor"
+        ))),
+    }
+}
+
+/// Signal incremental-blob expiry to `Blob::read`/`write`: store NULL in `dest` and
+/// advance. Expiry must fail the operation without aborting the program — the paused
+/// blob program owns the handle's transaction, and writes made before the expiry
+/// must still commit at close (sqlite3_blob semantics). Shared by BlobRead/BlobWrite.
+fn blob_expired_ack(state: &mut ProgramState, dest: usize) -> InsnFunctionStepResult {
+    state.registers[dest].set_value(Value::Null);
+    state.pc += 1;
+    InsnFunctionStepResult::Step
+}
+
+pub fn op_blob_read(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        BlobRead {
+            cursor,
+            column,
+            offset,
+            amount,
+            dest
+        },
+        insn
+    );
+    let off = blob_reg_usize(state, *offset, "BlobRead", "offset")?;
+    let amt = blob_reg_usize(state, *amount, "BlobRead", "amount")?;
+    // The callee validates (off, amt) against the value's length before sizing `out`,
+    // so a hostile amount register cannot force an allocation here.
+    let mut out: crate::ValueBlob = TursoAllocExt::new();
+    match blob_btree_cursor(state, *cursor, "BlobRead")?
+        .blob_read_column(*column, off, amt, &mut out)
+    {
+        Ok(IOResult::Done(())) => {}
+        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+        Err(LimboError::BlobHandleExpired) => return Ok(blob_expired_ack(state, *dest)),
+        Err(err) => return Err(err),
+    }
+    state.registers[*dest].set_value(Value::Blob(out));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Store the byte length of a column's value on the cursor's current row, validating
+/// that the value is byte-addressable (TEXT or BLOB) — the VDBE backing for
+/// sqlite3_blob_open's length and type check.
+pub fn op_blob_len(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        BlobLen {
+            cursor,
+            column,
+            dest
+        },
+        insn
+    );
+    let len = return_if_io!(blob_btree_cursor(state, *cursor, "BlobLen")?.blob_column_len(*column));
+    let len = i64::try_from(len)
+        .map_err(|_| LimboError::Corrupt("column byte length does not fit in i64".to_string()))?;
+    state.registers[*dest].set_value(Value::Numeric(Numeric::Integer(len)));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Write a blob's bytes into a column's value at an offset, in place — the VDBE
+/// backing for sqlite3_blob_write.
+pub fn op_blob_write(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        BlobWrite {
+            cursor,
+            column,
+            offset,
+            src,
+            dest
+        },
+        insn
+    );
+    let off = blob_reg_usize(state, *offset, "BlobWrite", "offset")?;
+    let data = match state.registers[*src].get_value() {
+        Value::Blob(b) => b.clone(),
+        other => {
+            return Err(LimboError::InternalError(format!(
+                "BlobWrite: source register must hold a blob, got {other:?}"
+            )))
+        }
+    };
+    match blob_btree_cursor(state, *cursor, "BlobWrite")?.blob_write_column(*column, off, &data) {
+        Ok(IOResult::Done(())) => {}
+        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+        Err(LimboError::BlobHandleExpired) => return Ok(blob_expired_ack(state, *dest)),
+        Err(err) => return Err(err),
+    }
+    state.registers[*dest].set_value(Value::Numeric(Numeric::Integer(1)));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_result_row(
     _program: &Program,
     state: &mut ProgramState,
@@ -2946,7 +3112,7 @@ pub fn halt(
 ) -> Result<InsnFunctionStepResult> {
     let mv_store = program.connection.mv_store();
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
-    let owns_auto_txn = state.owns_auto_txn();
+    let can_autocommit_now = state.can_autocommit_now(&program.connection);
 
     // Check if we're resuming from a FAIL commit I/O wait.
     // If pending_fail_error is set, we were in the middle of committing partial changes
@@ -3023,7 +3189,7 @@ pub fn halt(
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
         // Note: ON CONFLICT FAIL does NOT apply to FK violations, so we check for those first.
-        if program.resolve_type == ResolveType::Fail && owns_auto_txn {
+        if program.resolve_type == ResolveType::Fail && can_autocommit_now {
             // Check for immediate FK violations - FK errors don't respect ON CONFLICT
             if program.connection.foreign_keys_enabled()
                 && state.get_fk_immediate_violations_during_stmt() > 0
@@ -3055,9 +3221,9 @@ pub fn halt(
     }
 
     tracing::trace!(
-        "halt(auto_commit={}, owns_auto_txn={})",
+        "halt(auto_commit={}, can_autocommit_now={})",
         auto_commit,
-        owns_auto_txn
+        can_autocommit_now
     );
 
     // Check for immediate foreign key violations.
@@ -3077,7 +3243,7 @@ pub fn halt(
     if auto_commit {
         // In autocommit mode, a statement that leaves deferred violations must fail here,
         // and it also ends the transaction.
-        if owns_auto_txn && program.connection.foreign_keys_enabled() {
+        if can_autocommit_now && program.connection.foreign_keys_enabled() {
             let deferred_violations = program
                 .connection
                 .fk_deferred_violations
@@ -3099,7 +3265,7 @@ pub fn halt(
             }
         }
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
-        if owns_auto_txn {
+        if can_autocommit_now {
             vtab_commit_all(&program.connection)?;
             index_method_pre_commit_all(state, pager)?;
             // Sequence backing-table compaction and sqlite_sequence sync
@@ -3126,6 +3292,25 @@ pub fn halt(
             // Another root statement may own the implicit autocommit
             // transaction. This statement can finish, but must not commit or
             // roll back connection-level state it did not start.
+            //
+            // FIXME: when this statement is a writer in MVCC mode, deferring
+            // its commit to the last sibling statement means the writer's
+            // caller observes success before the changes are durable. If the
+            // shared transaction then ends in a rollback — the last sibling
+            // reader is reset or dropped mid-scan, or a later joining writer
+            // errors or is abandoned after changing rows — the finished
+            // writer's changes are silently discarded
+            // (see test_mvcc_completed_writer_changes_lost_when_last_reader_abandoned).
+            // SQLite never has this window: it commits at the writer's own
+            // halt and downgrades the transaction to read-only for the
+            // remaining statements (btreeEndTransaction). The MVCC equivalent
+            // is to commit here, allocating a successor read-only
+            // transaction's begin timestamp inside the same
+            // `get_commit_timestamp` critical section as this commit's end
+            // timestamp, swapping `mv_tx` to that successor so remaining
+            // readers keep an identical snapshot. That also attributes commit
+            // errors (e.g. WriteWriteConflict) to the writer's own step
+            // instead of whichever sibling happens to finish last.
             if let Some(cdc_info) = state.pending_cdc_info.take() {
                 program.connection.set_capture_data_changes_info(cdc_info);
             }
@@ -3319,14 +3504,18 @@ fn begin_mvcc_tx(
     mode: &TransactionMode,
     existing_tx_id: Option<u64>,
     connection: &Connection,
+    expected_schema_generation: Option<u64>,
 ) -> Result<u64> {
     match mode {
         TransactionMode::None | TransactionMode::Read | TransactionMode::Concurrent => {
-            mv_store.begin_tx(pager.clone())
+            mv_store.begin_tx_with_schema_generation(pager.clone(), expected_schema_generation)
         }
-        TransactionMode::Write => {
-            mv_store.begin_exclusive_tx(pager.clone(), existing_tx_id, connection)
-        }
+        TransactionMode::Write => mv_store.begin_exclusive_tx(
+            pager.clone(),
+            existing_tx_id,
+            connection,
+            expected_schema_generation,
+        ),
     }
 }
 
@@ -3492,22 +3681,52 @@ pub fn op_transaction_inner(
     let pager = program.get_pager_from_database_index(db)?;
     // Get the MvStore for the specific database (main or attached).
     let mv_store = program.connection.mv_store_for_db(*db);
+    let is_main_db = *db == crate::MAIN_DB_ID;
+    let is_secondary_db = !is_main_db;
+    let write = matches!(
+        tx_mode,
+        TransactionMode::Write | TransactionMode::Concurrent
+    );
+    // BEGIN IMMEDIATE / EXCLUSIVE / CONCURRENT need write-capable transaction
+    // access, but they are not themselves write statements. Only statements in
+    // `write_databases` count for same-connection writer blocking and
+    // active-writer cleanup.
+    let statement_writes_db = program.write_databases.get(*db);
     loop {
         match *state.active_op_state.transaction() {
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
-                let write = matches!(
-                    tx_mode,
-                    TransactionMode::Write | TransactionMode::Concurrent
-                );
                 let mut started_secondary_tx = false;
                 if write && conn.is_readonly(*db) {
                     return Err(LimboError::ReadOnly);
                 }
+                let active_writers = conn.n_active_writes.load(Ordering::SeqCst);
+                turso_assert!(
+                    active_writers <= 1,
+                    "n_active_writes must be 0 or 1, got {active_writers}"
+                );
+                // One connection may have many active readers, but only one
+                // top-level writer. A second writer on the same connection is
+                // rejected before it opens transaction or savepoint state.
+                //
+                // This is stricter than SQLite. SQLite can run overlapping
+                // write statements on one connection because sqlite3_step()
+                // does not return to the caller in the middle of built-in
+                // write opcodes. Turso can suspend there for async I/O, so a
+                // second writer would make reset/drop cleanup hard to get right.
+                if statement_writes_db
+                    && !conn.is_nested_stmt()
+                    && !state.is_active_write
+                    && active_writers > 0
+                {
+                    return Err(LimboError::StatementsInProgress(
+                        "cannot start a write statement",
+                    ));
+                }
 
                 // Fast path: if checkpoint root publication already replaced the
                 // shared schema, force reprepare before opening any transaction state.
-                if *db == crate::MAIN_DB_ID
+                if is_main_db
                     && mv_store.is_some()
                     && conn.mvcc_schema_requires_reprepare_before_tx()
                 {
@@ -3532,7 +3751,6 @@ pub fn op_transaction_inner(
 
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
-                let is_secondary_db = *db != crate::MAIN_DB_ID;
                 let (new_transaction_state, updated) = if conn.is_nested_stmt() {
                     (current_state, false)
                 } else if is_secondary_db {
@@ -3613,7 +3831,14 @@ pub fn op_transaction_inner(
                             // applies to all databases uniformly.
                             let effective_mode =
                                 conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or(*tx_mode);
-                            match begin_mvcc_tx(mv_store, &pager, &effective_mode, None, &conn) {
+                            match begin_mvcc_tx(
+                                mv_store,
+                                &pager,
+                                &effective_mode,
+                                None,
+                                &conn,
+                                None,
+                            ) {
                                 Ok(tx_id) => {
                                     conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
                                     started_secondary_tx = true;
@@ -3631,9 +3856,14 @@ pub fn op_transaction_inner(
                             if matches!(current_mode, TransactionMode::None | TransactionMode::Read)
                                 && matches!(tx_mode, TransactionMode::Write)
                             {
-                                if let Err(err) =
-                                    begin_mvcc_tx(mv_store, &pager, tx_mode, Some(tx_id), &conn)
-                                {
+                                if let Err(err) = begin_mvcc_tx(
+                                    mv_store,
+                                    &pager,
+                                    tx_mode,
+                                    Some(tx_id),
+                                    &conn,
+                                    None,
+                                ) {
                                     pager.end_read_tx();
                                     return Err(err);
                                 }
@@ -3678,21 +3908,35 @@ pub fn op_transaction_inner(
                         }
 
                         if !has_existing_mv_tx {
-                            match begin_mvcc_tx(mv_store, &pager, tx_mode, None, &conn) {
-                                Ok(tx_id) => {
-                                    // Check again in case checkpoint published roots after the
-                                    // previous check and before this transaction was protected.
-                                    if conn.mvcc_schema_requires_reprepare_before_tx() {
-                                        tracing::debug!(
-                                            "MVCC shared schema changed while starting transaction; force reprepare"
-                                        );
-                                        mv_store.rollback_tx(tx_id, pager.clone(), &conn, *db);
+                            // Gate the begin on the connection's prepared schema generation,
+                            // captured here (atomically with the connection.schema == db.schema
+                            // check) and re-checked inside begin_tx's clock callback. A passive
+                            // checkpoint publish runs under the same clock and bumps the
+                            // generation, so one that orders into the begin window is detected
+                            // there and forces a reprepare against the published roots — without
+                            // the old non-atomic post-begin recheck (which also tripped on
+                            // publishes strictly after our snapshot).
+                            let expected_schema_generation =
+                                match conn.mvcc_begin_schema_generation() {
+                                    Ok(generation) => generation,
+                                    Err(err) => {
                                         if started_read_tx {
                                             pager.end_read_tx();
+                                            conn.set_tx_state(TransactionState::None);
                                             state.auto_txn_cleanup = TxnCleanup::None;
                                         }
-                                        return Err(LimboError::SchemaUpdated);
+                                        return Err(err);
                                     }
+                                };
+                            match begin_mvcc_tx(
+                                mv_store,
+                                &pager,
+                                tx_mode,
+                                None,
+                                &conn,
+                                expected_schema_generation,
+                            ) {
+                                Ok(tx_id) => {
                                     program
                                         .connection
                                         .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
@@ -3727,6 +3971,7 @@ pub fn op_transaction_inner(
                                     &actual_tx_mode,
                                     Some(tx_id),
                                     &conn,
+                                    None,
                                 ) {
                                     if started_read_tx {
                                         pager.end_read_tx();
@@ -3867,7 +4112,7 @@ pub fn op_transaction_inner(
             OpTransactionState::BeginNamedSavepoints => {
                 match open_connection_named_savepoints_for_db(&program.connection, *db, &pager)? {
                     IOResult::Done(()) => {
-                        if *db != crate::MAIN_DB_ID
+                        if is_secondary_db
                             && mv_store.is_none()
                             && matches!(tx_mode, TransactionMode::Write)
                             && !pager.holds_write_lock()
@@ -3911,64 +4156,86 @@ pub fn op_transaction_inner(
             }
             OpTransactionState::BeginStatement => {
                 let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
-                let in_explicit_txn = !program.connection.auto_commit.load(Ordering::SeqCst);
-                if *db == crate::MAIN_DB_ID && needs_stmt_journal {
-                    let write = matches!(tx_mode, TransactionMode::Write);
-                    let res = state.begin_statement(&program.connection, &pager, write)?;
-                    if let IOResult::IO(io) = res {
-                        return Ok(InsnFunctionStepResult::IO(io));
-                    }
-                } else if *db != crate::MAIN_DB_ID
-                    && matches!(tx_mode, TransactionMode::Write)
-                    && needs_stmt_journal
-                {
-                    if in_explicit_txn && !state.has_stmt_transaction {
-                        state.has_stmt_transaction = true;
-                        state.fk_deferred_violations_when_stmt_started.store(
-                            program
-                                .connection
-                                .fk_deferred_violations
-                                .load(Ordering::Acquire),
-                            Ordering::SeqCst,
-                        );
-                        state
-                            .fk_immediate_violations_during_stmt
-                            .store(0, Ordering::Release);
-                    }
-                    if !in_explicit_txn {
-                        // Autocommit statements rollback the whole transaction on error, so
-                        // non-main pagers do not need statement savepoints here.
-                    } else if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
-                        // Attached MVCC DB: open an MvStore savepoint.
-                        if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
-                            mv_store.begin_savepoint(tx_id);
+                let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
+                let in_explicit_txn = !auto_commit;
+                if needs_stmt_journal {
+                    if is_main_db {
+                        let res = state.begin_statement(
+                            &program.connection,
+                            &pager,
+                            statement_writes_db,
+                        )?;
+                        if let IOResult::IO(io) = res {
+                            return Ok(InsnFunctionStepResult::IO(io));
                         }
-                    } else {
-                        // Attached WAL DB: open a pager savepoint for statement rollback.
-                        let db_size =
-                            return_if_io!(pager.with_header(|header| header.database_size.get()));
-                        pager.open_subjournal()?;
-                        pager.try_use_subjournal()?;
-                        let result = pager.open_savepoint(db_size);
-                        if result.is_err() {
-                            pager.stop_use_subjournal();
+                    } else if statement_writes_db && in_explicit_txn {
+                        if !state.has_stmt_transaction {
+                            state.has_stmt_transaction = true;
+                            state.fk_deferred_violations_when_stmt_started.store(
+                                program
+                                    .connection
+                                    .fk_deferred_violations
+                                    .load(Ordering::Acquire),
+                                Ordering::SeqCst,
+                            );
+                            state
+                                .fk_immediate_violations_during_stmt
+                                .store(0, Ordering::Release);
                         }
-                        result?;
-                        state.attached_savepoint_pagers.push(pager.clone());
+                        if let Some(mv_store) = mv_store.as_ref() {
+                            // Attached MVCC DB: open an MvStore savepoint.
+                            if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
+                                mv_store.begin_savepoint(tx_id);
+                            }
+                        } else {
+                            // Attached WAL DB: open a pager savepoint for statement rollback.
+                            let db_size = return_if_io!(
+                                pager.with_header(|header| header.database_size.get())
+                            );
+                            pager.open_subjournal()?;
+                            pager.try_use_subjournal()?;
+                            let result = pager.open_savepoint(db_size);
+                            if result.is_err() {
+                                pager.stop_use_subjournal();
+                            }
+                            result?;
+                            state.attached_savepoint_pagers.push(pager.clone());
+                        }
                     }
                 }
 
-                if *db == MAIN_DB_ID
-                    && matches!(tx_mode, TransactionMode::Write)
-                    && !program.connection.auto_commit.load(Ordering::SeqCst)
-                {
-                    program
-                        .connection
-                        .n_active_writes
-                        .fetch_add(1, Ordering::SeqCst);
-                    state.is_active_write = true;
-                    if state.has_stmt_transaction {
+                let is_top_level_statement = !program.connection.is_nested_stmt();
+                if statement_writes_db && is_top_level_statement {
+                    if !state.is_active_write {
+                        let previous = program
+                            .connection
+                            .n_active_writes
+                            .fetch_add(1, Ordering::SeqCst);
+                        turso_assert!(
+                            previous == 0,
+                            "starting a writer while {previous} writer(s) are already active"
+                        );
+                        state.is_active_write = true;
+                    }
+                    if is_main_db && in_explicit_txn && state.has_stmt_transaction {
                         state.auto_txn_cleanup = TxnCleanup::RollbackSavepoint;
+                    }
+                }
+                if is_top_level_statement
+                    && is_main_db
+                    && auto_commit
+                    && state.auto_txn_cleanup == TxnCleanup::None
+                {
+                    let active_root_statements = program
+                        .connection
+                        .n_active_root_statements
+                        .load(Ordering::SeqCst);
+                    if active_root_statements > 1 {
+                        // A sibling statement opened the implicit transaction
+                        // before this statement joined it. Mark this statement
+                        // so the last remaining sibling can close the
+                        // transaction.
+                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                     }
                 }
                 state.pc += 1;
@@ -4023,6 +4290,7 @@ pub fn op_auto_commit(
             res,
             Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
         ) {
+            conn.clear_tx_poison();
             conn.clear_named_savepoints();
             conn.clear_partition_write_target();
         }
@@ -4063,7 +4331,11 @@ pub fn op_auto_commit(
         if matches!(tx_op, TxOp::Commit | TxOp::Rollback)
             && conn.n_active_writes.load(Ordering::SeqCst) > 0
         {
-            return Err(LimboError::Busy);
+            return Err(LimboError::StatementsInProgress(match tx_op {
+                TxOp::Commit => "cannot commit transaction",
+                TxOp::Rollback => "cannot rollback transaction",
+                TxOp::Begin => unreachable!("guard only matches Commit | Rollback"),
+            }));
         }
 
         match tx_op {
@@ -4085,11 +4357,26 @@ pub fn op_auto_commit(
                 conn.clear_partition_write_target();
             }
             TxOp::Commit => {
+                if conn.tx_is_poisoned() {
+                    // A write statement inside BEGIN was reset/dropped before
+                    // it reached Done, and there was no statement savepoint to
+                    // undo only that statement. Letting COMMIT proceed would
+                    // persist a partial statement, so COMMIT rolls back the
+                    // whole transaction and reports the abandoned write.
+                    conn.rollback_manual_txn_cleanup(pager, true);
+                    return Err(LimboError::TxError(
+                        "cannot commit - an unfinished write statement was abandoned".to_string(),
+                    ));
+                }
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
                 conn.auto_commit.store(true, Ordering::SeqCst);
             }
             TxOp::Begin => {
+                turso_assert!(
+                    !conn.tx_is_poisoned(),
+                    "rollback-only marker leaked outside an explicit transaction"
+                );
                 conn.clear_partition_write_target();
                 conn.auto_commit.store(false, Ordering::SeqCst);
                 return Ok(InsnFunctionStepResult::Done);
@@ -4153,6 +4440,7 @@ pub fn op_auto_commit(
 
     // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
     conn.set_cdc_transaction_id(-1);
+    conn.clear_tx_poison();
     conn.clear_named_savepoints();
     conn.clear_partition_write_target();
 
@@ -4168,6 +4456,24 @@ pub fn op_savepoint(
     load_insn!(Savepoint { op, name }, insn);
     let conn = program.connection.clone();
     let mv_store = conn.mv_store();
+
+    // No savepoint operation may run while a write statement on this
+    // connection is suspended mid-execution. SQLite rejects SAVEPOINT and
+    // RELEASE with SQLITE_BUSY while write statements are in progress
+    // (vdbe.c, OP_Savepoint: "cannot open/release savepoint - SQL statements
+    // in progress"). SQLite does allow ROLLBACK TO there because it trips all
+    // open cursors so the affected statements abort instead of resuming;
+    // Turso has no cursor-tripping mechanism, and letting a suspended writer
+    // resume on top of pages restored by ROLLBACK TO would interleave two
+    // inconsistent page states. Rejecting all three keeps the rule simple:
+    // finish or reset the active writer first.
+    if !conn.is_nested_stmt() && conn.n_active_writes.load(Ordering::SeqCst) > 0 {
+        return Err(LimboError::StatementsInProgress(match *op {
+            SavepointOp::Begin => "cannot open savepoint",
+            SavepointOp::Release => "cannot release savepoint",
+            SavepointOp::RollbackTo => "cannot rollback savepoint",
+        }));
+    }
 
     match *op {
         SavepointOp::Begin => {
@@ -4259,6 +4565,10 @@ pub fn op_savepoint(
                     }
                     conn.push_named_savepoint(frame);
                     if starts_transaction {
+                        turso_assert!(
+                            !conn.tx_is_poisoned(),
+                            "rollback-only marker leaked outside an explicit transaction"
+                        );
                         conn.clear_partition_write_target();
                         conn.auto_commit.store(false, Ordering::SeqCst);
                     }
@@ -5271,7 +5581,7 @@ pub fn seek_internal(
                         let new_val = apply_numeric_affinity(temp_value.as_value_ref(), false);
                         let converted = new_val.is_some();
                         if let Some(new_val) = new_val {
-                            temp_value = new_val.to_owned();
+                            temp_value = new_val.to_owned()?;
                         }
                         converted
                     } else {
@@ -5397,7 +5707,7 @@ pub fn seek_internal(
                                 };
                                 (cursor, record)
                             };
-                            match cursor.seek(SeekKey::IndexKey(record), *op)? {
+                            match cursor.seek(SeekKey::IndexKey(record.as_record_ref()), *op)? {
                                 IOResult::Done(seek_result) => seek_result,
                                 IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                             }
@@ -5890,11 +6200,11 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-            payload.push(Value::Blob(vec![]));
+            payload.push(Value::Blob(crate::alloc::vec![]));
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
-            payload.push(Value::Blob(vec![]));
+            payload.push(Value::Blob(crate::alloc::vec![]));
         }
     };
     Ok(())
@@ -6155,8 +6465,8 @@ fn update_agg_payload(
                     "JsonGroupObject/JsonbGroupObject: no value provided".to_string(),
                 ));
             };
-            let mut key_vec = convert_dbtype_to_raw_jsonb(arg)?;
-            let mut val_vec = convert_dbtype_to_raw_jsonb(&value)?;
+            let mut key_vec = convert_dbtype_to_raw_jsonb(arg, Conv::ToString)?;
+            let mut val_vec = convert_dbtype_to_raw_jsonb(&value, Conv::NotStrict)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
@@ -6204,7 +6514,7 @@ fn update_agg_payload(
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             // arg = value
-            let mut data = convert_dbtype_to_raw_jsonb(arg)?;
+            let mut data = convert_dbtype_to_raw_jsonb(arg, Conv::NotStrict)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
@@ -6472,6 +6782,44 @@ fn op_window_step(
             };
             *counter += 1;
         }
+        // rank() — mirrors SQLite's CallCount-based rankStepFunc.
+        //
+        // State (payload):
+        //   [0] = current rank value (what AggValue returns; cleared to 0 by
+        //         AggValue so the next step can detect that AggValue just ran).
+        //   [1] = rows-seen counter for the partition (always increments).
+        //
+        // The "latch on zero" trick: AggValue clears payload[0] every time it
+        // runs, and a flush only happens at peer-group / partition boundaries.
+        // So when this step observes payload[0] == 0, it knows AggValue just
+        // fired on the prior peer group — meaning this row begins a fresh peer
+        // group, and the current row position (rows_seen) is the new rank.
+        // Subsequent rows in the same peer group see payload[0] != 0 and leave
+        // the rank value untouched, so every peer reads the same rank.
+        WindowFunc::Rank => {
+            if let Register::Value(Value::Null) = state.registers[acc_reg] {
+                state.registers[acc_reg] =
+                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
+                        Value::from_i64(0),
+                        Value::from_i64(0),
+                    ]?));
+            }
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                unreachable!("rank accumulator must be a Builtin payload");
+            };
+            let Value::Numeric(Numeric::Integer(rows_seen)) = &mut payload[1] else {
+                unreachable!("rank rows_seen counter must be Integer");
+            };
+            *rows_seen += 1;
+            let rows_seen = *rows_seen;
+            let Value::Numeric(Numeric::Integer(rank)) = &mut payload[0] else {
+                unreachable!("rank current value must be Integer");
+            };
+            if *rank == 0 {
+                *rank = rows_seen;
+            }
+        }
         other => {
             return Err(LimboError::InternalError(format!(
                 "window function {other} reached runtime dispatch but has no handler"
@@ -6498,6 +6846,18 @@ fn op_window_value(
                 )))
             }
         },
+        WindowFunc::Rank => {
+            // Read current rank, then clear it so the next peer group's first
+            // AggStep latches a fresh value (matches SQLite's rankValueFunc).
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                return Err(LimboError::InternalError(format!(
+                    "rank accumulator in unexpected register state: {:?}",
+                    state.registers[acc_reg]
+                )));
+            };
+            std::mem::replace(&mut payload[0], Value::from_i64(0))
+        }
         other => {
             return Err(LimboError::InternalError(format!(
                 "window function {other} reached runtime dispatch but has no handler"
@@ -6730,7 +7090,7 @@ pub fn op_agg_final(
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupArray => {
                     state.registers[dest_reg]
-                        .set_blob(json::jsonb::Jsonb::make_empty_array(1).data())?;
+                        .set_blob(json::jsonb::Jsonb::make_empty_array(1)?.data())?;
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonGroupObject => {
@@ -6739,7 +7099,7 @@ pub fn op_agg_final(
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupObject => {
                     state.registers[dest_reg]
-                        .set_blob(json::jsonb::Jsonb::make_empty_obj(1).data())?;
+                        .set_blob(json::jsonb::Jsonb::make_empty_obj(1)?.data())?;
                 }
                 AggFunc::External(ext_func) => {
                     let value = match ext_func.as_ref() {
@@ -7183,6 +7543,24 @@ pub fn op_rowset_test(
     Ok(InsnFunctionStepResult::Step)
 }
 
+fn parse_schema_sql_for_alter(
+    dialect: &dyn crate::Dialect,
+    entry_type: &str,
+    root_page: i64,
+    sql: &str,
+) -> Result<Option<ast::Cmd>> {
+    if entry_type == "table" && root_page != 0 {
+        let stmt = dialect.parse_table_sql_ast(sql)?;
+        if !matches!(stmt, ast::Stmt::CreateTable { .. }) {
+            return Err(LimboError::Corrupt(
+                "storage-backed table schema is not CREATE TABLE".to_string(),
+            ));
+        }
+        return Ok(Some(ast::Cmd::Stmt(stmt)));
+    }
+    dialect.parse(sql).map(|(cmd, _)| cmd)
+}
+
 pub fn op_function(
     program: &Program,
     state: &mut ProgramState,
@@ -7327,7 +7705,7 @@ pub fn op_function(
             }
             JsonFunc::JsonValid => {
                 let json_value = &state.registers[*start_reg];
-                state.registers[*dest].set_value(is_json_valid(json_value.get_value()));
+                state.registers[*dest].set_value(is_json_valid(json_value.get_value())?);
             }
             JsonFunc::JsonPatch => {
                 assert_eq!(arg_count, 2);
@@ -7490,7 +7868,7 @@ pub fn op_function(
                 };
                 let result = reg_value_argument
                     .get_value()
-                    .exec_cast(reg_value_type.as_str());
+                    .exec_cast(reg_value_type.as_str())?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Changes => {
@@ -7534,7 +7912,7 @@ pub fn op_function(
                 } else {
                     let pattern_cow = match pattern_value {
                         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                        v => match v.exec_cast("TEXT") {
+                        v => match v.exec_cast("TEXT")? {
                             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                             _ => unreachable!("Cast to TEXT should yield Text"),
                         },
@@ -7542,7 +7920,7 @@ pub fn op_function(
 
                     let match_cow = match match_value {
                         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                        v => match v.exec_cast("TEXT") {
+                        v => match v.exec_cast("TEXT")? {
                             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                             _ => unreachable!("Cast to TEXT should yield Text"),
                         },
@@ -7589,7 +7967,7 @@ pub fn op_function(
                             _ => {
                                 let escape_cow = match escape_value {
                                     Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                                    v => match v.exec_cast("TEXT") {
+                                    v => match v.exec_cast("TEXT")? {
                                         Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                         _ => unreachable!("Cast to TEXT should yield Text"),
                                     },
@@ -7613,7 +7991,7 @@ pub fn op_function(
                         // 3. Prepare Pattern and Text
                         let pattern_cow = match pattern_value {
                             Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                            v => match v.exec_cast("TEXT") {
+                            v => match v.exec_cast("TEXT")? {
                                 Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                 _ => unreachable!("Cast to TEXT should yield Text"),
                             },
@@ -7621,7 +7999,7 @@ pub fn op_function(
 
                         let match_cow = match match_value {
                             Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                            v => match v.exec_cast("TEXT") {
+                            v => match v.exec_cast("TEXT")? {
                                 Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                 _ => unreachable!("Cast to TEXT should yield Text"),
                             },
@@ -7773,6 +8151,19 @@ pub fn op_function(
                     .exec_unhex(ignored_chars.map(|x| x.get_value()));
                 state.registers[*dest].set_value(result);
             }
+            ScalarFunc::GetByte => {
+                let value = state.registers[*start_reg].get_value();
+                let offset = state.registers[*start_reg + 1].get_value();
+                let result = value.exec_get_byte(offset)?;
+                state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::SetByte => {
+                let value = state.registers[*start_reg].get_value();
+                let offset = state.registers[*start_reg + 1].get_value();
+                let new_value = state.registers[*start_reg + 2].get_value();
+                let result = value.exec_set_byte(offset, new_value)?;
+                state.registers[*dest].set_value(result);
+            }
             ScalarFunc::Random => {
                 state.registers[*dest].set_int(pager.io.generate_random_number());
             }
@@ -7866,7 +8257,7 @@ pub fn op_function(
                     str_value.get_value(),
                     start_value.get_value(),
                     length_value.map(|x| x.get_value()),
-                );
+                )?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Date => {
@@ -7948,7 +8339,7 @@ pub fn op_function(
                     source.get_value(),
                     pattern.get_value(),
                     replacement.get_value(),
-                ));
+                )?);
             }
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
@@ -8002,7 +8393,8 @@ pub fn op_function(
                         }
                     };
 
-                    let mut json = json::jsonb::Jsonb::make_empty_array(table.columns().len() * 10);
+                    let mut json =
+                        json::jsonb::Jsonb::make_empty_array(table.columns().len() * 10)?;
                     for column in table.columns() {
                         use crate::types::TextRef;
 
@@ -8059,9 +8451,9 @@ pub fn op_function(
 
                     let mut payload_iterator = ValueIterator::new(bin_record.as_slice())?;
 
-                    let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len);
+                    let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len)?;
                     for i in 0..columns_len {
-                        let mut op = json::jsonb::SearchOperation::new(0);
+                        let mut op = json::jsonb::SearchOperation::new(0)?;
                         let path = json::path::JsonPath {
                             elements: vec![
                                 json::path::PathElement::Root(),
@@ -8868,8 +9260,23 @@ pub fn op_function(
                 ),
             },
         },
+        crate::function::Func::Dialect(name) => {
+            let args: Vec<Value> = state.registers[*start_reg..*start_reg + arg_count]
+                .iter()
+                .map(|r| r.get_value().clone())
+                .collect();
+            let result = program.connection.dialect().exec_scalar_function(
+                &program.connection,
+                name,
+                &args,
+            )?;
+            state.registers[*dest].set_value(result);
+        }
         crate::function::Func::AlterTable(alter_func) => {
             let r#type = &state.registers[*start_reg].get_value().clone();
+            let Value::Text(entry_type) = r#type else {
+                panic!("sqlite_schema.type should be TEXT")
+            };
 
             let Value::Text(name) = &state.registers[*start_reg + 1].get_value() else {
                 panic!("sqlite_schema.name should be TEXT")
@@ -8927,10 +9334,13 @@ pub fn op_function(
                             break 'sql None;
                         };
 
-                        let mut parser = Parser::new(sql.as_str().as_bytes());
-                        let ast::Cmd::Stmt(stmt) =
-                            parser.next().expect("parser should have next item")?
-                        else {
+                        let cmd = parse_schema_sql_for_alter(
+                            program.connection.dialect().as_ref(),
+                            entry_type.as_str(),
+                            *root_page,
+                            sql.as_str(),
+                        )?;
+                        let Some(ast::Cmd::Stmt(stmt)) = cmd else {
                             return Err(LimboError::InternalError(
                                 "Unexpected command during ALTER TABLE RENAME processing"
                                     .to_string(),
@@ -9057,25 +9467,33 @@ pub fn op_function(
                                             partition,
                                         },
                                     };
-                                    Some(new_stmt.to_string())
+                                    Some(
+                                        program
+                                            .connection
+                                            .dialect()
+                                            .format_rewritten_table_sql(&new_stmt)?,
+                                    )
                                 } else {
                                     // Other tables: only emit if we actually changed their FK targets.
                                     if !any_change {
                                         break 'sql None;
                                     }
+                                    let new_stmt = ast::Stmt::CreateTable {
+                                        tbl_name,
+                                        temporary,
+                                        if_not_exists,
+                                        body: ast::CreateTableBody::ColumnsAndConstraints {
+                                            columns,
+                                            constraints,
+                                            options,
+                                            partition,
+                                        },
+                                    };
                                     Some(
-                                        ast::Stmt::CreateTable {
-                                            tbl_name,
-                                            temporary,
-                                            if_not_exists,
-                                            body: ast::CreateTableBody::ColumnsAndConstraints {
-                                                columns,
-                                                constraints,
-                                                options,
-                                                partition,
-                                            },
-                                        }
-                                        .to_string(),
+                                        program
+                                            .connection
+                                            .dialect()
+                                            .format_rewritten_table_sql(&new_stmt)?,
                                     )
                                 }
                             }
@@ -9201,10 +9619,13 @@ pub fn op_function(
                             break 'sql None;
                         };
 
-                        let mut parser = Parser::new(sql.as_str().as_bytes());
-                        let ast::Cmd::Stmt(stmt) =
-                            parser.next().expect("parser should have next item")?
-                        else {
+                        let cmd = parse_schema_sql_for_alter(
+                            program.connection.dialect().as_ref(),
+                            entry_type.as_str(),
+                            *root_page,
+                            sql.as_str(),
+                        )?;
+                        let Some(ast::Cmd::Stmt(stmt)) = cmd else {
                             return Err(LimboError::InternalError(
                                 "Unexpected command during ALTER TABLE RENAME COLUMN processing"
                                     .to_string(),
@@ -9427,19 +9848,22 @@ pub fn op_function(
                                         break 'sql None;
                                     }
                                 }
+                                let new_stmt = ast::Stmt::CreateTable {
+                                    tbl_name,
+                                    body: ast::CreateTableBody::ColumnsAndConstraints {
+                                        columns,
+                                        constraints,
+                                        options,
+                                        partition,
+                                    },
+                                    temporary,
+                                    if_not_exists,
+                                };
                                 Some(
-                                    ast::Stmt::CreateTable {
-                                        tbl_name,
-                                        body: ast::CreateTableBody::ColumnsAndConstraints {
-                                            columns,
-                                            constraints,
-                                            options,
-                                            partition,
-                                        },
-                                        temporary,
-                                        if_not_exists,
-                                    }
-                                    .to_string(),
+                                    program
+                                        .connection
+                                        .dialect()
+                                        .format_rewritten_table_sql(&new_stmt)?,
                                 )
                             }
                             // Trigger SQL is rewritten by separate UPDATE statements
@@ -9968,7 +10392,9 @@ pub fn op_insert(
                         };
                         return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
                     } else {
-                        return_if_io!(cursor.insert(&BTreeKey::new_index_key(&record)));
+                        return_if_io!(
+                            cursor.insert(&BTreeKey::new_index_key(record.as_record_ref()))
+                        );
                     }
                     state.record_rows_written(1);
                 }
@@ -10503,7 +10929,9 @@ pub fn op_idx_insert(
             {
                 let cursor = get_cursor!(state, cursor_id);
                 let cursor = cursor.as_btree_mut();
-                return_if_io!(cursor.insert(&BTreeKey::new_index_key(record_to_insert)));
+                return_if_io!(
+                    cursor.insert(&BTreeKey::new_index_key(record_to_insert.as_record_ref()))
+                );
             }
             if flags.has(IdxInsertFlags::NCHANGE) {
                 state.record_rows_written(1);
@@ -10640,11 +11068,7 @@ fn new_rowid_inner(
                 {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
-                    // We have an optimization in the btree cursor to not seek if we know the rightmost page and are already on it.
-                    // However, this optimization should NOT never performed in cases where we cannot be sure that the btree wasn't modified from under us
-                    // e.g. by a trigger subprogram.
-                    let always_seek = program.contains_trigger_subprograms;
-                    return_if_io!(cursor.seek_to_last(always_seek));
+                    return_if_io!(cursor.seek_to_last());
                 }
                 if mvcc_already_initialized {
                     *state.active_op_state.new_rowid() = OpNewRowidState::GoNext;
@@ -12025,12 +12449,12 @@ const SEQ_COMMIT_STATUS_CONFLICT_RETRY: i64 = 1;
 /// "no prior mv_tx for this db" (must be restored to `None`).
 fn encode_saved_outer_mv_tx(
     outer: Option<(TxID, crate::translate::emitter::TransactionMode)>,
-) -> Vec<u8> {
+) -> crate::ValueBlob {
     use crate::translate::emitter::TransactionMode;
     let Some((tx_id, mode)) = outer else {
-        return Vec::new();
+        return crate::alloc::vec![];
     };
-    let mut buf = Vec::with_capacity(9);
+    let mut buf = <crate::ValueBlob as TursoVecExt<u8>>::with_capacity(9);
     buf.extend_from_slice(&tx_id.to_le_bytes());
     let mode_tag: u8 = match mode {
         TransactionMode::None => 0,
@@ -12104,7 +12528,7 @@ pub fn op_sequence_begin_inner_tx(
         // WAL mode: no inner tx needed. The WAL single-writer lock
         // already serializes writes across processes.
         state.registers[*path_kind_reg].set_value(Value::from_i64(SEQ_PATH_SKIPPED));
-        state.registers[*saved_outer_reg].set_value(Value::Blob(Vec::new()));
+        state.registers[*saved_outer_reg].set_value(Value::Blob(crate::alloc::vec![]));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     };
@@ -12113,7 +12537,7 @@ pub fn op_sequence_begin_inner_tx(
     if let Some((outer_id, _)) = outer_tx {
         if mv_store.is_exclusive_tx(&outer_id) {
             state.registers[*path_kind_reg].set_value(Value::from_i64(SEQ_PATH_SKIPPED));
-            state.registers[*saved_outer_reg].set_value(Value::Blob(Vec::new()));
+            state.registers[*saved_outer_reg].set_value(Value::Blob(crate::alloc::vec![]));
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
@@ -12562,6 +12986,7 @@ fn op_parse_schema_step(
                     &mut inner.dbsp_state_index_roots,
                     &mut inner.materialized_view_info,
                     &attached_resolver,
+                    conn.dialect().as_ref(),
                 )?;
                 continue;
             }
@@ -13251,11 +13676,10 @@ pub fn op_concat(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Concat { lhs, rhs, dest }, insn);
-    state.registers[*dest].set_value(
-        state.registers[*lhs]
-            .get_value()
-            .exec_concat(state.registers[*rhs].get_value()),
-    );
+    let value = state.registers[*lhs]
+        .get_value()
+        .exec_concat(state.registers[*rhs].get_value())?;
+    state.registers[*dest].set_value(value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -13804,6 +14228,7 @@ pub enum OpIntegrityCheckState {
     CheckingBTreeStructure {
         errors: Vec<IntegrityCheckError>,
         current_root_idx: usize,
+        current_dropped_idx: usize,
         state: IntegrityCheckState,
     },
 }
@@ -13819,6 +14244,7 @@ pub fn op_integrity_check(
             db,
             max_errors,
             roots,
+            dropped_roots,
             message_register,
         },
         insn
@@ -13831,11 +14257,17 @@ pub fn op_integrity_check(
     } else {
         program.get_pager_from_database_index(db)?
     };
+    // Passive MVCC: read page-1 freelist fields from the pager; the MVCC header can lag.
+    let passive = mv_store.is_some()
+        && program
+            .connection
+            .experimental_mvcc_passive_checkpoint_enabled();
+    let physical_header_store = if passive { None } else { mv_store.as_ref() };
     match state.active_op_state.integrity_check() {
         OpIntegrityCheckState::Start => {
             let (freelist_trunk_page, db_size) = return_if_io!(with_header(
                 &target_pager,
-                mv_store.as_ref(),
+                physical_header_store,
                 program,
                 *db,
                 |header| (header.freelist_trunk_page.get(), header.database_size.get())
@@ -13847,7 +14279,7 @@ pub fn op_integrity_check(
             if freelist_trunk_page > 0 {
                 let expected_freelist_count = return_if_io!(with_header(
                     &target_pager,
-                    mv_store.as_ref(),
+                    physical_header_store,
                     program,
                     *db,
                     |header| { header.freelist_pages.get() }
@@ -13868,11 +14300,13 @@ pub fn op_integrity_check(
                     errors,
                     state: integrity_check_state,
                     current_root_idx,
+                    current_dropped_idx: 0,
                 };
         }
         OpIntegrityCheckState::CheckingBTreeStructure {
             errors,
             current_root_idx,
+            current_dropped_idx,
             state: integrity_check_state,
         } => {
             return_if_io!(integrity_check(
@@ -13884,11 +14318,10 @@ pub fn op_integrity_check(
 
             if errors.len() >= *max_errors {
                 errors.truncate(*max_errors);
-                let message = format_integrity_check_result(errors);
-                match message {
+                match format_integrity_check_result(errors) {
                     Some(msg) => state.registers[*message_register].set_text(Text::new(msg))?,
                     None => state.registers[*message_register].set_null(),
-                };
+                }
                 state.active_op_state.clear();
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
@@ -13897,6 +14330,19 @@ pub fn op_integrity_check(
             if *current_root_idx < roots.len() {
                 integrity_check_state.start(roots[*current_root_idx], PageCategory::Normal, errors);
                 *current_root_idx += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+
+            while *current_dropped_idx < dropped_roots.len() {
+                let dropped_root = dropped_roots[*current_dropped_idx];
+                *current_dropped_idx += 1;
+                if integrity_check_state
+                    .page_reference
+                    .contains_key(&dropped_root)
+                {
+                    continue;
+                }
+                integrity_check_state.start(dropped_root, PageCategory::Normal, errors);
                 return Ok(InsnFunctionStepResult::Step);
             }
 
@@ -13942,11 +14388,10 @@ pub fn op_integrity_check(
             }
 
             errors.truncate(*max_errors);
-            let message = format_integrity_check_result(errors);
-            match message {
+            match format_integrity_check_result(errors) {
                 Some(msg) => state.registers[*message_register].set_text(Text::new(msg))?,
                 None => state.registers[*message_register].set_null(),
-            };
+            }
             state.active_op_state.clear();
             state.pc += 1;
         }
@@ -13969,7 +14414,7 @@ pub fn op_cast(
         Affinity::Numeric => value.exec_cast("NUMERIC"),
         Affinity::Integer => value.exec_cast("INTEGER"),
         Affinity::Real => value.exec_cast("REAL"),
-    };
+    }?;
 
     state.registers[*reg].set_value(result);
     state.pc += 1;
@@ -15898,6 +16343,19 @@ pub struct OpJournalModeState {
     pub bootstrap_guard: Option<MvccBootstrapGuard>,
 }
 
+impl OpJournalModeState {
+    pub(super) fn cleanup_checkpoint(&mut self) -> Result<()> {
+        let Some(mut checkpoint_sm) = self.checkpoint_sm.take() else {
+            return Ok(());
+        };
+        checkpoint_sm
+            .inner_mut()
+            .cleanup_after_external_io_error(LimboError::InternalError(
+                "mvcc: abandoned journal-mode checkpoint".to_string(),
+            ))
+    }
+}
+
 /// Restores in-memory MVCC state if a `PRAGMA journal_mode=mvcc` bootstrap is
 /// abandoned (statement reset/dropped) or errors after the connection has been
 /// demoted and the shared `MvStore` installed.
@@ -16035,6 +16493,41 @@ fn op_journal_mode_inner(
                     return Err(LimboError::ReadOnly);
                 }
 
+                // CDC capture is connection-level state that feeds off the
+                // current journal mode's write path. Changing the mode while
+                // capture is active silently stops capture while the capture
+                // pragma still reports it as on. Reject the change loudly
+                // (0.6 rejected it with "cannot enable MVCC while CDC is
+                // active"; that guard was lost in the logical log v3
+                // redesign). A no-op re-run of the current mode is fine —
+                // the same-mode early return above already handled it.
+                if program.connection.get_capture_data_changes_info().is_some() {
+                    let prev: &'static str = prev_mode.into();
+                    let new: &'static str = new_mode.into();
+                    return Err(LimboError::InvalidArgument(format!(
+                        "cannot change journal_mode (from {prev} to {new}) while CDC capture is active: \
+                         capture would silently stop; disable capture first with \
+                         PRAGMA capture_data_changes_conn('off')"
+                    )));
+                }
+
+                // MVCC has no cross-process coordination: commit
+                // serialization, the logical-log append offset, and
+                // checkpoint exclusion are all process-local, so switching a
+                // multiprocess-coordinated database to MVCC would silently
+                // lose committed transactions and corrupt live views.
+                if matches!(new_mode, journal_mode::JournalMode::Mvcc)
+                    && program
+                        .connection
+                        .db
+                        .experimental_multiprocess_wal_enabled()
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "journal_mode=mvcc is not supported with experimental multiprocess WAL: MVCC does not support multiprocess access"
+                            .to_string(),
+                    ));
+                }
+
                 state.active_op_state.journal_mode().new_mode = Some(new_mode);
                 state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::Checkpoint;
             }
@@ -16053,6 +16546,10 @@ fn op_journal_mode_inner(
                                 true,
                                 program.connection.get_sync_mode(),
                                 *db,
+                                // Changing journal mode requires the WAL fully reset.
+                                CheckpointMode::Truncate {
+                                    upper_bound_inclusive: None,
+                                },
                             ))));
                     }
 
@@ -16146,6 +16643,10 @@ fn op_journal_mode_inner(
                         program.connection.db.durable_storage.clone(),
                         enc_ctx,
                         program.connection.db.mv_store_allocator.clone(),
+                        program
+                            .connection
+                            .db
+                            .experimental_mvcc_passive_checkpoint_enabled(),
                     )?;
                     // Arm the abandonment guard *before* the irreversible
                     // store install + demote so a reset/drop at any subsequent
@@ -16556,6 +17057,7 @@ fn op_vacuum_into_inner(
                     OpenFlags::Create,
                     output_opts,
                     None,
+                    source_db.dialect(),
                 )?;
                 let output_conn = output_db.connect()?;
                 output_conn.reset_page_size(page_size)?;
@@ -16755,6 +17257,7 @@ mod tests {
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
+    use crate::SqliteDialect;
     use crate::{Database, DatabaseOpts, MemoryIO, IO};
 
     fn prepare_test_statement() -> Statement {
@@ -16765,6 +17268,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -16825,6 +17329,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -16889,6 +17394,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_attach(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -16950,6 +17456,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -16994,6 +17501,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();
@@ -17545,6 +18053,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect().unwrap();

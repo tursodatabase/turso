@@ -548,7 +548,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "first value must be sparse vector".to_string(),
                         ));
                     };
-                    let vector = Vector::from_vec(vector.to_vec())?;
+                    let vector = Vector::from_slice_owned(vector)?;
                     if !matches!(vector.vector_type, VectorType::Float32Sparse) {
                         return Err(LimboError::InternalError(
                             "first value must be sparse vector".to_string(),
@@ -617,9 +617,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in SeekInverted state".to_string(),
                         ));
                     };
-                    let result =
-                        return_if_io!(inverted_cursor
-                            .seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true }));
+                    let result = return_if_io!(inverted_cursor.seek(
+                        SeekKey::IndexKey(k.as_record_ref()),
+                        SeekOp::GE { eq_only: true }
+                    ));
                     tracing::debug!("insert_state: seek: result={:?}", result);
                     self.insert_state = VectorSparseInvertedIndexInsertState::InsertInverted {
                         vector: vector.take(),
@@ -641,7 +642,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in InsertInverted state".to_string(),
                         ));
                     };
-                    return_if_io!(inverted_cursor.insert(&BTreeKey::IndexKey(k)));
+                    return_if_io!(inverted_cursor.insert(&BTreeKey::IndexKey(k.as_record_ref())));
 
                     let Some(v) = vector.as_ref() else {
                         return Err(LimboError::InternalError(
@@ -670,9 +671,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in SeekStats state".to_string(),
                         ));
                     };
-                    let result = return_if_io!(
-                        stats_cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
-                    );
+                    let result = return_if_io!(stats_cursor.seek(
+                        SeekKey::IndexKey(k.as_record_ref()),
+                        SeekOp::GE { eq_only: true },
+                    ));
                     match result {
                         SeekResult::Found => {
                             self.insert_state = VectorSparseInvertedIndexInsertState::ReadStats {
@@ -767,7 +769,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in UpdateStats state".to_string(),
                         ));
                     };
-                    return_if_io!(stats_cursor.insert(&BTreeKey::IndexKey(k)));
+                    return_if_io!(stats_cursor.insert(&BTreeKey::IndexKey(k.as_record_ref())));
 
                     self.insert_state = VectorSparseInvertedIndexInsertState::Prepare {
                         vector: vector.take(),
@@ -800,7 +802,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "first value must be sparse vector".to_string(),
                         ));
                     };
-                    let vector = Vector::from_vec(vector.to_vec())?;
+                    let vector = Vector::from_slice_owned(vector)?;
                     if !matches!(vector.vector_type, VectorType::Float32Sparse) {
                         return Err(LimboError::InternalError(
                             "first value must be sparse vector".to_string(),
@@ -877,9 +879,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in SeekInverted state".to_string(),
                         ));
                     };
-                    let result = return_if_io!(
-                        cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
-                    );
+                    let result = return_if_io!(cursor.seek(
+                        SeekKey::IndexKey(k.as_record_ref()),
+                        SeekOp::GE { eq_only: true },
+                    ));
                     match result {
                         SeekResult::Found => {
                             self.delete_state =
@@ -900,7 +903,9 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 };
                         }
                         SeekResult::NotFound => {
-                            return Err(LimboError::Corrupt("inverted index corrupted".to_string()))
+                            return Err(LimboError::Corrupt(
+                                "inverted index corrupted".to_string(),
+                            ));
                         }
                     }
                 }
@@ -955,9 +960,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in SeekStats state".to_string(),
                         ));
                     };
-                    let result = return_if_io!(
-                        stats_cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
-                    );
+                    let result = return_if_io!(stats_cursor.seek(
+                        SeekKey::IndexKey(k.as_record_ref()),
+                        SeekOp::GE { eq_only: true },
+                    ));
                     match result {
                         SeekResult::Found => {
                             self.delete_state = VectorSparseInvertedIndexDeleteState::ReadStats {
@@ -970,7 +976,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         SeekResult::NotFound | SeekResult::TryAdvance => {
                             return Err(LimboError::Corrupt(
                                 "stats index corrupted: can't find component row".to_string(),
-                            ))
+                            ));
                         }
                     }
                 }
@@ -1024,7 +1030,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in UpdateStats state".to_string(),
                         ));
                     };
-                    return_if_io!(stats_cursor.insert(&BTreeKey::IndexKey(k)));
+                    return_if_io!(stats_cursor.insert(&BTreeKey::IndexKey(k.as_record_ref())));
 
                     self.delete_state = VectorSparseInvertedIndexDeleteState::Prepare {
                         vector: vector.take(),
@@ -1067,7 +1073,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "second value must be i64 limit parameter".to_string(),
                         ));
                     };
-                    let vector = Vector::from_vec(vector.to_vec())?;
+                    let vector = Vector::from_slice_owned(vector)?;
                     if !matches!(vector.vector_type, VectorType::Float32Sparse) {
                         return Err(LimboError::InternalError(
                             "first value must be sparse vector".to_string(),
@@ -1160,9 +1166,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in CollectComponentsSeek state".to_string(),
                         ));
                     };
-                    let result = return_if_io!(
-                        stats.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
-                    );
+                    let result = return_if_io!(stats.seek(
+                        SeekKey::IndexKey(k.as_record_ref()),
+                        SeekOp::GE { eq_only: true },
+                    ));
                     match result {
                         SeekResult::Found => {
                             self.search_state =
@@ -1306,9 +1313,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             "key must be present in Seek state".to_string(),
                         ));
                     };
-                    let result = return_if_io!(
-                        inverted.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: false })
-                    );
+                    let result = return_if_io!(inverted.seek(
+                        SeekKey::IndexKey(k.as_record_ref()),
+                        SeekOp::GE { eq_only: false },
+                    ));
                     match result {
                         SeekResult::Found => {
                             let Some(comp) = component.take() else {
@@ -1532,7 +1540,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 "table column value must be sparse vector".to_string(),
                             ));
                         };
-                        let data = Vector::from_vec(data.to_vec())?;
+                        let data = Vector::from_slice_owned(data)?;
                         if !matches!(data.vector_type, VectorType::Float32Sparse) {
                             return Err(LimboError::InternalError(
                                 "table column value must be sparse vector".to_string(),
@@ -1543,7 +1551,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 "first value must be sparse vector".to_string(),
                             ));
                         };
-                        let arg = Vector::from_vec(arg.to_vec())?;
+                        let arg = Vector::from_slice_owned(arg)?;
                         if !matches!(arg.vector_type, VectorType::Float32Sparse) {
                             return Err(LimboError::InternalError(
                                 "first value must be sparse vector".to_string(),

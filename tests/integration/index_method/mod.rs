@@ -34,7 +34,7 @@ fn run<T>(db: &TempDatabase, mut f: impl FnMut() -> Result<IOResult<T>>) -> Resu
 
 fn sparse_vector(v: &str) -> Value {
     let vector = vector::operations::text::vector_from_text(VectorType::Float32Sparse, v).unwrap();
-    vector::operations::serialize::vector_serialize(vector)
+    vector::operations::serialize::vector_serialize(vector).expect(turso_core::alloc::ALLOC_ERR_MSG)
 }
 
 // TODO: cannot use MVCC as we use indexes here
@@ -2310,4 +2310,51 @@ fn test_fts_multi_table_join(tmp_db: TempDatabase) {
         .collect();
     assert!(titles.contains(&"Database Systems".to_string()));
     assert!(titles.contains(&"SQL Performance".to_string()));
+}
+
+/// Regression test for issue 7522: a rolled-back transaction containing FTS
+/// writes and OPTIMIZE INDEX must not leave the shared directory cache
+/// pointing at segment files whose BTree rows were rolled back. Before the
+/// fix, the next write against the index failed with
+/// `FileDoesNotExist("<uuid>.term")`.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[test]
+fn fts_rolled_back_optimize_does_not_leak_segment_state() {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT, f TEXT, b BLOB)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx ON t USING fts(f)").unwrap();
+    conn.execute(
+        "INSERT INTO t(id,x,f,b) VALUES (270323, 'x', 'optimize', X'01'), (-596572, NULL, 'foo', X'02')",
+    )
+    .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("UPDATE t SET b=X'D9', f='rust token full search text search rollback'")
+        .unwrap();
+    conn.execute("OPTIMIZE INDEX idx").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    // Writes after the rollback must see the pre-transaction index state.
+    conn.execute("INSERT INTO t(id) VALUES (32378), (NULL), (524997)")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE x").unwrap();
+
+    // The rolled-back UPDATE must not be searchable; the surviving row is.
+    let hits = limbo_exec_rows(&conn, "SELECT id FROM t WHERE f MATCH 'foo'");
+    assert_eq!(
+        hits.len(),
+        1,
+        "pre-transaction document must remain searchable"
+    );
+    let rolled_back = limbo_exec_rows(&conn, "SELECT id FROM t WHERE f MATCH 'rollback'");
+    assert!(
+        rolled_back.is_empty(),
+        "rolled-back document must not be searchable"
+    );
 }

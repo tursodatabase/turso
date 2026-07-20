@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 use turso_core::partition::{DefaultPathResolver, PartitionConfig};
-use turso_core::{Database, LimboError, Numeric, PlatformIO, Result, Value};
+use turso_core::{Database, LimboError, Numeric, PlatformIO, Result, SqliteDialect, Value};
 
 /// Microseconds per minute
 const MICROS_PER_MINUTE: i64 = 60 * 1_000_000;
@@ -43,7 +43,11 @@ fn main() -> Result<()> {
     println!("--- Part 1: Creating Database and Partitioned Table ---\n");
 
     let io = Arc::new(PlatformIO::new()?);
-    let db = Database::open_file(io.clone(), db_path.to_str().unwrap())?;
+    let db = Database::open_file(
+        io.clone(),
+        db_path.to_str().unwrap(),
+        Arc::new(SqliteDialect),
+    )?;
     let conn = db.connect()?;
 
     // Create a partitioned table for trigonometric data

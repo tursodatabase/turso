@@ -1,11 +1,31 @@
 [__meta__]
 schema_version = 1
 canon_version = "v0.1.0"
-last_fetched = "2026-05-30T06:00:12.353Z"
+last_fetched = "2026-07-07T07:53:35.240089285Z"
 
 [aret_4mbjdhds]
 last_match_text_hash = "sha256:9d400437abc7d933b5a5f93bdc8bef54c9f0dbc03d029683fd41dbfe40b5bc16"
 canon_fetched_at = "2026-05-26T06:22:36.7271Z"
+
+["aristos:wal_checkpoint_backfill_crash_atomic"]
+last_match_text_hash = "sha256:964113cb0dc5eb70d66767acf6391b0a93398867ba7eabf81a7364058b6b8747"
+canon_fetched_at = "2026-07-07T07:54:27Z"
+
+[["aristos:wal_checkpoint_backfill_crash_atomic".accepted_matches]]
+canon_id = "wal_checkpoint_backfill_crash_atomic"
+version = "v0.1.0"
+canonical_text = "Checkpoint backfill copies a log frame into the main database file only after that frame is durable in the log, so a crash can never recover a database torn between persisted backfill pages and dropped log frames"
+canon_version = "v0.1.0"
+confidence = 0.9763275354539468
+prefix_tier = "aristos:"
+backed_by = "model-derived crash-consistency differential test"
+linked = "arta_e93bbba0b482550ba1a513e42a0c7c42"
+accepted_at = "2026-07-07T07:54:27Z"
+bound_at = "2026-07-07T07:54:27Z"
+
+["aristos:wal_checkpoint_backfill_crash_atomic".accepted_matches.verification]
+coverage_level = "partial"
+test_binaries = []
 
 ["aristos:wal_checkpoint_error_no_db_leak"]
 last_match_text_hash = "sha256:99cf0a4664b81492fcaf3eaace7c7ab17a51261a6c340c7cad8faae4be7d45cc"
@@ -113,6 +133,14 @@ backed_by = "golden model + proofs + differential testing"
 linked = "arta_013316bc46e9af51cf52612fe2533e90"
 accepted_at = "2026-05-30T05:43:56Z"
 bound_at = "2026-05-30T05:43:56Z"
+
+[savepoint_rollback_shape_and_bytes_consistent]
+last_match_text_hash = "sha256:9eb52c41e3fcf89d2515efa52befc82509297ce3c657585352714afe61147e87"
+canon_fetched_at = "2026-07-07T07:53:35.241472796Z"
+
+[wal_checkpoint_backfill_crash_atomic]
+last_match_text_hash = "sha256:964113cb0dc5eb70d66767acf6391b0a93398867ba7eabf81a7364058b6b8747"
+canon_fetched_at = "2026-07-07T07:53:35.241472796Z"
 
 [wal_checkpoint_error_no_db_leak]
 last_match_text_hash = "sha256:99cf0a4664b81492fcaf3eaace7c7ab17a51261a6c340c7cad8faae4be7d45cc"

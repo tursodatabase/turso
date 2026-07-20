@@ -1,0 +1,41 @@
+@database :memory:
+
+test jsonb_group_object_integer_label {
+	SELECT hex(jsonb_group_object(1, 2)),
+		   json(jsonb_group_object(1, 2));
+}
+expect {
+	4C17311332|{"1":2}
+}
+
+test jsonb_group_object_real_label {
+	SELECT hex(jsonb_group_object(1.5, 2)),
+		   json(jsonb_group_object(1.5, 2));
+}
+expect {
+	6C37312E351332|{"1.5":2}
+}
+
+test jsonb_group_object_text_numeric_label_unchanged {
+	SELECT hex(jsonb_group_object('1', 2)),
+		   json(jsonb_group_object('1', 2));
+}
+expect {
+	4C17311332|{"1":2}
+}
+
+test jsonb_group_object_numeric_column_labels {
+	CREATE TABLE t(label, value);
+	INSERT INTO t VALUES (1, 2), (1.5, 3);
+	SELECT json(jsonb_group_object(label, value)) FROM t;
+}
+expect {
+	{"1":2,"1.5":3}
+}
+
+test jsonb_group_object_does_not_stringify_value {
+	SELECT json(jsonb_group_object(1, jsonb_array(2)));
+}
+expect {
+	{"1":[2]}
+}

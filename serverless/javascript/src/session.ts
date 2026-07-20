@@ -101,12 +101,19 @@ export class Session {
     this.baseUrl = normalizeUrl(config.url);
   }
 
-  private httpContext(): HttpContext {
+  private httpContext(queryOptions?: QueryOptions): HttpContext {
+    // Per-query headers are merged over the session-level ones, so a query
+    // can override a header the session sets (and both override the
+    // standard headers).
+    let requestHeaders = this.config.requestHeaders;
+    if (queryOptions?.requestHeaders) {
+      requestHeaders = { ...requestHeaders, ...queryOptions.requestHeaders };
+    }
     return {
       url: this.baseUrl,
       authToken: this.config.authToken,
       remoteEncryptionKey: this.config.remoteEncryptionKey,
-      requestHeaders: this.config.requestHeaders,
+      requestHeaders,
     };
   }
 
@@ -168,7 +175,7 @@ export class Session {
 
     let response;
     try {
-      response = await executePipeline(this.httpContext(), request, this.createAbortSignal(queryOptions));
+      response = await executePipeline(this.httpContext(queryOptions), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
       this.autocommit = true;
@@ -198,7 +205,7 @@ export class Session {
 
   /**
    * Execute a SQL statement and return all results.
-   * 
+   *
    * @param sql - The SQL statement to execute
    * @param args - Optional array of parameter values or object with named parameters
    * @param safeIntegers - Whether to return integers as BigInt
@@ -211,8 +218,61 @@ export class Session {
   }
 
   /**
+   * A trailing batch step gated on `is_autocommit`, appended to every cursor
+   * request. The cursor endpoint cannot carry a `get_autocommit` probe, so
+   * whether this step executed tells us the connection's transaction state
+   * without an extra round trip.
+   */
+  private static autocommitProbeStep(): BatchStep {
+    return {
+      stmt: { sql: 'SELECT 1', args: [], named_args: [], want_rows: false },
+      condition: { type: 'is_autocommit' },
+    };
+  }
+
+  /**
+   * Filter the probe step's entries out of a cursor stream and update the
+   * cached transaction state from whether the probe executed. The probe is
+   * always the last step, so everything after its step_begin belongs to it.
+   *
+   * If the stream ends abnormally (fatal error entry, a probe error, or the
+   * consumer stops iterating early) the probe answer is unreliable, so the
+   * state is refreshed with a fallback pipeline request instead.
+   */
+  private async *trackAutocommit(entries: AsyncGenerator<CursorEntry>, probeIdx: number, queryOptions?: QueryOptions): AsyncGenerator<CursorEntry> {
+    let sawProbe = false;
+    let unreliable = false;
+    let completed = false;
+    try {
+      for await (const entry of entries) {
+        if (entry.type === 'step_begin' && entry.step === probeIdx) {
+          sawProbe = true;
+          continue;
+        }
+        if (sawProbe && (entry.type === 'row' || entry.type === 'step_end')) {
+          continue;
+        }
+        if (entry.type === 'error' || (entry.type === 'step_error' && entry.step === probeIdx)) {
+          unreliable = true;
+          if (entry.type === 'step_error') {
+            continue;
+          }
+        }
+        yield entry;
+      }
+      completed = true;
+    } finally {
+      if (completed && !unreliable) {
+        this.autocommit = sawProbe;
+      } else {
+        await this.refreshAutocommit(queryOptions);
+      }
+    }
+  }
+
+  /**
    * Execute a SQL statement and return the raw response and entries.
-   * 
+   *
    * @param sql - The SQL statement to execute
    * @param args - Optional array of parameter values or object with named parameters
    * @returns Promise resolving to the raw response and cursor entries
@@ -230,15 +290,16 @@ export class Session {
             named_args: encodedArgs.namedArgs,
             want_rows: true
           }
-        }]
+        }, Session.autocommitProbeStep()]
       }
     };
 
     let result;
     try {
-      result = await executeCursor(this.httpContext(), request, this.createAbortSignal(queryOptions));
+      result = await executeCursor(this.httpContext(queryOptions), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
+      this.autocommit = true;
       throw e;
     }
 
@@ -248,7 +309,35 @@ export class Session {
       this.baseUrl = response.base_url;
     }
 
-    return { response, entries };
+    return { response, entries: this.trackAutocommit(entries, 1, queryOptions) };
+  }
+
+  /**
+   * Refresh the cached transaction state with a standalone `get_autocommit`
+   * pipeline request. Errors are not rethrown — this runs from generator
+   * cleanup where an exception would mask the original failure; a dead stream
+   * means the server rolled back, so the state resets to autocommit instead.
+   */
+  private async refreshAutocommit(queryOptions?: QueryOptions): Promise<void> {
+    const request: PipelineRequest = {
+      baton: this.baton,
+      requests: [{ type: 'get_autocommit' } as GetAutocommitRequest],
+    };
+
+    let response;
+    try {
+      response = await executePipeline(this.httpContext(), request, this.createAbortSignal(queryOptions));
+    } catch {
+      this.baton = null;
+      this.autocommit = true;
+      return;
+    }
+
+    this.baton = response.baton;
+    if (response.base_url) {
+      this.baseUrl = response.base_url;
+    }
+    this.updateAutocommit(response);
   }
 
   /**
@@ -425,16 +514,18 @@ export class Session {
       ];
     }
 
+    const probeIdx = steps.length;
     const request: CursorRequest = {
       baton: this.baton,
-      batch: { steps },
+      batch: { steps: [...steps, Session.autocommitProbeStep()] },
     };
 
     let batchResult;
     try {
-      batchResult = await executeCursor(this.httpContext(), request, this.createAbortSignal(queryOptions));
+      batchResult = await executeCursor(this.httpContext(queryOptions), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
+      this.autocommit = true;
       throw e;
     }
 
@@ -473,7 +564,14 @@ export class Session {
       return undefined;
     };
 
-    for await (const entry of entries) {
+    for await (const entry of this.trackAutocommit(entries, probeIdx, queryOptions)) {
+      // Once a step has errored the whole batch will throw, so stop
+      // decoding and buffering later steps' results while draining the
+      // rest of the stream for the probe. Fatal stream errors still
+      // surface below.
+      if (deferredError !== null && entry.type !== 'error') {
+        continue;
+      }
       switch (entry.type) {
         case 'step_begin':
           currentResultIdx = stepToResultIdx(entry.step);
@@ -510,15 +608,12 @@ export class Session {
           break;
         }
         case 'step_error':
-          if (mode === undefined) {
-            throw new DatabaseError(entry.error?.message || 'Batch execution failed', entry.error?.code);
-          }
-          // Atomic batch: capture the first error from BEGIN, any user
-          // step, or COMMIT and keep draining so ROLLBACK has a chance
-          // to clean up. Errors on the synthetic ROLLBACK step are
-          // suppressed — by the time it runs the transaction has
-          // already been undone and surfacing a ROLLBACK error would
-          // mask the real cause we already captured.
+          // Capture the first error from BEGIN, any user step, or COMMIT
+          // and keep draining so the trailing probe (and, in atomic mode,
+          // ROLLBACK) is still observed. Errors on the synthetic ROLLBACK
+          // step are suppressed — by the time it runs the transaction has
+          // already been undone and surfacing a ROLLBACK error would mask
+          // the real cause we already captured.
           if (deferredError === null && entry.step !== rollbackIdx) {
             deferredError = new DatabaseError(entry.error?.message || 'Batch execution failed', entry.error?.code);
           }
@@ -553,7 +648,7 @@ export class Session {
 
     let seqResponse;
     try {
-      seqResponse = await executePipeline(this.httpContext(), request, this.createAbortSignal(queryOptions));
+      seqResponse = await executePipeline(this.httpContext(queryOptions), request, this.createAbortSignal(queryOptions));
     } catch (e) {
       this.baton = null;
       this.autocommit = true;

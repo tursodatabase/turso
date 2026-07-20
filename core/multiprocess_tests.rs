@@ -29,6 +29,10 @@ const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
 const MULTIPROCESS_SHM_EXPECT_OPEN_FAILURE_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_expect_open_failure_child_process";
 const DEFAULT_LOCKED_DB_CHILD_TEST: &str = "multiprocess_tests::default_locked_db_child_process";
+const MULTIPROCESS_ASYNC_OPEN_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_async_open_child_process";
+const MULTIPROCESS_HOLD_OPEN_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_hold_open_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
@@ -130,7 +134,27 @@ fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
         OpenFlags::default(),
         multiprocess_wal_db_opts(),
         None,
+        Arc::new(SqliteDialect),
     )
+}
+
+/// Mimic the sdk-kit async open path: the caller pre-opens the DB file with
+/// NoLock but hands `OpenFlags::default()` to `open_async`, so the async
+/// entrypoint itself must re-derive the multiprocess lock mode before the WAL
+/// file is opened.
+fn open_multiprocess_db_async(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
+    let file = io.open_file(path, OpenFlags::default() | OpenFlags::NoLock, true)?;
+    let db_file = Arc::new(DatabaseFile::new(file));
+    let options = OpenOptions::new(Arc::new(SqliteDialect))
+        .storage(db_file)
+        .db_opts(multiprocess_wal_db_opts());
+    let mut state = OpenDbAsyncState::new();
+    loop {
+        match Database::open_async(&mut state, io.clone(), path, &options)? {
+            IOResult::Done(db) => return Ok(db),
+            IOResult::IO(io_completion) => io_completion.wait(&*io)?,
+        }
+    }
 }
 
 fn open_multiprocess_db_with_flags(
@@ -138,7 +162,14 @@ fn open_multiprocess_db_with_flags(
     path: &str,
     flags: OpenFlags,
 ) -> Result<Arc<Database>> {
-    Database::open_file_with_flags(io, path, flags, multiprocess_wal_db_opts(), None)
+    Database::open_file_with_flags(
+        io,
+        path,
+        flags,
+        multiprocess_wal_db_opts(),
+        None,
+        Arc::new(SqliteDialect),
+    )
 }
 
 #[test]
@@ -228,7 +259,7 @@ fn database_open_without_experimental_multiprocess_wal_uses_in_process_backend()
     let db_path = dir.path().join("coordination-default-off.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let db = Database::open_file(io, db_path_str).unwrap();
+    let db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -248,7 +279,7 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_process() 
     let db_path = dir.path().join("coordination-default-locked.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let _db = Database::open_file(io, db_path_str).unwrap();
+    let _db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
     let child_output = Command::new(&current_exe)
@@ -275,11 +306,55 @@ fn database_open_with_experimental_multiprocess_wal_rejects_unsupported_io_backe
         OpenFlags::default(),
         multiprocess_wal_db_opts(),
         None,
+        Arc::new(SqliteDialect),
     )
     .expect_err("multiprocess WAL should reject IO backends without shared coordination");
     assert!(
         matches!(err, LimboError::InvalidArgument(ref message) if message.contains("active IO backend")),
         "expected InvalidArgument about unsupported IO backend, got {err:?}"
+    );
+}
+
+#[test]
+fn multiprocess_wal_rejects_journal_mode_mvcc_pragma() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("multiprocess-rejects-mvcc-pragma.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    let err = conn
+        .execute("PRAGMA journal_mode = mvcc")
+        .expect_err("switching a multiprocess-coordinated database to MVCC must be rejected");
+    assert!(
+        matches!(err, LimboError::InvalidArgument(ref message) if message.contains("multiprocess")),
+        "expected InvalidArgument about multiprocess WAL, got {err:?}"
+    );
+}
+
+#[test]
+fn multiprocess_wal_rejects_opening_mvcc_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("multiprocess-rejects-mvcc-open.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    {
+        let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("PRAGMA journal_mode = mvcc").unwrap();
+        conn.execute("insert into test(value) values ('mvcc-row')")
+            .unwrap();
+    }
+
+    let err = open_multiprocess_db(io, db_path_str)
+        .expect_err("opening an MVCC-marked database with multiprocess WAL must be rejected");
+    assert!(
+        matches!(err, LimboError::InvalidArgument(ref message) if message.contains("MVCC")),
+        "expected InvalidArgument about MVCC, got {err:?}"
     );
 }
 
@@ -291,7 +366,7 @@ fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     {
-        let db = Database::open_file(io.clone(), db_path_str).unwrap();
+        let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -336,7 +411,7 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_multiproce
         .join("coordination-default-parent-multiprocess-child.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let _db = Database::open_file(io, db_path_str).unwrap();
+    let _db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
     let child_output = Command::new(&current_exe)
@@ -351,6 +426,141 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_multiproce
         "multiprocess child process unexpectedly opened against default parent: stdout={}; stderr={}",
         String::from_utf8_lossy(&child_output.stdout),
         String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+#[test]
+fn database_open_async_with_default_flags_allows_second_multiprocess_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-async-open.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db_async(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(value) values ('parent')")
+        .unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let child_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_ASYNC_OPEN_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "second async multiprocess open must not be blocked by a WAL file lock: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
+#[test]
+fn multiprocess_async_open_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db_async(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db.connect().unwrap();
+    assert_eq!(count_test_rows(&conn), 1);
+}
+
+/// Child half of `reject_live_multiprocess_probe_uses_configured_wal_path`:
+/// open the multiprocess database, hold it open (keeping the authority in
+/// multiprocess mode), signal readiness, and wait for release before exiting.
+#[test]
+fn multiprocess_hold_open_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let release_file = std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let last = db.shared_wal.read().last_checksum_and_max_frame();
+    let wal = db.build_wal(last, db.buffer_pool.clone()).unwrap();
+    let wal_file = wal.as_any().downcast_ref::<WalFile>().unwrap();
+    assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
+
+    std::fs::write(&ready_file, b"ready").unwrap();
+    wait_for_file(&release_file);
+}
+
+/// The legacy/multiprocess probe keys the coordination file off the configured
+/// WAL path, not a hard-coded `{path}-wal`. With a live multiprocess authority
+/// held open by a child process, the probe rejects a legacy open only when it
+/// inspects the WAL path that actually backs the authority; a probe pointed at
+/// a different WAL path finds nothing. Before the fix, the probe hard-coded
+/// `{path}-wal` and so missed the authority whenever a custom WAL path was in
+/// use.
+#[test]
+fn reject_live_multiprocess_probe_uses_configured_wal_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("probe-wal-path.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    // Parent keeps the multiprocess database open so a second (child) opener
+    // flips the authority into multiprocess mode.
+    let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_HOLD_OPEN_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready_file);
+
+    // Probing the WAL path that actually backs the authority finds it and
+    // rejects a legacy open.
+    let default_wal = format!("{db_path_str}-wal");
+    let err = Database::reject_live_multiprocess_wal_for_legacy_open(
+        &io,
+        db_path_str,
+        Some(&default_wal),
+        DatabaseOpts::new(),
+    )
+    .expect_err("legacy open over a live multiprocess authority must be rejected");
+    assert!(
+        matches!(err, LimboError::LockingError(_)),
+        "expected LockingError from the multiprocess probe, got {err:?}"
+    );
+
+    // Probing an unrelated WAL path must NOT reject: the coordination file is
+    // keyed on the WAL path, so the probe must honor its argument.
+    let other_wal = format!("{db_path_str}-other-wal");
+    Database::reject_live_multiprocess_wal_for_legacy_open(
+        &io,
+        db_path_str,
+        Some(&other_wal),
+        DatabaseOpts::new(),
+    )
+    .expect("probe over an unrelated wal path must not reject");
+
+    std::fs::write(&release_file, b"release").unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "hold-open child should exit cleanly after release"
     );
 }
 
@@ -719,7 +929,7 @@ fn default_locked_db_child_process() {
     };
 
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let err = Database::open_file(io, db_path.to_str().unwrap())
+    let err = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(SqliteDialect))
         .expect_err("default non-multiprocess open should stay DB-file locked across processes");
     assert!(
         matches!(err, LimboError::LockingError(_)),
@@ -943,6 +1153,7 @@ fn plain_vacuum_rejects_multiprocess_wal_database() {
         OpenFlags::default(),
         multiprocess_wal_db_opts().with_vacuum(true),
         None,
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db.connect().unwrap();
@@ -1169,6 +1380,50 @@ fn subprocess_database_open_parent_directly_uses_child_created_table() {
         .prepare("insert into child_table(value) values ('parent-schema')")
         .unwrap();
     stmt.run_ignore_rows().unwrap();
+
+    let child_rows =
+        get_rows_without_schema_retry(&conn, "select value from child_table order by rowid");
+    assert_eq!(child_rows.len(), 2);
+    assert_eq!(child_rows[0][0].to_string(), "child-schema");
+    assert_eq!(child_rows[1][0].to_string(), "parent-schema");
+}
+
+#[test]
+fn subprocess_database_open_parent_translated_stmt_uses_child_created_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("coordination-translated-child-table-use.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "child schema process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&schema_output.stdout),
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    let input = "insert into child_table(value) values ('parent-schema')";
+    let (cmd, _) = crate::dialect::sqlite::parse(input).unwrap();
+    let Some(turso_parser::ast::Cmd::Stmt(stmt)) = cmd else {
+        panic!("translated statement input did not parse as a statement");
+    };
+    conn.prepare_translated_stmt(stmt, input)
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
 
     let child_rows =
         get_rows_without_schema_retry(&conn, "select value from child_table order by rowid");
@@ -1730,7 +1985,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
 #[test]
 fn memory_database_keeps_in_process_wal_backend() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:").unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -1743,7 +1998,7 @@ fn memory_database_keeps_in_process_wal_backend() {
 #[test]
 fn memory_database_query_can_close_without_checkpointing() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:").unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
 
     conn.query("VALUES ('ok')").unwrap();

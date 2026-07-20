@@ -25,6 +25,12 @@ members = [
     "testing/sqlite_test_ext",
     "tests",
     "sqlite/parser",
+    "postgres/cli",
+    "postgres/frontend",
+    "postgres/parser",
+    "postgres/regress",
+    "postgres/server",
+    "postgres/tests",
     "sync/engine",
     "sync/sdk-kit",
     "sql_generation",
@@ -41,7 +47,7 @@ members = [
     "testing/differential-oracle/sql_gen_prop",
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
-    "testing/sqltests"
+    "testing/sqltest"
 ]
 exclude = ["perf/latency/limbo"]
 
@@ -68,6 +74,7 @@ default-members = [
     "testing/sqlite_test_ext",
     "tests",
     "sqlite/parser",
+    "postgres/tests",
     "sync/engine",
     "sync/sdk-kit",
     "sql_generation",
@@ -81,28 +88,31 @@ default-members = [
     "testing/differential-oracle/sql_gen_prop",
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
-    "testing/sqltests"
+    "testing/sqltest"
 ]
 
 [workspace.package]
-version = "0.7.0-pre.18"
+version = "0.7.0"
 authors = ["the Turso authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
-turso = { path = "bindings/rust", version = "0.7.0-pre.18" }
-turso_node = { path = "bindings/javascript", version = "0.7.0-pre.18" }
-turso_sdk_kit = { path = "sdk-kit", version = "0.7.0-pre.18" }
-turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.7.0-pre.18" }
-turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.7.0-pre.18" }
-limbo_completion = { path = "extensions/completion", version = "0.7.0-pre.18" }
-turso_core = { path = "core", version = "0.7.0-pre.18" }
-turso_sync_engine = { path = "sync/engine", version = "0.7.0-pre.18" }
-turso_ext = { path = "extensions/core", version = "0.7.0-pre.18" }
-turso_macros = { path = "macros", version = "0.7.0-pre.18" }
-turso_parser = { path = "sqlite/parser", version = "0.7.0-pre.18" }
+turso = { path = "bindings/rust", version = "0.7.0" }
+turso_node = { path = "bindings/javascript", version = "0.7.0" }
+turso_sdk_kit = { path = "sdk-kit", version = "0.7.0" }
+turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.7.0" }
+turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.7.0" }
+limbo_completion = { path = "extensions/completion", version = "0.7.0" }
+turso_core = { path = "core", version = "0.7.0" }
+turso_sync_engine = { path = "sync/engine", version = "0.7.0" }
+turso_ext = { path = "extensions/core", version = "0.7.0" }
+turso_macros = { path = "macros", version = "0.7.0" }
+turso_parser = { path = "sqlite/parser", version = "0.7.0" }
+turso_pg = { path = "postgres/frontend", version = "0.7.0" }
+turso_pg_parser = { path = "postgres/parser", version = "0.7.0" }
+turso_pg_server = { path = "postgres/server", version = "0.7.0" }
 sql_generation = { path = "sql_generation" }
 turso-dbhash = { path = "tools/dbhash" }
 strum = { version = "0.26", features = ["derive"] }

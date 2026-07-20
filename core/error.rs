@@ -65,6 +65,16 @@ pub enum LimboError {
     ReadOnly,
     #[error("Database is busy")]
     Busy,
+    /// A transaction-control or savepoint operation, or a second concurrent
+    /// write statement, was rejected because another statement on the same
+    /// connection is still in progress. This carries SQLITE_BUSY semantics at
+    /// the API surface (SQLite reports these as SQLITE_BUSY, e.g. "cannot
+    /// commit transaction - SQL statements in progress"), but unlike `Busy`
+    /// it is not retryable in place and must never invoke the busy handler:
+    /// waiting cannot help, only the application finishing or resetting its
+    /// own statement can. The payload names the rejected operation.
+    #[error("{0} - SQL statements in progress")]
+    StatementsInProgress(&'static str),
     #[error("interrupt")]
     Interrupt,
     #[error("Database snapshot is stale. You must rollback and retry the whole transaction.")]
@@ -93,6 +103,12 @@ pub enum LimboError {
     InvalidColumnType,
     #[error("Invalid blob size, expected {0}")]
     InvalidBlobSize(usize),
+    /// An incremental-blob handle was invalidated because the row it points to
+    /// (or its table) was modified after the handle was opened. Mirrors SQLite's
+    /// expired blob handles: every subsequent read/write must fail with
+    /// SQLITE_ABORT until the handle is closed.
+    #[error("Runtime error: blob handle expired")]
+    BlobHandleExpired,
     #[error("Planning error: {0}")]
     PlanningError(String),
     #[error("Checkpoint failed: {0}")]

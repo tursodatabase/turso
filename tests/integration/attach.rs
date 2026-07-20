@@ -6,6 +6,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
+use turso_core::SqliteDialect;
 use turso_core::{Database, DatabaseOpts, OpenFlags};
 
 const PAGE_SIZE_OFFSET: u64 = 16;
@@ -163,6 +164,7 @@ fn test_fresh_attach_inherits_mvcc_before_first_write(_tmp_db: TempDatabase) -> 
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
+        Arc::new(SqliteDialect),
     )?;
     let aux_conn = aux_db.connect()?;
     assert!(aux_conn.mvcc_enabled());
@@ -184,6 +186,7 @@ fn test_attach_rejects_initialized_page_size_mismatch(_tmp_db: TempDatabase) -> 
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
+        Arc::new(SqliteDialect),
     )?;
     let aux_conn = aux_db.connect()?;
     aux_conn.execute("CREATE TABLE t(x INTEGER)")?;
@@ -282,13 +285,14 @@ fn test_fresh_mvcc_attach_rejects_custom_durable_storage_without_attached_backen
         None,
     ));
 
-    let db = Database::open_file_with_flags_and_durable_storage(
+    let db = Database::open(
         tmp_db.io.clone(),
         db_path.to_str().unwrap(),
-        OpenFlags::default(),
-        DatabaseOpts::new().with_attach(true),
-        None,
-        Some(durable_storage),
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(DatabaseOpts::new().with_attach(true))
+            .durable_storage(
+                durable_storage as Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>,
+            ),
     )?;
     let conn = db.connect()?;
     conn.pragma_update("journal_mode", "'mvcc'")?;

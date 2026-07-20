@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use turso_core::partition::{
     DefaultPathResolver, PartitionConfig, PartitionPathResolver, VideoAnalyticsPathResolver,
 };
-use turso_core::{Connection, Database, PlatformIO, Value};
+use turso_core::{Connection, Database, PlatformIO, SqliteDialect, Value};
 
 const DAY_MICROS: i64 = 86_400_000_000;
 const FIRST_DAY: i64 = 1_735_689_600_000_000;
@@ -55,7 +55,11 @@ impl RecorderDatabase {
         let database_path = directory.path().join("recorder.db");
         let partitions_directory = directory.path().join("events");
         let io = Arc::new(PlatformIO::new()?);
-        let database = Database::open_file(io, database_path.to_string_lossy().as_ref())?;
+        let database = Database::open_file(
+            io,
+            database_path.to_string_lossy().as_ref(),
+            Arc::new(SqliteDialect),
+        )?;
         let connection = database.connect()?;
 
         connection.execute(format!("{EVENTS_SCHEMA} PARTITION BY (ts)"))?;
@@ -100,7 +104,8 @@ impl RecorderDatabase {
             std::fs::create_dir_all(parent)?;
         }
         let io = Arc::new(PlatformIO::new()?);
-        let database = Database::open_file(io, path.to_string_lossy().as_ref())?;
+        let database =
+            Database::open_file(io, path.to_string_lossy().as_ref(), Arc::new(SqliteDialect))?;
         let connection = database.connect()?;
         connection.execute(EVENTS_PARTITION_SCHEMA)?;
         connection.execute(format!(
@@ -263,8 +268,11 @@ fn recorder_reopens_a_partition_replaced_at_the_same_path() -> anyhow::Result<()
         .prepare("SELECT id, event_type FROM events ORDER BY id")?;
     let replacement_path = recorder.partitions_directory.join(".replacement.db");
     let replacement_io = Arc::new(PlatformIO::new()?);
-    let replacement_database =
-        Database::open_file(replacement_io, replacement_path.to_string_lossy().as_ref())?;
+    let replacement_database = Database::open_file(
+        replacement_io,
+        replacement_path.to_string_lossy().as_ref(),
+        Arc::new(SqliteDialect),
+    )?;
     let replacement_connection = replacement_database.connect()?;
     replacement_connection.execute(EVENTS_PARTITION_SCHEMA)?;
     replacement_connection.execute(format!(
@@ -694,7 +702,11 @@ fn recorder_recovers_after_a_full_reopen_and_retention_delete() -> anyhow::Resul
     drop(database);
 
     let io = Arc::new(PlatformIO::new()?);
-    let reopened_database = Database::open_file(io, database_path.to_string_lossy().as_ref())?;
+    let reopened_database = Database::open_file(
+        io,
+        database_path.to_string_lossy().as_ref(),
+        Arc::new(SqliteDialect),
+    )?;
     let reopened = reopened_database.connect()?;
     register_events(&reopened, partitions_directory.clone())?;
     assert_eq!(
@@ -707,8 +719,11 @@ fn recorder_recovers_after_a_full_reopen_and_retention_delete() -> anyhow::Resul
     drop(reopened_database);
 
     let io = Arc::new(PlatformIO::new()?);
-    let after_retention_database =
-        Database::open_file(io, database_path.to_string_lossy().as_ref())?;
+    let after_retention_database = Database::open_file(
+        io,
+        database_path.to_string_lossy().as_ref(),
+        Arc::new(SqliteDialect),
+    )?;
     let after_retention = after_retention_database.connect()?;
     register_events(&after_retention, partitions_directory)?;
     assert_eq!(
@@ -828,7 +843,8 @@ fn recorder_concurrent_creators_publish_one_complete_daily_file() -> anyhow::Res
 
     let path = recorder.partition_path(timestamp);
     let io = Arc::new(PlatformIO::new()?);
-    let physical_database = Database::open_file(io, path.to_string_lossy().as_ref())?;
+    let physical_database =
+        Database::open_file(io, path.to_string_lossy().as_ref(), Arc::new(SqliteDialect))?;
     let physical_connection = physical_database.connect()?;
     assert_eq!(
         query_rows(&physical_connection, "PRAGMA integrity_check")?,
@@ -911,7 +927,8 @@ fn recorder_rejects_mismatched_external_schema_and_recovers() -> anyhow::Result<
     let path = recorder.partition_path(timestamp);
     std::fs::create_dir_all(&recorder.partitions_directory)?;
     let io = Arc::new(PlatformIO::new()?);
-    let bad_database = Database::open_file(io, path.to_string_lossy().as_ref())?;
+    let bad_database =
+        Database::open_file(io, path.to_string_lossy().as_ref(), Arc::new(SqliteDialect))?;
     let bad_connection = bad_database.connect()?;
     bad_connection.execute("CREATE TABLE events(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL)")?;
     bad_connection.close()?;
@@ -945,7 +962,8 @@ fn recorder_rejects_external_partition_missing_configured_indexes() -> anyhow::R
     let path = recorder.partition_path(timestamp);
     std::fs::create_dir_all(&recorder.partitions_directory)?;
     let io = Arc::new(PlatformIO::new()?);
-    let database = Database::open_file(io, path.to_string_lossy().as_ref())?;
+    let database =
+        Database::open_file(io, path.to_string_lossy().as_ref(), Arc::new(SqliteDialect))?;
     let connection = database.connect()?;
     connection.execute(EVENTS_SCHEMA)?;
     connection.close()?;
@@ -965,7 +983,8 @@ fn recorder_rejects_external_rows_outside_the_filename_range() -> anyhow::Result
     let path = recorder.partition_path(FIRST_DAY);
     std::fs::create_dir_all(&recorder.partitions_directory)?;
     let io = Arc::new(PlatformIO::new()?);
-    let database = Database::open_file(io, path.to_string_lossy().as_ref())?;
+    let database =
+        Database::open_file(io, path.to_string_lossy().as_ref(), Arc::new(SqliteDialect))?;
     let connection = database.connect()?;
     connection.execute(EVENTS_PARTITION_SCHEMA)?;
     connection.execute(format!(
@@ -1004,7 +1023,8 @@ fn recorder_validates_partition_ddl_and_configuration() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("validation.db");
     let io = Arc::new(PlatformIO::new()?);
-    let database = Database::open_file(io, path.to_string_lossy().as_ref())?;
+    let database =
+        Database::open_file(io, path.to_string_lossy().as_ref(), Arc::new(SqliteDialect))?;
     let connection = database.connect()?;
 
     for (sql, expected) in [
@@ -1331,7 +1351,8 @@ fn recorder_supports_returning_upsert_and_explicit_local_index() -> anyhow::Resu
     let partitions = recorder.connection.list_partitions("events")?;
     for partition in partitions {
         let io = Arc::new(PlatformIO::new()?);
-        let physical_database = Database::open_file(io, &partition.file_path)?;
+        let physical_database =
+            Database::open_file(io, &partition.file_path, Arc::new(SqliteDialect))?;
         let physical_connection = physical_database.connect()?;
         assert_eq!(
             query_rows(&physical_connection, "PRAGMA integrity_check")?,
@@ -1628,7 +1649,11 @@ fn video_analytics_layout_creates_discovers_and_recreates_daily_files() -> anyho
     let database_path = directory.path().join("plugin-main.db");
     let archive_path = directory.path().join("archive");
     let io = Arc::new(PlatformIO::new()?);
-    let database = Database::open_file(io, database_path.to_string_lossy().as_ref())?;
+    let database = Database::open_file(
+        io,
+        database_path.to_string_lossy().as_ref(),
+        Arc::new(SqliteDialect),
+    )?;
     let connection = database.connect()?;
     connection.execute(EVENTS_SCHEMA.to_string() + " PARTITION BY (ts)")?;
     connection.register_partitioned_table(

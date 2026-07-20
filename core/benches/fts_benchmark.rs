@@ -11,6 +11,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 #[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
+use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{criterion_group, criterion_main, BenchmarkId, Criterion};
@@ -95,6 +96,7 @@ fn setup_fts_db(temp_dir: &TempDir, row_count: usize) -> Arc<Database> {
         OpenFlags::default(),
         opts,
         None,
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db.connect().unwrap();

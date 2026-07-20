@@ -24,6 +24,8 @@ pub struct VirtualTable {
     pub(crate) vtab_type: VirtualTableType,
     // identifier to tie a cursor to a specific instantiated virtual table instance
     pub(crate) vtab_id: u64,
+    /// Whether `DROP TABLE` may remove this table from its schema.
+    pub(crate) is_droppable: bool,
     // Whether this virtual table is safe to use from within triggers and views.
     // Corresponds to SQLite's SQLITE_VTAB_INNOCUOUS flag.
     pub(crate) innocuous: bool,
@@ -51,15 +53,35 @@ impl VirtualTable {
     {
         let name = table.name();
         let sql = table.sql();
-        let columns = Self::resolve_columns(sql)?;
-        Ok(Arc::new(VirtualTable {
+        Ok(Arc::new(Self::new_internal(
             name,
-            columns,
-            kind: VTabKind::TableValuedFunction,
-            vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(table))),
+            sql,
+            VTabKind::TableValuedFunction,
+            Arc::new(RwLock::new(table)),
+        )?))
+    }
+
+    /// Build a virtual table around an [`InternalVirtualTable`]
+    /// implementation. `sql` must be a `CREATE TABLE` statement; it is
+    /// parsed to derive the column metadata. Schema dialects use this to
+    /// construct catalog tables (e.g. a `pg_catalog` surface) with a
+    /// non-table-valued-function kind and install them through
+    /// [`crate::dialect::Dialect::register_catalog`].
+    pub fn new_internal(
+        name: String,
+        sql: String,
+        kind: VTabKind,
+        table: Arc<RwLock<dyn InternalVirtualTable>>,
+    ) -> crate::Result<Self> {
+        Ok(VirtualTable {
+            name,
+            columns: Self::resolve_columns(sql)?,
+            kind,
+            vtab_type: VirtualTableType::Internal(table),
             vtab_id: 0,
+            is_droppable: false,
             innocuous: true,
-        }))
+        })
     }
 
     pub(crate) fn function(name: &str, syms: &SymbolTable) -> crate::Result<Arc<VirtualTable>> {
@@ -79,6 +101,7 @@ impl VirtualTable {
             kind: VTabKind::TableValuedFunction,
             vtab_type,
             vtab_id: 0,
+            is_droppable: false,
             innocuous: false,
         };
         Ok(Arc::new(vtab))
@@ -99,6 +122,7 @@ impl VirtualTable {
             kind: VTabKind::VirtualTable,
             vtab_type: VirtualTableType::External(table),
             vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
+            is_droppable: true,
             innocuous: false,
         };
         Ok(Arc::new(vtab))
@@ -601,6 +625,7 @@ pub trait InternalVirtualTableCursor: Send + Sync {
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
+    use crate::SqliteDialect;
     use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags};
 
     /// Minimal `InternalVirtualTable` that exposes a fixed two-row table. Used
@@ -692,6 +717,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let name = db
@@ -735,6 +761,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let name = db

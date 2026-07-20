@@ -59,20 +59,20 @@ uv-sync-test:
 	uv sync --all-extras --dev --package turso_test
 .PHONE: uv-sync
 
-test: build uv-sync-test test-compat test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-runner test-runner-js test-runner-cli
+test: build uv-sync-test test-compat test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-sqltest test-sqltest-js test-sqltest-cli
 .PHONY: test
 
-test-runner:
-	@make -C testing/sqltests run
-.PHONY: test-runner
+test-sqltest:
+	@make -C sqlite/conformance run
+.PHONY: test-sqltest
 
-test-runner-js:
-	@make -C testing/sqltests run-js
-.PHONY: test-runner-js
+test-sqltest-js:
+	@make -C sqlite/conformance run-js
+.PHONY: test-sqltest-js
 
-test-runner-cli:
-	@make -C testing/sqltests run-cli
-.PHONY: test-runner-cli
+test-sqltest-cli:
+	@make -C sqlite/conformance run-cli
+.PHONY: test-sqltest-cli
 
 test-extensions: build uv-sync-test
 	RUST_LOG=$(RUST_LOG) uv run --project limbo_test test-extensions

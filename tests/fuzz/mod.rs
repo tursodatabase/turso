@@ -4261,9 +4261,13 @@ mod fuzz_tests {
                 (rusqlite::types::Value::Real(limbo), rusqlite::types::Value::Real(sqlite))
                     if limbo.is_finite() && sqlite.is_finite() =>
                 {
+                    // Rust and C libm may differ by 1 ulp, and inverse functions with
+                    // singular derivatives amplify that near domain boundaries: e.g.
+                    // atanh(tanh(-1.0)) is -1.0 in Rust but 1 ulp inside in glibc, and
+                    // asin turns that into a ~1.5e-8 difference. Hence the loose epsilon.
                     assert!(
-                        (limbo - sqlite).abs() < 1e-9
-                            || (limbo - sqlite) / (limbo.abs().max(sqlite.abs())) < 1e-9,
+                        (limbo - sqlite).abs() < 1e-6
+                            || (limbo - sqlite).abs() / (limbo.abs().max(sqlite.abs())) < 1e-6,
                         "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?} seed: {seed}"
                     )
                 }

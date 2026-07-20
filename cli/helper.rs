@@ -77,7 +77,7 @@ impl Highlighter for LimboHelper {
                 .theme_set
                 .themes
                 .get(&self.syntax_config.theme)
-                .unwrap_or(&self.theme_set.themes["base16-ocean.dark"]);
+                .unwrap_or_else(|| &self.theme_set.themes["base16-ocean.dark"]);
             let mut h = HighlightLines::new(syntax, theme);
             let ranges = {
                 let mut ret_ranges = Vec::new();

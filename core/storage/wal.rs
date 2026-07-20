@@ -171,7 +171,7 @@ pub enum CheckpointMode {
 }
 
 impl CheckpointMode {
-    fn should_restart_log(&self) -> bool {
+    pub(crate) fn should_restart_log(&self) -> bool {
         matches!(
             self,
             CheckpointMode::Truncate { .. } | CheckpointMode::Restart
@@ -423,6 +423,19 @@ impl TursoRwLock {
     }
 
     #[inline]
+    /// The embedded read-mark value, but only if a reader currently holds this slot
+    /// (otherwise the value is stale from a past holder). Lock-free single-load; used to
+    /// find the minimum frame any active reader is pinned at without mutating the slot.
+    pub fn held_value(&self) -> Option<u32> {
+        let cur = self.0.load(Ordering::Acquire);
+        if Self::has_readers(cur) {
+            Some((cur >> Self::VALUE_SHIFT) as u32)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     /// Set the embedded value while holding the write lock.
     pub fn set_value_exclusive(&self, v: u32) {
         // Must be called only while WRITER bit is set
@@ -545,6 +558,9 @@ trait WalCoordination: Debug + Send + Sync {
 
     /// Compute the highest frame a checkpoint may safely backfill and refresh read marks.
     fn determine_max_safe_checkpoint_frame(&self, max_frame: u64) -> u64;
+
+    /// Lowest read-mark frame any reader is currently pinned at, or `None` if none. Read-only.
+    fn min_pinned_read_frame(&self) -> Option<u64>;
 
     /// Begin a restart while the caller holds the required external checkpoint/write guards.
     fn begin_restart(&self, io: &dyn IO) -> Result<WalSnapshot>;
@@ -732,7 +748,23 @@ pub trait Wal: Debug + Send + Sync {
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
     fn get_max_frame(&self) -> u64;
+    /// This connection's frozen `(checkpoint_seq, max_frame)`: for a reader it is the WAL read
+    /// mark installed at `begin_read_tx`; for a writer it is the position after its last commit.
+    /// Used by MVCC to gate btree reads on physical reachability (a materialization at WAL
+    /// position `P` is reachable iff `P <= this`, lexicographically). See `RootEntry`.
+    fn connection_wal_pos(&self) -> (u32, u64);
+    /// The lowest WAL frame any active reader is currently pinned at (across the read-mark
+    /// slots), or `None` if no reader holds a slot. This is the authoritative set of pinned
+    /// readers — it includes a reader that has called `begin_read_tx` but not yet published an
+    /// MVCC transaction — so the MVCC checkpoint uses it as the version-store GC floor (a row
+    /// whose btree page was materialized past a pinned reader's frame is invisible in that
+    /// reader's snapshot, so its version-store copy must be retained).
+    fn min_pinned_read_frame(&self) -> Option<u64>;
     fn get_min_frame(&self) -> u64;
+    /// The shared backfill boundary: WAL frames at or below this are durably copied into the DB
+    /// file, so a version materialized there is reachable by EVERY snapshot (including a db-file
+    /// reader pinned at the boundary). Used as the passive-checkpoint version-store GC floor.
+    fn backfill_frame(&self) -> u64;
     fn rollback(&self, rollback_to: Option<RollbackTo>);
     fn abort_checkpoint(&self);
     fn get_last_checksum(&self) -> (u32, u32);
@@ -820,6 +852,22 @@ impl InProcessWalCoordination {
 
     fn read_mark_value(&self, slot: usize) -> u32 {
         self.shared.read().runtime.read_locks[slot].get_value()
+    }
+
+    /// Lowest read-mark frame across slots currently held by a reader (1..5; slot 0 is the
+    /// db-file read mark), or `None` if no reader holds a slot. Read-only / lock-free.
+    fn min_pinned_read_frame_inner(&self) -> Option<u64> {
+        let shared = self.shared.read();
+        let mut min: Option<u64> = None;
+        for slot in 1..5 {
+            if let Some(v) = shared.runtime.read_locks[slot].held_value() {
+                if v != READMARK_NOT_USED {
+                    let f = v as u64;
+                    min = Some(min.map_or(f, |m: u64| m.min(f)));
+                }
+            }
+        }
+        min
     }
 
     fn set_read_mark_value_exclusive(&self, slot: usize, value: u32) {
@@ -1119,6 +1167,10 @@ impl WalCoordination for InProcessWalCoordination {
             }
         }
         max_safe_frame
+    }
+
+    fn min_pinned_read_frame(&self) -> Option<u64> {
+        self.min_pinned_read_frame_inner()
     }
 
     fn begin_restart(&self, io: &dyn IO) -> Result<WalSnapshot> {
@@ -2168,6 +2220,17 @@ impl WalCoordination for ShmWalCoordination {
         match self.authority.min_active_reader_frame() {
             Some(shared_min) => max_safe_frame.min(shared_min),
             None => max_safe_frame,
+        }
+    }
+
+    fn min_pinned_read_frame(&self) -> Option<u64> {
+        // Combine this process's local read marks with cross-process readers tracked by the
+        // shared authority.
+        let local = self.fallback.min_pinned_read_frame_inner();
+        match (local, self.authority.min_active_reader_frame()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
         }
     }
 
@@ -3893,8 +3956,23 @@ impl Wal for WalFile {
         self.max_frame.load(Ordering::Acquire)
     }
 
+    fn connection_wal_pos(&self) -> (u32, u64) {
+        (
+            self.checkpoint_seq.load(Ordering::Acquire),
+            self.max_frame.load(Ordering::Acquire),
+        )
+    }
+
+    fn min_pinned_read_frame(&self) -> Option<u64> {
+        self.coordination.min_pinned_read_frame()
+    }
+
     fn get_min_frame(&self) -> u64 {
         self.min_frame.load(Ordering::Acquire)
+    }
+
+    fn backfill_frame(&self) -> u64 {
+        self.load_coordination_snapshot().nbackfills
     }
 
     fn get_last_checksum(&self) -> (u32, u32) {
@@ -4404,7 +4482,15 @@ impl Wal for WalFile {
         // single completion for the whole batch
         let total_len: i32 = iovecs.iter().map(|b| b.len() as i32).sum();
         let page_frame_for_cb = page_frame_and_checksum.clone();
-        let cmp = move |res: Result<i32, CompletionError>| {
+        // Make the frames readable only once the write is durable. `find_frame`
+        // (reads) and `iter_latest_frames` (checkpoint) resolve a page->frame
+        // only through the frame cache, so populating it here — from the write
+        // completion callback — is what publishes the frames. Doing it before
+        // durability would let a reader or a checkpoint pick up a frame whose
+        // bytes are not on disk yet. On write failure `res` is `Err`, so we
+        // publish nothing.
+        let coordination = self.coordination.clone();
+        let on_complete = move |res: Result<i32, CompletionError>| {
             let Ok(bytes_written) = res else {
                 return;
             };
@@ -4416,18 +4502,38 @@ impl Wal for WalFile {
 
             for (page, fid, _csum) in &page_frame_for_cb {
                 page.set_wal_tag(*fid, epoch);
+                coordination.cache_frame(page.get().id as u64, *fid);
             }
         };
 
-        let c = Completion::new_write(cmp);
+        let c = Completion::new_write(on_complete);
 
         let file = self.coordination.wal_file()?;
         let c = file.pwritev(start_off, iovecs, c)?;
 
-        self.io.drain_completions(std::slice::from_ref(&c))?;
-
-        for (page, fid, csum) in &page_frame_and_checksum {
-            self.complete_append_frame(page.get().id as u64, *fid, *csum);
+        // Advance the connection-private write cursor (max_frame / rolling
+        // checksum / dirty) synchronously so a following batch in the same
+        // flush chains onto the correct frame ids and checksum.
+        //
+        // These are optimistic in-memory bookkeeping fields, not durable state,
+        // and they do not make the frame visible (visibility is the frame
+        // cache, published from the completion callback above only after the
+        // write succeeds). So advancing them before the write lands is safe:
+        // if the write fails the transaction unwinds and `rollback()` restores
+        // max_frame / last_checksum from the committed watermark and drops
+        // cached frames above it; nothing is durable until a commit frame is
+        // fsynced, and crash recovery rebuilds max_frame by scanning only
+        // committed, checksum-valid frames. `dirty` is conservative — it only
+        // forces an fsync before the next commit is reported durable.
+        //
+        // Must NOT block for durability here: the returned completion is awaited
+        // by the caller's state machine (spill: `SpillState::WritingToWal`;
+        // cacheflush: the collected completions). A synchronous drain would
+        // deadlock a caller that drives I/O from a single-threaded event loop.
+        if let Some((_, last_frame_id, last_checksum)) = page_frame_and_checksum.last() {
+            self.dirty.store(true, Ordering::Release);
+            *self.last_checksum.write() = *last_checksum;
+            self.max_frame.store(*last_frame_id, Ordering::Release);
         }
 
         Ok(c)
@@ -4591,6 +4697,7 @@ impl WalFile {
         Ok(())
     }
 
+    #[aristo::intent("Checkpoint backfill copies a log frame into the main database file only after that frame is durable in the log, so a crash can never recover a database torn between persisted backfill pages and dropped log frames", id = "aristos:wal_checkpoint_backfill_crash_atomic", verify = "full", parent = "wal_protocol_correctness")]
     fn checkpoint_inner(
         &self,
         pager: &Pager,
@@ -5718,6 +5825,7 @@ pub mod test {
     };
     use crate::sync::{atomic::Ordering, Arc};
     use crate::sync::{Mutex, RwLock};
+    use crate::SqliteDialect;
     use crate::{
         io::FileSyncType,
         storage::{
@@ -5768,6 +5876,7 @@ pub mod test {
             crate::OpenFlags::default(),
             crate::DatabaseOpts::new().with_multiprocess_wal(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         // db + tmp directory
@@ -5943,8 +6052,8 @@ pub mod test {
 
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "shutdown checkpoint does not truncate the WAL file to zero on Windows"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shutdown_checkpoint_truncates_after_restart() {
         let (db, path) = get_database();
@@ -6107,6 +6216,89 @@ pub mod test {
         io.wait_for_completion(c).unwrap();
 
         (io, buffer_pool, wal)
+    }
+
+    /// Like `make_initialized_memory_wal`, but backed by `MemoryYieldIO`, which
+    /// writes bytes synchronously yet defers every I/O *completion* until the
+    /// next `io.step()`. That makes the "write submitted but not yet durable"
+    /// window observable in a single-threaded test.
+    #[cfg(feature = "io_memory_yield")]
+    fn make_initialized_memory_yield_wal(
+        page_size: u32,
+    ) -> (Arc<dyn IO>, Arc<BufferPool>, WalFile) {
+        let io: Arc<dyn IO> = Arc::new(crate::io::MemoryYieldIO::new());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(page_size as usize)
+            .unwrap();
+        let file = io
+            .open_file("spill-visibility.db-wal", OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let wal = WalFile::new(io.clone(), shared, ((0, 0), 0), buffer_pool.clone());
+        let page_size = PageSize::new(page_size).unwrap();
+
+        if let Some(c) = wal.prepare_wal_start(page_size).unwrap() {
+            io.wait_for_completion(c).unwrap();
+        }
+        let c = wal.prepare_wal_finish(FileSyncType::Fsync).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        (io, buffer_pool, wal)
+    }
+
+    /// Regression test for the cache-spill WAL append path: a frame appended via
+    /// `append_frames_vectored` must not become resolvable by `find_frame`
+    /// (reads) or `iter_latest_frames` (checkpoint) until its write is durable.
+    ///
+    /// An earlier version of the async spill fix published the page->frame
+    /// mapping (`cache_frame`) synchronously at submission, before the write
+    /// landed on disk — so a reader or a concurrent checkpoint could resolve a
+    /// frame whose bytes were not yet written. `MemoryYieldIO` defers the write
+    /// completion until `io.step()`, so this test can observe the frame while
+    /// the write is still in flight: the mapping must not be visible yet.
+    #[cfg(feature = "io_memory_yield")]
+    #[test]
+    fn append_frames_vectored_frame_hidden_until_write_is_durable() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_yield_wal(page_size);
+        let page = page_with_pattern(7, 0x70, &buffer_pool);
+
+        let completion = wal
+            .append_frames_vectored(vec![page], PageSize::new(page_size).unwrap())
+            .unwrap();
+
+        // The write cursor advances synchronously (so a following batch chains
+        // correctly), but the completion has not fired: the write is not durable.
+        assert!(
+            !completion.succeeded(),
+            "MemoryYieldIO must defer the write completion until io.step()"
+        );
+        assert_eq!(
+            wal.get_max_frame(),
+            1,
+            "write cursor advances synchronously"
+        );
+
+        // The frame must NOT be resolvable before the write is durable. The
+        // buggy version cached the mapping at submission and returned Some(1)
+        // here, exposing bytes that were not on disk yet.
+        assert_eq!(
+            wal.find_frame(7, None).unwrap(),
+            None,
+            "frame must not be visible to readers before its write is durable"
+        );
+
+        // Drive the deferred completion: the write is now durable and the
+        // completion callback publishes the page->frame mapping.
+        io.step().unwrap();
+        assert!(completion.succeeded());
+
+        assert_eq!(
+            wal.find_frame(7, None).unwrap(),
+            Some(1),
+            "frame must be visible once its write is durable"
+        );
     }
 
     fn page_with_pattern(page_id: i64, seed: u8, buffer_pool: &Arc<BufferPool>) -> PageRef {
@@ -6895,8 +7087,8 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "Windows file locks are mandatory; opening the same WAL twice in one process clashes"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shm_coordination_uses_shared_authority() {
         let dir = tempfile::tempdir().unwrap();
@@ -7129,8 +7321,8 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "Windows file locks are mandatory; opening the same WAL twice in one process clashes"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shm_coordination_shared_index_grows_past_old_fixed_limit() {
         const OLD_FIXED_LIMIT: u64 = 65_536;
@@ -8095,8 +8287,8 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "Windows file locks are mandatory; opening the same WAL twice in one process clashes"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shm_coordination_secondary_disk_scan_does_not_reseed_authority_while_writer_active() {
         let dir = tempfile::tempdir().unwrap();
@@ -8172,8 +8364,8 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "Windows file locks are mandatory; opening the same WAL twice in one process clashes"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shm_coordination_disk_scan_matching_authority_keeps_frame_index() {
         let dir = tempfile::tempdir().unwrap();
@@ -8250,8 +8442,8 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "Windows file locks are mandatory; opening the same WAL twice in one process clashes"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shm_coordination_disk_scan_matching_snapshot_rebuilds_stale_frame_index() {
         let dir = tempfile::tempdir().unwrap();
@@ -8381,8 +8573,8 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "Windows file locks are mandatory; opening the same WAL twice in one process clashes"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shm_coordination_empty_disk_scan_does_not_clobber_positive_authority() {
         let dir = tempfile::tempdir().unwrap();
@@ -8566,8 +8758,8 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     #[cfg_attr(
-        windows,
-        ignore = "Windows file locks are mandatory; opening the same WAL twice in one process clashes"
+        all(target_os = "windows", not(feature = "experimental_win_iocp")),
+        ignore = "shared WAL coordination requires the experimental Windows IOCP backend"
     )]
     fn test_shm_prepare_wal_header_does_not_clobber_zero_frame_authority_snapshot() {
         let dir = tempfile::tempdir().unwrap();

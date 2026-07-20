@@ -1115,8 +1115,9 @@ mod tests {
                     Value::from_f64(numerator / denominator)
                 }
                 ValueType::Blob => {
-                    let mut blob =
-                        std::vec::Vec::with_capacity((rng.next_u64() % 2047 + 1) as usize);
+                    let mut blob = <Vec<u8> as TursoVecExt<u8>>::with_capacity(
+                        (rng.next_u64() % 2047 + 1) as usize,
+                    );
                     rng.fill_bytes(&mut blob);
                     Value::Blob(blob)
                 }

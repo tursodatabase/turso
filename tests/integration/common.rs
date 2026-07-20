@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Clock, Connection, Database, FromValueRow, Row, IO};
+use turso_core::{Clock, Connection, Database, FromValueRow, Row, SqliteDialect, IO};
 
 pub struct TempDatabase {
     pub path: PathBuf,
@@ -220,6 +220,7 @@ impl TempDatabaseBuilder {
             flags,
             opts,
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
 
@@ -297,7 +298,12 @@ impl TempDatabase {
 
     pub fn limbo_database(&self) -> Arc<turso_core::Database> {
         log::debug!("conneting to limbo");
-        Database::open_file(self.io.clone(), self.path.to_str().unwrap()).unwrap()
+        Database::open_file(
+            self.io.clone(),
+            self.path.to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap()
     }
 
     #[allow(dead_code)]
@@ -672,6 +678,7 @@ impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6, T7: 7
 mod tests {
     use std::{sync::Arc, vec};
     use tempfile::{NamedTempFile, TempDir};
+    use turso_core::SqliteDialect;
     use turso_core::{Database, StepResult, IO};
 
     use crate::common::{do_flush, ExecRows};
@@ -948,7 +955,7 @@ mod tests {
         // Open database
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db = Database::open_file(io, &db_path)?;
+        let db = Database::open_file(io, &db_path, Arc::new(SqliteDialect))?;
 
         const NUM_CONNECTIONS: usize = 5;
         let mut connections = Vec::new();
@@ -1892,6 +1899,69 @@ mod tests {
         Ok(())
     }
 
+    /// Run `SELECT nextval(...)` until it succeeds, retrying on transient
+    /// contention errors: `Busy` always, `WriteWriteConflict` only when
+    /// `allow_ww_conflict` is set (MVCC allocators legitimately race on the
+    /// watermark row; in WAL mode a WW conflict would be a bug and panics).
+    ///
+    /// Gives up on a wall-clock stall, not an iteration count. The number of
+    /// retries a waiter burns before winning the WAL single-writer lock (or
+    /// the MVCC watermark race) scales with commit fsync latency times queue
+    /// depth, so an iteration cap measures disk speed rather than forward
+    /// progress — a 10k cap tripped spuriously on slow CI disks (issue
+    /// #7738). A thread that makes no progress for the full deadline while
+    /// the whole workload should drain in well under a minute is a genuine
+    /// livelock. Backoff: stay hot for the first attempts to keep exercising
+    /// the contended path, then sleep so a long fsync-bound queue is not
+    /// spun on at full CPU.
+    fn nextval_with_retry(
+        conn: &Arc<turso_core::Connection>,
+        sql: &str,
+        allow_ww_conflict: bool,
+    ) -> i64 {
+        use std::time::{Duration, Instant};
+        const STALL_DEADLINE: Duration = Duration::from_secs(120);
+        let start = Instant::now();
+        let mut tries = 0usize;
+        loop {
+            tries += 1;
+            if start.elapsed() > STALL_DEADLINE {
+                panic!(
+                    "nextval made no progress for {STALL_DEADLINE:?} \
+                     ({tries} attempts) — livelock or leaked write lock"
+                );
+            }
+            let transient = |e: &turso_core::LimboError| {
+                matches!(e, turso_core::LimboError::Busy)
+                    || (allow_ww_conflict
+                        && matches!(e, turso_core::LimboError::WriteWriteConflict))
+            };
+            let backoff = || {
+                if tries < 100 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            };
+            match conn.prepare(sql) {
+                Ok(mut stmt) => {
+                    let mut got: Option<i64> = None;
+                    let r = stmt.run_with_row_callback(|row| {
+                        got = Some(row.get::<i64>(0).unwrap());
+                        Ok(())
+                    });
+                    match r {
+                        Ok(()) => return got.expect("nextval row"),
+                        Err(ref e) if transient(e) => backoff(),
+                        Err(e) => panic!("nextval failed: {e:?}"),
+                    }
+                }
+                Err(ref e) if transient(e) => backoff(),
+                Err(e) => panic!("prepare failed: {e:?}"),
+            }
+        }
+    }
+
     /// Stress: N threads, each pulling M values from the same sequence in WAL
     /// mode. Every value must be unique — duplicates would mean two threads
     /// observed the same disk watermark and computed the same next value
@@ -1925,32 +1995,7 @@ mod tests {
                     let conn = db.connect_limbo();
                     let mut mine = Vec::with_capacity(PER_THREAD);
                     for _ in 0..PER_THREAD {
-                        let mut tries = 0usize;
-                        loop {
-                            tries += 1;
-                            if tries > 10_000 {
-                                panic!("nextval gave up after 10k Busy retries");
-                            }
-                            match conn.prepare("SELECT nextval('s')") {
-                                Ok(mut stmt) => {
-                                    let mut got: Option<i64> = None;
-                                    let r = stmt.run_with_row_callback(|row| {
-                                        got = Some(row.get::<i64>(0).unwrap());
-                                        Ok(())
-                                    });
-                                    match r {
-                                        Ok(()) => {
-                                            mine.push(got.expect("nextval row"));
-                                            break;
-                                        }
-                                        Err(turso_core::LimboError::Busy) => continue,
-                                        Err(e) => panic!("nextval failed: {e:?}"),
-                                    }
-                                }
-                                Err(turso_core::LimboError::Busy) => continue,
-                                Err(e) => panic!("prepare failed: {e:?}"),
-                            }
-                        }
+                        mine.push(nextval_with_retry(&conn, "SELECT nextval('s')", false));
                     }
                     collected.lock().unwrap().extend(mine);
                 })
@@ -2026,35 +2071,7 @@ mod tests {
                     let conn = db.connect_limbo();
                     let mut mine = Vec::with_capacity(PER_THREAD);
                     for _ in 0..PER_THREAD {
-                        let mut tries = 0usize;
-                        loop {
-                            tries += 1;
-                            if tries > 10_000 {
-                                panic!("nextval gave up after 10k retries");
-                            }
-                            match conn.prepare("SELECT nextval('s')") {
-                                Ok(mut stmt) => {
-                                    let mut got: Option<i64> = None;
-                                    let r = stmt.run_with_row_callback(|row| {
-                                        got = Some(row.get::<i64>(0).unwrap());
-                                        Ok(())
-                                    });
-                                    match r {
-                                        Ok(()) => {
-                                            mine.push(got.expect("nextval row"));
-                                            break;
-                                        }
-                                        Err(turso_core::LimboError::Busy)
-                                        | Err(turso_core::LimboError::WriteWriteConflict) => {
-                                            continue
-                                        }
-                                        Err(e) => panic!("nextval failed: {e:?}"),
-                                    }
-                                }
-                                Err(turso_core::LimboError::Busy) => continue,
-                                Err(e) => panic!("prepare failed: {e:?}"),
-                            }
-                        }
+                        mine.push(nextval_with_retry(&conn, "SELECT nextval('s')", true));
                     }
                     collected.lock().unwrap().extend(mine);
                 })
@@ -2137,35 +2154,7 @@ mod tests {
                     let conn = db.connect_limbo();
                     let mut mine = Vec::with_capacity(NEXTVAL_PER_THREAD);
                     for _ in 0..NEXTVAL_PER_THREAD {
-                        let mut tries = 0usize;
-                        loop {
-                            tries += 1;
-                            if tries > 10_000 {
-                                panic!("nextval gave up after 10k retries");
-                            }
-                            match conn.prepare("SELECT nextval('s')") {
-                                Ok(mut stmt) => {
-                                    let mut got: Option<i64> = None;
-                                    let r = stmt.run_with_row_callback(|row| {
-                                        got = Some(row.get::<i64>(0).unwrap());
-                                        Ok(())
-                                    });
-                                    match r {
-                                        Ok(()) => {
-                                            mine.push(got.expect("nextval row"));
-                                            break;
-                                        }
-                                        Err(turso_core::LimboError::Busy)
-                                        | Err(turso_core::LimboError::WriteWriteConflict) => {
-                                            continue
-                                        }
-                                        Err(e) => panic!("nextval failed: {e:?}"),
-                                    }
-                                }
-                                Err(turso_core::LimboError::Busy) => continue,
-                                Err(e) => panic!("prepare failed: {e:?}"),
-                            }
-                        }
+                        mine.push(nextval_with_retry(&conn, "SELECT nextval('s')", true));
                     }
                     nextvals.lock().unwrap().extend(mine);
                 })

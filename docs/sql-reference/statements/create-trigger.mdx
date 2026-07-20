@@ -6,10 +6,6 @@ sidebarTitle: CREATE TRIGGER
 
 # CREATE TRIGGER
 
-<Info>
-This feature is experimental and must be [enabled before use](/docs/sql-reference/experimental-features).
-</Info>
-
 Create a trigger that automatically executes one or more SQL statements when a row is inserted into, updated in, or deleted from a table.
 
 ## Syntax
@@ -39,7 +35,7 @@ A trigger defines a set of SQL statements that run automatically when a specifie
 | `IF NOT EXISTS` | Prevents an error if a trigger with the same name already exists. |
 | `schema-name` | The name of the attached database containing the trigger. Defaults to the main database if omitted. Cannot be used with `TEMPORARY`. |
 | `trigger-name` | A unique name for the trigger within the database. |
-| `BEFORE` / `AFTER` / `INSTEAD OF` | When the trigger fires relative to the triggering event. Default is `BEFORE`. |
+| `BEFORE` / `AFTER` / `INSTEAD OF` | When the trigger fires relative to the triggering event. Default is `BEFORE`. `INSTEAD OF` triggers are not yet supported. |
 | `INSERT` / `UPDATE` / `DELETE` | The data modification event that fires the trigger. |
 | `OF column-name, ...` | For UPDATE triggers only. Restricts the trigger to fire only when the specified columns are modified. |
 | `table-name` | The table (or view, for INSTEAD OF triggers) that the trigger monitors. |
@@ -65,9 +61,11 @@ An `AFTER` trigger fires after the triggering statement has modified the row. Us
 
 ### INSTEAD OF Triggers
 
-An `INSTEAD OF` trigger can only be created on a view. It fires in place of the triggering INSERT, UPDATE, or DELETE, allowing you to make views writable.
+<Warning>
+`INSTEAD OF` triggers are not yet supported in Turso. `CREATE TRIGGER ... INSTEAD OF ...` returns an error.
+</Warning>
 
-- The actual INSERT, UPDATE, or DELETE on the view does not execute. The trigger body is responsible for performing the desired changes on the underlying tables.
+In SQLite, an `INSTEAD OF` trigger can only be created on a view and fires in place of the triggering INSERT, UPDATE, or DELETE, allowing you to make views writable. Turso parses this syntax but does not yet execute it.
 
 ## Row References
 

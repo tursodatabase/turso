@@ -196,7 +196,7 @@ impl InternalVirtualTableCursor for BtreeDumpCursor {
     fn column(&self, column: usize) -> Result<Value> {
         match column {
             0 => match &self.current_record {
-                Some(data) => Ok(Value::from_blob(data.clone())),
+                Some(data) => Ok(Value::from_slice(data)?),
                 None => Ok(Value::Null),
             },
             _ => Ok(Value::Null),

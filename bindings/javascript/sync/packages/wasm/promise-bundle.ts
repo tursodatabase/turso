@@ -179,7 +179,7 @@ class Database extends DatabasePromise {
                     registerFileAtWorker(this.#worker, `${this.name}-changes`),
                 ]);
             }
-            await run(this.#runner, this.#engine.connect());
+            await run(this.#runner, this.#engine.connect(), this.execLock);
         }
         this.connected = true;
     }
@@ -192,11 +192,11 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        const changes = await this.#guards.wait(async () => await run(this.#runner, this.#engine.wait()));
+        const changes = await this.#guards.wait(async () => await run(this.#runner, this.#engine.wait(), this.execLock));
         if (changes.empty()) {
             return false;
         }
-        await this.#guards.apply(async () => await run(this.#runner, this.#engine.apply(changes)));
+        await this.#guards.apply(async () => await run(this.#runner, this.#engine.apply(changes), this.execLock));
         return true;
     }
     /**
@@ -207,7 +207,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        await this.#guards.push(async () => await run(this.#runner, this.#engine.push()));
+        await this.#guards.push(async () => await run(this.#runner, this.#engine.push(), this.execLock));
     }
     /**
      * checkpoint WAL for local database
@@ -216,7 +216,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        await this.#guards.checkpoint(async () => await run(this.#runner, this.#engine.checkpoint()));
+        await this.#guards.checkpoint(async () => await run(this.#runner, this.#engine.checkpoint(), this.execLock));
     }
     /**
      * @returns statistic of current local database
@@ -225,7 +225,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        return (await run(this.#runner, this.#engine.stats()));
+        return (await run(this.#runner, this.#engine.stats(), this.execLock));
     }
 
     /**

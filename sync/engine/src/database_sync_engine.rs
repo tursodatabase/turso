@@ -5,6 +5,7 @@ use std::{
         Arc, Mutex,
     },
 };
+use turso_core::SqliteDialect;
 
 use turso_core::{Buffer, Completion, DatabaseStorage, LimboError, OpenDbAsyncState, OpenFlags};
 
@@ -138,6 +139,7 @@ mod tests {
         time::Duration,
     };
     use tempfile::NamedTempFile;
+    use turso_core::SqliteDialect;
 
     #[test]
     fn logical_mvcc_pull_disabled_by_config_falls_back_to_page_pull() {
@@ -818,7 +820,9 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let main_path = temp_file.path().to_str().unwrap().to_string();
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let main_db = turso_core::Database::open_file(io.clone(), &main_path).unwrap();
+        let main_db =
+            turso_core::Database::open_file(io.clone(), &main_path, Arc::new(SqliteDialect))
+                .unwrap();
 
         let meta = DatabaseMetadata {
             version: DATABASE_METADATA_VERSION.to_string(),
@@ -941,8 +945,12 @@ mod tests {
         ];
         std::fs::write(changes_temp.path(), encoded_logical_txns(&txns)).unwrap();
 
-        let db =
-            turso_core::Database::open_file(io.clone(), db_temp.path().to_str().unwrap()).unwrap();
+        let db = turso_core::Database::open_file(
+            io.clone(),
+            db_temp.path().to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let db_file = db.db_file.clone();
         let db_io = db.io.clone();
         let main_tape = DatabaseTape::new_with_opts(
@@ -1112,8 +1120,12 @@ mod tests {
         }];
         std::fs::write(changes_temp.path(), encoded_logical_txns(&txns)).unwrap();
 
-        let db =
-            turso_core::Database::open_file(io.clone(), db_temp.path().to_str().unwrap()).unwrap();
+        let db = turso_core::Database::open_file(
+            io.clone(),
+            db_temp.path().to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let db_file = db.db_file.clone();
         let db_io = db.io.clone();
         let main_tape = DatabaseTape::new_with_opts(
@@ -1275,7 +1287,9 @@ mod tests {
         let changes_path = changes_file.path().to_str().unwrap().to_string();
 
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let remote_db = turso_core::Database::open_file(io.clone(), &remote_path).unwrap();
+        let remote_db =
+            turso_core::Database::open_file(io.clone(), &remote_path, Arc::new(SqliteDialect))
+                .unwrap();
         let remote_conn = remote_db.connect().unwrap();
         remote_conn
             .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
@@ -1388,10 +1402,14 @@ mod tests {
 
                 drop(conn);
                 drop(engine);
-                let verify_db =
-                    turso_core::Database::open_file(io.clone(), &main_path).map_err(|error| {
-                        Error::DatabaseSyncEngineError(format!("test verify open failed: {error}"))
-                    })?;
+                let verify_db = turso_core::Database::open_file(
+                    io.clone(),
+                    &main_path,
+                    Arc::new(SqliteDialect),
+                )
+                .map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test verify open failed: {error}"))
+                })?;
                 let verify_conn = verify_db.connect().map_err(|error| {
                     Error::DatabaseSyncEngineError(format!("test verify connect failed: {error}"))
                 })?;
@@ -2591,17 +2609,17 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         )?;
 
         // Use async database opening that yields on IO for large schemas
+        let main_db_options = turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(main_db_storage)
+            .flags(OpenFlags::Create)
+            .db_opts(opts.db_opts);
         let mut open_state = turso_core::OpenDbAsyncState::new();
         let main_db = loop {
-            match turso_core::Database::open_with_flags_async(
+            match turso_core::Database::open_async(
                 &mut open_state,
                 io.clone(),
                 main_db_path,
-                main_db_storage.clone(),
-                OpenFlags::Create,
-                opts.db_opts,
-                None,
-                None,
+                &main_db_options,
             )? {
                 turso_core::IOResult::Done(db) => break db,
                 turso_core::IOResult::IO(io_completion) => {
@@ -2620,18 +2638,18 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         coro: &Coro<Ctx>,
     ) -> Result<Arc<turso_core::Connection>> {
         let db = {
+            let options = turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                .storage(self.db_file.clone())
+                .wal_path(self.revert_db_wal_path.clone())
+                .flags(OpenFlags::Create)
+                .db_opts(self.opts.db_opts);
             let mut state = OpenDbAsyncState::new();
             loop {
-                match turso_core::Database::open_with_flags_bypass_registry_async(
+                match turso_core::Database::do_open_async(
                     &mut state,
                     self.io.clone(),
                     &self.main_db_path,
-                    Some(&self.revert_db_wal_path),
-                    self.db_file.clone(),
-                    OpenFlags::Create,
-                    self.opts.db_opts,
-                    None,
-                    None,
+                    &options,
                 )? {
                     turso_core::IOResult::Done(db) => break db,
                     turso_core::IOResult::IO(io_completion) => {

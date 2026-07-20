@@ -2893,6 +2893,31 @@ impl Pager {
         self.with_header(|header| header.schema_cookie.get())
     }
 
+    /// This connection's frozen WAL position `(checkpoint_seq, max_frame)` — the read mark for a
+    /// reader, or the post-commit position for a writer. `(u32::MAX, u64::MAX)` when there is no
+    /// WAL (no WAL materialization hazard). See `Wal::connection_wal_pos`.
+    pub fn wal_pos(&self) -> (u32, u64) {
+        self.wal
+            .as_ref()
+            .map_or((u32::MAX, u64::MAX), |wal| wal.connection_wal_pos())
+    }
+
+    /// Lowest WAL frame any active reader is pinned at, or `None` if none / no WAL. Used as the
+    /// Passive-checkpoint version-store GC floor (includes readers pinned via `begin_read_tx`
+    /// before they publish an MVCC transaction). See `MvStore::rootpage_gc_protected`.
+    pub fn min_pinned_read_frame(&self) -> Option<u64> {
+        self.wal
+            .as_ref()
+            .and_then(|wal| wal.min_pinned_read_frame())
+    }
+
+    /// The WAL backfill boundary (frames at or below this are durable in the DB file). The MVCC
+    /// Version-store GC floor for passive checkpoints: a materialized version may be reclaimed only
+    /// once its materialization frame is backfilled here, so every snapshot can read it from the btree.
+    pub fn wal_backfill_frame(&self) -> Option<u64> {
+        self.wal.as_ref().map(|wal| wal.backfill_frame())
+    }
+
     #[inline(always)]
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn begin_read_tx(&self) -> Result<()> {
@@ -3325,6 +3350,10 @@ impl Pager {
 
     /// Insert a page into the cache, with spilling support.
     /// This handles cache full conditions by spilling dirty pages and retrying.
+    /// The cache capacity is a soft limit: if nothing can be spilled or
+    /// evicted, the page is admitted over capacity rather than failing the
+    /// read (mirroring SQLite, where `cache_size` may be exceeded while all
+    /// pages are in use); later inserts drain the excess.
     fn cache_insert(&self, page_idx: usize, page: PageRef) -> Result<IOResult<()>> {
         {
             let mut page_cache = self.page_cache.write();
@@ -3342,16 +3371,15 @@ impl Pager {
         }
 
         match self.try_spill_dirty_pages()? {
-            IOResult::Done(true) => {
+            IOResult::Done(()) => {
                 let mut page_cache = self.page_cache.write();
                 let page_key = PageCacheKey::new(page_idx);
-                match page_cache.insert(page_key, page) {
+                match page_cache.force_insert_page(page_key, page) {
                     Ok(_) => Ok(IOResult::Done(())),
                     Err(CacheError::KeyExists) => Ok(IOResult::Done(())),
                     Err(e) => Err(e.into()),
                 }
             }
-            IOResult::Done(false) => Err(LimboError::Busy),
             IOResult::IO(c) => Ok(IOResult::IO(c)),
         }
     }
@@ -3718,7 +3746,7 @@ impl Pager {
     /// then mark them as spilled so they can be evicted even while dirty.
     /// For ephemeral tables: writes pages directly to the temp database file.
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn try_spill_dirty_pages(&self) -> Result<IOResult<bool>> {
+    fn try_spill_dirty_pages(&self) -> Result<IOResult<()>> {
         loop {
             let state = self.spill_state.read().clone();
             match state {
@@ -3730,17 +3758,17 @@ impl Pager {
                     };
                     match spill_result {
                         SpillResult::NotNeeded | SpillResult::Disabled => {
-                            return Ok(IOResult::Done(false));
+                            return Ok(IOResult::Done(()));
                         }
                         SpillResult::CacheFull => {
                             tracing::debug!(
                                 "try_spill_dirty_pages: cache full, no spillable pages"
                             );
-                            return Ok(IOResult::Done(false));
+                            return Ok(IOResult::Done(()));
                         }
                         SpillResult::PagesToSpill(pages) => {
                             if pages.is_empty() {
-                                return Ok(IOResult::Done(false));
+                                return Ok(IOResult::Done(()));
                             }
                             let page_count = pages.len();
                             tracing::debug!("try_spill_dirty_pages: spilling {} pages", page_count);
@@ -3776,7 +3804,7 @@ impl Pager {
                                 let completions = self.spill_pages_to_disk(&pages)?;
                                 if completions.is_empty() {
                                     self.finish_ephemeral_spill(&pages);
-                                    return Ok(IOResult::Done(true));
+                                    return Ok(IOResult::Done(()));
                                 }
                                 for completion in &completions {
                                     group.add(completion);
@@ -3850,7 +3878,7 @@ impl Pager {
                         spilled_count,
                         pages.len(),
                     );
-                    return Ok(IOResult::Done(true));
+                    return Ok(IOResult::Done(()));
                 }
                 SpillState::WritingToDisk { pages, completions } => {
                     let all_done = completions.iter().all(|c| c.succeeded());
@@ -3868,18 +3896,18 @@ impl Pager {
                         "try_spill_dirty_pages: successfully spilled {} pages to disk",
                         pages.len()
                     );
-                    return Ok(IOResult::Done(true));
+                    return Ok(IOResult::Done(()));
                 }
             }
         }
     }
 
-    /// Append the prepared spill `pages` as WAL frames. Returns
-    /// `Done(true)` if the write completed synchronously, otherwise
-    /// transitions to `SpillState::WritingToWal` and yields the write
-    /// completion. The WAL must already be initialized (callers route
-    /// through `PreparingWal*` first).
-    fn spill_append_frames_to_wal(&self, pages: Vec<PinGuard>) -> Result<IOResult<bool>> {
+    /// Append the prepared spill `pages` as WAL frames. Returns `Done` if
+    /// the write completed synchronously, otherwise transitions to
+    /// `SpillState::WritingToWal` and yields the write completion. The WAL
+    /// must already be initialized (callers route through `PreparingWal*`
+    /// first).
+    fn spill_append_frames_to_wal(&self, pages: Vec<PinGuard>) -> Result<IOResult<()>> {
         let wal = self
             .wal
             .as_ref()
@@ -3910,7 +3938,7 @@ impl Pager {
                 }
             }
             *self.spill_state.write() = SpillState::Idle;
-            return Ok(IOResult::Done(true));
+            return Ok(IOResult::Done(()));
         }
         *self.spill_state.write() = SpillState::WritingToWal {
             pages,
@@ -3928,7 +3956,7 @@ impl Pager {
                 return Ok(IOResult::Done(()));
             }
             match self.try_spill_dirty_pages()? {
-                IOResult::Done(_) => continue,
+                IOResult::Done(()) => continue,
                 IOResult::IO(c) => return Ok(IOResult::IO(c)),
             }
         }
@@ -3965,7 +3993,7 @@ impl Pager {
 
     /// Check if the cache needs spilling and attempt to spill if necessary.
     /// This should be called before inserting new pages into the cache.
-    pub fn ensure_cache_space(&self) -> Result<IOResult<()>> {
+    fn ensure_cache_space(&self) -> Result<IOResult<()>> {
         let needs_spill = {
             let cache = self.page_cache.read();
             cache.needs_spill()
@@ -3973,18 +4001,11 @@ impl Pager {
 
         if needs_spill {
             match self.try_spill_dirty_pages()? {
-                IOResult::Done(spilled) => {
-                    if spilled {
-                        // After spilling, try to evict clean pages to make room in the cache
-                        let mut cache = self.page_cache.write();
-                        if let Err(e) = cache.make_room_for(1, false) {
-                            // Cache is completely full with unevictable pages
-                            tracing::error!(
-                                "ensure_cache_space: {e} cache full, could not make room"
-                            );
-                            return Err(LimboError::CacheError(CacheError::Full));
-                        }
-                    }
+                IOResult::Done(()) => {
+                    // Whether or not anything could be spilled, proceed: the
+                    // capacity is a soft limit, and the upcoming insert
+                    // evicts what it can and admits the page over capacity
+                    // otherwise.
                 }
                 IOResult::IO(completion) => {
                     return Ok(IOResult::IO(completion));
@@ -4931,6 +4952,14 @@ impl Pager {
     /// Invalidates entire page cache by removing all dirty and clean pages. Usually used in case
     /// of a rollback or in case we want to invalidate page cache after starting a read transaction
     /// right after new writes happened which would invalidate current page cache.
+    /// Test-only: evict clean, unpinned pages WITHOUT invalidating cursors, so we
+    /// can exercise what happens to a cursor that still holds a `PageRef` to an
+    /// evicted (buffer-taken) page — the exact hazard normal LRU eviction creates.
+    #[cfg(test)]
+    pub fn test_evict_all_unpinned_clean(&self) {
+        self.page_cache.write().test_evict_all_unpinned_clean();
+    }
+
     pub fn clear_page_cache(&self, clear_dirty: bool) {
         self.invalidate_all_cursors();
         let dirty_pages = self.dirty_pages.write();
@@ -5297,8 +5326,7 @@ impl Pager {
                             if !already_present {
                                 let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
                                 self.add_dirty(&page)?;
-                                let mut cache = self.page_cache.write();
-                                cache.insert(page_key, page)?;
+                                self.page_cache.write().force_insert_page(page_key, page)?;
                             }
                         }
                     }
@@ -5461,10 +5489,9 @@ impl Pager {
                             allocate_new_page(new_db_size as i64, &self.buffer_pool);
                         self.add_dirty(&richard_hipp_special_page)?;
                         let page_key = PageCacheKey::new(richard_hipp_special_page.get().id);
-                        {
-                            let mut cache = self.page_cache.write();
-                            cache.insert(page_key, richard_hipp_special_page).unwrap();
-                        }
+                        self.page_cache
+                            .write()
+                            .force_insert_page(page_key, richard_hipp_special_page)?;
                         // HIPP special page is assumed to zeroed and should never be read or written to by the BTREE
                         new_db_size += 1;
                     }
@@ -5484,11 +5511,9 @@ impl Pager {
                         self.add_dirty(&page)?;
 
                         let page_key = PageCacheKey::new(page.get().id as usize);
-                        {
-                            // Run in separate block to avoid deadlock on page cache write lock
-                            let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page.clone())?;
-                        }
+                        self.page_cache
+                            .write()
+                            .force_insert_page(page_key, page.clone())?;
                         header.database_size = new_db_size.into();
                         *state = AllocatePageState::Start;
                         return Ok(IOResult::Done(page));
@@ -5511,11 +5536,15 @@ impl Pager {
         if dirty_page_must_exist {
             turso_assert!(page.is_dirty(), "page must be dirty for upsert", { "page_id": id });
         }
-        cache.upsert_page(page_key, page.clone()).map_err(|e| {
-            LimboError::InternalError(format!(
-                "Failed to insert loaded page {id} into cache: {e:?}"
-            ))
-        })?;
+        // The page carries writes that must stay cache-resident, so admit it
+        // over capacity when nothing is evictable.
+        cache
+            .force_upsert_page(page_key, page.clone())
+            .map_err(|e| {
+                LimboError::InternalError(format!(
+                    "Failed to insert loaded page {id} into cache: {e:?}"
+                ))
+            })?;
         page.set_loaded();
         page.clear_wal_tag();
         Ok(())
@@ -5928,9 +5957,124 @@ mod tests {
 
     use crate::sync::RwLock;
 
+    use crate::io::{MemoryIO, OpenFlags, IO};
+    use crate::storage::buffer_pool::BufferPool;
+    use crate::storage::database::DatabaseFile;
     use crate::storage::page_cache::{PageCache, PageCacheKey};
+    use crate::storage::wal::{Wal, WalFile, WalFileShared};
+    use crate::util::IOExt;
+    use arc_swap::ArcSwapOption;
 
-    use super::Page;
+    use super::{default_page1, Page, PageRef, Pager};
+
+    fn pager_with_cache_capacity(cache_capacity: usize, database_pages: u32) -> Arc<Pager> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = BufferPool::begin_init(&io, 4096 * 128);
+
+        let db_file = Arc::new(DatabaseFile::new(
+            io.open_file(":memory:", OpenFlags::Create, false).unwrap(),
+        ));
+
+        let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
+        let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
+        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
+        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
+            io.clone(),
+            wal_shared,
+            last_checksum_and_max_frame,
+            buffer_pool.clone(),
+        ));
+
+        let init_page_1 = Arc::new(ArcSwapOption::new(Some(default_page1(None))));
+        let pager = Arc::new(
+            Pager::new(
+                db_file,
+                Some(wal),
+                io,
+                PageCache::new(cache_capacity),
+                buffer_pool,
+                Arc::new(crate::sync::Mutex::new(())),
+                init_page_1,
+            )
+            .unwrap(),
+        );
+
+        pager.io.step().unwrap();
+        pager.io.block(|| pager.allocate_page1()).unwrap();
+        for _ in 0..(database_pages - 1) {
+            pager.io.block(|| pager.allocate_page()).unwrap();
+        }
+        pager
+    }
+
+    /// The page cache capacity is a soft limit, as in SQLite: when every
+    /// resident page is unevictable (held by cursors, dirty and unspillable),
+    /// a read must still succeed by admitting the page over capacity instead
+    /// of failing with Busy. The excess drains once pages become evictable.
+    #[test]
+    fn read_page_exceeds_capacity_when_cache_unevictable() {
+        const CAP: usize = 5;
+        let pager = pager_with_cache_capacity(CAP, 6);
+
+        // Allocating 6 pages against a 5-page cache forces a spill and evicts
+        // at least one spilled page; find one that is no longer resident.
+        let missing = (2..=6)
+            .find(|&id| !pager.page_cache.read().contains_key(&PageCacheKey::new(id)))
+            .expect("allocating 6 pages with a 5-page cache must evict at least one page")
+            as i64;
+
+        // Hold strong references to every resident page so none can be
+        // evicted or spilled.
+        let held: Vec<PageRef> = (1..=6)
+            .filter_map(|id| pager.cache_get(id).unwrap())
+            .collect();
+        assert_eq!(held.len(), CAP, "cache should be at capacity");
+
+        let (page, c) = pager.io.block(|| pager.read_page(missing)).unwrap();
+        if let Some(c) = c {
+            pager.io.wait_for_completion(c).unwrap();
+        }
+        while page.is_locked() {
+            pager.io.step().unwrap();
+        }
+        assert_eq!(page.get().id as i64, missing);
+        assert!(
+            pager.page_cache.read().len() > CAP,
+            "page must have been admitted over capacity"
+        );
+
+        // Once the strong references are gone, the next insert drains the
+        // excess back under capacity.
+        drop(held);
+        drop(page);
+        pager.io.block(|| pager.allocate_page()).unwrap();
+        assert!(
+            pager.page_cache.read().len() <= CAP,
+            "excess over capacity must drain once pages become evictable"
+        );
+    }
+
+    /// Same soft-limit guarantee for the write path: allocating a new page
+    /// while the cache is full of unevictable pages must not fail.
+    #[test]
+    fn allocate_page_exceeds_capacity_when_cache_unevictable() {
+        const CAP: usize = 5;
+        let pager = pager_with_cache_capacity(CAP, 5);
+
+        // Hold strong references to all resident pages: dirty pages with
+        // outstanding references can neither be spilled nor evicted.
+        let held: Vec<PageRef> = (1..=5)
+            .filter_map(|id| pager.cache_get(id).unwrap())
+            .collect();
+        assert_eq!(held.len(), CAP, "cache should be at capacity");
+
+        let page = pager.io.block(|| pager.allocate_page()).unwrap();
+        assert_eq!(page.get().id, 6);
+        assert!(
+            pager.page_cache.read().len() > CAP,
+            "page must have been admitted over capacity"
+        );
+    }
 
     #[test]
     fn test_shared_cache() {
@@ -6366,6 +6510,7 @@ mod checkpoint_phase_tests {
     use crate::sync::atomic::Ordering;
     use crate::types::IOResult;
     use crate::Database;
+    use crate::SqliteDialect;
 
     /// Returns an IO backend that supports shared WAL coordination on the host.
     /// On Windows the default `PlatformIO` (`WindowsIO`) lacks the byte-locking
@@ -6398,6 +6543,7 @@ mod checkpoint_phase_tests {
             crate::OpenFlags::default(),
             crate::DatabaseOpts::new().with_multiprocess_wal(true),
             None,
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         (db, dir)

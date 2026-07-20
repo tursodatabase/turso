@@ -518,7 +518,116 @@ impl WindowFunc {
     /// drifts ahead of the resolver and users get "no such function" when
     /// they try to call them.
     pub fn is_implemented(&self) -> bool {
-        matches!(self, Self::RowNumber)
+        matches!(self, Self::RowNumber | Self::Rank)
+    }
+
+    /// The hardcoded frame this built-in evaluates over, overriding any
+    /// user-written FRAME clause.
+    /// - `Some(frame)` = even if the user provides an explicit frame, it's ignored in favor of this hardcoded frame.
+    /// - `None` = the function honors the user's frame, falling back to Frame::default() when user hasn't specified one.
+    ///
+    /// This is taken from SQLite's `sqlite3WindowUpdate` table at `window.c:699-708`.
+    pub fn coerced_frame(&self) -> Option<crate::translate::plan::Frame> {
+        use crate::translate::plan::{Frame, FrameBoundary};
+        use turso_parser::ast::{Expr, FrameMode, Literal};
+        match self {
+            Self::RowNumber | Self::Lag => Some(Frame {
+                mode: FrameMode::Rows,
+                start: FrameBoundary::UnboundedPreceding,
+                end: FrameBoundary::CurrentRow,
+            }),
+            Self::Rank | Self::DenseRank => Some(Frame {
+                mode: FrameMode::Range,
+                start: FrameBoundary::UnboundedPreceding,
+                end: FrameBoundary::CurrentRow,
+            }),
+            Self::PercentRank => Some(Frame {
+                mode: FrameMode::Groups,
+                start: FrameBoundary::CurrentRow,
+                end: FrameBoundary::UnboundedFollowing,
+            }),
+            Self::CumeDist => Some(Frame {
+                mode: FrameMode::Groups,
+                start: FrameBoundary::Following(Box::new(Expr::Literal(Literal::Numeric(
+                    "1".to_string(),
+                )))),
+                end: FrameBoundary::UnboundedFollowing,
+            }),
+            Self::Ntile => Some(Frame {
+                mode: FrameMode::Rows,
+                start: FrameBoundary::CurrentRow,
+                end: FrameBoundary::UnboundedFollowing,
+            }),
+            Self::Lead => Some(Frame {
+                mode: FrameMode::Rows,
+                start: FrameBoundary::UnboundedPreceding,
+                end: FrameBoundary::UnboundedFollowing,
+            }),
+            Self::FirstValue | Self::LastValue | Self::NthValue => None,
+            Self::External(_) => unreachable!(
+                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
+            ),
+        }
+    }
+
+    /// Whether the function produces a single value shared by every row in a
+    /// peer group (true) or a distinct value per row (false).
+    ///
+    /// This controls where `emit_aggregation_step` and
+    /// `emit_peer_group_flush` emit the function's `AggStep` and
+    /// `AggValue` opcodes:
+    ///
+    /// * true (rank-family): `AggStep` is emitted inside the input-scan loop
+    ///   in `emit_aggregation_step`, so it runs once for every row read from
+    ///   the subquery and advances the function's internal counter. `AggValue`
+    ///   is emitted once per peer-group flush in `emit_peer_group_flush`,
+    ///   before the loop over buffered rows, reading the accumulator into a
+    ///   result register. The loop then writes that one register's contents
+    ///   into the output for every buffered row in the group.
+    /// * false (row_number, ntile, lag, lead, first/last/nth_value): nothing
+    ///   is emitted in `emit_aggregation_step`. Both `AggStep` and `AggValue`
+    ///   are emitted inside the per-row loop in `emit_peer_group_flush`,
+    ///   so they run once per buffered row and produce a distinct value for
+    ///   each output row.
+    ///
+    /// Concrete example. Given `scores(name, score)`:
+    ///
+    ///   alice  100
+    ///   bob    100
+    ///   carol   90
+    ///
+    /// `rank() OVER (ORDER BY score DESC)` returns true — alice and bob are
+    /// peers on score=100 and share the same rank:
+    ///
+    ///   alice  100  1
+    ///   bob    100  1
+    ///   carol   90  3
+    ///
+    /// `row_number() OVER (ORDER BY score DESC)` returns false — every row
+    /// gets a distinct number even within the score=100 peer group:
+    ///
+    ///   alice  100  1
+    ///   bob    100  2
+    ///   carol   90  3
+    ///
+    /// Functions returning true: `rank`, `dense_rank`, `percent_rank`,
+    /// `cume_dist` — their value is determined entirely by where the peer
+    /// group sits in the partition's ordering.
+    /// Functions returning false: `row_number`, `ntile`, `lag`, `lead`,
+    /// `first_value`, `last_value`, `nth_value` — all depend on a row's
+    /// position within the partition/frame, not just its peer group.
+    pub fn one_value_per_peer_group(&self) -> bool {
+        match self {
+            Self::Rank | Self::DenseRank | Self::PercentRank | Self::CumeDist => true,
+            Self::RowNumber
+            | Self::Ntile
+            | Self::Lag
+            | Self::Lead
+            | Self::FirstValue
+            | Self::LastValue
+            | Self::NthValue
+            | Self::External(_) => false,
+        }
     }
 }
 
@@ -763,6 +872,8 @@ pub enum ScalarFunc {
     JulianDay,
     Hex,
     Unhex,
+    GetByte,
+    SetByte,
     ZeroBlob,
     LastInsertRowid,
     Replace,
@@ -896,6 +1007,8 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::JulianDay => false,
             ScalarFunc::Hex => true,
             ScalarFunc::Unhex => true,
+            ScalarFunc::GetByte => true,
+            ScalarFunc::SetByte => true,
             ScalarFunc::ZeroBlob => true,
             ScalarFunc::LastInsertRowid => false,
             ScalarFunc::Replace => true,
@@ -1040,6 +1153,8 @@ impl Display for ScalarFunc {
             Self::UnixEpoch => "unixepoch",
             Self::Hex => "hex",
             Self::Unhex => "unhex",
+            Self::GetByte => "get_byte",
+            Self::SetByte => "set_byte",
             Self::ZeroBlob => "zeroblob",
             Self::LastInsertRowid => "last_insert_rowid",
             Self::Replace => "replace",
@@ -1179,9 +1294,10 @@ impl ScalarFunc {
             | Self::Nullif
             | Self::IfNull
             | Self::Likelihood
+            | Self::GetByte
             | Self::TimeDiff => &[2],
             // 3-arg
-            Self::Iif | Self::Replace => &[3],
+            Self::Iif | Self::Replace | Self::SetByte => &[3],
             // Multi-arity (one row per valid arity)
             Self::Like => &[2, 3],
             Self::Trim | Self::LTrim | Self::RTrim | Self::Round | Self::Unhex => &[1, 2],
@@ -1435,6 +1551,10 @@ pub enum Func {
     Json(JsonFunc),
     AlterTable(AlterTableFunc),
     External(Arc<ExternalFunc>),
+    /// Scalar function provided by the database's schema dialect (e.g. a
+    /// PostgreSQL catalog function). Resolved and executed through
+    /// [`crate::dialect::Dialect`]; the engine only carries the name.
+    Dialect(String),
 }
 
 impl Display for Func {
@@ -1451,6 +1571,7 @@ impl Display for Func {
             Self::Json(json_func) => write!(f, "{json_func}"),
             Self::External(generic_func) => write!(f, "{generic_func}"),
             Self::AlterTable(alter_func) => write!(f, "{alter_func}"),
+            Self::Dialect(name) => write!(f, "{name}"),
         }
     }
 }
@@ -1475,6 +1596,10 @@ impl Deterministic for Func {
             Self::Json(json_func) => json_func.is_deterministic(),
             Self::External(external_func) => external_func.is_deterministic(),
             Self::AlterTable(_) => true,
+            // Dialect scalars are catalog readers (stable within a
+            // statement); a dialect that adds a nondeterministic function
+            // should register it as an extension function instead.
+            Self::Dialect(_) => true,
         }
     }
 }
@@ -1537,322 +1662,12 @@ impl Func {
     pub fn needs_star_expansion(&self) -> bool {
         false
     }
+    /// Resolve a built-in function name. Thin wrapper over
+    /// [`crate::dialect::sqlite::resolve_builtin_function`], where the
+    /// SQLite name table lives; kept on `Func` for the engine call sites
+    /// that classify translated AST.
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Option<Self>, LimboError> {
-        let normalized_name = crate::util::normalize_ident(name);
-        match normalized_name.as_str() {
-            "avg" => {
-                if arg_count != 1 {
-                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-                }
-                Ok(Some(Self::Agg(AggFunc::Avg)))
-            }
-            "count" => {
-                // Handle both COUNT() and COUNT(expr) cases
-                if arg_count == 0 {
-                    Ok(Some(Self::Agg(AggFunc::Count0))) // COUNT() case
-                } else if arg_count == 1 {
-                    Ok(Some(Self::Agg(AggFunc::Count))) // COUNT(expr) case
-                } else {
-                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-                }
-            }
-            "group_concat" => {
-                if arg_count != 1 && arg_count != 2 {
-                    println!("{arg_count}");
-                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-                }
-                Ok(Some(Self::Agg(AggFunc::GroupConcat)))
-            }
-            "max" if arg_count > 1 => Ok(Some(Self::Scalar(ScalarFunc::Max))),
-            "max" => {
-                if arg_count < 1 {
-                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-                }
-                Ok(Some(Self::Agg(AggFunc::Max)))
-            }
-            "min" if arg_count > 1 => Ok(Some(Self::Scalar(ScalarFunc::Min))),
-            "min" => {
-                if arg_count < 1 {
-                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-                }
-                Ok(Some(Self::Agg(AggFunc::Min)))
-            }
-            "nullif" if arg_count == 2 => Ok(Some(Self::Scalar(ScalarFunc::Nullif))),
-            "string_agg" => {
-                if arg_count != 2 {
-                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-                }
-                Ok(Some(Self::Agg(AggFunc::StringAgg)))
-            }
-            "sum" => {
-                if arg_count != 1 {
-                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-                }
-                Ok(Some(Self::Agg(AggFunc::Sum)))
-            }
-            "total" => {
-                if arg_count != 1 {
-                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-                }
-                Ok(Some(Self::Agg(AggFunc::Total)))
-            }
-            "row_number" => {
-                if arg_count != 0 {
-                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-                }
-                Ok(Some(Self::Window(WindowFunc::RowNumber)))
-            }
-            "timediff" => {
-                if arg_count != 2 {
-                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-                }
-                Ok(Some(Self::Scalar(ScalarFunc::TimeDiff)))
-            }
-            "array_agg" => Ok(Some(Self::Agg(AggFunc::ArrayAgg))),
-            #[cfg(feature = "json")]
-            "jsonb_group_array" => Ok(Some(Self::Agg(AggFunc::JsonbGroupArray))),
-            #[cfg(feature = "json")]
-            "json_group_array" => Ok(Some(Self::Agg(AggFunc::JsonGroupArray))),
-            #[cfg(feature = "json")]
-            "jsonb_group_object" => Ok(Some(Self::Agg(AggFunc::JsonbGroupObject))),
-            #[cfg(feature = "json")]
-            "json_group_object" => Ok(Some(Self::Agg(AggFunc::JsonGroupObject))),
-            "char" | "chr" => Ok(Some(Self::Scalar(ScalarFunc::Char))),
-            "coalesce" => Ok(Some(Self::Scalar(ScalarFunc::Coalesce))),
-            "concat" => {
-                if arg_count == 0 {
-                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-                }
-                Ok(Some(Self::Scalar(ScalarFunc::Concat)))
-            }
-            "concat_ws" => {
-                if arg_count < 2 {
-                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-                }
-                Ok(Some(Self::Scalar(ScalarFunc::ConcatWs)))
-            }
-            "changes" => Ok(Some(Self::Scalar(ScalarFunc::Changes))),
-            "total_changes" => Ok(Some(Self::Scalar(ScalarFunc::TotalChanges))),
-            "glob" => Ok(Some(Self::Scalar(ScalarFunc::Glob))),
-            "ifnull" => Ok(Some(Self::Scalar(ScalarFunc::IfNull))),
-            "if" | "iif" => Ok(Some(Self::Scalar(ScalarFunc::Iif))),
-            "instr" | "strpos" => Ok(Some(Self::Scalar(ScalarFunc::Instr))),
-            "like" => Ok(Some(Self::Scalar(ScalarFunc::Like))),
-            "abs" => Ok(Some(Self::Scalar(ScalarFunc::Abs))),
-            "upper" => Ok(Some(Self::Scalar(ScalarFunc::Upper))),
-            "lower" => Ok(Some(Self::Scalar(ScalarFunc::Lower))),
-            "random" => Ok(Some(Self::Scalar(ScalarFunc::Random))),
-            "randomblob" => Ok(Some(Self::Scalar(ScalarFunc::RandomBlob))),
-            "trim" | "btrim" => Ok(Some(Self::Scalar(ScalarFunc::Trim))),
-            "ltrim" => Ok(Some(Self::Scalar(ScalarFunc::LTrim))),
-            "rtrim" => Ok(Some(Self::Scalar(ScalarFunc::RTrim))),
-            "round" => Ok(Some(Self::Scalar(ScalarFunc::Round))),
-            "length" | "char_length" | "character_length" => {
-                Ok(Some(Self::Scalar(ScalarFunc::Length)))
-            }
-            "octet_length" => Ok(Some(Self::Scalar(ScalarFunc::OctetLength))),
-            "sign" => Ok(Some(Self::Scalar(ScalarFunc::Sign))),
-            "substr" => {
-                if arg_count != 2 && arg_count != 3 {
-                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-                }
-                Ok(Some(Self::Scalar(ScalarFunc::Substr)))
-            }
-            "substring" => {
-                if arg_count != 2 && arg_count != 3 {
-                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
-                }
-                Ok(Some(Self::Scalar(ScalarFunc::Substring)))
-            }
-            "date" => Ok(Some(Self::Scalar(ScalarFunc::Date))),
-            "time" => Ok(Some(Self::Scalar(ScalarFunc::Time))),
-            "datetime" => Ok(Some(Self::Scalar(ScalarFunc::DateTime))),
-            "typeof" => Ok(Some(Self::Scalar(ScalarFunc::Typeof))),
-            "last_insert_rowid" => Ok(Some(Self::Scalar(ScalarFunc::LastInsertRowid))),
-            "unicode" => Ok(Some(Self::Scalar(ScalarFunc::Unicode))),
-            "unistr" => Ok(Some(Self::Scalar(ScalarFunc::Unistr))),
-            "unistr_quote" => Ok(Some(Self::Scalar(ScalarFunc::UnistrQuote))),
-            "quote" => Ok(Some(Self::Scalar(ScalarFunc::Quote))),
-            "sqlite_version" => Ok(Some(Self::Scalar(ScalarFunc::SqliteVersion))),
-            "turso_version" => Ok(Some(Self::Scalar(ScalarFunc::TursoVersion))),
-            "sqlite_source_id" => Ok(Some(Self::Scalar(ScalarFunc::SqliteSourceId))),
-            "replace" => Ok(Some(Self::Scalar(ScalarFunc::Replace))),
-            "likely" => Ok(Some(Self::Scalar(ScalarFunc::Likely))),
-            "likelihood" => Ok(Some(Self::Scalar(ScalarFunc::Likelihood))),
-            "unlikely" => Ok(Some(Self::Scalar(ScalarFunc::Unlikely))),
-            #[cfg(feature = "json")]
-            "json" => Ok(Some(Self::Json(JsonFunc::Json))),
-            #[cfg(feature = "json")]
-            "jsonb" => Ok(Some(Self::Json(JsonFunc::Jsonb))),
-            #[cfg(feature = "json")]
-            "json_array_length" => Ok(Some(Self::Json(JsonFunc::JsonArrayLength))),
-            #[cfg(feature = "json")]
-            "json_array" => Ok(Some(Self::Json(JsonFunc::JsonArray))),
-            #[cfg(feature = "json")]
-            "jsonb_array" => Ok(Some(Self::Json(JsonFunc::JsonbArray))),
-            #[cfg(feature = "json")]
-            "json_extract" => Ok(Some(Func::Json(JsonFunc::JsonExtract))),
-            #[cfg(feature = "json")]
-            "jsonb_extract" => Ok(Some(Func::Json(JsonFunc::JsonbExtract))),
-            #[cfg(feature = "json")]
-            "json_object" => Ok(Some(Func::Json(JsonFunc::JsonObject))),
-            #[cfg(feature = "json")]
-            "jsonb_object" => Ok(Some(Func::Json(JsonFunc::JsonbObject))),
-            #[cfg(feature = "json")]
-            "json_type" => Ok(Some(Func::Json(JsonFunc::JsonType))),
-            #[cfg(feature = "json")]
-            "json_error_position" => Ok(Some(Self::Json(JsonFunc::JsonErrorPosition))),
-            #[cfg(feature = "json")]
-            "json_valid" => Ok(Some(Self::Json(JsonFunc::JsonValid))),
-            #[cfg(feature = "json")]
-            "json_patch" => Ok(Some(Self::Json(JsonFunc::JsonPatch))),
-            #[cfg(feature = "json")]
-            "jsonb_patch" => Ok(Some(Self::Json(JsonFunc::JsonbPatch))),
-            #[cfg(feature = "json")]
-            "json_remove" => Ok(Some(Self::Json(JsonFunc::JsonRemove))),
-            #[cfg(feature = "json")]
-            "jsonb_remove" => Ok(Some(Self::Json(JsonFunc::JsonbRemove))),
-            #[cfg(feature = "json")]
-            "json_replace" => Ok(Some(Self::Json(JsonFunc::JsonReplace))),
-            #[cfg(feature = "json")]
-            "json_insert" => Ok(Some(Self::Json(JsonFunc::JsonInsert))),
-            #[cfg(feature = "json")]
-            "jsonb_insert" => Ok(Some(Self::Json(JsonFunc::JsonbInsert))),
-            #[cfg(feature = "json")]
-            "jsonb_replace" => Ok(Some(Self::Json(JsonFunc::JsonReplace))),
-            #[cfg(feature = "json")]
-            "json_pretty" => Ok(Some(Self::Json(JsonFunc::JsonPretty))),
-            #[cfg(feature = "json")]
-            "json_set" => Ok(Some(Self::Json(JsonFunc::JsonSet))),
-            #[cfg(feature = "json")]
-            "jsonb_set" => Ok(Some(Self::Json(JsonFunc::JsonbSet))),
-            #[cfg(feature = "json")]
-            "json_quote" => Ok(Some(Self::Json(JsonFunc::JsonQuote))),
-            "unixepoch" => Ok(Some(Self::Scalar(ScalarFunc::UnixEpoch))),
-            "julianday" => Ok(Some(Self::Scalar(ScalarFunc::JulianDay))),
-            "hex" => Ok(Some(Self::Scalar(ScalarFunc::Hex))),
-            "unhex" => Ok(Some(Self::Scalar(ScalarFunc::Unhex))),
-            "zeroblob" => Ok(Some(Self::Scalar(ScalarFunc::ZeroBlob))),
-            "soundex" => Ok(Some(Self::Scalar(ScalarFunc::Soundex))),
-            "table_columns_json_array" => Ok(Some(Self::Scalar(ScalarFunc::TableColumnsJsonArray))),
-            "bin_record_json_object" => Ok(Some(Self::Scalar(ScalarFunc::BinRecordJsonObject))),
-            "conn_txn_id" => Ok(Some(Self::Scalar(ScalarFunc::ConnTxnId))),
-            "is_autocommit" => Ok(Some(Self::Scalar(ScalarFunc::IsAutocommit))),
-            "sequence_watermark_experimental" => {
-                Ok(Some(Self::Scalar(ScalarFunc::SequenceWatermark)))
-            }
-            "acos" => Ok(Some(Self::Math(MathFunc::Acos))),
-            "acosh" => Ok(Some(Self::Math(MathFunc::Acosh))),
-            "asin" => Ok(Some(Self::Math(MathFunc::Asin))),
-            "asinh" => Ok(Some(Self::Math(MathFunc::Asinh))),
-            "atan" => Ok(Some(Self::Math(MathFunc::Atan))),
-            "atan2" => Ok(Some(Self::Math(MathFunc::Atan2))),
-            "atanh" => Ok(Some(Self::Math(MathFunc::Atanh))),
-            "ceil" => Ok(Some(Self::Math(MathFunc::Ceil))),
-            "ceiling" => Ok(Some(Self::Math(MathFunc::Ceiling))),
-            "cos" => Ok(Some(Self::Math(MathFunc::Cos))),
-            "cosh" => Ok(Some(Self::Math(MathFunc::Cosh))),
-            "degrees" => Ok(Some(Self::Math(MathFunc::Degrees))),
-            "exp" => Ok(Some(Self::Math(MathFunc::Exp))),
-            "floor" => Ok(Some(Self::Math(MathFunc::Floor))),
-            "ln" => Ok(Some(Self::Math(MathFunc::Ln))),
-            "log" => Ok(Some(Self::Math(MathFunc::Log))),
-            "log10" => Ok(Some(Self::Math(MathFunc::Log10))),
-            "log2" => Ok(Some(Self::Math(MathFunc::Log2))),
-            "mod" => Ok(Some(Self::Math(MathFunc::Mod))),
-            "pi" => Ok(Some(Self::Math(MathFunc::Pi))),
-            "pow" => Ok(Some(Self::Math(MathFunc::Pow))),
-            "power" => Ok(Some(Self::Math(MathFunc::Power))),
-            "radians" => Ok(Some(Self::Math(MathFunc::Radians))),
-            "sin" => Ok(Some(Self::Math(MathFunc::Sin))),
-            "sinh" => Ok(Some(Self::Math(MathFunc::Sinh))),
-            "sqrt" => Ok(Some(Self::Math(MathFunc::Sqrt))),
-            "tan" => Ok(Some(Self::Math(MathFunc::Tan))),
-            "tanh" => Ok(Some(Self::Math(MathFunc::Tanh))),
-            "trunc" => Ok(Some(Self::Math(MathFunc::Trunc))),
-            #[cfg(feature = "fs")]
-            #[cfg(not(target_family = "wasm"))]
-            "load_extension" => Ok(Some(Self::Scalar(ScalarFunc::LoadExtension))),
-            "strftime" => Ok(Some(Self::Scalar(ScalarFunc::StrfTime))),
-            "printf" | "format" => Ok(Some(Self::Scalar(ScalarFunc::Printf))),
-            "vector" => Ok(Some(Self::Vector(VectorFunc::Vector))),
-            "vector32" => Ok(Some(Self::Vector(VectorFunc::Vector32))),
-            "vector32_sparse" => Ok(Some(Self::Vector(VectorFunc::Vector32Sparse))),
-            "vector64" => Ok(Some(Self::Vector(VectorFunc::Vector64))),
-            "vector8" => Ok(Some(Self::Vector(VectorFunc::Vector8))),
-            "vector1bit" => Ok(Some(Self::Vector(VectorFunc::Vector1Bit))),
-            "vector_extract" => Ok(Some(Self::Vector(VectorFunc::VectorExtract))),
-            "vector_distance_cos" => Ok(Some(Self::Vector(VectorFunc::VectorDistanceCos))),
-            "vector_distance_l2" => Ok(Some(Self::Vector(VectorFunc::VectorDistanceL2))),
-            "vector_distance_jaccard" => Ok(Some(Self::Vector(VectorFunc::VectorDistanceJaccard))),
-            "vector_distance_dot" => Ok(Some(Self::Vector(VectorFunc::VectorDistanceDot))),
-            "vector_concat" => Ok(Some(Self::Vector(VectorFunc::VectorConcat))),
-            "vector_slice" => Ok(Some(Self::Vector(VectorFunc::VectorSlice))),
-            // FTS functions
-            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-            "fts_score" => Ok(Some(Self::Fts(FtsFunc::Score))),
-            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-            "fts_match" => Ok(Some(Self::Fts(FtsFunc::Match))),
-            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-            "fts_highlight" => Ok(Some(Self::Fts(FtsFunc::Highlight))),
-            // Test type functions (for custom type system testing)
-            "test_uint_encode" => Ok(Some(Self::Scalar(ScalarFunc::TestUintEncode))),
-            "test_uint_decode" => Ok(Some(Self::Scalar(ScalarFunc::TestUintDecode))),
-            "test_uint_add" => Ok(Some(Self::Scalar(ScalarFunc::TestUintAdd))),
-            "test_uint_sub" => Ok(Some(Self::Scalar(ScalarFunc::TestUintSub))),
-            "test_uint_mul" => Ok(Some(Self::Scalar(ScalarFunc::TestUintMul))),
-            "test_uint_div" => Ok(Some(Self::Scalar(ScalarFunc::TestUintDiv))),
-            "test_uint_lt" => Ok(Some(Self::Scalar(ScalarFunc::TestUintLt))),
-            "test_uint_eq" => Ok(Some(Self::Scalar(ScalarFunc::TestUintEq))),
-            #[cfg(feature = "test_helper")]
-            "test_nondet_counter" => Ok(Some(Self::Scalar(ScalarFunc::TestNondetCounter))),
-            "string_reverse" | "reverse" => Ok(Some(Self::Scalar(ScalarFunc::StringReverse))),
-            "gcd" => Ok(Some(Self::Scalar(ScalarFunc::Gcd))),
-            "lcm" => Ok(Some(Self::Scalar(ScalarFunc::Lcm))),
-            "repeat" => Ok(Some(Self::Scalar(ScalarFunc::Repeat))),
-            "lpad" => Ok(Some(Self::Scalar(ScalarFunc::Lpad))),
-            "rpad" => Ok(Some(Self::Scalar(ScalarFunc::Rpad))),
-            // Built-in type support functions
-            "boolean_to_int" => Ok(Some(Self::Scalar(ScalarFunc::BooleanToInt))),
-            "int_to_boolean" => Ok(Some(Self::Scalar(ScalarFunc::IntToBoolean))),
-            "validate_ipaddr" => Ok(Some(Self::Scalar(ScalarFunc::ValidateIpAddr))),
-            "numeric_encode" => Ok(Some(Self::Scalar(ScalarFunc::NumericEncode))),
-            "numeric_decode" => Ok(Some(Self::Scalar(ScalarFunc::NumericDecode))),
-            "numeric_add" => Ok(Some(Self::Scalar(ScalarFunc::NumericAdd))),
-            "numeric_sub" => Ok(Some(Self::Scalar(ScalarFunc::NumericSub))),
-            "numeric_mul" => Ok(Some(Self::Scalar(ScalarFunc::NumericMul))),
-            "numeric_div" => Ok(Some(Self::Scalar(ScalarFunc::NumericDiv))),
-            "numeric_lt" => Ok(Some(Self::Scalar(ScalarFunc::NumericLt))),
-            "numeric_eq" => Ok(Some(Self::Scalar(ScalarFunc::NumericEq))),
-            // Array construction / element access (desugared from syntax)
-            "array" => Ok(Some(Self::Scalar(ScalarFunc::Array))),
-            "array_element" => Ok(Some(Self::Scalar(ScalarFunc::ArrayElement))),
-            "array_set_element" => Ok(Some(Self::Scalar(ScalarFunc::ArraySetElement))),
-            // Array functions
-            "array_length" | "array_upper" => Ok(Some(Self::Scalar(ScalarFunc::ArrayLength))),
-            "array_append" => Ok(Some(Self::Scalar(ScalarFunc::ArrayAppend))),
-            "array_prepend" => Ok(Some(Self::Scalar(ScalarFunc::ArrayPrepend))),
-            "array_cat" => Ok(Some(Self::Scalar(ScalarFunc::ArrayCat))),
-            "array_remove" => Ok(Some(Self::Scalar(ScalarFunc::ArrayRemove))),
-            "array_contains" => Ok(Some(Self::Scalar(ScalarFunc::ArrayContains))),
-            "array_position" => Ok(Some(Self::Scalar(ScalarFunc::ArrayPosition))),
-            "array_slice" => Ok(Some(Self::Scalar(ScalarFunc::ArraySlice))),
-            "string_to_array" => Ok(Some(Self::Scalar(ScalarFunc::StringToArray))),
-            "array_to_string" => Ok(Some(Self::Scalar(ScalarFunc::ArrayToString))),
-            "array_overlap" | "array_overlaps" => Ok(Some(Self::Scalar(ScalarFunc::ArrayOverlap))),
-            "array_contains_all" => Ok(Some(Self::Scalar(ScalarFunc::ArrayContainsAll))),
-            // Struct/Union functions
-            "struct_pack" => Ok(Some(Self::Scalar(ScalarFunc::StructPack))),
-            "struct_extract" => Ok(Some(Self::Scalar(ScalarFunc::StructExtractFunc))),
-            "union_value" => Ok(Some(Self::Scalar(ScalarFunc::UnionValueFunc))),
-            "union_tag" => Ok(Some(Self::Scalar(ScalarFunc::UnionTagFunc))),
-            "union_extract" => Ok(Some(Self::Scalar(ScalarFunc::UnionExtractFunc))),
-            // Sequence functions
-            "nextval" => Ok(Some(Self::Scalar(ScalarFunc::NextVal))),
-            "currval" => Ok(Some(Self::Scalar(ScalarFunc::CurrVal))),
-            "setval" => Ok(Some(Self::Scalar(ScalarFunc::SetVal))),
-            _ => Ok(None),
-        }
+        crate::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
 
     /// Returns a list of all built-in functions for PRAGMA function_list.

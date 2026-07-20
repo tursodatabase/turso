@@ -10,10 +10,15 @@ use std::fmt::Debug;
 pub mod logical_log;
 use crate::mvcc::database::{LogRecord, RowVersion};
 use crate::mvcc::persistent_storage::logical_log::{
-    serialize_header_entry, serialize_op_entry, LogicalLog, OnSerializationComplete,
-    DEFAULT_LOG_CHECKPOINT_THRESHOLD,
+    LogSerializer, LogicalLog, OnSerializationComplete, DEFAULT_LOG_CHECKPOINT_THRESHOLD,
 };
 use crate::{CheckpointResult, Completion, File, LimboError, Result};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogicalLogTruncateOutcome {
+    Truncated,
+    Retained,
+}
 
 pub trait DurableStorage: Send + Sync + Debug {
     /// Append one row-version op to `log_record`'s payload buffer, in the
@@ -35,9 +40,11 @@ pub trait DurableStorage: Send + Sync + Debug {
     /// Write a transaction to the logical log without advancing the writer offset.
     ///
     /// If `on_serialization_complete` is provided, it is called with shared
-    /// ownership of the framed bytes and the running CRC after framing but
-    /// before the disk write. The callback runs while the internal write lock
-    /// is held, so it should be fast.
+    /// ownership of the framed bytes and the frame's
+    /// [`logical_log::LogTxFrameInfo`] chain state (start offset, pre-frame
+    /// committed CRC, post-frame CRC) after framing but before the disk write.
+    /// The callback runs while the internal write lock is held, so it should
+    /// be fast.
     fn log_tx(
         &self,
         m: LogRecord,
@@ -66,7 +73,16 @@ pub trait DurableStorage: Send + Sync + Debug {
     /// reaching into concrete storage internals.
     fn update_header(&self) -> Result<Completion>;
 
-    fn truncate(&self) -> Result<Completion>;
+    /// Truncate the logical log, discarding frames at or below
+    /// `checkpointed_through_ts` (the checkpoint's published boundary). Frames
+    /// above the boundary (uncheckpointed concurrent commits) are preserved.
+    ///
+    /// Returns whether the log was actually truncated ([`LogicalLogTruncateOutcome::Truncated`])
+    /// or left intact ([`LogicalLogTruncateOutcome::Retained`]).
+    fn truncate(
+        &self,
+        checkpointed_through_ts: u64,
+    ) -> Result<(Completion, LogicalLogTruncateOutcome)>;
 
     /// Reset the logical log to a fresh header-only file.
     ///
@@ -147,7 +163,8 @@ impl DurableStorage for Storage {
         row_version: &RowVersion,
         portable_extension: Option<&[u8]>,
     ) -> Result<()> {
-        serialize_op_entry(&mut log_record.buf, row_version, portable_extension)?;
+        LogSerializer::new(&mut log_record.buf)
+            .serialize_op_entry(row_version, portable_extension)?;
         log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
             LimboError::InternalError("logical log op_count exceeds u32".to_string())
         })?;
@@ -163,7 +180,7 @@ impl DurableStorage for Storage {
             !log_record.has_header,
             "DatabaseHeader op appended more than once to a single LogRecord"
         );
-        serialize_header_entry(&mut log_record.buf, header);
+        LogSerializer::new(&mut log_record.buf).serialize_header_entry(header)?;
         log_record.has_header = true;
         log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
             LimboError::InternalError("logical log op_count exceeds u32".to_string())
@@ -193,10 +210,19 @@ impl DurableStorage for Storage {
         self.logical_log.write().update_header()
     }
 
-    fn truncate(&self) -> Result<Completion> {
-        let c = self.logical_log.write().truncate()?;
-        self.shadow_offset_store(0);
-        Ok(c)
+    fn truncate(
+        &self,
+        checkpointed_through_ts: u64,
+    ) -> Result<(Completion, LogicalLogTruncateOutcome)> {
+        let mut log = self.logical_log.write();
+        let (c, outcome) = log.truncate(checkpointed_through_ts)?;
+        // Shadow the log's actual offset: 0 if it truncated, unchanged if it
+        // skipped (uncheckpointed frames remain), so should_checkpoint() stays
+        // accurate.
+        let new_offset = log.offset;
+        drop(log);
+        self.shadow_offset_store(new_offset);
+        Ok((c, outcome))
     }
 
     fn reset_to_fresh_header(&self) -> Result<Completion> {

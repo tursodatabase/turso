@@ -689,7 +689,7 @@ pub fn translate_expr(
                 Func::Window(_) => {
                     crate::bail_parse_error!("misuse of window function {}()", name.as_str())
                 }
-                Func::External(_) => {
+                Func::External(_) | Func::Dialect(_) => {
                     let regs = program.alloc_registers(args_count);
                     for (i, arg_expr) in args.iter().enumerate() {
                         translate_expr(program, referenced_tables, arg_expr, regs + i, resolver)?;
@@ -1663,6 +1663,14 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::Printf => translate_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        ),
+                        ScalarFunc::GetByte | ScalarFunc::SetByte => translate_function(
                             program,
                             args,
                             referenced_tables,
@@ -3077,6 +3085,13 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::Register(src_reg) => {
+            // When a column reference has been rewritten to a register
+            // (UPSERT DO UPDATE WHERE/SET), the register still carries the
+            // column's implicit collation for comparison purposes, same as
+            // the Expr::Column arm above.
+            if let Some(collation) = resolver.register_collations.get(src_reg) {
+                program.set_collation(Some((*collation, false)));
+            }
             // For DBSP expression compilation: copy from source register to target
             program.emit_insn(Insn::Copy {
                 src_reg: *src_reg,

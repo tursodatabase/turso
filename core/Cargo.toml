@@ -162,6 +162,7 @@ pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
 
 [dev-dependencies]
 memory-stats = "1.2.0"
+serde_json = { workspace = true }
 criterion = { workspace = true, features = [
     "html_reports",
     "async",
@@ -199,6 +200,11 @@ harness = false
 [[bench]]
 name = "mvcc_recovery_benchmark"
 harness = false
+
+[[bench]]
+name = "logical_log_serialization"
+harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "json_benchmark"

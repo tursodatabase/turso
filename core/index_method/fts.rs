@@ -15,6 +15,7 @@ use crate::{
     },
     translate::collate::CollationSeq,
     types::{IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekKey, SeekOp, SeekResult, Text},
+    util::quote_identifier,
     vdbe::Register,
     Connection, LimboError, Result, Value,
 };
@@ -37,7 +38,7 @@ use tantivy::{
     },
     DocAddress, HasLen, Index, IndexReader, IndexSettings, IndexWriter, Searcher, TantivyDocument,
 };
-use turso_parser::ast::{self, Select, SortOrder};
+use turso_parser::ast::{Select, SortOrder};
 
 /// Name identifier for the FTS index method, used in `CREATE INDEX ... USING fts`.
 pub const FTS_INDEX_METHOD_NAME: &str = "fts";
@@ -704,7 +705,7 @@ impl HybridBTreeDirectory {
             &[
                 Value::Text(Text::new(path_str.clone())),
                 Value::from_i64(uncached_start as i64),
-                Value::Blob(vec![]),
+                Value::Blob(crate::alloc::vec![]),
             ],
             Self::CHUNK_LEN,
         )
@@ -712,7 +713,10 @@ impl HybridBTreeDirectory {
 
         // Blocking seek to first chunk
         loop {
-            match cursor.seek(SeekKey::IndexKey(&seek_key), SeekOp::GE { eq_only: false }) {
+            match cursor.seek(
+                SeekKey::IndexKey(seek_key.as_record_ref()),
+                SeekOp::GE { eq_only: false },
+            ) {
                 Ok(IOResult::Done(SeekResult::Found)) => break,
                 Ok(IOResult::Done(SeekResult::TryAdvance)) => {
                     loop {
@@ -860,6 +864,136 @@ impl HybridBTreeDirectory {
         }
 
         Ok(result)
+    }
+
+    /// Read a file's full contents straight from the BTree, bypassing the
+    /// catalog and every cache layer. Returns `None` when the BTree holds no
+    /// rows for the path. Used to validate the shared directory cache
+    /// against durable state at cursor checkout.
+    fn read_file_from_btree_uncached(&self, path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+        let path_str = path.to_string_lossy().to_string();
+        let mut cursor =
+            BTreeCursor::new(self.pager.clone(), self.btree_root_page, Self::CHUNK_LEN);
+        cursor.index_info = Some(Arc::new(
+            IndexInfo::new(
+                [key_info(), key_info(), key_info()],
+                false,
+                Self::CHUNK_LEN,
+                false,
+            )
+            .expect(ALLOC_ERR_MSG),
+        ));
+
+        let seek_key = ImmutableRecord::from_values(
+            &[
+                Value::Text(Text::new(path_str.clone())),
+                Value::from_i64(0),
+                Value::Blob(crate::alloc::vec![]),
+            ],
+            Self::CHUNK_LEN,
+        )
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        loop {
+            match cursor.seek(
+                SeekKey::IndexKey(seek_key.as_record_ref()),
+                SeekOp::GE { eq_only: false },
+            ) {
+                Ok(IOResult::Done(SeekResult::Found)) => break,
+                Ok(IOResult::Done(SeekResult::TryAdvance)) => {
+                    loop {
+                        match cursor.next() {
+                            Ok(IOResult::Done(_)) => break,
+                            Ok(IOResult::IO(_)) => {
+                                self.pager
+                                    .io
+                                    .step()
+                                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                            }
+                            Err(e) => return Err(std::io::Error::other(e.to_string())),
+                        }
+                    }
+                    break;
+                }
+                Ok(IOResult::Done(SeekResult::NotFound)) => return Ok(None),
+                Ok(IOResult::IO(_)) => {
+                    self.pager
+                        .io
+                        .step()
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                }
+                Err(e) => return Err(std::io::Error::other(e.to_string())),
+            }
+        }
+
+        let mut result: Option<Vec<u8>> = None;
+        loop {
+            if !cursor.has_record() {
+                return Ok(result);
+            }
+            let record = loop {
+                match cursor.record() {
+                    Ok(IOResult::Done(r)) => break r,
+                    Ok(IOResult::IO(_)) => {
+                        self.pager
+                            .io
+                            .step()
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    }
+                    Err(e) => return Err(std::io::Error::other(e.to_string())),
+                }
+            };
+            let Some(record) = record else {
+                return Ok(result);
+            };
+            let matches_path = record.get_value_opt(0).is_some_and(|v| match v {
+                crate::types::ValueRef::Text(t) => t.value == path_str.as_str(),
+                _ => false,
+            });
+            if !matches_path {
+                return Ok(result);
+            }
+            let bytes = record.get_value_opt(2).and_then(|v| match v {
+                crate::types::ValueRef::Blob(b) => Some(b.to_vec()),
+                _ => None,
+            });
+            let Some(bytes) = bytes else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed chunk record",
+                ));
+            };
+            result
+                .get_or_insert_with(Vec::new)
+                .extend_from_slice(&bytes);
+            loop {
+                match cursor.next() {
+                    Ok(IOResult::Done(_)) => break,
+                    Ok(IOResult::IO(_)) => {
+                        self.pager
+                            .io
+                            .step()
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    }
+                    Err(e) => return Err(std::io::Error::other(e.to_string())),
+                }
+            }
+        }
+    }
+
+    /// True when this directory's in-memory view of the Tantivy metadata file
+    /// matches what the BTree currently holds. The shared directory cache can
+    /// go stale without any notification — a rolled-back transaction (or
+    /// savepoint) reverts the BTree while the cache keeps the state published
+    /// mid-transaction (issue 7522) — so cursors verify before trusting it.
+    fn is_consistent_with_btree(&self) -> std::io::Result<bool> {
+        let meta_path = Path::new(TANTIVY_META_FILE);
+        let Some(cached_meta) = self.hot_cache.get(meta_path) else {
+            // No in-memory metadata to compare — cannot vouch for the cache.
+            return Ok(false);
+        };
+        let btree_meta = self.read_file_from_btree_uncached(meta_path)?;
+        Ok(btree_meta.as_deref() == Some(&cached_meta[..]))
     }
 
     /// Add a file to the hot cache.
@@ -1222,11 +1356,6 @@ fn key_info() -> KeyInfo {
     }
 }
 
-/// Creates an AST `Name` node from a string.
-fn name(name: impl ToString) -> ast::Name {
-    ast::Name::exact(name.to_string())
-}
-
 /// Parse field weights from a string like "body=2.0,title=1.0"
 /// Returns a HashMap mapping column names to tantivy 'boost factors'
 fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<HashMap<String, f32>> {
@@ -1513,110 +1642,34 @@ impl IndexMethodAttachment for FtsIndexAttachment {
     }
 }
 
-const NOTNULL_CONSTRAINT: ast::NamedColumnConstraint = ast::NamedColumnConstraint {
-    name: None,
-    constraint: ast::ColumnConstraint::NotNull {
-        nullable: false,
-        conflict_clause: None,
-    },
-};
-
 fn initialize_btree_storage_table(
     conn: &Arc<Connection>,
     database_id: usize,
     table_name: &str,
 ) -> Result<()> {
-    const PATH_COLUMN: &str = "path";
-    const CHUNK_NO_COLUMN: &str = "chunk_no";
-    const BYTES_COLUMN: &str = "bytes";
-    let db_name = conn
+    let db_prefix = conn
         .get_database_name_by_index(database_id)
-        .filter(|name| name != "main");
-    let qualified_name = ast::QualifiedName {
-        db_name: db_name.clone().map(ast::Name::from_string),
-        name: name(table_name),
-        alias: None,
-    };
-    let qualified_index_name = ast::QualifiedName {
-        db_name: db_name.map(ast::Name::from_string),
-        name: name(format!("{table_name}_key")),
-        alias: None,
-    };
-    // inline ast to reduce parsing overhead
-    // CREATE TABLE table_name (path TEXT NOT NULL, chunk_no INTEGER NOT NULL, bytes BLOB NOT NULL);
-    let create_table_stmt = ast::Stmt::CreateTable {
-        body: ast::CreateTableBody::ColumnsAndConstraints {
-            columns: vec![
-                ast::ColumnDefinition {
-                    col_name: name(PATH_COLUMN),
-                    col_type: Some(ast::Type {
-                        name: "TEXT".to_string(),
-                        size: None,
-                        array_dimensions: 0,
-                    }),
-                    constraints: vec![NOTNULL_CONSTRAINT],
-                },
-                ast::ColumnDefinition {
-                    col_name: name(CHUNK_NO_COLUMN),
-                    col_type: Some(ast::Type {
-                        name: "INTEGER".to_string(),
-                        size: None,
-                        array_dimensions: 0,
-                    }),
-                    constraints: vec![NOTNULL_CONSTRAINT],
-                },
-                ast::ColumnDefinition {
-                    col_name: name(BYTES_COLUMN),
-                    col_type: Some(ast::Type {
-                        name: "BLOB".to_string(),
-                        size: None,
-                        array_dimensions: 0,
-                    }),
-                    constraints: vec![NOTNULL_CONSTRAINT],
-                },
-            ],
-            constraints: vec![],
-            options: ast::TableOptions::empty(),
-            partition: None,
-        },
-        temporary: false,
-        if_not_exists: true,
-        tbl_name: qualified_name,
-    };
-    // "CREATE INDEX IF NOT EXISTS idx_name ON table_name USING backing_btree (path, chunk_no, bytes);"
-    // Use backing_btree to create a BTree that stores all columns without rowid indirection
-    // This allows direct cursor access with the exact key structure
-    let create_index_stmt = ast::Stmt::CreateIndex {
-        unique: false, // backing_btree doesn't use unique constraint
-        if_not_exists: true,
-        idx_name: qualified_index_name,
-        tbl_name: name(table_name),
-        using: Some(name(super::BACKING_BTREE_INDEX_METHOD_NAME)),
-        columns: vec![
-            ast::SortedColumn {
-                expr: Box::new(ast::Expr::Name(name(PATH_COLUMN))),
-                order: None,
-                nulls: None,
-            },
-            ast::SortedColumn {
-                expr: Box::new(ast::Expr::Name(name(CHUNK_NO_COLUMN))),
-                order: None,
-                nulls: None,
-            },
-            ast::SortedColumn {
-                expr: Box::new(ast::Expr::Name(name(BYTES_COLUMN))),
-                order: None,
-                nulls: None,
-            },
-        ],
-        where_clause: None,
-        with_clause: vec![],
-    };
+        .filter(|name| name != "main")
+        .map(|name| format!("{}.", quote_identifier(&name)))
+        .unwrap_or_default();
+    let table_ident = quote_identifier(table_name);
+    let create_table_sql = format!(
+        "CREATE TABLE IF NOT EXISTS {db_prefix}{table_ident} \
+         (path TEXT NOT NULL, chunk_no INTEGER NOT NULL, bytes BLOB NOT NULL)"
+    );
+    // Use backing_btree to create a BTree that stores all columns without rowid
+    // indirection, allowing direct cursor access with the exact key structure.
+    let create_index_sql = format!(
+        "CREATE INDEX IF NOT EXISTS {db_prefix}{index_ident} ON {table_ident} \
+         USING {method} (path, chunk_no, bytes)",
+        index_ident = quote_identifier(&format!("{table_name}_key")),
+        method = super::BACKING_BTREE_INDEX_METHOD_NAME,
+    );
     // Execute nested statements without subtransactions to avoid DatabaseBusy
     // (we're already inside a transaction from the parent CREATE INDEX statement)
     {
         conn.start_nested();
-        let mut stmt = conn.prepare_stmt(create_table_stmt)?;
+        let mut stmt = conn.prepare(create_table_sql)?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
@@ -1627,7 +1680,7 @@ fn initialize_btree_storage_table(
     }
     {
         conn.start_nested();
-        let mut stmt = conn.prepare_stmt(create_index_stmt)?;
+        let mut stmt = conn.prepare(create_index_sql)?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
@@ -1997,14 +2050,15 @@ impl FtsCursor {
                         &[
                             Value::Text(Text::new(path_str.clone())),
                             Value::from_i64(0),
-                            Value::Blob(vec![]),
+                            Value::Blob(crate::alloc::vec![]),
                         ],
                         3,
                     )?;
 
-                    let seek_result =
-                        return_if_io!(cursor
-                            .seek(SeekKey::IndexKey(&seek_key), SeekOp::GE { eq_only: false }));
+                    let seek_result = return_if_io!(cursor.seek(
+                        SeekKey::IndexKey(seek_key.as_record_ref()),
+                        SeekOp::GE { eq_only: false },
+                    ));
 
                     match seek_result {
                         SeekResult::NotFound => {
@@ -2182,16 +2236,17 @@ impl FtsCursor {
                         &[
                             Value::Text(Text::new(path_str.clone())),
                             Value::from_i64(actual_chunk_idx as i64),
-                            Value::Blob(chunk_data.to_vec()),
+                            Value::from_slice(chunk_data)?,
                         ],
                         3,
                     )?;
 
                     // Seek to find the correct position using GE (not eq_only)
                     // This positions the cursor at or after where the record should be inserted
-                    let _result = return_if_io!(
-                        cursor.seek(SeekKey::IndexKey(&record), SeekOp::GE { eq_only: false })
-                    );
+                    let _result = return_if_io!(cursor.seek(
+                        SeekKey::IndexKey(record.as_record_ref()),
+                        SeekOp::GE { eq_only: false },
+                    ));
 
                     // don't do insert in same state to avoid re-seeking on IO
                     self.state = FtsState::InsertingWrite {
@@ -2212,7 +2267,7 @@ impl FtsCursor {
                     })?;
 
                     // the cursor should be positioned correctly after seek
-                    return_if_io!(cursor.insert(&BTreeKey::IndexKey(record)));
+                    return_if_io!(cursor.insert(&BTreeKey::IndexKey(record.as_record_ref())));
 
                     // Move to next chunk
                     self.state = FtsState::FlushingWrites {
@@ -2267,14 +2322,15 @@ impl FtsCursor {
                         &[
                             Value::Text(Text::new(path_str)),
                             Value::from_i64(0),
-                            Value::Blob(vec![]),
+                            Value::Blob(crate::alloc::vec![]),
                         ],
                         3,
                     )?;
 
-                    let _result =
-                        return_if_io!(cursor
-                            .seek(SeekKey::IndexKey(&seek_key), SeekOp::GE { eq_only: false }));
+                    let _result = return_if_io!(cursor.seek(
+                        SeekKey::IndexKey(seek_key.as_record_ref()),
+                        SeekOp::GE { eq_only: false },
+                    ));
 
                     self.state = FtsState::DeletingRecord {
                         deletes: std::mem::take(deletes),
@@ -2598,19 +2654,17 @@ impl IndexMethodCursor for FtsCursor {
         // The backing_btree index will be dropped automatically when the table is dropped
         // Use start_nested() before prepare() to bypass system table protection,
         // then use prepare/run_ignore_rows pattern and disable subtransactions to avoid Busy error
-        let drop_table_ast = ast::Stmt::DropTable {
-            if_exists: true,
-            tbl_name: ast::QualifiedName {
-                db_name: conn
-                    .get_database_name_by_index(database_id)
-                    .filter(|name| name != "main")
-                    .map(ast::Name::from_string),
-                name: ast::Name::exact(self.dir_table_name.clone()),
-                alias: None,
-            },
-        };
+        let db_prefix = conn
+            .get_database_name_by_index(database_id)
+            .filter(|name| name != "main")
+            .map(|name| format!("{}.", quote_identifier(&name)))
+            .unwrap_or_default();
+        let drop_table_sql = format!(
+            "DROP TABLE IF EXISTS {db_prefix}{}",
+            quote_identifier(&self.dir_table_name)
+        );
         conn.start_nested();
-        let mut stmt = conn.prepare_stmt(drop_table_ast)?;
+        let mut stmt = conn.prepare(drop_table_sql)?;
         // Disable subtransactions since we're already inside a transaction from the parent DROP INDEX
         stmt.program
             .prepared
@@ -2637,20 +2691,41 @@ impl IndexMethodCursor for FtsCursor {
                     // Open BTree cursor (needed for btree_root_page)
                     self.open_cursor(conn, database_id)?;
 
-                    // Check for cached directory, avoid expensive catalog reload
+                    // Check for cached directory, avoid expensive catalog reload.
+                    // The cache must be verified against the BTree before use:
+                    // a rolled-back transaction (or savepoint) reverts the
+                    // BTree while the cache keeps state published
+                    // mid-transaction, leaving it referencing segment files
+                    // that no longer exist (issue 7522).
                     {
-                        let cache = self.shared_directory_cache.read();
-                        if let Some(ref cached) = *cache {
+                        let mut cached_stale = false;
+                        {
+                            let cache = self.shared_directory_cache.read();
+                            if let Some(ref cached) = *cache {
+                                if cached.directory.is_consistent_with_btree().map_err(|e| {
+                                    LimboError::InternalError(format!(
+                                        "FTS cache validation failed: {e}"
+                                    ))
+                                })? {
+                                    tracing::debug!(
+                                        "FTS open_read: using cached directory (skipping catalog load)"
+                                    );
+                                    // Clone with fresh pending state to ensure this cursor's writes
+                                    // don't affect other cursors or cause Drop to flush after txn commits
+                                    self.hybrid_directory =
+                                        Some(cached.directory.clone_with_fresh_pending());
+                                    // Skip to CreatingIndex to build Index/Reader from cached directory
+                                    self.state = FtsState::CreatingIndex;
+                                    continue;
+                                }
+                                cached_stale = true;
+                            }
+                        }
+                        if cached_stale {
                             tracing::debug!(
-                                "FTS open_read: using cached directory (skipping catalog load)"
+                                "FTS open_read: cached directory is stale (BTree diverged), reloading"
                             );
-                            // Clone with fresh pending state to ensure this cursor's writes
-                            // don't affect other cursors or cause Drop to flush after txn commits
-                            self.hybrid_directory =
-                                Some(cached.directory.clone_with_fresh_pending());
-                            // Skip to CreatingIndex to build Index/Reader from cached directory
-                            self.state = FtsState::CreatingIndex;
-                            continue;
+                            *self.shared_directory_cache.write() = None;
                         }
                     }
 

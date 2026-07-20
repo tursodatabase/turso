@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
 use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
@@ -30,7 +31,7 @@ use crate::{
         insn::{to_u16, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
-    LimboError, Numeric, Result, Value,
+    LimboError, Numeric, Result, Value, ValueRef,
 };
 use either::Either;
 use rustc_hash::FxHashSet as HashSet;
@@ -420,7 +421,7 @@ pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
                     let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
                     u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
                 })
-                .collect(),
+                .try_collect()?,
         )),
         ast::Literal::Null => Ok(Value::Null),
         ast::Literal::True => Ok(Value::from_i64(1)),
@@ -470,7 +471,10 @@ pub(crate) fn eval_constant_default_value(expr: &ast::Expr) -> Result<Value> {
 fn apply_affinity_to_value(value: &mut Value, affinity: Affinity) {
     if let Some(converted) = affinity.convert(value) {
         *value = match converted {
-            Either::Left(val_ref) => val_ref.to_owned(),
+            Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
+            Either::Left(_) => {
+                unreachable!("affinity conversion returned an unexpected borrowed value")
+            }
             Either::Right(val) => val,
         };
     }
@@ -2811,8 +2815,8 @@ enum ColumnRenameExprTraversal {
     RewriteResultExpr,
 }
 
-fn no_such_column_error(old_col_norm: &str) -> LimboError {
-    LimboError::ParseError(format!("no such column: {old_col_norm}"))
+fn no_such_column_error(column_ref: &str) -> LimboError {
+    LimboError::ParseError(format!("no such column: {column_ref}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2827,13 +2831,26 @@ fn apply_expr_column_ref_with_context(
     from_target_qualifiers: &[String],
 ) -> Result<()> {
     match e {
-        ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
+        ast::Expr::Qualified(..) | ast::Expr::DoublyQualified(..) => {
+            let (db, ns, col) = match e {
+                ast::Expr::Qualified(ns, col) => (None, &*ns, col),
+                ast::Expr::DoublyQualified(db, ns, col) => (Some(&*db), &*ns, col),
+                _ => unreachable!("outer match arm only admits (Doubly)Qualified"),
+            };
             let ns_norm = normalize_ident(ns.as_str());
             let col_norm = normalize_ident(col.as_str());
 
             if col_norm != *old_col_norm {
                 return Ok(());
             }
+
+            // SQLite reports unresolvable references as written in the
+            // original expression (e.g. "no such column: t.b"), so keep
+            // the qualifier(s) when building validation error messages.
+            let error_column_ref = match db {
+                Some(db) => format!("{}.{}.{}", db.as_str(), ns.as_str(), col.as_str()),
+                None => format!("{}.{}", ns.as_str(), col.as_str()),
+            };
 
             // These branches are mutually exclusive — a qualifier can
             // match at most one of: NEW/OLD (the trigger table), the
@@ -2849,7 +2866,7 @@ fn apply_expr_column_ref_with_context(
                     if let Some(new_col_norm) = mode.rewritten_name() {
                         *col = ast::Name::from_string(new_col_norm);
                     } else {
-                        return Err(no_such_column_error(old_col_norm));
+                        return Err(no_such_column_error(&error_column_ref));
                     }
                 }
                 return Ok(());
@@ -2864,7 +2881,7 @@ fn apply_expr_column_ref_with_context(
                 if let Some(new_col_norm) = mode.rewritten_name() {
                     *col = ast::Name::from_string(new_col_norm);
                 } else {
-                    return Err(no_such_column_error(old_col_norm));
+                    return Err(no_such_column_error(&error_column_ref));
                 }
             } else if is_renaming_trigger_table
                 && ns_norm.eq_ignore_ascii_case(trigger_table_name)
@@ -2876,19 +2893,17 @@ fn apply_expr_column_ref_with_context(
                         .as_ref()
                         .is_some_and(|(_, ctx_name, _)| *ctx_name != trigger_table_name_norm);
                     if ctx_is_different_table {
-                        return Err(LimboError::ParseError(format!(
-                            "no such column: {trigger_table_name}.{col_norm}"
-                        )));
+                        return Err(no_such_column_error(&error_column_ref));
                     }
                     *col = ast::Name::from_string(new_col_norm);
                 } else {
-                    return Err(no_such_column_error(old_col_norm));
+                    return Err(no_such_column_error(&error_column_ref));
                 }
             } else if from_target_qualifiers.contains(&ns_norm) {
                 if let Some(new_col_norm) = mode.rewritten_name() {
                     *col = ast::Name::from_string(new_col_norm);
                 } else {
-                    return Err(no_such_column_error(old_col_norm));
+                    return Err(no_such_column_error(&error_column_ref));
                 }
             }
         }

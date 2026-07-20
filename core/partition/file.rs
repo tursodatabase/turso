@@ -218,7 +218,7 @@ pub fn create_partition_file(
     schema_sql: &str,
 ) -> Result<PartitionFile, PartitionError> {
     use crate::sync::Arc;
-    use crate::{Database, PlatformIO};
+    use crate::{Database, PlatformIO, SqliteDialect};
 
     if path.exists() {
         return Err(PartitionError::FileAlreadyExists(path.to_path_buf()));
@@ -240,7 +240,7 @@ pub fn create_partition_file(
 
     let path_str = temporary_path.to_string_lossy();
     let io = Arc::new(PlatformIO::new().map_err(|e| PartitionError::DatabaseError(e.to_string()))?);
-    let db = Database::open_file(io, &path_str)
+    let db = Database::open_file(io, &path_str, Arc::new(SqliteDialect))
         .map_err(|e| PartitionError::DatabaseError(e.to_string()))?;
     let conn = db
         .connect()

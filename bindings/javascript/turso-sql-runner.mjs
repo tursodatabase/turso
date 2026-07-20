@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * SQL runner script for test-runner JavaScript backend.
+ * SQL runner script for the sqltest JavaScript backend.
  * Reads SQL from stdin, executes via @tursodatabase/database, outputs pipe-separated results.
  *
  * Usage: node turso-sql-runner.mjs <database_path> [--readonly]

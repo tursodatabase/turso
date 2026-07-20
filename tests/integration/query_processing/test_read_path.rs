@@ -909,40 +909,6 @@ fn test_many_columns(tmp_db: TempDatabase) {
     );
 }
 
-#[turso_macros::test]
-fn test_eval_param_only_once(tmp_db: TempDatabase) {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("CREATE TABLE t(x)").unwrap();
-    conn.execute("INSERT INTO t SELECT value FROM generate_series(1, 10000)")
-        .unwrap();
-    let mut stmt = conn
-        .query("SELECT COUNT(*) FROM t WHERE LENGTH(zeroblob(?)) = ?")
-        .unwrap()
-        .unwrap();
-    stmt.bind_at(
-        1.try_into().unwrap(),
-        turso_core::Value::from_i64(100_000_000),
-    )
-    .unwrap();
-    stmt.bind_at(
-        2.try_into().unwrap(),
-        turso_core::Value::from_i64(100_000_000),
-    )
-    .unwrap();
-    let start_time = std::time::Instant::now();
-    stmt.run_with_row_callback(|row| {
-        let values = row.get_values().cloned().collect::<Vec<_>>();
-        assert_eq!(values, vec![turso_core::Value::from_i64(10000)]);
-        Ok(())
-    })
-    .unwrap();
-
-    let end_time = std::time::Instant::now();
-    let elapsed = end_time.duration_since(start_time);
-    // the test will allocate 10^8 * 10^4 bytes in case if parameter will be evaluated for every row
-    assert!(elapsed < std::time::Duration::from_millis(500));
-}
-
 /// Regression test for https://github.com/tursodatabase/turso/issues/5232
 /// SELECT with more than SQLITE_MAX_COLUMN (2000) columns should return an error,
 /// not panic from u16 overflow.

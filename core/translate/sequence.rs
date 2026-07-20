@@ -558,7 +558,7 @@ pub fn emit_disk_advance_past(
     // engine's actual watermark, regressing the SQLite-compatibility
     // row even though the engine's autoinc state is unchanged. Repro
     // covered by `mvcc-autoinc-explicit-low-rowid-preserves-sqlite-sequence`
-    // in `testing/sqltests/turso-tests/mvcc_sequence.sqltest`.
+    // in `sqlite/conformance/turso-sqltests/mvcc_sequence.sqltest`.
     emit_autoincrement_sqlite_sequence_sync(program, resolver, database_id, seq_name, value_reg)?;
 
     program.preassign_label_to_next_insn(done_seek_label);
@@ -824,7 +824,7 @@ pub fn translate_create_sequence(
     // persistent SQLite-compatibility metadata corruption. Reject the
     // namespace at CREATE time. Covered by
     // `create-sequence-rejects-autoincrement-internal-prefix` in
-    // `testing/sqltests/turso-tests/sequence.sqltest`.
+    // `sqlite/conformance/turso-sqltests/sequence.sqltest`.
     if normalized_name.starts_with(AUTOINCREMENT_SEQ_PREFIX) {
         bail_parse_error!(
             "sequence name \"{}\" is reserved for internal AUTOINCREMENT use",

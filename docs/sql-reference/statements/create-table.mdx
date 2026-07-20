@@ -196,6 +196,8 @@ Specifies the collation sequence used for text comparisons and sorting on the co
 | `NOCASE` | Case-insensitive comparison for ASCII characters |
 | `RTRIM` | Like `BINARY`, but ignores trailing spaces |
 
+Turso also resolves locale-aware collations and custom collations registered on the connection. An unknown collation name now raises a `no such collation sequence` error rather than being silently ignored.
+
 ```sql
 CREATE TABLE contacts (
     id INTEGER PRIMARY KEY,
@@ -356,9 +358,16 @@ The following CREATE TABLE features are not yet supported:
 |---------|-------|
 | `CREATE TEMPORARY TABLE` | Temporary tables are not supported |
 | `CREATE TABLE ... AS SELECT` | Creating a table from a query result is not supported |
-| `WITHOUT ROWID` | WITHOUT ROWID tables are not supported |
-| `GENERATED ALWAYS AS` | Generated (computed) columns are not supported |
 | `ON CONFLICT` clause on column constraints | The column-level ON CONFLICT clause (e.g., `NOT NULL ON CONFLICT REPLACE`) is not supported. Use the [INSERT ... ON CONFLICT](/docs/sql-reference/statements/upsert) syntax instead |
+
+### Experimental Features
+
+The following are available behind [experimental feature flags](/docs/sql-reference/experimental-features):
+
+| Feature | Flag | Notes |
+|---------|------|-------|
+| `WITHOUT ROWID` | `--experimental-without-rowid` | WITHOUT ROWID tables have limitations; see the experimental features page |
+| `GENERATED ALWAYS AS` | `--experimental-generated-columns` | Virtual generated (computed) columns only; stored columns are not yet supported |
 
 ## Examples
 

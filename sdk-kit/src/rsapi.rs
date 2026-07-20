@@ -10,6 +10,7 @@ use std::{
     task::Waker,
     time::Duration,
 };
+use turso_core::SqliteDialect;
 
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
@@ -20,14 +21,14 @@ use tracing_subscriber::{
 };
 use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, QueryMode,
-    Statement, StepResult, IO,
+    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions,
+    QueryMode, Statement, StepResult, IO,
 };
 
 use crate::{
     assert_send, assert_sync,
     capi::{self, c},
-    ConcurrentGuard,
+    ConcurrentGuard, IoBackend,
 };
 
 assert_send!(TursoDatabase, TursoConnection, TursoStatement);
@@ -87,7 +88,7 @@ pub struct TursoLog<'a> {
     pub level: &'a str,
 }
 
-type Logger = dyn Fn(TursoLog) + Send + Sync + 'static;
+type Logger = dyn Fn(TursoLog<'_>) + Send + Sync + 'static;
 pub struct TursoSetupConfig {
     pub logger: Option<Box<Logger>>,
     pub log_level: Option<String>,
@@ -171,7 +172,7 @@ pub struct TursoDatabaseConfig {
     /// - "memory": in-memory backend
     /// - "syscall": generic syscall backend
     /// - "io_uring": IO uring (supported only on Linux)
-    pub vfs: Option<String>,
+    pub vfs: IoBackend,
 
     /// optional custom IO provided by the caller
     pub io: Option<Arc<dyn IO>>,
@@ -205,6 +206,7 @@ impl TursoDatabaseConfig {
                 "generated_columns" => opts.with_generated_columns(true),
                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
                 "without_rowid" => opts.with_without_rowid(true),
+                "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
                 // "strict" is always enabled, kept for backwards compatibility
                 _ => opts,
             };
@@ -346,9 +348,9 @@ impl TursoDatabaseConfig {
                 hexkey: encryption_hexkey.unwrap(),
             }),
             vfs: if !config.vfs.is_null() {
-                Some(str_from_c_str(config.vfs)?.to_string())
+                str_from_c_str(config.vfs)?.into()
             } else {
-                None
+                IoBackend::Default
             },
             io: None,
             db_file: None,
@@ -378,6 +380,7 @@ pub struct TursoDatabaseOpenState {
     io: Option<Arc<dyn IO>>,
     db_file: Option<Arc<dyn DatabaseStorage>>,
     opts: Option<DatabaseOpts>,
+    open_flags: OpenFlags,
     open_db_state: OpenDbAsyncState,
 }
 
@@ -394,6 +397,7 @@ impl TursoDatabaseOpenState {
             io: None,
             db_file: None,
             opts: None,
+            open_flags: OpenFlags::default(),
             open_db_state: OpenDbAsyncState::new(),
         }
     }
@@ -510,6 +514,9 @@ impl From<LimboError> for TursoError {
             LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),
             LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
             LimboError::Busy => TursoError::Busy("database is locked".to_string()),
+            // Same-connection rejections carry SQLITE_BUSY semantics, but the
+            // caller must finish/reset its own statement rather than wait.
+            err @ LimboError::StatementsInProgress(_) => TursoError::Busy(err.to_string()),
             LimboError::BusySnapshot => TursoError::BusySnapshot(
                 "database snapshot is stale, rollback and retry the transaction".to_string(),
             ),
@@ -552,7 +559,7 @@ static SETUP: Once = Once::new();
 
 struct CallbackLayer<F>
 where
-    F: Fn(TursoLog) + Send + Sync + 'static,
+    F: Fn(TursoLog<'_>) + Send + Sync + 'static,
 {
     callback: F,
 }
@@ -560,7 +567,7 @@ where
 impl<S, F> tracing_subscriber::Layer<S> for CallbackLayer<F>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    F: Fn(TursoLog) + Send + Sync + 'static,
+    F: Fn(TursoLog<'_>) + Send + Sync + 'static,
 {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let mut buffer = String::new();
@@ -667,9 +674,9 @@ impl TursoDatabase {
         let io: Arc<dyn turso_core::IO + 'static> = if let Some(io) = &self.config.io {
             io.clone()
         } else {
-            match self.config.vfs.as_deref() {
-                Some("memory") => Arc::new(turso_core::MemoryIO::new()),
-                Some("syscall") => {
+            match self.config.vfs {
+                IoBackend::Memory => Arc::new(turso_core::MemoryIO::new()),
+                IoBackend::Syscall => {
                     #[cfg(all(target_family = "unix", not(miri)))]
                     {
                         Arc::new(turso_core::UnixIO::new().map_err(|e| {
@@ -688,31 +695,29 @@ impl TursoDatabase {
                     }
                 }
                 #[cfg(all(target_os = "linux", not(miri)))]
-                Some("io_uring") => Arc::new(turso_core::UringIO::new().map_err(|e| {
+                IoBackend::IoUring => Arc::new(turso_core::UringIO::new().map_err(|e| {
                     TursoError::Error(format!("unable to create io_uring backend: {e}"))
                 })?),
                 #[cfg(all(target_os = "windows", not(miri)))]
-                Some("experimental_win_iocp") => {
-                    Arc::new(turso_core::WindowsIOCP::new().map_err(|e| {
-                        TursoError::Error(format!("unable to create win_iocp backend: {e}"))
-                    })?)
-                }
+                IoBackend::IOCP => Arc::new(turso_core::WindowsIOCP::new().map_err(|e| {
+                    TursoError::Error(format!("unable to create win_iocp backend: {e}"))
+                })?),
                 #[cfg(any(not(target_os = "linux"), miri))]
-                Some("io_uring") => {
+                IoBackend::IoUring => {
                     return Err(TursoError::Error(
                         "io_uring is only available on Linux targets".to_string(),
                     ));
                 }
                 #[cfg(any(not(target_os = "windows"), miri))]
-                Some("experimental_win_iocp") => {
+                IoBackend::IOCP => {
                     return Err(TursoError::Error(
                         "win_iocp is only available on Windows targets".to_string(),
                     ));
                 }
-                Some(vfs) => {
+                IoBackend::Other(ref vfs) => {
                     Database::io_for_vfs(vfs).map_err(|e| TursoError::Error(format!("{e}")))?
                 }
-                None => match self.config.path.as_str() {
+                IoBackend::Default => match self.config.path.as_str() {
                     ":memory:" => Arc::new(turso_core::MemoryIO::new()),
                     _ => Arc::new(turso_core::PlatformIO::new()?),
                 },
@@ -768,6 +773,7 @@ impl TursoDatabase {
                     state.io = Some(io);
                     state.db_file = Some(db_file);
                     state.opts = Some(opts);
+                    state.open_flags = open_flags;
                     state.phase = TursoDatabaseOpenPhase::Opening;
                 }
 
@@ -783,16 +789,18 @@ impl TursoDatabase {
                         .expect("db_file must be initialized in Init phase")
                         .clone();
                     let opts = state.opts.expect("opts must be initialized in Init phase");
+                    let open_flags = state.open_flags;
 
-                    match Database::open_with_flags_async(
+                    let options = OpenOptions::new(Arc::new(SqliteDialect))
+                        .storage(db_file)
+                        .flags(open_flags)
+                        .db_opts(opts)
+                        .encryption(self.config.encryption.clone());
+                    match Database::open_async(
                         &mut state.open_db_state,
                         io.clone(),
                         &self.config.path,
-                        db_file,
-                        OpenFlags::default(),
-                        opts,
-                        self.config.encryption.clone(),
-                        None,
+                        &options,
                     )? {
                         IOResult::Done(db) => {
                             let mut inner_db = self.db.lock().unwrap();
@@ -1459,7 +1467,11 @@ impl TursoStatement {
                 "attempt to access row value out of bounds".to_string(),
             ));
         }
-        Ok(row.get_value(index).as_value_ref().to_owned())
+        Ok(row
+            .get_value(index)
+            .as_value_ref()
+            .to_owned()
+            .map_err(LimboError::from)?)
     }
     /// returns column count
     pub fn column_count(&self) -> usize {
@@ -1569,8 +1581,9 @@ impl TursoStatement {
 
 #[cfg(test)]
 mod tests {
-    use crate::rsapi::{
-        TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR,
+    use crate::{
+        rsapi::{TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode, FINALIZED_ERR},
+        IoBackend,
     };
     use turso_core::Value;
 
@@ -1580,7 +1593,7 @@ mod tests {
             experimental_features: features.map(str::to_string),
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         }
@@ -1630,7 +1643,7 @@ mod tests {
                 experimental_features: None,
                 async_io: false,
                 encryption: None,
-                vfs: None,
+                vfs: IoBackend::Default,
                 io: None,
                 db_file: None,
             });
@@ -1691,7 +1704,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1711,7 +1724,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1741,7 +1754,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1764,7 +1777,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1814,7 +1827,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1873,7 +1886,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1905,7 +1918,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1934,7 +1947,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1959,7 +1972,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -1985,7 +1998,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -2035,7 +2048,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -2123,7 +2136,7 @@ mod tests {
                     experimental_features: Some("encryption".to_string()),
                     async_io: false,
                     encryption: Some(create_encryption_opts()),
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
                 });
@@ -2163,7 +2176,7 @@ mod tests {
                     experimental_features: Some("encryption".to_string()),
                     async_io: false,
                     encryption: Some(create_encryption_opts()),
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
                 });
@@ -2189,7 +2202,7 @@ mod tests {
                         cipher: TEST_CIPHER.to_string(),
                         hexkey: WRONG_HEXKEY.to_string(),
                     }),
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
                 });
@@ -2203,7 +2216,7 @@ mod tests {
                     experimental_features: Some("encryption".to_string()),
                     async_io: false,
                     encryption: None,
-                    vfs: None,
+                    vfs: IoBackend::Default,
                     io: None,
                     db_file: None,
                 });
@@ -2238,7 +2251,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -2275,7 +2288,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -2309,7 +2322,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });
@@ -2343,7 +2356,7 @@ mod tests {
             experimental_features: None,
             async_io: false,
             encryption: None,
-            vfs: None,
+            vfs: IoBackend::Default,
             io: None,
             db_file: None,
         });

@@ -17,7 +17,8 @@ use crate::{
             emit_program_for_select_with_resolver, emit_query,
         },
         expr::{
-            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr_mut, WalkControl,
+            compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr, walk_expr_mut,
+            WalkControl,
         },
         optimizer::optimize_select_plan,
         plan::{
@@ -230,6 +231,32 @@ pub fn plan_subqueries_from_select_plan(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    // Common-subexpression elimination for scalar subqueries shared by GROUP BY and the SELECT
+    // list (e.g. `SELECT (subq) AS rs ... GROUP BY rs`, where the GROUP BY term is a copy of the
+    // result column): plan and evaluate the subquery once instead of once per use.
+    //
+    // The set of shared subqueries is computed up front, independent of the order the clause passes
+    // below run, so correctness does not hinge on GROUP BY being processed before the SELECT list.
+    // Whichever pass reaches a shared subquery first registers it in `cse_map`; the other reuses
+    // that registration. Shared subqueries are registered at the GROUP BY eval phase (the earliest
+    // phase among their uses), so the single evaluation is ready for whichever clause reads it.
+    let shared_subqueries: Vec<ast::Expr> = match &plan.group_by {
+        Some(group_by) => {
+            let in_group_by = collect_scalar_subqueries(group_by.exprs.iter())?;
+            if in_group_by.is_empty() {
+                Vec::new()
+            } else {
+                let in_select =
+                    collect_scalar_subqueries(plan.result_columns.iter().map(|c| &c.expr))?;
+                in_group_by
+                    .into_iter()
+                    .filter(|g| in_select.contains(g))
+                    .collect()
+            }
+        }
+        None => Vec::new(),
+    };
+    let mut cse_map: Vec<(ast::Expr, ast::Expr)> = Vec::new();
     // WHERE
     {
         crate::stack::trace_stack!("select_where");
@@ -243,6 +270,8 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryPosition::Where,
             SubqueryOrigin::SelectWhere,
             SubqueryPosition::Where.allow_correlated(),
+            &mut cse_map,
+            &[],
         )?;
     }
 
@@ -260,6 +289,8 @@ pub fn plan_subqueries_from_select_plan(
                 SubqueryPosition::GroupBy,
                 SubqueryOrigin::SelectGroupBy,
                 SubqueryPosition::GroupBy.allow_correlated(),
+                &mut cse_map,
+                &shared_subqueries,
             )?;
         }
         if let Some(having) = group_by.having.as_mut() {
@@ -274,6 +305,8 @@ pub fn plan_subqueries_from_select_plan(
                 SubqueryPosition::Having,
                 SubqueryOrigin::SelectHaving,
                 !group_by.exprs.is_empty(),
+                &mut cse_map,
+                &[],
             )?;
         }
     }
@@ -291,6 +324,8 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryPosition::ResultColumn,
             SubqueryOrigin::SelectList,
             SubqueryPosition::ResultColumn.allow_correlated(),
+            &mut cse_map,
+            &shared_subqueries,
         )?;
     }
 
@@ -307,6 +342,8 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryPosition::OrderBy,
             SubqueryOrigin::SelectOrderBy,
             SubqueryPosition::OrderBy.allow_correlated(),
+            &mut cse_map,
+            &[],
         )?;
     }
 
@@ -323,6 +360,8 @@ pub fn plan_subqueries_from_select_plan(
             SubqueryPosition::LimitOffset,
             SubqueryOrigin::SelectLimitOffset,
             false,
+            &mut cse_map,
+            &[],
         );
         // Limit
         if let Some(limit) = &mut plan.limit {
@@ -384,6 +423,8 @@ pub fn plan_subqueries_from_where_clause(
         SubqueryPosition::Where,
         SubqueryOrigin::DmlWhere,
         SubqueryPosition::Where.allow_correlated(),
+        &mut Vec::new(),
+        &[],
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
@@ -412,6 +453,8 @@ pub fn plan_subqueries_from_values(
         SubqueryPosition::ResultColumn, // VALUES are similar to result columns in terms of subquery handling
         SubqueryOrigin::SelectList,
         SubqueryPosition::ResultColumn.allow_correlated(),
+        &mut Vec::new(),
+        &[],
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
@@ -439,6 +482,8 @@ pub fn plan_subqueries_from_update_sets(
         SubqueryPosition::ResultColumn,
         SubqueryOrigin::DmlSet,
         SubqueryPosition::ResultColumn.allow_correlated(),
+        &mut Vec::new(),
+        &[],
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
@@ -473,6 +518,8 @@ pub fn plan_subqueries_from_returning(
         SubqueryPosition::ResultColumn,
         SubqueryOrigin::DmlReturning,
         SubqueryPosition::ResultColumn.allow_correlated(),
+        &mut Vec::new(),
+        &[],
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
@@ -501,6 +548,8 @@ pub fn plan_subqueries_from_trigger_when_clause(
         SubqueryPosition::Where,
         SubqueryOrigin::TriggerWhen,
         false,
+        &mut Vec::new(),
+        &[],
     )
 }
 
@@ -517,6 +566,8 @@ fn plan_subqueries_with_outer_query_access<'a>(
     position: SubqueryPosition,
     origin: SubqueryOrigin,
     allow_correlated: bool,
+    cse_map: &mut Vec<(ast::Expr, ast::Expr)>,
+    shared: &[ast::Expr],
 ) -> Result<()> {
     // Most subqueries can reference columns from the outer query,
     // including nested cases where a subquery inside a subquery references columns from its parent's parent
@@ -575,12 +626,32 @@ fn plan_subqueries_with_outer_query_access<'a>(
         position,
         origin,
         allow_correlated,
+        cse_map,
+        shared,
     );
     for expr in exprs {
         walk_expr_mut(expr, &mut subquery_parser)?;
     }
 
     Ok(())
+}
+
+/// Collect every scalar-subquery (`ast::Expr::Subquery`) node that appears anywhere in `exprs`.
+/// Used to find, up front, the subqueries shared between the GROUP BY clause and the SELECT list
+/// so they can be common-subexpression-eliminated independently of the order the clause passes run.
+fn collect_scalar_subqueries<'a>(
+    exprs: impl Iterator<Item = &'a ast::Expr>,
+) -> Result<Vec<ast::Expr>> {
+    let mut found = Vec::new();
+    for expr in exprs {
+        walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+            if matches!(e, ast::Expr::Subquery(_)) {
+                found.push(e.clone());
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    Ok(found)
 }
 
 /// Create a closure that will walk the AST and replace subqueries with [ast::Expr::SubqueryResult] expressions.]
@@ -596,6 +667,8 @@ fn get_subquery_parser<'a>(
     position: SubqueryPosition,
     origin: SubqueryOrigin,
     allow_correlated: bool,
+    cse_map: &'a mut Vec<(ast::Expr, ast::Expr)>,
+    shared: &'a [ast::Expr],
 ) -> impl FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a {
     let handle_unsupported_correlation =
         |correlated: bool, position: SubqueryPosition, allow_correlated: bool| -> Result<()> {
@@ -661,6 +734,27 @@ fn get_subquery_parser<'a>(
                 Ok(WalkControl::Continue)
             }
             ast::Expr::Subquery(_) => {
+                // CSE: a scalar subquery in `shared` appears in both GROUP BY and the SELECT list,
+                // so plan and evaluate it once. Whichever clause reaches it first registers it in
+                // cse_map; the other reuses that registration. Order-independent: membership in
+                // `shared` is computed up front, so this does not depend on GROUP BY being walked
+                // before the SELECT list.
+                let is_shared = shared.contains(&*expr);
+                if is_shared {
+                    if let Some((_, result)) = cse_map.iter().find(|(k, _)| *k == *expr) {
+                        *expr = result.clone();
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                }
+                let cse_key = is_shared.then(|| expr.clone());
+                // A shared subquery is registered at the GROUP BY eval phase (the earliest among its
+                // uses), so its single evaluation is ready for whichever clause reads it first,
+                // regardless of the order these passes run.
+                let effective_origin = if is_shared {
+                    SubqueryOrigin::SelectGroupBy
+                } else {
+                    origin
+                };
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = {
                     crate::stack::trace_stack!("get_outer_refs");
@@ -766,9 +860,12 @@ fn get_subquery_parser<'a>(
                         plan: Some(Box::new(Plan::Select(plan))),
                     },
                     correlated,
-                    origin,
-                    eval_phase: origin.phase_floor(),
+                    origin: effective_origin,
+                    eval_phase: effective_origin.phase_floor(),
                 });
+                if let Some(key) = cse_key {
+                    cse_map.push((key, expr.clone()));
+                }
                 Ok(WalkControl::Continue)
             }
             ast::Expr::InSelect { .. } => {
@@ -943,21 +1040,33 @@ fn recollect_aggregates(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()
 
     // Collect from result columns (same order as original collection)
     for rc in &plan.result_columns {
-        resolve_window_and_aggregate_functions(&rc.expr, resolver, &mut new_aggregates, None)?;
+        resolve_window_and_aggregate_functions(
+            &rc.expr,
+            resolver,
+            &mut new_aggregates,
+            None,
+            &mut [],
+        )?;
     }
 
     // Collect from HAVING
     if let Some(group_by) = &plan.group_by {
         if let Some(having) = &group_by.having {
             for expr in having {
-                resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None)?;
+                resolve_window_and_aggregate_functions(
+                    expr,
+                    resolver,
+                    &mut new_aggregates,
+                    None,
+                    &mut [],
+                )?;
             }
         }
     }
 
     // Collect from ORDER BY
     for (expr, _, _) in &plan.order_by {
-        resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None)?;
+        resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None, &mut [])?;
     }
 
     plan.aggregates = new_aggregates;

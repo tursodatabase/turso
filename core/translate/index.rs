@@ -1170,7 +1170,7 @@ pub fn resolve_index_method_parameters(
                             let hex_byte = std::str::from_utf8(pair).unwrap();
                             u8::from_str_radix(hex_byte, 16).unwrap()
                         })
-                        .collect(),
+                        .try_collect()?,
                 ),
                 _ => bail_parse_error!("parameters must be constant literals"),
             },

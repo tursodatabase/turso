@@ -213,18 +213,27 @@ impl DatabaseMetadata {
             self.saved_configuration = Some(configuration);
             return true;
         };
+        // Only report a change when a value actually differs: every open calls
+        // this, and a spurious `true` makes every open rewrite the metadata
+        // file, racing with concurrent opens reading it.
         let mut changed = false;
         if let Some(remote_url) = configuration.remote_url {
-            saved_configuration.remote_url = Some(remote_url);
-            changed |= true;
+            if saved_configuration.remote_url.as_ref() != Some(&remote_url) {
+                saved_configuration.remote_url = Some(remote_url);
+                changed = true;
+            }
         }
         if let Some(partial_sync_prefetch) = configuration.partial_sync_prefetch {
-            saved_configuration.partial_sync_prefetch = Some(partial_sync_prefetch);
-            changed |= true;
+            if saved_configuration.partial_sync_prefetch != Some(partial_sync_prefetch) {
+                saved_configuration.partial_sync_prefetch = Some(partial_sync_prefetch);
+                changed = true;
+            }
         }
         if let Some(partial_sync_segment_size) = configuration.partial_sync_segment_size {
-            saved_configuration.partial_sync_segment_size = Some(partial_sync_segment_size);
-            changed |= true;
+            if saved_configuration.partial_sync_segment_size != Some(partial_sync_segment_size) {
+                saved_configuration.partial_sync_segment_size = Some(partial_sync_segment_size);
+                changed = true;
+            }
         }
         changed
     }
@@ -634,7 +643,7 @@ fn get_core_value_text_or_null(row: &turso_core::Row, index: usize) -> Result<Op
 fn get_core_value_blob_or_null(row: &turso_core::Row, index: usize) -> Result<Option<Vec<u8>>> {
     match row.get_value(index) {
         turso_core::Value::Null => Ok(None),
-        turso_core::Value::Blob(x) => Ok(Some(x.clone())),
+        turso_core::Value::Blob(x) => Ok(Some(x.to_vec())),
         v => Err(Error::DatabaseTapeError(format!(
             "column {index} type mismatch: expected blob, got '{v:?}'"
         ))),
@@ -661,7 +670,47 @@ pub fn parse_bin_record(
 
 #[cfg(test)]
 mod tests {
-    use super::DatabaseMetadata;
+    use super::{DatabaseMetadata, DatabaseSavedConfiguration};
+
+    #[test]
+    fn update_configuration_reports_change_only_when_values_differ() {
+        let mut meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": null,
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+        let configuration = DatabaseSavedConfiguration {
+            remote_url: Some("http://remote".to_string()),
+            partial_sync_prefetch: Some(true),
+            partial_sync_segment_size: Some(4096),
+        };
+
+        assert!(meta.update_configuration(configuration.clone()));
+        assert_eq!(meta.saved_configuration, Some(configuration.clone()));
+
+        // Re-applying the identical configuration (what every open of an
+        // existing replica does) must not report a change, otherwise every
+        // open rewrites the metadata file.
+        assert!(!meta.update_configuration(configuration.clone()));
+
+        let updated = DatabaseSavedConfiguration {
+            remote_url: Some("http://other-remote".to_string()),
+            ..configuration
+        };
+        assert!(meta.update_configuration(updated.clone()));
+        assert_eq!(meta.saved_configuration, Some(updated));
+    }
 
     #[test]
     fn metadata_load_defaults_missing_logical_table_map() {

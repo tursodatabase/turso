@@ -14,6 +14,7 @@ use crate::incremental::operator::{
 };
 use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
+use crate::SqliteDialect;
 // Note: logical module must be made pub(crate) in translate/mod.rs
 use crate::numeric::Numeric;
 use crate::sync::{atomic::Ordering, Arc};
@@ -81,7 +82,7 @@ impl WriteRowView {
 
                         // Weight is always the last value
                         let existing_weight = match last {
-                            Some(val) => match val?.to_owned() {
+                            Some(val) => match val?.to_owned()? {
                                 Value::Numeric(Numeric::Integer(w)) => w as isize,
                                 _ => {
                                     return Err(LimboError::InternalError(format!(
@@ -1636,7 +1637,7 @@ impl DbspCompiler {
 
         // Create an internal connection for expression compilation
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:")?;
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
         let internal_conn = db.connect()?;
         internal_conn.set_query_only(true);
         internal_conn.auto_commit.store(false, Ordering::SeqCst);
@@ -2276,6 +2277,7 @@ mod tests {
     use crate::sync::Arc;
     use crate::translate::logical::{ColumnInfo, LogicalPlanBuilder, LogicalSchema};
     use crate::util::IOExt;
+    use crate::SqliteDialect;
     use crate::{Database, MemoryIO, Pager, IO};
     use rustc_hash::FxHashSet as HashSet;
     use turso_parser::ast;
@@ -2562,7 +2564,7 @@ mod tests {
 
     fn setup_btree_for_circuit() -> (Arc<Pager>, i64, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:").unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         let pager = conn.pager.load().clone();
 
@@ -2778,7 +2780,7 @@ mod tests {
 
             for _ in 0..num_data_columns {
                 let value = values_iter.next().expect("we already checked bounds")?;
-                values.push(value.to_owned());
+                values.push(value.to_owned()?);
             }
 
             delta.insert(rowid, values);

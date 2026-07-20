@@ -46,8 +46,17 @@ pub fn translate_integrity_check(
     resolver: &Resolver,
     database_id: usize,
     max_errors: usize,
+    connection: &std::sync::Arc<crate::Connection>,
 ) -> crate::Result<()> {
-    translate_integrity_check_impl(schema, program, resolver, database_id, max_errors, false)
+    translate_integrity_check_impl(
+        schema,
+        program,
+        resolver,
+        database_id,
+        max_errors,
+        false,
+        connection,
+    )
 }
 
 /// Translate PRAGMA quick_check.
@@ -57,8 +66,17 @@ pub fn translate_quick_check(
     resolver: &Resolver,
     database_id: usize,
     max_errors: usize,
+    connection: &std::sync::Arc<crate::Connection>,
 ) -> crate::Result<()> {
-    translate_integrity_check_impl(schema, program, resolver, database_id, max_errors, true)
+    translate_integrity_check_impl(
+        schema,
+        program,
+        resolver,
+        database_id,
+        max_errors,
+        true,
+        connection,
+    )
 }
 
 fn emit_integrity_result_row(
@@ -138,6 +156,7 @@ fn translate_integrity_check_impl(
     database_id: usize,
     max_errors: usize,
     quick: bool,
+    connection: &std::sync::Arc<crate::Connection>,
 ) -> crate::Result<()> {
     // 1) Run low-level btree/freelist/overflow verification first. This mirrors
     // SQLite's OP_IntegrityCk front-pass and can already emit corruption errors
@@ -145,26 +164,46 @@ fn translate_integrity_check_impl(
     let mut root_pages = Vec::with_capacity(schema.tables.len() + schema.indexes.len());
     let mut live_root_pages = HashSet::default();
 
+    // integrity_check verifies the physical file, so a placeholder (negative) root for an
+    // object a passive checkpoint has since materialized must be resolved to its real page.
+    let mv_store_guard = connection.db.get_mv_store();
+    let resolve_root = |root_page: i64| -> i64 {
+        match mv_store_guard.as_ref() {
+            Some(mv) => mv.resolve_root_page(root_page),
+            None => root_page,
+        }
+    };
+
     for table in schema.tables.values() {
         if let Table::BTree(btree_table) = table.as_ref() {
-            if btree_table.root_page < 0 {
+            let table_root = resolve_root(btree_table.root_page);
+            if table_root < 0 {
                 continue;
             }
-            root_pages.push(btree_table.root_page);
-            live_root_pages.insert(btree_table.root_page);
+            root_pages.push(table_root);
+            live_root_pages.insert(table_root);
             if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
                 for index in indexes {
-                    if index.root_page > 0 {
-                        root_pages.push(index.root_page);
-                        live_root_pages.insert(index.root_page);
+                    let index_root = resolve_root(index.root_page);
+                    if index_root > 0 {
+                        root_pages.push(index_root);
+                        live_root_pages.insert(index_root);
                     }
                 }
             }
         }
     }
 
+    let passive =
+        mv_store_guard.is_some() && connection.experimental_mvcc_passive_checkpoint_enabled();
+    let mut dropped_roots = Vec::new();
     for &dropped_root in &schema.dropped_root_pages {
-        if !live_root_pages.contains(&dropped_root) {
+        if live_root_pages.contains(&dropped_root) {
+            continue;
+        }
+        if passive {
+            dropped_roots.push(dropped_root);
+        } else {
             root_pages.push(dropped_root);
         }
     }
@@ -182,6 +221,7 @@ fn translate_integrity_check_impl(
         db: database_id,
         max_errors,
         roots: root_pages,
+        dropped_roots,
         message_register: message_reg,
     });
 

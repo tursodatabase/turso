@@ -18,10 +18,12 @@
 //! https://www.sqlite.org/opcode.html
 
 use crate::translate::plan::BitSet;
-use crate::types::{Extendable, Text};
+use crate::types::{Extendable, Text, ValueBlob};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
 pub mod affinity;
 pub mod array;
+#[cfg(test)]
+mod blob_io_tests;
 pub mod bloom_filter;
 pub mod builder;
 pub mod execute;
@@ -32,6 +34,8 @@ pub mod insn;
 pub mod metrics;
 pub mod rowset;
 pub mod sorter;
+#[cfg(test)]
+mod statement_lifecycle_tests;
 pub mod vacuum;
 pub mod value;
 // for benchmarks
@@ -321,14 +325,10 @@ impl Register {
         Ok(())
     }
 
-    /// Set the value of the register to a blob,
-    /// reusing Register::Value(Value::Blob(_)) buffer if possible.
+    /// Move a blob into the register without copying its allocation.
     #[inline]
-    pub fn set_blob(&mut self, val: Vec<u8>) -> Result<()> {
+    pub fn set_blob(&mut self, val: ValueBlob) -> Result<()> {
         match self {
-            Register::Value(Value::Blob(existing)) => {
-                existing.do_extend(&val)?;
-            }
             Register::Value(other_value_kind) => {
                 *other_value_kind = Value::Blob(val);
             }
@@ -531,6 +531,19 @@ impl Default for ActiveOpState {
 impl ActiveOpStateSlot {
     fn clear(&mut self) {
         self.state = ActiveOpState::None;
+    }
+
+    /// True when no multi-step opcode is suspended. Hot opcodes use this to
+    /// bypass the slot entirely on their non-yielding fast path.
+    fn is_idle(&self) -> bool {
+        matches!(self.state, ActiveOpState::None)
+    }
+
+    fn cleanup_journal_mode_checkpoint(&mut self) -> Result<()> {
+        match &mut self.state {
+            ActiveOpState::JournalMode(state) => state.cleanup_checkpoint(),
+            _ => Ok(()),
+        }
     }
 
     active_state_accessor!(
@@ -995,12 +1008,41 @@ impl ProgramState {
         self.n_total_change.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Whether this statement owns the implicit autocommit transaction it is
-    /// about to finish, including re-entry while its commit is in progress.
+    /// Whether this statement may finish the implicit autocommit transaction
+    /// now, including re-entry while its commit is in progress.
     #[inline]
-    pub(crate) fn owns_auto_txn(&self) -> bool {
-        self.auto_txn_cleanup == TxnCleanup::RollbackTxn
-            || !matches!(self.commit_state, CommitState::Ready)
+    pub(crate) fn can_autocommit_now(&self, connection: &Connection) -> bool {
+        let is_already_committing = !matches!(self.commit_state, CommitState::Ready);
+        if is_already_committing {
+            return true;
+        }
+        if self.auto_txn_cleanup != TxnCleanup::RollbackTxn {
+            return false;
+        }
+        let active_writers = connection.n_active_writes.load(Ordering::SeqCst);
+        turso_assert!(
+            active_writers <= 1,
+            "n_active_writes must be 0 or 1, got {active_writers}"
+        );
+        if self.is_active_write {
+            turso_assert!(
+                active_writers == 1,
+                "active writer state without an active writer count"
+            );
+        }
+        if connection.mv_store().is_some() {
+            // MVCC keeps one tx id on the connection. A writer waits for
+            // sibling readers, and a reader waits for sibling readers/writers.
+            return connection.n_active_root_statements.load(Ordering::SeqCst) == 1
+                && (self.is_active_write || active_writers == 0);
+        }
+        if self.is_active_write {
+            // Pager/WAL writers can finish while sibling readers remain active.
+            // The readers keep their cursors and release them when they finish.
+            return true;
+        }
+        // Pager/WAL readers do not wait for sibling readers.
+        active_writers == 0
     }
 
     #[inline]
@@ -1059,6 +1101,26 @@ impl ProgramState {
             .unwrap_or_else(|| panic!("cursor id {cursor_id} out of bounds"))
             .as_mut()
             .unwrap_or_else(|| panic!("cursor id {cursor_id} is None"))
+    }
+
+    /// Close all virtual table cursors owned by this program.
+    ///
+    /// A virtual table cursor can own a nested helper statement on the same
+    /// connection (e.g. `PragmaVirtualTableCursor` runs `PRAGMA ...` via
+    /// `Connection::prepare_internal`), and that helper holds the
+    /// connection's nested-statement guard until it is dropped. Both
+    /// `commit_txn` and `abort` consult `Connection::is_nested_stmt()` to
+    /// decide whether the current statement owns top-level transaction
+    /// finalization, so the helpers must be dropped first — otherwise a root
+    /// statement that scanned a pragma virtual table misclassifies itself as
+    /// nested, skips ending its implicit read transaction, and subsequent
+    /// writes on the connection never auto-commit (issue #7466).
+    pub(crate) fn close_virtual_table_cursors(&mut self) {
+        for slot in self.cursors.iter_mut() {
+            if matches!(slot, Some(Cursor::Virtual(_))) {
+                *slot = None;
+            }
+        }
     }
 
     /// Begin a statement subtransaction.
@@ -1126,7 +1188,11 @@ impl ProgramState {
         end_statement: EndStatement,
     ) -> Result<()> {
         if self.is_active_write {
-            connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
+            let previous = connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
+            turso_assert!(
+                previous == 1,
+                "ending a writer with {previous} active writer(s)"
+            );
             self.is_active_write = false;
         }
         // If begin_statement was never called, no savepoint/FK cleanup needed.
@@ -1384,8 +1450,6 @@ pub struct PreparedProgram {
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
     pub is_subprogram: bool,
-    /// Whether the program contains any trigger subprograms.
-    pub contains_trigger_subprograms: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
     /// Set of attached database indices that need write transactions.
@@ -1949,6 +2013,11 @@ impl Program {
 
         // Reset state for next use
         program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
+        // Drop virtual table cursors before the `is_nested_stmt()` check
+        // below: a pragma virtual table cursor owns a nested helper statement
+        // whose guard would otherwise make this top-level statement classify
+        // itself as nested and skip transaction finalization entirely.
+        program_state.close_virtual_table_cursors();
         let tx_state = self.connection.get_tx_state();
         if tx_state == TransactionState::None
             && matches!(program_state.commit_state, CommitState::Ready)
@@ -2395,6 +2464,16 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
+        // than commit_state. Clean it before transaction abort logic inspects
+        // pager checkpoint state or reset drops the opcode state.
+        if let Err(err) = state.active_op_state.cleanup_journal_mode_checkpoint() {
+            capture_abort_error(
+                &mut abort_error,
+                err,
+                "Failed to clean up journal-mode checkpoint during abort",
+            );
+        }
         // MVCC auto-checkpoint is owned by commit_state, not by normal_step().
         // If its yielded I/O fails, normal_step sees the error before
         // CommitStateMachine::Checkpoint gets another step, so the checkpoint
@@ -2441,6 +2520,11 @@ impl Program {
             );
         }
 
+        // Virtual table cursors (pragma table-valued functions) also own
+        // nested helper statements whose drop releases nested guards. Drop
+        // them before the `is_nested_stmt()` check below for the same reason.
+        state.close_virtual_table_cursors();
+
         // Only end trigger execution if the subprogram was actually running.
         // Cached (pooled) statements may be dropped after their trigger execution
         // was already ended by op_program; calling end again would pop the wrong
@@ -2483,7 +2567,41 @@ impl Program {
         }
         // Errors from nested statements are handled by the parent statement.
         if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
-            let owns_auto_txn = state.owns_auto_txn();
+            let unfinished_statement_reset_or_drop =
+                err.is_none() && state.execution_state.is_running();
+            let inside_explicit_transaction = !self.connection.get_auto_commit();
+            let unfinished_writer = state.is_active_write;
+            let can_rollback_just_this_statement =
+                state.auto_txn_cleanup == TxnCleanup::RollbackSavepoint;
+
+            let poison_tx = unfinished_statement_reset_or_drop
+                && inside_explicit_transaction
+                && unfinished_writer
+                && !can_rollback_just_this_statement;
+            if poison_tx {
+                // Example: BEGIN; UPDATE rows SET ... writes one row, then
+                // returns IO before reaching Done. If the caller drops that
+                // statement, we cannot pretend COMMIT is still safe: there is
+                // no statement savepoint to undo only the partial UPDATE.
+                self.connection.mark_tx_poisoned();
+            }
+
+            let can_autocommit_now = state.can_autocommit_now(&self.connection);
+            let is_mvcc = self.connection.mv_store().is_some();
+            let changed_shared_mvcc_auto_txn = !can_autocommit_now
+                && state.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                && state.n_change.load(Ordering::SeqCst) > 0;
+            if changed_shared_mvcc_auto_txn {
+                turso_assert!(
+                    is_mvcc,
+                    "shared autocommit transaction needed full rollback outside MVCC"
+                );
+                // A writer changed rows in an MVCC autocommit transaction, but
+                // a sibling reader is still holding that transaction open. The
+                // writer had no statement savepoint, so the only safe cleanup
+                // is rolling back the whole MVCC transaction.
+            }
+            let must_rollback_tx_if_needed = can_autocommit_now || changed_shared_mvcc_auto_txn;
             if err.is_some() && !pager.is_checkpointing() {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
@@ -2512,6 +2630,12 @@ impl Program {
                 Some(LimboError::TableLocked) => {}
                 // Busy errors do not cause a rollback.
                 Some(LimboError::Busy) => {}
+                // Same-connection "SQL statements in progress" rejections do
+                // not cause a rollback either: the rejected operation was
+                // refused before it touched any transaction or savepoint
+                // state, and the in-progress statement it collided with must
+                // keep running unharmed.
+                Some(LimboError::StatementsInProgress(_)) => {}
                 // BusySnapshot errors do not cause a rollback either - user must rollback explicitly.
                 // BusySnapshot is distinct from Busy in that a busy_timeout or handler should not be
                 // used because it will not help - the snapshot is permanently stale and rollback is
@@ -2531,7 +2655,7 @@ impl Program {
                 // FK errors always behave like ABORT: rollback statement,
                 // rollback transaction in autocommit mode.
                 Some(LimboError::ForeignKeyConstraint(_)) => {
-                    if owns_auto_txn {
+                    if must_rollback_tx_if_needed {
                         self.rollback_current_txn(pager);
                     }
                     self.connection.set_changes(0);
@@ -2567,7 +2691,7 @@ impl Program {
                                     "Failed to release statement savepoint during abort",
                                 );
                             }
-                            if owns_auto_txn {
+                            if can_autocommit_now {
                                 // Autocommit FAIL: commit partial changes.
                                 // This matches halt()'s FAIL+autocommit path.
                                 let mv_store = self.connection.mv_store();
@@ -2616,7 +2740,7 @@ impl Program {
                             }
                         }
                         _ => {
-                            if owns_auto_txn {
+                            if must_rollback_tx_if_needed {
                                 self.rollback_current_txn(pager);
                             }
                         }
@@ -2638,10 +2762,12 @@ impl Program {
                 }
                 _ => match state.auto_txn_cleanup {
                     TxnCleanup::RollbackTxn => {
-                        self.rollback_current_txn(pager);
+                        if must_rollback_tx_if_needed {
+                            self.rollback_current_txn(pager);
+                        }
                     }
                     TxnCleanup::RollbackSavepoint => {
-                        if owns_auto_txn {
+                        if can_autocommit_now {
                             self.rollback_current_txn(pager);
                         } else if err.is_none() && !pager.is_checkpointing() {
                             if let Err(end_stmt_err) = state.end_statement(
@@ -2658,7 +2784,9 @@ impl Program {
                         }
                     }
                     TxnCleanup::None => {
-                        if owns_auto_txn || (!self.connection.get_auto_commit() && err.is_some()) {
+                        if can_autocommit_now
+                            || (!self.connection.get_auto_commit() && err.is_some())
+                        {
                             self.rollback_current_txn(pager);
                         }
                     }
@@ -2995,7 +3123,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 ))));
             }
             // BLOB (n >= 12 && n & 1 == 0)
-            n if n >= 12 && n & 1 == 0 => {
+            n if n >= 12 && n & 1 == 0 => crate::with_value_blob_allocation_site!(RecordDecode, {
                 let content_size = ((n - 12) / 2) as usize;
                 if unlikely(data.len() < content_size) {
                     return Some(Err(LimboError::Corrupt("Invalid Blob value".into())));
@@ -3009,12 +3137,16 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                         }
                     }
                     _ => {
-                        if let Err(err) = dest.set_blob(blob_data.to_vec()) {
+                        let blob = match crate::types::value_blob_from_slice(blob_data) {
+                            Ok(blob) => blob,
+                            Err(err) => return Some(Err(err.into())),
+                        };
+                        if let Err(err) = dest.set_blob(blob) {
                             return Some(Err(err));
                         }
                     }
                 }
-            }
+            }),
             // TEXT (n >= 13 && n & 1 == 1)
             n if n >= 13 && n & 1 == 1 => {
                 let content_size = ((n - 13) / 2) as usize;
