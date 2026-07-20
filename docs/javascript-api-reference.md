@@ -78,7 +78,40 @@ The function returns an object with two properties: `rowsAffected` (the total nu
 
 #### transaction(function) ⇒ function
 
-This function is currently not supported.
+Wraps a function so that it runs inside a transaction.
+
+| Param    | Type                  | Description                               |
+| -------- | --------------------- | ----------------------------------------- |
+| function | <code>function</code> | The function to run inside a transaction. |
+
+The returned function issues `BEGIN` before invoking `function`, then `COMMIT` once it returns, or `ROLLBACK` if it throws. Any arguments passed to the returned function are forwarded to `function`, and `function`'s return value is passed back to the caller. The wrapper is asynchronous, so `await` it.
+
+The locking mode is chosen by calling one of the variants exposed as properties on the returned function, not by passing an option to `transaction()`:
+
+| Variant      | Begins with          |
+| ------------ | -------------------- |
+| (called directly) | `BEGIN`         |
+| `.deferred`  | `BEGIN DEFERRED`     |
+| `.immediate` | `BEGIN IMMEDIATE`    |
+| `.exclusive` | `BEGIN EXCLUSIVE`    |
+| `.concurrent` | `BEGIN CONCURRENT`  |
+
+```js
+const insert = db.prepare("INSERT INTO users(name) VALUES (?)");
+const insertMany = db.transaction(async (names) => {
+  for (const name of names) {
+    await insert.run([name]);
+  }
+});
+
+await insertMany.concurrent(["Alice", "Bob"]);
+await insertMany.deferred(["Carol"]);
+await insertMany(["Dave"]);
+```
+
+Each variant is itself a transaction function carrying the same set of properties, so `insertMany.deferred.immediate` is equivalent to `insertMany.immediate`. The returned function also exposes the originating connection as `.database`.
+
+Transactions do not nest. Calling a transaction function from inside another transaction function's callback issues a second `BEGIN` on a connection that is already in a transaction, which fails. Use `batch()` or plain statements within the callback instead, and note that `batch()` ignores its `mode` argument when called there, since the surrounding transaction is reused.
 
 #### pragma(string, [options]) ⇒ results
 
