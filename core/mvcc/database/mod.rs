@@ -6710,7 +6710,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     /// Returns true if there is an exclusive transaction ongoing.
     #[inline]
-    fn has_exclusive_tx(&self) -> bool {
+    pub(crate) fn has_exclusive_tx(&self) -> bool {
         self.exclusive_tx.load(Ordering::Acquire) != NO_EXCLUSIVE_TX
     }
 

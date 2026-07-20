@@ -1468,6 +1468,15 @@ impl Statement {
         self.busy
     }
 
+    /// True if an exclusive write transaction is active anywhere on this
+    /// statement's database (any connection, or an ongoing MVCC exclusive tx).
+    /// See [`crate::Connection::has_active_writer`]. Intended for callers that
+    /// need to assert that a surfaced `SQLITE_BUSY` is backed by real write
+    /// contention.
+    pub fn database_has_active_writer(&self) -> bool {
+        self.program.connection.has_active_writer()
+    }
+
     /// Internal method to get IO from a statement.
     /// Used by select internal crate
     ///

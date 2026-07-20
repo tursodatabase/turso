@@ -436,6 +436,15 @@ impl TursoRwLock {
     }
 
     #[inline]
+    /// True if the exclusive (writer) bit is currently set, i.e. some holder
+    /// owns the write lock. Lock-free single load; does not mutate the lock and
+    /// does not care about readers. Used to answer "is anyone writing right now"
+    /// without attempting to acquire.
+    pub fn is_write_locked(&self) -> bool {
+        Self::has_writer(self.0.load(Ordering::Acquire))
+    }
+
+    #[inline]
     /// Set the embedded value while holding the write lock.
     pub fn set_value_exclusive(&self, v: u32) {
         // Must be called only while WRITER bit is set
@@ -642,6 +651,13 @@ pub trait Wal: Debug + Send + Sync {
 
     /// Returns true if this WAL instance currently holds the write lock.
     fn holds_write_lock(&self) -> bool;
+
+    /// Returns true if the process-wide single-writer WAL lock is currently
+    /// held by ANY connection to this database. Unlike [`Wal::holds_write_lock`],
+    /// which only reports whether *this* handle owns the lock, this inspects the
+    /// shared lock state and is the ground truth for "is an exclusive write
+    /// transaction active on the database right now".
+    fn shared_write_lock_held(&self) -> bool;
 
     /// Whether shutdown checkpointing is valid when this process closes its last connection.
     fn should_checkpoint_on_close(&self) -> bool;
@@ -3381,6 +3397,10 @@ impl Wal for WalFile {
     /// Returns true if this WAL instance currently holds the write lock.
     fn holds_write_lock(&self) -> bool {
         self.write_lock_held.load(Ordering::Acquire)
+    }
+
+    fn shared_write_lock_held(&self) -> bool {
+        self.with_shared(|shared| shared.runtime.write_lock.is_write_locked())
     }
 
     fn should_checkpoint_on_close(&self) -> bool {

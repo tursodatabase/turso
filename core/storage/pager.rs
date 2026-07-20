@@ -3180,6 +3180,16 @@ impl Pager {
         wal.holds_write_lock()
     }
 
+    /// True if any connection to this pager's database currently holds the
+    /// exclusive WAL write lock (not just this connection). See
+    /// [`Wal::shared_write_lock_held`].
+    pub fn shared_write_lock_held(&self) -> bool {
+        let Some(wal) = self.wal.as_ref() else {
+            return false;
+        };
+        wal.shared_write_lock_held()
+    }
+
     /// Rollback and clean up an attached database pager's transaction.
     /// Unlike rollback_tx, this doesn't modify connection-level state.
     pub fn rollback_attached(&self) {

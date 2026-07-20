@@ -4539,6 +4539,37 @@ impl Connection {
         matches!(self.get_tx_state(), TransactionState::Write { .. })
     }
 
+    /// Returns true if an exclusive write transaction is active *anywhere* on
+    /// this database (or any database attached to this connection), regardless
+    /// of which connection owns it.
+    ///
+    /// Unlike [`Connection::is_in_write_tx`], which only reports this
+    /// connection's own transaction state, this inspects the process-wide
+    /// single-writer state:
+    /// - In WAL mode: whether the shared WAL write lock is held by any connection.
+    /// - In MVCC mode: whether an exclusive MVCC transaction is ongoing.
+    ///
+    /// This is the ground truth for "could a concurrent writer legitimately be
+    /// forcing another connection to see `SQLITE_BUSY` right now".
+    pub fn has_active_writer(&self) -> bool {
+        if self.pager.load().shared_write_lock_held() {
+            return true;
+        }
+        let attached_writer = self.with_all_attached_pagers_with_index(|pagers| {
+            pagers
+                .iter()
+                .any(|(_, pager)| pager.shared_write_lock_held())
+        });
+        if attached_writer {
+            return true;
+        }
+        // MVCC mode does not use the WAL write lock for its single-writer
+        // discipline; consult the exclusive-transaction tracker instead.
+        self.mv_store()
+            .as_ref()
+            .is_some_and(|mv_store| mv_store.has_exclusive_tx())
+    }
+
     pub(crate) fn get_mv_tx_id(&self) -> Option<u64> {
         self.mv_tx.read().map(|(tx_id, _)| tx_id)
     }
