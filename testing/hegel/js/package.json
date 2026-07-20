@@ -1,0 +1,17 @@
+{
+  "name": "@turso/hegel-parity-js",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "ava --timeout=120s"
+  },
+  "devDependencies": {
+    "ava": "^6.4.1",
+    "fast-check": "^4.6.0"
+  },
+  "dependencies": {
+    "@tursodatabase/database": "file:../../../bindings/javascript/packages/native",
+    "@tursodatabase/serverless": "file:../../../serverless/javascript"
+  }
+}

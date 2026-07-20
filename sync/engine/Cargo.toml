@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 turso_core = { workspace = true, features = ["conn_raw_api"] }
 turso_parser = { workspace = true }
+turso_remote_protocol = { workspace = true }
 thiserror = "2.0.12"
 tracing = "0.1.41"
 serde_json.workspace = true

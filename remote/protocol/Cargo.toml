@@ -1,0 +1,15 @@
+[package]
+name = "turso_remote_protocol"
+description = "Turso hrana v3 remote wire-protocol types (shared by the sync engine and serverless drivers)"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+bytes = "1"
+base64 = "0.22"
+prost = "0.13"
