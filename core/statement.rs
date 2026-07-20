@@ -519,8 +519,17 @@ impl Statement {
             // Once a transaction is active, keep its attached-file set stable
             // so external retention or publication cannot change the logical
             // snapshot between statements in that transaction.
-            if self.program.connection.get_auto_commit() {
-                if let Err(error) = self.program.connection.refresh_all_partitioned_tables() {
+            if self.program.connection.get_auto_commit()
+                && self.program.prepared.partitioned_insert.is_none()
+            {
+                let refresh_result = if self.program.prepared.refresh_all_partitions {
+                    self.program.connection.refresh_all_partitioned_tables()
+                } else {
+                    self.program
+                        .connection
+                        .refresh_partitioned_tables(&self.program.prepared.partitioned_tables)
+                };
+                if let Err(error) = refresh_result {
                     self.release_active_root_if_counted();
                     return Err(error);
                 }
@@ -733,6 +742,9 @@ impl Statement {
                     insert.table_name, first_target.db_alias, target.db_alias
                 )));
             }
+        }
+        if connection.get_auto_commit() {
+            connection.refresh_partition_target(&insert.table_name, &first_target)?;
         }
         connection.track_partition_write(
             &insert.table_name,

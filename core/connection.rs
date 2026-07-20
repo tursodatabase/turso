@@ -2220,6 +2220,63 @@ impl Connection {
             .map_err(|error| LimboError::InvalidArgument(error.to_string()))
     }
 
+    /// Reconcile only the partition addressed by an insert. Recorder ingestion
+    /// must not scan every retained day before writing the current day.
+    #[cfg(feature = "fs")]
+    pub(crate) fn refresh_partition_target(
+        &self,
+        table_name: &str,
+        target: &crate::partition::manager::PartitionTarget,
+    ) -> Result<()> {
+        let known = self
+            .partition_manager
+            .read()
+            .partition_for_range_start(table_name, target.range_start)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+
+        if let Some(partition) = known {
+            if partition.path != target.path || partition.db_alias != target.db_alias {
+                return Err(LimboError::InternalError(format!(
+                    "partition resolver changed target for table '{table_name}' and range {}",
+                    target.range_start
+                )));
+            }
+
+            let still_present = partition.path.exists();
+            let replaced = still_present && self.partition_file_was_replaced(&partition);
+            if still_present && !replaced {
+                if !partition.attached {
+                    self.attach_partition(table_name, &partition.path)?;
+                }
+                return Ok(());
+            }
+
+            self.detach_partition(table_name, &partition.path)?;
+            self.partition_manager
+                .write()
+                .remove_partition(table_name, &partition.path)
+                .map_err(|error| LimboError::InternalError(error.to_string()))?;
+            crate::partition::with_partition_path_lock(&partition.path, || -> Result<()> {
+                crate::partition::remove_partition_sidecars(&partition.path)
+                    .map_err(|error| LimboError::InternalError(error.to_string()))
+            })?;
+        }
+
+        if target.path.exists() {
+            self.attach_partition(table_name, &target.path)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "fs"))]
+    pub(crate) fn refresh_partition_target(
+        &self,
+        _table_name: &str,
+        _target: &crate::partition::manager::PartitionTarget,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     pub(crate) fn track_partition_write(
         &self,
         table_name: &str,
@@ -2722,14 +2779,28 @@ impl Connection {
     #[cfg(feature = "fs")]
     pub(crate) fn refresh_all_partitioned_tables(&self) -> Result<()> {
         let tables = self.partition_manager.read().registered_tables();
+        self.refresh_partitioned_tables(&tables)
+    }
+
+    /// Reconcile only the logical tables referenced by the statement being run.
+    #[cfg(feature = "fs")]
+    pub(crate) fn refresh_partitioned_tables(&self, tables: &[String]) -> Result<()> {
         for table in tables {
-            self.refresh_partitioned_table(&table)?;
+            if !self.partition_manager.read().is_partitioned(table) {
+                continue;
+            }
+            self.refresh_partitioned_table(table)?;
         }
         Ok(())
     }
 
     #[cfg(not(feature = "fs"))]
     pub(crate) fn refresh_all_partitioned_tables(&self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(feature = "fs"))]
+    pub(crate) fn refresh_partitioned_tables(&self, _tables: &[String]) -> Result<()> {
         Ok(())
     }
 

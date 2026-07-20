@@ -1906,6 +1906,91 @@ fn recorder_supports_multiple_independent_partitioned_event_tables() -> anyhow::
 }
 
 #[test]
+fn recorder_ingestion_isolated_from_an_unrelated_invalid_archive() -> anyhow::Result<()> {
+    let recorder = RecorderDatabase::new()?;
+    const ALERTS_SCHEMA: &str =
+        "CREATE TABLE alerts(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, event_id INTEGER NOT NULL)";
+    let alerts_directory = recorder._directory.path().join("alerts");
+    recorder
+        .connection
+        .execute(ALERTS_SCHEMA.to_string() + " PARTITION BY (ts)")?;
+    recorder.connection.register_partitioned_table(
+        "alerts",
+        PartitionConfig::new(
+            Box::new(DefaultPathResolver::daily(alerts_directory.clone())),
+            ALERTS_SCHEMA.to_string(),
+            "ts".to_string(),
+        ),
+    )?;
+
+    std::fs::create_dir_all(&alerts_directory)?;
+    let invalid_alerts_path =
+        DefaultPathResolver::daily(alerts_directory).resolve_path("alerts", FIRST_DAY + 1_000);
+    std::fs::write(&invalid_alerts_path, b"not a database")?;
+
+    recorder.insert_event(1, FIRST_DAY + 1_000, "gate-a", "motion", 0.8)?;
+    assert!(recorder.partition_path(FIRST_DAY + 1_000).exists());
+    assert_eq!(recorder.connection.list_partitions("events")?.len(), 1);
+    assert_eq!(
+        query_rows(&recorder.connection, "SELECT id FROM events")?,
+        vec!["1"]
+    );
+    let error = query_rows(&recorder.connection, "SELECT id FROM alerts")
+        .expect_err("the invalid alerts archive must still fail closed when queried");
+    assert!(error.to_string().contains("short read"));
+
+    std::fs::remove_file(invalid_alerts_path)?;
+    assert_eq!(
+        query_rows(&recorder.connection, "SELECT id FROM events")?,
+        vec!["1"]
+    );
+    recorder.connection.execute(format!(
+        "INSERT INTO alerts VALUES (10, {}, 1)",
+        FIRST_DAY + 2_000
+    ))?;
+    assert_eq!(
+        query_rows(&recorder.connection, "SELECT id FROM alerts")?,
+        vec!["10"]
+    );
+
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn recorder_retries_retention_after_a_transient_sidecar_failure() -> anyhow::Result<()> {
+    let recorder = RecorderDatabase::new()?;
+    recorder.insert_event(1, FIRST_DAY + 1_000, "gate-a", "motion", 0.8)?;
+    recorder.insert_event(2, FIRST_DAY + DAY_MICROS + 1_000, "gate-b", "plate", 0.9)?;
+
+    let first_path = recorder.partition_path(FIRST_DAY + 1_000);
+    let blocking_sidecar = PathBuf::from(format!("{}-wal", first_path.to_string_lossy()));
+    if blocking_sidecar.exists() {
+        std::fs::remove_file(&blocking_sidecar)?;
+    }
+    std::fs::create_dir(&blocking_sidecar)?;
+
+    let error = recorder
+        .connection
+        .delete_partition("events", &first_path)
+        .expect_err("a non-file sidecar must make checked retention fail");
+    assert!(error.to_string().contains("partition I/O error"));
+    assert!(!first_path.exists());
+
+    std::fs::remove_dir(&blocking_sidecar)?;
+    recorder
+        .connection
+        .delete_partition("events", &first_path)?;
+    assert_eq!(
+        query_rows(&recorder.connection, "SELECT id FROM events")?,
+        vec!["2"]
+    );
+    assert_eq!(recorder.connection.list_partitions("events")?.len(), 1);
+
+    Ok(())
+}
+
+#[test]
 fn recorder_handles_a_month_of_daily_files_and_bulk_retention() -> anyhow::Result<()> {
     let recorder = RecorderDatabase::new()?;
     const DAYS: i64 = 31;

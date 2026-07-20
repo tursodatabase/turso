@@ -211,7 +211,9 @@ pub struct ProgramBuilder {
     pub parameters: Parameters,
     partition_bindings: Option<Vec<crate::Value>>,
     partitioned_insert: Option<crate::partition::PartitionedInsert>,
+    partitioned_tables: Vec<String>,
     partition_pruning_bindings: Vec<(NonZeroUsize, Option<i64>)>,
+    refresh_all_partitions: bool,
     pub result_columns: Vec<ResultSetColumn>,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
@@ -604,7 +606,22 @@ impl ProgramBuilder {
         &mut self,
         partitioned_insert: crate::partition::PartitionedInsert,
     ) {
+        self.record_partitioned_table(&partitioned_insert.table_name);
         self.partitioned_insert = Some(partitioned_insert);
+    }
+
+    pub(crate) fn record_partitioned_table(&mut self, table_name: &str) {
+        if !self
+            .partitioned_tables
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(table_name))
+        {
+            self.partitioned_tables.push(table_name.to_string());
+        }
+    }
+
+    pub(crate) fn require_full_partition_refresh(&mut self) {
+        self.refresh_all_partitions = true;
     }
 
     pub(crate) fn record_partition_pruning_parameter(&mut self, index: NonZeroUsize) {
@@ -698,7 +715,9 @@ impl ProgramBuilder {
             parameters: Parameters::new(),
             partition_bindings: None,
             partitioned_insert: None,
+            partitioned_tables: Vec::new(),
             partition_pruning_bindings: Vec::new(),
+            refresh_all_partitions: false,
             result_columns: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
             collation: None,
@@ -2027,7 +2046,9 @@ impl ProgramBuilder {
             comments: self.comments,
             parameters: self.parameters,
             partitioned_insert: self.partitioned_insert,
+            partitioned_tables: self.partitioned_tables,
             partition_pruning_bindings: self.partition_pruning_bindings,
+            refresh_all_partitions: self.refresh_all_partitions,
             change_cnt_on,
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,

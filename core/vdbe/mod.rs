@@ -1434,7 +1434,9 @@ pub struct PreparedProgram {
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
     pub(crate) partitioned_insert: Option<crate::partition::PartitionedInsert>,
+    pub(crate) partitioned_tables: Vec<String>,
     pub(crate) partition_pruning_bindings: Vec<(std::num::NonZeroUsize, Option<i64>)>,
+    pub(crate) refresh_all_partitions: bool,
     pub change_cnt_on: bool,
     /// Flag that detect if the sqlite statement will directly manipulate the database file.\
     /// mirrors: https://sqlite.org/c3ref/stmt_readonly.html.

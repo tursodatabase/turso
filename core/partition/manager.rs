@@ -167,6 +167,24 @@ impl PartitionManager {
             .ok_or_else(|| PartitionError::TableNotPartitioned(table_name.to_string()))
     }
 
+    /// Return the known descriptor for one resolved range without scanning the
+    /// archive or cloning every partition descriptor.
+    pub(crate) fn partition_for_range_start(
+        &self,
+        table_name: &str,
+        range_start: i64,
+    ) -> Result<Option<PartitionFile>, PartitionError> {
+        let partitions = self
+            .partitions
+            .get(table_name)
+            .ok_or_else(|| PartitionError::TableNotPartitioned(table_name.to_string()))?;
+        Ok(partitions
+            .binary_search_by_key(&range_start, |partition| partition.range_start)
+            .ok()
+            .and_then(|index| partitions.get(index))
+            .cloned())
+    }
+
     /// Route an insert to the correct partition based on timestamp.
     ///
     /// # Arguments
@@ -865,8 +883,8 @@ mod tests {
             let day_offset = (i - 20) as i64;
             let start = 1_737_331_200_000_000 + day_offset * 86_400_000_000;
             let mut p = PartitionFile::new(
-                PathBuf::from(format!("/tmp/p{}.db", i)),
-                format!("events_202501{}", i),
+                PathBuf::from(format!("/tmp/p{i}.db")),
+                format!("events_202501{i}"),
                 start,
                 start + 86_400_000_000,
             );

@@ -53,6 +53,9 @@ effect of configuration. Configuration is connection-local and is not
 persisted in the database.
 
 `DefaultPathResolver::daily` writes `events_YYYY-MM-DD.db` files.
+Table names that are not already portable filename components are encoded in
+the physical filename, so quoted SQL identifiers cannot escape the configured
+partition directory.
 `VideoAnalyticsPathResolver::daily` writes
 `YYYY-MM-DD/<plugin-id>.bin` files.
 Plugin identifiers must contain only ASCII letters, digits, `-`, and `_`, must
@@ -72,10 +75,13 @@ the combined archive. Simple timestamp comparisons, `BETWEEN`, and `IN`
 predicates prune unrelated files and are pushed down so local timestamp indexes
 remain useful.
 
-Before each root statement, the connection reconciles its catalog with the
-resolver's files. A newly published file therefore appears in already-prepared
-queries, while a file removed between statements disappears without rebuilding
-the connection.
+Before each root statement that references a partitioned table, the connection
+reconciles that table with the resolver's files. A newly published file therefore
+appears in already-prepared queries, while a file removed between statements
+disappears without rebuilding the connection. Recorder inserts use a narrower
+check of only their target time range, so retained days and unrelated plugins do
+not add filesystem scans to the ingestion hot path. Transaction-opening
+statements reconcile every registered table before freezing their file set.
 
 Catalog discovery, attachment, and first-file initialization currently use
 synchronous local-filesystem operations. Partitioned tables should therefore be

@@ -9,6 +9,7 @@ use turso_parser::ast::Name;
 
 /// Emits bytecode for `SAVEPOINT <name>`.
 pub fn translate_savepoint(program: &mut ProgramBuilder, name: Name) -> Result<()> {
+    program.require_full_partition_refresh();
     program.emit_insn(Insn::Savepoint {
         op: SavepointOp::Begin,
         name: name.as_str().to_ascii_lowercase(),

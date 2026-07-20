@@ -12,6 +12,22 @@ use super::error::PartitionError;
 
 const DAY_MICROS: i64 = 86_400_000_000;
 
+fn portable_path_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('~');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
 fn interval_range_start(timestamp_micros: i64, interval_micros: i64) -> Option<i64> {
     if interval_micros <= 0 {
         return None;
@@ -129,6 +145,7 @@ impl DefaultPathResolver {
 
 impl PartitionPathResolver for DefaultPathResolver {
     fn resolve_path(&self, table: &str, timestamp_micros: i64) -> PathBuf {
+        let table = portable_path_component(table);
         let suffix = if self.interval_micros == DAY_MICROS {
             match micros_to_date(timestamp_micros) {
                 Some(date) => date.format("%Y-%m-%d").to_string(),
@@ -155,10 +172,11 @@ impl PartitionPathResolver for DefaultPathResolver {
     }
 
     fn glob_pattern(&self, table: &str) -> String {
+        let table = portable_path_component(table);
         format!(
             "{}/{}_*.db",
             glob::Pattern::escape(self.directory.to_string_lossy().as_ref()),
-            glob::Pattern::escape(table)
+            glob::Pattern::escape(&table)
         )
     }
 
@@ -454,7 +472,7 @@ mod tests {
         let default = DefaultPathResolver::daily(PathBuf::from("/data/[camera]*"));
         assert_eq!(
             default.glob_pattern("events[0]*"),
-            "/data/[[]camera[]][*]/events[[]0[]][*]_*.db"
+            "/data/[[]camera[]][*]/events~5B0~5D~2A_*.db"
         );
 
         let video = VideoAnalyticsPathResolver::daily(
@@ -462,6 +480,25 @@ mod tests {
             "plugin[0]*".to_string(),
         );
         assert!(matches!(video, Err(PartitionError::InvalidPluginId { .. })));
+    }
+
+    #[test]
+    fn test_default_resolver_encodes_table_names_as_one_portable_component() {
+        let resolver = DefaultPathResolver::daily(PathBuf::from("/archive"));
+        let path = resolver.resolve_path("../camera\\stream:0", 1_737_547_200_000_000);
+        assert_eq!(
+            path,
+            PathBuf::from("/archive/~2E~2E~2Fcamera~5Cstream~3A0_2025-01-22.db")
+        );
+        assert!(path.starts_with("/archive"));
+        assert_eq!(
+            resolver.glob_pattern("../camera\\stream:0"),
+            "/archive/~2E~2E~2Fcamera~5Cstream~3A0_*.db"
+        );
+        assert_eq!(
+            resolver.parse_path(&path),
+            Some((1_737_504_000_000_000, 1_737_590_400_000_000))
+        );
     }
 
     #[test]

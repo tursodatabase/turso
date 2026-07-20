@@ -465,6 +465,9 @@ pub fn translate_insert(
                     )));
                 }
             }
+            if connection.get_auto_commit() {
+                connection.refresh_partition_target(table_name.as_str(), &first_target)?;
+            }
             connection.check_partition_write_target(
                 table_name.as_str(),
                 &first_target.db_alias,

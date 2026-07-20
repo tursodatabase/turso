@@ -1506,6 +1506,7 @@ fn parse_table(
             Table::Virtual(tbl.clone())
         } else if let Table::BTree(table) = table.as_ref() {
             if let Some(partition_spec) = &table.partition_spec {
+                program.record_partitioned_table(&table.name);
                 if !connection.is_table_partitioned(&table.name) {
                     crate::bail_parse_error!(
                         "SELECT from partitioned table '{}' requires partition configuration for column '{}'",
