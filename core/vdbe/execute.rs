@@ -1269,6 +1269,7 @@ pub fn op_open_read(
                 cursor,
                 view_mutex.clone(),
                 pager,
+                program.connection.clone(),
                 tx_state,
             )?;
 
@@ -13544,6 +13545,7 @@ pub fn op_populate_materialized_views(
                     root_page,
                     num_view_columns,
                     crate::incremental::vdbe_maintenance::MaintenanceInput::BaseTable,
+                    crate::incremental::vdbe_maintenance::MaintenanceOutput::ViewBtree,
                     &schema,
                     &conn,
                 )?;

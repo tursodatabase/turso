@@ -71,6 +71,18 @@ pub enum MaintenanceInput {
     BaseTable,
 }
 
+/// Where the maintenance program's output goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceOutput {
+    /// Weight-merge into the view's btree (commit-time maintenance and
+    /// initial population).
+    ViewBtree,
+    /// Emit each transformed row as a result row `(rowid, columns.., weight)`
+    /// without touching any btree. Used to overlay uncommitted transaction
+    /// changes for same-transaction reads of the view.
+    EmitRows,
+}
+
 /// Read-only cursor over a captured [`Delta`] for one base table, in capture
 /// order. Exposes the base columns at their table positions and the weight as
 /// one extra trailing column; the delta row's key is exposed as the rowid.
@@ -263,12 +275,14 @@ pub fn validate_vdbe_maintainable(select: &ast::Select) -> Result<()> {
 /// `view_root_page` is the root of the view's data btree; `view_columns` are
 /// the view's output columns (the on-disk record is these plus a trailing
 /// weight column).
+#[allow(clippy::too_many_arguments)]
 pub fn compile_maintenance_program(
     view_name: &str,
     select: &ast::Select,
     view_root_page: i64,
     num_view_columns: usize,
     input: MaintenanceInput,
+    output: MaintenanceOutput,
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<Program> {
@@ -384,19 +398,26 @@ pub fn compile_maintenance_program(
         }
     };
 
-    // Write cursor over the view btree. The synthesized table exists only to
-    // size the cursor: view records are the output columns plus the weight.
-    let view_btree = Arc::new(synthesized_view_table(
-        view_name,
-        view_root_page,
-        num_view_columns,
-    ));
-    let view_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(view_btree));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: view_cursor_id,
-        root_page: RegisterOrLiteral::Literal(view_root_page),
-        db: 0,
-    });
+    // Write cursor over the view btree (btree output only). The synthesized
+    // table exists only to size the cursor: view records are the output
+    // columns plus the weight.
+    let view_cursor_id = match output {
+        MaintenanceOutput::ViewBtree => {
+            let view_btree = Arc::new(synthesized_view_table(
+                view_name,
+                view_root_page,
+                num_view_columns,
+            ));
+            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(view_btree));
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id,
+                root_page: RegisterOrLiteral::Literal(view_root_page),
+                db: 0,
+            });
+            Some(cursor_id)
+        }
+        MaintenanceOutput::EmitRows => None,
+    };
 
     let end_label = program.allocate_label();
     let loop_label = program.allocate_label();
@@ -496,90 +517,111 @@ pub fn compile_maintenance_program(
         "projection produced {num_projected} columns, view declares {num_view_columns}"
     );
 
-    // Merge (rowid, out.., weight) into the view btree.
-    let notfound_label = program.allocate_label();
-    let merge_label = program.allocate_label();
-    let write_label = program.allocate_label();
-    let delete_label = program.allocate_label();
+    match output {
+        MaintenanceOutput::EmitRows => {
+            // rowid_reg is allocated immediately before the out block, so
+            // [rowid, out.., weight] is one contiguous range. The input
+            // weight is copied into the trailing slot and the whole row is
+            // emitted for the caller to collect.
+            debug_assert_eq!(rowid_reg + 1, out_start_reg);
+            program.emit_insn(Insn::Copy {
+                src_reg: weight_reg,
+                dst_reg: new_weight_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::ResultRow {
+                start_reg: rowid_reg,
+                count: num_view_columns + 2,
+            });
+        }
+        MaintenanceOutput::ViewBtree => {
+            // Merge (rowid, out.., weight) into the view btree.
+            let view_cursor_id = view_cursor_id.expect("btree output mode opened the view cursor");
+            let notfound_label = program.allocate_label();
+            let merge_label = program.allocate_label();
+            let write_label = program.allocate_label();
+            let delete_label = program.allocate_label();
 
-    let cur_weight_reg = program.alloc_register();
-    let found_reg = program.alloc_register();
-    let zero_reg = program.alloc_register();
-    program.emit_int(0, zero_reg);
+            let cur_weight_reg = program.alloc_register();
+            let found_reg = program.alloc_register();
+            let zero_reg = program.alloc_register();
+            program.emit_int(0, zero_reg);
 
-    program.emit_insn(Insn::SeekRowid {
-        cursor_id: view_cursor_id,
-        src_reg: rowid_reg,
-        target_pc: notfound_label,
-    });
-    program.emit_insn(Insn::Column {
-        cursor_id: view_cursor_id,
-        column: num_view_columns,
-        dest: cur_weight_reg,
-        default: None,
-    });
-    program.emit_int(1, found_reg);
-    program.emit_insn(Insn::Goto {
-        target_pc: merge_label,
-    });
-    program.preassign_label_to_next_insn(notfound_label);
-    program.emit_int(0, cur_weight_reg);
-    program.emit_int(0, found_reg);
-    program.preassign_label_to_next_insn(merge_label);
+            program.emit_insn(Insn::SeekRowid {
+                cursor_id: view_cursor_id,
+                src_reg: rowid_reg,
+                target_pc: notfound_label,
+            });
+            program.emit_insn(Insn::Column {
+                cursor_id: view_cursor_id,
+                column: num_view_columns,
+                dest: cur_weight_reg,
+                default: None,
+            });
+            program.emit_int(1, found_reg);
+            program.emit_insn(Insn::Goto {
+                target_pc: merge_label,
+            });
+            program.preassign_label_to_next_insn(notfound_label);
+            program.emit_int(0, cur_weight_reg);
+            program.emit_int(0, found_reg);
+            program.preassign_label_to_next_insn(merge_label);
 
-    program.emit_insn(Insn::Add {
-        lhs: weight_reg,
-        rhs: cur_weight_reg,
-        dest: new_weight_reg,
-    });
-    program.emit_insn(Insn::Gt {
-        lhs: new_weight_reg,
-        rhs: zero_reg,
-        target_pc: write_label,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-    // new_weight <= 0: remove the row if it existed; a retraction of a row
-    // the view never held (weight <= 0 and not found) is a no-op, matching
-    // the previous engine's write_row behavior.
-    program.emit_insn(Insn::If {
-        reg: found_reg,
-        target_pc: delete_label,
-        jump_if_null: false,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: next_label,
-    });
-    program.preassign_label_to_next_insn(delete_label);
-    program.emit_insn(Insn::Delete {
-        cursor_id: view_cursor_id,
-        table_name: view_name.to_string(),
-        is_part_of_update: true,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: next_label,
-    });
+            program.emit_insn(Insn::Add {
+                lhs: weight_reg,
+                rhs: cur_weight_reg,
+                dest: new_weight_reg,
+            });
+            program.emit_insn(Insn::Gt {
+                lhs: new_weight_reg,
+                rhs: zero_reg,
+                target_pc: write_label,
+                flags: CmpInsFlags::default(),
+                collation: None,
+            });
+            // new_weight <= 0: remove the row if it existed; a retraction of
+            // a row the view never held (weight <= 0 and not found) is a
+            // no-op, matching the previous engine's write_row behavior.
+            program.emit_insn(Insn::If {
+                reg: found_reg,
+                target_pc: delete_label,
+                jump_if_null: false,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: next_label,
+            });
+            program.preassign_label_to_next_insn(delete_label);
+            program.emit_insn(Insn::Delete {
+                cursor_id: view_cursor_id,
+                table_name: view_name.to_string(),
+                is_part_of_update: true,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: next_label,
+            });
 
-    program.preassign_label_to_next_insn(write_label);
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: out_start_reg as u16,
-        count: (num_view_columns + 1) as u16,
-        dest_reg: record_reg as u16,
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: view_cursor_id,
-        key_reg: rowid_reg,
-        record_reg,
-        flag: InsertFlags(
-            InsertFlags::REQUIRE_SEEK
-                | InsertFlags::SKIP_LAST_ROWID
-                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-        ),
-        table_name: view_name.to_string(),
-    });
+            program.preassign_label_to_next_insn(write_label);
+            let record_reg = program.alloc_register();
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: out_start_reg as u16,
+                count: (num_view_columns + 1) as u16,
+                dest_reg: record_reg as u16,
+                index_name: None,
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::Insert {
+                cursor: view_cursor_id,
+                key_reg: rowid_reg,
+                record_reg,
+                flag: InsertFlags(
+                    InsertFlags::REQUIRE_SEEK
+                        | InsertFlags::SKIP_LAST_ROWID
+                        | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+                ),
+                table_name: view_name.to_string(),
+            });
+        }
+    }
 
     program.preassign_label_to_next_insn(next_label);
     program.emit_insn(Insn::Next {

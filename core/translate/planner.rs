@@ -1238,7 +1238,7 @@ fn parse_table(
         });
 
         if !has_compatible_state {
-            use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+            use crate::incremental::view::DBSP_CIRCUIT_VERSION;
             return Err(crate::LimboError::InternalError(format!(
                 "Materialized view '{table_name}' has an incompatible version. \n\
                  The current version is {DBSP_CIRCUIT_VERSION}, but the view was created with a different version. \n\
@@ -1330,7 +1330,7 @@ fn parse_table(
     });
 
     if is_incompatible {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        use crate::incremental::view::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
             "Materialized view '{}' has an incompatible version. \n\
              The view was created with a different DBSP version than the current version ({}). \n\

@@ -3,7 +3,6 @@ use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::{
     incremental::{
-        compiler::{DeltaSet, ExecuteState},
         dbsp::{Delta, HashableRow, RowKeyZSet},
         view::{IncrementalView, ViewTransactionState},
     },
@@ -48,6 +47,7 @@ pub struct MaterializedViewCursor {
     btree_cursor: Box<dyn CursorTrait>,
     view: Arc<Mutex<IncrementalView>>,
     pager: Arc<Pager>,
+    connection: Arc<crate::Connection>,
 
     // Current changes that are uncommitted
     uncommitted: RowKeyZSet,
@@ -63,8 +63,13 @@ pub struct MaterializedViewCursor {
     // Current row cache - only cache the current row we're looking at
     current_row: Option<(i64, Vec<Value>)>,
 
-    // Execution state for circuit processing
-    execute_state: ExecuteState,
+    // The overlay statement currently being stepped (the view's maintenance
+    // program in emit mode over the transaction's deltas), parked across I/O
+    // yields, plus the rows it has produced so far and the tx-state length it
+    // was compiled against.
+    overlay_stmt: Option<Box<crate::Statement>>,
+    overlay_rows: Delta,
+    overlay_len: usize,
 
     // State machine for seek operations
     seek_state: SeekState,
@@ -75,48 +80,121 @@ impl MaterializedViewCursor {
         btree_cursor: Box<dyn CursorTrait>,
         view: Arc<Mutex<IncrementalView>>,
         pager: Arc<Pager>,
+        connection: Arc<crate::Connection>,
         tx_state: Arc<ViewTransactionState>,
     ) -> Result<Self> {
         Ok(Self {
             btree_cursor,
             view,
             pager,
+            connection,
             uncommitted: RowKeyZSet::new(),
             tx_state,
             last_tx_state_len: 0,
             current_row: None,
-            execute_state: ExecuteState::Uninitialized,
+            overlay_stmt: None,
+            overlay_rows: Delta::new(),
+            overlay_len: 0,
             seek_state: SeekState::Init,
         })
     }
 
-    /// Compute transaction changes lazily on first access
+    /// Compute transaction changes lazily on first access.
+    ///
+    /// Runs the view's maintenance program in emit mode over the
+    /// transaction's captured deltas — the same codegen that maintains the
+    /// view at commit — and collects the transformed `(rowid, columns..,
+    /// weight)` rows into an overlay Z-set that reads merge with the
+    /// committed btree contents.
     fn ensure_tx_changes_computed(&mut self) -> Result<IOResult<()>> {
-        // Check if we've already processed the current state
-        let current_len = self.tx_state.len();
-        if current_len == self.last_tx_state_len {
-            return Ok(IOResult::Done(()));
+        use crate::vdbe::StepResult;
+
+        loop {
+            if self.overlay_stmt.is_none() {
+                let current_len = self.tx_state.len();
+                if current_len == self.last_tx_state_len {
+                    return Ok(IOResult::Done(()));
+                }
+
+                let (view_name, select, num_view_columns) = {
+                    let view_guard = self.view.lock();
+                    (
+                        view_guard.name().to_string(),
+                        view_guard.select_stmt.clone(),
+                        view_guard.column_schema.flat_columns().len(),
+                    )
+                };
+                let program = {
+                    let schema = self.connection.schema.read();
+                    crate::incremental::vdbe_maintenance::compile_maintenance_program(
+                        &view_name,
+                        &select,
+                        0, // emit mode writes no btree
+                        num_view_columns,
+                        crate::incremental::vdbe_maintenance::MaintenanceInput::TransactionDelta,
+                        crate::incremental::vdbe_maintenance::MaintenanceOutput::EmitRows,
+                        &schema,
+                        &self.connection,
+                    )?
+                };
+                self.overlay_rows = Delta::new();
+                self.overlay_len = current_len;
+                self.overlay_stmt = Some(Box::new(crate::Statement::new_with_origin(
+                    program,
+                    self.pager.clone(),
+                    crate::QueryMode::Normal,
+                    0,
+                    crate::statement::StatementOrigin::Subprogram,
+                    false,
+                )));
+            }
+
+            let stmt = self
+                .overlay_stmt
+                .as_mut()
+                .expect("overlay statement was just built");
+            match stmt.step_subprogram()? {
+                StepResult::Row => {
+                    let row = stmt.row().expect("Row step result must carry a row");
+                    let mut values: Vec<Value> = row.get_values().cloned().collect();
+                    let weight = match values.pop() {
+                        Some(Value::Numeric(Numeric::Integer(w))) => w as isize,
+                        other => {
+                            return Err(crate::LimboError::InternalError(format!(
+                                "view overlay row has non-integer weight: {other:?}"
+                            )))
+                        }
+                    };
+                    let rowid = match values.first() {
+                        Some(Value::Numeric(Numeric::Integer(rowid))) => *rowid,
+                        other => {
+                            return Err(crate::LimboError::InternalError(format!(
+                                "view overlay row has non-integer rowid: {other:?}"
+                            )))
+                        }
+                    };
+                    values.remove(0);
+                    self.overlay_rows.changes.push((
+                        HashableRow::new(rowid, values.into_iter().collect()),
+                        weight,
+                    ));
+                }
+                StepResult::IO | StepResult::Yield => {
+                    let Some(io) = stmt.take_io_completions() else {
+                        continue;
+                    };
+                    return Ok(IOResult::IO(io));
+                }
+                StepResult::Done => {
+                    self.uncommitted = RowKeyZSet::from_delta(&self.overlay_rows);
+                    self.last_tx_state_len = self.overlay_len;
+                    self.overlay_stmt = None;
+                    return Ok(IOResult::Done(()));
+                }
+                StepResult::Busy => return Err(crate::LimboError::Busy),
+                StepResult::Interrupt => return Err(crate::LimboError::Interrupt),
+            }
         }
-
-        // Get the view and the current transaction state
-        let mut view_guard = self.view.lock();
-        let table_deltas = self.tx_state.get_table_deltas();
-
-        // Process the deltas through the circuit to get materialized changes
-        let mut uncommitted = DeltaSet::new();
-        for (table_name, delta) in table_deltas {
-            uncommitted.insert(table_name, delta);
-        }
-
-        let processed_delta = return_if_io!(view_guard.execute_with_uncommitted(
-            uncommitted,
-            self.pager.clone(),
-            &mut self.execute_state
-        ));
-
-        self.uncommitted = RowKeyZSet::from_delta(&processed_delta);
-        self.last_tx_state_len = current_len;
-        Ok(IOResult::Done(()))
     }
 
     // Read the current btree entry as a vector (empty if no current position)
@@ -456,6 +534,7 @@ mod tests {
             btree_cursor,
             view_mutex.clone(),
             pager.clone(),
+            conn.clone(),
             tx_state.clone(),
         )?;
 
@@ -1937,7 +2016,7 @@ mod tests {
             let mock_ptr = mock_cursor_box.as_ref() as *const dyn CursorTrait;
 
             let mut cursor =
-                MaterializedViewCursor::new(mock_cursor_box, view_mutex, pager, tx_state)?;
+                MaterializedViewCursor::new(mock_cursor_box, view_mutex, pager, conn, tx_state)?;
 
             // Use LE so that rowid=1 satisfies the condition (1 <= 5)
             let seek_op = SeekOp::LE { eq_only: false };

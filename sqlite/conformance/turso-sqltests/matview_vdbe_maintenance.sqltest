@@ -47,6 +47,40 @@ expect {
     44
 }
 
+# Same-transaction reads must see uncommitted changes through the view.
+test matview-vdbe-read-your-own-writes {
+    CREATE TABLE t5(a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t5 VALUES (1, 10), (2, 20);
+    CREATE MATERIALIZED VIEW v5 AS SELECT a, b + 1 AS b1 FROM t5 WHERE b >= 20;
+    BEGIN;
+    INSERT INTO t5 VALUES (3, 30);
+    UPDATE t5 SET b = 25 WHERE a = 1;
+    DELETE FROM t5 WHERE a = 2;
+    SELECT a, b1 FROM v5 ORDER BY a;
+    COMMIT;
+    SELECT a, b1 FROM v5 ORDER BY a;
+}
+expect {
+    1|26
+    3|31
+    1|26
+    3|31
+}
+
+# Negative literals in WHERE were rejected by the retired circuit compiler;
+# the VDBE codegen supports them.
+test matview-vdbe-negative-literal-filter {
+    CREATE TABLE t7(a INTEGER, b TEXT);
+    INSERT INTO t7 VALUES (-5,'neg'), (3,'pos');
+    CREATE MATERIALIZED VIEW v7 AS SELECT a, b FROM t7 WHERE a < -2;
+    INSERT INTO t7 VALUES (-10,'neg2');
+    SELECT * FROM v7 ORDER BY a;
+}
+expect {
+    -10|neg2
+    -5|neg
+}
+
 test matview-vdbe-transaction-rollback {
     CREATE TABLE t6(a INTEGER, b TEXT);
     CREATE MATERIALIZED VIEW v6 AS SELECT a, b FROM t6;

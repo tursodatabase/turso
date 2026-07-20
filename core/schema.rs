@@ -3,7 +3,7 @@ use crate::alloc::TursoFromIterator;
 use crate::alloc::*;
 use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::incremental::view::IncrementalView;
-use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, operator::create_dbsp_state_index};
+use crate::incremental::view::{create_dbsp_state_index, DBSP_CIRCUIT_VERSION};
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;

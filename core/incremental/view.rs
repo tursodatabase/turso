@@ -1,18 +1,11 @@
-use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::Delta;
-use super::operator::ComputationTracker;
-use crate::numeric::Numeric;
 use crate::schema::{BTreeTable, Schema};
-use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
-use crate::sync::Mutex;
-use crate::translate::logical::LogicalPlanBuilder;
-use crate::types::{IOResult, Value};
+use crate::types::Value;
 use crate::util::{extract_view_columns, ViewColumnSchema};
-use crate::{return_if_io, LimboError, Pager, Result, Statement};
+use crate::{LimboError, Result};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cell::RefCell;
-use std::fmt;
 use std::rc::Rc;
 use turso_parser::ast;
 use turso_parser::{
@@ -20,62 +13,51 @@ use turso_parser::{
     parser::Parser,
 };
 
-/// State machine for populating a view from its source table
-pub enum PopulateState {
-    /// Initial state - need to prepare the query
-    Start,
-    /// All tables that need to be populated
-    ProcessingAllTables {
-        queries: Vec<String>,
-        current_idx: usize,
-    },
-    /// Actively processing rows from the query
-    ProcessingOneTable {
-        queries: Vec<String>,
-        current_idx: usize,
-        stmt: Box<Statement>,
-        rows_processed: usize,
-        /// If we're in the middle of processing a row (merge_delta returned I/O)
-        pending_row: Option<(i64, Vec<Value>)>, // (rowid, values)
-    },
-    /// Population complete
-    Done,
-}
+/// Version of the materialized-view state storage format, embedded in the
+/// internal state table name (`__turso_internal_dbsp_state_v<N>_<view>`).
+/// Views created under a different version are unusable and must be
+/// recreated.
+pub const DBSP_CIRCUIT_VERSION: u32 = 1;
 
-// SAFETY: This needs to be audited for thread safety.
-// See: https://github.com/tursodatabase/turso/issues/1552
-unsafe impl Send for PopulateState {}
-unsafe impl Sync for PopulateState {}
-crate::assert::assert_send_sync!(PopulateState);
-
-/// State machine for merge_delta to handle I/O operations
-impl fmt::Debug for PopulateState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PopulateState::Start => write!(f, "Start"),
-            PopulateState::ProcessingAllTables {
-                current_idx,
-                queries,
-            } => f
-                .debug_struct("ProcessingAllTables")
-                .field("current_idx", current_idx)
-                .field("num_queries", &queries.len())
-                .finish(),
-            PopulateState::ProcessingOneTable {
-                current_idx,
-                rows_processed,
-                pending_row,
-                queries,
-                ..
-            } => f
-                .debug_struct("ProcessingOneTable")
-                .field("current_idx", current_idx)
-                .field("rows_processed", rows_processed)
-                .field("has_pending", &pending_row.is_some())
-                .field("total_queries", &queries.len())
-                .finish(),
-            PopulateState::Done => write!(f, "Done"),
-        }
+/// The automatic primary-key index of a view's internal state table.
+pub fn create_dbsp_state_index(root_page: i64) -> crate::schema::Index {
+    use crate::schema::{Index, IndexColumn};
+    Index {
+        name: "dbsp_state_pk".to_string(),
+        table_name: "dbsp_state".to_string(),
+        root_page,
+        columns: crate::alloc::vec![
+            IndexColumn {
+                name: "operator_id".to_string(),
+                order: turso_parser::ast::SortOrder::Asc,
+                collation: None,
+                pos_in_table: 0,
+                default: None,
+                expr: None,
+            },
+            IndexColumn {
+                name: "zset_id".to_string(),
+                order: turso_parser::ast::SortOrder::Asc,
+                collation: None,
+                pos_in_table: 1,
+                default: None,
+                expr: None,
+            },
+            IndexColumn {
+                name: "element_id".to_string(),
+                order: turso_parser::ast::SortOrder::Asc,
+                collation: None,
+                pos_in_table: 2,
+                default: None,
+                expr: None,
+            },
+        ],
+        unique: true,
+        ephemeral: false,
+        has_rowid: true,
+        where_clause: None,
+        index_method: None,
+        on_conflict: None,
     }
 }
 
@@ -233,44 +215,35 @@ impl AllViewsTxState {
     }
 }
 
-/// Incremental view that maintains its state through a DBSP circuit
+/// A materialized view: its defining SELECT, output schema, and storage root.
 ///
-/// This version keeps everything in-memory. This is acceptable for small views, since DBSP
-/// doesn't have to track the history of changes. Still for very large views (think of the result
-/// of create view v as select * from tbl where x > 1; and that having 1B values.
-///
-/// We should have a version of this that materializes the results. Materializing will also be good
-/// for large aggregations, because then we don't have to re-compute when opening the database
-/// again.
-///
-/// Uses DBSP circuits for incremental computation.
+/// Maintenance is performed by compiled VDBE programs (see
+/// `incremental::vdbe_maintenance`): the transaction's captured deltas are
+/// merged into the view's btree at commit, initial population runs the same
+/// program over the base table, and uncommitted same-transaction reads run it
+/// in emit mode to overlay the btree contents.
 #[derive(Debug)]
 pub struct IncrementalView {
     name: String,
     // The SELECT statement that defines how to transform input data
     pub select_stmt: ast::Select,
 
-    // DBSP circuit that encapsulates the computation
-    circuit: DbspCircuit,
-
     // All tables referenced by this view (from FROM clause and JOINs)
     referenced_tables: Vec<Arc<BTreeTable>>,
-    // Mapping from table aliases to actual table names (e.g., "c" -> "customers")
+    // Mapping from table aliases to actual table names (e.g., "c" -> "customers").
+    // Feeds populate-query generation, currently exercised only by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     table_aliases: HashMap<String, String>,
     // Mapping from table name to fully qualified name (e.g., "customers" -> "main.customers")
     // This preserves database qualification from the original query
+    #[cfg_attr(not(test), allow(dead_code))]
     qualified_table_names: HashMap<String, String>,
     // WHERE conditions for each table (accumulated from all occurrences)
     // Multiple conditions from UNION branches or duplicate references are stored as a vector
+    #[cfg_attr(not(test), allow(dead_code))]
     table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
     // The view's column schema with table relationships
     pub column_schema: ViewColumnSchema,
-    // State machine for population
-    populate_state: PopulateState,
-    // Computation tracker for statistics
-    // We will use this one day to export rows_read, but for now, will just test that we're doing the expected amount of compute
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub tracker: Arc<Mutex<ComputationTracker>>,
     // Root page of the btree storing the materialized state (0 for unmaterialized)
     root_page: i64,
 }
@@ -282,31 +255,6 @@ unsafe impl Sync for IncrementalView {}
 crate::assert::assert_send_sync!(IncrementalView);
 
 impl IncrementalView {
-    /// Try to compile the SELECT statement into a DBSP circuit
-    fn try_compile_circuit(
-        select: &ast::Select,
-        schema: &Schema,
-        main_data_root: i64,
-        internal_state_root: i64,
-        internal_state_index_root: i64,
-    ) -> Result<DbspCircuit> {
-        // Build the logical plan from the SELECT statement
-        let mut builder = LogicalPlanBuilder::new(schema);
-        // Convert Select to a Stmt for the builder
-        let stmt = ast::Stmt::Select(select.clone());
-        let logical_plan = builder.build_statement(&stmt)?;
-
-        // Compile the logical plan to a DBSP circuit with the storage roots
-        let compiler = DbspCompiler::new(
-            main_data_root,
-            internal_state_root,
-            internal_state_index_root,
-        );
-        let circuit = compiler.compile(&logical_plan)?;
-
-        Ok(circuit)
-    }
-
     /// Get an iterator over column names, using enumerated naming for unnamed columns
     pub fn column_names(&self) -> impl Iterator<Item = String> + '_ {
         self.column_schema
@@ -342,16 +290,12 @@ impl IncrementalView {
         crate::util::validate_select_for_unsupported_features(select)?;
         // Views are maintained by compiled VDBE programs; shapes the codegen
         // cannot maintain yet are rejected at CREATE rather than silently
-        // mis-maintained. The supported set grows as operator codegen lands.
+        // mis-maintained (and the rejection must happen HERE, at translate
+        // time: failing later inside the CREATE program aborts the statement
+        // after btree pages were allocated and leaves stale in-memory schema
+        // entries behind, which corrupts the database once those pages are
+        // reused). The supported set grows as operator codegen lands.
         crate::incremental::vdbe_maintenance::validate_vdbe_maintainable(select)?;
-        // Dry-run the DBSP circuit compilation (still needed for uncommitted
-        // same-transaction reads) with dummy roots. A definition the circuit
-        // compiler cannot handle must fail HERE, at translate time: failing
-        // later inside the CREATE program's ParseSchema step aborts the
-        // statement after btree pages were allocated and leaves stale
-        // in-memory schema entries behind, which corrupts the database once
-        // those pages are reused.
-        Self::try_compile_circuit(select, schema, 0, 0, 0)?;
         // Use the shared function to extract columns with full table context
         extract_view_columns(select, schema)
     }
@@ -436,54 +380,25 @@ impl IncrementalView {
         qualified_table_names: HashMap<String, String>,
         table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
         column_schema: ViewColumnSchema,
-        schema: &Schema,
+        _schema: &Schema,
         main_data_root: i64,
-        internal_state_root: i64,
-        internal_state_index_root: i64,
+        _internal_state_root: i64,
+        _internal_state_index_root: i64,
     ) -> Result<Self> {
-        // Create the tracker that will be shared by all operators
-        let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
-
-        // Compile the SELECT statement into a DBSP circuit
-        let circuit = Self::try_compile_circuit(
-            &select_stmt,
-            schema,
-            main_data_root,
-            internal_state_root,
-            internal_state_index_root,
-        )?;
-
         Ok(Self {
             name,
             select_stmt,
-            circuit,
             referenced_tables,
             table_aliases,
             qualified_table_names,
             table_conditions,
             column_schema,
-            populate_state: PopulateState::Start,
-            tracker,
             root_page: main_data_root,
         })
     }
 
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    /// Execute the circuit with uncommitted changes to get processed delta
-    pub fn execute_with_uncommitted(
-        &mut self,
-        uncommitted: DeltaSet,
-        pager: Arc<Pager>,
-        execute_state: &mut crate::incremental::compiler::ExecuteState,
-    ) -> crate::Result<crate::types::IOResult<Delta>> {
-        // Initialize execute_state with the input data
-        *execute_state = crate::incremental::compiler::ExecuteState::Init {
-            input_data: uncommitted,
-        };
-        self.circuit.execute(pager, execute_state)
     }
 
     /// Get the root page for this materialized view's btree
@@ -732,9 +647,9 @@ impl IncrementalView {
         Ok(())
     }
 
-    /// Generate SQL queries for populating the view from each source table
-    /// Returns a vector of SQL statements, one for each referenced table
-    /// Each query includes the WHERE conditions accumulated from all occurrences
+    /// Generate SQL queries for populating the view from each source table.
+    /// Retained for tests of populate-query generation.
+    #[cfg(test)]
     fn sql_for_populate(&self) -> crate::Result<Vec<String>> {
         Self::generate_populate_queries(
             &self.select_stmt,
@@ -1198,284 +1113,6 @@ impl IncrementalView {
                 // Literals, etc. don't reference tables
             }
         }
-    }
-    /// Populate the view by scanning the source table using a state machine
-    /// This can be called multiple times and will resume from where it left off
-    /// This method is only for materialized views and will persist data to the btree
-    pub fn populate_from_table(
-        &mut self,
-        conn: &crate::sync::Arc<crate::Connection>,
-        pager: &crate::sync::Arc<crate::Pager>,
-        _btree_cursor: &mut dyn CursorTrait,
-    ) -> crate::Result<IOResult<()>> {
-        // Assert that this is a materialized view with a root page
-        assert!(
-            self.root_page != 0,
-            "populate_from_table should only be called for materialized views with root_page"
-        );
-
-        // Mark as nested for the duration of this call to prevent inner queries from
-        // committing the outer transaction's dirty pages. We increment on every entry
-        // and decrement on every exit (including IO yields and errors) so re-entrant
-        // calls keep the counter balanced.
-        conn.start_nested();
-        let result = self.populate_from_table_inner(conn, pager, _btree_cursor);
-        conn.end_nested();
-        result
-    }
-
-    fn populate_from_table_inner(
-        &mut self,
-        conn: &crate::sync::Arc<crate::Connection>,
-        pager: &crate::sync::Arc<crate::Pager>,
-        _btree_cursor: &mut dyn CursorTrait,
-    ) -> crate::Result<IOResult<()>> {
-        'outer: loop {
-            match std::mem::replace(&mut self.populate_state, PopulateState::Done) {
-                PopulateState::Start => {
-                    // Generate the SQL query for populating the view
-                    // It is best to use a standard query than a cursor for two reasons:
-                    // 1) Using a sql query will allow us to be much more efficient in cases where we only want
-                    //    some rows, in particular for indexed filters
-                    // 2) There are two types of cursors: index and table. In some situations (like for example
-                    //    if the table has an integer primary key), the key will be exclusively in the index
-                    //    btree and not in the table btree. Using cursors would force us to be aware of this
-                    //    distinction (and others), and ultimately lead to reimplementing the whole query
-                    //    machinery (next step is which index is best to use, etc)
-                    let queries = self.sql_for_populate()?;
-
-                    self.populate_state = PopulateState::ProcessingAllTables {
-                        queries,
-                        current_idx: 0,
-                    };
-                }
-
-                PopulateState::ProcessingAllTables {
-                    queries,
-                    current_idx,
-                } => {
-                    if current_idx >= queries.len() {
-                        self.populate_state = PopulateState::Done;
-                        return Ok(IOResult::Done(()));
-                    }
-
-                    let query = queries[current_idx].clone();
-                    // Use the parent connection directly for reading.
-                    // We need to use the same connection that has the uncommitted schema changes.
-                    // Creating a new connection would cause schema version mismatch issues because
-                    // the new connection's schema cookie check would fail (database file has old version).
-
-                    // Prepare the statement using the parent connection
-                    let stmt = conn.prepare(&query)?;
-
-                    self.populate_state = PopulateState::ProcessingOneTable {
-                        queries,
-                        current_idx,
-                        stmt: Box::new(stmt),
-                        rows_processed: 0,
-                        pending_row: None,
-                    };
-                }
-
-                PopulateState::ProcessingOneTable {
-                    queries,
-                    current_idx,
-                    mut stmt,
-                    mut rows_processed,
-                    pending_row,
-                } => {
-                    // If we have a pending row from a previous I/O interruption, process it first
-                    if let Some((rowid, values)) = pending_row {
-                        match self.process_one_row(
-                            rowid,
-                            values.clone(),
-                            current_idx,
-                            pager.clone(),
-                        )? {
-                            IOResult::Done(_) => {
-                                // Row processed successfully, continue to next row
-                                rows_processed += 1;
-                            }
-                            IOResult::IO(io) => {
-                                // Still not done, restore state with pending row and return
-                                self.populate_state = PopulateState::ProcessingOneTable {
-                                    queries,
-                                    current_idx,
-                                    stmt,
-                                    rows_processed,
-                                    pending_row: Some((rowid, values)),
-                                };
-                                return Ok(IOResult::IO(io));
-                            }
-                        }
-                    }
-
-                    // Process rows one at a time - no batching
-                    loop {
-                        // This step() call resumes from where the statement left off
-                        match stmt.step()? {
-                            crate::vdbe::StepResult::Row => {
-                                // Get the row
-                                let row = stmt.row().ok_or_else(|| {
-                                    LimboError::InternalError(
-                                        "row should exist after StepResult::Row".to_string(),
-                                    )
-                                })?;
-
-                                // Extract values from the row
-                                let all_values: Vec<crate::types::Value> =
-                                    row.get_values().cloned().collect();
-
-                                // Extract rowid and values using helper
-                                let (rowid, values) =
-                                    match self.extract_rowid_and_values(all_values, current_idx) {
-                                        Some(result) => result,
-                                        None => {
-                                            // Invalid rowid, skip this row
-                                            rows_processed += 1;
-                                            continue;
-                                        }
-                                    };
-
-                                // Process this row
-                                match self.process_one_row(
-                                    rowid,
-                                    values.clone(),
-                                    current_idx,
-                                    pager.clone(),
-                                )? {
-                                    IOResult::Done(_) => {
-                                        // Row processed successfully, continue to next row
-                                        rows_processed += 1;
-                                    }
-                                    IOResult::IO(io) => {
-                                        // Save state and return I/O
-                                        // We'll resume at the SAME row when called again (don't increment rows_processed)
-                                        // The circuit still has unfinished work for this row
-                                        self.populate_state = PopulateState::ProcessingOneTable {
-                                            queries,
-                                            current_idx,
-                                            stmt,
-                                            rows_processed, // Don't increment - row not done yet!
-                                            pending_row: Some((rowid, values)), // Save the row for resumption
-                                        };
-                                        return Ok(IOResult::IO(io));
-                                    }
-                                }
-                            }
-
-                            crate::vdbe::StepResult::Done => {
-                                // All rows processed from this table
-                                // Move to next table
-                                self.populate_state = PopulateState::ProcessingAllTables {
-                                    queries,
-                                    current_idx: current_idx + 1,
-                                };
-                                continue 'outer;
-                            }
-
-                            crate::vdbe::StepResult::Interrupt | crate::vdbe::StepResult::Busy => {
-                                // Save state before returning error
-                                self.populate_state = PopulateState::ProcessingOneTable {
-                                    queries,
-                                    current_idx,
-                                    stmt,
-                                    rows_processed,
-                                    pending_row: None, // No pending row when interrupted between rows
-                                };
-                                return Err(LimboError::Busy);
-                            }
-
-                            crate::vdbe::StepResult::IO | crate::vdbe::StepResult::Yield => {
-                                // Statement needs I/O - save state and return
-                                self.populate_state = PopulateState::ProcessingOneTable {
-                                    queries,
-                                    current_idx,
-                                    stmt,
-                                    rows_processed,
-                                    pending_row: None, // No pending row when interrupted between rows
-                                };
-                                // TODO: Get the actual I/O completion from the statement
-                                let completion = crate::io::Completion::new_yield();
-                                return Ok(IOResult::IO(crate::types::IOCompletions::Single(
-                                    completion,
-                                )));
-                            }
-                        }
-                    }
-                }
-
-                PopulateState::Done => {
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
-    }
-
-    /// Process a single row through the circuit
-    fn process_one_row(
-        &mut self,
-        rowid: i64,
-        values: Vec<Value>,
-        table_idx: usize,
-        pager: Arc<crate::Pager>,
-    ) -> crate::Result<IOResult<()>> {
-        // Create a single-row delta
-        let mut single_row_delta = Delta::new();
-        single_row_delta.insert(rowid, values);
-
-        // Create a DeltaSet with this delta for the current table
-        let mut delta_set = DeltaSet::new();
-        let table_name = self.referenced_tables[table_idx].name.clone();
-        delta_set.insert(table_name, single_row_delta);
-
-        // Process through merge_delta
-        self.merge_delta(delta_set, pager)
-    }
-
-    /// Extract rowid and values from a row
-    fn extract_rowid_and_values(
-        &self,
-        all_values: Vec<Value>,
-        table_idx: usize,
-    ) -> Option<(i64, Vec<Value>)> {
-        if let Some((idx, _)) = self.referenced_tables[table_idx].get_rowid_alias_column() {
-            // The rowid is the value at the rowid alias column index
-            let rowid = match all_values.get(idx) {
-                Some(Value::Numeric(Numeric::Integer(id))) => *id,
-                _ => return None, // Invalid rowid
-            };
-            // All values are table columns (no separate rowid was selected)
-            Some((rowid, all_values))
-        } else {
-            // The last value is the explicitly selected rowid
-            let rowid = match all_values.last() {
-                Some(Value::Numeric(Numeric::Integer(id))) => *id,
-                _ => return None, // Invalid rowid
-            };
-            // Get all values except the rowid
-            let values = all_values[..all_values.len() - 1].to_vec();
-            Some((rowid, values))
-        }
-    }
-
-    /// Merge a delta set of changes into the view's current state
-    pub fn merge_delta(
-        &mut self,
-        delta_set: DeltaSet,
-        pager: Arc<crate::Pager>,
-    ) -> crate::Result<IOResult<()>> {
-        // Early return if all deltas are empty
-        if delta_set.is_empty() {
-            return Ok(IOResult::Done(()));
-        }
-
-        // Use the circuit to process the deltas and write to btree
-        let input_data = delta_set.into_map();
-
-        // The circuit now handles all btree I/O internally with the provided pager
-        let _delta = return_if_io!(self.circuit.commit(input_data, pager));
-        Ok(IOResult::Done(()))
     }
 }
 
