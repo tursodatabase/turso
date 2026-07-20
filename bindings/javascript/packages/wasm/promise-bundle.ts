@@ -1,4 +1,4 @@
-import { DatabasePromise, DatabaseOpts, SqliteError, } from "@tursodatabase/database-common"
+import { DatabasePromise, DatabaseOpts, SqliteError, Transaction } from "@tursodatabase/database-common"
 import { registerFileAtWorker, unregisterFileAtWorker, ioNotifier } from "@tursodatabase/database-wasm-common";
 import { initThreadPool, MainWorker, Database as NativeDatabase } from "./index-bundle.js";
 
@@ -59,4 +59,4 @@ async function connect(path: string, opts: DatabaseOpts = {}): Promise<Database>
     return db;
 }
 
-export { connect, Database, SqliteError }
+export { connect, Database, SqliteError, Transaction }
