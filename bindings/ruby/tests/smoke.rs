@@ -11,6 +11,8 @@ fn test_smoke_create_and_query() {
         vfs: IoBackend::Default,
         io: None,
         db_file: None,
+        readonly: false,
+        file_must_exist: false,
     });
     let result = db.open().unwrap();
     assert!(!result.is_io());
@@ -54,6 +56,8 @@ fn test_smoke_bind_positional() {
         vfs: IoBackend::Default,
         io: None,
         db_file: None,
+        readonly: false,
+        file_must_exist: false,
     });
     let result = db.open().unwrap();
     assert!(!result.is_io());

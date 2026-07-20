@@ -1,4 +1,4 @@
-use magnus::{data_type_builder, DataType, DataTypeFunctions, Error, Ruby, TypedData, Value};
+use magnus::{data_type_builder, DataType, DataTypeFunctions, Error, RArray, Ruby, TypedData, Value};
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::TursoConnection;
 
@@ -39,6 +39,39 @@ impl Connection {
         Ok(ruby.obj_wrap(Statement::new(stmt)))
     }
 
+    pub fn execute_batch(&self, sql: String) -> Result<RArray, Error> {
+        let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+        let mut results = RArray::new();
+        let mut offset: usize = 0;
+        loop {
+            match self
+                .inner
+                .prepare_first(&sql[offset..])
+                .map_err(|e| from_turso_error(e, classes))?
+            {
+                Some((mut stmt, consumed)) => {
+                    let info = stmt
+                        .execute(None)
+                        .map_err(|e| from_turso_error(e, classes))?;
+                    let ruby = unsafe { Ruby::get_unchecked() };
+                    let hash = ruby.hash_new();
+                    hash.aset(
+                        ruby.intern("changes"),
+                        ruby.integer_from_i64(info.rows_changed as i64),
+                    )?;
+                    hash.aset(
+                        ruby.intern("last_insert_rowid"),
+                        ruby.integer_from_i64(self.inner.last_insert_rowid()),
+                    )?;
+                    results.push(hash)?;
+                    offset += consumed;
+                }
+                None => break,
+            }
+        }
+        Ok(results)
+    }
+
     pub fn get_auto_commit(&self) -> bool {
         self.inner.get_auto_commit()
     }
@@ -63,6 +96,10 @@ impl Connection {
 
     pub fn total_changes(&self) -> i64 {
         self.inner.total_changes()
+    }
+
+    pub fn changes(&self) -> i64 {
+        self.inner.changes()
     }
 
     pub fn close(&self) -> Result<(), Error> {

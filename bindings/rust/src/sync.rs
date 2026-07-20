@@ -355,6 +355,8 @@ impl Builder {
             vfs: IoBackend::Default,
             io: None,
             db_file: None,
+            readonly: false,
+            file_must_exist: false,
         };
 
         let url = if let Some(remote_url) = &self.remote_url {

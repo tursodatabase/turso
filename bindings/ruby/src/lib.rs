@@ -46,7 +46,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let classes = ErrorClasses::define(ruby, &module)?;
     let _ = ERROR_CLASSES.set(classes);
 
-    let database_class = module.define_class("Database", ruby.class_object())?;
+    let database_class = module.define_class("NativeDatabase", ruby.class_object())?;
     let _ = RAW_DATABASE_CLASS.set(val_to_usize(database_class.as_value()));
     database_class.define_singleton_method("new", function!(Database::new, 2))?;
     database_class.define_method("close", method!(Database::close, 0))?;
@@ -61,6 +61,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let connection_class = module.define_class("Connection", ruby.class_object())?;
     let _ = RAW_CONNECTION_CLASS.set(val_to_usize(connection_class.as_value()));
     connection_class.define_method("prepare", method!(Connection::prepare_single, 1))?;
+    connection_class.define_method("execute_batch", method!(Connection::execute_batch, 1))?;
     connection_class.define_method("auto_commit?", method!(Connection::get_auto_commit, 0))?;
     connection_class.define_method(
         "last_insert_rowid",
@@ -70,6 +71,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     connection_class.define_method("query_timeout=", method!(Connection::set_query_timeout, 1))?;
     connection_class.define_method("interrupt", method!(Connection::interrupt, 0))?;
     connection_class.define_method("total_changes", method!(Connection::total_changes, 0))?;
+    connection_class.define_method("changes", method!(Connection::changes, 0))?;
     connection_class.define_method("close", method!(Connection::close, 0))?;
     connection_class.undef_default_alloc_func();
 
