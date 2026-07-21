@@ -254,10 +254,13 @@ use crate::File;
 
 mod serializer;
 use serializer::EncryptedPayload;
-pub(crate) use serializer::LogSerializer;
 #[cfg(feature = "conn_raw_api")]
 use serializer::{
     extension_record_len, ExtensionRecord, PortableChangePayload, PortableEndOffsetCtx,
+};
+pub(crate) use serializer::{
+    log_write, LogBufferWrite, LogChunkStream, LogSerializer, ProtoKey, ProtoSint64, ProtoVarint,
+    PROTO_WIRE_LENGTH_DELIMITED, PROTO_WIRE_VARINT,
 };
 
 /// Logical log size in bytes at which a committing transaction will trigger a checkpoint.
@@ -7115,7 +7118,7 @@ mod tests {
             None,
         );
         portable_tx.portable_changes_enabled = true;
-        portable_tx.portable_changes = vec![0x1a, 0x00];
+        portable_tx.portable_changes = crate::alloc::vec![0x1a, 0x00];
 
         let c = log
             .upgrade_header_for_log_tx(&portable_tx)
@@ -7169,7 +7172,7 @@ mod tests {
         let c = log.log_tx(empty_sync_tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
-        let encoded_empty_logical_op = vec![0x1a, 0x00];
+        let encoded_empty_logical_op = crate::alloc::vec![0x1a, 0x00];
         let mut sync_tx = crate::mvcc::database::LogRecord::for_test(
             20,
             &[make_test_row_version((-2).into(), 2, "visible", 20)],
@@ -7219,7 +7222,7 @@ mod tests {
             .unwrap();
         let mut log = LogicalLog::new(file.clone(), io.clone(), None);
 
-        let portable_metadata = vec![0x1a, 0x00];
+        let portable_metadata = crate::alloc::vec![0x1a, 0x00];
         let mut tx = crate::mvcc::database::LogRecord::for_test(
             20,
             &[make_test_row_version((-2).into(), 2, "visible", 20)],

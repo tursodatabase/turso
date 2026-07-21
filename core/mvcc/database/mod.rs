@@ -504,7 +504,7 @@ pub struct LogRecord {
     /// Recovery ignores this field. Raw-log consumers use it to resolve the
     /// recovery ops' MVCC table ids and read transaction-level metadata.
     #[cfg(feature = "conn_raw_api")]
-    pub portable_changes: Vec<u8>,
+    pub portable_changes: crate::alloc::Vec<u8>,
     /// True when the committing connection requested portable logical-change
     /// frames, even if this transaction has no client-visible metadata.
     #[cfg(feature = "conn_raw_api")]
@@ -529,7 +529,7 @@ impl LogRecord {
             op_count: 0,
             has_header: false,
             #[cfg(feature = "conn_raw_api")]
-            portable_changes: Vec::new(),
+            portable_changes: crate::alloc::vec![],
             #[cfg(feature = "conn_raw_api")]
             portable_changes_enabled: false,
             #[cfg(feature = "conn_raw_api")]
@@ -2426,8 +2426,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 .into_iter()
                 .collect();
             metadata.sort_by(|a, b| a.0.cmp(&b.0));
-            for (key, value) in metadata {
-                builder.add_metadata(&key, &value);
+            for (key, value) in &metadata {
+                builder.add_metadata(key, value)?;
             }
 
             // The recovery payload is the single durable operation stream.
@@ -2594,7 +2594,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 let added = builder.add_object_map(PortableObjectMapEntry {
                     mv_table_id: i64::from(*table_id),
                     name: &table_ref.name,
-                });
+                })?;
                 turso_assert!(
                     added,
                     "portable object map unexpectedly rejected a user object"
@@ -2612,7 +2612,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 }
             }
 
-            log_record.portable_changes = builder.finish();
+            log_record.portable_changes = builder.finish()?;
             log_record.portable_changes_required = has_portable_schema_changes;
             Ok(())
         }

@@ -15116,12 +15116,14 @@ fn decoded_object_maps(txns: &[DecodedPortableTxn]) -> Vec<&DecodedObjectMap> {
 #[test]
 fn test_mvcc_portable_changes_encoder_matches_metadata_wire_golden() {
     let mut builder = PortableLogicalBuilder::new();
-    builder.add_metadata("client", "client-a");
-    builder.add_object_map(PortableObjectMapEntry {
-        mv_table_id: -5,
-        name: "items",
-    });
-    let encoded = builder.finish();
+    builder.add_metadata("client", "client-a").unwrap();
+    builder
+        .add_object_map(PortableObjectMapEntry {
+            mv_table_id: -5,
+            name: "items",
+        })
+        .unwrap();
+    let encoded = builder.finish().unwrap();
 
     assert_eq!(
         encoded,
