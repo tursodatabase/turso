@@ -126,7 +126,7 @@ pub struct PageInner {
     /// The actual page data buffer. None if not loaded.
     pub buffer: Option<Arc<Buffer>>,
     /// Overflow cells during btree operations
-    pub overflow_cells: Vec<OverflowCell>,
+    pub overflow_cells: crate::alloc::Vec<OverflowCell>,
 }
 
 // Methods moved from PageContent - these provide btree page access
@@ -139,7 +139,7 @@ impl PageInner {
             pin_count: AtomicUsize::new(0),
             wal_tag: AtomicU64::new(TAG_UNSET),
             buffer: Some(buffer),
-            overflow_cells: Vec::new(),
+            overflow_cells: crate::alloc::vec![],
         }
     }
 
@@ -151,7 +151,7 @@ impl PageInner {
             pin_count: AtomicUsize::new(0),
             wal_tag: AtomicU64::new(TAG_UNSET),
             buffer: Some(Arc::new(buffer)),
-            overflow_cells: Vec::new(),
+            overflow_cells: crate::alloc::vec![],
         }
     }
     /// Get the page buffer as a mutable slice. Panics if buffer not loaded.
@@ -750,7 +750,7 @@ impl Page {
                 pin_count: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
                 buffer: None,
-                overflow_cells: Vec::new(),
+                overflow_cells: crate::alloc::vec![],
             }),
         }
     }

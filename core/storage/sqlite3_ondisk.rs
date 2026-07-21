@@ -539,7 +539,7 @@ impl TryFrom<u8> for PageType {
 #[derive(Debug, Clone)]
 pub struct OverflowCell {
     pub index: usize,
-    pub payload: Pin<Vec<u8>>,
+    pub payload: Pin<crate::alloc::Vec<u8>>,
 }
 
 /// Send read request for DB page read to the IO
