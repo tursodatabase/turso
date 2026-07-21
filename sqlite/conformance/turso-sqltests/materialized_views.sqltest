@@ -1693,7 +1693,6 @@ expect {
     2|1
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-basic {
     CREATE TABLE items(id INTEGER, category TEXT, value INTEGER);
     INSERT INTO items VALUES
@@ -1713,7 +1712,6 @@ expect {
     C|300
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-single-column {
     CREATE TABLE numbers(n INTEGER);
     INSERT INTO numbers VALUES (1), (2), (1), (3), (2), (1), (4), (3);
@@ -1728,7 +1726,6 @@ expect {
     4
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-incremental-insert {
     CREATE TABLE data(x INTEGER, y TEXT);
     CREATE MATERIALIZED VIEW distinct_data AS
@@ -1742,7 +1739,6 @@ expect {
     2|beta
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-incremental-insert-new {
     CREATE TABLE data(x INTEGER, y TEXT);
     CREATE MATERIALIZED VIEW distinct_data AS
@@ -1760,7 +1756,6 @@ expect {
     4|delta
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-incremental-insert-dups {
     CREATE TABLE data(x INTEGER, y TEXT);
     CREATE MATERIALIZED VIEW distinct_data AS
@@ -1781,7 +1776,6 @@ expect {
     4|delta
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-incremental-delete {
     CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
     INSERT INTO records VALUES
@@ -1800,7 +1794,6 @@ expect {
     Z|3
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-incremental-delete-partial {
     CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
     INSERT INTO records VALUES
@@ -1822,7 +1815,6 @@ expect {
     Z|3
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-incremental-delete-all {
     CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
     INSERT INTO records VALUES
@@ -1842,7 +1834,6 @@ expect {
     Z|3
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-incremental-reappear {
     CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
     INSERT INTO records VALUES
@@ -1862,7 +1853,6 @@ expect {
     Z|3
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-null-handling {
     CREATE TABLE nullable(a INTEGER, b TEXT);
     INSERT INTO nullable VALUES
@@ -1885,7 +1875,6 @@ expect {
     2|
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-empty-table {
     CREATE TABLE empty_source(x INTEGER, y TEXT);
     CREATE MATERIALIZED VIEW distinct_empty AS
@@ -1897,7 +1886,6 @@ expect {
     0
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-empty-then-insert {
     CREATE TABLE empty_source(x INTEGER, y TEXT);
     CREATE MATERIALIZED VIEW distinct_empty AS
@@ -1911,7 +1899,6 @@ expect {
     2|second
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-multi-column-types {
     CREATE TABLE mixed_types(i INTEGER, t TEXT, r REAL, b BLOB);
     INSERT INTO mixed_types VALUES
@@ -1930,7 +1917,6 @@ expect {
     3|text3
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-update-simulation {
     CREATE TABLE updatable(id INTEGER PRIMARY KEY, val TEXT);
     INSERT INTO updatable VALUES (1, 'old'), (2, 'old'), (3, 'new');
@@ -1943,7 +1929,6 @@ expect {
     old
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-update-simulation-change {
     CREATE TABLE updatable(id INTEGER PRIMARY KEY, val TEXT);
     INSERT INTO updatable VALUES (1, 'old'), (2, 'old'), (3, 'new');
@@ -1960,7 +1945,6 @@ expect {
     old
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-update-simulation-all-same {
     CREATE TABLE updatable(id INTEGER PRIMARY KEY, val TEXT);
     INSERT INTO updatable VALUES (1, 'new'), (2, 'old'), (3, 'new');
@@ -1976,7 +1960,6 @@ expect {
     new
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-large-duplicates {
     CREATE TABLE many_dups(x INTEGER);
     -- Insert many duplicates
@@ -1993,7 +1976,6 @@ expect {
     3
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-large-duplicates-remove {
     CREATE TABLE many_dups(x INTEGER);
     -- Insert many duplicates
@@ -2013,7 +1995,6 @@ expect {
     3
 }
 
-@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-large-duplicates-remove-all {
     CREATE TABLE many_dups(x INTEGER);
     -- Insert many duplicates but only one instance of 2

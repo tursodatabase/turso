@@ -301,7 +301,9 @@ impl IncrementalView {
         // entries behind, which corrupts the database once those pages are
         // reused). The supported set grows as operator codegen lands.
         let shape = crate::incremental::vdbe_maintenance::classify_view(select, schema, resolver)?;
-        crate::incremental::vdbe_maintenance::validate_multiset_args(select, &shape, schema)?;
+        crate::incremental::vdbe_maintenance::validate_collation_constraints(
+            select, &shape, schema,
+        )?;
         // Use the shared function to extract columns with full table context
         extract_view_columns(select, schema)
     }
