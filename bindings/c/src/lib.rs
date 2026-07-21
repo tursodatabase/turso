@@ -425,6 +425,11 @@ pub const SQLITE_OPEN_SHAREDCACHE: ffi::c_int = 0x00020000;
 pub const SQLITE_OPEN_PRIVATECACHE: ffi::c_int = 0x00040000;
 pub const SQLITE_OPEN_NOFOLLOW: ffi::c_int = 0x01000000;
 
+/* Flags for sqlite3_deserialize() */
+pub const SQLITE_DESERIALIZE_FREEONCLOSE: ffi::c_uint = 1;
+pub const SQLITE_DESERIALIZE_RESIZEABLE: ffi::c_uint = 2;
+pub const SQLITE_DESERIALIZE_READONLY: ffi::c_uint = 4;
+
 /// Percent-decode a URI component (e.g., `%20` -> ` `, `%2F` -> `/`).
 /// Returns None if a percent sequence is malformed or the result is not valid UTF-8.
 fn percent_decode(input: &str) -> Option<String> {
@@ -1351,15 +1356,108 @@ pub unsafe extern "C" fn sqlite3_serialize(
     stub!();
 }
 
+/// Open the database `db` on the contents of the in-memory image `p_data`.
+///
+/// Copy-based (not zero-copy): the first `sz_db` bytes are copied into a fresh
+/// in-memory IO backend, a database is opened over it (mirroring
+/// `sqlite3_open(":memory:")`), and the connection on `db` is swapped to it.
+///
+/// Flags: `SQLITE_DESERIALIZE_FREEONCLOSE` is honored (the image is copied, so
+/// the caller's buffer is freed immediately via `sqlite3_free`, including on
+/// failure, per the SQLite contract). `SQLITE_DESERIALIZE_RESIZEABLE` and
+/// `SQLITE_DESERIALIZE_READONLY` are not yet supported and are rejected with
+/// `SQLITE_ERROR` rather than silently ignored. `sz_buf` (buffer capacity, only
+/// meaningful for RESIZEABLE) is unused. Only the `main` schema is supported.
+///
+/// A zero-copy variant would implement a borrowed-buffer `DatabaseStorage` via
+/// `OpenOptions::storage` instead of copying — tracked as a follow-up.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_deserialize(
-    _db: *mut sqlite3,
-    _schema: *const ffi::c_char,
-    _in_: *const ffi::c_void,
-    _in_bytes: ffi::c_int,
-    _flags: ffi::c_uint,
+    db: *mut sqlite3,
+    schema: *const ffi::c_char,
+    p_data: *mut ffi::c_uchar,
+    sz_db: i64,
+    _sz_buf: i64,
+    flags: ffi::c_uint,
 ) -> ffi::c_int {
-    stub!();
+    trace!("sqlite3_deserialize");
+    // Per the SQLite contract, FREEONCLOSE transfers buffer ownership to us and
+    // is honored even when deserialization fails. Since we copy, free eagerly.
+    let free_on_close = flags & SQLITE_DESERIALIZE_FREEONCLOSE != 0;
+    let maybe_free = |p: *mut ffi::c_uchar| {
+        if free_on_close && !p.is_null() {
+            unsafe { sqlite3_free(p as *mut ffi::c_void) };
+        }
+    };
+    if db.is_null() || p_data.is_null() || sz_db < 0 {
+        maybe_free(p_data);
+        return SQLITE_MISUSE;
+    }
+    // Reject flags we cannot honor rather than silently mis-serving the caller.
+    if flags & (SQLITE_DESERIALIZE_RESIZEABLE | SQLITE_DESERIALIZE_READONLY) != 0 {
+        maybe_free(p_data);
+        return SQLITE_ERROR;
+    }
+    // Only the main schema is supported; anything else would silently replace it.
+    if !schema.is_null() && CStr::from_ptr(schema).to_str() != Ok("main") {
+        maybe_free(p_data);
+        return SQLITE_ERROR;
+    }
+    let Ok(len) = usize::try_from(sz_db) else {
+        maybe_free(p_data);
+        return SQLITE_TOOBIG;
+    };
+    let db_ref: &sqlite3 = &*db;
+    let mut inner = db_ref.inner.lock().unwrap();
+    // SQLite refuses deserialize while statements are open OR a transaction is
+    // active on the connection (exec-driven BEGIN leaves no sqlite3_stmt, so the
+    // autocommit check is required in addition to the stmt list).
+    if !inner.stmt_list.is_null() || !inner.conn.get_auto_commit() {
+        maybe_free(p_data);
+        return SQLITE_BUSY;
+    }
+    // Copy the caller-provided image, then release the caller's buffer if owned.
+    let bytes = std::slice::from_raw_parts(p_data as *const u8, len).to_vec();
+    maybe_free(p_data);
+    // Fresh in-memory IO seeded with the image (MemoryIO caches files by path,
+    // so the seeded pages are visible to the subsequent Database open).
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let file = match io.open_file(":memory:", turso_core::OpenFlags::Create, false) {
+        Ok(f) => f,
+        Err(_) => return SQLITE_CANTOPEN,
+    };
+    let buf = Arc::new(turso_core::Buffer::new(bytes));
+    if file
+        .pwrite(0, buf, turso_core::Completion::new_write(|_| {}))
+        .is_err()
+    {
+        return SQLITE_IOERR;
+    }
+    match turso_core::Database::open_file_with_flags(
+        io.clone(),
+        ":memory:",
+        turso_core::OpenFlags::default(),
+        default_db_opts(),
+        None,
+        Arc::new(SqliteDialect),
+    ) {
+        Ok(new_db) => match new_db.connect() {
+            Ok(conn) => {
+                inner._io = io;
+                inner._db = new_db;
+                inner.conn = conn;
+                SQLITE_OK
+            }
+            Err(e) => {
+                trace!("sqlite3_deserialize: connect failed: {e:?}");
+                SQLITE_ERROR
+            }
+        },
+        Err(e) => {
+            trace!("sqlite3_deserialize: open failed: {e:?}");
+            SQLITE_CANTOPEN
+        }
+    }
 }
 
 #[no_mangle]
@@ -3233,6 +3331,86 @@ unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
 mod tests {
     use super::*;
     use std::ptr;
+
+    // sqlite3_deserialize round-trips a real database image: build a populated
+    // database through the C API, read its on-disk bytes, deserialize them into
+    // a fresh :memory: connection, and query. Self-contained; fails without the
+    // implementation (the prior stub aborts).
+    #[test]
+    fn sqlite3_deserialize_roundtrips_a_populated_database() {
+        unsafe {
+            // 1. Build a populated on-disk database via the C API.
+            let tmp = std::env::temp_dir()
+                .join(format!("turso_deserialize_test_{}.db", std::process::id()));
+            let wal = std::path::PathBuf::from(format!("{}-wal", tmp.display()));
+            let shm = std::path::PathBuf::from(format!("{}-shm", tmp.display()));
+            let clean = || {
+                let _ = std::fs::remove_file(&tmp);
+                let _ = std::fs::remove_file(&wal);
+                let _ = std::fs::remove_file(&shm);
+            };
+            clean();
+            let tmp_c = std::ffi::CString::new(tmp.to_str().unwrap()).unwrap();
+            let mut wdb = ptr::null_mut();
+            assert_eq!(sqlite3_open(tmp_c.as_ptr(), &mut wdb), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    wdb,
+                    c"CREATE TABLE t(id INTEGER, name TEXT)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            for i in 0..100 {
+                let sql =
+                    std::ffi::CString::new(format!("INSERT INTO t VALUES ({i}, 'n{i}')")).unwrap();
+                assert_eq!(
+                    sqlite3_exec(wdb, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                    SQLITE_OK
+                );
+            }
+            // Flush the WAL into the main file so the raw bytes are complete.
+            assert_eq!(sqlite3_wal_checkpoint(wdb, ptr::null()), SQLITE_OK);
+            sqlite3_close(wdb);
+
+            // 2. Read the on-disk image.
+            let bytes = std::fs::read(&tmp).unwrap();
+            assert!(!bytes.is_empty(), "on-disk image is empty");
+
+            // 3. Deserialize the image into a fresh in-memory connection.
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            let rc = sqlite3_deserialize(
+                db,
+                c"main".as_ptr(),
+                bytes.as_ptr() as *mut ffi::c_uchar,
+                bytes.len() as i64,
+                bytes.len() as i64,
+                0,
+            );
+            assert_eq!(rc, SQLITE_OK, "deserialize rc={rc}");
+
+            // 4. Query the deserialized database.
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT count(*) FROM t".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(stmt, 0), 100, "deserialized row count");
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+            clean();
+        }
+    }
 
     #[test]
     fn test_sqlite3_stmt_status_rows_read_written() {

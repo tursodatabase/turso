@@ -21,6 +21,7 @@ void test_sqlite3_column_decltype();
 void test_sqlite3_next_stmt();
 void test_sqlite3_table_column_metadata();
 void test_sqlite3_insert_returning();
+void test_sqlite3_deserialize();
 
 int allocated = 0;
 
@@ -41,6 +42,7 @@ int main(void)
     test_sqlite3_next_stmt();
     test_sqlite3_table_column_metadata();
     test_sqlite3_insert_returning();
+    test_sqlite3_deserialize();
     return 0;
 }
 
@@ -791,4 +793,63 @@ void test_sqlite3_insert_returning()
     sqlite3_close(db);
 
     printf("test_sqlite3_insert_retuning test passed\n");
+}
+void test_sqlite3_deserialize()
+{
+    // Build a populated on-disk database, read its bytes, and deserialize them
+    // into a fresh in-memory connection. Runs against both real SQLite and
+    // Turso, so it verifies behavioral parity.
+    const char *path = "test_deserialize_tmp.db";
+    char wal[512], shm[512];
+    snprintf(wal, sizeof(wal), "%s-wal", path);
+    snprintf(shm, sizeof(shm), "%s-shm", path);
+    remove(path);
+    remove(wal);
+    remove(shm);
+
+    sqlite3 *wdb;
+    assert(sqlite3_open(path, &wdb) == SQLITE_OK);
+    assert(sqlite3_exec(wdb, "CREATE TABLE t(id INTEGER, name TEXT)", 0, 0, 0) ==
+           SQLITE_OK);
+    for (int i = 0; i < 100; i++) {
+        char sql[64];
+        snprintf(sql, sizeof(sql), "INSERT INTO t VALUES (%d, 'n%d')", i, i);
+        assert(sqlite3_exec(wdb, sql, 0, 0, 0) == SQLITE_OK);
+    }
+    // Flush the WAL into the main file (Turso); a no-op on a rollback journal.
+    sqlite3_wal_checkpoint(wdb, NULL);
+    sqlite3_close(wdb);
+
+    // Read the on-disk image.
+    FILE *f = fopen(path, "rb");
+    assert(f != NULL);
+    assert(fseek(f, 0, SEEK_END) == 0);
+    long sz = ftell(f);
+    assert(sz > 0);
+    assert(fseek(f, 0, SEEK_SET) == 0);
+    unsigned char *buf = (unsigned char *)malloc((size_t)sz);
+    assert(buf != NULL);
+    assert(fread(buf, 1, (size_t)sz, f) == (size_t)sz);
+    fclose(f);
+
+    // Deserialize into a fresh in-memory connection. With flags=0 the buffer is
+    // used in place by real SQLite, so it must outlive the connection: free
+    // after close.
+    sqlite3 *db;
+    assert(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    assert(sqlite3_deserialize(db, "main", buf, sz, sz, 0) == SQLITE_OK);
+
+    sqlite3_stmt *stmt;
+    assert(sqlite3_prepare_v2(db, "SELECT count(*) FROM t", -1, &stmt, NULL) ==
+           SQLITE_OK);
+    assert(sqlite3_step(stmt) == SQLITE_ROW);
+    assert(sqlite3_column_int64(stmt, 0) == 100);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    free(buf);
+
+    remove(path);
+    remove(wal);
+    remove(shm);
+    printf("test_sqlite3_deserialize passed\n");
 }

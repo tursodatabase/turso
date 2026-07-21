@@ -823,7 +823,7 @@ Modifiers:
 | Interface              | Status  | Comment |
 |------------------------|---------|---------|
 | sqlite3_serialize      | ❌ No      | Stub    |
-| sqlite3_deserialize    | ❌ No      | Stub    |
+| sqlite3_deserialize    | 🚧 Partial | Copy-based (image copied into a MemoryIO); `FREEONCLOSE` honored; `RESIZEABLE`/`READONLY` rejected (`SQLITE_ERROR`); only the `main` schema |
 
 ### Miscellaneous
 
