@@ -92,12 +92,10 @@ pub fn translate_create_materialized_view(
 
     // The classified shape decides what internal storage the view needs:
     // filter/project views are maintained purely in the view btree, while
-    // GROUP BY views also persist per-group aggregate state.
+    // GROUP BY views persist per-group aggregate state and join views a
+    // rowid-pair map.
     let shape = crate::incremental::vdbe_maintenance::classify_view(select_stmt, resolver)?;
-    let needs_state_table = matches!(
-        shape,
-        crate::incremental::vdbe_maintenance::ViewShape::GroupAggregate { .. }
-    );
+    let needs_state_table = crate::incremental::vdbe_maintenance::needs_state_table(&shape);
 
     // Reconstruct the SQL string for storage
     let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);
@@ -223,10 +221,8 @@ pub fn translate_create_materialized_view(
             "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"
         ));
         let dbsp_table_ident = dbsp_table_name.as_ident();
-        let dbsp_sql = crate::incremental::vdbe_maintenance::aggregate_state_table_sql(
-            &dbsp_table_ident,
-            &shape,
-        )?;
+        let dbsp_sql =
+            crate::incremental::vdbe_maintenance::state_table_sql(&dbsp_table_ident, &shape)?;
 
         emit_schema_entry(
             program,

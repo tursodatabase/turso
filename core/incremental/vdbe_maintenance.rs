@@ -183,6 +183,14 @@ pub enum OutputColumn {
 pub enum ViewShape {
     /// Single-table SELECT with optional WHERE: rows map 1:1 to base rows.
     FilterProject,
+    /// Two-table inner join with an arbitrary ON predicate. Join rows are
+    /// identified by their (left rowid, right rowid) pair through a hidden
+    /// state table whose rowid doubles as the view rowid.
+    Join {
+        /// The ON constraint; None for a plain cartesian product (CROSS or
+        /// comma join, optionally filtered by WHERE).
+        on_expr: Option<ast::Expr>,
+    },
     /// Single-table GROUP BY with invertible aggregates.
     GroupAggregate {
         group_exprs: Vec<ast::Expr>,
@@ -361,15 +369,57 @@ pub fn classify_view(select: &ast::Select, resolver: &Resolver) -> Result<ViewSh
     let Some(from) = from else {
         return unsupported("no FROM clause");
     };
-    if !from.joins.is_empty() {
-        return unsupported("joins");
-    }
     if !matches!(from.select.as_ref(), ast::SelectTable::Table(_, _, _)) {
         return unsupported("subqueries or table functions in FROM");
     }
 
     if let Some(where_expr) = where_clause {
         check_scalar_expr(where_expr)?;
+    }
+
+    if !from.joins.is_empty() {
+        if from.joins.len() > 1 {
+            return unsupported("joins over more than two tables");
+        }
+        let join = &from.joins[0];
+        if let ast::JoinOperator::TypedJoin(join_type) = &join.operator {
+            let join_type = join_type.unwrap_or(ast::JoinType::INNER);
+            if join_type
+                .intersects(ast::JoinType::LEFT | ast::JoinType::RIGHT | ast::JoinType::OUTER)
+            {
+                return unsupported("outer joins");
+            }
+            if join_type.contains(ast::JoinType::NATURAL) {
+                return unsupported("NATURAL joins");
+            }
+        }
+        if !matches!(join.table.as_ref(), ast::SelectTable::Table(_, _, _)) {
+            return unsupported("subqueries or table functions in FROM");
+        }
+        let on_expr = match &join.constraint {
+            Some(ast::JoinConstraint::On(expr)) => {
+                check_scalar_expr(expr)?;
+                Some(expr.as_ref().clone())
+            }
+            Some(ast::JoinConstraint::Using(_)) => {
+                return unsupported("USING join constraints");
+            }
+            None => None,
+        };
+        if group_by.is_some() {
+            return unsupported("GROUP BY over joins");
+        }
+        for column in columns {
+            if let ast::ResultColumn::Expr(expr, _) = column {
+                let mut aggs = Vec::new();
+                if resolve_window_and_aggregate_functions(expr, resolver, &mut aggs, None, &mut [])?
+                {
+                    return unsupported("aggregates over joins");
+                }
+                check_scalar_expr(expr)?;
+            }
+        }
+        return Ok(ViewShape::Join { on_expr });
     }
 
     // HAVING without GROUP BY parses as a GroupBy node with no expressions;
@@ -507,46 +557,63 @@ pub fn classify_view_for_connection(
     classify_view(select, &resolver)
 }
 
-/// The CREATE TABLE statement for a GROUP BY view's internal state table:
-/// one row per live group, holding the group-key values and each payload
-/// aggregate's persisted state. The PRIMARY KEY over the group columns gives
-/// the automatic index used to find a group's state. MIN/MAX aggregates
-/// contribute no columns here — their state is the value multiset table.
+/// Whether the view keeps a hidden internal state table.
+pub fn needs_state_table(shape: &ViewShape) -> bool {
+    matches!(
+        shape,
+        ViewShape::GroupAggregate { .. } | ViewShape::Join { .. }
+    )
+}
+
+/// The CREATE TABLE statement for a view's internal state table.
 ///
-/// The state row's rowid doubles as the group's rowid in the view btree:
-/// state rows are written unconditionally for live groups, so their rowids
-/// are unique, stable, and — unlike a separately reserved rowid — cannot
-/// collide when HAVING suppresses a group's view row.
+/// For a GROUP BY view: one row per live group, holding the group-key values
+/// and each payload aggregate's persisted state, with the PRIMARY KEY over
+/// the group columns giving the automatic group-lookup index. MIN/MAX
+/// aggregates contribute no columns here — their state is the value multiset
+/// table.
+///
+/// For a join view: one row per live join-output row, keyed by the pair of
+/// base-table rowids that produced it.
+///
+/// In both cases the state row's rowid doubles as the row's rowid in the
+/// view btree: state rows are written unconditionally for live groups/pairs,
+/// so their rowids are unique, stable, and — unlike a separately reserved
+/// rowid — cannot collide when HAVING suppresses a group's view row.
 ///
 /// Declared column types are empty so nothing coerces the stored values.
-pub fn aggregate_state_table_sql(state_table_name: &str, shape: &ViewShape) -> Result<String> {
-    let ViewShape::GroupAggregate {
-        group_exprs,
-        aggregates,
-        ..
-    } = shape
-    else {
-        return Err(LimboError::InternalError(
-            "only GROUP BY views have state tables".to_string(),
-        ));
-    };
-    let mut columns = Vec::new();
-    for i in 0..group_exprs.len() {
-        columns.push(format!("g{i}"));
-    }
-    for (i, agg) in aggregates.iter().enumerate() {
-        if let Some(width) = crate::vdbe::execute::agg_payload_width(&agg.func) {
-            for j in 0..width {
-                columns.push(format!("a{i}_{j}"));
+pub fn state_table_sql(state_table_name: &str, shape: &ViewShape) -> Result<String> {
+    match shape {
+        ViewShape::GroupAggregate {
+            group_exprs,
+            aggregates,
+            ..
+        } => {
+            let mut columns = Vec::new();
+            for i in 0..group_exprs.len() {
+                columns.push(format!("g{i}"));
             }
+            for (i, agg) in aggregates.iter().enumerate() {
+                if let Some(width) = crate::vdbe::execute::agg_payload_width(&agg.func) {
+                    for j in 0..width {
+                        columns.push(format!("a{i}_{j}"));
+                    }
+                }
+            }
+            let key: Vec<String> = (0..group_exprs.len()).map(|i| format!("g{i}")).collect();
+            Ok(format!(
+                "CREATE TABLE {state_table_name} ({}, PRIMARY KEY ({}))",
+                columns.join(", "),
+                key.join(", ")
+            ))
         }
+        ViewShape::Join { .. } => Ok(format!(
+            "CREATE TABLE {state_table_name} (l_rid, r_rid, PRIMARY KEY (l_rid, r_rid))"
+        )),
+        ViewShape::FilterProject => Err(LimboError::InternalError(
+            "filter/project views have no state table".to_string(),
+        )),
     }
-    let key: Vec<String> = (0..group_exprs.len()).map(|i| format!("g{i}")).collect();
-    Ok(format!(
-        "CREATE TABLE {state_table_name} ({}, PRIMARY KEY ({}))",
-        columns.join(", "),
-        key.join(", ")
-    ))
 }
 
 /// Whether an aggregate keeps per-value state in the multiset table: MIN/MAX
@@ -676,6 +743,24 @@ pub fn compile_maintenance_program(
                 ));
             }
             compile_group_aggregate_program(
+                view_name,
+                select,
+                &shape,
+                view_root_page,
+                num_view_columns,
+                input,
+                schema,
+                connection,
+            )
+        }
+        shape @ ViewShape::Join { .. } => {
+            if matches!(output, MaintenanceOutput::EmitRows) {
+                return Err(LimboError::InternalError(
+                    "join views serve uncommitted reads by recomputing the defining query"
+                        .to_string(),
+                ));
+            }
+            compile_join_program(
                 view_name,
                 select,
                 &shape,
@@ -2218,6 +2303,623 @@ fn compile_group_aggregate_program(
         connection.clone(),
         false,
         "materialized view aggregate maintenance",
+    )
+}
+
+/// Which relation a join phase reads for one side of the join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinSide {
+    /// The transaction's captured delta for the table.
+    Delta,
+    /// The table's btree, which at maintenance time holds the post-change
+    /// state.
+    Btree,
+}
+
+/// Compile the maintenance (or population) program for a two-table inner
+/// join view.
+///
+/// Join is bilinear, so with the base btrees holding post-change state at
+/// commit time the view delta is
+///
+/// ```text
+///   d(L ⋈ R) = dL ⋈ R_new  +  L_new ⋈ dR  −  dL ⋈ dR
+/// ```
+///
+/// emitted as three nested-loop phases (population is a single
+/// btree-by-btree phase with weight +1). Every matching pair funnels through
+/// one weight-merge subroutine: the (l_rowid, r_rowid) pair is looked up in
+/// the state table, whose row's rowid doubles as the view rowid, and the
+/// view row's trailing weight column accumulates the contribution — a pair
+/// double-counted by the first two phases transiently holds weight 2 until
+/// the third phase subtracts the overlap. Delta rows are applied in capture
+/// order, so the last touch of a surviving pair always computes its output
+/// columns from both sides' final images.
+///
+/// The ON predicate is arbitrary (evaluated with the shared condition
+/// translator, so NULL join keys behave exactly as in a regular query); the
+/// probe is a nested-loop scan of the other side.
+#[allow(clippy::too_many_arguments)]
+fn compile_join_program(
+    view_name: &str,
+    select: &ast::Select,
+    shape: &ViewShape,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<Program> {
+    let ViewShape::Join { on_expr } = shape else {
+        unreachable!("compile_join_program requires a Join shape");
+    };
+    let ast::OneSelect::Select {
+        columns,
+        from,
+        where_clause,
+        ..
+    } = &select.body.select
+    else {
+        unreachable!("classify_view admits only OneSelect::Select");
+    };
+    let from = from.as_ref().expect("classify_view requires a FROM clause");
+    let ast::SelectTable::Table(l_name, l_alias, _) = from.select.as_ref() else {
+        unreachable!("classify_view admits only plain tables in FROM");
+    };
+    let ast::SelectTable::Table(r_name, r_alias, _) = from.joins[0].table.as_ref() else {
+        unreachable!("classify_view admits only plain tables in joins");
+    };
+
+    let lookup_table = |name: &ast::QualifiedName| {
+        schema.get_btree_table(name.name.as_str()).ok_or_else(|| {
+            LimboError::ParseError(format!(
+                "materialized view base table {} not found",
+                name.name.as_str()
+            ))
+        })
+    };
+    let l_table = lookup_table(l_name)?;
+    let r_table = lookup_table(r_name)?;
+    let identifier_for = |alias: &Option<ast::As>, table: &Arc<BTreeTable>| match alias {
+        Some(ast::As::As(name) | ast::As::Elided(name) | ast::As::ImplicitColumnName(name)) => {
+            name.as_str().to_string()
+        }
+        None => table.name.clone(),
+    };
+    let l_ident = identifier_for(l_alias, &l_table);
+    let r_ident = identifier_for(r_alias, &r_table);
+
+    let state_table_name = format!(
+        "{}{}_{view_name}",
+        crate::schema::DBSP_TABLE_PREFIX,
+        crate::incremental::view::DBSP_CIRCUIT_VERSION
+    );
+    let state_table = schema.get_btree_table(&state_table_name).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "state table {state_table_name} of materialized view {view_name} not found"
+        ))
+    })?;
+    let state_index = schema
+        .get_indices(&state_table_name)
+        .next()
+        .cloned()
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "state table {state_table_name} of materialized view {view_name} has no index"
+            ))
+        })?;
+
+    let mut program = ProgramBuilder::new_for_subprogram(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts {
+            num_cursors: 9,
+            approx_num_insns: 96 + 48 * num_view_columns,
+            approx_num_labels: 32,
+        },
+    );
+    program.prologue();
+
+    let syms = connection.syms.read();
+    let resolver = Resolver::new(
+        schema,
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        &syms,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        Arc::new(crate::dialect::SqliteDialect),
+    );
+
+    let state_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(state_table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: state_cursor_id,
+        root_page: RegisterOrLiteral::Literal(state_table.root_page),
+        db: 0,
+    });
+    let state_index_cursor_id =
+        program.alloc_cursor_id(CursorType::BTreeIndex(state_index.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: state_index_cursor_id,
+        root_page: RegisterOrLiteral::Literal(state_index.root_page),
+        db: 0,
+    });
+    let view_btree = Arc::new(synthesized_view_table(
+        view_name,
+        view_root_page,
+        num_view_columns,
+    ));
+    let view_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(view_btree));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: view_cursor_id,
+        root_page: RegisterOrLiteral::Literal(view_root_page),
+        db: 0,
+    });
+
+    // Register layout, shared by all phases: the merge subroutine reads the
+    // rowid pair, the projected outputs, and the contribution weight.
+    let zero_reg = program.alloc_register();
+    let neg_one_reg = program.alloc_register();
+    let gosub_return_reg = program.alloc_register();
+    let prev_rowid_scratch = program.alloc_register();
+    // [l_rowid, r_rowid, state_rowid], contiguous for Found/IdxInsert/IdxDelete.
+    let pair_start = program.alloc_registers(3);
+    let l_rid_reg = pair_start;
+    let r_rid_reg = pair_start + 1;
+    let srid_reg = pair_start + 2;
+    // [outputs.., weight], contiguous for MakeRecord.
+    let out_start = program.alloc_registers(num_view_columns + 1);
+    let out_weight_reg = out_start + num_view_columns;
+    let w_outer_reg = program.alloc_register();
+    let w_inner_reg = program.alloc_register();
+    let w_reg = program.alloc_register();
+    let cur_w_reg = program.alloc_register();
+    let new_w_reg = program.alloc_register();
+    let state_record_reg = program.alloc_register();
+    let index_record_reg = program.alloc_register();
+    let view_record_reg = program.alloc_register();
+
+    program.emit_int(0, zero_reg);
+    program.emit_int(-1, neg_one_reg);
+
+    let merge_label = program.allocate_label();
+    let main_start_label = program.allocate_label();
+    let corrupt_label = program.allocate_label();
+    let end_label = program.allocate_label();
+
+    program.emit_insn(Insn::Goto {
+        target_pc: main_start_label,
+    });
+
+    // Weight-merge subroutine: apply (pair, outputs, w) to the state and
+    // view btrees.
+    program.preassign_label_to_next_insn(merge_label);
+    let m_found_label = program.allocate_label();
+    let m_rewrite_label = program.allocate_label();
+    let m_write_label = program.allocate_label();
+    let m_ret_label = program.allocate_label();
+    program.emit_insn(Insn::Found {
+        cursor_id: state_index_cursor_id,
+        target_pc: m_found_label,
+        record_reg: pair_start,
+        num_regs: 2,
+    });
+    // Unknown pair: a retraction is a no-op (matching the filter/project
+    // merge behavior for unknown rowids).
+    program.emit_insn(Insn::Lt {
+        lhs: w_reg,
+        rhs: zero_reg,
+        target_pc: m_ret_label,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::NewRowid {
+        cursor: state_cursor_id,
+        rowid_reg: srid_reg,
+        prev_largest_reg: prev_rowid_scratch,
+    });
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: pair_start as u16,
+        count: 2,
+        dest_reg: state_record_reg as u16,
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: state_cursor_id,
+        key_reg: srid_reg,
+        record_reg: state_record_reg,
+        flag: InsertFlags(
+            InsertFlags::REQUIRE_SEEK
+                | InsertFlags::SKIP_LAST_ROWID
+                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+        ),
+        table_name: state_table_name.clone(),
+    });
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: pair_start as u16,
+        count: 3,
+        dest_reg: index_record_reg as u16,
+        index_name: Some(state_index.name.clone()),
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::IdxInsert {
+        cursor_id: state_index_cursor_id,
+        record_reg: index_record_reg,
+        unpacked_start: Some(pair_start),
+        unpacked_count: Some(3),
+        flags: IdxInsertFlags::new(),
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: w_reg,
+        dst_reg: out_weight_reg,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: m_write_label,
+    });
+
+    program.preassign_label_to_next_insn(m_found_label);
+    program.emit_insn(Insn::IdxRowId {
+        cursor_id: state_index_cursor_id,
+        dest: srid_reg,
+    });
+    // A live pair always has its view row; its trailing column holds the
+    // accumulated weight.
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: view_cursor_id,
+        src_reg: srid_reg,
+        target_pc: corrupt_label,
+    });
+    program.emit_insn(Insn::Column {
+        cursor_id: view_cursor_id,
+        column: num_view_columns,
+        dest: cur_w_reg,
+        default: None,
+    });
+    program.emit_insn(Insn::Add {
+        lhs: w_reg,
+        rhs: cur_w_reg,
+        dest: new_w_reg,
+    });
+    program.emit_insn(Insn::Gt {
+        lhs: new_w_reg,
+        rhs: zero_reg,
+        target_pc: m_rewrite_label,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    // Weight reached zero: the pair leaves the view.
+    program.emit_insn(Insn::Delete {
+        cursor_id: view_cursor_id,
+        table_name: view_name.to_string(),
+        is_part_of_update: true,
+    });
+    program.emit_insn(Insn::IdxDelete {
+        start_reg: pair_start,
+        num_regs: 3,
+        cursor_id: state_index_cursor_id,
+        raise_error_if_no_matching_entry: true,
+    });
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: state_cursor_id,
+        src_reg: srid_reg,
+        target_pc: corrupt_label,
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id: state_cursor_id,
+        table_name: state_table_name,
+        is_part_of_update: true,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: m_ret_label,
+    });
+
+    program.preassign_label_to_next_insn(m_rewrite_label);
+    program.emit_insn(Insn::Copy {
+        src_reg: new_w_reg,
+        dst_reg: out_weight_reg,
+        extra_amount: 0,
+    });
+    program.preassign_label_to_next_insn(m_write_label);
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: out_start as u16,
+        count: (num_view_columns + 1) as u16,
+        dest_reg: view_record_reg as u16,
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: view_cursor_id,
+        key_reg: srid_reg,
+        record_reg: view_record_reg,
+        flag: InsertFlags(
+            InsertFlags::REQUIRE_SEEK
+                | InsertFlags::SKIP_LAST_ROWID
+                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+        ),
+        table_name: view_name.to_string(),
+    });
+    program.preassign_label_to_next_insn(m_ret_label);
+    program.emit_insn(Insn::Return {
+        return_reg: gosub_return_reg,
+        can_fallthrough: false,
+    });
+
+    program.preassign_label_to_next_insn(main_start_label);
+
+    // (left source, right source, negate, outer side is left). The delta
+    // side drives the outer loop so the probe scan is on the (usually
+    // larger) btree side.
+    let phases: Vec<(JoinSide, JoinSide, bool, bool)> = match input {
+        MaintenanceInput::BaseTable => vec![(JoinSide::Btree, JoinSide::Btree, false, true)],
+        MaintenanceInput::TransactionDelta => vec![
+            (JoinSide::Delta, JoinSide::Btree, false, true),
+            (JoinSide::Btree, JoinSide::Delta, false, false),
+            (JoinSide::Delta, JoinSide::Delta, true, true),
+        ],
+    };
+
+    for (l_source, r_source, negate, outer_is_l) in phases {
+        // Fresh table references per phase: the same logical table reads
+        // from a different relation (delta vs btree) in each phase, and
+        // cursors are keyed by the internal id expressions bind against.
+        let l_id = program.table_reference_counter.next();
+        let r_id = program.table_reference_counter.next();
+        let make_joined = |table: &Arc<BTreeTable>, identifier: &str, id| JoinedTable {
+            op: Operation::Scan(Scan::BTreeTable {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            }),
+            table: crate::schema::Table::BTree(table.clone()),
+            identifier: identifier.to_string(),
+            internal_id: id,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: 0,
+            indexed: None,
+        };
+        let mut table_references = TableReferences::new(
+            vec![
+                make_joined(&l_table, &l_ident, l_id),
+                make_joined(&r_table, &r_ident, r_id),
+            ],
+            vec![],
+        );
+
+        let open_side = |program: &mut ProgramBuilder, source, table: &Arc<BTreeTable>, id| {
+            let cursor_id = match source {
+                JoinSide::Delta => program.alloc_cursor_id_keyed(
+                    CursorKey::table(id),
+                    CursorType::ViewDelta {
+                        view_name: view_name.to_string(),
+                        table: table.clone(),
+                    },
+                ),
+                JoinSide::Btree => program.alloc_cursor_id_keyed(
+                    CursorKey::table(id),
+                    CursorType::BTreeTable(table.clone()),
+                ),
+            };
+            program.emit_insn(Insn::OpenRead {
+                cursor_id,
+                root_page: match source {
+                    JoinSide::Delta => 0,
+                    JoinSide::Btree => table.root_page,
+                },
+                db: 0,
+            });
+            cursor_id
+        };
+        let l_cursor_id = open_side(&mut program, l_source, &l_table, l_id);
+        let r_cursor_id = open_side(&mut program, r_source, &r_table, r_id);
+
+        let (
+            outer_cursor_id,
+            outer_source,
+            outer_ncols,
+            inner_cursor_id,
+            inner_source,
+            inner_ncols,
+        ) = if outer_is_l {
+            (
+                l_cursor_id,
+                l_source,
+                l_table.columns().len(),
+                r_cursor_id,
+                r_source,
+                r_table.columns().len(),
+            )
+        } else {
+            (
+                r_cursor_id,
+                r_source,
+                r_table.columns().len(),
+                l_cursor_id,
+                l_source,
+                l_table.columns().len(),
+            )
+        };
+
+        let phase_done_label = program.allocate_label();
+        let outer_loop_label = program.allocate_label();
+        let outer_next_label = program.allocate_label();
+        let inner_loop_label = program.allocate_label();
+        let inner_next_label = program.allocate_label();
+
+        program.emit_insn(Insn::Rewind {
+            cursor_id: outer_cursor_id,
+            pc_if_empty: phase_done_label,
+        });
+        program.preassign_label_to_next_insn(outer_loop_label);
+        match outer_source {
+            JoinSide::Delta => program.emit_insn(Insn::Column {
+                cursor_id: outer_cursor_id,
+                column: outer_ncols,
+                dest: w_outer_reg,
+                default: None,
+            }),
+            JoinSide::Btree => program.emit_int(1, w_outer_reg),
+        }
+        program.emit_insn(Insn::Rewind {
+            cursor_id: inner_cursor_id,
+            pc_if_empty: outer_next_label,
+        });
+        program.preassign_label_to_next_insn(inner_loop_label);
+        match inner_source {
+            JoinSide::Delta => program.emit_insn(Insn::Column {
+                cursor_id: inner_cursor_id,
+                column: inner_ncols,
+                dest: w_inner_reg,
+                default: None,
+            }),
+            JoinSide::Btree => program.emit_int(1, w_inner_reg),
+        }
+
+        // ON, then WHERE: a FALSE or NULL result means this pair is not a
+        // join output.
+        for condition in [on_expr.as_ref(), where_clause.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let mut bound = condition.clone();
+            bind_and_rewrite_expr(
+                &mut bound,
+                Some(&mut table_references),
+                None,
+                &resolver,
+                BindingBehavior::ResultColumnsNotAllowed,
+            )?;
+            let pred_true = program.allocate_label();
+            translate_condition_expr(
+                &mut program,
+                &table_references,
+                &bound,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_true: pred_true,
+                    jump_target_when_false: inner_next_label,
+                    jump_target_when_null: inner_next_label,
+                },
+                &resolver,
+            )?;
+            program.preassign_label_to_next_insn(pred_true);
+        }
+
+        program.emit_insn(Insn::RowId {
+            cursor_id: l_cursor_id,
+            dest: l_rid_reg,
+        });
+        program.emit_insn(Insn::RowId {
+            cursor_id: r_cursor_id,
+            dest: r_rid_reg,
+        });
+
+        let mut out_reg = out_start;
+        for column in columns {
+            match column {
+                ast::ResultColumn::Expr(expr, _) => {
+                    let mut bound = expr.as_ref().clone();
+                    bind_and_rewrite_expr(
+                        &mut bound,
+                        Some(&mut table_references),
+                        None,
+                        &resolver,
+                        BindingBehavior::ResultColumnsNotAllowed,
+                    )?;
+                    translate_expr_no_constant_opt(
+                        &mut program,
+                        Some(&table_references),
+                        &bound,
+                        out_reg,
+                        &resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
+                    out_reg += 1;
+                }
+                ast::ResultColumn::Star => {
+                    for (i, _col) in l_table.columns().iter().enumerate() {
+                        program.emit_column_or_rowid(l_cursor_id, i, out_reg);
+                        out_reg += 1;
+                    }
+                    for (i, _col) in r_table.columns().iter().enumerate() {
+                        program.emit_column_or_rowid(r_cursor_id, i, out_reg);
+                        out_reg += 1;
+                    }
+                }
+                ast::ResultColumn::TableStar(name) => {
+                    let target = crate::util::normalize_ident(name.as_str());
+                    let (cursor_id, table) = if target == crate::util::normalize_ident(&l_ident) {
+                        (l_cursor_id, &l_table)
+                    } else if target == crate::util::normalize_ident(&r_ident) {
+                        (r_cursor_id, &r_table)
+                    } else {
+                        return Err(LimboError::ParseError(format!("no such table: {target}")));
+                    };
+                    for (i, _col) in table.columns().iter().enumerate() {
+                        program.emit_column_or_rowid(cursor_id, i, out_reg);
+                        out_reg += 1;
+                    }
+                }
+            }
+        }
+        let num_projected = out_reg - out_start;
+        turso_assert!(
+            num_projected == num_view_columns,
+            "projection produced {num_projected} columns, view declares {num_view_columns}"
+        );
+
+        program.emit_insn(Insn::Multiply {
+            lhs: w_outer_reg,
+            rhs: w_inner_reg,
+            dest: w_reg,
+        });
+        if negate {
+            program.emit_insn(Insn::Multiply {
+                lhs: w_reg,
+                rhs: neg_one_reg,
+                dest: w_reg,
+            });
+        }
+        program.emit_insn(Insn::Gosub {
+            target_pc: merge_label,
+            return_reg: gosub_return_reg,
+        });
+
+        program.preassign_label_to_next_insn(inner_next_label);
+        program.emit_insn(Insn::Next {
+            cursor_id: inner_cursor_id,
+            pc_if_next: inner_loop_label,
+        });
+        program.preassign_label_to_next_insn(outer_next_label);
+        program.emit_insn(Insn::Next {
+            cursor_id: outer_cursor_id,
+            pc_if_next: outer_loop_label,
+        });
+        program.preassign_label_to_next_insn(phase_done_label);
+    }
+
+    program.emit_insn(Insn::Goto {
+        target_pc: end_label,
+    });
+    program.preassign_label_to_next_insn(corrupt_label);
+    program.emit_insn(Insn::Halt {
+        err_code: crate::error::SQLITE_ERROR,
+        description: format!("materialized view {view_name} state is corrupted"),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(end_label);
+
+    program.epilogue(schema);
+    drop(syms);
+    program.build(
+        connection.clone(),
+        false,
+        "materialized view join maintenance",
     )
 }
 
