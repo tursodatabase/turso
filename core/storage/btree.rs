@@ -75,7 +75,7 @@ const STACK_ALLOC_KEY_VALS_MAX: usize = 16;
 fn write_varint_to_vec(value: u64, payload: &mut crate::alloc::Vec<u8>) -> Result<()> {
     let mut varint = [0u8; 9];
     let len = write_varint(&mut varint, value);
-    payload.try_reserve(len)?;
+    crate::with_btree_allocation_site!(CellPayload, payload.try_reserve(len))?;
     payload.extend_from_slice(&varint[..len]);
     Ok(())
 }
@@ -1394,8 +1394,10 @@ impl BTreeCursor {
                 // page that doesn't exist yet, and re-entry would skip the
                 // `is_none()` branch entirely.
                 let (page, c) = return_if_io!(self.read_page(start_next_page as i64));
+                let payload =
+                    crate::with_btree_allocation_site!(OverflowRead, payload.try_to_vec())?;
                 self.read_overflow_state.replace(ReadPayloadOverflow {
-                    payload: payload.try_to_vec()?,
+                    payload,
                     next_page: start_next_page,
                     remaining_to_read,
                     page,
@@ -1476,10 +1478,13 @@ impl BTreeCursor {
             let mut reuse_immutable = self.get_immutable_record_or_create()?;
             reuse_immutable.as_mut().unwrap().invalidate();
 
-            reuse_immutable
-                .as_mut()
-                .unwrap()
-                .start_serialization(&payload_swap)?;
+            crate::with_btree_allocation_site!(
+                RecordPayload,
+                reuse_immutable
+                    .as_mut()
+                    .unwrap()
+                    .start_serialization(&payload_swap)
+            )?;
 
             self.read_overflow_state.take();
             break Ok(IOResult::Done(()));
@@ -2228,10 +2233,13 @@ impl BTreeCursor {
                 .as_mut()
                 .unwrap()
                 .invalidate();
-            self.get_immutable_record_or_create()?
-                .as_mut()
-                .unwrap()
-                .start_serialization(payload)?;
+            crate::with_btree_allocation_site!(
+                RecordPayload,
+                self.get_immutable_record_or_create()?
+                    .as_mut()
+                    .unwrap()
+                    .start_serialization(payload)
+            )?;
         };
 
         let (target_leaf_page_is_in_left_subtree, is_eq) = {
@@ -2664,10 +2672,13 @@ impl BTreeCursor {
                 .as_mut()
                 .unwrap()
                 .invalidate();
-            self.get_immutable_record_or_create()?
-                .as_mut()
-                .unwrap()
-                .start_serialization(payload)?;
+            crate::with_btree_allocation_site!(
+                RecordPayload,
+                self.get_immutable_record_or_create()?
+                    .as_mut()
+                    .unwrap()
+                    .start_serialization(payload)
+            )?;
         };
 
         let (cmp, found) = self.compare_with_current_record(
@@ -3774,7 +3785,10 @@ impl BTreeCursor {
                     #[cfg(debug_assertions)]
                     {
                         for cell in &cell_array.cell_payloads {
-                            cells_debug.try_push(cell.try_to_vec()?)?;
+                            crate::with_btree_allocation_site!(Balance, {
+                                let cell = cell.try_to_vec()?;
+                                cells_debug.try_push(cell)
+                            })?;
                             if is_leaf {
                                 crate::turso_assert_ne!(cell[0], 0);
                             }
@@ -5645,7 +5659,10 @@ impl BTreeCursor {
             // bytes (bounded above by MAX_RECORD_HEADER_SIZE) and parse those. On an
             // IO yield the whole function restarts; every step up to here is a pure
             // cached read, so the restart is cheap and idempotent.
-            let mut header = crate::alloc::try_vec![0u8; header_size]?;
+            let mut header = crate::with_btree_allocation_site!(
+                BlobRecordHeader,
+                crate::alloc::try_vec![0u8; header_size]
+            )?;
             return_if_io!(self.blob_read_range(0, &mut header));
             blob_locate_column_in_header(&header, hpos0, payload_size, column)?
         };
@@ -5979,7 +5996,10 @@ impl BTreeCursor {
         let reusable_immutable_record = &mut self.reusable_immutable_record;
         if reusable_immutable_record.is_none() {
             let page_size = self.pager.get_page_size_unchecked().get();
-            let record = ImmutableRecord::new(page_size as usize)?;
+            let record = crate::with_btree_allocation_site!(
+                RecordPayload,
+                ImmutableRecord::new(page_size as usize)
+            )?;
             reusable_immutable_record.replace(record);
         }
         Ok(reusable_immutable_record.as_mut())
@@ -6477,10 +6497,13 @@ impl CursorTrait for BTreeCursor {
                 .as_mut()
                 .unwrap()
                 .invalidate();
-            self.get_immutable_record_or_create()?
-                .as_mut()
-                .unwrap()
-                .start_serialization(payload)?;
+            crate::with_btree_allocation_site!(
+                RecordPayload,
+                self.get_immutable_record_or_create()?
+                    .as_mut()
+                    .unwrap()
+                    .start_serialization(payload)
+            )?;
         };
 
         Ok(IOResult::Done(self.reusable_immutable_record.as_ref()))
@@ -7260,8 +7283,14 @@ impl CursorTrait for BTreeCursor {
             let record = return_if_io!(self.record());
             let record = record.expect("has_record=true but record() returned None");
             let payload = record.get_payload();
-            let mut owned = ImmutableRecord::new(payload.len())?;
-            owned.start_serialization(payload)?;
+            let mut owned = crate::with_btree_allocation_site!(
+                SavedCursorRecord,
+                ImmutableRecord::new(payload.len())
+            )?;
+            crate::with_btree_allocation_site!(
+                SavedCursorRecord,
+                owned.start_serialization(payload)
+            )?;
             owned
         };
         self.save_context(CursorContext {
@@ -7522,7 +7551,7 @@ impl IntegrityCheckState {
     ) -> Result<()> {
         let page_id = entry.page_idx;
         let Some(previous) = self.page_reference.get(&page_id).copied() else {
-            self.page_stack.try_reserve(1)?;
+            crate::with_btree_allocation_site!(IntegrityCheck, self.page_stack.try_reserve(1))?;
             let previous = self.page_reference.insert(page_id, referenced_by);
             turso_assert!(
                 previous.is_none(),
@@ -7533,10 +7562,14 @@ impl IntegrityCheckState {
                 .unwrap_or_else(|_| unreachable!("reserved page stack slot was unavailable"));
             return Ok(());
         };
+        let references = crate::with_btree_allocation_site!(
+            IntegrityCheck,
+            crate::alloc::try_vec![previous, referenced_by]
+        )?;
         errors.push(IntegrityCheckError::PageReferencedMultipleTimes {
             page_id,
             page_category: entry.page_category,
-            references: crate::alloc::try_vec![previous, referenced_by]?,
+            references,
         });
         Ok(())
     }
@@ -9367,11 +9400,15 @@ fn _insert_into_cell(
                 turso_assert!(overflow_cell.index + 1 == cell_idx, "multiple overflow cells can only occur when a parent overflows during balancing as divider cells are inserted into it. those cells should always be in-order and sequential", { "page_id": page.id, "last_overflow_index": overflow_cell.index, "cell_idx": cell_idx, "cell_count": page.cell_count(), "overflow_count": page.overflow_cells.len() });
             }
         }
+        let payload = crate::with_btree_allocation_site!(OverflowCell, payload.try_to_vec())?;
         let overflow_cell = OverflowCell {
             index: cell_idx,
-            payload: Pin::new(payload.try_to_vec()?),
+            payload: Pin::new(payload),
         };
-        page.overflow_cells.try_push(overflow_cell)?;
+        crate::with_btree_allocation_site!(
+            OverflowCell,
+            page.overflow_cells.try_push(overflow_cell)
+        )?;
         return Ok(());
     }
     turso_assert_less_than_or_equal!(
