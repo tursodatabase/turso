@@ -1740,20 +1740,14 @@ impl Program {
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
-        loop {
-            if self.connection.is_closed() {
-                // Connection is closed for whatever reason, rollback the transaction.
-                let state = self.connection.get_tx_state();
-                if let TransactionState::Write { .. } = state {
-                    pager.rollback_tx(&self.connection);
-                }
-                return Err(LimboError::InternalError("Connection closed".to_string()));
-            }
-            if self.maybe_request_interrupt(state, pager.io.as_ref()) {
-                self.abort(pager, None, state)?;
-                return Ok(StepResult::Interrupt);
-            }
-
+        // Invalidate the previous result row once per step call: rows are only
+        // handed out between step calls, and ResultRow returns immediately
+        // after setting a fresh one.
+        let _ = state.result_row.take();
+        // The outer loop runs once per step call and is re-entered only when an
+        // instruction completed its IO inline; the inner loop dispatches
+        // instructions without re-inspecting the completion slot every time.
+        'io_check: loop {
             if let Some(io) = &state.io_completions {
                 if !io.finished() {
                     io.set_waker(waker);
@@ -1783,110 +1777,124 @@ impl Program {
                 }
                 state.io_completions = None;
             }
-            // invalidate row
-            let _ = state.result_row.take();
-            let (insn, _) = &self.insns[state.pc as usize];
-            let insn_function = insn.to_function();
-            if enable_tracing {
-                trace_insn(self, state.pc as InsnReference, insn);
-                crate::stack::trace_remaining("program_step:opcode");
-            }
-            if self.connection.get_vdbe_trace() {
-                // Diff registers from PREVIOUS opcode
-                // The last opcode (Halt) won't have its diff printed, but Halt
-                // doesn't write to any registers
-                if let Some(ref old) = state.pre_op_registers {
-                    for (i, (old_reg, new_reg)) in
-                        old.iter().zip(state.registers.iter()).enumerate()
-                    {
-                        if old_reg != new_reg {
-                            match new_reg {
-                                Register::Value(v) => eprintln!("R[{i}] = {v}"),
-                                Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
-                                Register::Record(_) => eprintln!("R[{i}] = <record>"),
+            loop {
+                if self.connection.is_closed() {
+                    // Connection is closed for whatever reason, rollback the transaction.
+                    let state = self.connection.get_tx_state();
+                    if let TransactionState::Write { .. } = state {
+                        pager.rollback_tx(&self.connection);
+                    }
+                    return Err(LimboError::InternalError("Connection closed".to_string()));
+                }
+                if self.maybe_request_interrupt(state, pager.io.as_ref()) {
+                    self.abort(pager, None, state)?;
+                    return Ok(StepResult::Interrupt);
+                }
+                let (insn, _) = &self.insns[state.pc as usize];
+                let insn_function = insn.to_function();
+                if enable_tracing {
+                    trace_insn(self, state.pc as InsnReference, insn);
+                    crate::stack::trace_remaining("program_step:opcode");
+                }
+                if self.connection.get_vdbe_trace() {
+                    // Diff registers from PREVIOUS opcode
+                    // The last opcode (Halt) won't have its diff printed, but Halt
+                    // doesn't write to any registers
+                    if let Some(ref old) = state.pre_op_registers {
+                        for (i, (old_reg, new_reg)) in
+                            old.iter().zip(state.registers.iter()).enumerate()
+                        {
+                            if old_reg != new_reg {
+                                match new_reg {
+                                    Register::Value(v) => eprintln!("R[{i}] = {v}"),
+                                    Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
+                                    Register::Record(_) => eprintln!("R[{i}] = <record>"),
+                                }
                             }
                         }
+                        state.pre_op_registers = None;
                     }
-                    state.pre_op_registers = None;
-                }
 
-                // Print CURRENT opcode
-                if matches!(insn, Insn::Init { .. }) {
-                    eprintln!("VDBE Trace:");
+                    // Print CURRENT opcode
+                    if matches!(insn, Insn::Init { .. }) {
+                        eprintln!("VDBE Trace:");
+                    }
+                    eprintln!(
+                        "{}",
+                        explain::insn_to_str(
+                            self,
+                            state.pc as InsnReference,
+                            insn,
+                            String::new(),
+                            self.comments
+                                .iter()
+                                .find(|(offset, _)| *offset == state.pc as InsnReference)
+                                .map(|(_, comment)| comment)
+                                .copied()
+                        )
+                    );
+                    // Snapshot for next iteration
+                    state.pre_op_registers = Some(state.registers.clone());
                 }
-                eprintln!(
-                    "{}",
-                    explain::insn_to_str(
-                        self,
-                        state.pc as InsnReference,
-                        insn,
-                        String::new(),
-                        self.comments
-                            .iter()
-                            .find(|(offset, _)| *offset == state.pc as InsnReference)
-                            .map(|(_, comment)| comment)
-                            .copied()
-                    )
-                );
-                // Snapshot for next iteration
-                state.pre_op_registers = Some(state.registers.clone());
-            }
-            // Always increment VM steps for every loop iteration
-            state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+                // Always increment VM steps for every loop iteration
+                state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
-            match insn_function(self, state, insn, pager) {
-                Ok(InsnFunctionStepResult::Step) => {
-                    // Instruction completed, moving to next
-                    state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
-                }
-                Ok(InsnFunctionStepResult::Done) => {
-                    // Instruction completed execution
-                    state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
-                    state.auto_txn_cleanup = TxnCleanup::None;
-                    return Ok(StepResult::Done);
-                }
-                Ok(InsnFunctionStepResult::IO(io)) => {
-                    // Instruction not complete - waiting for I/O, will resume at same PC
-                    io.set_waker(waker);
-                    let is_yield = io.is_explicit_yield();
-                    if is_yield {
-                        // Yield: return control to the cooperative scheduler so
-                        // other connections can make progress (e.g. release a
-                        // contended lock). Don't store in io_completions —
-                        // yields aren't pending I/O, so the instruction will
-                        // simply re-execute on the next step.
-                        return Ok(StepResult::Yield);
+                match insn_function(self, state, insn, pager) {
+                    Ok(InsnFunctionStepResult::Step) => {
+                        // Instruction completed, moving to next
+                        state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
                     }
-                    let finished = io.finished();
-                    state.io_completions = Some(io);
-                    if !finished {
-                        return Ok(StepResult::IO);
+                    Ok(InsnFunctionStepResult::Done) => {
+                        // Instruction completed execution
+                        state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
+                        state.auto_txn_cleanup = TxnCleanup::None;
+                        return Ok(StepResult::Done);
                     }
-                    // just continue the outer loop if IO is finished so db will continue execution immediately
-                }
-                Ok(InsnFunctionStepResult::Row) => {
-                    // Instruction completed (ResultRow already incremented PC)
-                    state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
-                    return Ok(StepResult::Row);
-                }
-                Err(LimboError::Busy) => {
-                    // Instruction blocked - will retry at same PC
-                    return Ok(StepResult::Busy);
-                }
-                Err(LimboError::BusySnapshot)
-                    if self.connection.transaction_state.get() == TransactionState::None =>
-                {
-                    // For interactive transactions that are already in a read transaction, retrying BusySnapshot is pointless
-                    // because the snapshot will continue to be stale no matter how many times we retry.
-                    // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
-                    // back, so auto-retrying can be useful.
-                    return Ok(StepResult::Busy);
-                }
-                Err(err) => {
-                    if let Err(abort_err) = self.abort(pager, Some(&err), state) {
-                        tracing::error!("Abort failed during error handling: {abort_err}");
+                    Ok(InsnFunctionStepResult::IO(io)) => {
+                        // Instruction not complete - waiting for I/O, will resume at same PC
+                        io.set_waker(waker);
+                        let is_yield = io.is_explicit_yield();
+                        if is_yield {
+                            // Yield: return control to the cooperative scheduler so
+                            // other connections can make progress (e.g. release a
+                            // contended lock). Don't store in io_completions —
+                            // yields aren't pending I/O, so the instruction will
+                            // simply re-execute on the next step.
+                            return Ok(StepResult::Yield);
+                        }
+                        let finished = io.finished();
+                        state.io_completions = Some(io);
+                        if !finished {
+                            return Ok(StepResult::IO);
+                        }
+                        // IO already finished: loop back to the completion check so
+                        // errors are observed, then continue execution immediately.
+                        continue 'io_check;
                     }
-                    return Err(err);
+                    Ok(InsnFunctionStepResult::Row) => {
+                        // Instruction completed (ResultRow already incremented PC)
+                        state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
+                        return Ok(StepResult::Row);
+                    }
+                    Err(LimboError::Busy) => {
+                        // Instruction blocked - will retry at same PC
+                        return Ok(StepResult::Busy);
+                    }
+                    Err(LimboError::BusySnapshot)
+                        if self.connection.transaction_state.get() == TransactionState::None =>
+                    {
+                        // For interactive transactions that are already in a read transaction, retrying BusySnapshot is pointless
+                        // because the snapshot will continue to be stale no matter how many times we retry.
+                        // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
+                        // back, so auto-retrying can be useful.
+                        return Ok(StepResult::Busy);
+                    }
+                    Err(err) => {
+                        if let Err(abort_err) = self.abort(pager, Some(&err), state) {
+                            tracing::error!("Abort failed during error handling: {abort_err}");
+                        }
+                        return Err(err);
+                    }
                 }
             }
         }
