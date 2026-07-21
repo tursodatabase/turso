@@ -14338,17 +14338,13 @@ pub fn op_count(
 
 /// Format integrity check errors into a result string.
 /// Returns NULL when no errors were found.
-fn format_integrity_check_result(errors: &[IntegrityCheckError]) -> Option<String> {
+fn format_integrity_check_result(errors: &[IntegrityCheckError]) -> Result<Option<String>> {
     if errors.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(
-            errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<String>>()
-                .join("\n"),
-        )
+        let errors: crate::alloc::Vec<_> =
+            errors.iter().map(|error| error.to_string()).try_collect()?;
+        Ok(Some(errors.join("\n")))
     }
 }
 
@@ -14369,7 +14365,7 @@ fn has_freelist_error(errors: &[IntegrityCheckError]) -> bool {
 pub enum OpIntegrityCheckState {
     Start,
     CheckingBTreeStructure {
-        errors: Vec<IntegrityCheckError>,
+        errors: crate::alloc::Vec<IntegrityCheckError>,
         current_root_idx: usize,
         current_dropped_idx: usize,
         state: IntegrityCheckState,
@@ -14415,7 +14411,7 @@ pub fn op_integrity_check(
                 *db,
                 |header| (header.freelist_trunk_page.get(), header.database_size.get())
             ));
-            let mut errors = Vec::new();
+            let mut errors: crate::alloc::Vec<_> = crate::alloc::vec![];
             let mut integrity_check_state = IntegrityCheckState::new(db_size as usize);
             let mut current_root_idx = 0;
 
@@ -14461,7 +14457,7 @@ pub fn op_integrity_check(
 
             if errors.len() >= *max_errors {
                 errors.truncate(*max_errors);
-                match format_integrity_check_result(errors) {
+                match format_integrity_check_result(errors)? {
                     Some(msg) => state.registers[*message_register].set_text(Text::new(msg))?,
                     None => state.registers[*message_register].set_null(),
                 }
@@ -14497,10 +14493,13 @@ pub fn op_integrity_check(
                 && integrity_check_state.freelist_count.actual_count
                     != integrity_check_state.freelist_count.expected_count
             {
-                errors.push(IntegrityCheckError::FreelistCountMismatch {
-                    actual_count: integrity_check_state.freelist_count.actual_count,
-                    expected_count: integrity_check_state.freelist_count.expected_count,
-                });
+                crate::with_btree_allocation_site!(
+                    IntegrityCheck,
+                    errors.try_push(IntegrityCheckError::FreelistCountMismatch {
+                        actual_count: integrity_check_state.freelist_count.actual_count,
+                        expected_count: integrity_check_state.freelist_count.expected_count,
+                    })
+                )?;
             }
 
             #[cfg(not(feature = "omit_autovacuum"))]
@@ -14518,14 +14517,20 @@ pub fn op_integrity_check(
                         .contains_key(&(page_number as i64))
                     {
                         if target_pager.pending_byte_page_id() != Some(page_number as u32) {
-                            errors.push(IntegrityCheckError::PageNeverUsed {
-                                page_id: page_number as i64,
-                            });
+                            crate::with_btree_allocation_site!(
+                                IntegrityCheck,
+                                errors.try_push(IntegrityCheckError::PageNeverUsed {
+                                    page_id: page_number as i64,
+                                })
+                            )?;
                         }
                     } else if target_pager.pending_byte_page_id() == Some(page_number as u32) {
-                        errors.push(IntegrityCheckError::PendingBytePageUsed {
-                            page_id: page_number as i64,
-                        })
+                        crate::with_btree_allocation_site!(
+                            IntegrityCheck,
+                            errors.try_push(IntegrityCheckError::PendingBytePageUsed {
+                                page_id: page_number as i64,
+                            })
+                        )?;
                     }
 
                     if errors.len() >= *max_errors {
@@ -14535,7 +14540,7 @@ pub fn op_integrity_check(
             }
 
             errors.truncate(*max_errors);
-            match format_integrity_check_result(errors) {
+            match format_integrity_check_result(errors)? {
                 Some(msg) => state.registers[*message_register].set_text(Text::new(msg))?,
                 None => state.registers[*message_register].set_null(),
             }
