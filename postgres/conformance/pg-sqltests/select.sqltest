@@ -87,3 +87,55 @@ test select-abs {
 expect {
     7
 }
+
+# = ANY / != ALL over arrays. Comparisons stay in WHERE position: turso
+# renders a bare boolean expression as 0/1 where PostgreSQL renders t/f.
+
+setup any_ids {
+    CREATE TABLE t (id int);
+    INSERT INTO t VALUES (1), (2), (5);
+}
+
+@setup any_ids
+test any-array-literal {
+    SELECT id FROM t WHERE id = ANY(ARRAY[1, 2, 7]) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# The PG lexer rewrites != to <>; both spellings must behave identically.
+
+@setup any_ids
+test all-array-literal-not-equal {
+    SELECT id FROM t WHERE id <> ALL(ARRAY[1, 2]);
+}
+expect {
+    5
+}
+
+@setup any_ids
+test all-array-literal-not-equal-bang-spelling {
+    SELECT id FROM t WHERE id != ALL(ARRAY[1, 2]);
+}
+expect {
+    5
+}
+
+@setup any_ids
+test any-array-null-element-filters {
+    SELECT id FROM t WHERE id = ANY(ARRAY[1, NULL]);
+}
+expect {
+    1
+}
+
+@setup any_ids
+test any-subquery {
+    SELECT id FROM t WHERE id = ANY(SELECT 1 UNION SELECT 5) ORDER BY id;
+}
+expect {
+    1
+    5
+}
