@@ -439,26 +439,26 @@ impl Debug for ValueRef<'_> {
 }
 
 pub trait AsValueRef {
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a>;
+    fn as_value_ref(&'_ self) -> ValueRef<'_>;
 }
 
 impl<'b> AsValueRef for ValueRef<'b> {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         *self
     }
 }
 
 impl AsValueRef for Value {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         self.as_ref()
     }
 }
 
 impl AsValueRef for &mut Value {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         self.as_ref()
     }
 }
@@ -469,7 +469,7 @@ where
     V2: AsValueRef,
 {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         match self {
             Either::Left(left) => left.as_value_ref(),
             Either::Right(right) => right.as_value_ref(),
@@ -478,7 +478,7 @@ where
 }
 
 impl<V: AsValueRef> AsValueRef for &V {
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         (*self).as_value_ref()
     }
 }
@@ -495,7 +495,7 @@ impl Value {
         Self::Numeric(Numeric::Integer(i))
     }
 
-    pub fn as_ref<'a>(&'a self) -> ValueRef<'a> {
+    pub fn as_ref(&'_ self) -> ValueRef<'_> {
         match self {
             Value::Null => ValueRef::Null,
             Value::Numeric(n) => ValueRef::Numeric(*n),
