@@ -1,7 +1,7 @@
 [__meta__]
 schema_version = 1
 canon_version = "v0.1.0"
-last_fetched = "2026-07-07T07:53:35.240089285Z"
+last_fetched = "2026-07-10T07:09:09.697220051Z"
 
 [aret_4mbjdhds]
 last_match_text_hash = "sha256:9d400437abc7d933b5a5f93bdc8bef54c9f0dbc03d029683fd41dbfe40b5bc16"
@@ -25,6 +25,259 @@ bound_at = "2026-07-07T07:54:27Z"
 
 ["aristos:wal_checkpoint_backfill_crash_atomic".accepted_matches.verification]
 coverage_level = "partial"
+test_binaries = []
+
+["aristos:logical_log_header_publish_after_fsync"]
+last_match_text_hash = "sha256:3f6afab40638b16a555ecf9684e49947a002d985a3885cd83421977479ccea61"
+canon_fetched_at = "2026-07-10T07:09:58Z"
+
+[["aristos:logical_log_header_publish_after_fsync".accepted_matches]]
+canon_id = "logical_log_header_publish_after_fsync"
+version = "v0.1.1"
+canonical_text = "the in-memory log header is published only after the on-disk header pwrite has completed durably"
+canon_version = "v0.1.0"
+confidence = 0.9999995524555196
+prefix_tier = "aristos:"
+backed_by = "differentially tested against another implementation"
+linked = "arta_cd4620222780dc449d3fa11b12ac9eea"
+accepted_at = "2026-07-10T07:09:58Z"
+bound_at = "2026-07-10T07:09:58Z"
+
+["aristos:logical_log_header_publish_after_fsync".accepted_matches.verification]
+coverage_level = "informal"
+test_binaries = ["c1_header_upgrade_failure"]
+
+["aristos:logical_log_header_publish_after_fsync".accepted_matches.verification.instrumentation]
+bundle_id = "turso:c193ae1:dc5694ef4986"
+companions = []
+
+["aristos:logical_log_header_publish_after_fsync".accepted_matches.verification.instrumentation.provenance]
+base_ref = "ad351877c5cf38c1fafc7f08703bfe521b8f4437"
+payload_ref = "c193ae1768a0e7f3bb3d938dba60280d6b5bcd09"
+macro_grammar_rev = "aristo-macros 0.3.0 (two-mode Inspect grammar)"
+authored_at = "c193ae1768a0e7f3bb3d938dba60280d6b5bcd09"
+
+["aristos:logical_log_header_publish_after_fsync".accepted_matches.verification.instrumentation.provenance.sut_binding]
+turso_core = "core"
+
+["aristos:logical_log_header_publish_after_fsync".accepted_matches.verification.instrumentation.compile_check]
+package = "turso_core"
+features = "aristo-instr,turso_core/aristo-instr"
+
+[["aristos:logical_log_header_publish_after_fsync".accepted_matches.verification.instrumentation.records]]
+accessor_id = "inspect_header_version"
+kind = "inspect_projection"
+class = "A"
+semantic_tier = "none"
+intent = "Expose the in-memory logical-log header version so a verifier can observe header.version advancing (None -> Some(2)) across a failed header write."
+catch = "Logical-log durability-or-intact under LogicalLogWriteHeader"
+upstream_status = "local-only"
+
+["aristos:logical_log_header_publish_after_fsync".accepted_matches.verification.instrumentation.records.landing]
+annotation = '#[cfg_attr(feature = "aristo-instr", inspect(ret = Option<u8>, with = |h| h.as_ref().map(|x| x.version), name = "header_version"))]'
+ensure_derive = '#[cfg_attr(feature = "aristo-instr", derive(Inspect))]'
+required_use = []
+companions_ref = []
+
+["aristos:logical_log_header_publish_after_fsync".accepted_matches.verification.instrumentation.records.landing.target]
+container = "LogicalLog"
+crate = "turso_core"
+field = "header"
+field_type = "Option<LogHeader>"
+file = "core/mvcc/persistent_storage/logical_log.rs"
+
+["aristos:logical_log_header_publish_after_fsync".accepted_matches.verification.instrumentation.records.presence]
+expected_symbol = "LogicalLog::inspect_header_version"
+expected_signature = "fn inspect_header_version(&self) -> Option<u8>"
+harness_probe = "let impl_header = log.inspect_header_version().map(|version| HeaderView {"
+
+[["aristos:logical_log_header_publish_after_fsync".accepted_matches.verification.instrumentation.records]]
+accessor_id = "read_logicallog_offset_crc"
+kind = "field_read"
+class = "A"
+semantic_tier = "none"
+intent = "Read the logical-log write cursor and running CRC directly off the pub fields so a verifier can bound a torn write. These are ALWAYS-pub fields (present in clean upstream); they place nothing and are not the instrumentation gate — this row documents a coupling the routed tests read."
+catch = "Logical-log durability-or-intact under LogicalLogWriteHeader"
+upstream_status = "upstream"
+
+["aristos:logical_log_header_publish_after_fsync".accepted_matches.verification.instrumentation.records.landing]
+required_use = []
+companions_ref = []
+
+["aristos:logical_log_header_publish_after_fsync".accepted_matches.verification.instrumentation.records.landing.target]
+container = "LogicalLog"
+crate = "turso_core"
+field = [
+    "offset",
+    "running_crc",
+]
+field_type = "u64 / u32"
+file = "core/mvcc/persistent_storage/logical_log.rs"
+
+["aristos:logical_log_header_publish_after_fsync".accepted_matches.verification.instrumentation.records.presence]
+expected_symbol = "LogicalLog::read_logicallog_offset_crc"
+expected_signature = "fn read_logicallog_offset_crc(&self) -> u64 / u32"
+
+["aristos:logical_log_inmemory_offset_advances_after_durable_write"]
+last_match_text_hash = "sha256:69987375b5915574c5fada86beca138d461c413bba84b8c1e326418c6407a955"
+canon_fetched_at = "2026-07-10T07:09:58Z"
+
+[["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches]]
+canon_id = "logical_log_inmemory_offset_advances_after_durable_write"
+version = "v0.1.1"
+canonical_text = "the in-memory log offset advances only after the corresponding frame pwrite has completed durably"
+canon_version = "v0.1.0"
+confidence = 1.0000000029926728
+prefix_tier = "aristos:"
+backed_by = "differentially tested against another implementation"
+linked = "arta_51abd96d0aa4aed2b32b8292c2c453df"
+accepted_at = "2026-07-10T07:09:58Z"
+bound_at = "2026-07-10T07:09:58Z"
+
+["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification]
+coverage_level = "informal"
+test_binaries = ["lwf_write_frame_failure"]
+
+["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation]
+bundle_id = "turso:c193ae1:8568341f097a"
+
+["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.provenance]
+base_ref = "ad351877c5cf38c1fafc7f08703bfe521b8f4437"
+payload_ref = "c193ae1768a0e7f3bb3d938dba60280d6b5bcd09"
+macro_grammar_rev = "aristo-macros 0.3.0 (two-mode Inspect grammar)"
+authored_at = "c193ae1768a0e7f3bb3d938dba60280d6b5bcd09"
+
+["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.provenance.sut_binding]
+turso_core = "core"
+
+["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.compile_check]
+package = "turso_core"
+features = "aristo-instr,turso_core/aristo-instr"
+
+[["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.companions]]
+symbol = "LogRecord::new"
+role = "delegate_method"
+file = "core/mvcc/database/mod.rs"
+visibility = "pub(crate)"
+payload_ref = "c193ae17"
+
+[["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.records]]
+accessor_id = "inspect_pending_running_crc"
+kind = "inspect_clone"
+class = "A"
+semantic_tier = "none"
+intent = "Clone the pending-running-CRC (deferred-offset write state) so a verifier can distinguish a torn write from a discarded one after a failed frame write."
+catch = "Logical-log durability-or-intact under LogicalLogWriteFrame"
+upstream_status = "local-only"
+
+["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.records.landing]
+annotation = '#[cfg_attr(feature = "aristo-instr", inspect(name = "pending_running_crc"))]'
+ensure_derive = '#[cfg_attr(feature = "aristo-instr", derive(Inspect))]'
+required_use = []
+companions_ref = []
+
+["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.records.landing.target]
+container = "LogicalLog"
+crate = "turso_core"
+field = "pending_running_crc"
+field_type = "Option<u32>"
+file = "core/mvcc/persistent_storage/logical_log.rs"
+
+["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.records.presence]
+expected_symbol = "LogicalLog::inspect_pending_running_crc"
+expected_signature = "fn inspect_pending_running_crc(&self) -> Option<u32>"
+harness_probe = "let observed_pending_running_crc = log.inspect_pending_running_crc();"
+
+[["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.records]]
+accessor_id = "new_for_test"
+kind = "hand_written_fn"
+class = "A"
+semantic_tier = "none"
+intent = "Deterministic LogRecord constructor for MVCC recovery tests (pre-reserves LOG_HDR_SIZE + TX_HEADER_SIZE, op_count=0, has_header=false), delegating to LogRecord::new."
+catch = "Logical-log durability-or-intact under LogicalLogWriteFrame"
+upstream_status = "local-only"
+
+["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.records.landing]
+required_use = []
+companions_ref = ["LogRecord::new"]
+
+["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.records.landing.target]
+container = "LogRecord"
+crate = "turso_core"
+file = "core/mvcc/database/mod.rs"
+method = "new_for_test"
+signature = "fn new_for_test(tx_timestamp: TxID) -> Self"
+
+["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.records.presence]
+expected_symbol = "LogRecord::new_for_test"
+expected_signature = "fn new_for_test(tx_timestamp: TxID) -> Self"
+harness_probe = "let tx = LogRecord::new_for_test(0);"
+
+[["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.records]]
+accessor_id = "read_logicallog_offset_crc"
+kind = "field_read"
+class = "A"
+semantic_tier = "none"
+intent = "Read the logical-log write cursor and running CRC directly off the pub fields so a verifier can bound a torn write. These are ALWAYS-pub fields (present in clean upstream); they place nothing and are not the instrumentation gate — this row documents a coupling the routed tests read."
+catch = "Logical-log durability-or-intact under LogicalLogWriteFrame"
+upstream_status = "upstream"
+
+["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.records.landing]
+required_use = []
+companions_ref = []
+
+["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.records.landing.target]
+container = "LogicalLog"
+crate = "turso_core"
+field = [
+    "offset",
+    "running_crc",
+]
+field_type = "u64 / u32"
+file = "core/mvcc/persistent_storage/logical_log.rs"
+
+["aristos:logical_log_inmemory_offset_advances_after_durable_write".accepted_matches.verification.instrumentation.records.presence]
+expected_symbol = "LogicalLog::read_logicallog_offset_crc"
+expected_signature = "fn read_logicallog_offset_crc(&self) -> u64 / u32"
+
+["aristos:logical_log_shadow_offset_matches_durable"]
+last_match_text_hash = "sha256:5a74c1a5142874836d6dfcf8557b1af99381f07c946d0caa45a4a05a6756a824"
+canon_fetched_at = "2026-07-10T07:09:59Z"
+
+[["aristos:logical_log_shadow_offset_matches_durable".accepted_matches]]
+canon_id = "logical_log_shadow_offset_matches_durable"
+version = "v0.1.0"
+canonical_text = "the shadow offset tracking the log's durable boundary equals the durable offset at every quiescent boundary after a truncate"
+canon_version = "v0.1.0"
+confidence = 1.0000000030914833
+prefix_tier = "aristos:"
+backed_by = "differentially tested against another implementation"
+linked = "arta_b45fe637d1b7c73d115ac9a0833dff83"
+accepted_at = "2026-07-10T07:09:59Z"
+bound_at = "2026-07-10T07:09:59Z"
+
+["aristos:logical_log_shadow_offset_matches_durable".accepted_matches.verification]
+coverage_level = "none"
+test_binaries = []
+
+["aristos:logical_log_truncate_crc_reseed_after_completion"]
+last_match_text_hash = "sha256:207d5abc31d86f4e78320981e396e0a50fd6df12b9a9fb51a71c8d3b79e0bfd3"
+canon_fetched_at = "2026-07-10T07:09:59Z"
+
+[["aristos:logical_log_truncate_crc_reseed_after_completion".accepted_matches]]
+canon_id = "logical_log_truncate_crc_reseed_after_completion"
+version = "v0.1.0"
+canonical_text = "the running CRC of the log is reseeded only after the truncate operation has completed durably"
+canon_version = "v0.1.0"
+confidence = 0.9999995376893536
+prefix_tier = "aristos:"
+backed_by = "differentially tested against another implementation"
+linked = "arta_ca1e4e378b30acb57cc56d73fd0bcf86"
+accepted_at = "2026-07-10T07:09:59Z"
+bound_at = "2026-07-10T07:09:59Z"
+
+["aristos:logical_log_truncate_crc_reseed_after_completion".accepted_matches.verification]
+coverage_level = "none"
 test_binaries = []
 
 ["aristos:wal_checkpoint_error_no_db_leak"]
@@ -136,7 +389,7 @@ bound_at = "2026-05-30T05:43:56Z"
 
 [savepoint_rollback_shape_and_bytes_consistent]
 last_match_text_hash = "sha256:9eb52c41e3fcf89d2515efa52befc82509297ce3c657585352714afe61147e87"
-canon_fetched_at = "2026-07-07T07:53:35.241472796Z"
+canon_fetched_at = "2026-07-10T07:09:09.698962846Z"
 
 [wal_checkpoint_backfill_crash_atomic]
 last_match_text_hash = "sha256:964113cb0dc5eb70d66767acf6391b0a93398867ba7eabf81a7364058b6b8747"
@@ -157,6 +410,25 @@ canon_fetched_at = "2026-05-30T05:43:33.980749Z"
 [wal_nbackfills_orders_with_recovery]
 last_match_text_hash = "sha256:7e7d1fd2ae298d6be58888acc49a0b7464f686bb0aa5725cf62e7459d3c59f42"
 canon_fetched_at = "2026-05-30T06:00:12.360964Z"
+
+[wal_protocol_correctness]
+last_match_text_hash = "sha256:9e70f3e012c13ec400044e473cb06d4935d943af34d40aa0e04d7acb7e3ada86"
+canon_fetched_at = "2026-07-10T07:09:09.698962846Z"
+
+[[wal_protocol_correctness.pending_matches]]
+canon_id = "wal_protocol_correctness"
+version = "v0.1.0"
+canonical_text = "the WAL subsystem maintains LSN monotonicity, frame commitment ordering, recovery idempotency, checkpoint safety, and group-commit atomicity"
+canon_version = "v0.1.0"
+confidence = 0.9521647919254752
+prefix_tier = "kanon:"
+disposition = "open"
+found_at = "2026-07-10T07:09:09.698962846Z"
+found_by = "aristo canon refresh"
+
+[wal_protocol_correctness.pending_matches.verification]
+coverage_level = "none"
+test_binaries = []
 
 [wal_truncate_atomic_under_concurrent_writers]
 last_match_text_hash = "sha256:3d260cf86a59e54d02ee3224cc3951b4c17aa0488e8be1109cf70e0912eef1ae"

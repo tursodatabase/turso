@@ -20,6 +20,11 @@ path = "lib.rs"
 default = ["fs", "uuid", "time", "json", "series", "encryption", "percentile"]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
+# Harness-side observability: turns on aristo's instrument surface so the
+# logical-log conformance DTs can read private LogicalLog state (header
+# version, pending running CRC) and construct LogRecords. Off by default;
+# production builds carry zero instrumentation.
+aristo-instr = ["aristo/aristo_instrument"]
 fs = ["turso_ext/vfs"]
 json = []
 uuid = ["dep:uuid"]

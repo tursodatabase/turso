@@ -400,6 +400,11 @@ pub struct SqliteSchemaBtreeIdentity {
 /// Identity of a sqlite_schema row version that refers to a B-tree-backed object.
 /// Schema rewrites that preserve this identity are metadata-only and should not be
 /// treated as create/drop lifecycle changes.
+#[aristo::intent(
+    "Recovery never replays a sqlite_schema delete as an empty payload; it keeps the row's pre-delete record, so every recovered schema row still has a decodable (type, rootpage)",
+    id = "mvcc_recovered_schema_record_wellformed",
+    verify = "full"
+)]
 pub fn sqlite_schema_btree_identity(version: &RowVersion) -> Option<SqliteSchemaBtreeIdentity> {
     if version.row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
         return None;
