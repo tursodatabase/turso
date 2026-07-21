@@ -148,9 +148,9 @@ fn generate_definition(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<String> 
     let table = tables[rng.random_range(0..tables.len())];
     match rng.random_range(0..12u32) {
         0..=2 => Some(projection(table, rng, false)),
-        3..=5 => Some(projection(table, rng, true)),
-        6..=8 => Some(aggregate(table, rng)),
-        9..=10 => Some(scalar_aggregate(table, rng)),
+        3..=4 => Some(projection(table, rng, true)),
+        5..=7 => Some(aggregate(table, rng)),
+        8..=9 => Some(scalar_aggregate(table, rng)),
         _ => join(&tables, rng).or_else(|| Some(projection(table, rng, true))),
     }
 }
@@ -308,15 +308,13 @@ fn scalar_aggregate(table: &Table, rng: &mut ChaCha8Rng) -> String {
 
 /// `SELECT l.a AS l_a, r.b AS r_b FROM t1 AS l JOIN t2 AS r ON l.j = r.k`
 ///
-/// Requires two distinct tables with a same-typed column pair (the IVM engine
-/// supports equijoins only). Returns `None` when no such pair exists.
+/// Picks any two tables (possibly the same one — self-joins exercise reading
+/// a table's delta and btree on both sides) with a same-typed column pair.
+/// Returns `None` when no such pair exists.
 fn join(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
-    if tables.len() < 2 {
-        return None;
-    }
     let mut pairs = Vec::new();
-    for (i, left) in tables.iter().enumerate() {
-        for right in tables.iter().skip(i + 1) {
+    for left in tables.iter() {
+        for right in tables.iter() {
             for lc in &left.columns {
                 for rc in &right.columns {
                     if lc.data_type == rc.data_type

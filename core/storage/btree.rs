@@ -2281,6 +2281,11 @@ impl BTreeCursor {
             let cell_count = contents.cell_count();
             if cell_count == 0 {
                 self.stack.set_cell_index(0);
+                // The cursor may still carry has_record=true from a position
+                // that a Delete has since removed; without clearing it,
+                // rowid()/record() would read the stale (physically intact
+                // but unreferenced) cell bytes of the emptied page.
+                self.set_has_record(false);
                 return Ok(IOResult::Done(SeekResult::NotFound));
             }
             let min_cell_idx = 0;
@@ -2500,6 +2505,9 @@ impl BTreeCursor {
             let contents = page.get_contents();
             let cell_count = contents.cell_count();
             if cell_count == 0 {
+                // See tablebtree_seek: clear any position that a Delete has
+                // since removed, so stale cell bytes cannot be read back.
+                self.set_has_record(false);
                 return Ok(IOResult::Done(SeekResult::NotFound));
             }
 

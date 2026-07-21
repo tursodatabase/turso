@@ -1934,6 +1934,53 @@ fn test_matview_read_your_own_writes(tmp_db: TempDatabase) -> anyhow::Result<()>
     Ok(())
 }
 
+/// A join pair introduced by both sides of the join changing in the same
+/// transaction is counted once: the dL x dR overlap term cancels the
+/// double-count from joining each side's delta against the other side's
+/// post-change btree.
+#[turso_macros::test(views)]
+fn test_matview_join_both_sides_one_txn(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE jl (id INTEGER PRIMARY KEY, k INTEGER, a TEXT)")?;
+    conn.execute("CREATE TABLE jr (id INTEGER PRIMARY KEY, k INTEGER, b TEXT)")?;
+    conn.execute(
+        "CREATE MATERIALIZED VIEW vj AS SELECT jl.a, jr.b FROM jl JOIN jr ON jl.k = jr.k",
+    )?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO jl VALUES (1, 5, 'l')")?;
+    conn.execute("INSERT INTO jr VALUES (1, 5, 'r')")?;
+    conn.execute("COMMIT")?;
+    let rows = limbo_exec_rows(&conn, "SELECT * FROM vj");
+    assert_eq!(
+        rows,
+        vec![vec![RValue::Text("l".into()), RValue::Text("r".into())]]
+    );
+
+    conn.execute("BEGIN")?;
+    conn.execute("UPDATE jl SET a = 'lx'")?;
+    conn.execute("UPDATE jr SET b = 'rx'")?;
+    conn.execute("COMMIT")?;
+    let rows = limbo_exec_rows(&conn, "SELECT * FROM vj");
+    assert_eq!(
+        rows,
+        vec![vec![RValue::Text("lx".into()), RValue::Text("rx".into())]]
+    );
+
+    conn.execute("BEGIN")?;
+    conn.execute("DELETE FROM jl")?;
+    conn.execute("DELETE FROM jr")?;
+    conn.execute("COMMIT")?;
+    let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM vj");
+    assert_eq!(rows, vec![vec![RValue::Integer(0)]]);
+
+    let rows = limbo_exec_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows, vec![vec![RValue::Text("ok".into())]]);
+
+    Ok(())
+}
+
 /// Aggregate view state (per-group payloads in the internal state table)
 /// must survive closing and reopening the database: maintenance after reopen
 /// resumes from the persisted state.

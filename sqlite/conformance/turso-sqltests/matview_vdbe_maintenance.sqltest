@@ -482,6 +482,150 @@ expect {
     1|1
 }
 
+# Two-table inner joins: rows are identified by their (left rowid, right
+# rowid) pair, and each side's changes are joined against the other side's
+# post-change state.
+test matview-vdbe-join-maintenance {
+    CREATE TABLE jl(id INTEGER PRIMARY KEY, k INTEGER, a TEXT);
+    CREATE TABLE jr(id INTEGER PRIMARY KEY, k INTEGER, b TEXT);
+    INSERT INTO jl VALUES (1, 10, 'l1'), (2, 20, 'l2');
+    INSERT INTO jr VALUES (1, 10, 'r1'), (2, 10, 'r2'), (3, 30, 'r3');
+    CREATE MATERIALIZED VIEW vj1 AS SELECT jl.a, jr.b FROM jl JOIN jr ON jl.k = jr.k;
+    SELECT 'pop', * FROM vj1 ORDER BY 1, 2, 3;
+    INSERT INTO jl VALUES (3, 30, 'l3');
+    DELETE FROM jr WHERE id = 2;
+    SELECT 'dml', * FROM vj1 ORDER BY 1, 2, 3;
+    UPDATE jl SET k = 30 WHERE id = 1;
+    SELECT 'mov', * FROM vj1 ORDER BY 1, 2, 3;
+    INSERT INTO jl VALUES (4, NULL, 'lnull');
+    INSERT INTO jr VALUES (4, NULL, 'rnull');
+    SELECT 'nul', COUNT(*) FROM vj1;
+}
+expect {
+    pop|l1|r1
+    pop|l1|r2
+    dml|l1|r1
+    dml|l3|r3
+    mov|l1|r3
+    mov|l3|r3
+    nul|2
+}
+
+# Both sides changing in one transaction exercises the dL x dR overlap term:
+# without it, a pair introduced by both sides would be double-counted.
+test matview-vdbe-join-both-sides-one-txn {
+    CREATE TABLE jl2(id INTEGER PRIMARY KEY, k INTEGER, a TEXT);
+    CREATE TABLE jr2(id INTEGER PRIMARY KEY, k INTEGER, b TEXT);
+    CREATE MATERIALIZED VIEW vj2 AS SELECT jl2.a, jr2.b FROM jl2 JOIN jr2 ON jl2.k = jr2.k;
+    BEGIN;
+    INSERT INTO jl2 VALUES (1, 5, 'l');
+    INSERT INTO jr2 VALUES (1, 5, 'r');
+    COMMIT;
+    SELECT 'ins', * FROM vj2;
+    BEGIN;
+    UPDATE jl2 SET a = 'lx';
+    UPDATE jr2 SET b = 'rx';
+    COMMIT;
+    SELECT 'upd', * FROM vj2;
+    BEGIN;
+    DELETE FROM jl2;
+    DELETE FROM jr2;
+    COMMIT;
+    SELECT 'del', COUNT(*) FROM vj2;
+}
+expect {
+    ins|l|r
+    upd|lx|rx
+    del|0
+}
+
+# Cartesian products (comma join) with WHERE, and expressions over both
+# sides.
+test matview-vdbe-join-cartesian {
+    CREATE TABLE jl3(x INTEGER);
+    CREATE TABLE jr3(y INTEGER);
+    INSERT INTO jl3 VALUES (1), (2);
+    INSERT INTO jr3 VALUES (10), (20);
+    CREATE MATERIALIZED VIEW vj3 AS SELECT x + y AS s FROM jl3, jr3 WHERE x + y > 11;
+    INSERT INTO jl3 VALUES (3);
+    SELECT * FROM vj3 ORDER BY s;
+}
+expect {
+    12
+    13
+    21
+    22
+    23
+}
+
+# Self-joins read the same table's delta and btree on both sides.
+test matview-vdbe-join-self {
+    CREATE TABLE js(id INTEGER PRIMARY KEY, mgr INTEGER, name TEXT);
+    INSERT INTO js VALUES (1, NULL, 'root'), (2, 1, 'mid');
+    CREATE MATERIALIZED VIEW vjs AS SELECT e.name, m.name AS mname FROM js AS e JOIN js AS m ON e.mgr = m.id;
+    INSERT INTO js VALUES (3, 2, 'leaf');
+    SELECT * FROM vjs ORDER BY 1;
+    DELETE FROM js WHERE id = 2;
+    SELECT COUNT(*) FROM vjs;
+}
+expect {
+    leaf|mid
+    mid|root
+    0
+}
+
+# SELECT * over a join expands both tables' columns; rollback discards the
+# captured deltas of both sides.
+test matview-vdbe-join-star-and-rollback {
+    CREATE TABLE jl4(x INTEGER);
+    CREATE TABLE jr4(y INTEGER);
+    INSERT INTO jl4 VALUES (1);
+    INSERT INTO jr4 VALUES (2);
+    CREATE MATERIALIZED VIEW vj4 AS SELECT * FROM jl4 JOIN jr4 ON jl4.x < jr4.y;
+    BEGIN;
+    INSERT INTO jl4 VALUES (0);
+    SELECT * FROM vj4 ORDER BY 1, 2;
+    ROLLBACK;
+    SELECT * FROM vj4 ORDER BY 1, 2;
+}
+expect {
+    0|2
+    1|2
+    1|2
+}
+
+# Dropping a join view cleans up its pair-map state table and index.
+test matview-vdbe-join-drop-clean {
+    CREATE TABLE jl5(x INTEGER);
+    CREATE TABLE jr5(y INTEGER);
+    INSERT INTO jl5 VALUES (1);
+    INSERT INTO jr5 VALUES (1);
+    CREATE MATERIALIZED VIEW vj5 AS SELECT x, y FROM jl5 JOIN jr5 ON x = y;
+    DROP VIEW vj5;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test matview-vdbe-join-outer-rejected {
+    CREATE TABLE jl6(x INTEGER);
+    CREATE TABLE jr6(y INTEGER);
+    CREATE MATERIALIZED VIEW bad6 AS SELECT x, y FROM jl6 LEFT JOIN jr6 ON x = y;
+}
+expect error {
+    materialized views with outer joins are not yet supported
+}
+
+test matview-vdbe-join-aggregate-rejected {
+    CREATE TABLE jl7(x INTEGER);
+    CREATE TABLE jr7(y INTEGER);
+    CREATE MATERIALIZED VIEW bad7 AS SELECT COUNT(*) FROM jl7 JOIN jr7 ON x = y;
+}
+expect error {
+    materialized views with aggregates over joins are not yet supported
+}
+
 # Shapes the VDBE codegen cannot maintain yet are rejected at translate time,
 # before the CREATE program allocates any btree pages.
 test matview-vdbe-rejected-create-is-clean {
