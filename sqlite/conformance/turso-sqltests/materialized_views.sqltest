@@ -1078,7 +1078,6 @@ expect {
 }
 
 # Test UNION queries in materialized views
-@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-simple {
     CREATE TABLE sales_online(id INTEGER, product TEXT, amount INTEGER);
     CREATE TABLE sales_store(id INTEGER, product TEXT, amount INTEGER);
@@ -1106,7 +1105,6 @@ expect {
     Mouse|25
 }
 
-@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-with-where {
     CREATE TABLE employees(id INTEGER, name TEXT, dept TEXT, salary INTEGER);
     CREATE TABLE contractors(id INTEGER, name TEXT, dept TEXT, rate INTEGER);
@@ -1132,7 +1130,6 @@ expect {
     Frank|Engineering|360000
 }
 
-@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-same-table-different-filters {
     CREATE TABLE orders(id INTEGER, customer_id INTEGER, product TEXT, amount INTEGER, status TEXT);
     INSERT INTO orders VALUES
@@ -1157,7 +1154,7 @@ expect {
     6|3|Chair|150
 }
 
-@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
+@skip "aggregate branches in compound SELECT views are not supported by the VDBE maintenance codegen yet"
 test matview-union-with-aggregation {
     CREATE TABLE q1_sales(product TEXT, quantity INTEGER, revenue INTEGER);
     CREATE TABLE q2_sales(product TEXT, quantity INTEGER, revenue INTEGER);
@@ -1183,7 +1180,7 @@ expect {
     Q2|105.0|21750.0
 }
 
-@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
+@skip "join branches in compound SELECT views are not supported by the VDBE maintenance codegen yet"
 test matview-union-with-join {
     CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, type TEXT);
     CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, amount INTEGER);
@@ -1220,7 +1217,6 @@ expect {
     Charlie|quote|2000
 }
 
-@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-distinct {
     CREATE TABLE active_users(id INTEGER, name TEXT, email TEXT);
     CREATE TABLE inactive_users(id INTEGER, name TEXT, email TEXT);
@@ -1247,7 +1243,6 @@ expect {
     5|Eve|eve@example.com
 }
 
-@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-complex-multiple-branches {
     CREATE TABLE products(id INTEGER, name TEXT, category TEXT, price INTEGER);
     INSERT INTO products VALUES
@@ -1283,7 +1278,6 @@ expect {
     Tablet|Electronics|600|PremiumElectronic
 }
 
-@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-maintenance-insert {
     CREATE TABLE t1(id INTEGER, value INTEGER);
     CREATE TABLE t2(id INTEGER, value INTEGER);
@@ -1313,7 +1307,6 @@ expect {
     6|600
 }
 
-@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-maintenance-delete {
     CREATE TABLE source1(id INTEGER PRIMARY KEY, data TEXT);
     CREATE TABLE source2(id INTEGER PRIMARY KEY, data TEXT);
@@ -1335,7 +1328,6 @@ expect {
     3
 }
 
-@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-maintenance-update {
     CREATE TABLE high_priority(id INTEGER PRIMARY KEY, task TEXT, priority INTEGER);
     CREATE TABLE normal_priority(id INTEGER PRIMARY KEY, task TEXT, priority INTEGER);
@@ -1360,7 +1352,6 @@ expect {
 }
 
 # Test UNION ALL with same table and different WHERE conditions
-@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-all-same-table {
     CREATE TABLE test(id INTEGER PRIMARY KEY, value INTEGER);
     INSERT INTO test VALUES (1, 10), (2, 20);
@@ -1378,7 +1369,6 @@ expect {
 }
 
 # Test UNION ALL preserves all rows in count
-@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-all-row-count {
     CREATE TABLE data(id INTEGER PRIMARY KEY, num INTEGER);
     INSERT INTO data VALUES (1, 5), (2, 15), (3, 25);
@@ -1394,7 +1384,6 @@ expect {
 }
 
 # Test UNION ALL with text columns and filtering
-@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-all-text-filter {
     CREATE TABLE items(id INTEGER PRIMARY KEY, category TEXT, price INTEGER);
     INSERT INTO items VALUES

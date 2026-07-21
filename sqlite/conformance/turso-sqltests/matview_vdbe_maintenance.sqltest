@@ -787,6 +787,105 @@ expect {
     shrunk|b|2
 }
 
+# UNION dedups across branches through a content-keyed state row whose
+# multiplicity counts copies: the view row survives while any branch still
+# produces the content.
+test matview-vdbe-union-maintenance {
+    CREATE TABLE ua(x INTEGER, s TEXT);
+    CREATE TABLE ub(y INTEGER, t TEXT);
+    INSERT INTO ua VALUES (1, 'a'), (2, 'both');
+    INSERT INTO ub VALUES (2, 'both'), (3, 'b');
+    CREATE MATERIALIZED VIEW vu1 AS SELECT x, s FROM ua UNION SELECT y, t FROM ub;
+    SELECT 'pop', * FROM vu1 ORDER BY 2, 3;
+    DELETE FROM ua WHERE x = 2;
+    SELECT 'one', * FROM vu1 ORDER BY 2, 3;
+    DELETE FROM ub WHERE y = 2;
+    SELECT 'gone', * FROM vu1 ORDER BY 2, 3;
+    BEGIN;
+    INSERT INTO ua VALUES (9, 'z');
+    INSERT INTO ub VALUES (9, 'z');
+    COMMIT;
+    SELECT 'txn', * FROM vu1 ORDER BY 2, 3;
+}
+expect {
+    pop|1|a
+    pop|2|both
+    pop|3|b
+    one|1|a
+    one|2|both
+    one|3|b
+    gone|1|a
+    gone|3|b
+    txn|1|a
+    txn|3|b
+    txn|9|z
+}
+
+# UNION ALL keeps duplicates: rows are identified by (branch, source rowid),
+# so per-branch updates and deletes hit the right copy.
+test matview-vdbe-union-all-maintenance {
+    CREATE TABLE uc(x INTEGER);
+    CREATE MATERIALIZED VIEW vu2 AS SELECT x FROM uc WHERE x < 5 UNION ALL SELECT x FROM uc WHERE x >= 0;
+    INSERT INTO uc VALUES (3), (7);
+    SELECT 'ins', * FROM vu2 ORDER BY 2;
+    UPDATE uc SET x = 4 WHERE x = 3;
+    SELECT 'upd', * FROM vu2 ORDER BY 2;
+    DELETE FROM uc WHERE x = 7;
+    SELECT 'del', * FROM vu2 ORDER BY 2;
+    BEGIN;
+    DELETE FROM uc;
+    ROLLBACK;
+    SELECT 'rb', * FROM vu2 ORDER BY 2;
+}
+expect {
+    ins|3
+    ins|3
+    ins|7
+    upd|4
+    upd|4
+    upd|7
+    del|4
+    del|4
+    rb|4
+    rb|4
+}
+
+# Dropping a union view cleans up its state table and index.
+test matview-vdbe-union-drop-clean {
+    CREATE TABLE ud(x INTEGER);
+    INSERT INTO ud VALUES (1);
+    CREATE MATERIALIZED VIEW vu3 AS SELECT x FROM ud UNION SELECT x + 1 FROM ud;
+    DROP VIEW vu3;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test matview-vdbe-union-arity-mismatch-rejected {
+    CREATE TABLE ue(x INTEGER, y INTEGER);
+    CREATE MATERIALIZED VIEW bad_u AS SELECT x FROM ue UNION ALL SELECT x, y FROM ue;
+}
+expect error {
+    SELECTs to the left and right of UNION ALL do not have the same number of result columns
+}
+
+test matview-vdbe-union-mixed-operators-rejected {
+    CREATE TABLE uf(x INTEGER);
+    CREATE MATERIALIZED VIEW bad_u2 AS SELECT x FROM uf UNION ALL SELECT x FROM uf UNION SELECT x FROM uf;
+}
+expect error {
+    materialized views with mixed UNION/UNION ALL compound SELECTs are not yet supported
+}
+
+test matview-vdbe-intersect-rejected {
+    CREATE TABLE ug(x INTEGER);
+    CREATE MATERIALIZED VIEW bad_u3 AS SELECT x FROM ug INTERSECT SELECT x FROM ug;
+}
+expect error {
+    materialized views with INTERSECT/EXCEPT compound SELECTs are not yet supported
+}
+
 # Shapes the VDBE codegen cannot maintain yet are rejected at translate time,
 # before the CREATE program allocates any btree pages.
 test matview-vdbe-rejected-create-is-clean {
