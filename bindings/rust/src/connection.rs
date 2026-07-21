@@ -142,7 +142,6 @@ impl Connection {
         let statement = Statement {
             conn: self.clone(),
             inner: Arc::new(Mutex::new(stmt)),
-            local_io_wait: Arc::new(Mutex::new(None)),
         };
         Ok(statement)
     }
@@ -156,7 +155,6 @@ impl Connection {
         let statement = Statement {
             conn: self.clone(),
             inner: Arc::new(Mutex::new(stmt)),
-            local_io_wait: Arc::new(Mutex::new(None)),
         };
         Ok(statement)
     }
@@ -169,7 +167,6 @@ impl Connection {
             let mut stmt = Statement {
                 conn: self.clone(),
                 inner: Arc::new(Mutex::new(stmt)),
-                local_io_wait: Arc::new(Mutex::new(None)),
             };
             let _ = stmt.execute(()).await?;
             sql = &sql[offset..];
