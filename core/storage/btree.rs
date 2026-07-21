@@ -9367,10 +9367,11 @@ fn _insert_into_cell(
                 turso_assert!(overflow_cell.index + 1 == cell_idx, "multiple overflow cells can only occur when a parent overflows during balancing as divider cells are inserted into it. those cells should always be in-order and sequential", { "page_id": page.id, "last_overflow_index": overflow_cell.index, "cell_idx": cell_idx, "cell_count": page.cell_count(), "overflow_count": page.overflow_cells.len() });
             }
         }
-        page.overflow_cells.push(OverflowCell {
+        let overflow_cell = OverflowCell {
             index: cell_idx,
-            payload: Pin::new(Vec::from(payload)),
-        });
+            payload: Pin::new(payload.try_to_vec()?),
+        };
+        page.overflow_cells.try_push(overflow_cell)?;
         return Ok(());
     }
     turso_assert_less_than_or_equal!(
@@ -9963,6 +9964,15 @@ mod tests {
             assert_alloc_vec(&cursor.reusable_cell_payload);
             assert_alloc_vec(&cursor.blob_cache.overflow_pages);
         }
+        fn assert_overflow_cell_buffers(
+            page: &crate::storage::pager::PageInner,
+            cell: &OverflowCell,
+        ) {
+            fn assert_alloc_payload(_: &Pin<crate::alloc::Vec<u8>>) {}
+
+            assert_alloc_vec(&page.overflow_cells);
+            assert_alloc_payload(&cell.payload);
+        }
 
         let balance = BalanceState::default();
         assert_alloc_vec(&balance.reusable_divider_buffers[0]);
@@ -9971,6 +9981,7 @@ mod tests {
         let integrity_check = IntegrityCheckState::new(0);
         assert_alloc_vec(&integrity_check.page_stack);
         let _ = assert_cursor_buffers;
+        let _ = assert_overflow_cell_buffers;
     }
 
     #[test]
