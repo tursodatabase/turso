@@ -17,11 +17,14 @@ mod cmath {
     pub fn log(x: f64) -> f64 {
         x.ln()
     }
+    // Use log10/log2 directly rather than log(x, base): the latter computes
+    // ln(x)/ln(base), which can be 1 ulp off from the dedicated functions
+    // SQLite calls, and e.g. mod() amplifies that into visible divergence.
     pub fn log10(x: f64) -> f64 {
-        x.log(10.)
+        x.log10()
     }
     pub fn log2(x: f64) -> f64 {
-        x.log(2.)
+        x.log2()
     }
     pub fn pow(x: f64, y: f64) -> f64 {
         x.powf(y)
@@ -1134,36 +1137,36 @@ impl Value {
         }
     }
 
+    /// Mirrors SQLite's logFunc: log(X) calls log10 directly, and log(B,X)
+    /// always computes log(X)/log(B). Special-casing base 2 or 10 to call
+    /// their dedicated logarithm functions looks more accurate but shifts
+    /// the result by 1 ulp relative to SQLite's ratio.
+    #[allow(unused_unsafe)]
     pub fn exec_math_log(&self, base: Option<&Value>) -> Value {
         let Some(f) = Numeric::from_value_strict(self).map(|v| v.to_f64()) else {
             return Value::Null;
         };
 
-        let base = match base.map(|value| Numeric::from_value_strict(value).map(|v| v.to_f64())) {
-            Some(Some(f)) => f,
-            Some(None) => return Value::Null,
-            None => 10.0,
-        };
-
-        if f <= 0.0 || base <= 0.0 || base == 1.0 {
+        if f <= 0.0 {
             return Value::Null;
         }
 
-        if base == 2.0 {
-            return Value::from_f64(libm::log2(f));
-        } else if base == 10.0 {
-            return Value::from_f64(libm::log10(f));
+        let base = match base.map(|value| Numeric::from_value_strict(value).map(|v| v.to_f64())) {
+            Some(Some(base)) => base,
+            Some(None) => return Value::Null,
+            None => return Value::from_f64(unsafe { cmath::log10(f) }),
         };
 
-        let log_x = libm::log(f);
-        let log_base = libm::log(base);
+        if base <= 0.0 {
+            return Value::Null;
+        }
 
+        let log_base = unsafe { cmath::log(base) };
         if log_base <= 0.0 {
             return Value::Null;
         }
 
-        let result = log_x / log_base;
-        Value::from_f64(result)
+        Value::from_f64(unsafe { cmath::log(f) } / log_base)
     }
 
     pub fn exec_add(&self, rhs: &Value) -> Value {

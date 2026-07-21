@@ -4174,6 +4174,32 @@ mod fuzz_tests {
         }
     }
 
+    /// Minimized regressions from math_expression_fuzz_run. Results must match
+    /// SQLite bit-for-bit: log10/log2 must call the dedicated functions rather
+    /// than computing ln(x)/ln(base) (1 ulp apart), and two-arg log(B,X) must
+    /// compute log(X)/log(B) exactly like SQLite's logFunc instead of
+    /// special-casing bases 2 and 10. mod() with a huge dividend amplifies any
+    /// 1-ulp difference in the modulus far beyond fuzzer tolerance.
+    #[turso_macros::test(mvcc)]
+    pub fn math_ex(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        for query in [
+            "SELECT log10(2.0)",
+            "SELECT log2(3.0)",
+            "SELECT log(5.0)",
+            "SELECT log(2.0, 3.0)",
+            "SELECT log(10.0, 7.0)",
+            "SELECT log(0.5, 3.0)",
+            "SELECT log(1.0, 3.0)",
+            "SELECT mod(cosh(-2.0 - (0.5) * (-2.0 / 2.0 + (0.5) - degrees(1.0))), log10(2.0))",
+        ] {
+            helpers::assert_differential(&limbo_conn, &sqlite_conn, query, "");
+        }
+    }
+
     #[turso_macros::test(mvcc)]
     pub fn math_expression_fuzz_run(db: TempDatabase) {
         let (mut rng, seed) = helpers::init_fuzz_test("math_expression_fuzz_run");
