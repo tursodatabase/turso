@@ -3815,30 +3815,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 use_pushed_change_hint_for_local_replay(stream_kind, raw_page_replay_on_sql_conn);
 
             // Phase 4: as now DB has all data from remote - let's read pull generation and last change id for current client
-            let (remote_pull_gen, remote_last_change_id) = if replace_base_pages {
-                tracing::info!(
-                    "apply_changes(path={}): using local acknowledged high-water mark for replace-base replay floor: pull_gen={} change_id={:?}",
-                    self.main_db_path,
-                    local_pull_gen,
-                    local_last_change_id,
-                );
-                (
-                    local_pull_gen,
-                    if no_checkpoint_replace_base {
-                        None
-                    } else {
-                        local_last_change_id
-                    },
-                )
-            } else {
+            let (remote_pull_gen, remote_last_change_id) =
                 read_last_change_id(coro, phase_conn, &self.client_unique_id)
                     .await
                     .map_err(|error| {
                         Error::DatabaseSyncEngineError(format!(
                             "failed to read last_change_id after remote apply: {error}",
                         ))
-                    })?
-            };
+                    })?;
 
             if remote_pull_gen > local_pull_gen {
                 return Err(Error::DatabaseSyncEngineError(format!(
