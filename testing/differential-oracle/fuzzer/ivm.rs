@@ -146,13 +146,55 @@ fn generate_definition(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<String> 
     }
 
     let table = tables[rng.random_range(0..tables.len())];
-    match rng.random_range(0..12u32) {
+    match rng.random_range(0..13u32) {
         0..=2 => Some(projection(table, rng, false)),
         3..=4 => Some(projection(table, rng, true)),
         5..=7 => Some(aggregate(table, rng)),
         8..=9 => Some(scalar_aggregate(table, rng)),
+        10 => union(&tables, rng),
         _ => join(&tables, rng).or_else(|| Some(projection(table, rng, true))),
     }
+}
+
+/// `SELECT c FROM t1 [WHERE ...] UNION [ALL] SELECT c FROM t2 [WHERE ...]`
+///
+/// Picks two (possibly identical) tables with same-typed columns.
+fn union(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
+    let mut pairs = Vec::new();
+    for left in tables.iter() {
+        for right in tables.iter() {
+            for lc in &left.columns {
+                for rc in &right.columns {
+                    if lc.data_type == rc.data_type {
+                        pairs.push((*left, *right, lc, rc));
+                    }
+                }
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    let (left, right, lc, rc) = pairs[rng.random_range(0..pairs.len())];
+    let op = if rng.random_bool(0.5) {
+        "UNION"
+    } else {
+        "UNION ALL"
+    };
+    let mut sql = format!("SELECT {} FROM {}", quoted(&lc.name), quoted(&left.name));
+    if rng.random_bool(0.4) {
+        let _ = write!(sql, " WHERE {}", predicate(lc, rng));
+    }
+    let _ = write!(
+        sql,
+        " {op} SELECT {} FROM {}",
+        quoted(&rc.name),
+        quoted(&right.name)
+    );
+    if rng.random_bool(0.4) {
+        let _ = write!(sql, " WHERE {}", predicate(rc, rng));
+    }
+    Some(sql)
 }
 
 fn quoted(name: &str) -> String {
