@@ -886,6 +886,92 @@ expect error {
     materialized views with INTERSECT/EXCEPT compound SELECTs are not yet supported
 }
 
+# Three-way joins: maintenance runs one delta phase per non-empty subset of
+# the joined tables (seven for three tables), keyed by the rowid triple.
+test matview-vdbe-three-way-join {
+    CREATE TABLE w1(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE TABLE w2(id INTEGER PRIMARY KEY, w1_id INTEGER, v TEXT);
+    CREATE TABLE w3(id INTEGER PRIMARY KEY, w2_id INTEGER, v TEXT);
+    INSERT INTO w1 VALUES (1, 'a'), (2, 'b');
+    INSERT INTO w2 VALUES (1, 1, 'x'), (2, 2, 'y');
+    INSERT INTO w3 VALUES (1, 1, 'p'), (2, 1, 'q'), (3, 2, 'r');
+    CREATE MATERIALIZED VIEW v3w AS SELECT w1.v, w2.v, w3.v FROM w1 JOIN w2 ON w1.id = w2.w1_id JOIN w3 ON w2.id = w3.w2_id;
+    SELECT 'pop', * FROM v3w ORDER BY 2, 3, 4;
+    DELETE FROM w2 WHERE id = 1;
+    SELECT 'mid', * FROM v3w ORDER BY 2, 3, 4;
+    BEGIN;
+    INSERT INTO w1 VALUES (3, 'c');
+    INSERT INTO w2 VALUES (3, 3, 'z');
+    INSERT INTO w3 VALUES (4, 3, 's');
+    COMMIT;
+    SELECT 'txn', * FROM v3w ORDER BY 2, 3, 4;
+}
+expect {
+    pop|a|x|p
+    pop|a|x|q
+    pop|b|y|r
+    mid|b|y|r
+    txn|b|y|r
+    txn|c|z|s
+}
+
+# Cross-generation tuples in a three-way join: rotate two tables' join keys
+# in one transaction so only mixed-generation combinations match; the signed
+# multiplicity nets them out to zero instead of leaving phantom rows.
+test matview-vdbe-three-way-cross-generation {
+    CREATE TABLE x1(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE x2(id INTEGER PRIMARY KEY, k INTEGER, j INTEGER);
+    CREATE TABLE x3(id INTEGER PRIMARY KEY, j INTEGER);
+    INSERT INTO x1 VALUES (1, 20);
+    INSERT INTO x2 VALUES (1, 10, 5);
+    INSERT INTO x3 VALUES (1, 5);
+    CREATE MATERIALIZED VIEW v3x AS SELECT x1.k, x2.j FROM x1 JOIN x2 ON x1.k = x2.k JOIN x3 ON x2.j = x3.j;
+    BEGIN;
+    UPDATE x1 SET k = 10;
+    UPDATE x2 SET k = 20;
+    COMMIT;
+    SELECT 'phantom', COUNT(*) FROM v3x;
+    UPDATE x2 SET k = 10;
+    SELECT 'match', * FROM v3x;
+    PRAGMA integrity_check;
+}
+expect {
+    phantom|0
+    match|10|5
+    ok
+}
+
+# Four tables is the cap (fifteen delta phases).
+test matview-vdbe-four-way-join {
+    CREATE TABLE f1(a INTEGER);
+    CREATE TABLE f2(a INTEGER);
+    CREATE TABLE f3(a INTEGER);
+    CREATE TABLE f4(a INTEGER);
+    INSERT INTO f1 VALUES (1);
+    INSERT INTO f2 VALUES (1);
+    INSERT INTO f3 VALUES (1);
+    INSERT INTO f4 VALUES (1), (2);
+    CREATE MATERIALIZED VIEW v4w AS SELECT COUNT(*) AS c FROM f1 JOIN f2 ON f1.a = f2.a JOIN f3 ON f2.a = f3.a JOIN f4 ON f3.a = f4.a;
+    SELECT * FROM v4w;
+    INSERT INTO f4 VALUES (1);
+    SELECT * FROM v4w;
+}
+expect {
+    1
+    2
+}
+
+test matview-vdbe-five-way-join-rejected {
+    CREATE TABLE g1(a INTEGER);
+    CREATE TABLE g2(a INTEGER);
+    CREATE TABLE g3(a INTEGER);
+    CREATE TABLE g4(a INTEGER);
+    CREATE MATERIALIZED VIEW bad5 AS SELECT g1.a FROM g1 JOIN g2 ON g1.a = g2.a JOIN g3 ON g2.a = g3.a JOIN g4 ON g3.a = g4.a JOIN g1 AS g5 ON g4.a = g5.a;
+}
+expect error {
+    materialized views with joins over more than 4 tables are not yet supported
+}
+
 # Shapes the VDBE codegen cannot maintain yet are rejected at translate time,
 # before the CREATE program allocates any btree pages.
 test matview-vdbe-rejected-create-is-clean {

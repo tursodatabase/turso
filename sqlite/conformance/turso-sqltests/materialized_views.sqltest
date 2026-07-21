@@ -603,7 +603,6 @@ expect {
     Bob|250
 }
 
-@skip "joins over more than two tables are not supported by the VDBE maintenance codegen yet"
 test matview-three-way-join {
     CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, city TEXT);
     CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, product_id INTEGER, quantity INTEGER);
@@ -624,7 +623,6 @@ expect {
     Bob|Widget|2
 }
 
-@skip "joins over more than two tables are not supported by the VDBE maintenance codegen yet"
 test matview-three-way-join-with-aggregation {
     CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
     CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, product_id INTEGER, quantity INTEGER);
@@ -643,9 +641,9 @@ test matview-three-way-join-with-aggregation {
     SELECT * FROM sales_totals ORDER BY customer_name, product_name;
 }
 expect {
-    Alice|Gadget|3.0|60.0
-    Alice|Widget|9.0|90.0
-    Bob|Widget|2.0|20.0
+    Alice|Gadget|3|60
+    Alice|Widget|9|90
+    Bob|Widget|2|20
 }
 
 test matview-join-incremental-insert {
@@ -922,7 +920,6 @@ expect {
     Bob|Test
 }
 
-@skip "joins over more than two tables are not supported by the VDBE maintenance codegen yet"
 test matview-three-way-incremental {
     CREATE TABLE students(id INTEGER PRIMARY KEY, name TEXT, major TEXT);
     CREATE TABLE courses(id INTEGER PRIMARY KEY, name TEXT, department TEXT, credits INTEGER);
