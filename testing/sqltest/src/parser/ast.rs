@@ -13,11 +13,13 @@ pub enum Backend {
     Cli,
     /// JavaScript bindings backend
     Js,
+    /// PostgreSQL wire-protocol backend (tursopg server)
+    Pg,
 }
 
 impl Backend {
     /// All known backend variants
-    pub const ALL: &'static [Backend] = &[Backend::Rust, Backend::Cli, Backend::Js];
+    pub const ALL: &'static [Backend] = &[Backend::Rust, Backend::Cli, Backend::Js, Backend::Pg];
 }
 
 impl Display for Backend {
@@ -26,6 +28,7 @@ impl Display for Backend {
             Backend::Rust => write!(f, "rust"),
             Backend::Cli => write!(f, "cli"),
             Backend::Js => write!(f, "js"),
+            Backend::Pg => write!(f, "pg"),
         }
     }
 }
@@ -38,8 +41,9 @@ impl FromStr for Backend {
             "rust" => Ok(Backend::Rust),
             "cli" => Ok(Backend::Cli),
             "js" => Ok(Backend::Js),
+            "pg" => Ok(Backend::Pg),
             _ => Err(format!(
-                "unknown backend '{s}', valid backends are: rust, cli, js"
+                "unknown backend '{s}', valid backends are: rust, cli, js, pg"
             )),
         }
     }

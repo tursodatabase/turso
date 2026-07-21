@@ -61,5 +61,9 @@ turso = { workspace = true, features = ["test_helper"] }
 # Turso SQL parser (for splitting multi-statement SQL)
 turso_parser = { workspace = true }
 
+# PostgreSQL wire-protocol client (for the pg backend, which drives a
+# spawned tursopg server over TCP)
+turso_pg_client = { workspace = true }
+
 [dev-dependencies]
 pretty_assertions = "1"

@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod js;
+pub mod pg;
 pub mod rust;
 
 use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};

@@ -74,6 +74,10 @@ test-sqltest-cli:
 	@make -C sqlite/conformance run-cli
 .PHONY: test-sqltest-cli
 
+test-sqltest-pg:
+	@make -C postgres/conformance run
+.PHONY: test-sqltest-pg
+
 test-extensions: build uv-sync-test
 	RUST_LOG=$(RUST_LOG) uv run --project limbo_test test-extensions
 .PHONY: test-extensions
