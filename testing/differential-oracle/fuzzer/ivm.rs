@@ -173,14 +173,19 @@ fn column_subset<'t>(table: &'t Table, rng: &mut ChaCha8Rng) -> Vec<&'t ColumnDe
     }
 }
 
-/// `SELECT cols FROM t [WHERE pred]`
+/// `SELECT [DISTINCT] cols FROM t [WHERE pred]`
 fn projection(table: &Table, rng: &mut ChaCha8Rng, with_filter: bool) -> String {
     let cols = column_subset(table, rng)
         .iter()
         .map(|c| quoted(&c.name))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut sql = format!("SELECT {cols} FROM {}", quoted(&table.name));
+    let distinct = if rng.random_bool(0.25) {
+        "DISTINCT "
+    } else {
+        ""
+    };
+    let mut sql = format!("SELECT {distinct}{cols} FROM {}", quoted(&table.name));
     if with_filter {
         let col = &table.columns[rng.random_range(0..table.columns.len())];
         let _ = write!(sql, " WHERE {}", predicate(col, rng));
