@@ -191,7 +191,8 @@ impl MaterializedViewCursor {
                             next_synthetic_rowid: SYNTHETIC_ROWID_BASE,
                         }
                     }
-                    crate::incremental::vdbe_maintenance::ViewShape::GroupAggregate { .. } => {
+                    crate::incremental::vdbe_maintenance::ViewShape::GroupAggregate { .. }
+                    | crate::incremental::vdbe_maintenance::ViewShape::Join { .. } => {
                         // Recompute: the defining query runs on this
                         // connection and therefore sees the transaction's
                         // uncommitted base-table changes. prepare_internal
