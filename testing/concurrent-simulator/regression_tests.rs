@@ -196,24 +196,49 @@ fn count_test_rows(whopper: &mut MultiprocessWhopper, worker_idx: usize) -> i64 
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn truncate_checkpoint_until_stable(whopper: &mut MultiprocessWhopper, connection_idx: usize) {
-    for _ in 0..32 {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+    let started = std::time::Instant::now();
+    loop {
         let result = whopper
             .execute_sql_direct(connection_idx, "PRAGMA wal_checkpoint(TRUNCATE)")
             .expect("run TRUNCATE checkpoint");
-        match result {
-            Ok(_) => return,
+        let last_state = match result {
+            Ok(_) => {
+                let snapshot = whopper
+                    .shared_wal_snapshot_direct(connection_idx)
+                    .expect("read shared WAL snapshot after TRUNCATE checkpoint")
+                    .expect("shared WAL snapshot should exist after TRUNCATE checkpoint");
+                if snapshot.max_frame == 0 {
+                    return;
+                }
+                format!(
+                    "checkpoint returned successfully but WAL max_frame remained {}",
+                    snapshot.max_frame
+                )
+            }
             Err(
-                LimboError::Busy
+                err @ (LimboError::Busy
                 | LimboError::BusySnapshot
                 | LimboError::SchemaUpdated
                 | LimboError::SchemaConflict
                 | LimboError::TableLocked
-                | LimboError::OutOfMemory,
-            ) => continue,
+                | LimboError::OutOfMemory),
+            ) => format!("checkpoint returned {err}"),
             Err(err) => panic!("TRUNCATE checkpoint should stabilize: {err}"),
+        };
+
+        let elapsed = started.elapsed();
+        if elapsed >= TIMEOUT {
+            panic!(
+                "TRUNCATE checkpoint did not reset the WAL generation within {TIMEOUT:?}; last state: {last_state}"
+            );
         }
+
+        std::thread::yield_now();
+        std::thread::sleep(RETRY_BACKOFF.min(TIMEOUT.saturating_sub(elapsed)));
     }
-    panic!("TRUNCATE checkpoint did not stabilize after transient multiprocess errors");
 }
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
