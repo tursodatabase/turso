@@ -5631,6 +5631,32 @@ pub struct IndexColumn {
     pub expr: Option<Box<Expr>>,
 }
 
+impl IndexColumn {
+    /// Returns a default column with the given name and position.
+    pub fn new(name: impl ToString, pos_in_table: usize) -> Self {
+        Self {
+            name: name.to_string(),
+            order: SortOrder::Asc,
+            pos_in_table,
+            collation: None,
+            default: None,
+            expr: None,
+        }
+    }
+
+    /// Similar to [IndexColumn::new], but returns a 0-ordered sequence of columns.
+    pub fn new_many(names: impl IntoIterator<Item = impl ToString>) -> impl Iterator<Item = Self> {
+        names.into_iter().enumerate().map(|(i, name)| Self {
+            name: name.to_string(),
+            order: SortOrder::Asc,
+            pos_in_table: i,
+            collation: None,
+            default: None,
+            expr: None,
+        })
+    }
+}
+
 impl Index {
     pub fn from_sql(
         syms: &SymbolTable,

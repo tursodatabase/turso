@@ -11,8 +11,6 @@ use super::{
         write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
     },
 };
-#[cfg(test)]
-use crate::alloc::TursoIteratorExt;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::inject_io_yield;
@@ -9776,7 +9774,6 @@ mod tests {
     };
     use sorted_vec::SortedVec;
     use test_log::test;
-    use turso_parser::ast::SortOrder;
 
     use super::*;
     use crate::{
@@ -10813,17 +10810,8 @@ mod tests {
             let index_def = Index {
                 name: "testindex".to_string(),
                 where_clause: None,
-                columns: (0..10)
-                    .map(|i| IndexColumn {
-                        name: format!("test{i}"),
-                        order: SortOrder::Asc,
-                        collation: None,
-                        pos_in_table: i,
-                        default: None,
-                        expr: None,
-                    })
-                    .try_collect()
-                    .unwrap(),
+                columns: IndexColumn::new_many((0..10).map(|i| format!("test{i}")))
+                    .collect::<Vec<_>>(),
                 table_name: "test".to_string(),
                 root_page: index_root_page,
                 unique: false,
@@ -10996,14 +10984,7 @@ mod tests {
             let index_def = Index {
                 name: "testindex".to_string(),
                 where_clause: None,
-                columns: crate::alloc::vec![IndexColumn {
-                    name: "testcol".to_string(),
-                    order: SortOrder::Asc,
-                    collation: None,
-                    pos_in_table: 0,
-                    default: None,
-                    expr: None,
-                }],
+                columns: IndexColumn::new_many(vec!["testcol"]).collect::<Vec<_>>(),
                 table_name: "test".to_string(),
                 root_page: index_root_page,
                 unique: false,
