@@ -3161,18 +3161,15 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 }
                 self.set_data_section(&data[content_size..]);
                 let text_data = &data[..content_size];
-                // SAFETY: TEXT serial type contains valid UTF-8
-                let text_str = if cfg!(debug_assertions) {
-                    match std::str::from_utf8(text_data) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Some(Err(LimboError::InternalError(format!(
-                                "Invalid UTF-8 in TEXT serial type: {e}"
-                            ))));
-                        }
-                    }
-                } else {
-                    unsafe { std::str::from_utf8_unchecked(text_data) }
+                let Ok(text_str) = simdutf8::basic::from_utf8(text_data) else {
+                    mark_unlikely();
+                    return Some(crate::with_value_blob_allocation_site!(RecordDecode, {
+                        let blob = match crate::types::value_blob_from_slice(text_data) {
+                            Ok(blob) => blob,
+                            Err(err) => return Some(Err(err.into())),
+                        };
+                        dest.set_blob(blob)
+                    }));
                 };
                 match dest {
                     Register::Value(Value::Text(existing_text)) => {
