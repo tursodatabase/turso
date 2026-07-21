@@ -90,6 +90,15 @@ pub fn translate_create_materialized_view(
     })?;
     let view_columns = view_column_schema.flat_columns();
 
+    // The classified shape decides what internal storage the view needs:
+    // filter/project views are maintained purely in the view btree, while
+    // GROUP BY views also persist per-group aggregate state.
+    let shape = crate::incremental::vdbe_maintenance::classify_view(select_stmt)?;
+    let needs_state_table = matches!(
+        shape,
+        crate::incremental::vdbe_maintenance::ViewShape::GroupAggregate { .. }
+    );
+
     // Reconstruct the SQL string for storage
     let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);
 
@@ -103,15 +112,19 @@ pub fn translate_create_materialized_view(
         flags: CreateBTreeFlags::new_table(),
     });
 
-    // Create a second btree for DBSP operator state (e.g., aggregate state)
-    // This is stored as a hidden table: __turso_internal_dbsp_state_<view_name>
-    let dbsp_state_root_reg = program.alloc_register();
-
-    program.emit_insn(Insn::CreateBtree {
-        db: database_id,
-        root: dbsp_state_root_reg,
-        flags: CreateBTreeFlags::new_table(),
-    });
+    // Btree for the per-group aggregate state, stored as a hidden table:
+    // __turso_internal_dbsp_state_v<version>_<view_name>
+    let dbsp_state_root_reg = if needs_state_table {
+        let reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: database_id,
+            root: reg,
+            flags: CreateBTreeFlags::new_table(),
+        });
+        Some(reg)
+    } else {
+        None
+    };
 
     // Create a proper BTreeTable for the cursor with the actual view columns
     let view_table = Arc::new(BTreeTable::new(
@@ -186,75 +199,71 @@ pub fn translate_create_materialized_view(
         Some(sql),
     )?;
 
-    // Add the DBSP state table to sqlite_master (required for materialized views)
-    // Include the version number in the table name
-    let dbsp_table_name = ast::Name::exact(format!(
-        "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"
-    ));
-    let dbsp_table_ident = dbsp_table_name.as_ident();
-    // The element_id column uses SQLite's dynamic typing system to store different value types:
-    // - For hash-based operators (joins, filters): stores INTEGER hash values or rowids
-    // - For future MIN/MAX operators: stores the actual values being compared (INTEGER, REAL, TEXT, BLOB)
-    // SQLite's type affinity and sorting rules ensure correct ordering within each operator's data
-    let dbsp_sql = format!(
-        "CREATE TABLE {dbsp_table_ident} (\
-         operator_id INTEGER NOT NULL, \
-         zset_id BLOB NOT NULL, \
-         element_id BLOB NOT NULL, \
-         value BLOB, \
-         weight INTEGER NOT NULL, \
-         PRIMARY KEY (operator_id, zset_id, element_id)\
-        )"
-    );
+    // GROUP BY views persist per-group aggregate state in a hidden, typed
+    // table (group keys, the group's view rowid, and each aggregate's state
+    // payload), with the PRIMARY KEY over the group columns providing the
+    // group-lookup index.
+    let mut parse_schema_names = vec![escape_sql_string_literal(&normalized_view_name)];
+    if let Some(dbsp_state_root_reg) = dbsp_state_root_reg {
+        let dbsp_table_name = ast::Name::exact(format!(
+            "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"
+        ));
+        let dbsp_table_ident = dbsp_table_name.as_ident();
+        let dbsp_sql = crate::incremental::vdbe_maintenance::aggregate_state_table_sql(
+            &dbsp_table_ident,
+            &shape,
+        )?;
 
-    emit_schema_entry(
-        program,
-        resolver,
-        sqlite_schema_cursor_id,
-        None, // cdc_table_cursor_id
-        SchemaEntryType::Table,
-        dbsp_table_name.as_str(),
-        dbsp_table_name.as_str(),
-        dbsp_state_root_reg, // Root for DBSP state table
-        Some(dbsp_sql),
-    )?;
+        emit_schema_entry(
+            program,
+            resolver,
+            sqlite_schema_cursor_id,
+            None, // cdc_table_cursor_id
+            SchemaEntryType::Table,
+            dbsp_table_name.as_str(),
+            dbsp_table_name.as_str(),
+            dbsp_state_root_reg, // Root for DBSP state table
+            Some(dbsp_sql),
+        )?;
 
-    // Create automatic primary key index for the DBSP table
-    // Since the table has PRIMARY KEY (operator_id, zset_id, element_id), we need an index
-    let dbsp_index_root_reg = program.alloc_register();
-    program.emit_insn(Insn::CreateBtree {
-        db: database_id,
-        root: dbsp_index_root_reg,
-        flags: CreateBTreeFlags::new_index(),
-    });
+        // Automatic primary-key index over the group columns.
+        let dbsp_index_root_reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: database_id,
+            root: dbsp_index_root_reg,
+            flags: CreateBTreeFlags::new_index(),
+        });
 
-    // Register the index in sqlite_schema
-    let dbsp_index_name = format!(
-        "{}{}_1",
-        PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
-        &dbsp_table_name.as_str()
-    );
-    emit_schema_entry(
-        program,
-        resolver,
-        sqlite_schema_cursor_id,
-        None, // cdc_table_cursor_id
-        SchemaEntryType::Index,
-        &dbsp_index_name,
-        dbsp_table_name.as_str(),
-        dbsp_index_root_reg,
-        None, // Automatic indexes don't store SQL
-    )?;
+        let dbsp_index_name = format!(
+            "{}{}_1",
+            PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+            &dbsp_table_name.as_str()
+        );
+        emit_schema_entry(
+            program,
+            resolver,
+            sqlite_schema_cursor_id,
+            None, // cdc_table_cursor_id
+            SchemaEntryType::Index,
+            &dbsp_index_name,
+            dbsp_table_name.as_str(),
+            dbsp_index_root_reg,
+            None, // Automatic indexes don't store SQL
+        )?;
 
-    // Parse schema to load the new view and DBSP state table
-    let escaped_view_name = escape_sql_string_literal(&normalized_view_name);
-    let escaped_dbsp_table_name = escape_sql_string_literal(dbsp_table_name.as_str());
-    let escaped_dbsp_index_name = escape_sql_string_literal(&dbsp_index_name);
+        parse_schema_names.push(escape_sql_string_literal(dbsp_table_name.as_str()));
+        parse_schema_names.push(escape_sql_string_literal(&dbsp_index_name));
+    }
+
+    // Parse schema to load the new view (and its state table, if any)
+    let where_clause = parse_schema_names
+        .iter()
+        .map(|name| format!("name = '{name}'"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
-        where_clause: Some(format!(
-            "name = '{escaped_view_name}' OR name = '{escaped_dbsp_table_name}' OR name = '{escaped_dbsp_index_name}'"
-        )),
+        where_clause: Some(where_clause),
     });
 
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);

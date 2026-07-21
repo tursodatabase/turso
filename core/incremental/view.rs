@@ -17,48 +17,52 @@ use turso_parser::{
 /// internal state table name (`__turso_internal_dbsp_state_v<N>_<view>`).
 /// Views created under a different version are unusable and must be
 /// recreated.
-pub const DBSP_CIRCUIT_VERSION: u32 = 1;
+///
+/// v2: maintenance compiled to VDBE programs. Filter/project views have no
+/// state table at all; GROUP BY views use a typed state table (group keys,
+/// view rowid, aggregate payloads) instead of v1's generic blob layout.
+pub const DBSP_CIRCUIT_VERSION: u32 = 2;
 
-/// The automatic primary-key index of a view's internal state table.
-pub fn create_dbsp_state_index(root_page: i64) -> crate::schema::Index {
+/// The automatic primary-key index of a view's internal state table, derived
+/// from the state table's PRIMARY KEY (the group columns).
+pub fn create_dbsp_state_index(
+    root_page: i64,
+    state_table: &BTreeTable,
+) -> Result<crate::schema::Index> {
     use crate::schema::{Index, IndexColumn};
-    Index {
+    let mut columns = Vec::with_capacity(state_table.primary_key_columns.len());
+    for (name, order) in &state_table.primary_key_columns {
+        let pos_in_table = state_table
+            .columns()
+            .iter()
+            .position(|c| c.name.as_deref() == Some(name.as_str()))
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "state table {} primary key column {name} not found",
+                    state_table.name
+                ))
+            })?;
+        columns.push(IndexColumn {
+            name: name.clone(),
+            order: *order,
+            collation: None,
+            pos_in_table,
+            default: None,
+            expr: None,
+        });
+    }
+    Ok(Index {
         name: "dbsp_state_pk".to_string(),
-        table_name: "dbsp_state".to_string(),
+        table_name: state_table.name.clone(),
         root_page,
-        columns: crate::alloc::vec![
-            IndexColumn {
-                name: "operator_id".to_string(),
-                order: turso_parser::ast::SortOrder::Asc,
-                collation: None,
-                pos_in_table: 0,
-                default: None,
-                expr: None,
-            },
-            IndexColumn {
-                name: "zset_id".to_string(),
-                order: turso_parser::ast::SortOrder::Asc,
-                collation: None,
-                pos_in_table: 1,
-                default: None,
-                expr: None,
-            },
-            IndexColumn {
-                name: "element_id".to_string(),
-                order: turso_parser::ast::SortOrder::Asc,
-                collation: None,
-                pos_in_table: 2,
-                default: None,
-                expr: None,
-            },
-        ],
+        columns,
         unique: true,
         ephemeral: false,
         has_rowid: true,
         where_clause: None,
         index_method: None,
         on_conflict: None,
-    }
+    })
 }
 
 /// Per-connection transaction state for incremental views

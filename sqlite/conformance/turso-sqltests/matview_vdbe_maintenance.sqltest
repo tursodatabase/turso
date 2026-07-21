@@ -93,15 +93,102 @@ expect {
     0
 }
 
+# GROUP BY views with invertible aggregates: populated, then maintained
+# through inserts, deletes, and group-moving updates.
+test matview-vdbe-aggregate-maintenance {
+    CREATE TABLE t8(g TEXT, x INTEGER, y REAL);
+    INSERT INTO t8 VALUES ('a', 10, 1.5), ('a', 20, 2.5), ('b', 5, 0.5);
+    CREATE MATERIALIZED VIEW v8 AS SELECT g, COUNT(*) AS cnt, SUM(x) AS sx, AVG(y) AS ay FROM t8 GROUP BY g;
+    INSERT INTO t8 VALUES ('b', 7, 1.0), ('c', 1, 9.0);
+    DELETE FROM t8 WHERE g = 'a' AND x = 10;
+    UPDATE t8 SET g = 'b' WHERE g = 'c';
+    SELECT * FROM v8 ORDER BY g;
+}
+expect {
+    a|1|20|2.5
+    b|3|13|3.5
+}
+
+# A group whose rows are all removed disappears from the view.
+test matview-vdbe-aggregate-group-disappears {
+    CREATE TABLE t9(g TEXT, x INTEGER);
+    INSERT INTO t9 VALUES ('a', 1), ('b', 2), ('b', 3);
+    CREATE MATERIALIZED VIEW v9 AS SELECT g, COUNT(*) AS cnt FROM t9 GROUP BY g;
+    DELETE FROM t9 WHERE g = 'b';
+    SELECT * FROM v9;
+}
+expect {
+    a|1
+}
+
+# SUM over integers stays integer-typed, and returns NULL again when every
+# non-NULL input is retracted while the group survives on NULL rows.
+test matview-vdbe-aggregate-sum-typing-and-empty {
+    CREATE TABLE t10(g TEXT, x INTEGER);
+    INSERT INTO t10 VALUES ('a', 5), ('a', NULL), ('a', 7);
+    CREATE MATERIALIZED VIEW v10 AS SELECT g, COUNT(*) AS cnt, COUNT(x) AS cx, SUM(x) AS sx FROM t10 GROUP BY g;
+    DELETE FROM t10 WHERE x = 5;
+    SELECT g, cnt, cx, sx, typeof(sx) FROM v10;
+    DELETE FROM t10 WHERE x = 7;
+    SELECT g, cnt, cx, sx, typeof(sx) FROM v10;
+}
+expect {
+    a|2|1|7|integer
+    a|1|0||null
+}
+
+# AVG of a group whose inputs are all NULL is NULL (a divergence bug in the
+# retired interpreter, which returned 0.0).
+test matview-vdbe-aggregate-avg-all-null {
+    CREATE TABLE t11(g TEXT, x INTEGER);
+    INSERT INTO t11 VALUES ('a', NULL), ('a', NULL);
+    CREATE MATERIALIZED VIEW v11 AS SELECT g, AVG(x) AS ax FROM t11 GROUP BY g;
+    SELECT g, ax IS NULL FROM v11;
+}
+expect {
+    a|1
+}
+
+# NULL group keys form a group like any other (lost entirely by the retired
+# interpreter).
+test matview-vdbe-aggregate-null-group-key {
+    CREATE TABLE t12(g TEXT, x INTEGER);
+    INSERT INTO t12 VALUES (NULL, 1), (NULL, 2), ('a', 3);
+    CREATE MATERIALIZED VIEW v12 AS SELECT g, COUNT(*) AS cnt, SUM(x) AS sx FROM t12 GROUP BY g;
+    DELETE FROM t12 WHERE x = 1;
+    SELECT * FROM v12 ORDER BY g;
+}
+expect {
+    |1|2
+    a|1|3
+}
+
+# Aggregate views serve same-transaction reads by recomputation.
+test matview-vdbe-aggregate-read-your-own-writes {
+    CREATE TABLE t13(g TEXT, x INTEGER);
+    INSERT INTO t13 VALUES ('a', 1);
+    CREATE MATERIALIZED VIEW v13 AS SELECT g, SUM(x) AS sx FROM t13 GROUP BY g;
+    BEGIN;
+    INSERT INTO t13 VALUES ('a', 10), ('b', 5);
+    SELECT * FROM v13 ORDER BY g;
+    ROLLBACK;
+    SELECT * FROM v13 ORDER BY g;
+}
+expect {
+    a|11
+    b|5
+    a|1
+}
+
 # Shapes the VDBE codegen cannot maintain yet are rejected at translate time,
 # before the CREATE program allocates any btree pages.
 test matview-vdbe-rejected-create-is-clean {
     CREATE TABLE t7(a INTEGER, b TEXT);
     INSERT INTO t7 VALUES (1,'x');
-    CREATE MATERIALIZED VIEW bad7 AS SELECT count(*) FROM t7;
+    CREATE MATERIALIZED VIEW bad7 AS SELECT min(a) FROM t7 GROUP BY b;
 }
 expect error {
-    materialized views with aggregate functions are not yet supported
+    materialized views with the min aggregate are not yet supported
 }
 
 # Post-error state assertions (aborted statements must not leak captured

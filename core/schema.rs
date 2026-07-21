@@ -1158,12 +1158,29 @@ impl Schema {
     }
 
     /// Check if DBSP state table exists with the current version
+    /// Whether the view's persisted state matches the current storage
+    /// version. Filter/project views have no state table at all, so
+    /// compatibility means "no state table from a *different* version
+    /// exists" rather than "the current version's table exists".
     pub fn has_compatible_dbsp_state_table(&self, view_name: &str) -> bool {
-        let view_name = normalize_ident(view_name);
-        let expected_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
+        !self.dbsp_state_version_mismatch(view_name)
+    }
 
-        // Check if a table with the expected versioned name exists
-        self.tables.contains_key(&expected_table_name)
+    /// True when a state table for this view exists under a different
+    /// storage version than the current one.
+    pub(crate) fn dbsp_state_version_mismatch(&self, view_name: &str) -> bool {
+        let view_name = normalize_ident(view_name);
+        self.tables.keys().any(|table_name| {
+            table_name
+                .strip_prefix(DBSP_TABLE_PREFIX)
+                .and_then(|suffix| suffix.split_once('_'))
+                .is_some_and(|(version_str, name)| {
+                    name == view_name
+                        && version_str
+                            .parse::<u32>()
+                            .is_ok_and(|v| v != DBSP_CIRCUIT_VERSION)
+                })
+        })
     }
 
     pub fn is_materialized_view(&self, name: &str) -> bool {
@@ -1912,36 +1929,35 @@ impl Schema {
         dbsp_state_index_roots: HashMap<String, i64>,
     ) -> Result<()> {
         for (view_name, (sql, main_root)) in materialized_view_info {
-            // Look up the DBSP state root for this view
-            // If missing, it means version mismatch - skip this view
-            // Check if we have a compatible DBSP state root
-            let dbsp_state_root = if let Some(&root) = dbsp_state_roots.get(&view_name) {
-                root
-            } else {
+            // A state table left behind by a different storage version makes
+            // the view unusable until it is recreated. Filter/project views
+            // legitimately have no state table.
+            if self.dbsp_state_version_mismatch(&view_name) {
                 tracing::warn!(
-                    "Materialized view '{}' has incompatible version or missing DBSP state table",
+                    "Materialized view '{}' was created with an incompatible storage version; \
+                     DROP and recreate it",
                     view_name
                 );
-                // Track this as an incompatible view
                 self.incompatible_views.insert(view_name.clone());
-                // Use a dummy root page - the view won't be usable anyway
-                0
-            };
+            }
+            let dbsp_state_root = dbsp_state_roots.get(&view_name).copied().unwrap_or(0);
 
             // Look up the DBSP state index root (may not exist for older schemas)
             let dbsp_state_index_root =
                 dbsp_state_index_roots.get(&view_name).copied().unwrap_or(0);
 
-            // Register the DBSP state index so integrity check can account for its pages.
+            // Register the DBSP state index so lookups and integrity check
+            // can use it; its columns come from the state table's PRIMARY KEY.
             if dbsp_state_index_root > 0 && dbsp_state_root > 0 {
-                let mut index = create_dbsp_state_index(dbsp_state_index_root);
                 let dbsp_table_name =
                     format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
-                index.name = format!("sqlite_autoindex_{dbsp_table_name}_1");
-                index.table_name = dbsp_table_name;
-                if let Err(e) = self.add_index(std::sync::Arc::new(index)) {
-                    if !e.to_string().contains("already exists") {
-                        return Err(e);
+                if let Some(state_table) = self.get_btree_table(&dbsp_table_name) {
+                    let mut index = create_dbsp_state_index(dbsp_state_index_root, &state_table)?;
+                    index.name = format!("sqlite_autoindex_{dbsp_table_name}_1");
+                    if let Err(e) = self.add_index(std::sync::Arc::new(index)) {
+                        if !e.to_string().contains("already exists") {
+                            return Err(e);
+                        }
                     }
                 }
             }

@@ -1934,6 +1934,51 @@ fn test_matview_read_your_own_writes(tmp_db: TempDatabase) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Aggregate view state (per-group payloads in the internal state table)
+/// must survive closing and reopening the database: maintenance after reopen
+/// resumes from the persisted state.
+#[turso_macros::test(views)]
+fn test_matview_aggregate_state_survives_reopen(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    {
+        let conn = tmp_db.connect_limbo();
+        conn.execute("CREATE TABLE t (g TEXT, x INTEGER)")?;
+        conn.execute("INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 10)")?;
+        conn.execute(
+            "CREATE MATERIALIZED VIEW v AS SELECT g, COUNT(*) AS cnt, SUM(x) AS sx FROM t GROUP BY g",
+        )?;
+        conn.close()?;
+    }
+
+    let db2 = turso_core::Database::open_file_with_flags(
+        tmp_db.io.clone(),
+        tmp_db.path.to_str().unwrap(),
+        tmp_db.db_flags,
+        tmp_db.db_opts,
+        None,
+        std::sync::Arc::new(turso_core::SqliteDialect),
+    )?;
+    let conn = db2.connect()?;
+
+    // Maintenance after reopen must resume from the persisted group state.
+    conn.execute("INSERT INTO t VALUES ('a', 100)")?;
+    conn.execute("DELETE FROM t WHERE x = 10")?;
+
+    let rows = limbo_exec_rows(&conn, "SELECT g, cnt, sx FROM v ORDER BY g");
+    assert_eq!(
+        rows,
+        vec![vec![
+            RValue::Text("a".into()),
+            RValue::Integer(3),
+            RValue::Integer(103),
+        ]]
+    );
+
+    let rows = limbo_exec_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows, vec![vec![RValue::Text("ok".into())]]);
+
+    Ok(())
+}
+
 /// Regression test for simulator seed 867: UPDATE on an attached database table
 /// that changes the primary key (rowid) while a UNIQUE index exists would use
 /// the wrong database_id (0 instead of the attached db) for OpenWrite cursors,
