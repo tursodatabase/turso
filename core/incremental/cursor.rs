@@ -63,17 +63,47 @@ pub struct MaterializedViewCursor {
     // Current row cache - only cache the current row we're looking at
     current_row: Option<(i64, Vec<Value>)>,
 
-    // The overlay statement currently being stepped (the view's maintenance
-    // program in emit mode over the transaction's deltas), parked across I/O
-    // yields, plus the rows it has produced so far and the tx-state length it
-    // was compiled against.
-    overlay_stmt: Option<Box<crate::Statement>>,
-    overlay_rows: Delta,
-    overlay_len: usize,
+    // In-progress overlay computation, parked across I/O yields.
+    overlay_build: OverlayBuild,
 
     // State machine for seek operations
     seek_state: SeekState,
 }
+
+/// State machine for computing the uncommitted-changes overlay.
+///
+/// Filter/project views run their maintenance program in emit mode over the
+/// transaction's captured deltas and collect the transformed rows.
+///
+/// Aggregate views cannot be overlaid from deltas without mutating their
+/// persisted group state, so they recompute: run the defining query (which
+/// sees the transaction's uncommitted base-table changes on this connection)
+/// collecting each result row with a synthetic rowid, then scan the view
+/// btree emitting a cancelling `-1` for every committed row. Merged with the
+/// btree by the read path, the committed rows vanish and exactly the fresh
+/// result remains.
+enum OverlayBuild {
+    Idle,
+    /// Stepping a statement: the emit-mode maintenance program
+    /// (filter/project) or the defining query (aggregate; `cancel_btree`).
+    RunningStatement {
+        stmt: Box<crate::Statement>,
+        rows: Delta,
+        pending_len: usize,
+        cancel_btree: bool,
+        next_synthetic_rowid: i64,
+    },
+    /// Aggregate recompute phase 2: emitting -1 for each committed view row.
+    ScanningBtree {
+        rows: Delta,
+        pending_len: usize,
+        rewound: bool,
+    },
+}
+
+/// Synthetic rowids for recomputed aggregate view rows live far above any
+/// rowid NewRowid would allocate, so they cannot collide with committed rows.
+const SYNTHETIC_ROWID_BASE: i64 = 1 << 62;
 
 impl MaterializedViewCursor {
     pub fn new(
@@ -92,25 +122,18 @@ impl MaterializedViewCursor {
             tx_state,
             last_tx_state_len: 0,
             current_row: None,
-            overlay_stmt: None,
-            overlay_rows: Delta::new(),
-            overlay_len: 0,
+            overlay_build: OverlayBuild::Idle,
             seek_state: SeekState::Init,
         })
     }
 
-    /// Compute transaction changes lazily on first access.
-    ///
-    /// Runs the view's maintenance program in emit mode over the
-    /// transaction's captured deltas — the same codegen that maintains the
-    /// view at commit — and collects the transformed `(rowid, columns..,
-    /// weight)` rows into an overlay Z-set that reads merge with the
-    /// committed btree contents.
+    /// Compute transaction changes lazily on first access; see
+    /// [`OverlayBuild`] for the two strategies.
     fn ensure_tx_changes_computed(&mut self) -> Result<IOResult<()>> {
         use crate::vdbe::StepResult;
 
         loop {
-            if self.overlay_stmt.is_none() {
+            if matches!(self.overlay_build, OverlayBuild::Idle) {
                 let current_len = self.tx_state.len();
                 if current_len == self.last_tx_state_len {
                     return Ok(IOResult::Done(()));
@@ -124,75 +147,175 @@ impl MaterializedViewCursor {
                         view_guard.column_schema.flat_columns().len(),
                     )
                 };
-                let program = {
-                    let schema = self.connection.schema.read();
-                    crate::incremental::vdbe_maintenance::compile_maintenance_program(
-                        &view_name,
-                        &select,
-                        0, // emit mode writes no btree
-                        num_view_columns,
-                        crate::incremental::vdbe_maintenance::MaintenanceInput::TransactionDelta,
-                        crate::incremental::vdbe_maintenance::MaintenanceOutput::EmitRows,
-                        &schema,
-                        &self.connection,
-                    )?
+                let shape = crate::incremental::vdbe_maintenance::classify_view(&select)?;
+                self.overlay_build = match shape {
+                    crate::incremental::vdbe_maintenance::ViewShape::FilterProject => {
+                        let program = {
+                            let schema = self.connection.schema.read();
+                            crate::incremental::vdbe_maintenance::compile_maintenance_program(
+                                &view_name,
+                                &select,
+                                0, // emit mode writes no btree
+                                num_view_columns,
+                                crate::incremental::vdbe_maintenance::MaintenanceInput::TransactionDelta,
+                                crate::incremental::vdbe_maintenance::MaintenanceOutput::EmitRows,
+                                &schema,
+                                &self.connection,
+                            )?
+                        };
+                        OverlayBuild::RunningStatement {
+                            stmt: Box::new(crate::Statement::new_with_origin(
+                                program,
+                                self.pager.clone(),
+                                crate::QueryMode::Normal,
+                                0,
+                                crate::statement::StatementOrigin::Subprogram,
+                                false,
+                            )),
+                            rows: Delta::new(),
+                            pending_len: current_len,
+                            cancel_btree: false,
+                            next_synthetic_rowid: SYNTHETIC_ROWID_BASE,
+                        }
+                    }
+                    crate::incremental::vdbe_maintenance::ViewShape::GroupAggregate { .. } => {
+                        // Recompute: the defining query runs on this
+                        // connection and therefore sees the transaction's
+                        // uncommitted base-table changes. prepare_internal
+                        // takes the nested-statement guard so the inner
+                        // statement cannot commit the outer transaction.
+                        let sql = format!("{select}");
+                        OverlayBuild::RunningStatement {
+                            stmt: Box::new(self.connection.prepare_internal(&sql)?),
+                            rows: Delta::new(),
+                            pending_len: current_len,
+                            cancel_btree: true,
+                            next_synthetic_rowid: SYNTHETIC_ROWID_BASE,
+                        }
+                    }
                 };
-                self.overlay_rows = Delta::new();
-                self.overlay_len = current_len;
-                self.overlay_stmt = Some(Box::new(crate::Statement::new_with_origin(
-                    program,
-                    self.pager.clone(),
-                    crate::QueryMode::Normal,
-                    0,
-                    crate::statement::StatementOrigin::Subprogram,
-                    false,
-                )));
             }
 
-            let stmt = self
-                .overlay_stmt
-                .as_mut()
-                .expect("overlay statement was just built");
-            match stmt.step_subprogram()? {
-                StepResult::Row => {
-                    let row = stmt.row().expect("Row step result must carry a row");
-                    let mut values: Vec<Value> = row.get_values().cloned().collect();
-                    let weight = match values.pop() {
-                        Some(Value::Numeric(Numeric::Integer(w))) => w as isize,
-                        other => {
-                            return Err(crate::LimboError::InternalError(format!(
-                                "view overlay row has non-integer weight: {other:?}"
-                            )))
+            match &mut self.overlay_build {
+                OverlayBuild::Idle => unreachable!("Idle was replaced above"),
+
+                OverlayBuild::RunningStatement {
+                    stmt,
+                    rows,
+                    pending_len,
+                    cancel_btree,
+                    next_synthetic_rowid,
+                } => match if *cancel_btree {
+                    // A normally-prepared statement: step() runs its full
+                    // busy/reprepare handling (the InitCdcVersion precedent).
+                    stmt.step()?
+                } else {
+                    stmt.step_subprogram()?
+                } {
+                    StepResult::Row => {
+                        let row = stmt.row().expect("Row step result must carry a row");
+                        let mut values: Vec<Value> = row.get_values().cloned().collect();
+                        if *cancel_btree {
+                            // Defining-query row: synthetic rowid, weight +1.
+                            let rowid = *next_synthetic_rowid;
+                            *next_synthetic_rowid += 1;
+                            rows.changes
+                                .push((HashableRow::new(rowid, values.into_iter().collect()), 1));
+                        } else {
+                            // Emit-mode program row: (rowid, columns.., weight).
+                            let weight = match values.pop() {
+                                Some(Value::Numeric(Numeric::Integer(w))) => w as isize,
+                                other => {
+                                    return Err(crate::LimboError::InternalError(format!(
+                                        "view overlay row has non-integer weight: {other:?}"
+                                    )))
+                                }
+                            };
+                            let rowid = match values.first() {
+                                Some(Value::Numeric(Numeric::Integer(rowid))) => *rowid,
+                                other => {
+                                    return Err(crate::LimboError::InternalError(format!(
+                                        "view overlay row has non-integer rowid: {other:?}"
+                                    )))
+                                }
+                            };
+                            values.remove(0);
+                            rows.changes.push((
+                                HashableRow::new(rowid, values.into_iter().collect()),
+                                weight,
+                            ));
                         }
-                    };
-                    let rowid = match values.first() {
-                        Some(Value::Numeric(Numeric::Integer(rowid))) => *rowid,
-                        other => {
-                            return Err(crate::LimboError::InternalError(format!(
-                                "view overlay row has non-integer rowid: {other:?}"
-                            )))
+                    }
+                    StepResult::IO | StepResult::Yield => {
+                        let Some(io) = stmt.take_io_completions() else {
+                            continue;
+                        };
+                        return Ok(IOResult::IO(io));
+                    }
+                    StepResult::Done => {
+                        let rows = std::mem::take(rows);
+                        let pending_len = *pending_len;
+                        if *cancel_btree {
+                            self.overlay_build = OverlayBuild::ScanningBtree {
+                                rows,
+                                pending_len,
+                                rewound: false,
+                            };
+                        } else {
+                            self.uncommitted = RowKeyZSet::from_delta(&rows);
+                            self.last_tx_state_len = pending_len;
+                            self.overlay_build = OverlayBuild::Idle;
+                            return Ok(IOResult::Done(()));
                         }
-                    };
-                    values.remove(0);
-                    self.overlay_rows.changes.push((
-                        HashableRow::new(rowid, values.into_iter().collect()),
-                        weight,
-                    ));
-                }
-                StepResult::IO | StepResult::Yield => {
-                    let Some(io) = stmt.take_io_completions() else {
-                        continue;
-                    };
-                    return Ok(IOResult::IO(io));
-                }
-                StepResult::Done => {
-                    self.uncommitted = RowKeyZSet::from_delta(&self.overlay_rows);
-                    self.last_tx_state_len = self.overlay_len;
-                    self.overlay_stmt = None;
+                    }
+                    StepResult::Busy => return Err(crate::LimboError::Busy),
+                    StepResult::Interrupt => return Err(crate::LimboError::Interrupt),
+                },
+
+                OverlayBuild::ScanningBtree {
+                    rows,
+                    pending_len,
+                    rewound,
+                } => {
+                    if !*rewound {
+                        return_if_io!(self.btree_cursor.rewind());
+                        *rewound = true;
+                    }
+                    loop {
+                        if self.btree_cursor.is_empty() {
+                            break;
+                        }
+                        let Some(rowid) = return_if_io!(self.btree_cursor.rowid()) else {
+                            break;
+                        };
+                        let record =
+                            return_if_io!(self.btree_cursor.record()).ok_or_else(|| {
+                                crate::LimboError::InternalError(
+                                    "materialized view row has a rowid but no record".to_string(),
+                                )
+                            })?;
+                        let mut values = record.get_values_owned()?;
+                        let weight = match values.pop() {
+                            Some(Value::Numeric(Numeric::Integer(w))) => w as isize,
+                            other => {
+                                return Err(crate::LimboError::InternalError(format!(
+                                    "materialized view row has non-integer weight: {other:?}"
+                                )))
+                            }
+                        };
+                        // Cancel the committed row so only the fresh result
+                        // remains after the merge.
+                        rows.changes.push((
+                            HashableRow::new(rowid, values.into_iter().collect()),
+                            -weight,
+                        ));
+                        return_if_io!(self.btree_cursor.next());
+                    }
+                    self.uncommitted = RowKeyZSet::from_delta(rows);
+                    self.last_tx_state_len = *pending_len;
+                    self.overlay_build = OverlayBuild::Idle;
                     return Ok(IOResult::Done(()));
                 }
-                StepResult::Busy => return Err(crate::LimboError::Busy),
-                StepResult::Interrupt => return Err(crate::LimboError::Interrupt),
             }
         }
     }

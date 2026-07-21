@@ -1108,6 +1108,26 @@ pub enum Insn {
         func: AccumulatorFunc,
     },
 
+    /// Materialize an aggregate accumulator register from its persisted state
+    /// payload, read from `agg_payload_width(func)` registers starting at
+    /// `payload_start_reg`. The counterpart of AggContextStore; used by
+    /// materialized view maintenance to resume a group's aggregate state from
+    /// the view's state table.
+    AggContextLoad {
+        acc_reg: usize,
+        payload_start_reg: usize,
+        func: AccumulatorFunc,
+    },
+
+    /// Persist an aggregate accumulator's state payload into
+    /// `agg_payload_width(func)` registers starting at `payload_start_reg`,
+    /// for storage in a materialized view's state table.
+    AggContextStore {
+        acc_reg: usize,
+        payload_start_reg: usize,
+        func: AccumulatorFunc,
+    },
+
     /// Open a sorter.
     SorterOpen {
         cursor_id: CursorID, // P1
@@ -2118,6 +2138,8 @@ impl InsnVariants {
             InsnVariants::AggStep => execute::op_agg_step,
             InsnVariants::AggInverse => execute::op_agg_inverse,
             InsnVariants::AggFinal | InsnVariants::AggValue => execute::op_agg_final,
+            InsnVariants::AggContextLoad => execute::op_agg_context_load,
+            InsnVariants::AggContextStore => execute::op_agg_context_store,
             InsnVariants::SorterOpen => execute::op_sorter_open,
             InsnVariants::SorterInsert => execute::op_sorter_insert,
             InsnVariants::SorterSort => execute::op_sorter_sort,
