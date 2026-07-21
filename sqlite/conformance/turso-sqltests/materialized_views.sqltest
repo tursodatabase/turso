@@ -1,7 +1,6 @@
 @database :memory:
 @requires-file materialized_views ""
 @skip-file-if mvcc "materialized_views not supported with mvcc"
-@skip-file "IVM is being rewritten to compile to VDBE bytecode; aggregate/join/DISTINCT view shapes are rejected at CREATE until their codegen lands. Re-enable tests per shape as support returns. Filter/project coverage lives in matview_vdbe_maintenance.sqltest."
 
 # Test that INSERT with reused primary keys maintains correct aggregate counts
 # When a row is deleted and a new row is inserted with the same primary key
@@ -66,9 +65,9 @@ test matview-aggregation-population {
     SELECT * FROM daily_totals ORDER BY day;
 }
 expect {
-    1|7.0|2
-    2|2.0|2
-    3|4.0|2
+    1|7|2
+    2|2|2
+    3|4|2
 }
 
 test matview-filter-with-groupby {
@@ -82,9 +81,9 @@ test matview-filter-with-groupby {
     SELECT * FROM v ORDER BY yourb;
 }
 expect {
-    3|3.0|1
-    6|6.0|1
-    7|7.0|1
+    3|3|1
+    6|6|1
+    7|7|1
 }
 
 test matview-insert-maintenance {
@@ -102,12 +101,12 @@ test matview-insert-maintenance {
     SELECT * FROM v ORDER BY b;
 }
 expect {
-    3|3.0|1
-    6|6.0|1
-    3|7.0|2
-    6|11.0|2
-    3|7.0|2
-    6|11.0|2
+    3|3|1
+    6|6|1
+    3|7|2
+    6|11|2
+    3|7|2
+    6|11|2
 }
 
 test matview-delete-maintenance {
@@ -129,11 +128,11 @@ test matview-delete-maintenance {
     SELECT * FROM category_sums ORDER BY category;
 }
 expect {
-    A|90.0|3
-    B|60.0|2
-    A|60.0|2
-    B|60.0|2
-    A|60.0|2
+    A|90|3
+    B|60|2
+    A|60|2
+    B|60|2
+    A|60|2
 }
 
 test matview-update-maintenance {
@@ -154,12 +153,12 @@ test matview-update-maintenance {
     SELECT * FROM status_totals ORDER BY status;
 }
 expect {
-    1|400.0|2
-    2|600.0|2
-    1|450.0|2
-    2|600.0|2
-    1|150.0|1
-    2|900.0|3
+    1|400|2
+    2|600|2
+    1|450|2
+    2|600|2
+    1|150|1
+    2|900|3
 }
 
 test matview-integer-primary-key-basic {
@@ -240,12 +239,12 @@ test matview-integer-primary-key-with-aggregation {
     SELECT * FROM v ORDER BY b;
 }
 expect {
-    10|500.0|1
-    20|700.0|2
-    10|600.0|2
-    20|700.0|2
-    10|600.0|2
-    20|400.0|1
+    10|500|1
+    20|700|2
+    10|600|2
+    20|700|2
+    10|600|2
+    20|400|1
 }
 
 test matview-complex-filter-aggregation {
@@ -276,17 +275,17 @@ test matview-complex-filter-aggregation {
     SELECT * FROM account_deposits ORDER BY account;
 }
 expect {
-    100|70.0|2
-    200|100.0|1
-    300|60.0|1
-    100|95.0|3
-    200|100.0|1
-    300|60.0|1
-    100|125.0|3
-    200|100.0|1
-    300|60.0|1
-    100|125.0|3
-    300|60.0|1
+    100|70|2
+    200|100|1
+    300|60|1
+    100|95|3
+    200|100|1
+    300|60|1
+    100|125|3
+    200|100|1
+    300|60|1
+    100|125|3
+    300|60|1
 }
 
 test matview-sum-count-only {
@@ -310,12 +309,12 @@ test matview-sum-count-only {
     SELECT * FROM category_stats ORDER BY category;
 }
 expect {
-    1|80.0|3
-    2|70.0|2
-    1|85.0|4
-    2|70.0|2
-    1|85.0|4
-    2|75.0|2
+    1|80|3
+    2|70|2
+    1|85|4
+    2|70|2
+    1|85|4
+    2|75|2
 }
 
 test matview-empty-table-population {
@@ -331,8 +330,8 @@ test matview-empty-table-population {
 }
 expect {
     0
-    7|2.0|1
-    9|3.0|1
+    7|2|1
+    9|3|1
 }
 
 test matview-all-rows-filtered {
@@ -375,17 +374,17 @@ test matview-mixed-operations-sequence {
     SELECT * FROM customer_totals ORDER BY customer_id;
 }
 expect {
-    100|50.0|1
-    200|75.0|1
-    100|75.0|2
-    200|75.0|1
-    100|75.0|2
-    200|100.0|1
-    100|25.0|1
-    200|100.0|1
-    100|25.0|1
-    200|100.0|1
-    300|150.0|1
+    100|50|1
+    200|75|1
+    100|75|2
+    200|75|1
+    100|75|2
+    200|100|1
+    100|25|1
+    200|100|1
+    100|25|1
+    200|100|1
+    300|150|1
 }
 
 test matview-projections {
@@ -487,13 +486,13 @@ test matview-rollback-aggregation {
     SELECT * FROM product_totals ORDER BY product_id;
 }
 expect {
-    1|300.0|2
-    2|400.0|2
-    1|350.0|3
-    2|400.0|2
-    3|300.0|1
-    1|300.0|2
-    2|400.0|2
+    1|300|2
+    2|400|2
+    1|350|3
+    2|400|2
+    3|300|1
+    1|300|2
+    2|400|2
 }
 
 test matview-rollback-mixed-operations {
@@ -513,12 +512,12 @@ test matview-rollback-mixed-operations {
     SELECT * FROM customer_totals ORDER BY customer;
 }
 expect {
-    100|75.0|2
-    200|75.0|1
-    100|150.0|2
-    200|150.0|1
-    100|75.0|2
-    200|75.0|1
+    100|75|2
+    200|75|1
+    100|150|2
+    200|150|1
+    100|75|2
+    200|75|1
 }
 
 test matview-rollback-filtered-aggregation {
@@ -543,11 +542,11 @@ test matview-rollback-filtered-aggregation {
     SELECT * FROM deposits ORDER BY account;
 }
 expect {
-    100|50.0|1
-    200|100.0|1
-    100|135.0|2
-    100|50.0|1
-    200|100.0|1
+    100|50|1
+    200|100|1
+    100|135|2
+    100|50|1
+    200|100|1
 }
 
 test matview-rollback-empty-view {
@@ -587,6 +586,7 @@ expect {
     Bob|7
 }
 
+@skip "aggregates over joins are not supported by the VDBE maintenance codegen yet"
 test matview-join-with-aggregation {
     CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
     CREATE TABLE orders(order_id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER);
@@ -604,6 +604,7 @@ expect {
     Bob|250.0
 }
 
+@skip "joins over more than two tables are not supported by the VDBE maintenance codegen yet"
 test matview-three-way-join {
     CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, city TEXT);
     CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, product_id INTEGER, quantity INTEGER);
@@ -624,6 +625,7 @@ expect {
     Bob|Widget|2
 }
 
+@skip "joins over more than two tables are not supported by the VDBE maintenance codegen yet"
 test matview-three-way-join-with-aggregation {
     CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
     CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, product_id INTEGER, quantity INTEGER);
@@ -809,6 +811,7 @@ expect {
 }
 
 # Test 3: Join with aggregation BEFORE the join
+@skip "aggregates over joins are not supported by the VDBE maintenance codegen yet"
 test matview-aggregation-before-join {
     CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, product_id INTEGER, quantity INTEGER, order_date INTEGER);
     CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, tier TEXT);
@@ -839,6 +842,7 @@ expect {
 }
 
 # Test 4: Join with aggregation AFTER the join
+@skip "aggregates over joins are not supported by the VDBE maintenance codegen yet"
 test matview-aggregation-after-join {
     CREATE TABLE sales(id INTEGER PRIMARY KEY, product_id INTEGER, store_id INTEGER, units_sold INTEGER, revenue INTEGER);
     CREATE TABLE stores(id INTEGER PRIMARY KEY, name TEXT, region TEXT);
@@ -921,6 +925,7 @@ expect {
     Bob|Test
 }
 
+@skip "joins over more than two tables are not supported by the VDBE maintenance codegen yet"
 test matview-three-way-incremental {
     CREATE TABLE students(id INTEGER PRIMARY KEY, name TEXT, major TEXT);
     CREATE TABLE courses(id INTEGER PRIMARY KEY, name TEXT, department TEXT, credits INTEGER);
@@ -1076,6 +1081,7 @@ expect {
 }
 
 # Test UNION queries in materialized views
+@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-simple {
     CREATE TABLE sales_online(id INTEGER, product TEXT, amount INTEGER);
     CREATE TABLE sales_store(id INTEGER, product TEXT, amount INTEGER);
@@ -1103,6 +1109,7 @@ expect {
     Mouse|25
 }
 
+@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-with-where {
     CREATE TABLE employees(id INTEGER, name TEXT, dept TEXT, salary INTEGER);
     CREATE TABLE contractors(id INTEGER, name TEXT, dept TEXT, rate INTEGER);
@@ -1128,6 +1135,7 @@ expect {
     Frank|Engineering|360000
 }
 
+@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-same-table-different-filters {
     CREATE TABLE orders(id INTEGER, customer_id INTEGER, product TEXT, amount INTEGER, status TEXT);
     INSERT INTO orders VALUES
@@ -1152,6 +1160,7 @@ expect {
     6|3|Chair|150
 }
 
+@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-with-aggregation {
     CREATE TABLE q1_sales(product TEXT, quantity INTEGER, revenue INTEGER);
     CREATE TABLE q2_sales(product TEXT, quantity INTEGER, revenue INTEGER);
@@ -1177,6 +1186,7 @@ expect {
     Q2|105.0|21750.0
 }
 
+@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-with-join {
     CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, type TEXT);
     CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, amount INTEGER);
@@ -1213,6 +1223,7 @@ expect {
     Charlie|quote|2000
 }
 
+@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-distinct {
     CREATE TABLE active_users(id INTEGER, name TEXT, email TEXT);
     CREATE TABLE inactive_users(id INTEGER, name TEXT, email TEXT);
@@ -1239,6 +1250,7 @@ expect {
     5|Eve|eve@example.com
 }
 
+@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-complex-multiple-branches {
     CREATE TABLE products(id INTEGER, name TEXT, category TEXT, price INTEGER);
     INSERT INTO products VALUES
@@ -1274,6 +1286,7 @@ expect {
     Tablet|Electronics|600|PremiumElectronic
 }
 
+@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-maintenance-insert {
     CREATE TABLE t1(id INTEGER, value INTEGER);
     CREATE TABLE t2(id INTEGER, value INTEGER);
@@ -1303,6 +1316,7 @@ expect {
     6|600
 }
 
+@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-maintenance-delete {
     CREATE TABLE source1(id INTEGER PRIMARY KEY, data TEXT);
     CREATE TABLE source2(id INTEGER PRIMARY KEY, data TEXT);
@@ -1324,6 +1338,7 @@ expect {
     3
 }
 
+@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-maintenance-update {
     CREATE TABLE high_priority(id INTEGER PRIMARY KEY, task TEXT, priority INTEGER);
     CREATE TABLE normal_priority(id INTEGER PRIMARY KEY, task TEXT, priority INTEGER);
@@ -1348,6 +1363,7 @@ expect {
 }
 
 # Test UNION ALL with same table and different WHERE conditions
+@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-all-same-table {
     CREATE TABLE test(id INTEGER PRIMARY KEY, value INTEGER);
     INSERT INTO test VALUES (1, 10), (2, 20);
@@ -1365,6 +1381,7 @@ expect {
 }
 
 # Test UNION ALL preserves all rows in count
+@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-all-row-count {
     CREATE TABLE data(id INTEGER PRIMARY KEY, num INTEGER);
     INSERT INTO data VALUES (1, 5), (2, 15), (3, 25);
@@ -1380,6 +1397,7 @@ expect {
 }
 
 # Test UNION ALL with text columns and filtering
+@skip "compound SELECT (UNION) views are not supported by the VDBE maintenance codegen yet"
 test matview-union-all-text-filter {
     CREATE TABLE items(id INTEGER PRIMARY KEY, category TEXT, price INTEGER);
     INSERT INTO items VALUES
@@ -1602,8 +1620,8 @@ test matview-groupby-scalar-function {
     SELECT * FROM yearly_totals ORDER BY 1;
 }
 expect {
-    2020|250.0
-    2021|200.0
+    2020|250
+    2021|200
 }
 
 test matview-groupby-alias {
@@ -1618,8 +1636,8 @@ test matview-groupby-alias {
     SELECT * FROM yearly_totals ORDER BY year;
 }
 expect {
-    2020|250.0
-    2021|200.0
+    2020|250
+    2021|200
 }
 
 test matview-groupby-position {
@@ -1634,8 +1652,8 @@ test matview-groupby-position {
     SELECT * FROM national_yearly ORDER BY nation, year;
 }
 expect {
-    UK|2021|200.0
-    USA|2020|250.0
+    UK|2021|200
+    USA|2020|250
 }
 
 test matview-groupby-scalar-incremental {
@@ -1652,12 +1670,13 @@ test matview-groupby-scalar-incremental {
     SELECT * FROM yearly_totals ORDER BY year;
 }
 expect {
-    2020|100.0
-    2020|250.0
-    2020|250.0
-    2021|200.0
+    2020|100
+    2020|250
+    2020|250
+    2021|200
 }
 
+@skip "aggregates over joins are not supported by the VDBE maintenance codegen yet"
 test matview-groupby-join-position {
     CREATE TABLE t(a INTEGER);
     CREATE TABLE u(a INTEGER);
@@ -1674,6 +1693,7 @@ expect {
     2|1
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-basic {
     CREATE TABLE items(id INTEGER, category TEXT, value INTEGER);
     INSERT INTO items VALUES
@@ -1693,6 +1713,7 @@ expect {
     C|300
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-single-column {
     CREATE TABLE numbers(n INTEGER);
     INSERT INTO numbers VALUES (1), (2), (1), (3), (2), (1), (4), (3);
@@ -1707,6 +1728,7 @@ expect {
     4
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-incremental-insert {
     CREATE TABLE data(x INTEGER, y TEXT);
     CREATE MATERIALIZED VIEW distinct_data AS
@@ -1720,6 +1742,7 @@ expect {
     2|beta
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-incremental-insert-new {
     CREATE TABLE data(x INTEGER, y TEXT);
     CREATE MATERIALIZED VIEW distinct_data AS
@@ -1737,6 +1760,7 @@ expect {
     4|delta
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-incremental-insert-dups {
     CREATE TABLE data(x INTEGER, y TEXT);
     CREATE MATERIALIZED VIEW distinct_data AS
@@ -1757,6 +1781,7 @@ expect {
     4|delta
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-incremental-delete {
     CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
     INSERT INTO records VALUES
@@ -1775,6 +1800,7 @@ expect {
     Z|3
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-incremental-delete-partial {
     CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
     INSERT INTO records VALUES
@@ -1796,6 +1822,7 @@ expect {
     Z|3
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-incremental-delete-all {
     CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
     INSERT INTO records VALUES
@@ -1815,6 +1842,7 @@ expect {
     Z|3
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-incremental-reappear {
     CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
     INSERT INTO records VALUES
@@ -1834,6 +1862,7 @@ expect {
     Z|3
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-null-handling {
     CREATE TABLE nullable(a INTEGER, b TEXT);
     INSERT INTO nullable VALUES
@@ -1856,6 +1885,7 @@ expect {
     2|
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-empty-table {
     CREATE TABLE empty_source(x INTEGER, y TEXT);
     CREATE MATERIALIZED VIEW distinct_empty AS
@@ -1867,6 +1897,7 @@ expect {
     0
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-empty-then-insert {
     CREATE TABLE empty_source(x INTEGER, y TEXT);
     CREATE MATERIALIZED VIEW distinct_empty AS
@@ -1880,6 +1911,7 @@ expect {
     2|second
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-multi-column-types {
     CREATE TABLE mixed_types(i INTEGER, t TEXT, r REAL, b BLOB);
     INSERT INTO mixed_types VALUES
@@ -1898,6 +1930,7 @@ expect {
     3|text3
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-update-simulation {
     CREATE TABLE updatable(id INTEGER PRIMARY KEY, val TEXT);
     INSERT INTO updatable VALUES (1, 'old'), (2, 'old'), (3, 'new');
@@ -1910,6 +1943,7 @@ expect {
     old
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-update-simulation-change {
     CREATE TABLE updatable(id INTEGER PRIMARY KEY, val TEXT);
     INSERT INTO updatable VALUES (1, 'old'), (2, 'old'), (3, 'new');
@@ -1926,6 +1960,7 @@ expect {
     old
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-update-simulation-all-same {
     CREATE TABLE updatable(id INTEGER PRIMARY KEY, val TEXT);
     INSERT INTO updatable VALUES (1, 'new'), (2, 'old'), (3, 'new');
@@ -1941,6 +1976,7 @@ expect {
     new
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-large-duplicates {
     CREATE TABLE many_dups(x INTEGER);
     -- Insert many duplicates
@@ -1957,6 +1993,7 @@ expect {
     3
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-large-duplicates-remove {
     CREATE TABLE many_dups(x INTEGER);
     -- Insert many duplicates
@@ -1976,6 +2013,7 @@ expect {
     3
 }
 
+@skip "SELECT DISTINCT views are not supported by the VDBE maintenance codegen yet"
 test matview-distinct-large-duplicates-remove-all {
     CREATE TABLE many_dups(x INTEGER);
     -- Insert many duplicates but only one instance of 2
@@ -2255,12 +2293,12 @@ test matview-sum-distinct {
     SELECT * FROM sales_summary ORDER BY region;
 }
 expect {
-    North|300.0
-    South|700.0
-    North|300.0
-    South|700.0
-    North|300.0
-    South|1200.0
+    North|300
+    South|700
+    North|300
+    South|700
+    North|300
+    South|1200
 }
 
 test matview-avg-distinct {
@@ -2384,10 +2422,10 @@ test matview-multiple-distinct-aggregates-with-groupby {
     SELECT * FROM multi_distinct ORDER BY grp;
 }
 expect {
-    A|3|100.0|250.0
-    B|3|180.0|600.0
-    A|3|100.0|250.0
-    B|4|260.0|650.0
+    A|3|100|250.0
+    B|3|180|600.0
+    A|3|100|250.0
+    B|4|260|650.0
 }
 
 test matview-multiple-distinct-aggregates-no-groupby {
@@ -2416,8 +2454,8 @@ test matview-multiple-distinct-aggregates-no-groupby {
     SELECT * FROM multi_distinct_global;
 }
 expect {
-    6|280.0|400.0
-    7|360.0|450.0
+    6|280|400.0
+    7|360|450.0
 }
 
 test matview-count-distinct-global-aggregate {
@@ -2494,9 +2532,9 @@ test matview-recreate-after-drop {
     SELECT * FROM mv ORDER BY modified_x;
 }
 expect {
-    1|10.0
-    2|20.0
-    3|30.0
+    1|10
+    2|20
+    3|30
     3|40
     4|60
 }
