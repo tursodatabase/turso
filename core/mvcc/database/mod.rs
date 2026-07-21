@@ -2378,10 +2378,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
 
         // Move the assembled log record out and transition to
         // BeginCommitLogicalLog (or directly to CommitEnd if there is nothing
-        // to log). An error after this swap is terminal for the commit attempt:
-        // callers drop the state machine, whose unfinished-commit cleanup rolls
-        // the transaction back, so this emptied BuildLogRecord state is never
-        // resumed.
+        // to log).
         let mut log_record = std::mem::replace(&mut ctx.log_record, LogRecord::new(end_ts));
         self.populate_portable_changes(mvcc_store, &mut log_record)?;
         tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
