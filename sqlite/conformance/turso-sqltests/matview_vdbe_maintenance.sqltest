@@ -67,6 +67,22 @@ expect {
     3|31
 }
 
+# Compound NULL checks in WHERE: the retired circuit compiler's
+# projection-rewrite path collapsed 'a IS NOT NULL AND b IS NOT NULL' onto a
+# single column (fixed there in ef675eaec); the VDBE codegen translates the
+# whole predicate with the shared condition translator.
+test matview-vdbe-compound-null-check-filter {
+    CREATE TABLE tnn(a INTEGER, b INTEGER);
+    INSERT INTO tnn VALUES (1, NULL), (NULL, 2), (3, 4), (NULL, NULL);
+    CREATE MATERIALIZED VIEW vnn AS SELECT a, b FROM tnn WHERE a IS NOT NULL AND b IS NOT NULL;
+    INSERT INTO tnn VALUES (5, NULL), (6, 7);
+    SELECT * FROM vnn ORDER BY a;
+}
+expect {
+    3|4
+    6|7
+}
+
 # Negative literals in WHERE were rejected by the retired circuit compiler;
 # the VDBE codegen supports them.
 test matview-vdbe-negative-literal-filter {
