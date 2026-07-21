@@ -6813,6 +6813,37 @@ fn op_window_step(
                 *rank = rows_seen;
             }
         }
+        // dense_rank() — mirrors SQLite's CallCount-based dense_rankStepFunc.
+        //
+        // State (payload):
+        //   [0] = current dense_rank value (never cleared; persists across
+        //         peer groups in a partition and resets at partition boundary
+        //         via the Null on acc_reg).
+        //   [1] = "pending bump" flag.
+        //
+        // Step sets the flag every source row (no-op past the first row of a
+        // peer group since the flag is already 1). AggValue, called once per
+        // peer-group flush, sees the flag set, bumps payload[0] by one, then
+        // clears the flag. Subsequent source rows within the same peer group
+        // re-set the flag, but no AggValue runs between them, so the bump
+        // happens exactly once per peer group — yielding no gaps.
+        WindowFunc::DenseRank => {
+            if let Register::Value(Value::Null) = state.registers[acc_reg] {
+                state.registers[acc_reg] =
+                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
+                        Value::from_i64(0),
+                        Value::from_i64(0),
+                    ]?));
+            }
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                unreachable!("dense_rank accumulator must be a Builtin payload");
+            };
+            let Value::Numeric(Numeric::Integer(pending)) = &mut payload[1] else {
+                unreachable!("dense_rank pending flag must be Integer");
+            };
+            *pending = 1;
+        }
         other => {
             return Err(LimboError::InternalError(format!(
                 "window function {other} reached runtime dispatch but has no handler"
@@ -6850,6 +6881,32 @@ fn op_window_value(
                 )));
             };
             std::mem::replace(&mut payload[0], Value::from_i64(0))
+        }
+        WindowFunc::DenseRank => {
+            // If the pending-bump flag is set, increment the dense_rank value
+            // and clear the flag, then return the (possibly bumped) value.
+            // Mirrors SQLite's dense_rankValueFunc.
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                return Err(LimboError::InternalError(format!(
+                    "dense_rank accumulator in unexpected register state: {:?}",
+                    state.registers[acc_reg]
+                )));
+            };
+            let Value::Numeric(Numeric::Integer(pending)) = &mut payload[1] else {
+                unreachable!("dense_rank pending flag must be Integer");
+            };
+            let should_bump = *pending != 0;
+            if should_bump {
+                *pending = 0;
+            }
+            let Value::Numeric(Numeric::Integer(value_slot)) = &mut payload[0] else {
+                unreachable!("dense_rank current value must be Integer");
+            };
+            if should_bump {
+                *value_slot += 1;
+            }
+            Value::from_i64(*value_slot)
         }
         other => {
             return Err(LimboError::InternalError(format!(
