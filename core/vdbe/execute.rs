@@ -7031,6 +7031,90 @@ fn update_agg_payload(
 /// - **Min/Max**: Returns the tracked extreme value directly
 /// - **GroupConcat/StringAgg**: Returns the accumulated string
 /// - **JsonGroup***: Parses accumulated raw JSONB bytes into proper JSON output
+pub fn op_agg_context_load(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        AggContextLoad {
+            acc_reg,
+            payload_start_reg,
+            func,
+        },
+        insn
+    );
+    let func = func.expect_agg();
+    let width = agg_payload_width(func).ok_or_else(|| {
+        mark_unlikely();
+        LimboError::InternalError(format!("aggregate {func:?} has no fixed-width state"))
+    })?;
+    let mut payload = crate::alloc::Vec::new();
+    payload.try_reserve(width)?;
+    for j in 0..width {
+        payload.push(state.registers[*payload_start_reg + j].get_value().clone());
+    }
+    state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_agg_context_store(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        AggContextStore {
+            acc_reg,
+            payload_start_reg,
+            func,
+        },
+        insn
+    );
+    let func = func.expect_agg();
+    let width = agg_payload_width(func).ok_or_else(|| {
+        mark_unlikely();
+        LimboError::InternalError(format!("aggregate {func:?} has no fixed-width state"))
+    })?;
+    let values: Vec<Value> = match &state.registers[*acc_reg] {
+        Register::Aggregate(AggContext::Builtin(payload)) => {
+            let payload_len = payload.len();
+            turso_assert!(
+                payload_len == width,
+                "aggregate state payload width {payload_len} does not match expected {width}"
+            );
+            payload.to_vec()
+        }
+        _ => {
+            mark_unlikely();
+            return Err(LimboError::InternalError(
+                "AggContextStore on an uninitialized accumulator".to_string(),
+            ));
+        }
+    };
+    for (j, value) in values.into_iter().enumerate() {
+        state.registers[*payload_start_reg + j].set_value(value);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Number of payload slots for aggregates whose state is a fixed-width value
+/// vector, i.e. the aggregates that can be persisted to a materialized view's
+/// state table and maintained incrementally. Returns None for aggregates with
+/// variable-size or non-invertible state.
+pub(crate) fn agg_payload_width(func: &AggFunc) -> Option<usize> {
+    match func {
+        AggFunc::Count | AggFunc::Count0 => Some(1),
+        AggFunc::Avg => Some(3),
+        AggFunc::Sum | AggFunc::Total => Some(5),
+        _ => None,
+    }
+}
+
 fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
     let val = match func {
         AggFunc::Count | AggFunc::Count0 => payload[0].clone(),

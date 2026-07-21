@@ -1365,6 +1365,28 @@ pub fn insn_to_row(
                 0,
                 format!("accum=r[{}] dest=r[{}]", *acc_reg, *dest_reg),
             ),
+            Insn::AggContextLoad {
+                acc_reg,
+                payload_start_reg,
+                func,
+            } => (
+                "AggContextLoad",
+                *acc_reg as i64,
+                *payload_start_reg as i64,
+                0,
+                Value::build_text(func.as_str()),
+                0,
+                format!("accum=r[{}] state=r[{}..]", *acc_reg, *payload_start_reg),
+            ),
+            Insn::AggContextStore { acc_reg, payload_start_reg, func } => (
+                "AggContextStore",
+                *acc_reg as i64,
+                *payload_start_reg as i64,
+                0,
+                Value::build_text(func.as_str()),
+                0,
+                format!("accum=r[{}] state=r[{}..]", *acc_reg, *payload_start_reg),
+            ),
             Insn::SorterOpen {
                 cursor_id,
                 columns,
