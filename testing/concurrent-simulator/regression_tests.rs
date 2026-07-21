@@ -223,8 +223,7 @@ fn truncate_checkpoint_until_stable(whopper: &mut MultiprocessWhopper, connectio
                 | LimboError::BusySnapshot
                 | LimboError::SchemaUpdated
                 | LimboError::SchemaConflict
-                | LimboError::TableLocked
-                | LimboError::OutOfMemory),
+                | LimboError::TableLocked),
             ) => format!("checkpoint returned {err}"),
             Err(err) => panic!("TRUNCATE checkpoint should stabilize: {err}"),
         };
@@ -236,7 +235,6 @@ fn truncate_checkpoint_until_stable(whopper: &mut MultiprocessWhopper, connectio
             );
         }
 
-        std::thread::yield_now();
         std::thread::sleep(RETRY_BACKOFF.min(TIMEOUT.saturating_sub(elapsed)));
     }
 }
