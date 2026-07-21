@@ -194,6 +194,12 @@ pub enum ViewShape {
         /// HAVING predicate over group expressions and aggregate results;
         /// gates only the view row, not the group's persisted state.
         having: Option<ast::Expr>,
+        /// Aggregates without GROUP BY: the single group, keyed by a
+        /// synthetic constant group expression, exists even over an empty
+        /// input — its row is created at population and never deleted, with
+        /// empty-input aggregate values (COUNT 0, SUM NULL, ...) instead of
+        /// group death.
+        scalar: bool,
     },
 }
 
@@ -366,24 +372,45 @@ pub fn classify_view(select: &ast::Select, resolver: &Resolver) -> Result<ViewSh
         check_scalar_expr(where_expr)?;
     }
 
-    let Some(group_by) = group_by else {
-        // No GROUP BY: any aggregate call makes this a single-group scalar
-        // aggregate, which needs an always-present output row even over an
-        // empty table — not supported yet.
+    // HAVING without GROUP BY parses as a GroupBy node with no expressions;
+    // it makes the query an aggregate query just like an aggregate call does.
+    let (raw_group_exprs, having_clause): (Vec<ast::Expr>, Option<&ast::Expr>) = match group_by {
+        Some(group_by) => (
+            group_by.exprs.iter().map(|e| e.as_ref().clone()).collect(),
+            group_by.having.as_deref(),
+        ),
+        None => (Vec::new(), None),
+    };
+
+    let scalar = raw_group_exprs.is_empty();
+    if scalar && having_clause.is_none() {
+        let mut contains_aggregates = false;
         for column in columns {
             if let ast::ResultColumn::Expr(expr, _) = column {
                 let mut aggs = Vec::new();
                 if resolve_window_and_aggregate_functions(expr, resolver, &mut aggs, None, &mut [])?
                 {
-                    return unsupported("aggregates without GROUP BY");
+                    contains_aggregates = true;
                 }
-                check_scalar_expr(expr)?;
             }
         }
-        return Ok(ViewShape::FilterProject);
-    };
+        if !contains_aggregates {
+            for column in columns {
+                if let ast::ResultColumn::Expr(expr, _) = column {
+                    check_scalar_expr(expr)?;
+                }
+            }
+            return Ok(ViewShape::FilterProject);
+        }
+    }
 
-    let group_exprs: Vec<ast::Expr> = group_by.exprs.iter().map(|e| e.as_ref().clone()).collect();
+    // Scalar aggregates form one group keyed by a synthetic constant, so the
+    // single row flows through the same state-table machinery as GROUP BY.
+    let group_exprs: Vec<ast::Expr> = if scalar {
+        vec![ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))]
+    } else {
+        raw_group_exprs
+    };
     for g in &group_exprs {
         check_scalar_expr(g)?;
     }
@@ -431,7 +458,7 @@ pub fn classify_view(select: &ast::Select, resolver: &Resolver) -> Result<ViewSh
         outputs.push(OutputColumn::Aggregate(idx));
     }
 
-    let having = match &group_by.having {
+    let having = match having_clause {
         Some(having) => {
             resolve_window_and_aggregate_functions(
                 having,
@@ -441,7 +468,7 @@ pub fn classify_view(select: &ast::Select, resolver: &Resolver) -> Result<ViewSh
                 &mut [],
             )?;
             check_having_scalar_context(having, &group_exprs, &aggregates)?;
-            Some(having.as_ref().clone())
+            Some(having.clone())
         }
         None => None,
     };
@@ -455,6 +482,7 @@ pub fn classify_view(select: &ast::Select, resolver: &Resolver) -> Result<ViewSh
         aggregates,
         outputs,
         having,
+        scalar,
     })
 }
 
@@ -1060,10 +1088,12 @@ fn compile_group_aggregate_program(
         aggregates,
         outputs,
         having,
+        scalar,
     } = shape
     else {
         unreachable!("compile_group_aggregate_program requires a GroupAggregate shape");
     };
+    let scalar = *scalar;
     let ast::OneSelect::Select {
         from, where_clause, ..
     } = &select.body.select
@@ -1716,80 +1746,85 @@ fn compile_group_aggregate_program(
     }
 
     // Group liveness: the hidden COUNT(*) is zero when every row of the
-    // group has been retracted.
-    program.emit_insn(Insn::AggValue {
-        acc_reg: acc_start,
-        dest_reg: cnt_reg,
-        func: AccumulatorFunc::Agg(AggFunc::Count0),
-    });
-    let write_label = program.allocate_label();
-    program.emit_insn(Insn::Ne {
-        lhs: cnt_reg,
-        rhs: zero_reg,
-        target_pc: write_label,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
+    // group has been retracted. A scalar aggregate's single group is never
+    // deleted — retracting the last row rewrites its row with empty-input
+    // aggregate values instead.
+    if !scalar {
+        program.emit_insn(Insn::AggValue {
+            acc_reg: acc_start,
+            dest_reg: cnt_reg,
+            func: AccumulatorFunc::Agg(AggFunc::Count0),
+        });
+        let write_label = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: cnt_reg,
+            rhs: zero_reg,
+            target_pc: write_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
 
-    // Group emptied: remove its state row, index entry, and view row. A
-    // fresh group cannot reach zero (its first change was an insert), so
-    // found_reg is always set here; stay total anyway.
-    let do_delete_label = program.allocate_label();
-    program.emit_insn(Insn::If {
-        reg: found_reg,
-        target_pc: do_delete_label,
-        jump_if_null: false,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: next_label,
-    });
-    program.preassign_label_to_next_insn(do_delete_label);
-    if k > 1 {
-        program.emit_insn(Insn::Copy {
-            src_reg: group_start,
-            dst_reg: index_rec_start,
-            extra_amount: k - 1,
+        // Group emptied: remove its state row, index entry, and view row. A
+        // fresh group cannot reach zero (its first change was an insert), so
+        // found_reg is always set here; stay total anyway.
+        let do_delete_label = program.allocate_label();
+        program.emit_insn(Insn::If {
+            reg: found_reg,
+            target_pc: do_delete_label,
+            jump_if_null: false,
         });
-    } else {
-        program.emit_insn(Insn::Copy {
-            src_reg: group_start,
-            dst_reg: index_rec_start,
-            extra_amount: 0,
+        program.emit_insn(Insn::Goto {
+            target_pc: next_label,
         });
-    }
-    program.emit_insn(Insn::IdxDelete {
-        start_reg: index_rec_start,
-        num_regs: k + 1,
-        cursor_id: state_index_cursor_id,
-        raise_error_if_no_matching_entry: true,
-    });
-    program.emit_insn(Insn::Delete {
-        cursor_id: state_cursor_id,
-        table_name: state_table_name.clone(),
-        is_part_of_update: true,
-    });
-    // Without HAVING every live group has its view row, so a missing row is
-    // corruption; with HAVING the dying group may have been suppressed.
-    program.emit_insn(Insn::SeekRowid {
-        cursor_id: view_cursor_id,
-        src_reg: state_rowid_reg,
-        target_pc: if having.is_some() {
-            next_label
+        program.preassign_label_to_next_insn(do_delete_label);
+        if k > 1 {
+            program.emit_insn(Insn::Copy {
+                src_reg: group_start,
+                dst_reg: index_rec_start,
+                extra_amount: k - 1,
+            });
         } else {
-            corrupt_label
-        },
-    });
-    program.emit_insn(Insn::Delete {
-        cursor_id: view_cursor_id,
-        table_name: view_name.to_string(),
-        is_part_of_update: true,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: next_label,
-    });
+            program.emit_insn(Insn::Copy {
+                src_reg: group_start,
+                dst_reg: index_rec_start,
+                extra_amount: 0,
+            });
+        }
+        program.emit_insn(Insn::IdxDelete {
+            start_reg: index_rec_start,
+            num_regs: k + 1,
+            cursor_id: state_index_cursor_id,
+            raise_error_if_no_matching_entry: true,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: state_cursor_id,
+            table_name: state_table_name.clone(),
+            is_part_of_update: true,
+        });
+        // Without HAVING every live group has its view row, so a missing row
+        // is corruption; with HAVING the dying group may have been
+        // suppressed.
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: view_cursor_id,
+            src_reg: state_rowid_reg,
+            target_pc: if having.is_some() {
+                next_label
+            } else {
+                corrupt_label
+            },
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: view_cursor_id,
+            table_name: view_name.to_string(),
+            is_part_of_update: true,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: next_label,
+        });
+        program.preassign_label_to_next_insn(write_label);
+    }
 
     // Group live: persist aggregate state and (re)write the view row.
-    program.preassign_label_to_next_insn(write_label);
     let have_rowids_label = program.allocate_label();
     program.emit_insn(Insn::If {
         reg: found_reg,
@@ -1828,7 +1863,7 @@ fn compile_group_aggregate_program(
                 | InsertFlags::SKIP_LAST_ROWID
                 | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
         ),
-        table_name: state_table_name,
+        table_name: state_table_name.clone(),
     });
     let skip_index_label = program.allocate_label();
     program.emit_insn(Insn::If {
@@ -1857,94 +1892,48 @@ fn compile_group_aggregate_program(
     });
     program.preassign_label_to_next_insn(skip_index_label);
 
-    // Finalize every aggregate's value for the group; output columns and
-    // HAVING both read from this block.
-    for (i, agg) in aggregates.iter().enumerate() {
-        let value_reg = agg_value_start + i;
-        if matches!(agg.func, AggFunc::Min | AggFunc::Max) {
-            // The group's extreme is the first (MIN) or last (MAX) multiset
-            // entry with the (agg_id, group..) prefix.
-            let (_, mm_index_cursor_id) =
-                mm_cursors.expect("MIN/MAX aggregates imply the multiset table");
-            let empty_label = program.allocate_label();
-            let have_label = program.allocate_label();
-            program.emit_int(i as i64, mm_rec_start);
-            program.emit_insn(Insn::Copy {
-                src_reg: group_start,
-                dst_reg: mm_rec_start + 1,
-                extra_amount: k.saturating_sub(1),
-            });
-            match agg.func {
-                AggFunc::Min => {
-                    program.emit_insn(Insn::SeekGE {
-                        is_index: true,
-                        cursor_id: mm_index_cursor_id,
-                        start_reg: mm_rec_start,
-                        num_regs: 1 + k,
-                        target_pc: empty_label,
-                        eq_only: false,
-                    });
-                    // Positioned past the group: no values.
-                    program.emit_insn(Insn::IdxGT {
-                        cursor_id: mm_index_cursor_id,
-                        start_reg: mm_rec_start,
-                        num_regs: 1 + k,
-                        target_pc: empty_label,
-                    });
-                }
-                AggFunc::Max => {
-                    program.emit_insn(Insn::SeekLE {
-                        is_index: true,
-                        cursor_id: mm_index_cursor_id,
-                        start_reg: mm_rec_start,
-                        num_regs: 1 + k,
-                        target_pc: empty_label,
-                        eq_only: false,
-                    });
-                    // Positioned before the group: no values.
-                    program.emit_insn(Insn::IdxLT {
-                        cursor_id: mm_index_cursor_id,
-                        start_reg: mm_rec_start,
-                        num_regs: 1 + k,
-                        target_pc: empty_label,
-                    });
-                }
-                _ => unreachable!(),
-            }
-            program.emit_insn(Insn::Column {
-                cursor_id: mm_index_cursor_id,
-                column: 1 + k,
-                dest: value_reg,
-                default: None,
-            });
-            program.emit_insn(Insn::Goto {
-                target_pc: have_label,
-            });
-            program.preassign_label_to_next_insn(empty_label);
-            program.emit_insn(Insn::Null {
-                dest: value_reg,
-                dest_end: None,
-            });
-            program.preassign_label_to_next_insn(have_label);
-        } else {
-            program.emit_insn(Insn::AggValue {
-                acc_reg: acc_start + i,
-                dest_reg: value_reg,
-                func: AccumulatorFunc::Agg(agg.func.clone()),
-            });
-        }
-    }
-
     // HAVING gates only the view row: the group's state stays maintained
     // above so the predicate flips the row in and out as aggregates change.
     // Group expressions and aggregate calls inside the predicate resolve to
     // their computed registers through the expression cache, exactly like
-    // HAVING translation in a regular GROUP BY query.
-    let suppress_label = having.as_ref().map(|_| program.allocate_label());
-    if let Some(having_expr) = having {
-        let suppress_label = suppress_label.expect("allocated above");
-        for (i, group_expr) in group_exprs.iter().enumerate() {
-            let mut bound = group_expr.clone();
+    // HAVING translation in a regular GROUP BY query. Bind and seed once —
+    // the row tail below is emitted twice for scalar population.
+    let bound_having: Option<ast::Expr> = match having {
+        Some(having_expr) => {
+            for (i, group_expr) in group_exprs.iter().enumerate() {
+                let mut bound = group_expr.clone();
+                bind_and_rewrite_expr(
+                    &mut bound,
+                    Some(&mut table_references),
+                    None,
+                    &resolver,
+                    BindingBehavior::ResultColumnsNotAllowed,
+                )?;
+                resolver.cache_expr_reg(
+                    std::borrow::Cow::Owned(bound),
+                    group_start + i,
+                    false,
+                    None,
+                );
+            }
+            for (i, agg) in aggregates.iter().enumerate() {
+                let mut bound = agg.original_expr.clone();
+                bind_and_rewrite_expr(
+                    &mut bound,
+                    Some(&mut table_references),
+                    None,
+                    &resolver,
+                    BindingBehavior::ResultColumnsNotAllowed,
+                )?;
+                resolver.cache_expr_reg(
+                    std::borrow::Cow::Owned(bound),
+                    agg_value_start + i,
+                    false,
+                    None,
+                );
+            }
+            resolver.enable_expr_to_reg_cache();
+            let mut bound = having_expr.clone();
             bind_and_rewrite_expr(
                 &mut bound,
                 Some(&mut table_references),
@@ -1952,97 +1941,164 @@ fn compile_group_aggregate_program(
                 &resolver,
                 BindingBehavior::ResultColumnsNotAllowed,
             )?;
-            resolver.cache_expr_reg(std::borrow::Cow::Owned(bound), group_start + i, false, None);
+            Some(bound)
         }
-        for (i, agg) in aggregates.iter().enumerate() {
-            let mut bound = agg.original_expr.clone();
-            bind_and_rewrite_expr(
-                &mut bound,
-                Some(&mut table_references),
-                None,
-                &resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            )?;
-            resolver.cache_expr_reg(
-                std::borrow::Cow::Owned(bound),
-                agg_value_start + i,
-                false,
-                None,
-            );
-        }
-        resolver.enable_expr_to_reg_cache();
-        let mut bound = having_expr.clone();
-        bind_and_rewrite_expr(
-            &mut bound,
-            Some(&mut table_references),
-            None,
-            &resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
-        let pass_label = program.allocate_label();
-        translate_condition_expr(
-            &mut program,
-            &table_references,
-            &bound,
-            ConditionMetadata {
-                jump_if_condition_is_true: false,
-                jump_target_when_true: pass_label,
-                jump_target_when_false: suppress_label,
-                jump_target_when_null: suppress_label,
-            },
-            &resolver,
-        )?;
-        program.preassign_label_to_next_insn(pass_label);
-    }
+        None => None,
+    };
 
-    for (out_idx, output) in outputs.iter().enumerate() {
-        let src_reg = match output {
-            OutputColumn::Group(group_idx) => group_start + group_idx,
-            OutputColumn::Aggregate(agg_idx) => agg_value_start + agg_idx,
+    // The row tail: finalize every aggregate's value, evaluate HAVING, and
+    // write (or remove) the group's view row. Falls through — and jumps on
+    // suppression — to `done_label`, which the caller places right after.
+    let emit_row_tail =
+        |program: &mut ProgramBuilder, done_label: crate::vdbe::BranchOffset| -> Result<()> {
+            for (i, agg) in aggregates.iter().enumerate() {
+                let value_reg = agg_value_start + i;
+                if matches!(agg.func, AggFunc::Min | AggFunc::Max) {
+                    // The group's extreme is the first (MIN) or last (MAX)
+                    // multiset entry with the (agg_id, group..) prefix.
+                    let (_, mm_index_cursor_id) =
+                        mm_cursors.expect("MIN/MAX aggregates imply the multiset table");
+                    let empty_label = program.allocate_label();
+                    let have_label = program.allocate_label();
+                    program.emit_int(i as i64, mm_rec_start);
+                    program.emit_insn(Insn::Copy {
+                        src_reg: group_start,
+                        dst_reg: mm_rec_start + 1,
+                        extra_amount: k.saturating_sub(1),
+                    });
+                    match agg.func {
+                        AggFunc::Min => {
+                            program.emit_insn(Insn::SeekGE {
+                                is_index: true,
+                                cursor_id: mm_index_cursor_id,
+                                start_reg: mm_rec_start,
+                                num_regs: 1 + k,
+                                target_pc: empty_label,
+                                eq_only: false,
+                            });
+                            // Positioned past the group: no values.
+                            program.emit_insn(Insn::IdxGT {
+                                cursor_id: mm_index_cursor_id,
+                                start_reg: mm_rec_start,
+                                num_regs: 1 + k,
+                                target_pc: empty_label,
+                            });
+                        }
+                        AggFunc::Max => {
+                            program.emit_insn(Insn::SeekLE {
+                                is_index: true,
+                                cursor_id: mm_index_cursor_id,
+                                start_reg: mm_rec_start,
+                                num_regs: 1 + k,
+                                target_pc: empty_label,
+                                eq_only: false,
+                            });
+                            // Positioned before the group: no values.
+                            program.emit_insn(Insn::IdxLT {
+                                cursor_id: mm_index_cursor_id,
+                                start_reg: mm_rec_start,
+                                num_regs: 1 + k,
+                                target_pc: empty_label,
+                            });
+                        }
+                        _ => unreachable!(),
+                    }
+                    program.emit_insn(Insn::Column {
+                        cursor_id: mm_index_cursor_id,
+                        column: 1 + k,
+                        dest: value_reg,
+                        default: None,
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: have_label,
+                    });
+                    program.preassign_label_to_next_insn(empty_label);
+                    program.emit_insn(Insn::Null {
+                        dest: value_reg,
+                        dest_end: None,
+                    });
+                    program.preassign_label_to_next_insn(have_label);
+                } else {
+                    program.emit_insn(Insn::AggValue {
+                        acc_reg: acc_start + i,
+                        dest_reg: value_reg,
+                        func: AccumulatorFunc::Agg(agg.func.clone()),
+                    });
+                }
+            }
+
+            let suppress_label = bound_having.as_ref().map(|_| program.allocate_label());
+            if let Some(bound) = &bound_having {
+                let suppress_label = suppress_label.expect("allocated above");
+                let pass_label = program.allocate_label();
+                translate_condition_expr(
+                    program,
+                    &table_references,
+                    bound,
+                    ConditionMetadata {
+                        jump_if_condition_is_true: false,
+                        jump_target_when_true: pass_label,
+                        jump_target_when_false: suppress_label,
+                        jump_target_when_null: suppress_label,
+                    },
+                    &resolver,
+                )?;
+                program.preassign_label_to_next_insn(pass_label);
+            }
+
+            for (out_idx, output) in outputs.iter().enumerate() {
+                let src_reg = match output {
+                    OutputColumn::Group(group_idx) => group_start + group_idx,
+                    OutputColumn::Aggregate(agg_idx) => agg_value_start + agg_idx,
+                };
+                program.emit_insn(Insn::Copy {
+                    src_reg,
+                    dst_reg: out_start + out_idx,
+                    extra_amount: 0,
+                });
+            }
+            program.emit_int(1, out_start + num_view_columns);
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: out_start as u16,
+                count: (num_view_columns + 1) as u16,
+                dest_reg: view_record_reg as u16,
+                index_name: None,
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::Insert {
+                cursor: view_cursor_id,
+                key_reg: state_rowid_reg,
+                record_reg: view_record_reg,
+                flag: InsertFlags(
+                    InsertFlags::REQUIRE_SEEK
+                        | InsertFlags::SKIP_LAST_ROWID
+                        | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+                ),
+                table_name: view_name.to_string(),
+            });
+
+            if let Some(suppress_label) = suppress_label {
+                // Group failed HAVING: remove its previously-visible row, if
+                // any.
+                program.emit_insn(Insn::Goto {
+                    target_pc: done_label,
+                });
+                program.preassign_label_to_next_insn(suppress_label);
+                program.emit_insn(Insn::SeekRowid {
+                    cursor_id: view_cursor_id,
+                    src_reg: state_rowid_reg,
+                    target_pc: done_label,
+                });
+                program.emit_insn(Insn::Delete {
+                    cursor_id: view_cursor_id,
+                    table_name: view_name.to_string(),
+                    is_part_of_update: true,
+                });
+            }
+            Ok(())
         };
-        program.emit_insn(Insn::Copy {
-            src_reg,
-            dst_reg: out_start + out_idx,
-            extra_amount: 0,
-        });
-    }
-    program.emit_int(1, out_start + num_view_columns);
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: out_start as u16,
-        count: (num_view_columns + 1) as u16,
-        dest_reg: view_record_reg as u16,
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: view_cursor_id,
-        key_reg: state_rowid_reg,
-        record_reg: view_record_reg,
-        flag: InsertFlags(
-            InsertFlags::REQUIRE_SEEK
-                | InsertFlags::SKIP_LAST_ROWID
-                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-        ),
-        table_name: view_name.to_string(),
-    });
 
-    if let Some(suppress_label) = suppress_label {
-        // Group failed HAVING: remove its previously-visible row, if any.
-        program.emit_insn(Insn::Goto {
-            target_pc: next_label,
-        });
-        program.preassign_label_to_next_insn(suppress_label);
-        program.emit_insn(Insn::SeekRowid {
-            cursor_id: view_cursor_id,
-            src_reg: state_rowid_reg,
-            target_pc: next_label,
-        });
-        program.emit_insn(Insn::Delete {
-            cursor_id: view_cursor_id,
-            table_name: view_name.to_string(),
-            is_part_of_update: true,
-        });
-    }
+    emit_row_tail(&mut program, next_label)?;
 
     program.preassign_label_to_next_insn(next_label);
     program.emit_insn(Insn::Next {
@@ -2060,6 +2116,101 @@ fn compile_group_aggregate_program(
         description_reg: None,
     });
     program.preassign_label_to_next_insn(end_label);
+
+    // Batch semantics emit one row for a scalar aggregate even over empty
+    // input, so population must leave the single group present when the scan
+    // contributed nothing (empty table, or WHERE filtered every row).
+    // Maintenance never needs this: the row is created here and, with the
+    // group-death path disabled for scalar shapes, never deleted.
+    if scalar && input == MaintenanceInput::BaseTable {
+        let ensure_done = program.allocate_label();
+        // The synthetic group key is the constant 0 by construction.
+        program.emit_int(0, group_start);
+        program.emit_insn(Insn::Found {
+            cursor_id: state_index_cursor_id,
+            target_pc: ensure_done,
+            record_reg: group_start,
+            num_regs: k,
+        });
+        // Fresh, empty accumulators: stepping a NULL argument materializes
+        // each payload context without contributing to it — except COUNT(*),
+        // which counts rows regardless of argument, so its init step is
+        // cancelled with the matching inverse.
+        program.emit_insn(Insn::Null {
+            dest: acc_start,
+            dest_end: Some(acc_start + aggregates.len() - 1),
+        });
+        for (i, agg) in aggregates.iter().enumerate() {
+            if payload_offsets[i].is_none() {
+                continue; // MIN/MAX: an empty multiset already means NULL
+            }
+            program.emit_insn(Insn::AggStep {
+                acc_reg: acc_start + i,
+                col: null_arg_reg,
+                delimiter: 0,
+                func: AccumulatorFunc::Agg(agg.func.clone()),
+                comparator: None,
+            });
+            if matches!(agg.func, AggFunc::Count0) {
+                program.emit_insn(Insn::AggInverse {
+                    acc_reg: acc_start + i,
+                    col: null_arg_reg,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Agg(agg.func.clone()),
+                    comparator: None,
+                });
+            }
+            program.emit_insn(Insn::AggContextStore {
+                acc_reg: acc_start + i,
+                payload_start_reg: payload_start + payload_offsets[i].expect("checked above"),
+                func: AccumulatorFunc::Agg(agg.func.clone()),
+            });
+        }
+        program.emit_insn(Insn::NewRowid {
+            cursor: state_cursor_id,
+            rowid_reg: state_rowid_reg,
+            prev_largest_reg: prev_rowid_scratch,
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: state_rec_start as u16,
+            count: (k + total_payload) as u16,
+            dest_reg: state_record_reg as u16,
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: state_cursor_id,
+            key_reg: state_rowid_reg,
+            record_reg: state_record_reg,
+            flag: InsertFlags(
+                InsertFlags::REQUIRE_SEEK
+                    | InsertFlags::SKIP_LAST_ROWID
+                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+            ),
+            table_name: state_table_name,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: group_start,
+            dst_reg: index_rec_start,
+            extra_amount: k.saturating_sub(1),
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: index_rec_start as u16,
+            count: (k + 1) as u16,
+            dest_reg: index_record_reg as u16,
+            index_name: Some(state_index.name.clone()),
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: state_index_cursor_id,
+            record_reg: index_record_reg,
+            unpacked_start: Some(index_rec_start),
+            unpacked_count: Some((k + 1) as u16),
+            flags: IdxInsertFlags::new(),
+        });
+        emit_row_tail(&mut program, ensure_done)?;
+        program.preassign_label_to_next_insn(ensure_done);
+    }
 
     program.epilogue(schema);
     drop(syms);

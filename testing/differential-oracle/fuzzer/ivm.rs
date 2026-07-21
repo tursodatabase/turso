@@ -146,10 +146,11 @@ fn generate_definition(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<String> 
     }
 
     let table = tables[rng.random_range(0..tables.len())];
-    match rng.random_range(0..10u32) {
+    match rng.random_range(0..12u32) {
         0..=2 => Some(projection(table, rng, false)),
         3..=5 => Some(projection(table, rng, true)),
         6..=8 => Some(aggregate(table, rng)),
+        9..=10 => Some(scalar_aggregate(table, rng)),
         _ => join(&tables, rng).or_else(|| Some(projection(table, rng, true))),
     }
 }
@@ -262,6 +263,47 @@ fn aggregate(table: &Table, rng: &mut ChaCha8Rng) -> String {
         exprs = exprs.join(", "),
         t = quoted(&table.name),
     )
+}
+
+/// `SELECT COUNT(*) AS cnt, SUM(n) AS agg1, ... FROM t [WHERE ...] [HAVING ...]`
+///
+/// Scalar aggregates: no GROUP BY, one always-present row (unless HAVING
+/// suppresses it).
+fn scalar_aggregate(table: &Table, rng: &mut ChaCha8Rng) -> String {
+    let numeric_cols: Vec<&ColumnDef> = table
+        .columns
+        .iter()
+        .filter(|c| matches!(c.data_type, DataType::Integer | DataType::Real))
+        .collect();
+
+    let mut exprs = vec![format!("COUNT(*) AS cnt")];
+    if !numeric_cols.is_empty() {
+        for (i, func) in ["SUM", "AVG", "MIN", "MAX"].iter().enumerate() {
+            if rng.random_bool(0.4) {
+                let col = numeric_cols[rng.random_range(0..numeric_cols.len())];
+                let distinct = if rng.random_bool(0.3) {
+                    "DISTINCT "
+                } else {
+                    ""
+                };
+                exprs.push(format!("{func}({distinct}{}) AS agg{i}", quoted(&col.name)));
+            }
+        }
+    }
+
+    let mut sql = format!(
+        "SELECT {exprs} FROM {t}",
+        exprs = exprs.join(", "),
+        t = quoted(&table.name),
+    );
+    if rng.random_bool(0.4) {
+        let col = &table.columns[rng.random_range(0..table.columns.len())];
+        let _ = write!(sql, " WHERE {}", predicate(col, rng));
+    }
+    if rng.random_bool(0.4) {
+        let _ = write!(sql, " HAVING COUNT(*) > {}", rng.random_range(0..3));
+    }
+    sql
 }
 
 /// `SELECT l.a AS l_a, r.b AS r_b FROM t1 AS l JOIN t2 AS r ON l.j = r.k`
