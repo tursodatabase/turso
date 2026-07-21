@@ -53,6 +53,7 @@ impl Iterator for UnderreportedLowerBound {
 
 struct CountingAlloc {
     allocations: StdArc<AtomicUsize>,
+    deallocations: StdArc<AtomicUsize>,
 }
 
 unsafe impl ApiAllocator for CountingAlloc {
@@ -62,6 +63,7 @@ unsafe impl ApiAllocator for CountingAlloc {
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        self.deallocations.fetch_add(1, Ordering::Relaxed);
         unsafe {
             <Global as ApiAllocator>::deallocate(&Global, ptr, layout);
         }
@@ -71,8 +73,10 @@ unsafe impl ApiAllocator for CountingAlloc {
 #[test]
 fn dyn_allocator_delegates_skiplist_allocations() {
     let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
     let alloc = DynAllocator::new(CountingAlloc {
         allocations: allocations.clone(),
+        deallocations,
     });
     let map: crate::skiplist::SkipMap<i32, i32, _, DynAllocator> =
         crate::skiplist::SkipMap::new_in(alloc);
@@ -85,8 +89,10 @@ fn dyn_allocator_delegates_skiplist_allocations() {
 #[test]
 fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
     let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
     let alloc = DynAllocator::new(CountingAlloc {
         allocations: allocations.clone(),
+        deallocations,
     });
     let io = StdArc::new(crate::MemoryIO::new());
     let file = crate::IO::open_file(
@@ -112,6 +118,27 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
 
     assert!(db.get_mv_store().is_some());
     assert!(allocations.load(Ordering::Relaxed) > 0);
+}
+
+#[cfg(nightly)]
+#[test]
+fn logical_log_shared_buffer_retains_dyn_allocator() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
+    let alloc = DynAllocator::new(CountingAlloc {
+        allocations: allocations.clone(),
+        deallocations: deallocations.clone(),
+    });
+    let record = crate::mvcc::database::LogRecord::new(1, alloc).unwrap();
+    let data: DynBoxedSlice<u8> = record.buf.into_boxed_slice();
+    let shared = crate::io::SharedBufferData::new(crate::sync::Arc::new(data));
+    let returned = shared.clone();
+
+    assert!(allocations.load(Ordering::Relaxed) > 0);
+    drop(shared);
+    assert_eq!(deallocations.load(Ordering::Relaxed), 0);
+    drop(returned);
+    assert!(deallocations.load(Ordering::Relaxed) > 0);
 }
 
 #[test]
@@ -162,6 +189,13 @@ fn vec_push_within_capacity_returns_value_when_full() {
 
     assert_eq!(values.push_within_capacity(1), Err(1));
     assert!(values.is_empty());
+}
+
+#[test]
+fn try_vec_with_allocator_builds_requested_values() {
+    let values: DynVec<_> = try_vec![7; 3; DynAllocator::default()].unwrap();
+
+    assert_eq!(values.as_slice(), &[7, 7, 7]);
 }
 
 #[test]

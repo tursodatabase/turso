@@ -1,3 +1,4 @@
+use crate::alloc::DynBoxedSlice;
 use crate::storage::buffer_pool::ArenaBuffer;
 use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use crate::sync::Arc;
@@ -561,18 +562,18 @@ pub type BufferData = Pin<Box<[u8]>>;
 
 #[derive(Clone)]
 pub enum SharedBufferData {
-    Full(Arc<Box<[u8]>>),
+    Full(Arc<DynBoxedSlice<u8>>),
     View(SharedBufferView),
 }
 
 #[derive(Clone)]
 pub struct SharedBufferView {
-    data: Arc<Box<[u8]>>,
+    data: Arc<DynBoxedSlice<u8>>,
     start: usize,
 }
 
 impl SharedBufferView {
-    fn new(data: Arc<Box<[u8]>>, start: usize) -> Self {
+    fn new(data: Arc<DynBoxedSlice<u8>>, start: usize) -> Self {
         assert!(
             start <= data.len(),
             "SharedBufferData::new_view: start ({start}) > data.len() ({})",
@@ -599,11 +600,11 @@ impl SharedBufferView {
 }
 
 impl SharedBufferData {
-    pub fn new(data: Arc<Box<[u8]>>) -> Self {
+    pub fn new(data: Arc<DynBoxedSlice<u8>>) -> Self {
         Self::Full(data)
     }
 
-    pub fn new_view(data: Arc<Box<[u8]>>, start: usize) -> Self {
+    pub fn new_view(data: Arc<DynBoxedSlice<u8>>, start: usize) -> Self {
         Self::View(SharedBufferView::new(data, start))
     }
 
@@ -687,7 +688,7 @@ impl Buffer {
         Self::Heap(Pin::new(data.into_boxed_slice()))
     }
 
-    pub fn new_shared(data: Arc<Box<[u8]>>) -> Self {
+    pub fn new_shared(data: Arc<DynBoxedSlice<u8>>) -> Self {
         Self::Shared(SharedBufferData::new(data))
     }
 
@@ -809,9 +810,20 @@ crate::thread::thread_local! {
 mod buffer_tests {
     use super::*;
 
+    fn shared_bytes(bytes: &[u8]) -> Arc<DynBoxedSlice<u8>> {
+        let mut data =
+            <crate::alloc::DynVec<u8> as crate::alloc::TursoVecInExt<
+                u8,
+                crate::alloc::DynAllocator,
+            >>::try_with_capacity_in(bytes.len(), crate::alloc::DynAllocator::default())
+            .expect("failed to allocate shared buffer test data");
+        data.extend_from_slice(bytes);
+        Arc::new(data.into_boxed_slice())
+    }
+
     #[test]
     fn shared_buffer_exposes_arc_bytes() {
-        let data = Arc::new(vec![1, 2, 3, 4].into_boxed_slice());
+        let data = shared_bytes(&[1, 2, 3, 4]);
         let buffer = Buffer::new_shared(data.clone());
 
         assert_eq!(buffer.len(), 4);
@@ -823,7 +835,7 @@ mod buffer_tests {
 
     #[test]
     fn shared_buffer_view_exposes_tail_without_copying() {
-        let data = Arc::new(vec![0, 1, 2, 3, 4].into_boxed_slice());
+        let data = shared_bytes(&[0, 1, 2, 3, 4]);
         let shared = SharedBufferData::new_view(data.clone(), 2);
         let buffer = Buffer::new_shared_data(shared.clone());
 

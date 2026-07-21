@@ -118,6 +118,7 @@ impl LogChunkWriter {
 
 pub(crate) trait LogBufferExt: std::ops::DerefMut<Target = [u8]> {
     fn try_extend_chunks(&mut self, chunks: impl LogChunkStream) -> Result<()>;
+    fn try_resize_zeroed(&mut self, new_len: usize) -> Result<()>;
 }
 
 macro_rules! impl_try_extend_chunks {
@@ -149,6 +150,16 @@ macro_rules! impl_try_extend_chunks {
             unsafe {
                 self.set_len(new_len);
             }
+            Ok(())
+        }
+
+        #[inline(always)]
+        fn try_resize_zeroed(&mut self, new_len: usize) -> Result<()> {
+            let additional = new_len.checked_sub(self.len()).ok_or_else(|| {
+                LimboError::InternalError("logical log buffer shrinks unexpectedly".to_string())
+            })?;
+            self.try_reserve(additional)?;
+            self.resize(new_len, 0);
             Ok(())
         }
     };
@@ -383,7 +394,7 @@ impl<'a, B: LogBufferExt + ?Sized> LogSerializer<'a, B> {
     }
 }
 
-impl LogSerializer<'_, Vec<u8>> {
+impl<B: LogBufferExt + ?Sized> LogSerializer<'_, B> {
     pub(crate) fn encrypt_payload_in_place(&mut self, payload: EncryptedPayload<'_>) -> Result<()> {
         let tag_size = payload.enc_ctx.tag_size();
         let nonce_size = payload.enc_ctx.nonce_size();
@@ -404,11 +415,7 @@ impl LogSerializer<'_, Vec<u8>> {
                 "encrypted payload start exceeds buffer length".to_string(),
             ));
         }
-        let additional = payload_end.checked_sub(self.buffer.len()).ok_or_else(|| {
-            LimboError::InternalError("encrypted payload shrinks unexpectedly".to_string())
-        })?;
-        self.buffer.try_reserve(additional)?;
-        self.buffer.resize(payload_end, 0);
+        self.buffer.try_resize_zeroed(payload_end)?;
 
         let chunk_count = encrypted_payload_chunk_count(payload.plaintext_size, payload.chunk_size);
         let plaintext_size = u64::try_from(payload.plaintext_size).map_err(|_| {
@@ -468,7 +475,9 @@ impl LogSerializer<'_, Vec<u8>> {
         );
         Ok(())
     }
+}
 
+impl LogSerializer<'_, Vec<u8>> {
     pub(crate) fn encode_delete_portable_extension(
         identity_record: Option<&[u8]>,
         pk_record: Option<&[u8]>,
