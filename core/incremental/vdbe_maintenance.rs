@@ -51,8 +51,9 @@ use crate::translate::expr::{
     BindingBehavior, ConditionMetadata, NoConstantOptReason, WalkControl,
 };
 use crate::translate::plan::{
-    ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
+    Aggregate, ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
+use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::turso_assert;
 use crate::util::walk_expr_with_subqueries;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder, ProgramBuilderOpts};
@@ -159,12 +160,12 @@ impl DeltaCursor {
     }
 }
 
-/// One aggregate call in a GROUP BY view's SELECT list.
-#[derive(Debug, Clone)]
-pub struct AggregateSpec {
-    pub func: AggFunc,
-    /// The aggregate's argument expression; None for COUNT(*).
-    pub arg: Option<ast::Expr>,
+/// Whether an aggregate's accumulator must see each distinct argument value
+/// exactly once, tracked through the value multiset table. MIN/MAX see each
+/// value once by definition, so DISTINCT changes nothing for them — their
+/// multiset participation is about extremes, not distinctness.
+fn tracks_distinct_values(agg: &Aggregate) -> bool {
+    agg.distinctness.is_distinct() && !matches!(agg.func, AggFunc::Min | AggFunc::Max)
 }
 
 /// How each result column of a GROUP BY view is produced.
@@ -178,6 +179,7 @@ pub enum OutputColumn {
 
 /// The maintainable shape of a view definition, decided at CREATE time.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ViewShape {
     /// Single-table SELECT with optional WHERE: rows map 1:1 to base rows.
     FilterProject,
@@ -186,8 +188,12 @@ pub enum ViewShape {
         group_exprs: Vec<ast::Expr>,
         /// `aggregates[0]` is always a hidden COUNT(*) tracking group
         /// liveness (a group's view row exists iff its row count > 0).
-        aggregates: Vec<AggregateSpec>,
+        /// Aggregates appearing only in HAVING are also collected here.
+        aggregates: Vec<Aggregate>,
         outputs: Vec<OutputColumn>,
+        /// HAVING predicate over group expressions and aggregate results;
+        /// gates only the view row, not the group's persisted state.
+        having: Option<ast::Expr>,
     },
 }
 
@@ -234,65 +240,73 @@ fn check_scalar_expr(expr: &ast::Expr) -> Result<()> {
     })
 }
 
-/// Recognize a result column that is exactly one supported aggregate call.
-fn as_supported_aggregate(expr: &ast::Expr) -> Result<Option<AggregateSpec>> {
-    match expr {
-        ast::Expr::FunctionCallStar { name, filter_over } => {
-            let Ok(Some(Func::Agg(func))) = Func::resolve_function(name.as_str(), 0) else {
-                return Ok(None);
-            };
-            if filter_over.filter_clause.is_some() || filter_over.over_clause.is_some() {
-                return unsupported("FILTER or OVER clauses on aggregates");
-            }
-            match func {
-                AggFunc::Count0 => Ok(Some(AggregateSpec { func, arg: None })),
-                _ => unsupported(&format!("{}(*)", name.as_str())),
-            }
-        }
-        ast::Expr::FunctionCall {
-            name,
-            distinctness,
-            args,
-            order_by,
-            within_group,
-            filter_over,
-        } => {
-            let Ok(Some(Func::Agg(func))) = Func::resolve_function(name.as_str(), args.len())
-            else {
-                return Ok(None);
-            };
-            if distinctness.is_some() {
-                return unsupported("DISTINCT aggregates");
-            }
-            if !order_by.is_empty() || !within_group.is_empty() {
-                return unsupported("ordered aggregates");
-            }
-            if filter_over.filter_clause.is_some() || filter_over.over_clause.is_some() {
-                return unsupported("FILTER or OVER clauses on aggregates");
-            }
-            match func {
-                AggFunc::Count
-                | AggFunc::Sum
-                | AggFunc::Total
-                | AggFunc::Avg
-                | AggFunc::Min
-                | AggFunc::Max => {
-                    let [arg] = args.as_slice() else {
-                        return unsupported("multi-argument aggregates");
-                    };
-                    check_scalar_expr(arg)?;
-                    Ok(Some(AggregateSpec {
-                        func,
-                        arg: Some(arg.as_ref().clone()),
-                    }))
-                }
-                // GROUP_CONCAT and friends have no inverse and no
-                // multiset-based retraction strategy.
-                other => unsupported(&format!("the {} aggregate", other.as_str())),
-            }
-        }
-        _ => Ok(None),
+/// Reject collected aggregates the maintenance codegen cannot invert.
+///
+/// Aggregate recognition and deduplication use the planner's own collector
+/// ([`resolve_window_and_aggregate_functions`]); this is only the IVM gate on
+/// top of it.
+fn validate_supported_aggregate(agg: &Aggregate) -> Result<()> {
+    if agg.filter_expr.is_some() {
+        return unsupported("FILTER clauses on aggregates");
     }
+    match agg.func {
+        AggFunc::Count0
+        | AggFunc::Count
+        | AggFunc::Sum
+        | AggFunc::Total
+        | AggFunc::Avg
+        | AggFunc::Min
+        | AggFunc::Max => {}
+        // GROUP_CONCAT and friends have no inverse and no multiset-based
+        // retraction strategy.
+        ref other => return unsupported(&format!("the {} aggregate", other.as_str())),
+    }
+    if agg.args.len() > 1 {
+        return unsupported("multi-argument aggregates");
+    }
+    for arg in &agg.args {
+        check_scalar_expr(arg)?;
+    }
+    Ok(())
+}
+
+/// Validate that a HAVING expression evaluates only group expressions and
+/// aggregate results.
+///
+/// The aggregates themselves were already collected into `aggregates` by the
+/// planner's collector; this walk rejects what remains outside them: bare
+/// column references (SQLite's arbitrary-row semantics cannot be maintained
+/// incrementally), subqueries, and bound parameters.
+fn check_having_scalar_context(
+    expr: &ast::Expr,
+    group_exprs: &[ast::Expr],
+    aggregates: &[Aggregate],
+) -> Result<()> {
+    walk_expr_with_subqueries(expr, &mut |e: &ast::Expr| {
+        if group_exprs
+            .iter()
+            .any(|g| crate::util::exprs_are_equivalent(g, e))
+            || aggregates
+                .iter()
+                .any(|a| crate::util::exprs_are_equivalent(&a.original_expr, e))
+        {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match e {
+            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
+                Err(LimboError::ParseError(
+                    "materialized views with subqueries are not yet supported".to_string(),
+                ))
+            }
+            ast::Expr::Variable(_) => Err(LimboError::ParseError(
+                "materialized views with bound parameters are not supported".to_string(),
+            )),
+            ast::Expr::Id(_) | ast::Expr::Qualified(_, _) | ast::Expr::DoublyQualified(_, _, _) => {
+                unsupported("HAVING referencing columns outside GROUP BY")
+            }
+            _ => Ok(WalkControl::Continue),
+        }
+    })
 }
 
 /// Classify a view definition into its maintainable shape.
@@ -300,7 +314,11 @@ fn as_supported_aggregate(expr: &ast::Expr) -> Result<Option<AggregateSpec>> {
 /// This is the CREATE MATERIALIZED VIEW gate: shapes outside the supported
 /// set are rejected outright rather than silently mis-maintained. The set
 /// grows as codegen for more operators lands (MIN/MAX, joins, set ops).
-pub fn classify_view(select: &ast::Select) -> Result<ViewShape> {
+///
+/// Aggregate recognition uses the planner's collector so it cannot drift
+/// from what a regular GROUP BY query would compute; the `resolver` is what
+/// the collector needs to resolve (and here, reject) extension functions.
+pub fn classify_view(select: &ast::Select, resolver: &Resolver) -> Result<ViewShape> {
     if select.with.is_some() {
         return unsupported("WITH clauses");
     }
@@ -354,7 +372,9 @@ pub fn classify_view(select: &ast::Select) -> Result<ViewShape> {
         // empty table — not supported yet.
         for column in columns {
             if let ast::ResultColumn::Expr(expr, _) = column {
-                if as_supported_aggregate(expr)?.is_some() {
+                let mut aggs = Vec::new();
+                if resolve_window_and_aggregate_functions(expr, resolver, &mut aggs, None, &mut [])?
+                {
                     return unsupported("aggregates without GROUP BY");
                 }
                 check_scalar_expr(expr)?;
@@ -363,55 +383,112 @@ pub fn classify_view(select: &ast::Select) -> Result<ViewShape> {
         return Ok(ViewShape::FilterProject);
     };
 
-    if group_by.having.is_some() {
-        return unsupported("HAVING");
-    }
-
     let group_exprs: Vec<ast::Expr> = group_by.exprs.iter().map(|e| e.as_ref().clone()).collect();
     for g in &group_exprs {
         check_scalar_expr(g)?;
     }
 
-    // aggregates[0] is the hidden liveness COUNT(*).
-    let mut aggregates = vec![AggregateSpec {
-        func: AggFunc::Count0,
-        arg: None,
-    }];
+    // aggregates[0] is the hidden liveness COUNT(*); its expression form lets
+    // an explicit COUNT(*) in the SELECT list or HAVING dedup onto the same
+    // accumulator through the collector.
+    let count_star = ast::Expr::FunctionCallStar {
+        name: ast::Name::exact("count".to_string()),
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    };
+    let mut aggregates = Vec::new();
+    resolve_window_and_aggregate_functions(&count_star, resolver, &mut aggregates, None, &mut [])?;
+    turso_assert!(
+        aggregates.len() == 1 && matches!(aggregates[0].func, AggFunc::Count0),
+        "count(*) must collect as the single hidden liveness aggregate"
+    );
+
     let mut outputs = Vec::with_capacity(columns.len());
     for column in columns {
         let ast::ResultColumn::Expr(expr, _) = column else {
             return unsupported("star projections combined with GROUP BY");
         };
-        if let Some(spec) = as_supported_aggregate(expr)? {
-            outputs.push(OutputColumn::Aggregate(aggregates.len()));
-            aggregates.push(spec);
-            continue;
-        }
-        check_scalar_expr(expr)?;
-        let Some(idx) = group_exprs
+        if let Some(idx) = group_exprs
             .iter()
             .position(|g| crate::util::exprs_are_equivalent(g, expr))
+        {
+            outputs.push(OutputColumn::Group(idx));
+            continue;
+        }
+        resolve_window_and_aggregate_functions(expr, resolver, &mut aggregates, None, &mut [])?;
+        let Some(idx) = aggregates
+            .iter()
+            .position(|a| crate::util::exprs_are_equivalent(&a.original_expr, expr))
         else {
-            // SQLite's bare-column semantics (an arbitrary row of the group)
-            // cannot be maintained incrementally.
+            // The column is not one aggregate call: either an expression over
+            // aggregate results, or SQLite's bare-column semantics (an
+            // arbitrary row of the group) — neither is maintainable yet.
+            check_scalar_expr(expr)?;
             return unsupported("non-aggregate result columns not in GROUP BY");
         };
-        outputs.push(OutputColumn::Group(idx));
+        outputs.push(OutputColumn::Aggregate(idx));
+    }
+
+    let having = match &group_by.having {
+        Some(having) => {
+            resolve_window_and_aggregate_functions(
+                having,
+                resolver,
+                &mut aggregates,
+                None,
+                &mut [],
+            )?;
+            check_having_scalar_context(having, &group_exprs, &aggregates)?;
+            Some(having.as_ref().clone())
+        }
+        None => None,
+    };
+
+    for agg in &aggregates {
+        validate_supported_aggregate(agg)?;
     }
 
     Ok(ViewShape::GroupAggregate {
         group_exprs,
         aggregates,
         outputs,
+        having,
     })
 }
 
+/// [`classify_view`] with a transient resolver built from a connection, for
+/// callers outside the translate layer (maintenance compilation, cursors).
+pub fn classify_view_for_connection(
+    select: &ast::Select,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<ViewShape> {
+    let syms = connection.syms.read();
+    let resolver = Resolver::new(
+        schema,
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        &syms,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        Arc::new(crate::dialect::SqliteDialect),
+    );
+    classify_view(select, &resolver)
+}
+
 /// The CREATE TABLE statement for a GROUP BY view's internal state table:
-/// one row per live group, holding the group-key values, the rowid of the
-/// group's row in the view btree, and each payload aggregate's persisted
-/// state. The PRIMARY KEY over the group columns gives the automatic index
-/// used to find a group's state. MIN/MAX aggregates contribute no columns
-/// here — their state is the value multiset table.
+/// one row per live group, holding the group-key values and each payload
+/// aggregate's persisted state. The PRIMARY KEY over the group columns gives
+/// the automatic index used to find a group's state. MIN/MAX aggregates
+/// contribute no columns here — their state is the value multiset table.
+///
+/// The state row's rowid doubles as the group's rowid in the view btree:
+/// state rows are written unconditionally for live groups, so their rowids
+/// are unique, stable, and — unlike a separately reserved rowid — cannot
+/// collide when HAVING suppresses a group's view row.
 ///
 /// Declared column types are empty so nothing coerces the stored values.
 pub fn aggregate_state_table_sql(state_table_name: &str, shape: &ViewShape) -> Result<String> {
@@ -429,9 +506,8 @@ pub fn aggregate_state_table_sql(state_table_name: &str, shape: &ViewShape) -> R
     for i in 0..group_exprs.len() {
         columns.push(format!("g{i}"));
     }
-    columns.push("view_rowid".to_string());
-    for (i, spec) in aggregates.iter().enumerate() {
-        if let Some(width) = crate::vdbe::execute::agg_payload_width(&spec.func) {
+    for (i, agg) in aggregates.iter().enumerate() {
+        if let Some(width) = crate::vdbe::execute::agg_payload_width(&agg.func) {
             for j in 0..width {
                 columns.push(format!("a{i}_{j}"));
             }
@@ -445,17 +521,26 @@ pub fn aggregate_state_table_sql(state_table_name: &str, shape: &ViewShape) -> R
     ))
 }
 
-/// Whether the view needs the MIN/MAX value-multiset table.
-pub fn needs_minmax_table(shape: &ViewShape) -> bool {
-    matches!(shape, ViewShape::GroupAggregate { aggregates, .. }
-        if aggregates.iter().any(|s| matches!(s.func, AggFunc::Min | AggFunc::Max)))
+/// Whether an aggregate keeps per-value state in the multiset table: MIN/MAX
+/// (to find the next extreme after a retraction) and DISTINCT aggregates (to
+/// step the accumulator only on first occurrence of a value).
+fn uses_multiset(agg: &Aggregate) -> bool {
+    matches!(agg.func, AggFunc::Min | AggFunc::Max) || tracks_distinct_values(agg)
 }
 
-/// The CREATE TABLE statement for a GROUP BY view's MIN/MAX value multiset:
-/// one row per (aggregate, group, distinct value) with its multiplicity. The
-/// PRIMARY KEY ordering makes a group's extreme value an index seek, so
-/// retracting the current extreme never needs a rescan in Rust.
-pub fn minmax_table_sql(minmax_table_name: &str, shape: &ViewShape) -> Result<String> {
+/// Whether the view needs the value-multiset table.
+pub fn needs_multiset_table(shape: &ViewShape) -> bool {
+    matches!(shape, ViewShape::GroupAggregate { aggregates, .. }
+        if aggregates.iter().any(uses_multiset))
+}
+
+/// The CREATE TABLE statement for a GROUP BY view's value multiset: one row
+/// per (aggregate, group, distinct value) with its multiplicity. For MIN/MAX
+/// the PRIMARY KEY ordering makes a group's extreme value an index seek, so
+/// retracting the current extreme never needs a rescan in Rust; for DISTINCT
+/// aggregates the multiplicity decides when a value enters or leaves the
+/// accumulator.
+pub fn multiset_table_sql(multiset_table_name: &str, shape: &ViewShape) -> Result<String> {
     let ViewShape::GroupAggregate { group_exprs, .. } = shape else {
         return Err(LimboError::InternalError(
             "only GROUP BY views have multiset tables".to_string(),
@@ -467,18 +552,19 @@ pub fn minmax_table_sql(minmax_table_name: &str, shape: &ViewShape) -> Result<St
     }
     key.push("val".to_string());
     Ok(format!(
-        "CREATE TABLE {minmax_table_name} ({}, mult, PRIMARY KEY ({}))",
+        "CREATE TABLE {multiset_table_name} ({}, mult, PRIMARY KEY ({}))",
         key.join(", "),
         key.join(", ")
     ))
 }
 
-/// Validation of MIN/MAX arguments that needs the schema: the multiset index
-/// orders values with default (binary) comparison, so arguments carrying a
-/// collation would be maintained under the wrong order. Must run at
+/// Validation of multiset-tracked arguments that needs the schema: the
+/// multiset index compares values with default (binary) collation, so
+/// MIN/MAX ordering and DISTINCT equality over arguments carrying a
+/// collation would be maintained under the wrong comparison. Must run at
 /// translate time — rejecting later, inside the CREATE program, corrupts
 /// the database (see validate_and_extract_columns).
-pub fn validate_minmax_args(
+pub fn validate_multiset_args(
     select: &ast::Select,
     shape: &ViewShape,
     schema: &Schema,
@@ -497,15 +583,17 @@ pub fn validate_minmax_args(
         return Ok(());
     };
 
-    for spec in aggregates {
-        if !matches!(spec.func, AggFunc::Min | AggFunc::Max) {
+    for agg in aggregates {
+        if !uses_multiset(agg) {
             continue;
         }
-        let Some(arg) = &spec.arg else { continue };
+        let Some(arg) = agg.args.first() else {
+            continue;
+        };
         // Explicit COLLATE anywhere in the argument.
         walk_expr_with_subqueries(arg, &mut |e: &ast::Expr| {
             if matches!(e, ast::Expr::Collate(_, _)) {
-                return unsupported("MIN/MAX over collated expressions");
+                return unsupported("MIN/MAX or DISTINCT aggregates over collated expressions");
             }
             Ok(WalkControl::Continue)
         })?;
@@ -516,7 +604,7 @@ pub fn validate_minmax_args(
                 .iter()
                 .any(|c| c.name.as_deref() == Some(name.as_str()) && c.collation_opt().is_some());
             if collated {
-                return unsupported("MIN/MAX over collated columns");
+                return unsupported("MIN/MAX or DISTINCT aggregates over collated columns");
             }
         }
     }
@@ -541,7 +629,7 @@ pub fn compile_maintenance_program(
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<Program> {
-    match classify_view(select)? {
+    match classify_view_for_connection(select, schema, connection)? {
         ViewShape::FilterProject => compile_filter_project_program(
             view_name,
             select,
@@ -941,13 +1029,18 @@ fn compile_filter_project_program(
 ///   if NOT WHERE(row) -> next
 ///   g[..] := GROUP BY expressions of the row
 ///   look up the group in the state table's primary-key index
-///     found:     load view_rowid + each aggregate's persisted payload
+///     found:     load each payload aggregate's persisted state
 ///     not found: retraction of an unknown group -> next; else fresh state
 ///   for each aggregate: w > 0 ? AggStep(arg) : AggInverse(arg)
+///     (multiset aggregates weight-merge (agg, g.., value) rows instead;
+///      DISTINCT accumulators step/invert only on 0 <-> positive transitions)
 ///   if hidden COUNT(*) == 0:  delete state row + index entry + view row
-///   else:                     (new group: allocate state and view rowids)
+///   else:                     (new group: allocate the state rowid, which
+///                             doubles as the group's view-btree rowid)
 ///                             persist payloads, upsert state row,
-///                             write the group's view row (outputs + weight 1)
+///                             finalize aggregate values,
+///                             HAVING true -> write the view row,
+///                             HAVING false/NULL -> delete it if present
 /// ```
 #[allow(clippy::too_many_arguments)]
 fn compile_group_aggregate_program(
@@ -966,6 +1059,7 @@ fn compile_group_aggregate_program(
         group_exprs,
         aggregates,
         outputs,
+        having,
     } = shape
     else {
         unreachable!("compile_group_aggregate_program requires a GroupAggregate shape");
@@ -998,9 +1092,11 @@ fn compile_group_aggregate_program(
     // Payload aggregates persist fixed-width state in the group state table;
     // MIN/MAX keep a value multiset in the multiset table instead
     // (payload_widths[i] is None for them, and they have no accumulator).
+    // DISTINCT aggregates have both: the accumulator payload plus multiset
+    // rows deciding which values reach the accumulator.
     let payload_widths: Vec<Option<usize>> = aggregates
         .iter()
-        .map(|spec| crate::vdbe::execute::agg_payload_width(&spec.func))
+        .map(|agg| crate::vdbe::execute::agg_payload_width(&agg.func))
         .collect();
     let total_payload: usize = payload_widths.iter().flatten().sum();
     // Offset of each payload aggregate's slots within the payload block.
@@ -1014,7 +1110,7 @@ fn compile_group_aggregate_program(
             }))
         })
         .collect();
-    let has_minmax = needs_minmax_table(shape);
+    let has_multiset = needs_multiset_table(shape);
 
     // The state table and its primary-key index are real schema objects
     // created by CREATE MATERIALIZED VIEW.
@@ -1038,25 +1134,28 @@ fn compile_group_aggregate_program(
             ))
         })?;
 
-    // The MIN/MAX value multiset table, when the view has such aggregates.
-    let minmax_table_name = format!(
+    // The value multiset table, when the view has MIN/MAX or DISTINCT
+    // aggregates.
+    let multiset_table_name = format!(
         "{}{}_{view_name}",
-        crate::schema::DBSP_MINMAX_TABLE_PREFIX,
+        crate::schema::DBSP_MULTISET_TABLE_PREFIX,
         crate::incremental::view::DBSP_CIRCUIT_VERSION
     );
-    let mm_schema = if has_minmax {
-        let table = schema.get_btree_table(&minmax_table_name).ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "multiset table {minmax_table_name} of materialized view {view_name} not found"
+    let mm_schema = if has_multiset {
+        let table = schema
+            .get_btree_table(&multiset_table_name)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                "multiset table {multiset_table_name} of materialized view {view_name} not found"
             ))
-        })?;
+            })?;
         let index = schema
-            .get_indices(&minmax_table_name)
+            .get_indices(&multiset_table_name)
             .next()
             .cloned()
             .ok_or_else(|| {
                 LimboError::InternalError(format!(
-                    "multiset table {minmax_table_name} of materialized view {view_name} has no index"
+                    "multiset table {multiset_table_name} of materialized view {view_name} has no index"
                 ))
             })?;
         Some((table, index))
@@ -1076,7 +1175,7 @@ fn compile_group_aggregate_program(
     program.prologue();
 
     let syms = connection.syms.read();
-    let resolver = Resolver::new(
+    let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
@@ -1198,14 +1297,18 @@ fn compile_group_aggregate_program(
     let arg_reg = program.alloc_register();
     // Accumulators, one per aggregate (index 0 = hidden liveness COUNT(*)).
     let acc_start = program.alloc_registers(aggregates.len());
-    // State record image: [g.., view_rowid, payloads..], contiguous for MakeRecord.
-    let state_rec_start = program.alloc_registers(k + 1 + total_payload);
+    // State record image: [g.., payloads..], contiguous for MakeRecord.
+    let state_rec_start = program.alloc_registers(k + total_payload);
     let group_start = state_rec_start;
-    let view_rowid_reg = state_rec_start + k;
-    let payload_start = state_rec_start + k + 1;
+    let payload_start = state_rec_start + k;
     // Index key image: [g.., state_rowid], contiguous for IdxInsert/IdxDelete.
+    // The state rowid doubles as the group's view-btree rowid (see
+    // aggregate_state_table_sql).
     let index_rec_start = program.alloc_registers(k + 1);
     let state_rowid_reg = index_rec_start + k;
+    // Finalized value of each aggregate for the current group; group outputs
+    // and HAVING both read from here.
+    let agg_value_start = program.alloc_registers(aggregates.len());
     // View row image: [outputs.., weight].
     let out_start = program.alloc_registers(num_view_columns + 1);
     let state_record_reg = program.alloc_register();
@@ -1322,11 +1425,22 @@ fn compile_group_aggregate_program(
         flags: CmpInsFlags::default(),
         collation: None,
     });
-    program.emit_insn(Insn::Null {
-        dest: view_rowid_reg,
-        dest_end: None,
-    });
     program.emit_int(0, found_reg);
+    // A fresh group's DISTINCT accumulators may never be stepped in the apply
+    // loop (a NULL argument contributes nothing), but the write path stores
+    // every payload accumulator, so materialize empty contexts now. Stepping
+    // a NULL argument initializes the context without contributing to it.
+    for (i, agg) in aggregates.iter().enumerate() {
+        if tracks_distinct_values(agg) {
+            program.emit_insn(Insn::AggStep {
+                acc_reg: acc_start + i,
+                col: null_arg_reg,
+                delimiter: 0,
+                func: AccumulatorFunc::Agg(agg.func.clone()),
+                comparator: None,
+            });
+        }
+    }
     program.emit_insn(Insn::Goto {
         target_pc: apply_label,
     });
@@ -1342,20 +1456,14 @@ fn compile_group_aggregate_program(
         src_reg: state_rowid_reg,
         target_pc: corrupt_label,
     });
-    program.emit_insn(Insn::Column {
-        cursor_id: state_cursor_id,
-        column: k,
-        dest: view_rowid_reg,
-        default: None,
-    });
-    for (i, spec) in aggregates.iter().enumerate() {
+    for (i, agg) in aggregates.iter().enumerate() {
         let Some(offset) = payload_offsets[i] else {
             continue; // MIN/MAX: state lives in the multiset table
         };
         for j in 0..payload_widths[i].expect("offset implies width") {
             program.emit_insn(Insn::Column {
                 cursor_id: state_cursor_id,
-                column: k + 1 + offset + j,
+                column: k + offset + j,
                 dest: payload_start + offset + j,
                 default: None,
             });
@@ -1363,14 +1471,15 @@ fn compile_group_aggregate_program(
         program.emit_insn(Insn::AggContextLoad {
             acc_reg: acc_start + i,
             payload_start_reg: payload_start + offset,
-            func: AccumulatorFunc::Agg(spec.func.clone()),
+            func: AccumulatorFunc::Agg(agg.func.clone()),
         });
     }
 
     program.preassign_label_to_next_insn(apply_label);
-    for (i, spec) in aggregates.iter().enumerate() {
-        let is_minmax = matches!(spec.func, AggFunc::Min | AggFunc::Max);
-        let col_reg = match &spec.arg {
+    for (i, agg) in aggregates.iter().enumerate() {
+        let is_minmax = matches!(agg.func, AggFunc::Min | AggFunc::Max);
+        let is_distinct = tracks_distinct_values(agg);
+        let col_reg = match agg.args.first() {
             Some(arg_expr) => {
                 let mut bound = arg_expr.clone();
                 bind_and_rewrite_expr(
@@ -1393,12 +1502,17 @@ fn compile_group_aggregate_program(
             None => null_arg_reg,
         };
 
-        if is_minmax {
+        if is_minmax || is_distinct {
             // Weight-merge the value into the aggregate's multiset:
             // (agg_id, group.., value) -> multiplicity. NULLs are ignored,
-            // matching MIN/MAX semantics.
+            // matching aggregate NULL semantics. For a DISTINCT aggregate the
+            // accumulator steps only when a value's multiplicity transitions
+            // 0 -> positive and inverts only on positive -> 0, so it sees
+            // each distinct value exactly once. Transition detection relies
+            // on delta rows carrying unit weights (each captured DML op is
+            // one row of weight +1 or -1, and population scans weigh +1).
             let (mm_table_cursor_id, mm_index_cursor_id) = mm_cursors
-                .expect("classify_view guarantees the multiset table for MIN/MAX aggregates");
+                .expect("classify_view guarantees the multiset table for multiset aggregates");
             let done_label = program.allocate_label();
             let mm_found_label = program.allocate_label();
             let mm_upsert_label = program.allocate_label();
@@ -1444,6 +1558,16 @@ fn compile_group_aggregate_program(
                 dst_reg: mm_last_reg,
                 extra_amount: 0,
             });
+            if is_distinct {
+                // First occurrence of this value in the group.
+                program.emit_insn(Insn::AggStep {
+                    acc_reg: acc_start + i,
+                    col: mm_val_reg,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Agg(agg.func.clone()),
+                    comparator: None,
+                });
+            }
             program.emit_insn(Insn::Goto {
                 target_pc: mm_upsert_label,
             });
@@ -1478,6 +1602,16 @@ fn compile_group_aggregate_program(
                 collation: None,
             });
             // Multiplicity reached zero: remove the value.
+            if is_distinct {
+                // Last occurrence of this value left the group.
+                program.emit_insn(Insn::AggInverse {
+                    acc_reg: acc_start + i,
+                    col: mm_val_reg,
+                    delimiter: 0,
+                    func: AccumulatorFunc::Agg(agg.func.clone()),
+                    comparator: None,
+                });
+            }
             program.emit_insn(Insn::Copy {
                 src_reg: mm_rowid_reg,
                 dst_reg: mm_last_reg,
@@ -1491,7 +1625,7 @@ fn compile_group_aggregate_program(
             });
             program.emit_insn(Insn::Delete {
                 cursor_id: mm_table_cursor_id,
-                table_name: minmax_table_name.clone(),
+                table_name: multiset_table_name.clone(),
                 is_part_of_update: true,
             });
             program.emit_insn(Insn::Goto {
@@ -1517,7 +1651,7 @@ fn compile_group_aggregate_program(
                         | InsertFlags::SKIP_LAST_ROWID
                         | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
                 ),
-                table_name: minmax_table_name.clone(),
+                table_name: multiset_table_name.clone(),
             });
             // Only a freshly-inserted value needs an index entry; an
             // existing value's entry is already present.
@@ -1564,7 +1698,7 @@ fn compile_group_aggregate_program(
             acc_reg: acc_start + i,
             col: col_reg,
             delimiter: 0,
-            func: AccumulatorFunc::Agg(spec.func.clone()),
+            func: AccumulatorFunc::Agg(agg.func.clone()),
             comparator: None,
         });
         program.emit_insn(Insn::Goto {
@@ -1575,7 +1709,7 @@ fn compile_group_aggregate_program(
             acc_reg: acc_start + i,
             col: col_reg,
             delimiter: 0,
-            func: AccumulatorFunc::Agg(spec.func.clone()),
+            func: AccumulatorFunc::Agg(agg.func.clone()),
             comparator: None,
         });
         program.preassign_label_to_next_insn(after_label);
@@ -1634,14 +1768,16 @@ fn compile_group_aggregate_program(
         table_name: state_table_name.clone(),
         is_part_of_update: true,
     });
-    program.emit_insn(Insn::IsNull {
-        reg: view_rowid_reg,
-        target_pc: next_label,
-    });
+    // Without HAVING every live group has its view row, so a missing row is
+    // corruption; with HAVING the dying group may have been suppressed.
     program.emit_insn(Insn::SeekRowid {
         cursor_id: view_cursor_id,
-        src_reg: view_rowid_reg,
-        target_pc: corrupt_label,
+        src_reg: state_rowid_reg,
+        target_pc: if having.is_some() {
+            next_label
+        } else {
+            corrupt_label
+        },
     });
     program.emit_insn(Insn::Delete {
         cursor_id: view_cursor_id,
@@ -1665,25 +1801,20 @@ fn compile_group_aggregate_program(
         rowid_reg: state_rowid_reg,
         prev_largest_reg: prev_rowid_scratch,
     });
-    program.emit_insn(Insn::NewRowid {
-        cursor: view_cursor_id,
-        rowid_reg: view_rowid_reg,
-        prev_largest_reg: prev_rowid_scratch,
-    });
     program.preassign_label_to_next_insn(have_rowids_label);
-    for (i, spec) in aggregates.iter().enumerate() {
+    for (i, agg) in aggregates.iter().enumerate() {
         let Some(offset) = payload_offsets[i] else {
             continue; // MIN/MAX: state lives in the multiset table
         };
         program.emit_insn(Insn::AggContextStore {
             acc_reg: acc_start + i,
             payload_start_reg: payload_start + offset,
-            func: AccumulatorFunc::Agg(spec.func.clone()),
+            func: AccumulatorFunc::Agg(agg.func.clone()),
         });
     }
     program.emit_insn(Insn::MakeRecord {
         start_reg: state_rec_start as u16,
-        count: (k + 1 + total_payload) as u16,
+        count: (k + total_payload) as u16,
         dest_reg: state_record_reg as u16,
         index_name: None,
         affinity_str: None,
@@ -1726,91 +1857,154 @@ fn compile_group_aggregate_program(
     });
     program.preassign_label_to_next_insn(skip_index_label);
 
-    for (out_idx, output) in outputs.iter().enumerate() {
-        match output {
-            OutputColumn::Group(group_idx) => {
-                program.emit_insn(Insn::Copy {
-                    src_reg: group_start + group_idx,
-                    dst_reg: out_start + out_idx,
-                    extra_amount: 0,
-                });
-            }
-            OutputColumn::Aggregate(agg_idx) => {
-                let func = &aggregates[*agg_idx].func;
-                if matches!(func, AggFunc::Min | AggFunc::Max) {
-                    // The group's extreme is the first (MIN) or last (MAX)
-                    // multiset entry with the (agg_id, group..) prefix.
-                    let (_, mm_index_cursor_id) =
-                        mm_cursors.expect("MIN/MAX aggregates imply the multiset table");
-                    let empty_label = program.allocate_label();
-                    let have_label = program.allocate_label();
-                    program.emit_int(*agg_idx as i64, mm_rec_start);
-                    program.emit_insn(Insn::Copy {
-                        src_reg: group_start,
-                        dst_reg: mm_rec_start + 1,
-                        extra_amount: k.saturating_sub(1),
-                    });
-                    match func {
-                        AggFunc::Min => {
-                            program.emit_insn(Insn::SeekGE {
-                                is_index: true,
-                                cursor_id: mm_index_cursor_id,
-                                start_reg: mm_rec_start,
-                                num_regs: 1 + k,
-                                target_pc: empty_label,
-                                eq_only: false,
-                            });
-                            // Positioned past the group: no values.
-                            program.emit_insn(Insn::IdxGT {
-                                cursor_id: mm_index_cursor_id,
-                                start_reg: mm_rec_start,
-                                num_regs: 1 + k,
-                                target_pc: empty_label,
-                            });
-                        }
-                        AggFunc::Max => {
-                            program.emit_insn(Insn::SeekLE {
-                                is_index: true,
-                                cursor_id: mm_index_cursor_id,
-                                start_reg: mm_rec_start,
-                                num_regs: 1 + k,
-                                target_pc: empty_label,
-                                eq_only: false,
-                            });
-                            // Positioned before the group: no values.
-                            program.emit_insn(Insn::IdxLT {
-                                cursor_id: mm_index_cursor_id,
-                                start_reg: mm_rec_start,
-                                num_regs: 1 + k,
-                                target_pc: empty_label,
-                            });
-                        }
-                        _ => unreachable!(),
-                    }
-                    program.emit_insn(Insn::Column {
+    // Finalize every aggregate's value for the group; output columns and
+    // HAVING both read from this block.
+    for (i, agg) in aggregates.iter().enumerate() {
+        let value_reg = agg_value_start + i;
+        if matches!(agg.func, AggFunc::Min | AggFunc::Max) {
+            // The group's extreme is the first (MIN) or last (MAX) multiset
+            // entry with the (agg_id, group..) prefix.
+            let (_, mm_index_cursor_id) =
+                mm_cursors.expect("MIN/MAX aggregates imply the multiset table");
+            let empty_label = program.allocate_label();
+            let have_label = program.allocate_label();
+            program.emit_int(i as i64, mm_rec_start);
+            program.emit_insn(Insn::Copy {
+                src_reg: group_start,
+                dst_reg: mm_rec_start + 1,
+                extra_amount: k.saturating_sub(1),
+            });
+            match agg.func {
+                AggFunc::Min => {
+                    program.emit_insn(Insn::SeekGE {
+                        is_index: true,
                         cursor_id: mm_index_cursor_id,
-                        column: 1 + k,
-                        dest: out_start + out_idx,
-                        default: None,
+                        start_reg: mm_rec_start,
+                        num_regs: 1 + k,
+                        target_pc: empty_label,
+                        eq_only: false,
                     });
-                    program.emit_insn(Insn::Goto {
-                        target_pc: have_label,
-                    });
-                    program.preassign_label_to_next_insn(empty_label);
-                    program.emit_insn(Insn::Null {
-                        dest: out_start + out_idx,
-                        dest_end: None,
-                    });
-                    program.preassign_label_to_next_insn(have_label);
-                } else {
-                    program.emit_insn(Insn::AggValue {
-                        acc_reg: acc_start + agg_idx,
-                        dest_reg: out_start + out_idx,
-                        func: AccumulatorFunc::Agg(func.clone()),
+                    // Positioned past the group: no values.
+                    program.emit_insn(Insn::IdxGT {
+                        cursor_id: mm_index_cursor_id,
+                        start_reg: mm_rec_start,
+                        num_regs: 1 + k,
+                        target_pc: empty_label,
                     });
                 }
+                AggFunc::Max => {
+                    program.emit_insn(Insn::SeekLE {
+                        is_index: true,
+                        cursor_id: mm_index_cursor_id,
+                        start_reg: mm_rec_start,
+                        num_regs: 1 + k,
+                        target_pc: empty_label,
+                        eq_only: false,
+                    });
+                    // Positioned before the group: no values.
+                    program.emit_insn(Insn::IdxLT {
+                        cursor_id: mm_index_cursor_id,
+                        start_reg: mm_rec_start,
+                        num_regs: 1 + k,
+                        target_pc: empty_label,
+                    });
+                }
+                _ => unreachable!(),
             }
+            program.emit_insn(Insn::Column {
+                cursor_id: mm_index_cursor_id,
+                column: 1 + k,
+                dest: value_reg,
+                default: None,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: have_label,
+            });
+            program.preassign_label_to_next_insn(empty_label);
+            program.emit_insn(Insn::Null {
+                dest: value_reg,
+                dest_end: None,
+            });
+            program.preassign_label_to_next_insn(have_label);
+        } else {
+            program.emit_insn(Insn::AggValue {
+                acc_reg: acc_start + i,
+                dest_reg: value_reg,
+                func: AccumulatorFunc::Agg(agg.func.clone()),
+            });
         }
+    }
+
+    // HAVING gates only the view row: the group's state stays maintained
+    // above so the predicate flips the row in and out as aggregates change.
+    // Group expressions and aggregate calls inside the predicate resolve to
+    // their computed registers through the expression cache, exactly like
+    // HAVING translation in a regular GROUP BY query.
+    let suppress_label = having.as_ref().map(|_| program.allocate_label());
+    if let Some(having_expr) = having {
+        let suppress_label = suppress_label.expect("allocated above");
+        for (i, group_expr) in group_exprs.iter().enumerate() {
+            let mut bound = group_expr.clone();
+            bind_and_rewrite_expr(
+                &mut bound,
+                Some(&mut table_references),
+                None,
+                &resolver,
+                BindingBehavior::ResultColumnsNotAllowed,
+            )?;
+            resolver.cache_expr_reg(std::borrow::Cow::Owned(bound), group_start + i, false, None);
+        }
+        for (i, agg) in aggregates.iter().enumerate() {
+            let mut bound = agg.original_expr.clone();
+            bind_and_rewrite_expr(
+                &mut bound,
+                Some(&mut table_references),
+                None,
+                &resolver,
+                BindingBehavior::ResultColumnsNotAllowed,
+            )?;
+            resolver.cache_expr_reg(
+                std::borrow::Cow::Owned(bound),
+                agg_value_start + i,
+                false,
+                None,
+            );
+        }
+        resolver.enable_expr_to_reg_cache();
+        let mut bound = having_expr.clone();
+        bind_and_rewrite_expr(
+            &mut bound,
+            Some(&mut table_references),
+            None,
+            &resolver,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )?;
+        let pass_label = program.allocate_label();
+        translate_condition_expr(
+            &mut program,
+            &table_references,
+            &bound,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: pass_label,
+                jump_target_when_false: suppress_label,
+                jump_target_when_null: suppress_label,
+            },
+            &resolver,
+        )?;
+        program.preassign_label_to_next_insn(pass_label);
+    }
+
+    for (out_idx, output) in outputs.iter().enumerate() {
+        let src_reg = match output {
+            OutputColumn::Group(group_idx) => group_start + group_idx,
+            OutputColumn::Aggregate(agg_idx) => agg_value_start + agg_idx,
+        };
+        program.emit_insn(Insn::Copy {
+            src_reg,
+            dst_reg: out_start + out_idx,
+            extra_amount: 0,
+        });
     }
     program.emit_int(1, out_start + num_view_columns);
     program.emit_insn(Insn::MakeRecord {
@@ -1822,7 +2016,7 @@ fn compile_group_aggregate_program(
     });
     program.emit_insn(Insn::Insert {
         cursor: view_cursor_id,
-        key_reg: view_rowid_reg,
+        key_reg: state_rowid_reg,
         record_reg: view_record_reg,
         flag: InsertFlags(
             InsertFlags::REQUIRE_SEEK
@@ -1831,6 +2025,24 @@ fn compile_group_aggregate_program(
         ),
         table_name: view_name.to_string(),
     });
+
+    if let Some(suppress_label) = suppress_label {
+        // Group failed HAVING: remove its previously-visible row, if any.
+        program.emit_insn(Insn::Goto {
+            target_pc: next_label,
+        });
+        program.preassign_label_to_next_insn(suppress_label);
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: view_cursor_id,
+            src_reg: state_rowid_reg,
+            target_pc: next_label,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: view_cursor_id,
+            table_name: view_name.to_string(),
+            is_part_of_update: true,
+        });
+    }
 
     program.preassign_label_to_next_insn(next_label);
     program.emit_insn(Insn::Next {

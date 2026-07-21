@@ -86,14 +86,14 @@ pub fn translate_create_materialized_view(
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
 
     let view_column_schema = resolver.with_schema(database_id, |s| {
-        IncrementalView::validate_and_extract_columns(select_stmt, s)
+        IncrementalView::validate_and_extract_columns(select_stmt, s, resolver)
     })?;
     let view_columns = view_column_schema.flat_columns();
 
     // The classified shape decides what internal storage the view needs:
     // filter/project views are maintained purely in the view btree, while
     // GROUP BY views also persist per-group aggregate state.
-    let shape = crate::incremental::vdbe_maintenance::classify_view(select_stmt)?;
+    let shape = crate::incremental::vdbe_maintenance::classify_view(select_stmt, resolver)?;
     let needs_state_table = matches!(
         shape,
         crate::incremental::vdbe_maintenance::ViewShape::GroupAggregate { .. }
@@ -126,9 +126,9 @@ pub fn translate_create_materialized_view(
         None
     };
 
-    // Btree for the MIN/MAX value multiset, when the view has such
-    // aggregates: __turso_internal_dbsp_minmax_v<version>_<view_name>
-    let minmax_root_reg = if crate::incremental::vdbe_maintenance::needs_minmax_table(&shape) {
+    // Btree for the value multiset, when the view has MIN/MAX or DISTINCT
+    // aggregates: __turso_internal_dbsp_multiset_v<version>_<view_name>
+    let multiset_root_reg = if crate::incremental::vdbe_maintenance::needs_multiset_table(&shape) {
         let reg = program.alloc_register();
         program.emit_insn(Insn::CreateBtree {
             db: database_id,
@@ -269,13 +269,13 @@ pub fn translate_create_materialized_view(
         parse_schema_names.push(escape_sql_string_literal(&dbsp_index_name));
     }
 
-    if let Some(minmax_root_reg) = minmax_root_reg {
-        let minmax_table_name = ast::Name::exact(format!(
+    if let Some(multiset_root_reg) = multiset_root_reg {
+        let multiset_table_name = ast::Name::exact(format!(
             "{}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}",
-            crate::schema::DBSP_MINMAX_TABLE_PREFIX
+            crate::schema::DBSP_MULTISET_TABLE_PREFIX
         ));
-        let minmax_sql = crate::incremental::vdbe_maintenance::minmax_table_sql(
-            &minmax_table_name.as_ident(),
+        let multiset_sql = crate::incremental::vdbe_maintenance::multiset_table_sql(
+            &multiset_table_name.as_ident(),
             &shape,
         )?;
         emit_schema_entry(
@@ -284,22 +284,22 @@ pub fn translate_create_materialized_view(
             sqlite_schema_cursor_id,
             None,
             SchemaEntryType::Table,
-            minmax_table_name.as_str(),
-            minmax_table_name.as_str(),
-            minmax_root_reg,
-            Some(minmax_sql),
+            multiset_table_name.as_str(),
+            multiset_table_name.as_str(),
+            multiset_root_reg,
+            Some(multiset_sql),
         )?;
 
-        let minmax_index_root_reg = program.alloc_register();
+        let multiset_index_root_reg = program.alloc_register();
         program.emit_insn(Insn::CreateBtree {
             db: database_id,
-            root: minmax_index_root_reg,
+            root: multiset_index_root_reg,
             flags: CreateBTreeFlags::new_index(),
         });
-        let minmax_index_name = format!(
+        let multiset_index_name = format!(
             "{}{}_1",
             PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
-            minmax_table_name.as_str()
+            multiset_table_name.as_str()
         );
         emit_schema_entry(
             program,
@@ -307,14 +307,14 @@ pub fn translate_create_materialized_view(
             sqlite_schema_cursor_id,
             None,
             SchemaEntryType::Index,
-            &minmax_index_name,
-            minmax_table_name.as_str(),
-            minmax_index_root_reg,
+            &multiset_index_name,
+            multiset_table_name.as_str(),
+            multiset_index_root_reg,
             None,
         )?;
 
-        parse_schema_names.push(escape_sql_string_literal(minmax_table_name.as_str()));
-        parse_schema_names.push(escape_sql_string_literal(&minmax_index_name));
+        parse_schema_names.push(escape_sql_string_literal(multiset_table_name.as_str()));
+        parse_schema_names.push(escape_sql_string_literal(&multiset_index_name));
     }
 
     // Parse schema to load the new view (and its state table, if any)
@@ -545,7 +545,7 @@ pub fn translate_drop_view(
             format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"),
             format!(
                 "{}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}",
-                crate::schema::DBSP_MINMAX_TABLE_PREFIX
+                crate::schema::DBSP_MULTISET_TABLE_PREFIX
             ),
         ]
     } else {

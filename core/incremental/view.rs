@@ -290,6 +290,7 @@ impl IncrementalView {
     pub fn validate_and_extract_columns(
         select: &ast::Select,
         schema: &Schema,
+        resolver: &crate::translate::emitter::Resolver,
     ) -> Result<ViewColumnSchema> {
         crate::util::validate_select_for_unsupported_features(select)?;
         // Views are maintained by compiled VDBE programs; shapes the codegen
@@ -299,8 +300,8 @@ impl IncrementalView {
         // after btree pages were allocated and leaves stale in-memory schema
         // entries behind, which corrupts the database once those pages are
         // reused). The supported set grows as operator codegen lands.
-        let shape = crate::incremental::vdbe_maintenance::classify_view(select)?;
-        crate::incremental::vdbe_maintenance::validate_minmax_args(select, &shape, schema)?;
+        let shape = crate::incremental::vdbe_maintenance::classify_view(select, resolver)?;
+        crate::incremental::vdbe_maintenance::validate_multiset_args(select, &shape, schema)?;
         // Use the shared function to extract columns with full table context
         extract_view_columns(select, schema)
     }

@@ -205,7 +205,7 @@ fn predicate(col: &ColumnDef, rng: &mut ChaCha8Rng) -> String {
     }
 }
 
-/// `SELECT g, COUNT(*) AS cnt, SUM(n) AS agg1, ... FROM t GROUP BY g`
+/// `SELECT g, COUNT(*) AS cnt, SUM(n) AS agg1, ... FROM t GROUP BY g [HAVING ...]`
 fn aggregate(table: &Table, rng: &mut ChaCha8Rng) -> String {
     let group_col = &table.columns[rng.random_range(0..table.columns.len())];
     let numeric_cols: Vec<&ColumnDef> = table
@@ -219,13 +219,45 @@ fn aggregate(table: &Table, rng: &mut ChaCha8Rng) -> String {
         for (i, func) in ["SUM", "AVG", "MIN", "MAX"].iter().enumerate() {
             if rng.random_bool(0.5) {
                 let col = numeric_cols[rng.random_range(0..numeric_cols.len())];
-                exprs.push(format!("{func}({}) AS agg{i}", quoted(&col.name)));
+                let distinct = if rng.random_bool(0.3) {
+                    "DISTINCT "
+                } else {
+                    ""
+                };
+                exprs.push(format!("{func}({distinct}{}) AS agg{i}", quoted(&col.name)));
             }
+        }
+        if rng.random_bool(0.3) {
+            let col = numeric_cols[rng.random_range(0..numeric_cols.len())];
+            exprs.push(format!("COUNT(DISTINCT {}) AS agg_cd", quoted(&col.name)));
         }
     }
 
+    let having = if rng.random_bool(0.4) {
+        let g = quoted(&group_col.name);
+        match rng.random_range(0..4u8) {
+            0 => format!(" HAVING COUNT(*) > {}", rng.random_range(0..3)),
+            1 => format!(" HAVING {g} IS NOT NULL"),
+            2 if !numeric_cols.is_empty() => {
+                let col = numeric_cols[rng.random_range(0..numeric_cols.len())];
+                format!(" HAVING SUM({}) IS NOT NULL", quoted(&col.name))
+            }
+            _ if !numeric_cols.is_empty() => {
+                let col = numeric_cols[rng.random_range(0..numeric_cols.len())];
+                format!(
+                    " HAVING MAX({}) >= {}",
+                    quoted(&col.name),
+                    rng.random_range(-50..50)
+                )
+            }
+            _ => format!(" HAVING COUNT(*) >= {}", rng.random_range(1..3)),
+        }
+    } else {
+        String::new()
+    };
+
     format!(
-        "SELECT {g}, {exprs} FROM {t} GROUP BY {g}",
+        "SELECT {g}, {exprs} FROM {t} GROUP BY {g}{having}",
         g = quoted(&group_col.name),
         exprs = exprs.join(", "),
         t = quoted(&table.name),

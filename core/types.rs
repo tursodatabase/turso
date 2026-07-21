@@ -3188,6 +3188,7 @@ impl Cursor {
         match self {
             Self::BTree(cursor) => cursor.set_null_flag(flag),
             Self::Virtual(cursor) => cursor.set_null_flag(flag),
+            Self::MaterializedView(cursor) => cursor.set_null_flag(flag),
             _ => {
                 mark_unlikely();
                 panic!("set_null_flag on unexpected cursor type");

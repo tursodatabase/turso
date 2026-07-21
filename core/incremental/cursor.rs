@@ -63,6 +63,11 @@ pub struct MaterializedViewCursor {
     // Current row cache - only cache the current row we're looking at
     current_row: Option<(i64, Vec<Value>)>,
 
+    // Synthetic null-row flag (see Insn::NullRow): while set, column reads
+    // return NULL even though the cursor may still sit on a stale row.
+    // Cleared by any repositioning, mirroring BTreeCursor.
+    null_flag: bool,
+
     // In-progress overlay computation, parked across I/O yields.
     overlay_build: OverlayBuild,
 
@@ -122,6 +127,7 @@ impl MaterializedViewCursor {
             tx_state,
             last_tx_state_len: 0,
             current_row: None,
+            null_flag: false,
             overlay_build: OverlayBuild::Idle,
             seek_state: SeekState::Init,
         })
@@ -147,7 +153,14 @@ impl MaterializedViewCursor {
                         view_guard.column_schema.flat_columns().len(),
                     )
                 };
-                let shape = crate::incremental::vdbe_maintenance::classify_view(&select)?;
+                let shape = {
+                    let schema = self.connection.schema.read();
+                    crate::incremental::vdbe_maintenance::classify_view_for_connection(
+                        &select,
+                        &schema,
+                        &self.connection,
+                    )?
+                };
                 self.overlay_build = match shape {
                     crate::incremental::vdbe_maintenance::ViewShape::FilterProject => {
                         let program = {
@@ -434,6 +447,7 @@ impl MaterializedViewCursor {
             match &mut self.seek_state {
                 SeekState::Init => {
                     self.current_row = None;
+                    self.null_flag = false;
                     self.seek_state = SeekState::Seek {
                         target: target_rowid,
                     };
@@ -548,6 +562,9 @@ impl MaterializedViewCursor {
     }
 
     pub fn column(&mut self, col: usize) -> Result<IOResult<Value>> {
+        if self.null_flag {
+            return Ok(IOResult::Done(Value::Null));
+        }
         if let Some((_, ref values)) = self.current_row {
             Ok(IOResult::Done(
                 values.get(col).cloned().unwrap_or(Value::Null),
@@ -555,6 +572,11 @@ impl MaterializedViewCursor {
         } else {
             Ok(IOResult::Done(Value::Null))
         }
+    }
+
+    /// Synthetic null-row flag; see [`crate::vdbe::insn::Insn::NullRow`].
+    pub fn set_null_flag(&mut self, flag: bool) {
+        self.null_flag = flag;
     }
 
     pub fn rowid(&self) -> Result<IOResult<Option<i64>>> {
