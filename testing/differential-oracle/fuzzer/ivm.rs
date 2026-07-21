@@ -389,6 +389,42 @@ fn join(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
         cols.push(format!("r.{} AS r_{}", quoted(&c.name), c.name));
     }
 
+    // Sometimes extend to a three-way join through a second same-typed pair.
+    if rng.random_bool(0.25) {
+        let third = tables[rng.random_range(0..tables.len())];
+        let mut second_pairs = Vec::new();
+        for rc2 in &right.columns {
+            for tc in &third.columns {
+                if rc2.data_type == tc.data_type
+                    && matches!(
+                        rc2.data_type,
+                        DataType::Integer | DataType::Real | DataType::Text
+                    )
+                {
+                    second_pairs.push((rc2, tc));
+                }
+            }
+        }
+        if !second_pairs.is_empty() {
+            let (rc2, tc) = second_pairs[rng.random_range(0..second_pairs.len())];
+            return Some(format!(
+                "SELECT l.{lcol} AS a, r.{rcol} AS b, t.{tcol} AS c \
+                 FROM {lt} AS l JOIN {rt} AS r ON l.{lc} = r.{rc} \
+                 JOIN {tt} AS t ON r.{rc2} = t.{tc}",
+                lcol = quoted(&left.columns[0].name),
+                rcol = quoted(&right.columns[0].name),
+                tcol = quoted(&third.columns[0].name),
+                lt = quoted(&left.name),
+                rt = quoted(&right.name),
+                tt = quoted(&third.name),
+                lc = quoted(&lc.name),
+                rc = quoted(&rc.name),
+                rc2 = quoted(&rc2.name),
+                tc = quoted(&tc.name),
+            ));
+        }
+    }
+
     // Sometimes aggregate over the join instead of projecting it.
     if rng.random_bool(0.4) {
         let group_col = &left.columns[rng.random_range(0..left.columns.len())];
