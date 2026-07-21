@@ -180,15 +180,55 @@ expect {
     a|1
 }
 
+# MIN/MAX are maintained through a value multiset: duplicates carry
+# multiplicity, and retracting the current extreme falls back to the next
+# value without a rescan.
+test matview-vdbe-minmax-maintenance {
+    CREATE TABLE t14(g TEXT, x INTEGER);
+    INSERT INTO t14 VALUES ('a', 10), ('a', 20), ('a', 20), ('b', 5);
+    CREATE MATERIALIZED VIEW v14 AS SELECT g, MIN(x) AS mn, MAX(x) AS mx FROM t14 GROUP BY g;
+    DELETE FROM t14 WHERE rowid = (SELECT MAX(rowid) FROM t14 WHERE g='a' AND x=20);
+    SELECT 'dup', * FROM v14 ORDER BY g;
+    DELETE FROM t14 WHERE g = 'a' AND x = 20;
+    INSERT INTO t14 VALUES ('a', 3), ('b', NULL);
+    SELECT 'ext', * FROM v14 ORDER BY g;
+    UPDATE t14 SET x = 100 WHERE g = 'b' AND x = 5;
+    SELECT 'upd', * FROM v14 ORDER BY g;
+    DELETE FROM t14 WHERE g = 'b' AND x = 100;
+    SELECT 'nul', g, mn IS NULL, mx IS NULL FROM v14 ORDER BY g;
+}
+expect {
+    dup|a|10|20
+    dup|b|5|5
+    ext|a|3|10
+    ext|b|5|5
+    upd|a|3|10
+    upd|b|100|100
+    nul|a|0|0
+    nul|b|1|1
+}
+
+# Dropping a MIN/MAX view cleans up its multiset table and index.
+test matview-vdbe-minmax-drop-clean {
+    CREATE TABLE t15(g TEXT, x INTEGER);
+    INSERT INTO t15 VALUES ('a', 1);
+    CREATE MATERIALIZED VIEW v15 AS SELECT g, MIN(x) AS mn FROM t15 GROUP BY g;
+    DROP VIEW v15;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
 # Shapes the VDBE codegen cannot maintain yet are rejected at translate time,
 # before the CREATE program allocates any btree pages.
 test matview-vdbe-rejected-create-is-clean {
     CREATE TABLE t7(a INTEGER, b TEXT);
     INSERT INTO t7 VALUES (1,'x');
-    CREATE MATERIALIZED VIEW bad7 AS SELECT min(a) FROM t7 GROUP BY b;
+    CREATE MATERIALIZED VIEW bad7 AS SELECT group_concat(a) FROM t7 GROUP BY b;
 }
 expect error {
-    materialized views with the min aggregate are not yet supported
+    materialized views with the group_concat aggregate are not yet supported
 }
 
 # Post-error state assertions (aborted statements must not leak captured

@@ -126,6 +126,20 @@ pub fn translate_create_materialized_view(
         None
     };
 
+    // Btree for the MIN/MAX value multiset, when the view has such
+    // aggregates: __turso_internal_dbsp_minmax_v<version>_<view_name>
+    let minmax_root_reg = if crate::incremental::vdbe_maintenance::needs_minmax_table(&shape) {
+        let reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: database_id,
+            root: reg,
+            flags: CreateBTreeFlags::new_table(),
+        });
+        Some(reg)
+    } else {
+        None
+    };
+
     // Create a proper BTreeTable for the cursor with the actual view columns
     let view_table = Arc::new(BTreeTable::new(
         0, // root_page, will be set to actual root page after creation
@@ -253,6 +267,54 @@ pub fn translate_create_materialized_view(
 
         parse_schema_names.push(escape_sql_string_literal(dbsp_table_name.as_str()));
         parse_schema_names.push(escape_sql_string_literal(&dbsp_index_name));
+    }
+
+    if let Some(minmax_root_reg) = minmax_root_reg {
+        let minmax_table_name = ast::Name::exact(format!(
+            "{}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}",
+            crate::schema::DBSP_MINMAX_TABLE_PREFIX
+        ));
+        let minmax_sql = crate::incremental::vdbe_maintenance::minmax_table_sql(
+            &minmax_table_name.as_ident(),
+            &shape,
+        )?;
+        emit_schema_entry(
+            program,
+            resolver,
+            sqlite_schema_cursor_id,
+            None,
+            SchemaEntryType::Table,
+            minmax_table_name.as_str(),
+            minmax_table_name.as_str(),
+            minmax_root_reg,
+            Some(minmax_sql),
+        )?;
+
+        let minmax_index_root_reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: database_id,
+            root: minmax_index_root_reg,
+            flags: CreateBTreeFlags::new_index(),
+        });
+        let minmax_index_name = format!(
+            "{}{}_1",
+            PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+            minmax_table_name.as_str()
+        );
+        emit_schema_entry(
+            program,
+            resolver,
+            sqlite_schema_cursor_id,
+            None,
+            SchemaEntryType::Index,
+            &minmax_index_name,
+            minmax_table_name.as_str(),
+            minmax_index_root_reg,
+            None,
+        )?;
+
+        parse_schema_names.push(escape_sql_string_literal(minmax_table_name.as_str()));
+        parse_schema_names.push(escape_sql_string_literal(&minmax_index_name));
     }
 
     // Parse schema to load the new view (and its state table, if any)
@@ -461,8 +523,9 @@ pub fn translate_drop_view(
     }
 
     // If this is a materialized view, we need to destroy its btree as well
-    // and also clean up the associated DBSP state table and index
-    let dbsp_table_name = if is_materialized_view {
+    // and also clean up its internal tables (aggregate state, MIN/MAX
+    // multiset) — those that exist for its shape.
+    let internal_table_names: Vec<String> = if is_materialized_view {
         if let Some(table) =
             resolver.with_schema(database_id, |s| s.get_table(&normalized_view_name))
         {
@@ -477,22 +540,24 @@ pub fn translate_drop_view(
             }
         }
 
-        // Construct the DBSP state table name
         use crate::incremental::view::DBSP_CIRCUIT_VERSION;
-        Some(format!(
-            "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"
-        ))
+        vec![
+            format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"),
+            format!(
+                "{}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}",
+                crate::schema::DBSP_MINMAX_TABLE_PREFIX
+            ),
+        ]
     } else {
-        None
+        Vec::new()
     };
 
-    // Destroy DBSP state table and index btrees if this is a materialized view
-    if let Some(ref dbsp_table_name) = dbsp_table_name {
-        // Destroy DBSP indexes first
-        let dbsp_indexes: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(dbsp_table_name).cloned().collect()
+    // Destroy the internal tables' btrees and indexes (those that exist).
+    for internal_table_name in &internal_table_names {
+        let internal_indexes: Vec<_> = resolver.with_schema(database_id, |s| {
+            s.get_indices(internal_table_name).cloned().collect()
         });
-        for index in &dbsp_indexes {
+        for index in &internal_indexes {
             program.emit_insn(Insn::Destroy {
                 db: database_id,
                 root: index.root_page,
@@ -501,14 +566,13 @@ pub fn translate_drop_view(
             });
         }
 
-        // Destroy DBSP state table btree
-        if let Some(dbsp_table) =
-            resolver.with_schema(database_id, |s| s.get_table(dbsp_table_name))
+        if let Some(internal_table) =
+            resolver.with_schema(database_id, |s| s.get_table(internal_table_name))
         {
-            if let Some(dbsp_btree_table) = dbsp_table.btree() {
+            if let Some(internal_btree) = internal_table.btree() {
                 program.emit_insn(Insn::Destroy {
                     db: database_id,
-                    root: dbsp_btree_table.root_page,
+                    root: internal_btree.root_page,
                     former_root_reg: 0, // No autovacuum
                     is_temp: 0,
                 });
@@ -598,11 +662,12 @@ pub fn translate_drop_view(
 
     program.preassign_label_to_next_insn(end_loop_label);
 
-    // If this is a materialized view, delete DBSP table and index entries in a second pass
-    // We do this in a separate loop to ensure we catch all entries even if they come
-    // in different orders in sqlite_schema
-    if let Some(ref dbsp_table_name) = dbsp_table_name {
-        // Set up registers for DBSP table name and types (outside the loop for efficiency)
+    // If this is a materialized view, delete internal table and index
+    // entries in a second pass, one loop per internal table. We do this in
+    // separate loops to ensure we catch all entries even if they come in
+    // different orders in sqlite_schema.
+    for dbsp_table_name in &internal_table_names {
+        // Set up registers for the table name and types (outside the loop for efficiency)
         let dbsp_table_name_reg_2 = program.alloc_register();
         program.emit_insn(Insn::String8 {
             dest: dbsp_table_name_reg_2,
