@@ -73,9 +73,9 @@ addr  opcode                  p1  p2  p3  p4                  p5  comment
   41    Copy                   3  20   0                       0  r[20]=r[3]
   42    AggStep                0  20  17  avg                  0  accum=r[17] step(r[20])
   43    Copy                   3  21   0                       0  r[21]=r[3]
-  44    AggStep                0  21  18  max                  0  accum=r[18] step(r[21])
+  44    AggStep                0  21  18  max(Binary)          0  accum=r[18] step(r[21])
   45    Copy                   3  22   0                       0  r[22]=r[3]
-  46    AggStep                0  22  19  min                  0  accum=r[19] step(r[22])
+  46    AggStep                0  22  19  min(Binary)          0  accum=r[19] step(r[22])
   47  Goto                     0  40   0                       0
   48  AggFinal                 0  17   0  avg                  0  accum=r[17]
   49  AggFinal                 0  18   0  max                  0  accum=r[18]

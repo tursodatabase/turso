@@ -42,8 +42,8 @@ addr  opcode                  p1  p2  p3  p4                  p5  comment
   15            Move          12   7   1                       0  r[7..7]=r[12..12]
   16            IfPos          6  40   0                       0  r[6]>0 -> r[6]-=0, goto 40; check abort flag
   17            Gosub         15  37   0                       0  ; goto clear accumulator subroutine
-  18            AggStep        0  13   9  min                  0  accum=r[9] step(r[13])
-  19            AggStep        0  14  10  max                  0  accum=r[10] step(r[14])
+  18            AggStep        0  13   9  min(Binary)          0  accum=r[9] step(r[13])
+  19            AggStep        0  14  10  max(Binary)          0  accum=r[10] step(r[14])
   20            If             5  22   0                       0  if r[5] goto 22; don't emit group columns if continuing existing group
   21            Column         1   0   8                       0  r[8]=idx_sales_category.category
   22            Integer        1   5   0                       0  r[5]=1; indicate data in accumulator

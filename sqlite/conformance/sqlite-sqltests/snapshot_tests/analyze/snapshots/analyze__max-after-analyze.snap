@@ -20,7 +20,7 @@ addr  opcode          p1  p2  p3  p4                p5  comment
    3  Rewind           0   8   0                     0  Rewind table products
    4    Column         0   4   3                     0  r[3]=products.price
    5    RealAffinity   3   0   0                     0
-   6    AggStep        0   3   2  max                0  accum=r[2] step(r[3])
+   6    AggStep        0   3   2  max(Binary)        0  accum=r[2] step(r[3])
    7  Next             0   4   0                     0
    8  AggFinal         0   2   0  max                0  accum=r[2]
    9  Copy             2   1   0                     0  r[1]=r[2]

@@ -80,7 +80,7 @@ addr  opcode                            p1   p2   p3  p4              p5  commen
   45            InitCoroutine            3    0    5                   0
   46              Yield                  3   50    0                   0
   47              Copy                   5   19    0                   0  r[19]=r[5]
-  48              AggStep                0   19   17  max              0  accum=r[17] step(r[19])
+  48              AggStep                0   19   17  max(Binary)      0  accum=r[17] step(r[19])
   49            Goto                     0   46    0                   0
   50            AggFinal                 0   17    0  max              0  accum=r[17]
   51            Copy                    17   16    0                   0  r[16]=r[17]

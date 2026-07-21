@@ -1261,13 +1261,16 @@ pub fn insn_to_row(
                 delimiter: _,
                 col,
                 comparator: _,
-                collation: _,
+                collation,
             } => (
                 "AggStep",
                 0,
                 *col as i64,
                 *acc_reg as i64,
-                Value::build_text(func.as_str()),
+                Value::build_text(match collation {
+                    Some(collation) => format!("{}({collation})", func.as_str()),
+                    None => func.as_str().to_string(),
+                }),
                 0,
                 format!("accum=r[{}] step(r[{}])", *acc_reg, *col),
             ),

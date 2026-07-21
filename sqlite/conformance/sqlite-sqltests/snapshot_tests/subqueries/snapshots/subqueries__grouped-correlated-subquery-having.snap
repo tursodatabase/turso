@@ -66,7 +66,7 @@ addr  opcode                    p1  p2  p3  p4            p5  comment
   39          IdxGT              3  44  18                 0  key=[18..18]
   40          DeferredSeek       3   2   0                 0
   41          Column             2   1  19                 0  r[19]=grouped_values.val
-  42          AggStep            0  19  16  max            0  accum=r[16] step(r[19])
+  42          AggStep            0  19  16  max(Binary)    0  accum=r[16] step(r[19])
   43        Next                 3  39   0                 0
   44        AggFinal             0  16   0  max            0  accum=r[16]
   45        Copy                16  15   0                 0  r[15]=r[16]

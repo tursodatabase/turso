@@ -59,9 +59,9 @@ addr  opcode              p1  p2  p3  p4                     p5  comment
   29        Insert         3  30  27  buffer_table_window_1   0  intkey=r[27] data=r[30]
   30        AggStep        0  31  15  count                   0  accum=r[15] step(r[31])
   31        Copy           6  32   0                          0  r[32]=r[6]
-  32        AggStep        0  32  16  min                     0  accum=r[16] step(r[32])
+  32        AggStep        0  32  16  min(Binary)             0  accum=r[16] step(r[32])
   33        Copy           6  33   0                          0  r[33]=r[6]
-  34        AggStep        0  33  17  max                     0  accum=r[17] step(r[33])
+  34        AggStep        0  33  17  max(Binary)             0  accum=r[17] step(r[33])
   35        Copy           6  34   0                          0  r[34]=r[6]
   36        AggStep        0  34  18  avg                     0  accum=r[18] step(r[34])
   37      Goto             0  19   0                          0
