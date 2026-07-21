@@ -271,7 +271,12 @@ fn as_supported_aggregate(expr: &ast::Expr) -> Result<Option<AggregateSpec>> {
                 return unsupported("FILTER or OVER clauses on aggregates");
             }
             match func {
-                AggFunc::Count | AggFunc::Sum | AggFunc::Total | AggFunc::Avg => {
+                AggFunc::Count
+                | AggFunc::Sum
+                | AggFunc::Total
+                | AggFunc::Avg
+                | AggFunc::Min
+                | AggFunc::Max => {
                     let [arg] = args.as_slice() else {
                         return unsupported("multi-argument aggregates");
                     };
@@ -281,9 +286,8 @@ fn as_supported_aggregate(expr: &ast::Expr) -> Result<Option<AggregateSpec>> {
                         arg: Some(arg.as_ref().clone()),
                     }))
                 }
-                // MIN/MAX need stored value multisets to handle retraction of
-                // the current extreme; GROUP_CONCAT and friends have no
-                // inverse at all.
+                // GROUP_CONCAT and friends have no inverse and no
+                // multiset-based retraction strategy.
                 other => unsupported(&format!("the {} aggregate", other.as_str())),
             }
         }
@@ -402,16 +406,12 @@ pub fn classify_view(select: &ast::Select) -> Result<ViewShape> {
     })
 }
 
-/// Check whether a view definition is maintainable by the VDBE codegen.
-pub fn validate_vdbe_maintainable(select: &ast::Select) -> Result<()> {
-    classify_view(select).map(|_| ())
-}
-
 /// The CREATE TABLE statement for a GROUP BY view's internal state table:
 /// one row per live group, holding the group-key values, the rowid of the
-/// group's row in the view btree, and each aggregate's persisted state
-/// payload. The PRIMARY KEY over the group columns gives the automatic
-/// index used to find a group's state.
+/// group's row in the view btree, and each payload aggregate's persisted
+/// state. The PRIMARY KEY over the group columns gives the automatic index
+/// used to find a group's state. MIN/MAX aggregates contribute no columns
+/// here — their state is the value multiset table.
 ///
 /// Declared column types are empty so nothing coerces the stored values.
 pub fn aggregate_state_table_sql(state_table_name: &str, shape: &ViewShape) -> Result<String> {
@@ -431,14 +431,10 @@ pub fn aggregate_state_table_sql(state_table_name: &str, shape: &ViewShape) -> R
     }
     columns.push("view_rowid".to_string());
     for (i, spec) in aggregates.iter().enumerate() {
-        let width = crate::vdbe::execute::agg_payload_width(&spec.func).ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "aggregate {:?} has no fixed-width state",
-                spec.func
-            ))
-        })?;
-        for j in 0..width {
-            columns.push(format!("a{i}_{j}"));
+        if let Some(width) = crate::vdbe::execute::agg_payload_width(&spec.func) {
+            for j in 0..width {
+                columns.push(format!("a{i}_{j}"));
+            }
         }
     }
     let key: Vec<String> = (0..group_exprs.len()).map(|i| format!("g{i}")).collect();
@@ -447,6 +443,84 @@ pub fn aggregate_state_table_sql(state_table_name: &str, shape: &ViewShape) -> R
         columns.join(", "),
         key.join(", ")
     ))
+}
+
+/// Whether the view needs the MIN/MAX value-multiset table.
+pub fn needs_minmax_table(shape: &ViewShape) -> bool {
+    matches!(shape, ViewShape::GroupAggregate { aggregates, .. }
+        if aggregates.iter().any(|s| matches!(s.func, AggFunc::Min | AggFunc::Max)))
+}
+
+/// The CREATE TABLE statement for a GROUP BY view's MIN/MAX value multiset:
+/// one row per (aggregate, group, distinct value) with its multiplicity. The
+/// PRIMARY KEY ordering makes a group's extreme value an index seek, so
+/// retracting the current extreme never needs a rescan in Rust.
+pub fn minmax_table_sql(minmax_table_name: &str, shape: &ViewShape) -> Result<String> {
+    let ViewShape::GroupAggregate { group_exprs, .. } = shape else {
+        return Err(LimboError::InternalError(
+            "only GROUP BY views have multiset tables".to_string(),
+        ));
+    };
+    let mut key = vec!["agg_id".to_string()];
+    for i in 0..group_exprs.len() {
+        key.push(format!("g{i}"));
+    }
+    key.push("val".to_string());
+    Ok(format!(
+        "CREATE TABLE {minmax_table_name} ({}, mult, PRIMARY KEY ({}))",
+        key.join(", "),
+        key.join(", ")
+    ))
+}
+
+/// Validation of MIN/MAX arguments that needs the schema: the multiset index
+/// orders values with default (binary) comparison, so arguments carrying a
+/// collation would be maintained under the wrong order. Must run at
+/// translate time — rejecting later, inside the CREATE program, corrupts
+/// the database (see validate_and_extract_columns).
+pub fn validate_minmax_args(
+    select: &ast::Select,
+    shape: &ViewShape,
+    schema: &Schema,
+) -> Result<()> {
+    let ViewShape::GroupAggregate { aggregates, .. } = shape else {
+        return Ok(());
+    };
+    let ast::OneSelect::Select { from, .. } = &select.body.select else {
+        return Ok(());
+    };
+    let Some(from) = from else { return Ok(()) };
+    let ast::SelectTable::Table(base_name, _, _) = from.select.as_ref() else {
+        return Ok(());
+    };
+    let Some(base_table) = schema.get_btree_table(base_name.name.as_str()) else {
+        return Ok(());
+    };
+
+    for spec in aggregates {
+        if !matches!(spec.func, AggFunc::Min | AggFunc::Max) {
+            continue;
+        }
+        let Some(arg) = &spec.arg else { continue };
+        // Explicit COLLATE anywhere in the argument.
+        walk_expr_with_subqueries(arg, &mut |e: &ast::Expr| {
+            if matches!(e, ast::Expr::Collate(_, _)) {
+                return unsupported("MIN/MAX over collated expressions");
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        // A bare column reference with a declared collation.
+        if let ast::Expr::Id(name) = arg {
+            let collated = base_table
+                .columns()
+                .iter()
+                .any(|c| c.name.as_deref() == Some(name.as_str()) && c.collation_opt().is_some());
+            if collated {
+                return unsupported("MIN/MAX over collated columns");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Compile the maintenance (or population) program for a filter/project view.
@@ -921,14 +995,26 @@ fn compile_group_aggregate_program(
         "view column count does not match classified outputs"
     );
     let k = group_exprs.len();
-    let payload_widths: Vec<usize> = aggregates
+    // Payload aggregates persist fixed-width state in the group state table;
+    // MIN/MAX keep a value multiset in the multiset table instead
+    // (payload_widths[i] is None for them, and they have no accumulator).
+    let payload_widths: Vec<Option<usize>> = aggregates
         .iter()
-        .map(|spec| {
-            crate::vdbe::execute::agg_payload_width(&spec.func)
-                .expect("classify_view admits only fixed-width aggregates")
+        .map(|spec| crate::vdbe::execute::agg_payload_width(&spec.func))
+        .collect();
+    let total_payload: usize = payload_widths.iter().flatten().sum();
+    // Offset of each payload aggregate's slots within the payload block.
+    let payload_offsets: Vec<Option<usize>> = payload_widths
+        .iter()
+        .scan(0usize, |off, w| {
+            Some(w.map(|w| {
+                let this = *off;
+                *off += w;
+                this
+            }))
         })
         .collect();
-    let total_payload: usize = payload_widths.iter().sum();
+    let has_minmax = needs_minmax_table(shape);
 
     // The state table and its primary-key index are real schema objects
     // created by CREATE MATERIALIZED VIEW.
@@ -951,6 +1037,32 @@ fn compile_group_aggregate_program(
                 "state table {state_table_name} of materialized view {view_name} has no index"
             ))
         })?;
+
+    // The MIN/MAX value multiset table, when the view has such aggregates.
+    let minmax_table_name = format!(
+        "{}{}_{view_name}",
+        crate::schema::DBSP_MINMAX_TABLE_PREFIX,
+        crate::incremental::view::DBSP_CIRCUIT_VERSION
+    );
+    let mm_schema = if has_minmax {
+        let table = schema.get_btree_table(&minmax_table_name).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "multiset table {minmax_table_name} of materialized view {view_name} not found"
+            ))
+        })?;
+        let index = schema
+            .get_indices(&minmax_table_name)
+            .next()
+            .cloned()
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "multiset table {minmax_table_name} of materialized view {view_name} has no index"
+                ))
+            })?;
+        Some((table, index))
+    } else {
+        None
+    };
 
     let mut program = ProgramBuilder::new_for_subprogram(
         QueryMode::Normal,
@@ -1057,6 +1169,25 @@ fn compile_group_aggregate_program(
         db: 0,
     });
 
+    let mut mm_cursors = None;
+    let mut mm_index_name = String::new();
+    if let Some((mm_table, mm_index)) = &mm_schema {
+        let mm_table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(mm_table.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: mm_table_cursor_id,
+            root_page: RegisterOrLiteral::Literal(mm_table.root_page),
+            db: 0,
+        });
+        let mm_index_cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(mm_index.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: mm_index_cursor_id,
+            root_page: RegisterOrLiteral::Literal(mm_index.root_page),
+            db: 0,
+        });
+        mm_cursors = Some((mm_table_cursor_id, mm_index_cursor_id));
+        mm_index_name.clone_from(&mm_index.name);
+    }
+
     // Register layout.
     let weight_reg = program.alloc_register();
     let null_arg_reg = program.alloc_register(); // stays NULL: COUNT(*) argument
@@ -1072,14 +1203,6 @@ fn compile_group_aggregate_program(
     let group_start = state_rec_start;
     let view_rowid_reg = state_rec_start + k;
     let payload_start = state_rec_start + k + 1;
-    let payload_offsets: Vec<usize> = payload_widths
-        .iter()
-        .scan(0usize, |off, w| {
-            let this = *off;
-            *off += w;
-            Some(this)
-        })
-        .collect();
     // Index key image: [g.., state_rowid], contiguous for IdxInsert/IdxDelete.
     let index_rec_start = program.alloc_registers(k + 1);
     let state_rowid_reg = index_rec_start + k;
@@ -1088,6 +1211,14 @@ fn compile_group_aggregate_program(
     let state_record_reg = program.alloc_register();
     let index_record_reg = program.alloc_register();
     let view_record_reg = program.alloc_register();
+    // Multiset record image: [agg_id, g.., val, mult-or-rowid], contiguous.
+    let mm_rec_start = program.alloc_registers(1 + k + 2);
+    let mm_val_reg = mm_rec_start + 1 + k;
+    let mm_last_reg = mm_rec_start + 1 + k + 1;
+    let mm_rowid_reg = program.alloc_register();
+    let mm_mult_reg = program.alloc_register();
+    let mm_record_reg = program.alloc_register();
+    let mm_found_reg = program.alloc_register();
 
     program.emit_insn(Insn::Null {
         dest: null_arg_reg,
@@ -1218,23 +1349,27 @@ fn compile_group_aggregate_program(
         default: None,
     });
     for (i, spec) in aggregates.iter().enumerate() {
-        for j in 0..payload_widths[i] {
+        let Some(offset) = payload_offsets[i] else {
+            continue; // MIN/MAX: state lives in the multiset table
+        };
+        for j in 0..payload_widths[i].expect("offset implies width") {
             program.emit_insn(Insn::Column {
                 cursor_id: state_cursor_id,
-                column: k + 1 + payload_offsets[i] + j,
-                dest: payload_start + payload_offsets[i] + j,
+                column: k + 1 + offset + j,
+                dest: payload_start + offset + j,
                 default: None,
             });
         }
         program.emit_insn(Insn::AggContextLoad {
             acc_reg: acc_start + i,
-            payload_start_reg: payload_start + payload_offsets[i],
+            payload_start_reg: payload_start + offset,
             func: AccumulatorFunc::Agg(spec.func.clone()),
         });
     }
 
     program.preassign_label_to_next_insn(apply_label);
     for (i, spec) in aggregates.iter().enumerate() {
+        let is_minmax = matches!(spec.func, AggFunc::Min | AggFunc::Max);
         let col_reg = match &spec.arg {
             Some(arg_expr) => {
                 let mut bound = arg_expr.clone();
@@ -1257,6 +1392,165 @@ fn compile_group_aggregate_program(
             }
             None => null_arg_reg,
         };
+
+        if is_minmax {
+            // Weight-merge the value into the aggregate's multiset:
+            // (agg_id, group.., value) -> multiplicity. NULLs are ignored,
+            // matching MIN/MAX semantics.
+            let (mm_table_cursor_id, mm_index_cursor_id) = mm_cursors
+                .expect("classify_view guarantees the multiset table for MIN/MAX aggregates");
+            let done_label = program.allocate_label();
+            let mm_found_label = program.allocate_label();
+            let mm_upsert_label = program.allocate_label();
+
+            program.emit_insn(Insn::IsNull {
+                reg: col_reg,
+                target_pc: done_label,
+            });
+            // Key image: [agg_id, g.., val].
+            program.emit_int(i as i64, mm_rec_start);
+            program.emit_insn(Insn::Copy {
+                src_reg: group_start,
+                dst_reg: mm_rec_start + 1,
+                extra_amount: k.saturating_sub(1),
+            });
+            program.emit_insn(Insn::Copy {
+                src_reg: col_reg,
+                dst_reg: mm_val_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::Found {
+                cursor_id: mm_index_cursor_id,
+                target_pc: mm_found_label,
+                record_reg: mm_rec_start,
+                num_regs: 1 + k + 1,
+            });
+            // Not found: retraction of an unknown value is a no-op.
+            program.emit_insn(Insn::Lt {
+                lhs: weight_reg,
+                rhs: zero_reg,
+                target_pc: done_label,
+                flags: CmpInsFlags::default(),
+                collation: None,
+            });
+            program.emit_int(0, mm_found_reg);
+            program.emit_insn(Insn::NewRowid {
+                cursor: mm_table_cursor_id,
+                rowid_reg: mm_rowid_reg,
+                prev_largest_reg: prev_rowid_scratch,
+            });
+            program.emit_insn(Insn::Copy {
+                src_reg: weight_reg,
+                dst_reg: mm_last_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: mm_upsert_label,
+            });
+
+            program.preassign_label_to_next_insn(mm_found_label);
+            program.emit_int(1, mm_found_reg);
+            program.emit_insn(Insn::IdxRowId {
+                cursor_id: mm_index_cursor_id,
+                dest: mm_rowid_reg,
+            });
+            program.emit_insn(Insn::SeekRowid {
+                cursor_id: mm_table_cursor_id,
+                src_reg: mm_rowid_reg,
+                target_pc: corrupt_label,
+            });
+            program.emit_insn(Insn::Column {
+                cursor_id: mm_table_cursor_id,
+                column: 1 + k + 1,
+                dest: mm_mult_reg,
+                default: None,
+            });
+            program.emit_insn(Insn::Add {
+                lhs: weight_reg,
+                rhs: mm_mult_reg,
+                dest: mm_last_reg,
+            });
+            program.emit_insn(Insn::Ne {
+                lhs: mm_last_reg,
+                rhs: zero_reg,
+                target_pc: mm_upsert_label,
+                flags: CmpInsFlags::default(),
+                collation: None,
+            });
+            // Multiplicity reached zero: remove the value.
+            program.emit_insn(Insn::Copy {
+                src_reg: mm_rowid_reg,
+                dst_reg: mm_last_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: mm_rec_start,
+                num_regs: 1 + k + 2,
+                cursor_id: mm_index_cursor_id,
+                raise_error_if_no_matching_entry: true,
+            });
+            program.emit_insn(Insn::Delete {
+                cursor_id: mm_table_cursor_id,
+                table_name: minmax_table_name.clone(),
+                is_part_of_update: true,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: done_label,
+            });
+
+            // Write (agg_id, g.., val, mult) at the row's rowid; a fresh
+            // value also gets an index entry (agg_id, g.., val, rowid).
+            program.preassign_label_to_next_insn(mm_upsert_label);
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: mm_rec_start as u16,
+                count: (1 + k + 2) as u16,
+                dest_reg: mm_record_reg as u16,
+                index_name: None,
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::Insert {
+                cursor: mm_table_cursor_id,
+                key_reg: mm_rowid_reg,
+                record_reg: mm_record_reg,
+                flag: InsertFlags(
+                    InsertFlags::REQUIRE_SEEK
+                        | InsertFlags::SKIP_LAST_ROWID
+                        | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+                ),
+                table_name: minmax_table_name.clone(),
+            });
+            // Only a freshly-inserted value needs an index entry; an
+            // existing value's entry is already present.
+            let mm_skip_idx_label = program.allocate_label();
+            program.emit_insn(Insn::If {
+                reg: mm_found_reg,
+                target_pc: mm_skip_idx_label,
+                jump_if_null: false,
+            });
+            program.emit_insn(Insn::Copy {
+                src_reg: mm_rowid_reg,
+                dst_reg: mm_last_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: mm_rec_start as u16,
+                count: (1 + k + 2) as u16,
+                dest_reg: mm_record_reg as u16,
+                index_name: Some(mm_index_name.clone()),
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: mm_index_cursor_id,
+                record_reg: mm_record_reg,
+                unpacked_start: Some(mm_rec_start),
+                unpacked_count: Some((1 + k + 2) as u16),
+                flags: IdxInsertFlags::new(),
+            });
+            program.preassign_label_to_next_insn(mm_skip_idx_label);
+            program.preassign_label_to_next_insn(done_label);
+            continue;
+        }
+
         let step_label = program.allocate_label();
         let after_label = program.allocate_label();
         program.emit_insn(Insn::Gt {
@@ -1378,9 +1672,12 @@ fn compile_group_aggregate_program(
     });
     program.preassign_label_to_next_insn(have_rowids_label);
     for (i, spec) in aggregates.iter().enumerate() {
+        let Some(offset) = payload_offsets[i] else {
+            continue; // MIN/MAX: state lives in the multiset table
+        };
         program.emit_insn(Insn::AggContextStore {
             acc_reg: acc_start + i,
-            payload_start_reg: payload_start + payload_offsets[i],
+            payload_start_reg: payload_start + offset,
             func: AccumulatorFunc::Agg(spec.func.clone()),
         });
     }
@@ -1439,11 +1736,79 @@ fn compile_group_aggregate_program(
                 });
             }
             OutputColumn::Aggregate(agg_idx) => {
-                program.emit_insn(Insn::AggValue {
-                    acc_reg: acc_start + agg_idx,
-                    dest_reg: out_start + out_idx,
-                    func: AccumulatorFunc::Agg(aggregates[*agg_idx].func.clone()),
-                });
+                let func = &aggregates[*agg_idx].func;
+                if matches!(func, AggFunc::Min | AggFunc::Max) {
+                    // The group's extreme is the first (MIN) or last (MAX)
+                    // multiset entry with the (agg_id, group..) prefix.
+                    let (_, mm_index_cursor_id) =
+                        mm_cursors.expect("MIN/MAX aggregates imply the multiset table");
+                    let empty_label = program.allocate_label();
+                    let have_label = program.allocate_label();
+                    program.emit_int(*agg_idx as i64, mm_rec_start);
+                    program.emit_insn(Insn::Copy {
+                        src_reg: group_start,
+                        dst_reg: mm_rec_start + 1,
+                        extra_amount: k.saturating_sub(1),
+                    });
+                    match func {
+                        AggFunc::Min => {
+                            program.emit_insn(Insn::SeekGE {
+                                is_index: true,
+                                cursor_id: mm_index_cursor_id,
+                                start_reg: mm_rec_start,
+                                num_regs: 1 + k,
+                                target_pc: empty_label,
+                                eq_only: false,
+                            });
+                            // Positioned past the group: no values.
+                            program.emit_insn(Insn::IdxGT {
+                                cursor_id: mm_index_cursor_id,
+                                start_reg: mm_rec_start,
+                                num_regs: 1 + k,
+                                target_pc: empty_label,
+                            });
+                        }
+                        AggFunc::Max => {
+                            program.emit_insn(Insn::SeekLE {
+                                is_index: true,
+                                cursor_id: mm_index_cursor_id,
+                                start_reg: mm_rec_start,
+                                num_regs: 1 + k,
+                                target_pc: empty_label,
+                                eq_only: false,
+                            });
+                            // Positioned before the group: no values.
+                            program.emit_insn(Insn::IdxLT {
+                                cursor_id: mm_index_cursor_id,
+                                start_reg: mm_rec_start,
+                                num_regs: 1 + k,
+                                target_pc: empty_label,
+                            });
+                        }
+                        _ => unreachable!(),
+                    }
+                    program.emit_insn(Insn::Column {
+                        cursor_id: mm_index_cursor_id,
+                        column: 1 + k,
+                        dest: out_start + out_idx,
+                        default: None,
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: have_label,
+                    });
+                    program.preassign_label_to_next_insn(empty_label);
+                    program.emit_insn(Insn::Null {
+                        dest: out_start + out_idx,
+                        dest_end: None,
+                    });
+                    program.preassign_label_to_next_insn(have_label);
+                } else {
+                    program.emit_insn(Insn::AggValue {
+                        acc_reg: acc_start + agg_idx,
+                        dest_reg: out_start + out_idx,
+                        func: AccumulatorFunc::Agg(func.clone()),
+                    });
+                }
             }
         }
     }
