@@ -94,7 +94,9 @@ pub fn translate_create_materialized_view(
     // filter/project views are maintained purely in the view btree, while
     // GROUP BY views persist per-group aggregate state and join views a
     // rowid-pair map.
-    let shape = crate::incremental::vdbe_maintenance::classify_view(select_stmt, resolver)?;
+    let shape = resolver.with_schema(database_id, |s| {
+        crate::incremental::vdbe_maintenance::classify_view(select_stmt, s, resolver)
+    })?;
     let needs_state_table = crate::incremental::vdbe_maintenance::needs_state_table(&shape);
 
     // Reconstruct the SQL string for storage
