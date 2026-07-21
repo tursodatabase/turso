@@ -39,7 +39,7 @@ test('exec multiple statements', async () => {
     expect(rows).toEqual([{ x: 1 }, { x: 2 }]);
 })
 
-test('expanded rows preserve positional values for duplicate column names', async () => {
+test('expanded rows collapse duplicate column names like better-sqlite3', async () => {
     const db = await connect(":memory:");
     await db.exec("CREATE TABLE role(path TEXT); CREATE TABLE org_unit(path TEXT)");
     await db.exec("INSERT INTO role VALUES ('/Employee'); INSERT INTO org_unit VALUES ('/')");
@@ -48,9 +48,12 @@ test('expanded rows preserve positional values for duplicate column names', asyn
 
     expect(Object.keys(row)).toEqual(["path"]);
     expect(row.path).toBe("/");
-    expect(row[0]).toBe("/Employee");
-    expect(row[1]).toBe("/");
+    expect(row[0]).toBe(undefined);
+    expect(row[1]).toBe(undefined);
     expect(row).toEqual({ path: "/" });
+
+    const stmt = await db.prepare("SELECT role.path, org_unit.path FROM role JOIN org_unit");
+    expect(await stmt.raw(true).get()).toEqual(["/Employee", "/"]);
 })
 
 test('readonly-db', async () => {
