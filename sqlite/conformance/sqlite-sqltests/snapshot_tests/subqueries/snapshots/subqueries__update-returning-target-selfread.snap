@@ -44,7 +44,7 @@ addr  opcode           p1  p2  p3  p4          p5  comment
   21      Null          0  16   0               0  r[16]=NULL
   22      Integer       1  17   0               0  r[17]=1; LIMIT counter
   23      IfNot        17  30   0               0  if !r[17] goto 30
-  24      OpenRead      2   2   0  k(3,B,B,B)   0  table=t, root=2, iDb=0
+  24      ReopenIdx     2   2   0  k(3,B,B,B)   0  table=t, root=2, iDb=0
   25      Rewind        2  30   0               0  Rewind table t
   26        Column      2   2  19               0  r[19]=t.val
   27        Lt         19  20  29  Binary       0  if r[19]<r[20] goto 29

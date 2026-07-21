@@ -40,7 +40,7 @@ impl TableRefIdCounter {
 }
 
 use super::{
-    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, PrepareContext,
+    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, PageIdx, PrepareContext,
     PreparedProgram, Program,
 };
 use crate::translate::plan::BitSet;
@@ -1035,6 +1035,25 @@ impl ProgramBuilder {
             self.emitted_function_call = true;
         }
         self.insns.push((insn, self.insns.len()));
+    }
+
+    /// Emit an OpenRead, or ReopenIdx when inside a nested subquery. A correlated
+    /// subquery's cursor opens re-execute once per outer row, so they reuse the cursor
+    /// already open on the same root page instead of rebuilding it each iteration.
+    pub fn emit_open_read(&mut self, cursor_id: CursorID, root_page: PageIdx, db: usize) {
+        if self.is_nested() {
+            self.emit_insn(Insn::ReopenIdx {
+                cursor_id,
+                root_page,
+                db,
+            });
+        } else {
+            self.emit_insn(Insn::OpenRead {
+                cursor_id,
+                root_page,
+                db,
+            });
+        }
     }
 
     /// Emit an instruction that should not start or extend a constant span on its own.

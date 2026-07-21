@@ -29,7 +29,7 @@ addr  opcode           p1  p2  p3  p4            p5  comment
    5      Null          0   6   0                 0  r[6]=NULL
    6      Integer       1   7   0                 0  r[7]=1; LIMIT counter
    7      IfNot         7  14   0                 0  if !r[7] goto 14
-   8      OpenRead      1   9   0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
+   8      ReopenIdx     1   9   0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
    9      RowId         0   8   0                 0  r[8]=customers.rowid
   10      SeekGE        1  14   8                 0  key=[8..8]
   11        IdxGT       1  14   8                 0  key=[8..8]

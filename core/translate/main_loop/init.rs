@@ -167,18 +167,14 @@ impl InitLoop {
                     (OperationMode::SELECT, Table::BTree(btree)) => {
                         let root_page = btree.root_page;
                         if let Some(cursor_id) = table_cursor_id {
-                            program.emit_insn(Insn::OpenRead {
-                                cursor_id,
-                                root_page,
-                                db: table.database_id,
-                            });
+                            program.emit_open_read(cursor_id, root_page, table.database_id);
                         }
                         if let Some(index_cursor_id) = index_cursor_id {
-                            program.emit_insn(Insn::OpenRead {
-                                cursor_id: index_cursor_id,
-                                root_page: index.as_ref().unwrap().root_page,
-                                db: table.database_id,
-                            });
+                            program.emit_open_read(
+                                index_cursor_id,
+                                index.as_ref().unwrap().root_page,
+                                table.database_id,
+                            );
                         }
                     }
                     (OperationMode::DELETE, Table::BTree(btree)) => {
@@ -291,11 +287,11 @@ impl InitLoop {
                     match mode {
                         OperationMode::SELECT => {
                             if let Some(table_cursor_id) = table_cursor_id {
-                                program.emit_insn(Insn::OpenRead {
-                                    cursor_id: table_cursor_id,
-                                    root_page: table.table.get_root_page()?,
-                                    db: table.database_id,
-                                });
+                                program.emit_open_read(
+                                    table_cursor_id,
+                                    table.table.get_root_page()?,
+                                    table.database_id,
+                                );
                             }
                         }
                         OperationMode::DELETE | OperationMode::UPDATE { .. } => {
@@ -357,13 +353,13 @@ impl InitLoop {
                         if !index.ephemeral {
                             match mode {
                                 OperationMode::SELECT => {
-                                    program.emit_insn(Insn::OpenRead {
-                                        cursor_id: index_cursor_id.expect(
+                                    program.emit_open_read(
+                                        index_cursor_id.expect(
                                             "index cursor is always opened in Seek with index",
                                         ),
-                                        root_page: index.root_page,
-                                        db: table.database_id,
-                                    });
+                                        index.root_page,
+                                        table.database_id,
+                                    );
                                 }
                                 OperationMode::UPDATE { .. } | OperationMode::DELETE => {
                                     program.emit_insn(Insn::OpenWrite {
@@ -387,18 +383,18 @@ impl InitLoop {
                 Operation::IndexMethodQuery(_) => match mode {
                     OperationMode::SELECT => {
                         if let Some(table_cursor_id) = table_cursor_id {
-                            program.emit_insn(Insn::OpenRead {
-                                cursor_id: table_cursor_id,
-                                root_page: table.table.get_root_page()?,
-                                db: table.database_id,
-                            });
+                            program.emit_open_read(
+                                table_cursor_id,
+                                table.table.get_root_page()?,
+                                table.database_id,
+                            );
                         }
                         let index_cursor_id = index_cursor_id.unwrap();
-                        program.emit_insn(Insn::OpenRead {
-                            cursor_id: index_cursor_id,
-                            root_page: table.op.index().unwrap().root_page,
-                            db: table.database_id,
-                        });
+                        program.emit_open_read(
+                            index_cursor_id,
+                            table.op.index().unwrap().root_page,
+                            table.database_id,
+                        );
                     }
                     OperationMode::DELETE => {
                         if let Some(table_cursor_id) = table_cursor_id {
@@ -462,11 +458,11 @@ impl InitLoop {
                                 let Table::BTree(btree) = &table.table else {
                                     panic!("Expected hash join probe table to be a BTree table");
                                 };
-                                program.emit_insn(Insn::OpenRead {
-                                    cursor_id: table_cursor_id,
-                                    root_page: btree.root_page,
-                                    db: table.database_id,
-                                });
+                                program.emit_open_read(
+                                    table_cursor_id,
+                                    btree.root_page,
+                                    table.database_id,
+                                );
                             }
                         }
                         _ => unreachable!("Hash joins should only occur in SELECT operations"),
@@ -480,11 +476,11 @@ impl InitLoop {
                             };
                             // Open the table cursor
                             if let Some(table_cursor_id) = table_cursor_id {
-                                program.emit_insn(Insn::OpenRead {
-                                    cursor_id: table_cursor_id,
-                                    root_page: btree.root_page,
-                                    db: table.database_id,
-                                });
+                                program.emit_open_read(
+                                    table_cursor_id,
+                                    btree.root_page,
+                                    table.database_id,
+                                );
                             }
                             // Open cursors for each index branch
                             for branch in &multi_idx_op.branches {
@@ -493,11 +489,11 @@ impl InitLoop {
                                         Some(CursorKey::index(table.internal_id, index.clone())),
                                         index,
                                     )?;
-                                    program.emit_insn(Insn::OpenRead {
-                                        cursor_id: branch_cursor_id,
-                                        root_page: index.root_page,
-                                        db: table.database_id,
-                                    });
+                                    program.emit_open_read(
+                                        branch_cursor_id,
+                                        index.root_page,
+                                        table.database_id,
+                                    );
                                 }
                             }
                         }

@@ -31,8 +31,8 @@ addr  opcode              p1  p2  p3  p4              p5  comment
    5      Null             0   7   0                   0  r[7]=NULL
    6      Integer          1   8   0                   0  r[8]=1; LIMIT counter
    7      IfNot            8  20   0                   0  if !r[8] goto 20
-   8      OpenRead         1   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-   9      OpenRead         2   8   0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
+   8      ReopenIdx        1   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+   9      ReopenIdx        2   8   0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
   10      Column           0   2   9                   0  r[9]=products.category_id
   11      IsNull           9  20   0                   0  if (r[9]==NULL) goto 20
   12      Affinity         9   1   0                   0  r[9..10] = C

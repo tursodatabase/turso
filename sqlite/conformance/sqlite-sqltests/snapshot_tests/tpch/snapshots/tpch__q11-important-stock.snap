@@ -94,9 +94,9 @@ addr  opcode                    p1  p2  p3  p4                  p5  comment
   43        Null                 0  24   0                       0  r[24]=NULL
   44        Integer              1  25   0                       0  r[25]=1; LIMIT counter
   45        IfNot               25  62   0                       0  if !r[25] goto 62
-  46        OpenRead             5   6   0  k(6,B,B,B,B,B)       0  table=partsupp, root=6, iDb=0
-  47        OpenRead             6   5   0  k(7,B,B,B,B,B,B,B)   0  table=supplier, root=5, iDb=0
-  48        OpenRead             7   2   0  k(4,B,B,B,B)         0  table=nation, root=2, iDb=0
+  46        ReopenIdx            5   6   0  k(6,B,B,B,B,B)       0  table=partsupp, root=6, iDb=0
+  47        ReopenIdx            6   5   0  k(7,B,B,B,B,B,B,B)   0  table=supplier, root=5, iDb=0
+  48        ReopenIdx            7   2   0  k(4,B,B,B,B)         0  table=nation, root=2, iDb=0
   49        Rewind               5  62   0                       0  Rewind table partsupp
   50          Column             5   1  26                       0  r[26]=partsupp.PS_SUPPKEY
   51          SeekRowid          6  26  61                       0  if (r[26]!=cursor 6 for table supplier.rowid) goto 61

@@ -46,8 +46,8 @@ addr  opcode                                       p1   p2   p3  p4            p
    6                              Integer           0    9    0                 0  r[9]=0; clear group by abort flag
    7                              Null              0   10    0                 0  r[10]=NULL; initialize group by comparison registers to NULL
    8                              Gosub            16   38    0                 0  ; go to clear accumulator subroutine
-   9                              OpenRead          0    4    0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
-  10                              OpenRead          1    9    0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
+   9                              ReopenIdx         0    4    0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
+  10                              ReopenIdx         1    9    0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
   11                              Rewind            1   27    0                 0  Rewind index idx_orders_customer
   12                                DeferredSeek    1    0    0                 0
   13                                Column          1    0   14                 0  r[14]=idx_orders_customer.customer_id
@@ -99,8 +99,8 @@ addr  opcode                                       p1   p2   p3  p4            p
   59                    Integer                     0   27    0                 0  r[27]=0; clear group by abort flag
   60                    Null                        0   28    0                 0  r[28]=NULL; initialize group by comparison registers to NULL
   61                    Gosub                      34   91    0                 0  ; go to clear accumulator subroutine
-  62                    OpenRead                    2    4    0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
-  63                    OpenRead                    3    9    0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
+  62                    ReopenIdx                   2    4    0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
+  63                    ReopenIdx                   3    9    0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
   64                    Rewind                      3   80    0                 0  Rewind index idx_orders_customer
   65                      DeferredSeek              3    2    0                 0
   66                      Column                    3    0   32                 0  r[32]=idx_orders_customer.customer_id

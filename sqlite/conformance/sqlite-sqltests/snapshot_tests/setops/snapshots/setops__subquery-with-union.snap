@@ -29,14 +29,14 @@ addr  opcode         p1  p2  p3  p4              p5  comment
    0  Init            0  33   0                   0  Start at 33
    1  InitCoroutine   1  24   2                   0
    2  OpenEphemeral   0   0   0                   0  cursor=0 is_table=false
-   3  OpenRead        1   2   0  k(4,B,B,B,B)     0  table=current_employees, root=2, iDb=0
+   3  ReopenIdx       1   2   0  k(4,B,B,B,B)     0  table=current_employees, root=2, iDb=0
    4  Rewind          1  10   0                   0  Rewind table current_employees
    5    Column        1   1   2                   0  r[2]=current_employees.name
    6    Column        1   2   3                   0  r[3]=current_employees.department
    7    MakeRecord    2   2   4                   0  r[4]=mkrec(r[2..3]); for compound_dedupe
    8    IdxInsert     0   4   0                   8  key=r[4]
    9  Next            1   5   0                   0
-  10  OpenRead        2   3   0  k(5,B,B,B,B,B)   0  table=former_employees, root=3, iDb=0
+  10  ReopenIdx       2   3   0  k(5,B,B,B,B,B)   0  table=former_employees, root=3, iDb=0
   11  Rewind          2  17   0                   0  Rewind table former_employees
   12    Column        2   1   2                   0  r[2]=former_employees.name
   13    Column        2   2   3                   0  r[3]=former_employees.department

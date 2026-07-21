@@ -33,7 +33,7 @@ addr  opcode              p1   p2  p3  p4                     p5  comment
    1      InitCoroutine    1   77   2                          0
    2      InitCoroutine    2   23   3                          0
    3      SorterOpen       0    2   0  k(2,B,B)                0  cursor=0
-   4      OpenRead         1    3   0  k(5,B,B,B,B,B)          0  table=sales, root=3, iDb=0
+   4      ReopenIdx        1    3   0  k(5,B,B,B,B,B)          0  table=sales, root=3, iDb=0
    5      Rewind           1   13   0                          0  Rewind table sales
    6        Column         1    1   8                          0  r[8]=sales.emp_id
    7        Column         1    2   9                          0  r[9]=sales.sale_date

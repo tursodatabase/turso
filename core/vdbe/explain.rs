@@ -414,6 +414,39 @@ pub fn insn_to_row(
                     )
                 },
             ),
+            Insn::ReopenIdx {
+                cursor_id,
+                root_page,
+                db,
+            } => (
+                "ReopenIdx",
+                *cursor_id as i64,
+                *root_page,
+                *db as i64,
+                Value::build_text(program.cursor_ref[*cursor_id]
+                            .1.get_explain_description()),
+                0,
+                {
+                    let cursor_type =
+                        program.cursor_ref[*cursor_id]
+                            .0
+                            .as_ref()
+                            .map_or("", |cursor_key| {
+                                if cursor_key.index.is_some() {
+                                    "index"
+                                } else {
+                                    "table"
+                                }
+                            });
+                    format!(
+                        "{}={}, root={}, iDb={}",
+                        cursor_type,
+                        get_table_or_index_name(*cursor_id),
+                        root_page,
+                        db
+                    )
+                },
+            ),
             Insn::VOpen { cursor_id } => (
                 "VOpen",
                 *cursor_id as i64,

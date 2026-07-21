@@ -35,9 +35,9 @@ addr  opcode              p1  p2  p3  p4              p5  comment
    4      Integer          0   1   0                   0  r[1]=0
    5      Integer          1   7   0                   0  r[7]=1; LIMIT counter
    6      IfNot            7  21   0                   0  if !r[7] goto 21
-   7      OpenRead         1   5   0  k(5,B,B,B,B,B)   0  table=order_items, root=5, iDb=0
-   8      OpenRead         2  11   0  k(2,B)           0  index=idx_order_items_product, root=11, iDb=0
-   9      OpenRead         3   4   0  k(4,B,B,B,B)     0  table=orders, root=4, iDb=0
+   7      ReopenIdx        1   5   0  k(5,B,B,B,B,B)   0  table=order_items, root=5, iDb=0
+   8      ReopenIdx        2  11   0  k(2,B)           0  index=idx_order_items_product, root=11, iDb=0
+   9      ReopenIdx        3   4   0  k(4,B,B,B,B)     0  table=orders, root=4, iDb=0
   10      RowId            0   8   0                   0  r[8]=products.rowid
   11      SeekGE           2  21   8                   0  key=[8..8]
   12        IdxGT          2  21   8                   0  key=[8..8]

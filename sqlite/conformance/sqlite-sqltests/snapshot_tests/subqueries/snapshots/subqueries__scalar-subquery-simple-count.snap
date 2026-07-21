@@ -23,7 +23,7 @@ addr  opcode         p1  p2  p3  p4            p5  comment
    4    Null          0   4   0                 0  r[4]=NULL
    5    Integer       1   5   0                 0  r[5]=1; LIMIT counter
    6    IfNot         5  12   0                 0  if !r[5] goto 12
-   7    OpenRead      0   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
+   7    ReopenIdx     0   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
    8    Count         0   6   0                 0
    9    Close         0   0   0                 0
   10    Copy          6   3   0                 0  r[3]=r[6]

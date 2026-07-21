@@ -24,8 +24,8 @@ BYTECODE
 addr  opcode            p1  p2  p3  p4                     p5  comment
    0    Init             0  48   0                          0  Start at 48
    1    InitCoroutine    1  13   2                          0
-   2    OpenRead         0   2   0  k(5,B,B,B,B,B)          0  table=employees, root=2, iDb=0
-   3    OpenRead         1   5   0  k(2,B)                  0  index=idx_employees_salary, root=5, iDb=0
+   2    ReopenIdx        0   2   0  k(5,B,B,B,B,B)          0  table=employees, root=2, iDb=0
+   3    ReopenIdx        1   5   0  k(2,B)                  0  index=idx_employees_salary, root=5, iDb=0
    4    Last             1  12   0                          0
    5      DeferredSeek   1   0   0                          0
    6      Column         1   0   2                          0  r[2]=idx_employees_salary.salary

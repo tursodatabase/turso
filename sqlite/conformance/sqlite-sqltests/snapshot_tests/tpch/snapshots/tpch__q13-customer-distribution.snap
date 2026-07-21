@@ -48,11 +48,11 @@ addr  opcode                                p1   p2   p3  p4                    
    4                    Integer              0    6    0                                               0  r[6]=0; clear group by abort flag
    5                    Null                 0    7    0                                               0  r[7]=NULL; initialize group by comparison registers to NULL
    6                    Gosub               13   92    0                                               0  ; go to clear accumulator subroutine
-   7                    OpenRead             2    8    0  k(8,B,B,B,B,B,B,B,B)                         0  table=customer, root=8, iDb=0
-   8                    OpenRead             3    9    0  k(9,B,B,B,B,B,B,B,B,B)                       0  table=orders, root=9, iDb=0
+   7                    ReopenIdx            2    8    0  k(8,B,B,B,B,B,B,B,B)                         0  table=customer, root=8, iDb=0
+   8                    ReopenIdx            3    9    0  k(9,B,B,B,B,B,B,B,B,B)                       0  table=orders, root=9, iDb=0
    9                    Integer              0   14    0                                               0  r[14]=0
   10                    Once                19    0    0                                               0  goto 19
-  11                    OpenRead             4    8    0  k(8,B,B,B,B,B,B,B,B)                         0  table=customer, root=8, iDb=0
+  11                    ReopenIdx            4    8    0  k(8,B,B,B,B,B,B,B,B)                         0  table=customer, root=8, iDb=0
   12                    Rewind               4   18    0                                               0  Rewind table customer
   13                      RowId              4   15    0                                               0  r[15]=customer.rowid
   14                      Affinity          15    1    0                                               0  r[15..16] = C

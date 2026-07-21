@@ -21,7 +21,7 @@ BYTECODE
 addr  opcode            p1  p2  p3  p4                         p5  comment
    0  Init               0  42   0                              0  Start at 42
    1  InitCoroutine      2  15   2                              0
-   2  OpenRead           0   5   0  k(6,B,B,B,B,B,B)            0  table=orders, root=5, iDb=0
+   2  ReopenIdx          0   5   0  k(6,B,B,B,B,B,B)            0  table=orders, root=5, iDb=0
    3  Rewind             0  14   0                              0  Rewind table orders
    4    Column           0   5   9                              0  r[9]=orders.created_at
    5    Ge               9  10  13  Binary                      0  if r[9]>=r[10] goto 13

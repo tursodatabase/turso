@@ -25,11 +25,11 @@ BYTECODE
 addr  opcode           p1  p2  p3  p4                 p5  comment
    0    Init            0  33   0                      0  Start at 33
    1    OpenEphemeral   0   1   0                      0  cursor=0 is_table=true
-   2    OpenRead        1   2   0  k(5,B,B,B,B,B)      0  table=products, root=2, iDb=0
+   2    ReopenIdx       1   2   0  k(5,B,B,B,B,B)      0  table=products, root=2, iDb=0
    3    Rewind          1  16   0                      0  Rewind table products
    4      BeginSubrtn   3   0   0                      0  r[3]=NULL
    5      Integer       0   1   0                      0  r[1]=0
-   6      OpenRead      2   3   0  k(4,B,B,B,B)        0  table=users, root=3, iDb=0
+   6      ReopenIdx     2   3   0  k(4,B,B,B,B)        0  table=users, root=3, iDb=0
    7      RowId         1   5   0                      0  r[5]=products.rowid
    8      SeekRowid     2   5  10                      0  if (r[5]!=cursor 2 for table users.rowid) goto 10
    9      Integer       1   1   0                      0  r[1]=1

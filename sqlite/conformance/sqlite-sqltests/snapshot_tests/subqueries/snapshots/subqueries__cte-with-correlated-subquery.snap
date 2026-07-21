@@ -42,7 +42,7 @@ addr  opcode                      p1  p2  p3  p4              p5  comment
    8              Integer          0  12   0                   0  r[12]=0; clear group by abort flag
    9              Null             0  13   0                   0  r[13]=NULL; initialize group by comparison registers to NULL
   10              Gosub           19  49   0                   0  ; go to clear accumulator subroutine
-  11              OpenRead         4   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
+  11              ReopenIdx        4   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
   12              Rewind           4  19   0                   0  Rewind table employees
   13                Column         4   3  17                   0  r[17]=employees.department
   14                Column         4   4  18                   0  r[18]=employees.salary

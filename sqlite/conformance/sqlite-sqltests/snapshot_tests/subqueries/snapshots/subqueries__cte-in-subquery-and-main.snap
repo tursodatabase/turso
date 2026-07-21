@@ -41,8 +41,8 @@ addr  opcode                            p1   p2   p3  p4              p5  commen
    6                    Integer          0    8    0                   0  r[8]=0; clear group by abort flag
    7                    Null             0    9    0                   0  r[9]=NULL; initialize group by comparison registers to NULL
    8                    Gosub           15   38    0                   0  ; go to clear accumulator subroutine
-   9                    OpenRead         0    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-  10                    OpenRead         1    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
+   9                    ReopenIdx        0    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  10                    ReopenIdx        1    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
   11                    Rewind           1   27    0                   0  Rewind index idx_products_category
   12                      DeferredSeek   1    0    0                   0
   13                      Column         1    0   13                   0  r[13]=idx_products_category.category_id
