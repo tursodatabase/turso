@@ -1001,6 +1001,128 @@ mod tests {
         assert_eq!(snapshot.savepoints[0].name, "sp");
     }
 
+    /// Table with columns (a INTEGER, g INTEGER UNIQUE AS (a + b) VIRTUAL, b INTEGER)
+    /// and one row per (a, b) pair, with g materialized in the shadow rows.
+    fn table_with_unique_generated_column(rows: &[(i64, i64)]) -> Table {
+        use sql_generation::model::table::{Column, ColumnType};
+        use turso_parser::ast;
+
+        let generated_expr = ast::Expr::Binary(
+            Box::new(ast::Expr::Id(ast::Name::from_string("a"))),
+            ast::Operator::Add,
+            Box::new(ast::Expr::Id(ast::Name::from_string("b"))),
+        );
+        Table {
+            name: "t".to_string(),
+            columns: vec![
+                Column {
+                    name: "a".to_string(),
+                    column_type: ColumnType::Integer,
+                    constraints: vec![],
+                },
+                Column {
+                    name: "g".to_string(),
+                    column_type: ColumnType::Integer,
+                    constraints: vec![
+                        ColumnConstraint::Unique(None),
+                        ColumnConstraint::Generated {
+                            expr: Box::new(generated_expr),
+                            typ: Some(ast::GeneratedColumnType::Virtual),
+                        },
+                    ],
+                },
+                Column {
+                    name: "b".to_string(),
+                    column_type: ColumnType::Integer,
+                    constraints: vec![],
+                },
+            ],
+            rows: rows
+                .iter()
+                .map(|(a, b)| {
+                    vec![
+                        SimValue(turso_core::Value::from_i64(*a)),
+                        SimValue(turso_core::Value::from_i64(a + b)),
+                        SimValue(turso_core::Value::from_i64(*b)),
+                    ]
+                })
+                .collect(),
+            indexes: vec![],
+        }
+    }
+
+    fn update_set_b(value: i64) -> sql_generation::model::query::update::Update {
+        use sql_generation::model::query::predicate::Predicate;
+        use sql_generation::model::query::update::{SetValue, Update};
+
+        Update {
+            table: "t".to_string(),
+            set_values: vec![(
+                "b".to_string(),
+                SetValue::Simple(SimValue(turso_core::Value::from_i64(value))),
+            )],
+            predicate: Predicate::true_(),
+        }
+    }
+
+    #[test]
+    fn update_unique_rejects_transient_collision_in_row_order() {
+        // SQLite and Turso apply an UPDATE row by row in rowid order with an
+        // immediate uniqueness check per row, so the shadow must reject an
+        // update where a row's new value collides with the old value of a
+        // later, not-yet-updated row — even though the final row set would be
+        // unique. Here SET b = 2 rewrites g from (2, 3) to (3, 4): row 1's new
+        // g = 3 collides with row 2's still-present old g = 3.
+        let mut commited_tables = vec![table_with_unique_generated_column(&[(1, 1), (2, 1)])];
+        let mut transaction_tables = None;
+        let mut sequences = Vec::new();
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
+
+        let result = update_set_b(2).shadow(&mut tables);
+        assert!(
+            result.is_err(),
+            "shadow accepted an update that collides with a not-yet-updated row"
+        );
+        // The failed update must not modify the shadow rows.
+        assert_eq!(
+            commited_tables[0].rows[0][2],
+            SimValue(turso_core::Value::from_i64(1))
+        );
+    }
+
+    #[test]
+    fn update_unique_accepts_when_no_transient_collision() {
+        // Same shape as above, but the rewritten values (3, 7) never collide
+        // with any old value, so the update must be accepted and applied.
+        let mut commited_tables = vec![table_with_unique_generated_column(&[(1, 1), (5, 1)])];
+        let mut transaction_tables = None;
+        let mut sequences = Vec::new();
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
+
+        let result = update_set_b(2).shadow(&mut tables);
+        assert!(result.is_ok(), "shadow rejected a conflict-free update");
+        let g_values: Vec<_> = commited_tables[0]
+            .rows
+            .iter()
+            .map(|r| r[1].clone())
+            .collect();
+        assert_eq!(
+            g_values,
+            vec![
+                SimValue(turso_core::Value::from_i64(3)),
+                SimValue(turso_core::Value::from_i64(7)),
+            ]
+        );
+    }
+
     #[test]
     fn savepoint_inside_deferred_transaction_stays_open_on_release() {
         let mut commited_tables = Vec::new();

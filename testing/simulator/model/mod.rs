@@ -1353,30 +1353,38 @@ impl Shadow for Update {
                 if !col.has_unique_or_pk() {
                     continue;
                 }
-                let new_values: Vec<_> = updates
-                    .iter()
-                    .map(|(_, _, new)| &new[col_idx])
-                    .filter(|v| v.0 != turso_core::Value::Null)
-                    .collect();
-                // check duplicates within batch
-                for (i, v) in new_values.iter().enumerate() {
-                    if new_values[..i].contains(v) {
+                // SQLite applies an UPDATE row by row in scan (rowid) order with an
+                // immediate uniqueness check per row, so a new value that collides with
+                // the old value of a later, not-yet-updated row aborts the statement
+                // even if the final row set would be unique. Mirror that here: when row
+                // i is rewritten, rows before it already hold their new values and rows
+                // after it still hold their old ones (a row's own old entry is removed
+                // before its new one is checked).
+                for (i, (_, _, new_row)) in updates.iter().enumerate() {
+                    let v = &new_row[col_idx];
+                    if v.0 == turso_core::Value::Null {
+                        continue;
+                    }
+                    if updates[..i]
+                        .iter()
+                        .any(|(_, _, earlier_new)| &earlier_new[col_idx] == v)
+                    {
                         return Err(anyhow::anyhow!(
                             "UNIQUE constraint: duplicate '{}' in table '{}'",
                             col.name,
                             self.table
                         ));
                     }
-                }
-                // check against existing rows not being updated
-                for v in &new_values {
-                    let conflicts = table
+                    let conflicts_later_old = updates[i + 1..]
+                        .iter()
+                        .any(|(_, later_old, _)| &later_old[col_idx] == v);
+                    let conflicts_non_updated = table
                         .rows
                         .iter()
                         .enumerate()
                         .filter(|(row_idx, _)| !updated_row_indices.contains(row_idx))
-                        .any(|(_, r)| &r[col_idx] == *v);
-                    if conflicts {
+                        .any(|(_, r)| &r[col_idx] == v);
+                    if conflicts_later_old || conflicts_non_updated {
                         return Err(anyhow::anyhow!(
                             "UNIQUE constraint: '{}' already exists in '{}'",
                             col.name,
