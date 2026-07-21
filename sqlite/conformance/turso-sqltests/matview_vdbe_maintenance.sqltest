@@ -617,13 +617,13 @@ expect error {
     materialized views with outer joins are not yet supported
 }
 
-test matview-vdbe-join-aggregate-rejected {
+test matview-vdbe-join-distinct-rejected {
     CREATE TABLE jl7(x INTEGER);
     CREATE TABLE jr7(y INTEGER);
-    CREATE MATERIALIZED VIEW bad7 AS SELECT COUNT(*) FROM jl7 JOIN jr7 ON x = y;
+    CREATE MATERIALIZED VIEW bad7 AS SELECT DISTINCT x, y FROM jl7 JOIN jr7 ON x = y;
 }
 expect error {
-    materialized views with aggregates over joins are not yet supported
+    materialized views with DISTINCT over joins are not yet supported
 }
 
 # SELECT DISTINCT is maintained as GROUP BY over every result column: one
@@ -662,6 +662,129 @@ test matview-vdbe-distinct-over-aggregates-rejected {
 }
 expect error {
     materialized views with DISTINCT over aggregates are not yet supported
+}
+
+# A pair can be retracted by the delta phases before its insertion arrives
+# (it exists only across the transaction's old/new generations: here the ON
+# predicate matches old-left with new-right and new-left with old-right, but
+# neither generation with itself). The pair map records the transiently
+# negative multiplicity; dropping it would materialize phantom rows.
+test matview-vdbe-join-cross-generation-pairs {
+    CREATE TABLE pl(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE pr(id INTEGER PRIMARY KEY, k INTEGER);
+    INSERT INTO pl VALUES (1, 20);
+    INSERT INTO pr VALUES (1, 10);
+    CREATE MATERIALIZED VIEW vp AS SELECT pl.k AS lk, pr.k AS rk FROM pl JOIN pr ON pl.k = pr.k;
+    BEGIN;
+    UPDATE pl SET k = 10;
+    UPDATE pr SET k = 20;
+    COMMIT;
+    SELECT 'phantom', COUNT(*) FROM vp;
+    BEGIN;
+    UPDATE pl SET k = 20;
+    UPDATE pr SET k = 20;
+    COMMIT;
+    SELECT 'match', * FROM vp;
+    PRAGMA integrity_check;
+}
+expect {
+    phantom|0
+    match|20|20
+    ok
+}
+
+# The same cross-generation retraction-before-insertion reaches groups when
+# aggregating over a join; contributions apply positives-first so group
+# weights never dip below zero.
+test matview-vdbe-join-aggregate-cross-generation {
+    CREATE TABLE ga(id INTEGER PRIMARY KEY, k INTEGER, g INTEGER);
+    CREATE TABLE gb(id INTEGER PRIMARY KEY, k INTEGER);
+    INSERT INTO ga VALUES (1, 20, 7);
+    INSERT INTO gb VALUES (1, 10);
+    CREATE MATERIALIZED VIEW vg AS SELECT ga.g, COUNT(*) AS cnt FROM ga JOIN gb ON ga.k = gb.k GROUP BY ga.g;
+    BEGIN;
+    UPDATE ga SET k = 10, g = 8;
+    UPDATE gb SET k = 20;
+    COMMIT;
+    SELECT 'phantom', COUNT(*) FROM vg;
+    UPDATE gb SET k = 10;
+    SELECT 'match', * FROM vg;
+}
+expect {
+    phantom|0
+    match|8|1
+}
+
+# Aggregates over a join: the join delta phases pre-evaluate group keys,
+# aggregate arguments, and weights into a joined-delta relation that feeds
+# the same group machinery as single-table aggregates.
+test matview-vdbe-join-aggregate-maintenance {
+    CREATE TABLE jc(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE jo(id INTEGER PRIMARY KEY, cid INTEGER, amount INTEGER);
+    INSERT INTO jc VALUES (1, 'a'), (2, 'b');
+    INSERT INTO jo VALUES (1, 1, 100), (2, 1, 150), (3, 2, 200);
+    CREATE MATERIALIZED VIEW vja AS SELECT jc.name, COUNT(*) AS cnt, SUM(jo.amount) AS s, MIN(jo.amount) AS mn FROM jc JOIN jo ON jc.id = jo.cid GROUP BY jc.name;
+    SELECT 'pop', * FROM vja ORDER BY 2;
+    DELETE FROM jo WHERE id = 1;
+    SELECT 'del', * FROM vja ORDER BY 2;
+    UPDATE jo SET cid = 2 WHERE id = 2;
+    SELECT 'mov', * FROM vja ORDER BY 2;
+    BEGIN;
+    INSERT INTO jc VALUES (3, 'c');
+    INSERT INTO jo VALUES (4, 3, 70), (5, 3, 30);
+    COMMIT;
+    SELECT 'txn', * FROM vja ORDER BY 2;
+    DELETE FROM jc WHERE id = 2;
+    SELECT 'cgone', * FROM vja ORDER BY 2;
+}
+expect {
+    pop|a|2|250|100
+    pop|b|1|200|200
+    del|a|1|150|150
+    del|b|1|200|200
+    mov|b|2|350|150
+    txn|b|2|350|150
+    txn|c|2|100|30
+    cgone|c|2|100|30
+}
+
+# Scalar aggregates over a join keep their always-present row.
+test matview-vdbe-join-scalar-aggregate {
+    CREATE TABLE jl9(k INTEGER);
+    CREATE TABLE jr9(k INTEGER, x INTEGER);
+    CREATE MATERIALIZED VIEW vjs9 AS SELECT COUNT(*) AS c, SUM(jr9.x) AS s FROM jl9 JOIN jr9 ON jl9.k = jr9.k;
+    SELECT c, s IS NULL FROM vjs9;
+    INSERT INTO jl9 VALUES (1);
+    INSERT INTO jr9 VALUES (1, 10), (1, 20);
+    SELECT * FROM vjs9;
+    DELETE FROM jr9;
+    SELECT c, s IS NULL FROM vjs9;
+}
+expect {
+    0|1
+    2|30
+    0|1
+}
+
+# HAVING over a join gates group rows as their aggregates cross the
+# predicate.
+test matview-vdbe-join-aggregate-having {
+    CREATE TABLE jc2(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE jo2(id INTEGER PRIMARY KEY, cid INTEGER);
+    INSERT INTO jc2 VALUES (1, 'a'), (2, 'b');
+    INSERT INTO jo2 VALUES (1, 1), (2, 1), (3, 2);
+    CREATE MATERIALIZED VIEW vjh2 AS SELECT jc2.name, COUNT(*) AS cnt FROM jc2 JOIN jo2 ON jc2.id = jo2.cid GROUP BY jc2.name HAVING COUNT(*) > 1;
+    SELECT 'init', * FROM vjh2;
+    INSERT INTO jo2 VALUES (4, 2);
+    SELECT 'grew', * FROM vjh2 ORDER BY 2;
+    DELETE FROM jo2 WHERE id IN (1, 2);
+    SELECT 'shrunk', * FROM vjh2;
+}
+expect {
+    init|a|2
+    grew|a|2
+    grew|b|2
+    shrunk|b|2
 }
 
 # Shapes the VDBE codegen cannot maintain yet are rejected at translate time,

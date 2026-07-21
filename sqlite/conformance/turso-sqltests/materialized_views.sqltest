@@ -586,7 +586,6 @@ expect {
     Bob|7
 }
 
-@skip "aggregates over joins are not supported by the VDBE maintenance codegen yet"
 test matview-join-with-aggregation {
     CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
     CREATE TABLE orders(order_id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER);
@@ -600,8 +599,8 @@ test matview-join-with-aggregation {
     SELECT * FROM user_totals ORDER BY name;
 }
 expect {
-    Alice|250.0
-    Bob|250.0
+    Alice|250
+    Bob|250
 }
 
 @skip "joins over more than two tables are not supported by the VDBE maintenance codegen yet"
@@ -811,7 +810,6 @@ expect {
 }
 
 # Test 3: Join with aggregation BEFORE the join
-@skip "aggregates over joins are not supported by the VDBE maintenance codegen yet"
 test matview-aggregation-before-join {
     CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, product_id INTEGER, quantity INTEGER, order_date INTEGER);
     CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, tier TEXT);
@@ -836,13 +834,12 @@ test matview-aggregation-before-join {
     SELECT * FROM customer_order_summary ORDER BY total_quantity DESC;
 }
 expect {
-    Bob|Silver|2|7.0
-    Alice|Gold|3|6.0
-    Charlie|Bronze|1|1.0
+    Bob|Silver|2|7
+    Alice|Gold|3|6
+    Charlie|Bronze|1|1
 }
 
 # Test 4: Join with aggregation AFTER the join
-@skip "aggregates over joins are not supported by the VDBE maintenance codegen yet"
 test matview-aggregation-after-join {
     CREATE TABLE sales(id INTEGER PRIMARY KEY, product_id INTEGER, store_id INTEGER, units_sold INTEGER, revenue INTEGER);
     CREATE TABLE stores(id INTEGER PRIMARY KEY, name TEXT, region TEXT);
@@ -866,8 +863,8 @@ test matview-aggregation-after-join {
     SELECT * FROM regional_sales ORDER BY total_revenue DESC;
 }
 expect {
-    North|38.0|3150.0
-    South|18.0|1500.0
+    North|38|3150
+    South|18|1500
 }
 
 # Test 5: Modifying both tables in same transaction
@@ -1676,7 +1673,6 @@ expect {
     2021|200
 }
 
-@skip "aggregates over joins are not supported by the VDBE maintenance codegen yet"
 test matview-groupby-join-position {
     CREATE TABLE t(a INTEGER);
     CREATE TABLE u(a INTEGER);

@@ -347,6 +347,33 @@ fn join(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
         cols.push(format!("r.{} AS r_{}", quoted(&c.name), c.name));
     }
 
+    // Sometimes aggregate over the join instead of projecting it.
+    if rng.random_bool(0.4) {
+        let group_col = &left.columns[rng.random_range(0..left.columns.len())];
+        let mut exprs = vec![
+            format!("l.{} AS g", quoted(&group_col.name)),
+            "COUNT(*) AS cnt".to_string(),
+        ];
+        let r_numeric: Vec<&ColumnDef> = right
+            .columns
+            .iter()
+            .filter(|c| matches!(c.data_type, DataType::Integer | DataType::Real))
+            .collect();
+        if !r_numeric.is_empty() && rng.random_bool(0.7) {
+            let col = r_numeric[rng.random_range(0..r_numeric.len())];
+            exprs.push(format!("SUM(r.{}) AS s", quoted(&col.name)));
+        }
+        return Some(format!(
+            "SELECT {exprs} FROM {lt} AS l JOIN {rt} AS r ON l.{lc} = r.{rc} GROUP BY l.{g}",
+            exprs = exprs.join(", "),
+            lt = quoted(&left.name),
+            rt = quoted(&right.name),
+            lc = quoted(&lc.name),
+            rc = quoted(&rc.name),
+            g = quoted(&group_col.name),
+        ));
+    }
+
     Some(format!(
         "SELECT {cols} FROM {lt} AS l JOIN {rt} AS r ON l.{lc} = r.{rc}",
         cols = cols.join(", "),
