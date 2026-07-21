@@ -9,7 +9,7 @@ use super::{
     pager::PageRef,
     sqlite3_ondisk::{IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE},
 };
-use crate::alloc::{TursoSliceExt, TursoVecExt};
+use crate::alloc::{TursoFromIterator, TursoSliceExt, TursoVecExt};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::inject_io_yield;
@@ -73,8 +73,10 @@ const STACK_ALLOC_KEY_VALS_MAX: usize = 16;
 fn write_varint_to_vec(value: u64, payload: &mut crate::alloc::Vec<u8>) -> Result<()> {
     let mut varint = [0u8; 9];
     let len = write_varint(&mut varint, value);
-    crate::with_btree_allocation_site!(CellPayload, payload.try_reserve(len))?;
-    payload.extend_from_slice(&varint[..len]);
+    crate::with_btree_allocation_site!(
+        CellPayload,
+        payload.try_extend(varint[..len].iter().copied())
+    )?;
     Ok(())
 }
 
@@ -1439,7 +1441,10 @@ impl BTreeCursor {
                 page,
             } = self.read_overflow_state.as_mut().unwrap();
             let buf = page.get_contents().as_ptr();
-            payload.extend_from_slice(&buf[4..4 + to_read]);
+            crate::with_btree_allocation_site!(
+                OverflowRead,
+                payload.try_extend(buf[4..4 + to_read].iter().copied())
+            )?;
             *remaining_to_read -= to_read;
 
             if let Some((new_page, c)) = new_page_and_c {
@@ -2900,7 +2905,10 @@ impl BTreeCursor {
                     const MAX_CELL_HEADER: usize = 22;
                     let needed_capacity = record.get_payload().len() + MAX_CELL_HEADER;
                     if payload.capacity() < needed_capacity {
-                        payload.reserve(needed_capacity - payload.capacity());
+                        crate::with_btree_allocation_site!(
+                            CellPayload,
+                            payload.try_reserve(needed_capacity - payload.capacity())
+                        )?;
                     }
                     *write_state = WriteState::Insert {
                         page,
@@ -5561,14 +5569,13 @@ impl BTreeCursor {
                 cell.first_overflow_page,
             )
         };
-        self.blob_pinned_rowid = Some(rowid);
         if local_len > payload_size {
             return Err(LimboError::Corrupt(format!(
                 "cell claims {payload_size} payload bytes but holds {local_len} locally"
             )));
         }
         let c = &mut self.blob_cache;
-        c.valid = true;
+        c.valid = false;
         c.leaf_id = leaf_id;
         c.cell_idx = cell_idx;
         c.local_off = local_off;
@@ -5578,8 +5585,10 @@ impl BTreeCursor {
         c.first_overflow = first_overflow;
         c.overflow_pages.clear();
         if let Some(fo) = first_overflow {
-            c.overflow_pages.push(fo);
+            crate::with_btree_allocation_site!(OverflowRead, c.overflow_pages.try_push(fo))?;
         }
+        self.blob_pinned_rowid = Some(rowid);
+        c.valid = true;
         // Moving to a different cell: unpin the previous cell's cached overflow page.
         c.release_pinned_overflow();
         c.col_valid = false;
@@ -5733,7 +5742,10 @@ impl BTreeCursor {
                     upto + 1
                 )));
             }
-            self.blob_cache.overflow_pages.push(next);
+            crate::with_btree_allocation_site!(
+                OverflowRead,
+                self.blob_cache.overflow_pages.try_push(next)
+            )?;
         }
     }
 
@@ -5869,6 +5881,10 @@ impl BTreeCursor {
         out: &mut crate::ValueBlob,
     ) -> Result<IOResult<()>> {
         let payload_off = return_if_io!(self.blob_resolve_range(column, off, len));
+        crate::with_btree_allocation_site!(
+            OverflowRead,
+            out.try_reserve(len.saturating_sub(out.len()))
+        )?;
         out.clear();
         if len == 0 {
             return Ok(IOResult::Done(()));
@@ -5915,7 +5931,10 @@ impl BTreeCursor {
                     let mut new_payload = take_vec(&mut self.reusable_cell_payload);
                     new_payload.clear();
                     if new_payload.capacity() < serial_types_len {
-                        new_payload.reserve(serial_types_len - new_payload.capacity());
+                        crate::with_btree_allocation_site!(
+                            CellPayload,
+                            new_payload.try_reserve(serial_types_len - new_payload.capacity())
+                        )?;
                     }
                     let rowid = return_if_io!(self.rowid());
                     *state = OverwriteCellState::FillPayload {
@@ -6729,7 +6748,10 @@ impl CursorTrait for BTreeCursor {
                         match last_cell_on_child_page {
                             BTreeCell::TableLeafCell(leaf_cell) => {
                                 // Table interior cells contain the left child pointer and the rowid as varint.
-                                cell_payload.extend_from_slice(&child_pointer.to_be_bytes());
+                                crate::with_btree_allocation_site!(
+                                    CellPayload,
+                                    cell_payload.try_extend(child_pointer.to_be_bytes())
+                                )?;
                                 write_varint_to_vec(leaf_cell.rowid as u64, &mut cell_payload)?;
                             }
                             BTreeCell::IndexLeafCell(leaf_cell) => {
@@ -6738,12 +6760,20 @@ impl CursorTrait for BTreeCursor {
                                 // 2. The payload size as varint
                                 // 3. The payload
                                 // 4. The first overflow page as varint, omitted if no overflow.
-                                cell_payload.extend_from_slice(&child_pointer.to_be_bytes());
+                                crate::with_btree_allocation_site!(
+                                    CellPayload,
+                                    cell_payload.try_extend(child_pointer.to_be_bytes())
+                                )?;
                                 write_varint_to_vec(leaf_cell.payload_size, &mut cell_payload)?;
-                                cell_payload.extend_from_slice(leaf_cell.payload);
+                                crate::with_btree_allocation_site!(
+                                    CellPayload,
+                                    cell_payload.try_extend(leaf_cell.payload.iter().copied())
+                                )?;
                                 if let Some(first_overflow_page) = leaf_cell.first_overflow_page {
-                                    cell_payload
-                                        .extend_from_slice(&first_overflow_page.to_be_bytes());
+                                    crate::with_btree_allocation_site!(
+                                        CellPayload,
+                                        cell_payload.try_extend(first_overflow_page.to_be_bytes())
+                                    )?;
                                 }
                             }
                             _ => unreachable!("Expected table leaf cell"),
@@ -7461,6 +7491,14 @@ pub enum IntegrityCheckError {
     OverflowListLengthMismatch { got: usize, expected: usize },
 }
 
+fn push_integrity_error(
+    errors: &mut crate::alloc::Vec<IntegrityCheckError>,
+    error: IntegrityCheckError,
+) -> Result<()> {
+    crate::with_btree_allocation_site!(IntegrityCheck, errors.try_push(error))?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PageCategory {
     Normal,
@@ -7516,7 +7554,7 @@ impl IntegrityCheckState {
         &mut self,
         page_idx: i64,
         page_category: PageCategory,
-        errors: &mut Vec<IntegrityCheckError>,
+        errors: &mut crate::alloc::Vec<IntegrityCheckError>,
     ) -> Result<()> {
         turso_assert!(
             self.page_stack.is_empty(),
@@ -7544,7 +7582,7 @@ impl IntegrityCheckState {
         &mut self,
         entry: IntegrityCheckPageEntry,
         referenced_by: i64,
-        errors: &mut Vec<IntegrityCheckError>,
+        errors: &mut crate::alloc::Vec<IntegrityCheckError>,
     ) -> Result<()> {
         let page_id = entry.page_idx;
         let Some(previous) = self.page_reference.get(&page_id).copied() else {
@@ -7563,11 +7601,14 @@ impl IntegrityCheckState {
             IntegrityCheck,
             crate::alloc::try_vec![previous, referenced_by]
         )?;
-        errors.push(IntegrityCheckError::PageReferencedMultipleTimes {
-            page_id,
-            page_category: entry.page_category,
-            references,
-        });
+        push_integrity_error(
+            errors,
+            IntegrityCheckError::PageReferencedMultipleTimes {
+                page_id,
+                page_category: entry.page_category,
+                references,
+            },
+        )?;
         Ok(())
     }
 }
@@ -7605,7 +7646,7 @@ fn overflow_pages_expected_for_cell(
 /// depth.
 pub fn integrity_check(
     state: &mut IntegrityCheckState,
-    errors: &mut Vec<IntegrityCheckError>,
+    errors: &mut crate::alloc::Vec<IntegrityCheckError>,
     pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<IOResult<()>> {
@@ -7677,10 +7718,13 @@ pub fn integrity_check(
                         next_freelist_trunk_page,
                         &contents.as_ptr()[0..16]
                     );
-                    errors.push(IntegrityCheckError::FreelistPointerOutOfRange {
-                        page_id: page.get().id as i64,
-                        pointer: next_freelist_trunk_page as i64,
-                    });
+                    push_integrity_error(
+                        errors,
+                        IntegrityCheckError::FreelistPointerOutOfRange {
+                            page_id: page.get().id as i64,
+                            pointer: next_freelist_trunk_page as i64,
+                        },
+                    )?;
                     continue;
                 }
                 state.push_page(
@@ -7708,11 +7752,14 @@ pub fn integrity_check(
                     max_pointers,
                     &contents.as_ptr()[0..16]
                 );
-                errors.push(IntegrityCheckError::FreelistTrunkCorrupt {
-                    page_id: page.get().id as i64,
-                    page_pointers,
-                    max_pointers,
-                });
+                push_integrity_error(
+                    errors,
+                    IntegrityCheckError::FreelistTrunkCorrupt {
+                        page_id: page.get().id as i64,
+                        page_pointers,
+                        max_pointers,
+                    },
+                )?;
                 continue;
             }
             for i in 0..page_pointers {
@@ -7725,11 +7772,14 @@ pub fn integrity_check(
                         offset,
                         &contents.as_ptr()[0..16]
                     );
-                    errors.push(IntegrityCheckError::FreelistTrunkCorrupt {
-                        page_id: page.get().id as i64,
-                        page_pointers,
-                        max_pointers,
-                    });
+                    push_integrity_error(
+                        errors,
+                        IntegrityCheckError::FreelistTrunkCorrupt {
+                            page_id: page.get().id as i64,
+                            page_pointers,
+                            max_pointers,
+                        },
+                    )?;
                     break;
                 }
                 let page_pointer = contents.read_u32_no_offset(offset);
@@ -7740,10 +7790,13 @@ pub fn integrity_check(
                         page_pointer,
                         &contents.as_ptr()[0..16]
                     );
-                    errors.push(IntegrityCheckError::FreelistPointerOutOfRange {
-                        page_id: page.get().id as i64,
-                        pointer: page_pointer as i64,
-                    });
+                    push_integrity_error(
+                        errors,
+                        IntegrityCheckError::FreelistPointerOutOfRange {
+                            page_id: page.get().id as i64,
+                            pointer: page_pointer as i64,
+                        },
+                    )?;
                     continue;
                 }
                 state.push_page(
@@ -7783,10 +7836,13 @@ pub fn integrity_check(
                 )?;
             } else if let Some(expected) = overflow_pages_expected {
                 if overflow_pages_seen != expected {
-                    errors.push(IntegrityCheckError::OverflowListLengthMismatch {
-                        got: overflow_pages_seen,
-                        expected,
-                    });
+                    push_integrity_error(
+                        errors,
+                        IntegrityCheckError::OverflowListLengthMismatch {
+                            got: overflow_pages_seen,
+                            expected,
+                        },
+                    )?;
                 }
             }
             continue;
@@ -7809,24 +7865,30 @@ pub fn integrity_check(
         for cell_idx in (0..contents.cell_count()).rev() {
             let (cell_start, cell_length) = contents.cell_get_raw_region(cell_idx, usable_space)?;
             if cell_start < contents.cell_content_area() as usize || cell_start > usable_space - 4 {
-                errors.push(IntegrityCheckError::CellOutOfRange {
-                    cell_idx,
-                    page_id: page.get().id as i64,
-                    cell_start,
-                    cell_end: cell_start + cell_length,
-                    content_area: contents.cell_content_area() as usize,
-                    usable_space,
-                });
+                push_integrity_error(
+                    errors,
+                    IntegrityCheckError::CellOutOfRange {
+                        cell_idx,
+                        page_id: page.get().id as i64,
+                        cell_start,
+                        cell_end: cell_start + cell_length,
+                        content_area: contents.cell_content_area() as usize,
+                        usable_space,
+                    },
+                )?;
             }
             if cell_start + cell_length > usable_space {
-                errors.push(IntegrityCheckError::CellOverflowsPage {
-                    cell_idx,
-                    page_id: page.get().id as i64,
-                    cell_start,
-                    cell_end: cell_start + cell_length,
-                    content_area: contents.cell_content_area() as usize,
-                    usable_space,
-                });
+                push_integrity_error(
+                    errors,
+                    IntegrityCheckError::CellOverflowsPage {
+                        cell_idx,
+                        page_id: page.get().id as i64,
+                        cell_start,
+                        cell_end: cell_start + cell_length,
+                        content_area: contents.cell_content_area() as usize,
+                        usable_space,
+                    },
+                )?;
             }
             coverage_checker.add_cell(cell_start, cell_start + cell_length);
             let cell = contents.cell_get(cell_idx, usable_space)?;
@@ -7846,14 +7908,17 @@ pub fn integrity_check(
                     )?;
                     let rowid = table_interior_cell.rowid;
                     if rowid > max_intkey || rowid > next_rowid {
-                        errors.push(IntegrityCheckError::CellRowidOutOfRange {
-                            page_id: page.get().id as i64,
-                            page_category,
-                            cell_idx,
-                            rowid,
-                            max_intkey,
-                            next_rowid,
-                        });
+                        push_integrity_error(
+                            errors,
+                            IntegrityCheckError::CellRowidOutOfRange {
+                                page_id: page.get().id as i64,
+                                page_category,
+                                cell_idx,
+                                rowid,
+                                max_intkey,
+                                next_rowid,
+                            },
+                        )?;
                     }
                     next_rowid = rowid;
                 }
@@ -7861,25 +7926,31 @@ pub fn integrity_check(
                     // check depth of leaf pages are equal
                     if let Some(expected_leaf_level) = state.first_leaf_level {
                         if expected_leaf_level != level {
-                            errors.push(IntegrityCheckError::LeafDepthMismatch {
-                                page_id: page.get().id as i64,
-                                this_page_depth: level,
-                                other_page_depth: expected_leaf_level,
-                            });
+                            push_integrity_error(
+                                errors,
+                                IntegrityCheckError::LeafDepthMismatch {
+                                    page_id: page.get().id as i64,
+                                    this_page_depth: level,
+                                    other_page_depth: expected_leaf_level,
+                                },
+                            )?;
                         }
                     } else {
                         state.first_leaf_level = Some(level);
                     }
                     let rowid = table_leaf_cell.rowid;
                     if rowid > max_intkey || rowid > next_rowid {
-                        errors.push(IntegrityCheckError::CellRowidOutOfRange {
-                            page_id: page.get().id as i64,
-                            page_category,
-                            cell_idx,
-                            rowid,
-                            max_intkey,
-                            next_rowid,
-                        });
+                        push_integrity_error(
+                            errors,
+                            IntegrityCheckError::CellRowidOutOfRange {
+                                page_id: page.get().id as i64,
+                                page_category,
+                                cell_idx,
+                                rowid,
+                                max_intkey,
+                                next_rowid,
+                            },
+                        )?;
                     }
                     next_rowid = rowid;
                     if let Some(first_overflow_page) = table_leaf_cell.first_overflow_page {
@@ -7939,11 +8010,14 @@ pub fn integrity_check(
                     // check depth of leaf pages are equal
                     if let Some(expected_leaf_level) = state.first_leaf_level {
                         if expected_leaf_level != level {
-                            errors.push(IntegrityCheckError::LeafDepthMismatch {
-                                page_id: page.get().id as i64,
-                                this_page_depth: level,
-                                other_page_depth: expected_leaf_level,
-                            });
+                            push_integrity_error(
+                                errors,
+                                IntegrityCheckError::LeafDepthMismatch {
+                                    page_id: page.get().id as i64,
+                                    this_page_depth: level,
+                                    other_page_depth: expected_leaf_level,
+                                },
+                            )?;
                         }
                     } else {
                         state.first_leaf_level = Some(level);
@@ -7995,11 +8069,14 @@ pub fn integrity_check(
                 let size = contents.read_u16_no_offset(pc + 2) as usize;
                 // check it doesn't go out of range
                 if pc > usable_space - 4 {
-                    errors.push(IntegrityCheckError::FreeBlockOutOfRange {
-                        page_id: page.get().id as i64,
-                        start: pc,
-                        end: pc + size,
-                    });
+                    push_integrity_error(
+                        errors,
+                        IntegrityCheckError::FreeBlockOutOfRange {
+                            page_id: page.get().id as i64,
+                            start: pc,
+                            end: pc + size,
+                        },
+                    )?;
                     break;
                 }
                 coverage_checker.add_free_block(pc, pc + size);
@@ -8013,7 +8090,7 @@ pub fn integrity_check(
             contents.cell_content_area() as usize,
             errors,
             contents.num_frag_free_bytes() as usize,
-        );
+        )?;
     }
 }
 
@@ -8082,21 +8159,24 @@ impl CoverageChecker {
         &mut self,
         usable_space: usize,
         content_area: usize,
-        errors: &mut Vec<IntegrityCheckError>,
+        errors: &mut crate::alloc::Vec<IntegrityCheckError>,
         expected_fragmentation: usize,
-    ) {
+    ) -> Result<()> {
         let mut fragmentation = 0;
         let mut prev_end = content_area;
         while let Some(cell) = self.heap.pop() {
             let start = cell.0.start;
             if prev_end > start {
-                errors.push(IntegrityCheckError::CellOverlap {
-                    page_id: self.page_idx,
-                    start,
-                    prev_end,
-                    content_area,
-                    is_free_block: cell.0.is_free_block,
-                });
+                push_integrity_error(
+                    errors,
+                    IntegrityCheckError::CellOverlap {
+                        page_id: self.page_idx,
+                        start,
+                        prev_end,
+                        content_area,
+                        is_free_block: cell.0.is_free_block,
+                    },
+                )?;
                 break;
             } else {
                 fragmentation += start - prev_end;
@@ -8105,12 +8185,16 @@ impl CoverageChecker {
         }
         fragmentation += usable_space - prev_end;
         if fragmentation != expected_fragmentation {
-            errors.push(IntegrityCheckError::UnexpectedFragmentation {
-                page_id: self.page_idx,
-                got: fragmentation,
-                expected: expected_fragmentation,
-            });
+            push_integrity_error(
+                errors,
+                IntegrityCheckError::UnexpectedFragmentation {
+                    page_id: self.page_idx,
+                    got: fragmentation,
+                    expected: expected_fragmentation,
+                },
+            )?;
         }
+        Ok(())
     }
 }
 
@@ -8277,9 +8361,11 @@ impl PageStack {
         let current = self.current();
         #[cfg(debug_assertions)]
         {
+            let node_states: [i32; BTCURSOR_MAX_DEPTH + 1] =
+                std::array::from_fn(|index| self.node_states[index].cell_idx);
             tracing::trace!(
                 curr_cell_index = self.node_states[current].cell_idx,
-                node_states = ?self.node_states.iter().map(|state| state.cell_idx).collect::<Vec<_>>(),
+                ?node_states,
             );
         }
         self.node_states[current].cell_idx -= 1;
@@ -9670,7 +9756,10 @@ fn fill_cell_payload(
                     // we must copy the left child pointer of the replaced cell to the new cell.
                     let left_child_page =
                         page_contents.cell_interior_read_left_child_page(cell_idx)?;
-                    cell_payload.extend_from_slice(&left_child_page.to_be_bytes());
+                    crate::with_btree_allocation_site!(
+                        CellPayload,
+                        cell_payload.try_extend(left_child_page.to_be_bytes())
+                    )?;
                 }
                 if matches!(page_type, PageType::TableLeaf) {
                     let int_key = int_key.unwrap();
@@ -9687,13 +9776,20 @@ fn fill_cell_payload(
                     payload_overflows(record_buf.len(), max_local, min_local, usable_space);
                 if !overflows {
                     // enough allowed space to fit inside a btree page
-                    cell_payload.extend_from_slice(record_buf.as_ref());
+                    crate::with_btree_allocation_site!(
+                        CellPayload,
+                        cell_payload.try_extend(record_buf.iter().copied())
+                    )?;
                     break Ok(IOResult::Done(()));
                 }
 
                 // so far we've written any of: left child page, rowid, payload size (depending on page type)
                 let cell_non_payload_elems_size = cell_payload.len();
                 let new_total_local_size = cell_non_payload_elems_size + local_size_if_overflow;
+                crate::with_btree_allocation_site!(
+                    CellPayload,
+                    cell_payload.try_reserve(new_total_local_size - cell_payload.len())
+                )?;
                 cell_payload.resize(new_total_local_size, 0);
 
                 *fill_cell_payload_state = FillCellPayloadState::CopyData {
@@ -10174,6 +10270,19 @@ mod tests {
         assert_alloc_vec(&balance.pending_sibling_load_completions);
         let integrity_check = IntegrityCheckState::new(0);
         assert_alloc_vec(&integrity_check.page_stack);
+        let op_integrity_check =
+            crate::vdbe::execute::OpIntegrityCheckState::CheckingBTreeStructure {
+                errors: crate::alloc::vec![],
+                current_root_idx: 0,
+                current_dropped_idx: 0,
+                state: IntegrityCheckState::new(0),
+            };
+        let crate::vdbe::execute::OpIntegrityCheckState::CheckingBTreeStructure { errors, .. } =
+            op_integrity_check
+        else {
+            unreachable!()
+        };
+        assert_alloc_vec(&errors);
         let _ = assert_cursor_buffers;
         let _ = assert_overflow_cell_buffers;
     }
