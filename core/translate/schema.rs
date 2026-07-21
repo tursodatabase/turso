@@ -28,7 +28,7 @@ use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
     to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
 };
-use crate::{bail_parse_error, CaptureDataChangesExt, Result};
+use crate::{bail_parse_error, turso_assert, turso_assert_eq, CaptureDataChangesExt, Result};
 use crate::{Connection, MAIN_DB_ID};
 
 use turso_ext::VTabKind;
@@ -2323,7 +2323,22 @@ pub fn translate_drop_table(
         .get_table(crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME)
         .and_then(|t| t.btree())
     {
+        let version_index_name = format!(
+            "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_1",
+            crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
+        );
+        let version_index = resolver
+            .schema()
+            .get_index(
+                crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME,
+                &version_index_name,
+            )
+            .cloned();
         let ver_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(version_table.clone()));
+        let ver_index_cursor_id = version_index
+            .as_ref()
+            .map(|index| program.alloc_cursor_index(None, index))
+            .transpose()?;
         let ver_table_name_reg = program.alloc_register();
         let dropped_name_reg =
             program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
@@ -2334,6 +2349,13 @@ pub fn translate_drop_table(
             root_page: version_table.root_page.into(),
             db: crate::MAIN_DB_ID,
         });
+        if let (Some(index), Some(cursor_id)) = (&version_index, ver_index_cursor_id) {
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id,
+                root_page: index.root_page.into(),
+                db: crate::MAIN_DB_ID,
+            });
+        }
 
         let end_ver_loop_label = program.allocate_label();
         let ver_loop_start_label = program.allocate_label();
@@ -2355,6 +2377,30 @@ pub fn translate_drop_table(
             flags: CmpInsFlags::default(),
             collation: None,
         });
+
+        if let (Some(index), Some(cursor_id)) = (&version_index, ver_index_cursor_id) {
+            turso_assert_eq!(index.columns.len(), 1);
+            turso_assert!(index.has_rowid);
+            turso_assert!(index.where_clause.is_none());
+            turso_assert!(index.columns[0].expr.is_none());
+
+            let index_key_reg = program.alloc_registers(2);
+            program.emit_column_or_rowid(
+                ver_cursor_id,
+                index.columns[0].pos_in_table,
+                index_key_reg,
+            );
+            program.emit_insn(Insn::RowId {
+                cursor_id: ver_cursor_id,
+                dest: index_key_reg + 1,
+            });
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: index_key_reg,
+                num_regs: 2,
+                cursor_id,
+                raise_error_if_no_matching_entry: true,
+            });
+        }
 
         program.emit_insn(Insn::Delete {
             cursor_id: ver_cursor_id,
