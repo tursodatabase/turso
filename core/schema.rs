@@ -175,6 +175,8 @@ pub const TEMP_SCHEMA_TABLE_NAME_ALT: &str = "sqlite_temp_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
+/// Hidden per-view value-multiset table backing MIN/MAX aggregates.
+pub const DBSP_MINMAX_TABLE_PREFIX: &str = "__turso_internal_dbsp_minmax_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
 // Prefix for the hidden sequence *name* owned by an AUTOINCREMENT table.
@@ -1166,13 +1168,14 @@ impl Schema {
         !self.dbsp_state_version_mismatch(view_name)
     }
 
-    /// True when a state table for this view exists under a different
-    /// storage version than the current one.
+    /// True when a state or multiset table for this view exists under a
+    /// different storage version than the current one.
     pub(crate) fn dbsp_state_version_mismatch(&self, view_name: &str) -> bool {
         let view_name = normalize_ident(view_name);
         self.tables.keys().any(|table_name| {
             table_name
                 .strip_prefix(DBSP_TABLE_PREFIX)
+                .or_else(|| table_name.strip_prefix(DBSP_MINMAX_TABLE_PREFIX))
                 .and_then(|suffix| suffix.split_once('_'))
                 .is_some_and(|(version_str, name)| {
                     name == view_name
@@ -1215,10 +1218,15 @@ impl Schema {
             // Remove from tables
             self.remove_table(&name);
 
-            // Remove DBSP state table and its indexes from in-memory schema
+            // Remove the internal tables (aggregate state, MIN/MAX multiset)
+            // and their indexes from the in-memory schema
             let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}");
             self.remove_table(&dbsp_table_name);
             self.remove_indices_for_table(&dbsp_table_name);
+            let minmax_table_name =
+                format!("{DBSP_MINMAX_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}");
+            self.remove_table(&minmax_table_name);
+            self.remove_indices_for_table(&minmax_table_name);
 
             // Remove from materialized view tracking
             self.materialized_view_names.remove(&name);
