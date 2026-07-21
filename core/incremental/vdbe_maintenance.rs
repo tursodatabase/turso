@@ -422,9 +422,9 @@ pub fn classify_view(
         return unsupported("VALUES");
     };
 
-    if distinctness.is_some() {
-        return unsupported("DISTINCT");
-    }
+    // SELECT ALL is the default semantics spelled out; only DISTINCT changes
+    // the shape (handled below once the FROM structure is known).
+    let select_distinct = matches!(distinctness, Some(ast::Distinctness::Distinct));
     if !window_clause.is_empty() {
         return unsupported("window functions");
     }
@@ -472,6 +472,9 @@ pub fn classify_view(
         if group_by.is_some() {
             return unsupported("GROUP BY over joins");
         }
+        if select_distinct {
+            return unsupported("DISTINCT over joins");
+        }
         for column in columns {
             if let ast::ResultColumn::Expr(expr, _) = column {
                 let mut aggs = Vec::new();
@@ -483,6 +486,79 @@ pub fn classify_view(
             }
         }
         return Ok(ViewShape::Join { on_expr });
+    }
+
+    // SELECT DISTINCT over plain projections is GROUP BY every result column:
+    // one group per distinct output row, kept alive by the hidden COUNT(*)
+    // while any source row still produces it. DISTINCT over an aggregate
+    // query dedups the aggregated rows themselves, which the group machinery
+    // cannot express.
+    if select_distinct {
+        if group_by.is_some() {
+            return unsupported("DISTINCT over aggregates");
+        }
+        let mut group_exprs = Vec::with_capacity(columns.len());
+        for column in columns {
+            match column {
+                ast::ResultColumn::Expr(expr, _) => {
+                    let mut aggs = Vec::new();
+                    if resolve_window_and_aggregate_functions(
+                        expr,
+                        resolver,
+                        &mut aggs,
+                        None,
+                        &mut [],
+                    )? {
+                        return unsupported("DISTINCT over aggregates");
+                    }
+                    check_scalar_expr(expr)?;
+                    group_exprs.push(expr.as_ref().clone());
+                }
+                ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => {
+                    let ast::SelectTable::Table(name, _, _) = from.select.as_ref() else {
+                        unreachable!("single-table FROM checked above");
+                    };
+                    let base_table =
+                        schema.get_btree_table(name.name.as_str()).ok_or_else(|| {
+                            LimboError::ParseError(format!(
+                                "materialized view base table {} not found",
+                                name.name.as_str()
+                            ))
+                        })?;
+                    for column in base_table.columns() {
+                        let name = column.name.clone().ok_or_else(|| {
+                            LimboError::InternalError(
+                                "btree table column without a name".to_string(),
+                            )
+                        })?;
+                        group_exprs.push(ast::Expr::Id(ast::Name::exact(name)));
+                    }
+                }
+            }
+        }
+        let outputs = (0..group_exprs.len()).map(OutputColumn::Group).collect();
+        let count_star = ast::Expr::FunctionCallStar {
+            name: ast::Name::exact("count".to_string()),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        let mut aggregates = Vec::new();
+        resolve_window_and_aggregate_functions(
+            &count_star,
+            resolver,
+            &mut aggregates,
+            None,
+            &mut [],
+        )?;
+        return Ok(ViewShape::GroupAggregate {
+            group_exprs,
+            aggregates,
+            outputs,
+            having: None,
+            scalar: false,
+        });
     }
 
     // HAVING without GROUP BY parses as a GroupBy node with no expressions;
@@ -724,18 +800,26 @@ pub fn multiset_table_sql(multiset_table_name: &str, shape: &ViewShape) -> Resul
     ))
 }
 
-/// Validation of multiset-tracked arguments that needs the schema: the
-/// multiset index compares values with default (binary) collation, so
-/// MIN/MAX ordering and DISTINCT equality over arguments carrying a
-/// collation would be maintained under the wrong comparison. Must run at
+/// Validation of collation-sensitive terms that needs the schema. The
+/// internal state tables compare with default (binary) collation: the
+/// multiset index orders MIN/MAX and DISTINCT-aggregate values, and the
+/// state table's primary key groups the GROUP BY (or SELECT DISTINCT) keys.
+/// A term carrying a non-default collation would therefore be maintained
+/// under the wrong comparison — e.g. a NOCASE group key would split 'a' and
+/// 'A' into two groups while the defining query merges them. Must run at
 /// translate time — rejecting later, inside the CREATE program, corrupts
 /// the database (see validate_and_extract_columns).
-pub fn validate_multiset_args(
+pub fn validate_collation_constraints(
     select: &ast::Select,
     shape: &ViewShape,
     schema: &Schema,
 ) -> Result<()> {
-    let ViewShape::GroupAggregate { aggregates, .. } = shape else {
+    let ViewShape::GroupAggregate {
+        aggregates,
+        group_exprs,
+        ..
+    } = shape
+    else {
         return Ok(());
     };
     let ast::OneSelect::Select { from, .. } = &select.body.select else {
@@ -749,29 +833,36 @@ pub fn validate_multiset_args(
         return Ok(());
     };
 
-    for agg in aggregates {
-        if !uses_multiset(agg) {
-            continue;
-        }
-        let Some(arg) = agg.args.first() else {
-            continue;
-        };
-        // Explicit COLLATE anywhere in the argument.
-        walk_expr_with_subqueries(arg, &mut |e: &ast::Expr| {
+    let check_term = |term: &ast::Expr, what: &str| -> Result<()> {
+        // Explicit COLLATE anywhere in the term.
+        walk_expr_with_subqueries(term, &mut |e: &ast::Expr| {
             if matches!(e, ast::Expr::Collate(_, _)) {
-                return unsupported("MIN/MAX or DISTINCT aggregates over collated expressions");
+                return unsupported(&format!("{what} over collated expressions"));
             }
             Ok(WalkControl::Continue)
         })?;
         // A bare column reference with a declared collation.
-        if let ast::Expr::Id(name) = arg {
+        if let ast::Expr::Id(name) = term {
             let collated = base_table
                 .columns()
                 .iter()
                 .any(|c| c.name.as_deref() == Some(name.as_str()) && c.collation_opt().is_some());
             if collated {
-                return unsupported("MIN/MAX or DISTINCT aggregates over collated columns");
+                return unsupported(&format!("{what} over collated columns"));
             }
+        }
+        Ok(())
+    };
+
+    for group_expr in group_exprs {
+        check_term(group_expr, "GROUP BY or DISTINCT")?;
+    }
+    for agg in aggregates {
+        if !uses_multiset(agg) {
+            continue;
+        }
+        if let Some(arg) = agg.args.first() {
+            check_term(arg, "MIN/MAX or DISTINCT aggregates")?;
         }
     }
     Ok(())

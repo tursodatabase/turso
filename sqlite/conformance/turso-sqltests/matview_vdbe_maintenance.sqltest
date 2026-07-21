@@ -626,6 +626,44 @@ expect error {
     materialized views with aggregates over joins are not yet supported
 }
 
+# SELECT DISTINCT is maintained as GROUP BY over every result column: one
+# group per distinct output row, alive while any source row produces it.
+test matview-vdbe-select-distinct {
+    CREATE TABLE t33(a INTEGER, b TEXT);
+    INSERT INTO t33 VALUES (1, 'x'), (1, 'x'), (NULL, 'z'), (NULL, 'z');
+    CREATE MATERIALIZED VIEW v33 AS SELECT DISTINCT a, b FROM t33;
+    DELETE FROM t33 WHERE rowid = 1;
+    SELECT 'dup', COUNT(*) FROM v33;
+    DELETE FROM t33 WHERE rowid = 2;
+    SELECT 'last', a IS NULL, b FROM v33;
+    INSERT INTO t33 VALUES (2, 'y'), (2, 'y');
+    SELECT 'back', COUNT(*) FROM v33;
+}
+expect {
+    dup|2
+    last|1|z
+    back|2
+}
+
+# Internal state tables compare with binary collation, so grouping and
+# DISTINCT over collated keys would diverge from the defining query
+# (NOCASE merges 'a' and 'A'; a binary group key would not).
+test matview-vdbe-collated-group-key-rejected {
+    CREATE TABLE t34(g TEXT COLLATE NOCASE, x INTEGER);
+    CREATE MATERIALIZED VIEW bad34 AS SELECT g, COUNT(*) FROM t34 GROUP BY g;
+}
+expect error {
+    materialized views with GROUP BY or DISTINCT over collated columns are not yet supported
+}
+
+test matview-vdbe-distinct-over-aggregates-rejected {
+    CREATE TABLE t35(g TEXT, x INTEGER);
+    CREATE MATERIALIZED VIEW bad35 AS SELECT DISTINCT COUNT(*) FROM t35 GROUP BY g;
+}
+expect error {
+    materialized views with DISTINCT over aggregates are not yet supported
+}
+
 # Shapes the VDBE codegen cannot maintain yet are rejected at translate time,
 # before the CREATE program allocates any btree pages.
 test matview-vdbe-rejected-create-is-clean {
