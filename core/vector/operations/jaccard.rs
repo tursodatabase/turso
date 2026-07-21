@@ -202,26 +202,49 @@ mod tests {
         (d1.is_nan() && d2.is_nan()) || (d1 - d2).abs() < 1e-6
     }
 
-    // FIXME: flaky
-    // Float8 optimized Jaccard distance matches dequantized Float32 Jaccard distance.
-    // Tolerance is looser here because the Float8 path computes in f64 precision
-    // while the dequantized path accumulates in f32, causing precision differences
-    // that are amplified by Jaccard's min/max ratio when values are close to zero.
-    // #[quickcheck]
-    // fn prop_vector_distance_jaccard_f8_vs_dequantized(
-    //     v1: ArbitraryVector<100>,
-    //     v2: ArbitraryVector<100>,
-    // ) -> bool {
-    //     let v1 = vector_convert(v1.try_into().expect("generated vector must be valid"), VectorType::Float32Dense).unwrap();
-    //     let v2 = vector_convert(v2.try_into().expect("generated vector must be valid"), VectorType::Float32Dense).unwrap();
-    //     let v1_f8 = vector_convert(v1, VectorType::Float8).unwrap();
-    //     let v2_f8 = vector_convert(v2, VectorType::Float8).unwrap();
-    //     let d_f8 = vector_distance_jaccard(&v1_f8, &v2_f8).unwrap();
-    //     let v1_deq = vector_convert(v1_f8, VectorType::Float32Dense).unwrap();
-    //     let v2_deq = vector_convert(v2_f8, VectorType::Float32Dense).unwrap();
-    //     let d_deq = vector_distance_jaccard(&v1_deq, &v2_deq).unwrap();
-    //     (d_f8.is_nan() && d_deq.is_nan()) || (d_f8 - d_deq).abs() < 0.01
-    // }
+    /// min/max Jaccard is only well-defined for non-negative vectors: with
+    /// signed inputs, max_sum can cancel toward zero while min_sum stays large
+    /// and negative, making the "distance" blow up and the f64 (optimized f8)
+    /// and f32 (dequantized) paths diverge arbitrarily (observed: 20113747.77
+    /// vs NaN). Map inputs to the valid domain with `f32::abs`.
+    fn abs_dense_f32(v: &Vector) -> Vector<'static> {
+        let bytes: Vec<u8> = v
+            .as_f32_slice()
+            .iter()
+            .flat_map(|f| f.abs().to_le_bytes())
+            .collect();
+        Vector::from_data(VectorType::Float32Dense, Some(bytes), None)
+            .expect("f32 dense vector must be valid")
+    }
+
+    /// Float8 optimized Jaccard distance matches dequantized Float32 Jaccard distance.
+    /// Tolerance is looser here because the Float8 path computes in f64 precision
+    /// while the dequantized path accumulates in f32.
+    #[quickcheck]
+    fn prop_vector_distance_jaccard_f8_vs_dequantized(
+        v1: ArbitraryVector<100>,
+        v2: ArbitraryVector<100>,
+    ) -> bool {
+        let v1 = vector_convert(
+            v1.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
+        let v2 = vector_convert(
+            v2.try_into().expect("generated vector must be valid"),
+            VectorType::Float32Dense,
+        )
+        .unwrap();
+        let v1 = abs_dense_f32(&v1);
+        let v2 = abs_dense_f32(&v2);
+        let v1_f8 = vector_convert(v1, VectorType::Float8).unwrap();
+        let v2_f8 = vector_convert(v2, VectorType::Float8).unwrap();
+        let d_f8 = vector_distance_jaccard(&v1_f8, &v2_f8).unwrap();
+        let v1_deq = vector_convert(v1_f8, VectorType::Float32Dense).unwrap();
+        let v2_deq = vector_convert(v2_f8, VectorType::Float32Dense).unwrap();
+        let d_deq = vector_distance_jaccard(&v1_deq, &v2_deq).unwrap();
+        (d_f8.is_nan() && d_deq.is_nan()) || (d_f8 - d_deq).abs() < 0.01
+    }
 
     /// Float1Bit binary Jaccard matches manual computation from dequantized ±1 set bits.
     #[quickcheck]
