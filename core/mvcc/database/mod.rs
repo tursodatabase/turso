@@ -3452,12 +3452,7 @@ impl StateTransition for WriteRowStateMachine {
                 Ok(TransitionResult::Continue)
             }
             WriteRowState::Advance => {
-                match self
-                    .cursor
-                    .write()
-                    .next()
-                    .map_err(|e: LimboError| LimboError::InternalError(e.to_string()))?
-                {
+                match self.cursor.write().next()? {
                     IOResult::Done(_) => {}
                     IOResult::IO(io) => {
                         return Ok(TransitionResult::Io(io));
@@ -3477,12 +3472,7 @@ impl StateTransition for WriteRowStateMachine {
                     RowKey::Record(record) => BTreeKey::new_index_key(record.key.reborrow()),
                 };
 
-                match self
-                    .cursor
-                    .write()
-                    .insert(&key)
-                    .map_err(|e: LimboError| LimboError::InternalError(e.to_string()))?
-                {
+                match self.cursor.write().insert(&key)? {
                     IOResult::Done(()) => {}
                     IOResult::IO(io) => {
                         return Ok(TransitionResult::Io(io));
@@ -3492,12 +3482,7 @@ impl StateTransition for WriteRowStateMachine {
                 Ok(TransitionResult::Continue)
             }
             WriteRowState::Next => {
-                match self
-                    .cursor
-                    .write()
-                    .next()
-                    .map_err(|e: LimboError| LimboError::InternalError(e.to_string()))?
-                {
+                match self.cursor.write().next()? {
                     IOResult::Done(_) => {}
                     IOResult::IO(io) => {
                         return Ok(TransitionResult::Io(io));
@@ -3590,12 +3575,7 @@ impl StateTransition for DeleteRowStateMachine {
             DeleteRowState::Delete => {
                 // Insert the record into the B-tree
 
-                match self
-                    .cursor
-                    .write()
-                    .delete()
-                    .map_err(|e| LimboError::InternalError(e.to_string()))?
-                {
+                match self.cursor.write().delete()? {
                     IOResult::Done(()) => {}
                     IOResult::IO(io) => {
                         return Ok(TransitionResult::Io(io));
