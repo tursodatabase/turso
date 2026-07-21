@@ -220,6 +220,175 @@ expect {
     ok
 }
 
+# DISTINCT aggregates track value multiplicity through the multiset table:
+# retracting one duplicate leaves the accumulator untouched; retracting the
+# last occurrence inverts it.
+test matview-vdbe-distinct-maintenance {
+    CREATE TABLE t16(g TEXT, x INTEGER);
+    INSERT INTO t16 VALUES ('a', 10), ('a', 10), ('a', 20), ('b', 5);
+    CREATE MATERIALIZED VIEW v16 AS SELECT g, COUNT(DISTINCT x) AS cd, SUM(DISTINCT x) AS sd, AVG(DISTINCT x) AS ad FROM t16 GROUP BY g;
+    DELETE FROM t16 WHERE rowid = 1;
+    SELECT 'dup', * FROM v16 ORDER BY g;
+    DELETE FROM t16 WHERE rowid = 2;
+    SELECT 'last', * FROM v16 ORDER BY g;
+    INSERT INTO t16 VALUES ('a', 20), ('a', NULL);
+    SELECT 'back', * FROM v16 ORDER BY g;
+}
+expect {
+    dup|a|2|30|15.0
+    dup|b|1|5|5.0
+    last|a|1|20|20.0
+    last|b|1|5|5.0
+    back|a|1|20|20.0
+    back|b|1|5|5.0
+}
+
+# A group can enter (via population or maintenance) with a NULL argument as
+# its first row: the DISTINCT accumulator must still materialize, empty.
+test matview-vdbe-distinct-null-first-row {
+    CREATE TABLE t26(g TEXT, x INTEGER);
+    INSERT INTO t26 VALUES ('a', NULL);
+    CREATE MATERIALIZED VIEW v26 AS SELECT g, COUNT(*) AS cnt, COUNT(DISTINCT x) AS cd, SUM(DISTINCT x) AS sd FROM t26 GROUP BY g;
+    SELECT g, cnt, cd, sd IS NULL FROM v26;
+    INSERT INTO t26 VALUES ('b', NULL), ('a', 4);
+    SELECT g, cnt, cd, sd IS NULL FROM v26 ORDER BY g;
+}
+expect {
+    a|1|0|1
+    a|2|1|0
+    b|1|0|1
+}
+
+# MIN/MAX see each value once by definition; DISTINCT on them is accepted and
+# behaves identically to the plain form.
+test matview-vdbe-distinct-minmax {
+    CREATE TABLE t17(g TEXT, x INTEGER);
+    INSERT INTO t17 VALUES ('a', 3), ('a', 3), ('a', 9);
+    CREATE MATERIALIZED VIEW v17 AS SELECT g, MIN(DISTINCT x) AS mn, MAX(DISTINCT x) AS mx FROM t17 GROUP BY g;
+    DELETE FROM t17 WHERE x = 9;
+    SELECT * FROM v17;
+}
+expect {
+    a|3|3
+}
+
+# HAVING gates only the view row: groups flip in and out of the view as their
+# aggregates cross the predicate, while their state stays maintained.
+test matview-vdbe-having-appear-disappear {
+    CREATE TABLE t18(g TEXT, x INTEGER);
+    INSERT INTO t18 VALUES ('a', 1), ('b', 1), ('b', 2);
+    CREATE MATERIALIZED VIEW v18 AS SELECT g, SUM(x) AS sx FROM t18 GROUP BY g HAVING COUNT(*) > 1;
+    SELECT 'init', * FROM v18 ORDER BY g;
+    INSERT INTO t18 VALUES ('a', 5);
+    SELECT 'grew', * FROM v18 ORDER BY g;
+    DELETE FROM t18 WHERE g = 'b' AND x = 2;
+    SELECT 'shrunk', * FROM v18 ORDER BY g;
+    DELETE FROM t18 WHERE g = 'a';
+    SELECT COUNT(*) FROM v18;
+}
+expect {
+    init|b|3
+    grew|a|6
+    grew|b|3
+    shrunk|a|6
+    0
+}
+
+# Aggregates appearing only in HAVING are computed as hidden accumulators;
+# group expressions are also usable in the predicate.
+test matview-vdbe-having-hidden-aggregate {
+    CREATE TABLE t19(g INTEGER, x INTEGER);
+    INSERT INTO t19 VALUES (1, 10), (1, 20), (2, 100), (NULL, 100);
+    CREATE MATERIALIZED VIEW v19 AS SELECT g, COUNT(*) AS cnt FROM t19 GROUP BY g HAVING SUM(x) >= 30 AND g IS NOT NULL;
+    SELECT 'init', * FROM v19 ORDER BY g;
+    DELETE FROM t19 WHERE g = 1 AND x = 20;
+    INSERT INTO t19 VALUES (2, 1);
+    SELECT 'after', * FROM v19 ORDER BY g;
+}
+expect {
+    init|1|2
+    init|2|1
+    after|2|2
+}
+
+# A NULL HAVING result excludes the group, matching WHERE-style three-valued
+# logic: SUM(x) of all-NULL inputs is NULL, so the comparison is NULL.
+test matview-vdbe-having-null-excluded {
+    CREATE TABLE t20(g TEXT, x INTEGER);
+    INSERT INTO t20 VALUES ('a', NULL), ('b', 7);
+    CREATE MATERIALIZED VIEW v20 AS SELECT g FROM t20 GROUP BY g HAVING SUM(x) > 0;
+    SELECT * FROM v20;
+    UPDATE t20 SET x = 3 WHERE g = 'a';
+    SELECT * FROM v20 ORDER BY g;
+}
+expect {
+    b
+    a
+    b
+}
+
+# HAVING over a MIN/MAX extreme recomputes through the multiset on every
+# group touch, so retracting the extreme can suppress the row.
+test matview-vdbe-having-minmax {
+    CREATE TABLE t21(g TEXT, x INTEGER);
+    INSERT INTO t21 VALUES ('a', 20), ('a', 5), ('b', 5);
+    CREATE MATERIALIZED VIEW v21 AS SELECT g, COUNT(*) AS cnt FROM t21 GROUP BY g HAVING MAX(x) >= 20;
+    SELECT 'init', * FROM v21;
+    DELETE FROM t21 WHERE x = 20;
+    SELECT 'gone', COUNT(*) FROM v21;
+    INSERT INTO t21 VALUES ('b', 99);
+    SELECT 'b_in', * FROM v21;
+}
+expect {
+    init|a|2
+    gone|0
+    b_in|b|2
+}
+
+# DISTINCT aggregates inside HAVING share the multiset machinery.
+test matview-vdbe-having-distinct {
+    CREATE TABLE t22(g TEXT, x INTEGER);
+    INSERT INTO t22 VALUES ('a', 1), ('a', 1), ('b', 1), ('b', 2);
+    CREATE MATERIALIZED VIEW v22 AS SELECT g, SUM(x) AS sx FROM t22 GROUP BY g HAVING COUNT(DISTINCT x) > 1;
+    SELECT 'init', * FROM v22;
+    INSERT INTO t22 VALUES ('a', 2);
+    SELECT 'grew', * FROM v22 ORDER BY g;
+}
+expect {
+    init|b|3
+    grew|a|4
+    grew|b|3
+}
+
+# HAVING and DISTINCT views serve same-transaction reads by recomputation.
+test matview-vdbe-having-read-your-own-writes {
+    CREATE TABLE t23(g TEXT, x INTEGER);
+    INSERT INTO t23 VALUES ('a', 1), ('a', 2);
+    CREATE MATERIALIZED VIEW v23 AS SELECT g, COUNT(DISTINCT x) AS cd FROM t23 GROUP BY g HAVING COUNT(*) > 1;
+    BEGIN;
+    INSERT INTO t23 VALUES ('b', 5), ('b', 5);
+    DELETE FROM t23 WHERE g = 'a' AND x = 2;
+    SELECT * FROM v23 ORDER BY g;
+    ROLLBACK;
+    SELECT * FROM v23 ORDER BY g;
+}
+expect {
+    b|1
+    a|2
+}
+
+# Dropping a DISTINCT-aggregate view cleans up its multiset table and index.
+test matview-vdbe-distinct-drop-clean {
+    CREATE TABLE t24(g TEXT, x INTEGER);
+    INSERT INTO t24 VALUES ('a', 1), ('a', 1);
+    CREATE MATERIALIZED VIEW v24 AS SELECT g, COUNT(DISTINCT x) AS cd FROM t24 GROUP BY g;
+    DROP VIEW v24;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
 # Shapes the VDBE codegen cannot maintain yet are rejected at translate time,
 # before the CREATE program allocates any btree pages.
 test matview-vdbe-rejected-create-is-clean {
@@ -229,6 +398,16 @@ test matview-vdbe-rejected-create-is-clean {
 }
 expect error {
     materialized views with the group_concat aggregate are not yet supported
+}
+
+# Bare columns in HAVING use SQLite's arbitrary-row semantics, which cannot
+# be maintained incrementally.
+test matview-vdbe-having-bare-column-rejected {
+    CREATE TABLE t25(g TEXT, x INTEGER);
+    CREATE MATERIALIZED VIEW bad25 AS SELECT g, COUNT(*) FROM t25 GROUP BY g HAVING x > 1;
+}
+expect error {
+    materialized views with HAVING referencing columns outside GROUP BY are not yet supported
 }
 
 # Post-error state assertions (aborted statements must not leak captured
