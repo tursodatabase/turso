@@ -323,6 +323,65 @@ fn check_having_scalar_context(
     })
 }
 
+/// Resolve one GROUP BY term the way the planner does before classification
+/// compares it against result columns: an integer literal is a 1-based
+/// result-column reference, and an identifier that does not name a base-table
+/// column resolves to a result-column alias (canonical columns take
+/// precedence, mirroring `BindingBehavior::TryCanonicalColumnsFirst`).
+fn resolve_group_by_term(
+    term: &ast::Expr,
+    columns: &[ast::ResultColumn],
+    base_table: Option<&Arc<BTreeTable>>,
+) -> Result<ast::Expr> {
+    let column_expr = |idx: usize| -> Result<ast::Expr> {
+        match &columns[idx] {
+            ast::ResultColumn::Expr(expr, _) => Ok(expr.as_ref().clone()),
+            ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => {
+                unsupported("star projections combined with GROUP BY")
+            }
+        }
+    };
+    match term {
+        ast::Expr::Literal(ast::Literal::Numeric(num)) => {
+            if let Ok(column_number) = num.parse::<usize>() {
+                if column_number == 0 || column_number > columns.len() {
+                    return Err(LimboError::ParseError(format!(
+                        "1st GROUP BY term out of range - should be between 1 and {}",
+                        columns.len()
+                    )));
+                }
+                return column_expr(column_number - 1);
+            }
+            Ok(term.clone())
+        }
+        ast::Expr::Id(name) => {
+            let target = crate::util::normalize_ident(name.as_str());
+            let is_base_column = base_table.is_some_and(|table| {
+                table.columns().iter().any(|c| {
+                    c.name
+                        .as_deref()
+                        .is_some_and(|n| crate::util::normalize_ident(n) == target)
+                })
+            });
+            if !is_base_column {
+                for (idx, column) in columns.iter().enumerate() {
+                    if let ast::ResultColumn::Expr(
+                        _,
+                        Some(ast::As::As(alias) | ast::As::Elided(alias)),
+                    ) = column
+                    {
+                        if crate::util::normalize_ident(alias.as_str()) == target {
+                            return column_expr(idx);
+                        }
+                    }
+                }
+            }
+            Ok(term.clone())
+        }
+        _ => Ok(term.clone()),
+    }
+}
+
 /// Classify a view definition into its maintainable shape.
 ///
 /// This is the CREATE MATERIALIZED VIEW gate: shapes outside the supported
@@ -332,7 +391,11 @@ fn check_having_scalar_context(
 /// Aggregate recognition uses the planner's collector so it cannot drift
 /// from what a regular GROUP BY query would compute; the `resolver` is what
 /// the collector needs to resolve (and here, reject) extension functions.
-pub fn classify_view(select: &ast::Select, resolver: &Resolver) -> Result<ViewShape> {
+pub fn classify_view(
+    select: &ast::Select,
+    schema: &Schema,
+    resolver: &Resolver,
+) -> Result<ViewShape> {
     if select.with.is_some() {
         return unsupported("WITH clauses");
     }
@@ -425,10 +488,18 @@ pub fn classify_view(select: &ast::Select, resolver: &Resolver) -> Result<ViewSh
     // HAVING without GROUP BY parses as a GroupBy node with no expressions;
     // it makes the query an aggregate query just like an aggregate call does.
     let (raw_group_exprs, having_clause): (Vec<ast::Expr>, Option<&ast::Expr>) = match group_by {
-        Some(group_by) => (
-            group_by.exprs.iter().map(|e| e.as_ref().clone()).collect(),
-            group_by.having.as_deref(),
-        ),
+        Some(group_by) => {
+            let base_table = match from.select.as_ref() {
+                ast::SelectTable::Table(name, _, _) => schema.get_btree_table(name.name.as_str()),
+                _ => None,
+            };
+            let exprs = group_by
+                .exprs
+                .iter()
+                .map(|e| resolve_group_by_term(e, columns, base_table.as_ref()))
+                .collect::<Result<Vec<_>>>()?;
+            (exprs, group_by.having.as_deref())
+        }
         None => (Vec::new(), None),
     };
 
@@ -554,7 +625,7 @@ pub fn classify_view_for_connection(
         connection.get_dqs_dml().into(),
         Arc::new(crate::dialect::SqliteDialect),
     );
-    classify_view(select, &resolver)
+    classify_view(select, schema, &resolver)
 }
 
 /// Whether the view keeps a hidden internal state table.
