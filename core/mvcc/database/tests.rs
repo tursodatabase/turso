@@ -5558,6 +5558,7 @@ fn test_future_row() {
 use crate::mvcc::cursor::MvccLazyCursor;
 use crate::mvcc::database::CommitYieldPoint::LogRecordPrepared;
 use crate::mvcc::database::{MvStore, Row, RowID};
+use crate::schema::IndexColumn;
 use crate::types::Text;
 use crate::Value;
 use crate::{Database, StepResult};
@@ -8646,14 +8647,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         name: "testindex".to_string(),
         table_name: "test".to_string(),
         root_page: 0,
-        columns: crate::alloc::vec![crate::schema::IndexColumn {
-            name: "id".to_string(),
-            order: turso_parser::ast::SortOrder::Asc,
-            pos_in_table: 0,
-            collation: None,
-            default: None,
-            expr: None,
-        }],
+        columns: IndexColumn::new_many(vec!["id"]).collect::<Vec<_>>(),
         unique: true,
         ephemeral: false,
         has_rowid: true,

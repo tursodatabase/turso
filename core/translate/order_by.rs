@@ -232,14 +232,7 @@ impl EmitOrderBy {
             })?;
             for _ in remappings.iter().filter(|r| !r.deduplicated) {
                 let pos_in_table = index_columns.len();
-                index_columns.try_push(IndexColumn {
-                    name: pos_in_table.to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                })?;
+                index_columns.try_push(IndexColumn::new(pos_in_table.to_string(), pos_in_table))?;
             }
             let index = Arc::new(Index {
                 name: index_name,

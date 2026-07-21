@@ -552,16 +552,13 @@ fn create_dedupe_index(
         .result_columns
         .iter()
         .enumerate()
-        .map(|(i, c)| IndexColumn {
-            name: c
-                .name(&right_select.table_references)
-                .map(|n| n.to_string())
-                .unwrap_or_default(),
-            order: SortOrder::Asc,
-            pos_in_table: i,
-            default: None,
-            collation: None,
-            expr: None,
+        .map(|(i, c)| {
+            IndexColumn::new(
+                c.name(&right_select.table_references)
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+                i,
+            )
         })
         .try_collect::<crate::alloc::Vec<_>>()?;
     for (i, column) in dedupe_columns.iter_mut().enumerate() {
