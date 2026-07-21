@@ -389,6 +389,99 @@ expect {
     ok
 }
 
+# Scalar aggregates (no GROUP BY) keep exactly one row that exists even over
+# an empty table, matching batch semantics: COUNT 0, other aggregates NULL.
+# Retracting every row returns to that state instead of deleting the row.
+test matview-vdbe-scalar-aggregate-maintenance {
+    CREATE TABLE t27(x INTEGER);
+    CREATE MATERIALIZED VIEW v27 AS SELECT COUNT(*) AS c, SUM(x) AS s, AVG(x) AS a, MIN(x) AS mn, MAX(x) AS mx FROM t27;
+    SELECT c, s IS NULL, a IS NULL, mn IS NULL, mx IS NULL FROM v27;
+    INSERT INTO t27 VALUES (5), (10), (NULL);
+    SELECT c, s, typeof(s), a, mn, mx FROM v27;
+    DELETE FROM t27;
+    SELECT c, s IS NULL, a IS NULL, mn IS NULL, mx IS NULL FROM v27;
+}
+expect {
+    0|1|1|1|1
+    3|15|integer|7.5|5|10
+    0|1|1|1|1
+}
+
+# The single row also exists when WHERE filters out every scanned row.
+test matview-vdbe-scalar-aggregate-where-filters-all {
+    CREATE TABLE t28(x INTEGER);
+    INSERT INTO t28 VALUES (1), (2);
+    CREATE MATERIALIZED VIEW v28 AS SELECT COUNT(*) AS c, SUM(x) AS s FROM t28 WHERE x > 100;
+    SELECT c, s IS NULL FROM v28;
+    INSERT INTO t28 VALUES (200), (300);
+    DELETE FROM t28 WHERE x = 300;
+    SELECT * FROM v28;
+}
+expect {
+    0|1
+    1|200
+}
+
+# Scalar DISTINCT aggregates share the multiset machinery.
+test matview-vdbe-scalar-distinct {
+    CREATE TABLE t29(y TEXT);
+    INSERT INTO t29 VALUES ('a'), ('a'), ('b');
+    CREATE MATERIALIZED VIEW v29 AS SELECT COUNT(DISTINCT y) AS cd FROM t29;
+    DELETE FROM t29 WHERE rowid = 1;
+    SELECT * FROM v29;
+    DELETE FROM t29 WHERE rowid = 2;
+    SELECT * FROM v29;
+}
+expect {
+    2
+    1
+}
+
+# HAVING without GROUP BY gates the single row: over an empty table the
+# predicate sees empty-input aggregates and typically suppresses it.
+test matview-vdbe-scalar-having {
+    CREATE TABLE t30(x INTEGER);
+    CREATE MATERIALIZED VIEW v30 AS SELECT COUNT(*) AS c, MAX(x) AS mx FROM t30 HAVING COUNT(*) > 1;
+    SELECT COUNT(*) FROM v30;
+    INSERT INTO t30 VALUES (1), (2);
+    SELECT * FROM v30;
+    DELETE FROM t30 WHERE x = 2;
+    SELECT COUNT(*) FROM v30;
+}
+expect {
+    0
+    2|2
+    0
+}
+
+# Constant result columns alongside scalar aggregates.
+test matview-vdbe-scalar-constant-column {
+    CREATE TABLE t31(x INTEGER);
+    INSERT INTO t31 VALUES (7);
+    CREATE MATERIALIZED VIEW v31 AS SELECT 0, COUNT(*) AS c FROM t31;
+    INSERT INTO t31 VALUES (8);
+    SELECT * FROM v31;
+}
+expect {
+    0|2
+}
+
+# Scalar views serve same-transaction reads by recomputation.
+test matview-vdbe-scalar-read-your-own-writes {
+    CREATE TABLE t32(x INTEGER);
+    INSERT INTO t32 VALUES (1);
+    CREATE MATERIALIZED VIEW v32 AS SELECT COUNT(*) AS c, SUM(x) AS s FROM t32;
+    BEGIN;
+    INSERT INTO t32 VALUES (10);
+    SELECT * FROM v32;
+    ROLLBACK;
+    SELECT * FROM v32;
+}
+expect {
+    2|11
+    1|1
+}
+
 # Shapes the VDBE codegen cannot maintain yet are rejected at translate time,
 # before the CREATE program allocates any btree pages.
 test matview-vdbe-rejected-create-is-clean {

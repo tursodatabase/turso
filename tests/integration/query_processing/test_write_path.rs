@@ -1876,7 +1876,7 @@ fn test_matview_rejected_create_leaves_database_intact(tmp_db: TempDatabase) -> 
 
     // Rejected by the VDBE maintenance gate.
     assert!(conn
-        .execute("CREATE MATERIALIZED VIEW bad1 AS SELECT count(*) FROM t")
+        .execute("CREATE MATERIALIZED VIEW bad1 AS SELECT group_concat(a) FROM t GROUP BY b")
         .is_err());
 
     conn.execute("CREATE MATERIALIZED VIEW v AS SELECT a, b FROM t")?;
