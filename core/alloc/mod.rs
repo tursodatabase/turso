@@ -14,7 +14,7 @@ mod collections;
 
 pub use allocation_site::{
     current_allocation_site, enter_allocation_site, AllocationSite, AllocationSiteGuard,
-    MvStoreAllocationSite, MvccCheckpointAllocationSite, SchemaAllocationSite,
+    BTreeAllocationSite, MvStoreAllocationSite, MvccCheckpointAllocationSite, SchemaAllocationSite,
     ValueBlobAllocationSite, VectorAllocationSite,
 };
 /// The underlying allocator trait: `allocator_api2::alloc::Allocator` on
