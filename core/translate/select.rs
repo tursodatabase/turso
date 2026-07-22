@@ -863,33 +863,27 @@ fn validate_expr_correct_column_counts(plan: &SelectPlan) -> Result<()> {
     for result_column in plan.result_columns.iter() {
         let vec_size = expr_vector_size(&result_column.expr)?;
         if vec_size != 1 {
-            crate::bail_parse_error!("result column must return 1 value, got {}", vec_size);
+            crate::bail_parse_error!("row value misused");
         }
     }
     for (expr, _, _) in plan.order_by.iter() {
         let vec_size = expr_vector_size(expr)?;
         if vec_size != 1 {
-            crate::bail_parse_error!("order by expression must return 1 value, got {}", vec_size);
+            crate::bail_parse_error!("row value misused");
         }
     }
     if let Some(group_by) = &plan.group_by {
         for expr in group_by.exprs.iter() {
             let vec_size = expr_vector_size(expr)?;
             if vec_size != 1 {
-                crate::bail_parse_error!(
-                    "group by expression must return 1 value, got {}",
-                    vec_size
-                );
+                crate::bail_parse_error!("row value misused");
             }
         }
         if let Some(having) = &group_by.having {
             for expr in having.iter() {
                 let vec_size = expr_vector_size(expr)?;
                 if vec_size != 1 {
-                    crate::bail_parse_error!(
-                        "having expression must return 1 value, got {}",
-                        vec_size
-                    );
+                    crate::bail_parse_error!("row value misused");
                 }
             }
         }
@@ -898,40 +892,34 @@ fn validate_expr_correct_column_counts(plan: &SelectPlan) -> Result<()> {
         for arg in aggregate.args.iter() {
             let vec_size = expr_vector_size(arg)?;
             if vec_size != 1 {
-                crate::bail_parse_error!(
-                    "aggregate argument must return 1 value, got {}",
-                    vec_size
-                );
+                crate::bail_parse_error!("row value misused");
             }
         }
     }
     for term in plan.where_clause.iter() {
         let vec_size = expr_vector_size(&term.expr)?;
         if vec_size != 1 {
-            crate::bail_parse_error!(
-                "where clause expression must return 1 value, got {}",
-                vec_size
-            );
+            crate::bail_parse_error!("row value misused");
         }
     }
     for expr in plan.values.iter() {
         for value in expr.iter() {
             let vec_size = expr_vector_size(value)?;
             if vec_size != 1 {
-                crate::bail_parse_error!("value must return 1 value, got {}", vec_size);
+                crate::bail_parse_error!("row value misused");
             }
         }
     }
     if let Some(limit) = &plan.limit {
         let vec_size = expr_vector_size(limit)?;
         if vec_size != 1 {
-            crate::bail_parse_error!("limit expression must return 1 value, got {}", vec_size);
+            crate::bail_parse_error!("row value misused");
         }
     }
     if let Some(offset) = &plan.offset {
         let vec_size = expr_vector_size(offset)?;
         if vec_size != 1 {
-            crate::bail_parse_error!("offset expression must return 1 value, got {}", vec_size);
+            crate::bail_parse_error!("row value misused");
         }
     }
     Ok(())
