@@ -14,7 +14,9 @@ use crate::numeric::Numeric;
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::CursorTrait;
-use crate::storage::sqlite3_ondisk::{read_integer, read_value, read_varint, write_varint};
+use crate::storage::sqlite3_ondisk::{
+    read_integer, read_value, read_varint, varint_len, write_varint,
+};
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
@@ -338,6 +340,56 @@ pub enum Value {
     Numeric(Numeric),
     Text(Text),
     Blob(#[cfg_attr(feature = "serde", serde(with = "value_blob_serde"))] ValueBlob),
+}
+
+impl Value {
+    /// Fallibly copies `source` into `self`, reusing the existing Text/Blob
+    /// allocation when the variants match, so hot per-row copies are
+    /// allocation-free once buffers have grown to the row size. On allocation
+    /// failure `self` is left valid but unspecified (an empty Text/Blob).
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
+    pub fn try_clone_from(&mut self, source: &Self) -> std::result::Result<(), TryReserveError> {
+        match (self, source) {
+            (Self::Text(dst), Self::Text(src)) => {
+                let src_str = src.as_str();
+                match &mut dst.value {
+                    Cow::Owned(s) => {
+                        s.clear();
+                        s.try_reserve(src_str.len())?;
+                        s.push_str(src_str);
+                    }
+                    borrowed => {
+                        let mut s = String::new();
+                        s.try_reserve(src_str.len())?;
+                        s.push_str(src_str);
+                        *borrowed = Cow::Owned(s);
+                    }
+                }
+                dst.subtype = src.subtype;
+            }
+            (Self::Blob(dst), Self::Blob(src)) => {
+                dst.clear();
+                dst.try_reserve(src.len())?;
+                dst.extend_from_slice(src);
+            }
+            (dst, src) => {
+                *dst = match src {
+                    Self::Text(t) => {
+                        let mut s = String::new();
+                        s.try_reserve(t.as_str().len())?;
+                        s.push_str(t.as_str());
+                        Self::Text(Text {
+                            value: Cow::Owned(s),
+                            subtype: t.subtype,
+                        })
+                    }
+                    Self::Blob(b) => Self::from_slice(b)?,
+                    other => other.clone(),
+                };
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -807,6 +859,25 @@ pub enum AggContext {
 }
 
 impl AggContext {
+    /// Fallible clone: the builtin payload's Vec and each contained Text/Blob
+    /// go through fallible reservation. External state holds only FFI
+    /// pointers and copies without allocating.
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
+    pub fn try_clone(&self) -> Result<Self> {
+        match self {
+            Self::Builtin(payload) => {
+                let mut values = Vec::try_with_capacity_ext(payload.len())?;
+                for value in payload {
+                    let mut copy = Value::Null;
+                    copy.try_clone_from(value)?;
+                    values.push(copy);
+                }
+                Ok(Self::Builtin(values))
+            }
+            Self::External(_) => Ok(self.clone()),
+        }
+    }
+
     pub fn compute_external(&self) -> Result<Value> {
         if let Self::External(ext_state) = self {
             let mut final_value =
@@ -1508,12 +1579,51 @@ mod immutable_record {
         }
     }
 
+    /// A spent record buffer, obtained by retiring a record ([ImmutableRecord::retire],
+    /// [Register::take_buf]). Hot-path record construction requires one, so per-row
+    /// callers either recycle a previous record's allocation or go through the single
+    /// explicit entry point, [RecordBuf::alloc]. The wrapped buffer is always empty;
+    /// only its capacity carries over.
+    #[must_use = "dropping a RecordBuf discards a reusable allocation"]
+    pub struct RecordBuf(ValueBlob);
+
+    impl RecordBuf {
+        pub fn alloc() -> Self {
+            Self(crate::alloc::vec![])
+        }
+    }
+
     impl ImmutableRecord {
         pub fn new(payload_capacity: usize) -> Result<Self> {
             let mut payload = crate::alloc::vec![];
             payload.try_reserve_exact(payload_capacity)?;
             Ok(Self {
                 payload: Value::Blob(payload),
+            })
+        }
+
+        /// Consumes the record, keeping its allocation for reuse.
+        pub fn retire(self) -> RecordBuf {
+            let mut buf = self.into_payload();
+            buf.clear();
+            RecordBuf(buf)
+        }
+
+        /// An invalidated record backed by `buf`'s allocation.
+        pub fn from_buf(buf: RecordBuf) -> Self {
+            Self {
+                payload: Value::Blob(buf.0),
+            }
+        }
+
+        /// A record holding a copy of `payload`, serialized into `buf`.
+        #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordCopy)]
+        pub fn copy_payload(payload: &[u8], buf: RecordBuf) -> Result<Self> {
+            let RecordBuf(mut buf) = buf;
+            buf.try_reserve(payload.len())?;
+            buf.extend_from_slice(payload);
+            Ok(Self {
+                payload: Value::Blob(buf),
             })
         }
 
@@ -1538,42 +1648,62 @@ mod immutable_record {
             Self::from_values(registers.into_iter().map(|x| x.get_value()), len)
         }
 
+        /// Like [Self::from_registers], but serializes into `buf`; see [Self::build].
+        pub fn build_from_registers<'a, I: Iterator<Item = &'a Register> + Clone>(
+            registers: impl IntoIterator<Item = &'a Register, IntoIter = I>,
+            buf: RecordBuf,
+        ) -> Result<Self> {
+            Self::build(registers.into_iter().map(|x| x.get_value()), buf)
+        }
+
         pub fn from_values<'a>(
             values: impl IntoIterator<Item = impl AsValueRef + 'a> + Clone,
-            len: usize,
+            _len: usize,
         ) -> Result<Self> {
-            let mut serials = Vec::try_with_capacity_ext(len)?;
+            Self::build(values, RecordBuf::alloc())
+        }
+
+        /// Serializes `values` into `buf`, allocating only when the buffer's
+        /// capacity is insufficient. Per-row callers recycle the destination
+        /// register's previous record buffer, making steady-state record
+        /// construction allocation-free.
+        #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordBuild)]
+        pub fn build<'a>(
+            values: impl IntoIterator<Item = impl AsValueRef + 'a> + Clone,
+            buf: RecordBuf,
+        ) -> Result<Self> {
+            let RecordBuf(mut buf) = buf;
             let mut size_header = 0;
             let mut size_values = 0;
 
             let mut serial_type_buf = [0; 9];
-            // write serial types
+            // Sizing pass: the cloneable iterator is re-walked below to write
+            // the serial types, so no scratch buffer is needed.
             for value in values.clone() {
                 let serial_type = SerialType::from(value.as_value_ref());
-                let n = write_varint(&mut serial_type_buf[0..], serial_type.into());
-                serials.push((serial_type_buf, n));
-
-                let value_size = serial_type.size();
-
-                size_header += n;
-                size_values += value_size;
+                size_header += varint_len(serial_type.into());
+                size_values += serial_type.size();
             }
 
             let header_size = Record::calc_header_size(size_header);
 
             // 1. write header size
-            let mut buf = crate::alloc::vec![];
-            buf.try_reserve_exact(header_size + size_values)?;
-            assert_eq!(buf.capacity(), header_size + size_values);
+            let total_size = header_size + size_values;
+            if buf.capacity() < total_size {
+                // Relative to the empty buffer, so a no-op when capacity suffices.
+                buf.try_reserve_exact(total_size)?;
+            }
             let n = write_varint(&mut serial_type_buf, header_size as u64);
 
-            buf.resize(buf.capacity(), 0);
+            buf.resize(total_size, 0);
             let mut writer = AppendWriter::new(&mut buf, 0);
             writer.extend_from_slice(&serial_type_buf[..n]);
 
-            // 2. Write serial
-            for (value, n) in serials {
-                writer.extend_from_slice(&value[..n]);
+            // 2. Write serial types
+            for value in values.clone() {
+                let serial_type = SerialType::from(value.as_value_ref());
+                let n = write_varint(&mut serial_type_buf[0..], serial_type.into());
+                writer.extend_from_slice(&serial_type_buf[..n]);
             }
 
             // write content
@@ -1651,6 +1781,7 @@ mod immutable_record {
         }
 
         #[inline]
+        #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordCopy)]
         pub fn start_serialization(&mut self, payload: &[u8]) -> Result<()> {
             let blob = self.as_blob_mut();
             blob.try_reserve(payload.len())?;
@@ -1717,7 +1848,7 @@ mod immutable_record {
     }
 }
 
-pub use immutable_record::{ImmutableRecord, ImmutableRecordRef};
+pub use immutable_record::{ImmutableRecord, ImmutableRecordRef, RecordBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Record {
@@ -4503,5 +4634,96 @@ mod tests {
                 "column_count should be {num_values}, not {cnt}"
             );
         }
+    }
+
+    #[test]
+    fn test_value_try_clone_from_reuses_allocations() {
+        // Text into Text: an owned destination String buffer is reused.
+        let src = Value::build_text(String::from("short"));
+        let mut dst =
+            Value::build_text(String::from("a destination string with plenty of capacity"));
+        let ptr = match &dst {
+            Value::Text(t) => t.as_str().as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Value::Text(t) => assert_eq!(t.as_str().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        // A borrowed Text destination becomes owned.
+        let mut dst = Value::build_text("static text");
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+
+        // Blob into Blob: the destination Vec buffer is reused.
+        let src = Value::Blob(vec![1, 2, 3]);
+        let mut big_blob: ValueBlob = vec![];
+        big_blob.extend(0u8..32);
+        let mut dst = Value::Blob(big_blob);
+        let ptr = match &dst {
+            Value::Blob(b) => b.as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Value::Blob(b) => assert_eq!(b.as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        // Mismatched variants replace the destination.
+        let src = Value::from_i64(9);
+        let mut dst = Value::build_text("text");
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        let src = Value::build_text("into an integer slot");
+        let mut dst = Value::from_i64(3);
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn test_build_reuses_retired_buffer_and_matches_from_values() {
+        let mut blob: ValueBlob = vec![];
+        blob.extend(0u8..64);
+        let big = vec![
+            Value::build_text("a longer text value that forces a real allocation"),
+            Value::Blob(blob),
+            Value::from_i64(42),
+        ];
+        let small = vec![Value::from_i64(1), Value::Null];
+
+        let expected_big = ImmutableRecord::from_values(&big, big.len()).unwrap();
+        let expected_small = ImmutableRecord::from_values(&small, small.len()).unwrap();
+
+        let record = ImmutableRecord::build(&big, RecordBuf::alloc()).unwrap();
+        assert_eq!(record.get_payload(), expected_big.get_payload());
+
+        // A retired buffer with sufficient capacity is reused without reallocating.
+        let capacity = record.as_blob().capacity();
+        let ptr = record.get_payload().as_ptr();
+        let record = ImmutableRecord::build(&small, record.retire()).unwrap();
+        assert_eq!(record.get_payload(), expected_small.get_payload());
+        assert_eq!(record.as_blob().capacity(), capacity);
+        assert_eq!(record.get_payload().as_ptr(), ptr);
+
+        // Growing past the recycled capacity still serializes correctly.
+        let record = ImmutableRecord::build(&big, expected_small.retire()).unwrap();
+        assert_eq!(record.get_payload(), expected_big.get_payload());
+    }
+
+    #[test]
+    fn test_copy_payload_reuses_buffer() {
+        let values = vec![Value::build_text("payload to copy"), Value::from_i64(7)];
+        let source = ImmutableRecord::from_values(&values, values.len()).unwrap();
+        let spare = ImmutableRecord::from_values(&values, values.len()).unwrap();
+
+        let ptr = spare.get_payload().as_ptr();
+        let copy = ImmutableRecord::copy_payload(source.get_payload(), spare.retire()).unwrap();
+        assert_eq!(copy.get_payload(), source.get_payload());
+        assert_eq!(copy.get_payload().as_ptr(), ptr);
     }
 }

@@ -451,10 +451,12 @@ fn emit_refill_index(
             order_collations_nulls,
             comparators: crate::alloc::vec![],
         });
-        let content_reg = program.alloc_register();
+        // SorterData moves each sorted record into the pseudo cursor's
+        // content register; the two must name the same register.
+        let sorted_record_reg = program.alloc_register();
         program.emit_insn(Insn::OpenPseudo {
             cursor_id: pseudo_cursor_id,
-            content_reg,
+            content_reg: sorted_record_reg,
             num_fields: columns.len() + 1,
         });
 
@@ -550,8 +552,6 @@ fn emit_refill_index(
             cursor_id: sorter_cursor_id,
             pc_if_empty: sorted_loop_end,
         });
-
-        let sorted_record_reg = program.alloc_register();
 
         if idx.unique {
             let goto_label = program.allocate_label();
