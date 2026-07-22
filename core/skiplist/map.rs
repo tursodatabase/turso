@@ -30,6 +30,13 @@ pub struct SkipMap<K, V, C = BasicComparator, A: SkiplistAllocator = TursoAlloca
     inner: base::SkipList<K, V, C, A>,
 }
 
+/// A preallocated node reservation for [`SkipMap::insert_reserved`].
+///
+/// Dropping the reservation without inserting deallocates the reserved node.
+pub struct InsertReservation<K, V, C = BasicComparator, A: SkiplistAllocator = TursoAllocator> {
+    inner: base::InsertReservation<K, V, C, A>,
+}
+
 impl<K, V> SkipMap<K, V> {
     /// Returns a new, empty map with the default comparator.
     ///
@@ -518,6 +525,31 @@ where
     pub fn try_insert(&self, key: K, value: V) -> Result<Entry<'_, K, V, C, A>, TryReserveError> {
         let guard = &epoch::pin();
         self.inner.try_insert(key, value, guard).map(Entry::new)
+    }
+
+    /// Preallocates the node needed by a future [`insert_reserved`](Self::insert_reserved).
+    ///
+    /// Dropping the reservation without inserting deallocates the reserved node.
+    pub fn try_reserve_insert(&self) -> Result<InsertReservation<K, V, C, A>, TryReserveError> {
+        let inner = self.inner.try_reserve_insert()?;
+        Ok(InsertReservation { inner })
+    }
+
+    /// Inserts a `key`-`value` pair using a preallocated reservation.
+    ///
+    /// This operation performs no node allocation. The reservation must have
+    /// been created by this exact map.
+    pub fn insert_reserved(
+        &self,
+        reservation: InsertReservation<K, V, C, A>,
+        key: K,
+        value: V,
+    ) -> Entry<'_, K, V, C, A> {
+        let guard = &epoch::pin();
+        Entry::new(
+            self.inner
+                .insert_reserved(reservation.inner, key, value, guard),
+        )
     }
 
     /// Inserts a `key`-`value` pair into the skip list and returns the new entry.
