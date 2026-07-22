@@ -2756,13 +2756,35 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     }
 
     pub async fn checkpoint<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
+        let main_conn = connect_untracked(&self.main_tape)?;
+        if self.meta().logical_mvcc_pull_active && main_conn.mvcc_enabled() {
+            let main_wal_state = main_conn.wal_state()?;
+            let result = main_conn.checkpoint(turso_core::CheckpointMode::Truncate {
+                upper_bound_inclusive: Some(main_wal_state.max_frame),
+            })?;
+            tracing::info!(
+                "checkpoint(path={:?}): logical MVCC TRUNCATE checkpoint result: {:?}",
+                self.main_db_path,
+                result
+            );
+            if !result.everything_backfilled() {
+                return Err(LimboError::Busy.into());
+            }
+            self.update_meta(coro, |meta| {
+                meta.revert_since_wal_salt = None;
+                meta.revert_since_wal_watermark = 0;
+            })
+            .await?;
+            publish_schema_after_sync_checkpoint(&main_conn)?;
+            return Ok(());
+        }
+
         let (main_wal_salt, watermark) = self.checkpoint_passive(coro).await?;
 
         tracing::info!(
             "checkpoint(path={:?}): passive checkpoint is done",
             self.main_db_path
         );
-        let main_conn = connect_untracked(&self.main_tape)?;
         let revert_conn = self.open_revert_db_conn(coro).await?;
 
         let mut page = [0u8; PAGE_SIZE];
@@ -3793,30 +3815,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 use_pushed_change_hint_for_local_replay(stream_kind, raw_page_replay_on_sql_conn);
 
             // Phase 4: as now DB has all data from remote - let's read pull generation and last change id for current client
-            let (remote_pull_gen, remote_last_change_id) = if replace_base_pages {
-                tracing::info!(
-                    "apply_changes(path={}): using local acknowledged high-water mark for replace-base replay floor: pull_gen={} change_id={:?}",
-                    self.main_db_path,
-                    local_pull_gen,
-                    local_last_change_id,
-                );
-                (
-                    local_pull_gen,
-                    if no_checkpoint_replace_base {
-                        None
-                    } else {
-                        local_last_change_id
-                    },
-                )
-            } else {
+            let (remote_pull_gen, remote_last_change_id) =
                 read_last_change_id(coro, phase_conn, &self.client_unique_id)
                     .await
                     .map_err(|error| {
                         Error::DatabaseSyncEngineError(format!(
                             "failed to read last_change_id after remote apply: {error}",
                         ))
-                    })?
-            };
+                    })?;
 
             if remote_pull_gen > local_pull_gen {
                 return Err(Error::DatabaseSyncEngineError(format!(
