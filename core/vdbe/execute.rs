@@ -991,39 +991,37 @@ pub fn op_comparison(
     let lhs_value = state.registers[lhs].get_value();
     let rhs_value = state.registers[rhs].get_value();
 
-    // Fast path for integers
-    if matches!(lhs_value, Value::Numeric(Numeric::Integer(_)))
-        && matches!(rhs_value, Value::Numeric(Numeric::Integer(_)))
-    {
-        if op.compare(lhs_value, rhs_value, collation) {
-            state.pc = target_pc.as_offset_int();
-        } else {
-            state.pc += 1;
-        }
-        return Ok(InsnFunctionStepResult::Step);
-    }
-
-    // Handle NULL values
-    if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
-        let cmp_res = op.compare_nulls(lhs_value, rhs_value, null_eq);
-        let jump = match op {
-            ComparisonOp::Eq => cmp_res || (!null_eq && jump_if_null),
-            ComparisonOp::Ne => cmp_res || (!null_eq && jump_if_null),
-            ComparisonOp::Lt | ComparisonOp::Le | ComparisonOp::Gt | ComparisonOp::Ge => {
-                jump_if_null
+    macro_rules! take_jump_if {
+        ($should_take_jump:expr) => {
+            if $should_take_jump {
+                state.pc = target_pc.as_offset_int();
+            } else {
+                state.pc += 1;
             }
+            return Ok(InsnFunctionStepResult::Step);
         };
-        if jump {
-            state.pc = target_pc.as_offset_int();
-        } else {
-            state.pc += 1;
-        }
-        return Ok(InsnFunctionStepResult::Step);
     }
 
-    // Element-wise array comparison when ARRAY_CMP flag is set
-    if flags.has_array_cmp() {
-        if let (Value::Blob(lb), Value::Blob(rb)) = (lhs_value, rhs_value) {
+    match (lhs_value, rhs_value) {
+        (Value::Null, _) | (_, Value::Null) => {
+            let should_jump = match (null_eq, op) {
+                (true, ComparisonOp::Eq) => lhs_value == rhs_value,
+                (true, ComparisonOp::Ne) => lhs_value != rhs_value,
+                _ => jump_if_null,
+            };
+            take_jump_if!(should_jump);
+        }
+        (Value::Numeric(Numeric::Integer(_)), Value::Numeric(Numeric::Integer(_))) => {
+            // Fast path for integer comparison
+            if op.compare(lhs_value, rhs_value, collation) {
+                state.pc = target_pc.as_offset_int();
+            } else {
+                state.pc += 1;
+            }
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        (Value::Blob(lb), Value::Blob(rb)) if flags.has_array_cmp() => {
+            // Element-wise array comparison
             if let Ok(ord) = compare_arrays(lb, rb) {
                 let should_jump = match op {
                     ComparisonOp::Eq => ord.is_eq(),
@@ -1041,8 +1039,10 @@ pub fn op_comparison(
                 return Ok(InsnFunctionStepResult::Step);
             }
         }
+        (_, _) => {}
     }
 
+    // If all else failed, do an affinity-aware comparison
     let (new_lhs, new_rhs) = (
         affinity.convert_for_compare(lhs_value),
         affinity.convert_for_compare(rhs_value),
@@ -1080,13 +1080,7 @@ pub fn op_comparison(
         (None, None) => {}
     }
 
-    if should_jump {
-        state.pc = target_pc.as_offset_int();
-    } else {
-        state.pc += 1;
-    }
-
-    Ok(InsnFunctionStepResult::Step)
+    take_jump_if!(should_jump);
 }
 
 pub fn op_if(
