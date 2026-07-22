@@ -1264,7 +1264,7 @@ pub fn checked_cast_text_to_numeric(text: &str, lossless: bool) -> std::result::
     // sqlite will parse the first N digits of a string to numeric value, then determine
     // whether _that_ value is more likely a real or integer value. e.g.
     // '-100234-2344.23e14' evaluates to -100234 instead of -100234.0
-    let original_len = text.trim().len();
+    let original_len = trim_ascii_whitespace(text).len();
     let (kind, text) = parse_numeric_str(text)?;
 
     if original_len != text.len() && lossless {
@@ -1318,7 +1318,7 @@ fn real_to_numeric_value(value: f64) -> Value {
 }
 
 fn parse_numeric_str(text: &str) -> Result<(ValueType, &str), ()> {
-    let text = text.trim();
+    let text = trim_ascii_whitespace(text);
     let bytes = text.as_bytes();
 
     if matches!(
@@ -6536,6 +6536,10 @@ pub mod tests {
         assert_eq!(
             checked_cast_text_to_numeric("\t-3.22\n", true),
             Ok(Value::from_f64(-3.22))
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("\u{00A0}123\u{00A0}", true),
+            Err(())
         );
     }
 

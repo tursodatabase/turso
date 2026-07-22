@@ -1279,7 +1279,11 @@ pub fn insn_to_row(
                 0,
                 format!("accum=r[{}]", *register),
             ),
-            Insn::AggValue { acc_reg, dest_reg, func } => (
+            Insn::AggValue {
+                acc_reg,
+                dest_reg,
+                func,
+            } => (
                 "AggValue",
                 0,
                 *acc_reg as i64,

@@ -6753,6 +6753,8 @@ fn ordered_set_percentile_disc(values: &[Value], fraction: f64, collation: Colla
     sorted[index.min(n - 1)].clone()
 }
 
+/// Records what a window function needs from one row so its answer can be read
+/// later. Functions without arguments do not read `arg_reg`.
 fn op_window_step(
     state: &mut ProgramState,
     acc_reg: usize,
@@ -6971,13 +6973,12 @@ fn op_window_value(
             Value::from_i64(*value_slot)
         }
         WindowFunc::FirstValue => {
-            // first_value captures payload[0] once per partition; every
-            // peer-group flush in the partition reads the same slot, so
-            // we have to clone instead of taking ownership.
+            // Keep the saved value because every later row in this partition
+            // may need the same answer.
             let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
             else {
                 return Err(LimboError::InternalError(format!(
-                    "first_value accumulator in unexpected register state: {:?}",
+                    "{func} accumulator in unexpected register state: {:?}",
                     state.registers[acc_reg]
                 )));
             };
@@ -11347,9 +11348,9 @@ fn new_rowid_inner(
     }
 }
 
-fn coerce_register_to_integer(state: &mut ProgramState, reg: usize) -> Result<bool> {
+fn coerce_register_to_integer(state: &mut ProgramState, reg: usize) -> bool {
     let converted = match state.registers[reg].get_value() {
-        Value::Numeric(Numeric::Integer(_)) => return Ok(true),
+        Value::Numeric(Numeric::Integer(_)) => return true,
         Value::Numeric(Numeric::Float(f)) => cast_real_to_integer(f64::from(*f)).ok(),
         Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
             Ok(Value::Numeric(Numeric::Integer(i))) => Some(i),
@@ -11358,13 +11359,12 @@ fn coerce_register_to_integer(state: &mut ProgramState, reg: usize) -> Result<bo
         },
         _ => None,
     };
+    let Some(i) = converted else {
+        return false;
+    };
 
-    if let Some(i) = converted {
-        state.registers[reg].set_int(i);
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    state.registers[reg].set_int(i);
+    true
 }
 
 pub fn op_must_be_int(
@@ -11374,7 +11374,7 @@ pub fn op_must_be_int(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(MustBeInt { reg, target_pc }, insn);
-    if !coerce_register_to_integer(state, *reg)? {
+    if !coerce_register_to_integer(state, *reg) {
         if let Some(target_pc) = target_pc {
             state.pc = target_pc.as_offset_int();
             return Ok(InsnFunctionStepResult::Step);
