@@ -1072,6 +1072,9 @@ pub enum Insn {
         func: AccumulatorFunc,
         /// Optional custom type comparator for MIN/MAX aggregates.
         comparator: Option<SortComparatorType>,
+        /// Collation for comparison-based aggregates (MIN/MAX), resolved at
+        /// translation time from the argument expression.
+        collation: Option<CollationSeq>,
     },
 
     AggFinal {
@@ -1534,21 +1537,6 @@ pub enum Insn {
         target_pc: BranchOffset,
     },
 
-    /// Set the collation sequence for the next function call.
-    /// P4 is a pointer to a CollationSeq. If the next call to a user function
-    /// or aggregate calls sqlite3GetFuncCollSeq(), this collation sequence will
-    /// be returned. This is used by the built-in min(), max() and nullif()
-    /// functions.
-    ///
-    /// If P1 is not zero, then it is a register that a subsequent min() or
-    /// max() aggregate will set to 1 if the current row is not the minimum or
-    /// maximum.  The P1 register is initialized to 0 by this instruction.
-    CollSeq {
-        /// Optional register to initialize to 0 (P1).
-        reg: Option<usize>,
-        /// The collation sequence to set (P4).
-        collation: CollationSeq,
-    },
     ParseSchema {
         db: usize,
         where_clause: Option<String>,
@@ -2161,7 +2149,6 @@ impl InsnVariants {
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
-            InsnVariants::CollSeq => execute::op_coll_seq,
             InsnVariants::ParseSchema => execute::op_parse_schema,
             InsnVariants::PopulateMaterializedViews => execute::op_populate_materialized_views,
             InsnVariants::ShiftRight => execute::op_shift_right,

@@ -1,6 +1,6 @@
 use crate::translate::plan::SimpleAggregate;
 use crate::translate::{
-    aggregation::emit_collseq_if_needed,
+    aggregation::agg_arg_collation,
     order_by::{custom_type_comparator, EmitOrderBy},
     window::EmitWindow,
 };
@@ -251,12 +251,8 @@ fn emit_loop_source<'a>(
                     None
                 };
 
-                emit_collseq_if_needed(
-                    program,
-                    &plan.table_references,
-                    &min_max.argument,
-                    &t_ctx.resolver,
-                );
+                let arg_collation =
+                    agg_arg_collation(&plan.table_references, &min_max.argument, &t_ctx.resolver);
                 let comparator = custom_type_comparator(
                     &min_max.argument,
                     &plan.table_references,
@@ -268,6 +264,7 @@ fn emit_loop_source<'a>(
                     delimiter: 0,
                     func: crate::function::AccumulatorFunc::Agg(min_max.func.clone()),
                     comparator,
+                    collation: Some(arg_collation),
                 });
                 program.emit_insn(Insn::Goto {
                     target_pc: loop_end,
