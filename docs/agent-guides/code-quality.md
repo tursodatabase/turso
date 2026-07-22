@@ -71,7 +71,7 @@ Use if-statements only when both branches are expected paths.
 
 ## Comments
 
-- Do not add comments. Instead, focus on making your code expressive.
+- Do NOT add ANY comments. Instead, focus on making your code expressive.
 
 ## Avoid Over-Engineering
 

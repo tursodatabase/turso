@@ -48,15 +48,7 @@ Use if-statements only when both branches are expected paths.
 
 ## Comments
 
-**Do:**
-- Document WHY, not what
-- Document functions, structs, enums, variants
-- Focus on why something is necessary
-
-**Don't:**
-- Comments that repeat code
-- References to AI conversations ("This test should trigger the bug")
-- Temporal markers ("added", "existing code", "Phase 1")
+- Do NOT add ANY comments. Instead, focus on making your code expressive.
 
 ## Avoid Over-Engineering
 
