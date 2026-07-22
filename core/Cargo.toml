@@ -264,3 +264,7 @@ harness = false
 [[bench]]
 name = "prepare_params_benchmark"
 harness = false
+
+[[bench]]
+name = "record_recycling"
+harness = false
