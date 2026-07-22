@@ -1855,6 +1855,23 @@ pub fn compile_maintenance_program(
             connection,
         );
     }
+    if dag_is_compound(&dag) {
+        if matches!(output, MaintenanceOutput::EmitRows) {
+            return Err(LimboError::InternalError(
+                "compound views serve uncommitted reads by recomputing the defining query"
+                    .to_string(),
+            ));
+        }
+        return compile_dag_compound_program(
+            view_name,
+            &dag,
+            view_root_page,
+            num_view_columns,
+            input,
+            schema,
+            connection,
+        );
+    }
 
     match classify_view_for_connection(select, schema, connection)? {
         ViewShape::FilterProject => compile_filter_project_program(
@@ -2094,6 +2111,57 @@ fn dag_is_join(dag: &dag::MaintenanceDag) -> bool {
     matches!(dag.nodes[below], dag::OpNode::Join { .. })
 }
 
+/// Whether the DAG is a set-op view over filter/project branches: a `SetOp`
+/// root whose every other node is linear. A `SetOp` with a join or aggregate
+/// branch (`CompoundAll` over non-filter/project branches) is not handled by
+/// [`emit_compound_program`] and stays on the per-shape path.
+fn dag_is_compound(dag: &dag::MaintenanceDag) -> bool {
+    if !matches!(dag.root_node(), dag::OpNode::SetOp { .. }) {
+        return false;
+    }
+    dag.nodes.iter().enumerate().all(|(id, node)| {
+        id == dag.root
+            || matches!(
+                node,
+                dag::OpNode::Scan { .. }
+                    | dag::OpNode::Filter { .. }
+                    | dag::OpNode::Project { .. }
+            )
+    })
+}
+
+/// The filter/project [`BranchContent`] a compound `SetOp` branch produces,
+/// read from its `Project` -> `Filter`? -> `Scan` sub-tree.
+fn dag_branch_content(dag: &dag::MaintenanceDag, branch_root: dag::NodeId) -> Result<BranchContent> {
+    let bad = || LimboError::InternalError("compound branch is not filter/project".to_string());
+    let dag::OpNode::Project { input: proj_input, projections } = &dag.nodes[branch_root] else {
+        return Err(bad());
+    };
+    let (scan_id, where_clause): (dag::NodeId, Option<ast::Expr>) = match &dag.nodes[*proj_input] {
+        dag::OpNode::Filter { input, predicate } => (*input, Some(predicate.clone())),
+        dag::OpNode::Scan { .. } => (*proj_input, None),
+        _ => return Err(bad()),
+    };
+    let dag::OpNode::Scan { table, identifier } = &dag.nodes[scan_id] else {
+        return Err(bad());
+    };
+    let columns = projections
+        .iter()
+        .map(|(expr, alias)| {
+            ast::ResultColumn::Expr(
+                Box::new(expr.clone()),
+                alias.clone().map(|name| ast::As::As(ast::Name::exact(name))),
+            )
+        })
+        .collect();
+    Ok(BranchContent {
+        base_table: table.clone(),
+        identifier: identifier.clone(),
+        columns,
+        where_clause,
+    })
+}
+
 /// Reconstruct the [`OutputColumn`] mapping for an aggregate view from the
 /// `Project` node's expressions, resolving each against the `Aggregate` node's
 /// group keys and aggregate calls (which already collect every aggregate
@@ -2263,6 +2331,44 @@ fn compile_dag_join_program(
         connection.clone(),
         false,
         "materialized view join maintenance",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_dag_compound_program(
+    view_name: &str,
+    dag: &dag::MaintenanceDag,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<Program> {
+    let dag::OpNode::SetOp {
+        inputs,
+        operators,
+        prefix_len,
+        key_collations,
+        ..
+    } = dag.root_node()
+    else {
+        unreachable!("caller checked compound shape");
+    };
+    let branches = inputs
+        .iter()
+        .map(|&branch_root| dag_branch_content(dag, branch_root))
+        .collect::<Result<Vec<_>>>()?;
+    emit_compound_program(
+        view_name,
+        &branches,
+        operators,
+        *prefix_len,
+        key_collations,
+        view_root_page,
+        num_view_columns,
+        input,
+        schema,
+        connection,
     )
 }
 
@@ -5401,7 +5507,7 @@ fn emit_join(
                 program,
                 &resolver,
                 columns,
-                &tables,
+                tables,
                 &pad_cursors,
                 &mut pad_references,
                 out_start,
@@ -5597,7 +5703,7 @@ fn emit_join(
             program,
             &resolver,
             view_name,
-            &tables,
+            tables,
             &conditions,
             &sides,
             negate,
@@ -5663,7 +5769,7 @@ fn emit_join(
                     program,
                     &resolver,
                     columns,
-                    &tables,
+                    tables,
                     cursors,
                     table_references,
                     out_start,
@@ -5891,6 +5997,62 @@ fn emit_split_view_rowid(
 /// table when the whole chain is UNION ALL and in the auxiliary multiset
 /// table when a dedup prefix owns the state table.
 #[allow(clippy::too_many_arguments)]
+/// One filter/project branch of a compound view: the base table it scans,
+/// the identifier its columns bind under, its projected result columns, and
+/// its WHERE. Extracted from either the branch `OneSelect` or its DAG
+/// sub-tree so the compound maintenance body is agnostic to its source.
+struct BranchContent {
+    base_table: Arc<BTreeTable>,
+    identifier: String,
+    columns: Vec<ast::ResultColumn>,
+    where_clause: Option<ast::Expr>,
+}
+
+fn compound_branches_from_select(
+    select: &ast::Select,
+    schema: &Schema,
+) -> Result<Vec<BranchContent>> {
+    std::iter::once(&select.body.select)
+        .chain(select.body.compounds.iter().map(|c| &c.select))
+        .map(|branch| {
+            let ast::OneSelect::Select {
+                columns,
+                from,
+                where_clause,
+                ..
+            } = branch
+            else {
+                unreachable!("classify_view admits only plain SELECT branches");
+            };
+            let from = from.as_ref().expect("classify_view requires a FROM clause");
+            let ast::SelectTable::Table(base_name, base_alias, _) = from.select.as_ref() else {
+                unreachable!("classify_view admits only plain tables in branches");
+            };
+            let base_table = schema
+                .get_btree_table(base_name.name.as_str())
+                .ok_or_else(|| {
+                    LimboError::ParseError(format!(
+                        "materialized view base table {} not found",
+                        base_name.name.as_str()
+                    ))
+                })?;
+            let identifier = match base_alias {
+                Some(
+                    ast::As::As(name) | ast::As::Elided(name) | ast::As::ImplicitColumnName(name),
+                ) => name.as_str().to_string(),
+                None => base_table.name.clone(),
+            };
+            Ok(BranchContent {
+                base_table,
+                identifier,
+                columns: columns.clone(),
+                where_clause: where_clause.as_deref().cloned(),
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compile_compound_program(
     view_name: &str,
     select: &ast::Select,
@@ -5910,10 +6072,34 @@ fn compile_compound_program(
     else {
         unreachable!("compile_compound_program requires a Compound shape");
     };
-    let prefix_len = *prefix_len;
-    let branches: Vec<&ast::OneSelect> = std::iter::once(&select.body.select)
-        .chain(select.body.compounds.iter().map(|c| &c.select))
-        .collect();
+    let branches = compound_branches_from_select(select, schema)?;
+    emit_compound_program(
+        view_name,
+        &branches,
+        operators,
+        *prefix_len,
+        key_collations,
+        view_root_page,
+        num_view_columns,
+        input,
+        schema,
+        connection,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_compound_program(
+    view_name: &str,
+    branches: &[BranchContent],
+    operators: &[ast::CompoundOperator],
+    prefix_len: usize,
+    key_collations: &[CollationSeq],
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<Program> {
     let n_branches = branches.len();
     let has_prefix = prefix_len > 0;
     let has_append = prefix_len < n_branches;
@@ -6596,36 +6782,12 @@ fn compile_compound_program(
     program.preassign_label_to_next_insn(main_start_label);
 
     for (branch_idx, branch) in branches.iter().enumerate() {
-        let ast::OneSelect::Select {
-            columns,
-            from,
-            where_clause,
-            ..
-        } = branch
-        else {
-            unreachable!("classify_view admits only plain SELECT branches");
-        };
-        let from = from.as_ref().expect("classify_view requires a FROM clause");
-        let ast::SelectTable::Table(base_name, base_alias, _) = from.select.as_ref() else {
-            unreachable!("classify_view admits only plain tables in branches");
-        };
-        let base_table = schema
-            .get_btree_table(base_name.name.as_str())
-            .ok_or_else(|| {
-                LimboError::ParseError(format!(
-                    "materialized view base table {} not found",
-                    base_name.name.as_str()
-                ))
-            })?;
+        let base_table = &branch.base_table;
+        let columns = &branch.columns;
+        let where_clause = branch.where_clause.as_ref();
         let num_base_columns = base_table.columns().len();
 
         let table_ref_id = program.table_reference_counter.next();
-        let identifier = match base_alias {
-            Some(ast::As::As(name) | ast::As::Elided(name) | ast::As::ImplicitColumnName(name)) => {
-                name.as_str().to_string()
-            }
-            None => base_table.name.clone(),
-        };
         let mut table_references = TableReferences::new(
             vec![JoinedTable {
                 op: Operation::Scan(Scan::BTreeTable {
@@ -6633,7 +6795,7 @@ fn compile_compound_program(
                     index: None,
                 }),
                 table: crate::schema::Table::BTree(base_table.clone()),
-                identifier,
+                identifier: branch.identifier.clone(),
                 internal_id: table_ref_id,
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
