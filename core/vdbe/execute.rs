@@ -1656,14 +1656,14 @@ pub fn op_open_pseudo(
     load_insn!(
         OpenPseudo {
             cursor_id,
-            content_reg: _,
+            content_reg,
             num_fields: _,
         },
         insn
     );
     {
         let cursors = &mut state.cursors;
-        let cursor = PseudoCursor::default();
+        let cursor = PseudoCursor::new(*content_reg);
         cursors
             .get_mut(*cursor_id)
             .expect("cursor_id should be valid")
@@ -1964,14 +1964,25 @@ fn op_column_fetch(
             }
         }
         CursorType::Pseudo(_) => {
-            let cursor = crate::get_cursor!(state, cursor_id);
-            let cursor = cursor.as_pseudo_mut();
-            match cursor.record() {
-                Some(record) => {
+            let content_reg = crate::get_cursor!(state, cursor_id)
+                .as_pseudo_mut()
+                .content_reg();
+            // The record is read while decoding into the destination register,
+            // so the two registers must be distinct.
+            let [content, dest_reg] = state
+                .registers
+                .get_disjoint_mut([content_reg, dest])
+                .map_err(|_| {
+                    LimboError::InternalError(format!(
+                        "Column: pseudo-cursor content register {content_reg} and destination register {dest} must be distinct"
+                    ))
+                })?;
+            match content {
+                Register::Record(record) => {
                     // Decode straight into the register; going through an owned
                     // Value would allocate for every TEXT/BLOB column on every row.
                     let mut payload_iterator = record.iter()?;
-                    match payload_iterator.nth_into_register(column, &mut state.registers[dest]) {
+                    match payload_iterator.nth_into_register(column, dest_reg) {
                         Some(result) => result?,
                         // A pseudo cursor is opened with num_fields matching the
                         // record built for it, so every emitted Column index is in
@@ -1982,11 +1993,11 @@ fn op_column_fetch(
                                 "pseudo-cursor column out of range for record",
                                 { "column": column }
                             );
-                            state.registers[dest].set_null();
+                            dest_reg.set_null();
                         }
                     }
                 }
-                None => state.registers[dest].set_null(),
+                _ => dest_reg.set_null(),
             }
         }
         CursorType::IndexMethod(..) => {
@@ -7393,23 +7404,37 @@ pub fn op_sorter_data(
         },
         insn
     );
-    let record = {
+    // Column ops read the record through the pseudo cursor's content register,
+    // so SorterData's destination must be that same register.
+    {
+        let content_reg = state
+            .get_cursor(*pseudo_cursor)
+            .as_pseudo_mut()
+            .content_reg();
+        if content_reg != *dest_reg {
+            return Err(LimboError::InternalError(format!(
+                "SorterData: destination register {dest_reg} must be pseudo-cursor {pseudo_cursor}'s content register {content_reg}"
+            )));
+        }
+    }
+    {
         let cursor = state.get_cursor(*cursor_id);
-        let cursor = cursor.as_sorter_mut();
-        cursor.record().cloned()
-    };
-    let record = match record {
-        Some(record) => record,
-        None => {
+        if cursor.as_sorter_mut().record().is_none() {
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
-    };
-    state.registers[*dest_reg] = Register::Record(record.clone());
-    {
-        let pseudo_cursor = state.get_cursor(*pseudo_cursor);
-        pseudo_cursor.as_pseudo_mut().insert(record);
     }
+    // Move the record into the content register with no allocation or copy;
+    // the register's spent buffer seeds the sorter's next row.
+    let buf = state.registers[*dest_reg].take_buf();
+    let record = {
+        let cursor = state.get_cursor(*cursor_id);
+        cursor
+            .as_sorter_mut()
+            .take_current(buf)
+            .expect("sorter record checked above")
+    };
+    state.registers[*dest_reg] = Register::Record(record);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -17832,6 +17857,29 @@ mod tests {
         };
         assert!(
             matches!(err, LimboError::InternalError(ref message) if message.contains("overlaps its source range")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_sorter_data_unpaired_content_register_returns_error() {
+        let stmt = prepare_test_statement();
+
+        // Pseudo cursor 1 exposes register 2, but SorterData targets register 3.
+        let mut state = ProgramState::new(4, 2);
+        state.cursors[1] = Some(Cursor::new_pseudo(crate::pseudo::PseudoCursor::new(2)));
+        let insn = Insn::SorterData {
+            cursor_id: 0,
+            dest_reg: 3,
+            pseudo_cursor: 1,
+        };
+
+        let err = match op_sorter_data(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+            Ok(_) => panic!("unpaired content register must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, LimboError::InternalError(ref message) if message.contains("content register")),
             "unexpected error: {err:?}"
         );
     }

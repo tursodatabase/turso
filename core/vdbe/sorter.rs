@@ -18,7 +18,7 @@ use crate::{
     io::{Buffer, Completion, CompletionGroup, File, IO},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
-    types::{IOResult, ImmutableRecord, KeyInfo, ValueRef},
+    types::{IOResult, ImmutableRecord, KeyInfo, RecordBuf, ValueRef},
     Result,
 };
 use crate::{io_yield_one, return_if_io, CompletionError};
@@ -359,6 +359,17 @@ impl Sorter {
 
     pub const fn record(&self) -> Option<&ImmutableRecord> {
         self.current.as_ref()
+    }
+
+    /// Moves the current record out of the sorter, seeding the next
+    /// [Sorter::next] call with `spent`'s allocation. This lets SorterData
+    /// transfer records to a register with no allocation or payload copy.
+    pub fn take_current(&mut self, spent: RecordBuf) -> Option<ImmutableRecord> {
+        let current = self.current.take();
+        if current.is_some() {
+            self.current = Some(ImmutableRecord::from_buf(spent));
+        }
+        current
     }
 
     pub fn insert(&mut self, record: &ImmutableRecord) -> Result<IOResult<()>> {
