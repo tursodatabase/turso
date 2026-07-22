@@ -75,10 +75,6 @@ pub enum SortComparatorType {
 
 bitflags! {
     /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
-    ///
-    /// The bits within [`CmpInsFlags::AFFINITY_MASK`] do not act as independent flags: they store a
-    /// packed [`Affinity`] char code, manipulated via [`CmpInsFlags::with_affinity`] and
-    /// [`CmpInsFlags::get_affinity`]. The remaining named flags are ordinary booleans.
     #[derive(Clone, Copy, Debug, Default)]
     pub struct CmpInsFlags: usize {
         const NULL_EQ = 0x80;
@@ -88,7 +84,6 @@ bitflags! {
 }
 
 impl CmpInsFlags {
-    /// Bits reserved for the packed affinity char code (see [`with_affinity`](Self::with_affinity)).
     const AFFINITY_MASK: usize = 0x47;
 
     pub fn null_eq(mut self) -> Self {
