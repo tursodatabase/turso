@@ -257,7 +257,6 @@ pub enum ViewShape {
         /// column. One shared table stores all such values, so aggregates
         /// with differing argument collations are rejected at classify.
         multiset_collation: CollationSeq,
-        outputs: Vec<OutputColumn>,
         /// HAVING predicate over group expressions and aggregate results;
         /// gates only the view row, not the group's persisted state.
         having: Option<ast::Expr>,
@@ -1280,7 +1279,6 @@ pub fn classify_view(
                 }
             }
         }
-        let outputs = (0..group_exprs.len()).map(OutputColumn::Group).collect();
         let count_star = ast::Expr::FunctionCallStar {
             name: ast::Name::exact("count".to_string()),
             filter_over: ast::FunctionTail {
@@ -1302,7 +1300,6 @@ pub fn classify_view(
             group_collations,
             aggregates,
             multiset_collation: CollationSeq::Binary,
-            outputs,
             having: None,
             scalar: false,
         });
@@ -1395,39 +1392,35 @@ fn classify_group_aggregate(
         "count(*) must collect as the single hidden liveness aggregate"
     );
 
-    let mut outputs = Vec::with_capacity(columns.len());
+    // Collect aggregates referenced by the result columns and validate that
+    // every column is a group key, a plain aggregate, or an expression over
+    // them (SUM(x) + 1, and the like — the rule HAVING also follows). Bare
+    // columns outside GROUP BY carry SQLite's arbitrary-row semantics, which
+    // cannot be maintained incrementally. The output-column mapping itself is
+    // derived from the DAG's projection at codegen time, not stored here.
     for column in columns {
         let ast::ResultColumn::Expr(expr, _) = column else {
             return unsupported("star projections combined with GROUP BY");
         };
-        if let Some(idx) = group_exprs
+        if group_exprs
             .iter()
-            .position(|g| crate::util::exprs_are_equivalent(g, expr))
+            .any(|g| crate::util::exprs_are_equivalent(g, expr))
         {
-            outputs.push(OutputColumn::Group(idx));
             continue;
         }
         resolve_window_and_aggregate_functions(expr, resolver, &mut aggregates, None, &mut [])?;
-        if let Some(idx) = aggregates
+        if aggregates
             .iter()
-            .position(|a| crate::util::exprs_are_equivalent(&a.original_expr, expr))
+            .any(|a| crate::util::exprs_are_equivalent(&a.original_expr, expr))
         {
-            outputs.push(OutputColumn::Aggregate(idx));
             continue;
         }
-        // Not one plain aggregate call: allow any expression whose
-        // column-bearing subtrees are group expressions or aggregate calls
-        // (SUM(x) + 1, and the like), evaluated over the finalized group row
-        // — the same rule HAVING follows. What remains outside that is
-        // SQLite's bare-column semantics (a value from an arbitrary row of
-        // the group), which cannot be maintained incrementally.
         check_group_row_expr(
             expr,
             &group_exprs,
             &aggregates,
             "non-aggregate result columns not in GROUP BY",
         )?;
-        outputs.push(OutputColumn::Expr(expr.as_ref().clone()));
     }
 
     let having = match having_clause {
@@ -1481,7 +1474,6 @@ fn classify_group_aggregate(
         group_collations,
         aggregates,
         multiset_collation,
-        outputs,
         having,
         scalar,
     })
@@ -1924,93 +1916,9 @@ pub fn compile_maintenance_program(
         );
     }
 
-    match classify_view_for_connection(select, schema, connection)? {
-        ViewShape::FilterProject => compile_filter_project_program(
-            view_name,
-            select,
-            view_root_page,
-            num_view_columns,
-            input,
-            output,
-            &BranchNamespace::none(),
-            schema,
-            connection,
-        ),
-        shape @ ViewShape::GroupAggregate { .. } => {
-            if matches!(output, MaintenanceOutput::EmitRows) {
-                return Err(LimboError::InternalError(
-                    "aggregate views serve uncommitted reads by recomputing the defining query"
-                        .to_string(),
-                ));
-            }
-            compile_group_aggregate_program(
-                view_name,
-                select,
-                &shape,
-                view_root_page,
-                num_view_columns,
-                input,
-                &BranchNamespace::none(),
-                schema,
-                connection,
-            )
-        }
-        shape @ ViewShape::Join { .. } => {
-            if matches!(output, MaintenanceOutput::EmitRows) {
-                return Err(LimboError::InternalError(
-                    "join views serve uncommitted reads by recomputing the defining query"
-                        .to_string(),
-                ));
-            }
-            compile_join_program(
-                view_name,
-                select,
-                &shape,
-                view_root_page,
-                num_view_columns,
-                input,
-                &BranchNamespace::none(),
-                schema,
-                connection,
-            )
-        }
-        shape @ ViewShape::Compound { .. } => {
-            if matches!(output, MaintenanceOutput::EmitRows) {
-                return Err(LimboError::InternalError(
-                    "compound views serve uncommitted reads by recomputing the defining query"
-                        .to_string(),
-                ));
-            }
-            compile_compound_program(
-                view_name,
-                select,
-                &shape,
-                view_root_page,
-                num_view_columns,
-                input,
-                schema,
-                connection,
-            )
-        }
-        shape @ ViewShape::CompoundAll { .. } => {
-            if matches!(output, MaintenanceOutput::EmitRows) {
-                return Err(LimboError::InternalError(
-                    "compound views serve uncommitted reads by recomputing the defining query"
-                        .to_string(),
-                ));
-            }
-            compile_compound_all_program(
-                view_name,
-                select,
-                &shape,
-                view_root_page,
-                num_view_columns,
-                input,
-                schema,
-                connection,
-            )
-        }
-    }
+    Err(LimboError::InternalError(format!(
+        "materialized view {view_name} has no maintainable operator DAG shape"
+    )))
 }
 
 /// [`build_dag`] with a transient resolver from a connection, mirroring
@@ -2422,106 +2330,6 @@ fn compile_dag_compound_all_program(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compile_filter_project_program(
-    view_name: &str,
-    select: &ast::Select,
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
-    output: MaintenanceOutput,
-    ns: &BranchNamespace,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<Program> {
-    let mut program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts {
-            num_cursors: 2,
-            approx_num_insns: 32 + 8 * num_view_columns,
-            approx_num_labels: 8,
-        },
-    );
-    program.prologue();
-    emit_filter_project_from_select(
-        &mut program,
-        view_name,
-        select,
-        view_root_page,
-        num_view_columns,
-        input,
-        output,
-        ns,
-        schema,
-        connection,
-    )?;
-    program.epilogue(schema);
-    program.build(connection.clone(), false, "materialized view maintenance")
-}
-
-/// Extract a single-table filter/project view's base table, WHERE, and
-/// projection from its `SELECT` and emit the pipeline. The `select`-reading
-/// adapter over [`emit_filter_project`].
-#[allow(clippy::too_many_arguments)]
-fn emit_filter_project_from_select(
-    program: &mut ProgramBuilder,
-    view_name: &str,
-    select: &ast::Select,
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
-    output: MaintenanceOutput,
-    ns: &BranchNamespace,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<()> {
-    let ast::OneSelect::Select {
-        columns,
-        from,
-        where_clause,
-        ..
-    } = &select.body.select
-    else {
-        unreachable!("validate_vdbe_maintainable admits only OneSelect::Select");
-    };
-    let from = from
-        .as_ref()
-        .expect("validate_vdbe_maintainable requires a FROM clause");
-    let ast::SelectTable::Table(base_name, base_alias, _) = from.select.as_ref() else {
-        unreachable!("validate_vdbe_maintainable admits only plain tables in FROM");
-    };
-    let base_table = schema
-        .get_btree_table(base_name.name.as_str())
-        .ok_or_else(|| {
-            LimboError::ParseError(format!(
-                "materialized view base table {} not found",
-                base_name.name.as_str()
-            ))
-        })?;
-    let identifier = match base_alias {
-        Some(ast::As::As(name) | ast::As::Elided(name) | ast::As::ImplicitColumnName(name)) => {
-            name.as_str().to_string()
-        }
-        None => base_table.name.clone(),
-    };
-    emit_filter_project(
-        program,
-        view_name,
-        &base_table,
-        &identifier,
-        columns,
-        where_clause.as_deref(),
-        view_root_page,
-        num_view_columns,
-        input,
-        output,
-        ns,
-        schema,
-        connection,
-    )
-}
-
 // A single-table filter/project maintenance pipeline. Parameterized on its
 // base table and its WHERE/projection so it serves both the standalone
 // filter/project view (via `emit_filter_project_from_select`) and the DAG
@@ -2849,89 +2657,6 @@ fn emit_filter_project(
 
     drop(syms);
     Ok(())
-}
-
-/// Compile the maintenance (or population) program for a GROUP BY view with
-/// invertible aggregates.
-///
-/// Program shape, per input row (delta row with weight w, or base-table row
-/// with w = +1 during population):
-///
-/// ```text
-///   if NOT WHERE(row) -> next
-///   g[..] := GROUP BY expressions of the row
-///   look up the group in the state table's primary-key index
-///     found:     load each payload aggregate's persisted state
-///     not found: retraction of an unknown group -> next; else fresh state
-///   for each aggregate: w > 0 ? AggStep(arg) : AggInverse(arg)
-///     (multiset aggregates weight-merge (agg, g.., value) rows instead;
-///      DISTINCT accumulators step/invert only on 0 <-> positive transitions)
-///   if hidden COUNT(*) == 0:  delete state row + index entry + view row
-///   else:                     (new group: allocate the state rowid, which
-///                             doubles as the group's view-btree rowid)
-///                             persist payloads, upsert state row,
-///                             finalize aggregate values,
-///                             HAVING true -> write the view row,
-///                             HAVING false/NULL -> delete it if present
-/// ```
-#[allow(clippy::too_many_arguments)]
-fn compile_group_aggregate_program(
-    view_name: &str,
-    select: &ast::Select,
-    shape: &ViewShape,
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
-    ns: &BranchNamespace,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<Program> {
-    let mut program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts {
-            num_cursors: 4,
-            // Instruction/label counts are capacity hints only.
-            approx_num_insns: 128 + 32 * num_view_columns,
-            approx_num_labels: 32,
-        },
-    );
-    program.prologue();
-    let ViewShape::GroupAggregate {
-        group_exprs,
-        group_collations,
-        aggregates,
-        outputs,
-        having,
-        scalar,
-        ..
-    } = shape
-    else {
-        unreachable!("compile_group_aggregate_program requires a GroupAggregate shape");
-    };
-    emit_group_aggregate(
-        &mut program,
-        view_name,
-        select,
-        group_exprs,
-        group_collations,
-        aggregates,
-        outputs,
-        having.as_ref(),
-        *scalar,
-        view_root_page,
-        num_view_columns,
-        input,
-        ns,
-        schema,
-        connection,
-    )?;
-    program.epilogue(schema);
-    program.build(
-        connection.clone(),
-        false,
-        "materialized view aggregate maintenance",
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4779,111 +4504,6 @@ fn emit_join_deltas_to_ephemeral(
     ))
 }
 
-/// Compile the maintenance (or population) program for an inner join view
-/// of up to [`MAX_JOIN_TABLES`] tables.
-///
-/// Join is multilinear, so with the base btrees holding post-change state at
-/// commit time the view delta is the inclusion–exclusion sum over every
-/// non-empty subset of the joined tables (see [`join_subset_phases`]); the
-/// two-table case is `d(L ⋈ R) = dL ⋈ R_new + L_new ⋈ dR − dL ⋈ dR`.
-/// Population is a single all-btree phase with weight +1.
-///
-/// Every matching combination funnels through one weight-merge subroutine:
-/// the source-rowid tuple is looked up in the state table, whose row's
-/// rowid doubles as the view rowid and whose signed multiplicity absorbs
-/// the transient dips and double-counts of the phase decomposition. Delta
-/// rows are applied in capture order, so the last touch of a surviving
-/// tuple always computes its output columns from every side's final image.
-///
-/// The ON predicates are arbitrary (evaluated with the shared condition
-/// translator, so NULL join keys behave exactly as in a regular query); the
-/// probes are nested-loop scans of the btree sides.
-#[allow(clippy::too_many_arguments)]
-fn compile_join_program(
-    view_name: &str,
-    select: &ast::Select,
-    shape: &ViewShape,
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
-    ns: &BranchNamespace,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<Program> {
-    let mut program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts {
-            num_cursors: 13,
-            approx_num_insns: 128 + 64 * num_view_columns,
-            approx_num_labels: 48,
-        },
-    );
-    program.prologue();
-    emit_join_from_select(
-        &mut program,
-        view_name,
-        select,
-        shape,
-        view_root_page,
-        num_view_columns,
-        input,
-        ns,
-        schema,
-        connection,
-    )?;
-    program.epilogue(schema);
-    program.build(
-        connection.clone(),
-        false,
-        "materialized view join maintenance",
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_join_from_select(
-    program: &mut ProgramBuilder,
-    view_name: &str,
-    select: &ast::Select,
-    shape: &ViewShape,
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
-    ns: &BranchNamespace,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<()> {
-    let ViewShape::Join { left_outer, .. } = shape else {
-        unreachable!("emit_join_from_select requires a Join shape");
-    };
-    let ast::OneSelect::Select {
-        columns,
-        from,
-        where_clause,
-        ..
-    } = &select.body.select
-    else {
-        unreachable!("classify_view admits only OneSelect::Select");
-    };
-    let from = from.as_ref().expect("classify_view requires a FROM clause");
-    let (tables, on_conditions) = collect_join_tables(from, schema)?;
-    emit_join(
-        program,
-        view_name,
-        columns,
-        &tables,
-        &on_conditions,
-        where_clause.as_deref(),
-        *left_outer,
-        view_root_page,
-        num_view_columns,
-        input,
-        ns,
-        schema,
-        connection,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn emit_join(
     program: &mut ProgramBuilder,
@@ -6058,85 +5678,6 @@ struct BranchContent {
     where_clause: Option<ast::Expr>,
 }
 
-fn compound_branches_from_select(
-    select: &ast::Select,
-    schema: &Schema,
-) -> Result<Vec<BranchContent>> {
-    std::iter::once(&select.body.select)
-        .chain(select.body.compounds.iter().map(|c| &c.select))
-        .map(|branch| {
-            let ast::OneSelect::Select {
-                columns,
-                from,
-                where_clause,
-                ..
-            } = branch
-            else {
-                unreachable!("classify_view admits only plain SELECT branches");
-            };
-            let from = from.as_ref().expect("classify_view requires a FROM clause");
-            let ast::SelectTable::Table(base_name, base_alias, _) = from.select.as_ref() else {
-                unreachable!("classify_view admits only plain tables in branches");
-            };
-            let base_table = schema
-                .get_btree_table(base_name.name.as_str())
-                .ok_or_else(|| {
-                    LimboError::ParseError(format!(
-                        "materialized view base table {} not found",
-                        base_name.name.as_str()
-                    ))
-                })?;
-            let identifier = match base_alias {
-                Some(
-                    ast::As::As(name) | ast::As::Elided(name) | ast::As::ImplicitColumnName(name),
-                ) => name.as_str().to_string(),
-                None => base_table.name.clone(),
-            };
-            Ok(BranchContent {
-                base_table,
-                identifier,
-                columns: columns.clone(),
-                where_clause: where_clause.as_deref().cloned(),
-            })
-        })
-        .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compile_compound_program(
-    view_name: &str,
-    select: &ast::Select,
-    shape: &ViewShape,
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<Program> {
-    let ViewShape::Compound {
-        operators,
-        prefix_len,
-        key_collations,
-        ..
-    } = shape
-    else {
-        unreachable!("compile_compound_program requires a Compound shape");
-    };
-    let branches = compound_branches_from_select(select, schema)?;
-    emit_compound_program(
-        view_name,
-        &branches,
-        operators,
-        *prefix_len,
-        key_collations,
-        view_root_page,
-        num_view_columns,
-        input,
-        schema,
-        connection,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn emit_compound_program(
     view_name: &str,
@@ -7023,112 +6564,6 @@ fn emit_compound_program(
         connection.clone(),
         false,
         "materialized view compound maintenance",
-    )
-}
-
-/// Compile the maintenance (or population) program for a pure UNION ALL
-/// whose branches are not all filter/project. UNION ALL branches form an
-/// independent bag union, so each branch is maintained by its own
-/// sub-program — the ordinary filter/project, join, or aggregate
-/// maintenance — writing a disjoint rowid slice of the shared view btree
-/// (`local * n_branches + branch_idx`) and owning hidden state tables
-/// suffixed `__b<idx>`. The branches share one program (maintenance runs
-/// one program per view) but never interact: there is no cross-branch
-/// merge.
-#[allow(clippy::too_many_arguments)]
-fn compile_compound_all_program(
-    view_name: &str,
-    select: &ast::Select,
-    shape: &ViewShape,
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<Program> {
-    let ViewShape::CompoundAll { branch_shapes } = shape else {
-        unreachable!("compile_compound_all_program requires a CompoundAll shape");
-    };
-    let n_branches = branch_shapes.len();
-    let mut program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts {
-            num_cursors: 6 * n_branches,
-            approx_num_insns: 128 * n_branches + 32 * num_view_columns * n_branches,
-            approx_num_labels: 48 * n_branches,
-        },
-    );
-    program.prologue();
-
-    for (branch_idx, sub) in branch_shapes.iter().enumerate() {
-        let ns = BranchNamespace {
-            scale: n_branches as i64,
-            offset: branch_idx as i64,
-            suffix: format!("__b{branch_idx}"),
-        };
-        let branch = branch_select(select, branch_idx);
-        match sub {
-            ViewShape::FilterProject => emit_filter_project_from_select(
-                &mut program,
-                view_name,
-                &branch,
-                view_root_page,
-                num_view_columns,
-                input,
-                MaintenanceOutput::ViewBtree,
-                &ns,
-                schema,
-                connection,
-            )?,
-            ViewShape::Join { .. } => emit_join_from_select(
-                &mut program,
-                view_name,
-                &branch,
-                sub,
-                view_root_page,
-                num_view_columns,
-                input,
-                &ns,
-                schema,
-                connection,
-            )?,
-            ViewShape::GroupAggregate {
-                group_exprs,
-                group_collations,
-                aggregates,
-                outputs,
-                having,
-                scalar,
-                ..
-            } => emit_group_aggregate(
-                &mut program,
-                view_name,
-                &branch,
-                group_exprs,
-                group_collations,
-                aggregates,
-                outputs,
-                having.as_ref(),
-                *scalar,
-                view_root_page,
-                num_view_columns,
-                input,
-                &ns,
-                schema,
-                connection,
-            )?,
-            ViewShape::Compound { .. } | ViewShape::CompoundAll { .. } => {
-                unreachable!("classify_view rejects compound branches in a UNION ALL");
-            }
-        }
-    }
-
-    program.epilogue(schema);
-    program.build(
-        connection.clone(),
-        false,
-        "materialized view compound-all maintenance",
     )
 }
 
