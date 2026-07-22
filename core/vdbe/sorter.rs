@@ -12,7 +12,7 @@ use std::rc::Rc;
 use crate::alloc::vec;
 use crate::alloc::*;
 use crate::io::TempFile;
-use crate::types::{IOCompletions, ValueIterator};
+use crate::types::{compare_handling_nulls, IOCompletions, ValueIterator};
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, CompletionGroup, File, IO},
@@ -943,36 +943,22 @@ impl ArenaSortableRecord {
             .zip(index_key_info.iter())
             .enumerate()
         {
-            let cmp = if let Some(Some(comparator)) = comparators.get(i) {
-                comparator(&self_val, &other_val).expect("Memory allocation failed here")
-            } else {
-                match (self_val, other_val) {
-                    (ValueRef::Text(left), ValueRef::Text(right)) => {
-                        key_info.collation.compare_strings(&left, &right)
-                    }
-                    _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
+            if let Some(Some(comparator)) = comparators.get(i) {
+                let cmp = comparator(&self_val, &other_val).expect("Memory allocation failed here");
+                if cmp != Ordering::Equal {
+                    return cmp;
                 }
             };
+
+            let cmp = compare_handling_nulls(&self_val, &other_val, key_info);
             if cmp != Ordering::Equal {
-                let involves_null =
-                    matches!(self_val, ValueRef::Null) || matches!(other_val, ValueRef::Null);
-                if involves_null {
-                    if let Some(nulls_order) = key_info.nulls_order {
-                        // ValueRef ordering: NULL < non-NULL.
-                        // NULLS FIRST: keep that natural order regardless of ASC/DESC.
-                        // NULLS LAST: reverse it regardless of ASC/DESC.
-                        return match nulls_order {
-                            turso_parser::ast::NullsOrder::First => cmp,
-                            turso_parser::ast::NullsOrder::Last => cmp.reverse(),
-                        };
-                    }
-                }
                 return match key_info.sort_order {
                     SortOrder::Asc => cmp,
                     SortOrder::Desc => cmp.reverse(),
                 };
             }
         }
+
         Ordering::Equal
     }
 }
@@ -1173,28 +1159,7 @@ mod tests {
     /// Reference single-column comparison replicating the full comparator's
     /// rules (SQL type ordering, ASC/DESC, NULLS FIRST/LAST, binary collation).
     fn reference_single_key_cmp(a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
-        let cmp = match (a, b) {
-            (ValueRef::Text(left), ValueRef::Text(right)) => {
-                key.collation.compare_strings(left, right)
-            }
-            _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-        };
-        if cmp != Ordering::Equal {
-            let involves_null = matches!(a, ValueRef::Null) || matches!(b, ValueRef::Null);
-            if involves_null {
-                if let Some(nulls_order) = key.nulls_order {
-                    return match nulls_order {
-                        turso_parser::ast::NullsOrder::First => cmp,
-                        turso_parser::ast::NullsOrder::Last => cmp.reverse(),
-                    };
-                }
-            }
-            return match key.sort_order {
-                SortOrder::Asc => cmp,
-                SortOrder::Desc => cmp.reverse(),
-            };
-        }
-        Ordering::Equal
+        compare_handling_nulls(a, b, key)
     }
 
     #[test]
