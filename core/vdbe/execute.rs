@@ -154,7 +154,7 @@ use crate::{
     json::jsonb_patch, json::jsonb_remove, json::jsonb_replace, json::jsonb_set, json::Conv,
 };
 
-use super::{make_record, Program, ProgramState, Register};
+use super::{Program, ProgramState, Register};
 
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
@@ -1399,9 +1399,12 @@ pub fn op_vfilter(
     let has_rows = {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_virtual_mut();
-        let mut args = Vec::with_capacity(*arg_count);
+        let mut args = Vec::new();
+        args.try_reserve(*arg_count)?;
         for i in 0..*arg_count {
-            args.push(state.registers[args_reg + i].get_value().clone());
+            let mut value = Value::Null;
+            value.try_clone_from(state.registers[args_reg + i].get_value())?;
+            args.push(value);
         }
         let idx_str = if let Some(idx_str) = idx_str {
             Some(state.registers[*idx_str].get_value().to_string())
@@ -1491,10 +1494,13 @@ pub fn op_vupdate(
             "VUpdate: arg_count must be at least 2 (rowid and insert_rowid)".to_string(),
         ));
     }
-    let mut argv = Vec::with_capacity(*arg_count);
+    let mut argv = Vec::new();
+    argv.try_reserve(*arg_count)?;
     for i in 0..*arg_count {
         if let Some(value) = state.registers.get(*start_reg + i) {
-            argv.push(value.get_value().clone());
+            let mut copy = Value::Null;
+            copy.try_clone_from(value.get_value())?;
+            argv.push(copy);
         } else {
             mark_unlikely();
             return Err(LimboError::InternalError(format!(
@@ -1655,14 +1661,14 @@ pub fn op_open_pseudo(
     load_insn!(
         OpenPseudo {
             cursor_id,
-            content_reg: _,
+            content_reg,
             num_fields: _,
         },
         insn
     );
     {
         let cursors = &mut state.cursors;
-        let cursor = PseudoCursor::default();
+        let cursor = PseudoCursor::new(*content_reg);
         cursors
             .get_mut(*cursor_id)
             .expect("cursor_id should be valid")
@@ -1963,14 +1969,25 @@ fn op_column_fetch(
             }
         }
         CursorType::Pseudo(_) => {
-            let cursor = crate::get_cursor!(state, cursor_id);
-            let cursor = cursor.as_pseudo_mut();
-            match cursor.record() {
-                Some(record) => {
+            let content_reg = crate::get_cursor!(state, cursor_id)
+                .as_pseudo_mut()
+                .content_reg();
+            // The record (content register) is read while decoding into the
+            // destination register, so the two must be distinct.
+            let [content, dest_reg] = state
+                .registers
+                .get_disjoint_mut([content_reg, dest])
+                .map_err(|_| {
+                    LimboError::InternalError(format!(
+                        "Column: pseudo-cursor content register {content_reg} and destination register {dest} must be distinct"
+                    ))
+                })?;
+            match content {
+                Register::Record(record) => {
                     // Decode straight into the register; going through an owned
                     // Value would allocate for every TEXT/BLOB column on every row.
                     let mut payload_iterator = record.iter()?;
-                    match payload_iterator.nth_into_register(column, &mut state.registers[dest]) {
+                    match payload_iterator.nth_into_register(column, dest_reg) {
                         Some(result) => result?,
                         // A pseudo cursor is opened with num_fields matching the
                         // record built for it, so every emitted Column index is in
@@ -1981,11 +1998,11 @@ fn op_column_fetch(
                                 "pseudo-cursor column out of range for record",
                                 { "column": column }
                             );
-                            state.registers[dest].set_null();
+                            dest_reg.set_null();
                         }
                     }
                 }
-                None => state.registers[dest].set_null(),
+                _ => dest_reg.set_null(),
             }
         }
         CursorType::IndexMethod(..) => {
@@ -2631,7 +2648,14 @@ pub fn op_reg_copy_offset(
             state.registers.len()
         )));
     }
-    state.registers[dest] = state.registers[*src].clone();
+    if dest != *src {
+        // try_clone_from reuses the destination register's allocation.
+        let [src, dst] = state
+            .registers
+            .get_disjoint_mut([*src, dest])
+            .expect("RegCopyOffset source and destination registers are distinct");
+        dst.try_clone_from(src)?;
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2814,7 +2838,18 @@ pub fn op_make_record(
         }
     }
 
-    let record = make_record(&state.registers, &start_reg, &count)?;
+    if dest_reg >= start_reg && dest_reg < start_reg + count {
+        return Err(LimboError::InternalError(format!(
+            "MakeRecord: destination register {dest_reg} overlaps its source range {start_reg}..{}",
+            start_reg + count
+        )));
+    }
+    // Serialize into the destination register's spent record buffer: per-row
+    // paths (sorter fills, INSERT loops) become allocation-free once the
+    // buffer has grown to the row size.
+    let buf = state.registers[dest_reg].take_buf();
+    let regs = &state.registers[start_reg..start_reg + count];
+    let record = ImmutableRecord::build_from_registers(regs, buf)?;
     state.registers[dest_reg] = Register::Record(record);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5071,6 +5106,9 @@ pub fn op_row_data(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RowData { cursor_id, dest }, insn);
 
+    // Copy the row into the destination register's spent record buffer: one
+    // payload copy, no allocation once the buffer has grown to the row size.
+    let buf = state.registers[*dest].take_buf();
     let record = {
         let cursor_ref = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "RowData");
         let cursor = cursor_ref.as_btree_mut();
@@ -5081,7 +5119,7 @@ pub fn op_row_data(
             LimboError::InternalError("RowData: cursor has no record".to_string())
         })?;
 
-        record.clone()
+        ImmutableRecord::copy_payload(record.get_payload(), buf)?
     };
 
     let reg = &mut state.registers[*dest];
@@ -6229,10 +6267,11 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
 /// - **ArrayAgg/Mode/PercentileCont/PercentileDisc**: buffer every input value by growing the
 ///   payload `Vec` (one push per row); the leading slots hold a running count and, for the
 ///   ordered-set aggregates, the collation / percentile fraction to use at finalize time.
+#[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::AggAccumulate)]
 fn update_agg_payload(
     func: &AggFunc,
-    arg: &Value,               // first argument
-    maybe_arg2: Option<Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
+    arg: &Value,                // first argument
+    maybe_arg2: Option<&Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut crate::alloc::Vec<Value>,
     collation: CollationSeq,
     comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
@@ -6407,7 +6446,7 @@ fn update_agg_payload(
                 return Ok(());
             }
             if matches!(payload[0], Value::Null) {
-                payload[0] = arg.clone();
+                payload[0].try_clone_from(arg)?;
                 return Ok(());
             }
             use std::cmp::Ordering;
@@ -6426,22 +6465,25 @@ fn update_agg_payload(
                 _ => false,
             };
             if should_update {
-                payload[0] = arg.clone();
+                payload[0].try_clone_from(arg)?;
             }
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             if matches!(arg, Value::Null) {
                 return Ok(());
             }
-            let delimiter = maybe_arg2.unwrap_or_else(|| Value::build_text(","));
             let acc = &mut payload[0];
             if matches!(acc, Value::Null) {
-                // First non-null value: convert to Text
-                *acc = Value::build_text(arg.to_string());
+                // First non-null value: start an empty Text accumulator; the
+                // arg is appended below with no intermediate String.
+                *acc = Value::build_text(String::new());
             } else {
-                acc.exec_group_concat(&delimiter);
-                acc.exec_group_concat(arg);
+                match maybe_arg2 {
+                    Some(delimiter) => acc.try_group_concat_push(delimiter)?,
+                    None => acc.try_group_concat_push(&Value::build_text(","))?,
+                }
             }
+            acc.try_group_concat_push(arg)?;
         }
         AggFunc::External(_) => {
             mark_unlikely();
@@ -6459,13 +6501,14 @@ fn update_agg_payload(
                 ));
             };
             let mut key_vec = convert_dbtype_to_raw_jsonb(arg, Conv::ToString)?;
-            let mut val_vec = convert_dbtype_to_raw_jsonb(&value, Conv::NotStrict)?;
+            let mut val_vec = convert_dbtype_to_raw_jsonb(value, Conv::NotStrict)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
                     "JsonGroupObject: payload[0] is not a blob".to_string(),
                 ));
             };
+            vec.try_reserve(usize::from(vec.is_empty()) + key_vec.len() + val_vec.len())?;
             if vec.is_empty() {
                 // bits for obj header
                 vec.push(12);
@@ -6480,7 +6523,7 @@ fn update_agg_payload(
                 LimboError::InternalError("array_agg count slot must be an integer".into())
             })? as usize;
             payload[0] = Value::from_i64((count + 1) as i64);
-            payload.push(arg.clone());
+            try_push_value_clone(payload, arg)?;
         }
         AggFunc::Mode => {
             // Record the value's collation (constant per group) for finalize-time sorting, then
@@ -6489,19 +6532,19 @@ fn update_agg_payload(
             if !matches!(arg, Value::Null) {
                 let count = payload[1].as_int().unwrap_or(0) as usize;
                 payload[1] = Value::from_i64((count + 1) as i64);
-                payload.push(arg.clone());
+                try_push_value_clone(payload, arg)?;
             }
         }
         AggFunc::PercentileCont | AggFunc::PercentileDisc => {
             payload[0] = Value::from_i64(collation.to_bits() as i64);
             // The fraction is a per-group constant; record it on every step.
             if let Some(fraction) = maybe_arg2 {
-                payload[2] = fraction;
+                payload[2].try_clone_from(fraction)?;
             }
             if !matches!(arg, Value::Null) {
                 let count = payload[1].as_int().unwrap_or(0) as usize;
                 payload[1] = Value::from_i64((count + 1) as i64);
-                payload.push(arg.clone());
+                try_push_value_clone(payload, arg)?;
             }
         }
         #[cfg(feature = "json")]
@@ -6514,12 +6557,23 @@ fn update_agg_payload(
                     "JsonGroupArray: payload[0] is not a blob".to_string(),
                 ));
             };
+            vec.try_reserve(usize::from(vec.is_empty()) + data.len())?;
             if vec.is_empty() {
                 vec.push(11); // bits for array header
             }
             vec.append(&mut data);
         }
     }
+    Ok(())
+}
+
+/// Fallibly appends a copy of `value` to `payload`, used by aggregates that
+/// buffer every input value (array_agg, mode, percentiles).
+fn try_push_value_clone(payload: &mut crate::alloc::Vec<Value>, value: &Value) -> Result<()> {
+    payload.try_reserve(1)?;
+    let mut copy = Value::Null;
+    copy.try_clone_from(value)?;
+    payload.push(copy);
     Ok(())
 }
 
@@ -6878,13 +6932,18 @@ fn op_window_step(
                 *captured != 0
             };
             if !already_captured {
-                let arg_value = state.registers[arg_reg].get_value().clone();
-                let Register::Aggregate(AggContext::Builtin(payload)) =
-                    &mut state.registers[acc_reg]
-                else {
+                let [arg_slot, acc_slot] = state
+                    .registers
+                    .get_disjoint_mut([arg_reg, acc_reg])
+                    .map_err(|_| {
+                        LimboError::InternalError(format!(
+                            "first_value: argument register {arg_reg} and accumulator register {acc_reg} must be distinct"
+                        ))
+                    })?;
+                let Register::Aggregate(AggContext::Builtin(payload)) = acc_slot else {
                     unreachable!("first_value accumulator must be a Builtin payload");
                 };
-                payload[0] = arg_value;
+                payload[0].try_clone_from(arg_slot.get_value())?;
                 let Value::Numeric(Numeric::Integer(captured)) = &mut payload[1] else {
                     unreachable!("first_value capture flag must be Integer");
                 };
@@ -6901,12 +6960,19 @@ fn op_window_step(
                 state.registers[acc_reg] =
                     Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![Value::Null]?));
             }
-            let arg_value = state.registers[arg_reg].get_value().clone();
-            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
-            else {
+            // try_clone_from reuses payload[0]'s allocation on every row.
+            let [arg_slot, acc_slot] = state
+                .registers
+                .get_disjoint_mut([arg_reg, acc_reg])
+                .map_err(|_| {
+                    LimboError::InternalError(format!(
+                        "last_value: argument register {arg_reg} and accumulator register {acc_reg} must be distinct"
+                    ))
+                })?;
+            let Register::Aggregate(AggContext::Builtin(payload)) = acc_slot else {
                 unreachable!("last_value accumulator must be a Builtin payload");
             };
-            payload[0] = arg_value;
+            payload[0].try_clone_from(arg_slot.get_value())?;
         }
         other => {
             return Err(LimboError::InternalError(format!(
@@ -7127,19 +7193,23 @@ pub fn op_agg_step(
             }
         }
         _ => {
-            // Second argument (delimiter for group_concat/json, fraction for percentiles),
-            let maybe_arg2 = match func {
-                AggFunc::GroupConcat | AggFunc::StringAgg => {
-                    Some(state.registers[*delimiter].get_value().clone())
-                }
+            // Second argument (delimiter for group_concat/json, fraction for
+            // percentiles), staged in a per-statement scratch Value so its
+            // buffer is reused across rows.
+            let uses_arg2 = match func {
+                AggFunc::GroupConcat | AggFunc::StringAgg => true,
                 #[cfg(feature = "json")]
-                AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-                    Some(state.registers[*delimiter].get_value().clone())
-                }
-                AggFunc::PercentileCont | AggFunc::PercentileDisc => {
-                    Some(state.registers[*delimiter].get_value().clone())
-                }
-                _ => None,
+                AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => true,
+                AggFunc::PercentileCont | AggFunc::PercentileDisc => true,
+                _ => false,
+            };
+            let maybe_arg2 = if uses_arg2 {
+                state
+                    .agg_arg2_scratch
+                    .try_clone_from(state.registers[*delimiter].get_value())?;
+                Some(&state.agg_arg2_scratch)
+            } else {
+                None
             };
 
             let [arg_reg, acc_slot] =
@@ -7370,23 +7440,40 @@ pub fn op_sorter_data(
         },
         insn
     );
-    let record = {
+    // Column ops on the pseudo cursor read the record through its content
+    // register, so the record moved into dest_reg is only visible to them if
+    // the translator paired the two registers.
+    {
+        let content_reg = state
+            .get_cursor(*pseudo_cursor)
+            .as_pseudo_mut()
+            .content_reg();
+        if content_reg != *dest_reg {
+            return Err(LimboError::InternalError(format!(
+                "SorterData: destination register {dest_reg} must be pseudo-cursor {pseudo_cursor}'s content register {content_reg}"
+            )));
+        }
+    }
+    {
         let cursor = state.get_cursor(*cursor_id);
-        let cursor = cursor.as_sorter_mut();
-        cursor.record().cloned()
-    };
-    let record = match record {
-        Some(record) => record,
-        None => {
+        if cursor.as_sorter_mut().record().is_none() {
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
-    };
-    state.registers[*dest_reg] = Register::Record(record.clone());
-    {
-        let pseudo_cursor = state.get_cursor(*pseudo_cursor);
-        pseudo_cursor.as_pseudo_mut().insert(record);
     }
+    // Move the record out of the sorter and into the content register with no
+    // allocation or payload copy; the register's spent buffer seeds the
+    // sorter's next row. Pseudo-cursor Column ops read the record through
+    // this register.
+    let buf = state.registers[*dest_reg].take_buf();
+    let record = {
+        let cursor = state.get_cursor(*cursor_id);
+        cursor
+            .as_sorter_mut()
+            .take_current(buf)
+            .expect("sorter record checked above")
+    };
+    state.registers[*dest_reg] = Register::Record(record);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -7999,15 +8086,14 @@ pub fn op_function(
             ScalarFunc::Cast => {
                 assert_eq!(arg_count, 2);
                 assert!(*start_reg + 1 < state.registers.len());
-                let reg_value_argument = state.registers[*start_reg].clone();
-                let Value::Text(reg_value_type) =
-                    state.registers[*start_reg + 1].get_value().clone()
-                else {
-                    unreachable!("Cast with non-text type");
+                let result = {
+                    let Value::Text(cast_type) = state.registers[*start_reg + 1].get_value() else {
+                        unreachable!("Cast with non-text type");
+                    };
+                    state.registers[*start_reg]
+                        .get_value()
+                        .exec_cast(cast_type.as_str())?
                 };
-                let result = reg_value_argument
-                    .get_value()
-                    .exec_cast(reg_value_type.as_str())?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Changes => {
@@ -11753,7 +11839,16 @@ pub fn op_copy(
         insn
     );
     for i in 0..=*extra_amount {
-        state.registers[*dst_reg + i] = state.registers[*src_reg + i].clone();
+        let (src, dst) = (*src_reg + i, *dst_reg + i);
+        if src == dst {
+            continue;
+        }
+        // try_clone_from reuses the destination register's allocation.
+        let [src, dst] = state
+            .registers
+            .get_disjoint_mut([src, dst])
+            .expect("Copy source and destination registers are distinct");
+        dst.try_clone_from(src)?;
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -15640,11 +15735,21 @@ pub fn op_hash_distinct(
         .get_mut(&data.hash_table_id)
         .expect("hash table exists");
 
+    // Stage the key values in a per-statement scratch Vec; try_clone_from
+    // reuses each slot's allocation across rows.
     let key_values = &mut state.distinct_key_values;
-    key_values.clear();
-    for i in 0..data.num_keys {
-        let reg = &state.registers[data.key_start_reg + i];
-        key_values.push(reg.get_value().clone());
+    if key_values.len() == data.num_keys {
+        for (i, dst) in key_values.iter_mut().enumerate() {
+            dst.try_clone_from(state.registers[data.key_start_reg + i].get_value())?;
+        }
+    } else {
+        key_values.clear();
+        key_values.try_reserve(data.num_keys)?;
+        for i in 0..data.num_keys {
+            let mut value = Value::Null;
+            value.try_clone_from(state.registers[data.key_start_reg + i].get_value())?;
+            key_values.push(value);
+        }
     }
 
     let mut key_refs: SmallVec<[ValueRef; 2]> = SmallVec::with_capacity(data.num_keys);
@@ -15689,12 +15794,14 @@ fn write_hash_payload_to_registers(
     entry: &HashEntry,
     payload_dest_reg: Option<usize>,
     num_payload: usize,
-) {
+) -> Result<()> {
     if let Some(dest_reg) = payload_dest_reg {
         for (i, value) in entry.payload_values.iter().take(num_payload).enumerate() {
-            registers[dest_reg + i].set_value(value.clone());
+            // try_clone_value_from reuses the destination register's allocation.
+            registers[dest_reg + i].try_clone_value_from(value)?;
         }
     }
+    Ok(())
 }
 
 pub fn op_hash_probe(
@@ -15826,7 +15933,7 @@ pub fn op_hash_probe(
                     entry,
                     payload_dest_reg,
                     num_payload,
-                );
+                )?;
                 state.active_op_state.clear();
                 state.pc += 1;
                 Ok(InsnFunctionStepResult::Step)
@@ -15847,7 +15954,7 @@ pub fn op_hash_probe(
                     entry,
                     payload_dest_reg,
                     num_payload,
-                );
+                )?;
                 state.active_op_state.clear();
                 state.pc += 1;
                 Ok(InsnFunctionStepResult::Step)
@@ -15890,7 +15997,7 @@ pub fn op_hash_next(
                 entry,
                 *payload_dest_reg,
                 *num_payload,
-            );
+            )?;
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
@@ -16055,7 +16162,7 @@ fn advance_unmatched_scan(
         match hash_table.next_unmatched() {
             Some(entry) => {
                 registers[dest_reg].set_int(entry.rowid);
-                write_hash_payload_to_registers(registers, entry, payload_dest_reg, num_payload);
+                write_hash_payload_to_registers(registers, entry, payload_dest_reg, num_payload)?;
                 *pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -17780,6 +17887,55 @@ mod tests {
         };
         assert!(matches!(err, LimboError::Constraint(message) if message == "datatype mismatch"));
         assert_eq!(state.pc, 0);
+    }
+
+    #[test]
+    fn test_make_record_overlapping_dest_returns_error() {
+        let stmt = prepare_test_statement();
+
+        let mut state = ProgramState::new(3, 0);
+        for i in 0..3 {
+            state.set_register(i, Register::Value(Value::from_i64(i as i64)));
+        }
+        let insn = Insn::MakeRecord {
+            start_reg: 0,
+            count: 3,
+            dest_reg: 1,
+            index_name: None,
+            affinity_str: None,
+        };
+
+        let err = match op_make_record(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+            Ok(_) => panic!("overlapping destination register must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, LimboError::InternalError(ref m) if m.contains("overlaps its source range")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_sorter_data_unpaired_content_register_returns_error() {
+        let stmt = prepare_test_statement();
+
+        // Pseudo cursor 1 exposes register 2, but SorterData targets register 3.
+        let mut state = ProgramState::new(4, 2);
+        state.cursors[1] = Some(Cursor::new_pseudo(crate::pseudo::PseudoCursor::new(2)));
+        let insn = Insn::SorterData {
+            cursor_id: 0,
+            dest_reg: 3,
+            pseudo_cursor: 1,
+        };
+
+        let err = match op_sorter_data(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+            Ok(_) => panic!("unpaired content register must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, LimboError::InternalError(ref m) if m.contains("content register")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

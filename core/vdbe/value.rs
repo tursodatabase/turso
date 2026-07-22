@@ -1399,6 +1399,44 @@ impl Value {
         text.value.to_mut().push_str(&other.to_string());
     }
 
+    /// Fallibly appends `other`, rendered as text, onto this Text
+    /// accumulator, growing the accumulator's buffer in place. Text sources
+    /// append directly without an intermediate String. Panics if self is not
+    /// a Text value.
+    pub fn try_group_concat_push(
+        &mut self,
+        other: &Value,
+    ) -> std::result::Result<(), crate::alloc::TryReserveError> {
+        let Value::Text(text) = self else {
+            panic!("group_concat accumulator must be a Text value");
+        };
+        let acc = match &mut text.value {
+            std::borrow::Cow::Owned(s) => s,
+            borrowed => {
+                let mut s = String::new();
+                s.try_reserve(borrowed.len())?;
+                s.push_str(borrowed);
+                *borrowed = std::borrow::Cow::Owned(s);
+                let std::borrow::Cow::Owned(s) = borrowed else {
+                    unreachable!("accumulator was just converted to Owned");
+                };
+                s
+            }
+        };
+        match other {
+            Value::Text(t) => {
+                acc.try_reserve(t.as_str().len())?;
+                acc.push_str(t.as_str());
+            }
+            other => {
+                let rendered = other.to_string();
+                acc.try_reserve(rendered.len())?;
+                acc.push_str(&rendered);
+            }
+        }
+        Ok(())
+    }
+
     pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
         let mut result = String::new();
         for val in registers {

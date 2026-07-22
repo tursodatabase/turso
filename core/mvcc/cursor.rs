@@ -13,10 +13,9 @@ use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
-    compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
-    SeekResult, Value,
+    compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, RecordBuf, SeekKey,
+    SeekOp, SeekResult, Value,
 };
-use crate::vdbe::make_record;
 use crate::vdbe::Register;
 use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
 use std::any::Any;
@@ -506,6 +505,9 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     tx_id: u64,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: Option<ImmutableRecord>,
+    /// Spent buffer recycled across [`Self::seek_unpacked`] calls so each
+    /// seek's key record reuses one allocation.
+    seek_record_buf: Option<RecordBuf>,
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
     creating_new_rowid: bool,
@@ -584,6 +586,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             current_pos: CursorPosition::BeforeFirst,
             table_id,
             reusable_immutable_record: None,
+            seek_record_buf: None,
             btree_cursor,
             null_flag: false,
             creating_new_rowid: false,
@@ -1486,8 +1489,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         registers: &[Register],
         op: SeekOp,
     ) -> Result<IOResult<SeekResult>> {
-        let record = make_record(registers, &0, &registers.len())?;
-        self.seek(SeekKey::IndexKey(record.as_record_ref()), op)
+        let buf = self.seek_record_buf.take().unwrap_or_else(RecordBuf::alloc);
+        let record = ImmutableRecord::build_from_registers(registers, buf)?;
+        let result = self.seek(SeekKey::IndexKey(record.as_record_ref()), op);
+        self.seek_record_buf = Some(record.retire());
+        result
     }
 
     fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {

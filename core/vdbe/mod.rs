@@ -73,7 +73,7 @@ use crate::sync::RwLock;
 use crate::{
     storage::pager::Pager,
     translate::plan::ResultSetColumn,
-    types::{AggContext, Cursor, ImmutableRecord, Value},
+    types::{AggContext, Cursor, ImmutableRecord, RecordBuf, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
 use crate::{
@@ -262,6 +262,61 @@ pub enum Register {
 }
 
 impl Register {
+    /// Takes the register's spent record buffer for reuse, leaving NULL.
+    /// Callers about to overwrite the register use this to recycle its
+    /// allocation instead of dropping it.
+    #[inline]
+    pub fn take_buf(&mut self) -> RecordBuf {
+        match std::mem::replace(self, Register::Value(Value::Null)) {
+            Register::Record(record) => record.retire(),
+            _ => RecordBuf::alloc(),
+        }
+    }
+
+    /// Fallibly copies `source` into this register, reusing the destination's
+    /// Value or record allocation when the variants match; see
+    /// [Value::try_clone_from].
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
+    pub fn try_clone_from(&mut self, source: &Self) -> crate::Result<()> {
+        match (self, source) {
+            (Register::Value(dst), Register::Value(src)) => dst.try_clone_from(src)?,
+            (Register::Record(dst), Register::Record(src)) => {
+                let buf = dst.as_blob_mut();
+                buf.clear();
+                buf.try_reserve(src.get_payload().len())?;
+                buf.extend_from_slice(src.get_payload());
+            }
+            (dst, Register::Value(src)) => {
+                let mut value = Value::Null;
+                value.try_clone_from(src)?;
+                *dst = Register::Value(value);
+            }
+            (dst, Register::Record(src)) => {
+                *dst = Register::Record(ImmutableRecord::copy_payload(
+                    src.get_payload(),
+                    RecordBuf::alloc(),
+                )?);
+            }
+            (dst, Register::Aggregate(src)) => *dst = Register::Aggregate(src.try_clone()?),
+        }
+        Ok(())
+    }
+
+    /// Fallibly sets the register to a copy of `val`, reusing the register's
+    /// existing allocation when possible; see [Value::try_clone_from].
+    #[inline]
+    pub fn try_clone_value_from(&mut self, val: &Value) -> crate::Result<()> {
+        match self {
+            Register::Value(v) => v.try_clone_from(val)?,
+            _ => {
+                let mut value = Value::Null;
+                value.try_clone_from(val)?;
+                *self = Register::Value(value);
+            }
+        }
+        Ok(())
+    }
+
     #[inline]
     pub const fn is_null(&self) -> bool {
         matches!(self, Register::Value(Value::Null))
@@ -760,6 +815,9 @@ pub struct ProgramState {
     pub explain_state: RwLock<ExplainState>,
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
+    /// Scratch for AggStep's second argument (delimiter/fraction), copied in
+    /// fallibly each row so its buffer is reused instead of allocating.
+    agg_arg2_scratch: Value,
     hash_tables: HashMap<usize, HashTable>,
     /// TempFile handles for ephemeral cursors, keyed by cursor_id.
     /// Dropping removes the temp file from disk.
@@ -846,6 +904,7 @@ impl ProgramState {
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
             distinct_key_values: Vec::new(),
+            agg_arg2_scratch: Value::Null,
             current_collation: None,
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
@@ -990,6 +1049,7 @@ impl ProgramState {
         self.is_active_write = false;
         self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
+        self.agg_arg2_scratch = Value::Null;
         self.attached_savepoint_pagers.clear();
         self.n_change.store(0, Ordering::SeqCst);
         self.n_total_change.store(0, Ordering::SeqCst);
@@ -2827,15 +2887,6 @@ impl Deref for Program {
     }
 }
 
-pub(crate) fn make_record(
-    registers: &[Register],
-    start_reg: &usize,
-    count: &usize,
-) -> Result<ImmutableRecord> {
-    let regs = &registers[*start_reg..*start_reg + *count];
-    ImmutableRecord::from_registers(regs, regs.len())
-}
-
 /// Split a register slice into an immutable ref and a mutable ref at two distinct indices.
 pub(crate) fn split_registers(
     registers: &mut [Register],
@@ -3244,6 +3295,117 @@ mod tests {
             OpInsertSubState::Seek
         ));
         assert!(matches!(state.seek_state, OpSeekState::MoveLast));
+    }
+
+    #[test]
+    fn register_try_clone_from_reuses_matching_allocations() {
+        use crate::types::Text;
+
+        // Value -> Value: the destination Text buffer is reused.
+        let src = Register::Value(Value::Text(Text::new(String::from("short"))));
+        let mut dst = Register::Value(Value::Text(Text::new(String::from(
+            "a destination string with plenty of capacity",
+        ))));
+        let ptr = match &dst {
+            Register::Value(Value::Text(t)) => t.as_str().as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Register::Value(Value::Text(t)) => assert_eq!(t.as_str().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        // Record -> Record: the destination payload buffer is reused.
+        let values = [Value::from_i64(1), Value::build_text("record payload")];
+        let src = Register::Record(
+            ImmutableRecord::from_registers(
+                &[
+                    Register::Value(values[0].clone()),
+                    Register::Value(values[1].clone()),
+                ],
+                2,
+            )
+            .unwrap(),
+        );
+        let big = [Value::build_text(
+            "a much longer record payload that dwarfs the source record",
+        )];
+        let mut dst = Register::Record(
+            ImmutableRecord::from_registers(&[Register::Value(big[0].clone())], 1).unwrap(),
+        );
+        let ptr = match &dst {
+            Register::Record(r) => r.get_payload().as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Register::Record(r) => assert_eq!(r.get_payload().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        // Aggregate source goes through the fallible clone.
+        let src = Register::Aggregate(AggContext::Builtin(crate::alloc::vec![
+            Value::build_text("agg state"),
+            Value::from_i64(2),
+        ]));
+        let mut dst = Register::Value(Value::Null);
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn register_take_buf_recycles_record_allocations() {
+        let values = [Register::Value(Value::build_text("some record payload"))];
+        let record = ImmutableRecord::from_registers(&values, 1).unwrap();
+        let capacity = record.as_blob().capacity();
+        let ptr = record.get_payload().as_ptr();
+
+        let mut reg = Register::Record(record);
+        let buf = reg.take_buf();
+        assert!(reg.is_null(), "take_buf leaves the register NULL");
+
+        // Building into the recycled buffer reuses the allocation.
+        let rebuilt = ImmutableRecord::build_from_registers(&values, buf).unwrap();
+        assert_eq!(rebuilt.as_blob().capacity(), capacity);
+        assert_eq!(rebuilt.get_payload().as_ptr(), ptr);
+
+        // Non-record registers hand out an empty buffer.
+        let mut reg = Register::Value(Value::from_i64(1));
+        let rebuilt = ImmutableRecord::build_from_registers(&values, reg.take_buf()).unwrap();
+        assert_eq!(
+            rebuilt.get_payload(),
+            ImmutableRecord::from_registers(&values, 1)
+                .unwrap()
+                .get_payload()
+        );
+    }
+
+    #[test]
+    fn register_try_clone_value_from_reuses_value_slot() {
+        let val = Value::build_text(String::from("payload"));
+        let mut reg = Register::Value(Value::Text(crate::types::Text::new(String::from(
+            "existing buffer with plenty of capacity to reuse",
+        ))));
+        let ptr = match &reg {
+            Register::Value(Value::Text(t)) => t.as_str().as_ptr(),
+            _ => unreachable!(),
+        };
+        reg.try_clone_value_from(&val).unwrap();
+        assert_eq!(reg, Register::Value(val.clone()));
+        match &reg {
+            Register::Value(Value::Text(t)) => assert_eq!(t.as_str().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        // A non-Value register is replaced by a fresh fallible copy.
+        let mut reg = Register::Record(
+            ImmutableRecord::from_registers(&[Register::Value(Value::from_i64(1))], 1).unwrap(),
+        );
+        reg.try_clone_value_from(&val).unwrap();
+        assert_eq!(reg, Register::Value(val));
     }
 }
 
