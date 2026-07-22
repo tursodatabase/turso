@@ -45,7 +45,9 @@ pub fn create_dbsp_state_index(
         columns.push(IndexColumn {
             name: name.clone(),
             order: *order,
-            collation: None,
+            // Key columns carry the defining query's comparison collation
+            // (see state_table_sql), and the index must compare the same way.
+            collation: state_table.columns()[pos_in_table].collation_opt(),
             pos_in_table,
             default: None,
             expr: None,
@@ -300,10 +302,7 @@ impl IncrementalView {
         // after btree pages were allocated and leaves stale in-memory schema
         // entries behind, which corrupts the database once those pages are
         // reused). The supported set grows as operator codegen lands.
-        let shape = crate::incremental::vdbe_maintenance::classify_view(select, schema, resolver)?;
-        crate::incremental::vdbe_maintenance::validate_collation_constraints(
-            select, &shape, schema,
-        )?;
+        crate::incremental::vdbe_maintenance::classify_view(select, schema, resolver)?;
         // Use the shared function to extract columns with full table context
         extract_view_columns(select, schema)
     }

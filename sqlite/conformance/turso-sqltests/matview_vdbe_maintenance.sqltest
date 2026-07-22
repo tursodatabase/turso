@@ -812,15 +812,136 @@ expect {
     back|2
 }
 
-# Internal state tables compare with binary collation, so grouping and
-# DISTINCT over collated keys would diverge from the defining query
-# (NOCASE merges 'a' and 'A'; a binary group key would not).
-test matview-vdbe-collated-group-key-rejected {
+# Hidden state tables carry the key's comparison collation, so grouping over
+# a collated column merges exactly like the defining query: NOCASE puts 'a'
+# and 'A' in one group, whose displayed key is the first-seen representative
+# (matching batch GROUP BY output), stable while the group survives.
+test matview-vdbe-collated-group-key {
     CREATE TABLE t34(g TEXT COLLATE NOCASE, x INTEGER);
-    CREATE MATERIALIZED VIEW bad34 AS SELECT g, COUNT(*) FROM t34 GROUP BY g;
+    INSERT INTO t34 VALUES ('a', 1), ('A', 2), ('b', 10);
+    CREATE MATERIALIZED VIEW v34 AS SELECT g, SUM(x) AS s FROM t34 GROUP BY g;
+    SELECT 'init', * FROM v34 ORDER BY g;
+    INSERT INTO t34 VALUES ('B', 5), ('c', 7);
+    SELECT 'grew', * FROM v34 ORDER BY g;
+    DELETE FROM t34 WHERE x IN (10, 5);
+    SELECT 'died', * FROM v34 ORDER BY g;
+}
+expect {
+    init|a|3
+    init|b|10
+    grew|a|3
+    grew|b|15
+    grew|c|7
+    died|a|3
+    died|c|7
+}
+
+# MIN/MAX and DISTINCT aggregates over a collated argument compare through
+# the multiset table's collated value column: case variants share one
+# multiset entry, so retracting one of them does not disturb the count or
+# the extreme.
+test matview-vdbe-collated-minmax-distinct {
+    CREATE TABLE t50(g TEXT COLLATE NOCASE);
+    INSERT INTO t50 VALUES ('a'), ('A'), ('b');
+    CREATE MATERIALIZED VIEW v50 AS SELECT MAX(g) AS mx, MIN(g) AS mn, COUNT(DISTINCT g) AS cd FROM t50;
+    SELECT 'init', * FROM v50;
+    DELETE FROM t50 WHERE g = 'b';
+    SELECT 'shrunk', * FROM v50;
+    DELETE FROM t50 WHERE rowid = 1;
+    SELECT 'variant', * FROM v50;
+    DELETE FROM t50;
+    SELECT 'empty', mx IS NULL, mn IS NULL, cd FROM v50;
+}
+expect {
+    init|b|a|2
+    shrunk|a|a|1
+    variant|a|a|1
+    empty|1|1|0
+}
+
+# An explicit COLLATE on a DISTINCT aggregate's argument is honored.
+test matview-vdbe-collated-distinct-explicit {
+    CREATE TABLE t51(a TEXT);
+    INSERT INTO t51 VALUES ('x'), ('X'), ('y');
+    CREATE MATERIALIZED VIEW v51 AS SELECT COUNT(DISTINCT a COLLATE NOCASE) AS cd FROM t51;
+    SELECT * FROM v51;
+    INSERT INTO t51 VALUES ('Y');
+    SELECT * FROM v51;
+}
+expect {
+    2
+    2
+}
+
+# SELECT DISTINCT over a collated column dedups under that collation.
+test matview-vdbe-collated-select-distinct {
+    CREATE TABLE t52(g TEXT COLLATE NOCASE);
+    INSERT INTO t52 VALUES ('a'), ('A'), ('b');
+    CREATE MATERIALIZED VIEW v52 AS SELECT DISTINCT g FROM t52;
+    SELECT * FROM v52 ORDER BY g;
+    DELETE FROM t52 WHERE rowid <= 2;
+    SELECT * FROM v52 ORDER BY g;
+}
+expect {
+    a
+    b
+    b
+}
+
+# UNION dedup keys take the left-most branch's collation, like compound
+# dedup indexes: a NOCASE left column merges case variants from both
+# branches.
+test matview-vdbe-collated-union {
+    CREATE TABLE t53(g TEXT COLLATE NOCASE);
+    CREATE TABLE t54(h TEXT);
+    INSERT INTO t53 VALUES ('a'), ('b');
+    INSERT INTO t54 VALUES ('A'), ('c');
+    CREATE MATERIALIZED VIEW v53 AS SELECT g FROM t53 UNION SELECT h FROM t54;
+    SELECT * FROM v53 ORDER BY 1;
+    DELETE FROM t53 WHERE g = 'a';
+    -- The row survives through t54's 'A'; the view keeps showing the stored
+    -- first-seen representative 'a'.
+    SELECT * FROM v53 ORDER BY 1;
+    DELETE FROM t54 WHERE h = 'A';
+    SELECT * FROM v53 ORDER BY 1;
+}
+expect {
+    a
+    b
+    c
+    a
+    b
+    c
+    b
+    c
+}
+
+# RTRIM group keys ignore trailing spaces, and the multiset table's group
+# prefix follows the same collation so MIN/MAX stay attached to their group.
+test matview-vdbe-collated-rtrim {
+    CREATE TABLE t55(p TEXT COLLATE RTRIM, q INTEGER);
+    INSERT INTO t55 VALUES ('m', 1), ('m  ', 2), ('n', 3);
+    CREATE MATERIALIZED VIEW v55 AS SELECT p, SUM(q) AS s, MAX(q) AS mx FROM t55 GROUP BY p;
+    SELECT * FROM v55 ORDER BY p;
+    DELETE FROM t55 WHERE q = 2;
+    SELECT * FROM v55 ORDER BY p;
+}
+expect {
+    m|3|2
+    n|3|3
+    m|1|1
+    n|3|3
+}
+
+# One multiset table stores every MIN/MAX and DISTINCT aggregate's values,
+# so its value column carries a single collation; aggregates whose arguments
+# compare under different collations are rejected.
+test matview-vdbe-collated-multiset-mismatch-rejected {
+    CREATE TABLE t56(a TEXT, b TEXT COLLATE NOCASE);
+    CREATE MATERIALIZED VIEW bad56 AS SELECT MIN(a), COUNT(DISTINCT b) FROM t56;
 }
 expect error {
-    materialized views with GROUP BY or DISTINCT over collated columns are not yet supported
+    materialized views with different collations across MIN/MAX or DISTINCT aggregate arguments are not yet supported
 }
 
 test matview-vdbe-distinct-over-aggregates-rejected {
