@@ -659,7 +659,6 @@ fn expand_join_output_exprs(
 /// During migration this runs on selects `classify_view` has already
 /// accepted, so it assumes validity and produces structure only; the CREATE
 /// gate's per-operator validation folds in here at cutover.
-#[allow(dead_code)] // wired in by the DAG codegen (next slice)
 pub fn build_dag(
     select: &ast::Select,
     schema: &Schema,
@@ -670,7 +669,6 @@ pub fn build_dag(
     Ok(builder.finish(root))
 }
 
-#[allow(dead_code)] // wired in by the DAG codegen (next slice)
 fn build_select(
     builder: &mut dag::DagBuilder,
     select: &ast::Select,
@@ -741,7 +739,6 @@ fn build_select(
     }))
 }
 
-#[allow(dead_code)] // wired in by the DAG codegen (next slice)
 fn build_select_core(
     builder: &mut dag::DagBuilder,
     one_select: &ast::OneSelect,
@@ -859,7 +856,6 @@ fn build_select_core(
 
 /// Build the FROM source: one [`dag::OpNode::Scan`] per table, combined by a
 /// [`dag::OpNode::Join`] when there is more than one. Returns the source node.
-#[allow(dead_code)] // wired in by the DAG codegen (next slice)
 fn build_source(
     builder: &mut dag::DagBuilder,
     from: &ast::FromClause,
@@ -892,7 +888,6 @@ fn build_source(
 }
 
 /// The output-column name for a projection, from an explicit alias only.
-#[allow(dead_code)] // wired in by the DAG codegen (next slice)
 fn projection_alias(alias: &Option<ast::As>) -> Option<String> {
     match alias {
         Some(ast::As::As(name) | ast::As::Elided(name)) => Some(name.as_str().to_string()),
@@ -1813,6 +1808,20 @@ pub fn compile_maintenance_program(
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<Program> {
+    let dag = build_dag_for_connection(select, schema, connection)?;
+    if dag_is_all_linear(&dag) {
+        return compile_dag_program(
+            view_name,
+            &dag,
+            view_root_page,
+            num_view_columns,
+            input,
+            output,
+            schema,
+            connection,
+        );
+    }
+
     match classify_view_for_connection(select, schema, connection)? {
         ViewShape::FilterProject => compile_filter_project_program(
             view_name,
@@ -1902,6 +1911,129 @@ pub fn compile_maintenance_program(
     }
 }
 
+/// [`build_dag`] with a transient resolver from a connection, mirroring
+/// [`classify_view_for_connection`].
+fn build_dag_for_connection(
+    select: &ast::Select,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<dag::MaintenanceDag> {
+    let syms = connection.syms.read();
+    let resolver = Resolver::new(
+        schema,
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        &syms,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        Arc::new(crate::dialect::SqliteDialect),
+    );
+    build_dag(select, schema, &resolver)
+}
+
+/// Whether every node is a `Scan`, `Filter`, or `Project`.
+fn dag_is_all_linear(dag: &dag::MaintenanceDag) -> bool {
+    dag.nodes.iter().all(|node| {
+        matches!(
+            node,
+            dag::OpNode::Scan { .. } | dag::OpNode::Filter { .. } | dag::OpNode::Project { .. }
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_dag_program(
+    view_name: &str,
+    dag: &dag::MaintenanceDag,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    output: MaintenanceOutput,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<Program> {
+    let mut program = ProgramBuilder::new_for_subprogram(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts {
+            num_cursors: 2,
+            approx_num_insns: 32 + 8 * num_view_columns,
+            approx_num_labels: 8,
+        },
+    );
+    program.prologue();
+    emit_linear_view(
+        &mut program,
+        view_name,
+        dag,
+        view_root_page,
+        num_view_columns,
+        input,
+        output,
+        schema,
+        connection,
+    )?;
+    program.epilogue(schema);
+    program.build(connection.clone(), false, "materialized view dag maintenance")
+}
+
+/// Emit an all-linear DAG (`Scan` -> `Filter`? -> `Project`) as the
+/// filter/project pipeline, feeding the base table, WHERE, and projection
+/// extracted from the nodes into the shared [`emit_filter_project`].
+#[allow(clippy::too_many_arguments)]
+fn emit_linear_view(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    dag: &dag::MaintenanceDag,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    output: MaintenanceOutput,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let pending = || {
+        LimboError::InternalError("non-linear operator DAG reached linear codegen".to_string())
+    };
+    let dag::OpNode::Project { input: proj_input, projections } = dag.root_node() else {
+        return Err(pending());
+    };
+    // The projection input is either the WHERE Filter or the Scan directly.
+    let (scan_id, where_clause): (dag::NodeId, Option<&ast::Expr>) = match &dag.nodes[*proj_input] {
+        dag::OpNode::Filter { input, predicate } => (*input, Some(predicate)),
+        dag::OpNode::Scan { .. } => (*proj_input, None),
+        _ => return Err(pending()),
+    };
+    let dag::OpNode::Scan { table, identifier } = &dag.nodes[scan_id] else {
+        return Err(pending());
+    };
+    let columns: Vec<ast::ResultColumn> = projections
+        .iter()
+        .map(|(expr, alias)| {
+            ast::ResultColumn::Expr(
+                Box::new(expr.clone()),
+                alias.clone().map(|name| ast::As::As(ast::Name::exact(name))),
+            )
+        })
+        .collect();
+    emit_filter_project(
+        program,
+        view_name,
+        table,
+        identifier,
+        &columns,
+        where_clause,
+        view_root_page,
+        num_view_columns,
+        input,
+        output,
+        &BranchNamespace::none(),
+        schema,
+        connection,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_filter_project_program(
     view_name: &str,
@@ -1924,7 +2056,7 @@ fn compile_filter_project_program(
         },
     );
     program.prologue();
-    emit_filter_project(
+    emit_filter_project_from_select(
         &mut program,
         view_name,
         select,
@@ -1940,7 +2072,11 @@ fn compile_filter_project_program(
     program.build(connection.clone(), false, "materialized view maintenance")
 }
 
-fn emit_filter_project(
+/// Extract a single-table filter/project view's base table, WHERE, and
+/// projection from its `SELECT` and emit the pipeline. The `select`-reading
+/// adapter over [`emit_filter_project`].
+#[allow(clippy::too_many_arguments)]
+fn emit_filter_project_from_select(
     program: &mut ProgramBuilder,
     view_name: &str,
     select: &ast::Select,
@@ -1967,7 +2103,6 @@ fn emit_filter_project(
     let ast::SelectTable::Table(base_name, base_alias, _) = from.select.as_ref() else {
         unreachable!("validate_vdbe_maintainable admits only plain tables in FROM");
     };
-
     let base_table = schema
         .get_btree_table(base_name.name.as_str())
         .ok_or_else(|| {
@@ -1976,6 +2111,49 @@ fn emit_filter_project(
                 base_name.name.as_str()
             ))
         })?;
+    let identifier = match base_alias {
+        Some(ast::As::As(name) | ast::As::Elided(name) | ast::As::ImplicitColumnName(name)) => {
+            name.as_str().to_string()
+        }
+        None => base_table.name.clone(),
+    };
+    emit_filter_project(
+        program,
+        view_name,
+        &base_table,
+        &identifier,
+        columns,
+        where_clause.as_deref(),
+        view_root_page,
+        num_view_columns,
+        input,
+        output,
+        ns,
+        schema,
+        connection,
+    )
+}
+
+// A single-table filter/project maintenance pipeline. Parameterized on its
+// base table and its WHERE/projection so it serves both the standalone
+// filter/project view (via `emit_filter_project_from_select`) and the DAG
+// codegen's linear pipeline (a `Scan` → `Filter`? → `Project` chain).
+#[allow(clippy::too_many_arguments)]
+fn emit_filter_project(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    base_table: &Arc<BTreeTable>,
+    identifier: &str,
+    columns: &[ast::ResultColumn],
+    where_clause: Option<&ast::Expr>,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    output: MaintenanceOutput,
+    ns: &BranchNamespace,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<()> {
     let num_base_columns = base_table.columns().len();
 
     let syms = connection.syms.read();
@@ -1994,12 +2172,6 @@ fn emit_filter_project(
     // projection expressions resolve exactly as they would in the defining
     // query. The alias (if any) from the view definition is preserved.
     let table_ref_id = program.table_reference_counter.next();
-    let identifier = match base_alias {
-        Some(ast::As::As(name) | ast::As::Elided(name) | ast::As::ImplicitColumnName(name)) => {
-            name.as_str().to_string()
-        }
-        None => base_table.name.clone(),
-    };
     let mut table_references = TableReferences::new(
         vec![JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -2007,7 +2179,7 @@ fn emit_filter_project(
                 index: None,
             }),
             table: crate::schema::Table::BTree(base_table.clone()),
-            identifier,
+            identifier: identifier.to_string(),
             internal_id: table_ref_id,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -2100,7 +2272,7 @@ fn emit_filter_project(
 
     // WHERE: rows whose predicate is FALSE or NULL do not belong to the view.
     if let Some(where_expr) = where_clause {
-        let mut bound = where_expr.as_ref().clone();
+        let mut bound = where_expr.clone();
         bind_and_rewrite_expr(
             &mut bound,
             Some(&mut table_references),
@@ -6422,7 +6594,7 @@ fn compile_compound_all_program(
         };
         let branch = branch_select(select, branch_idx);
         match sub {
-            ViewShape::FilterProject => emit_filter_project(
+            ViewShape::FilterProject => emit_filter_project_from_select(
                 &mut program,
                 view_name,
                 &branch,
