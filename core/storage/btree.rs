@@ -1032,6 +1032,37 @@ impl BTreeNodeState {
     }
 }
 
+/// Verification-only projection of a `BTreeCursor`'s descent position.
+///
+/// A generous-payload snapshot of the cursor's page stack: the raw
+/// `node_states` at each live level plus the per-level page id, `root_page`,
+/// and the `going_upwards` flag. Exposed to the differential-testing harness
+/// via the `expose_pub` accessor `inspect_cursor_position` so downstream
+/// cursor-slice design changes never force a fork revision.
+#[cfg(feature = "aristo-instr")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BTreeCursorPosition {
+    pub root_page: i64,
+    pub going_upwards: bool,
+    /// One entry per live stack level (root at index 0), each
+    /// `(page_id, cell_idx, cell_count)`.
+    pub levels: Vec<(i64, i32, Option<i32>)>,
+    /// Mirror of `iteration_pending_descent`: `None`, or `Some((is_forwards,
+    /// target_page))` — the in-flight descent recorded on an IO-yield so the
+    /// traversal loop resumes without re-mutating the cell index. Lets the
+    /// harness observe the short-circuited descent-resume path.
+    pub pending_descent: Option<(bool, i64)>,
+    /// saveAllCursors registry participation (#7341). `has_peers` mirrors
+    /// SQLite's BTCF_Multiple (another cursor is registered on this root);
+    /// `did_register` is true iff this cursor entered the pager registry.
+    pub has_peers: bool,
+    pub did_register: bool,
+    /// `context.is_some()` — a seek context is saved, i.e. the cursor will
+    /// re-seek after an external (peer) balance. The restore-side observable
+    /// of the saveAllCursors save/restore pass.
+    pub context_saved: bool,
+}
+
 impl BTreeCursor {
     pub fn new(pager: Arc<Pager>, root_page: i64, _num_columns: usize) -> Self {
         let valid_state = if root_page == 1 && !pager.db_initialized() {
@@ -1090,6 +1121,43 @@ impl BTreeCursor {
     pub(crate) fn install_yield_context(&mut self, connection: &crate::Connection) {
         self.yield_injector = connection.yield_injector();
         self.yield_instance_id = connection.next_yield_instance_id();
+    }
+
+    /// Verification-only snapshot of the cursor's current descent position.
+    /// Walks the live page stack (`0..=current_page`), reading each level's
+    /// page id from `stack[i]` and its `node_states[i]`, and pairs that with
+    /// `root_page` and `going_upwards`. Exposed publicly through `expose_pub`
+    /// as `inspect_cursor_position` for the differential-testing harness.
+    #[cfg(feature = "aristo-instr")]
+    #[aristo::instrument::expose_pub(as = "inspect_cursor_position")]
+    fn cursor_position(&self) -> BTreeCursorPosition {
+        let stack = &self.stack;
+        let mut levels = Vec::new();
+        if stack.current_page >= 0 {
+            for i in 0..=stack.current_page as usize {
+                let page_id = stack.stack[i]
+                    .as_ref()
+                    .map(|page| page.get().id as i64)
+                    .unwrap_or(-1);
+                let node_state = stack.node_states[i];
+                levels.push((page_id, node_state.cell_idx, node_state.cell_count));
+            }
+        }
+        let pending_descent = self.iteration_pending_descent.map(|d| match d {
+            IterationPendingDescent::Forwards(t) => (true, t),
+            IterationPendingDescent::Backwards(t) => (false, t),
+        });
+        BTreeCursorPosition {
+            root_page: self.root_page,
+            going_upwards: self.going_upwards,
+            levels,
+            pending_descent,
+            has_peers: self.has_peers.load(crate::sync::atomic::Ordering::Relaxed),
+            did_register: self
+                .did_register
+                .load(crate::sync::atomic::Ordering::Relaxed),
+            context_saved: self.context.is_some(),
+        }
     }
 
     pub fn new_table(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
