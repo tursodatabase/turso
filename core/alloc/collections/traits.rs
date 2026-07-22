@@ -119,6 +119,14 @@ pub trait TryClone: Sized {
     type Error;
 
     fn try_clone(&self) -> Result<Self, Self::Error>;
+
+    /// Replaces `self` with a fallible clone of `source`.
+    ///
+    /// Implementors can override this to reuse owned resources.
+    fn try_clone_from(&mut self, source: &Self) -> Result<(), Self::Error> {
+        *self = source.try_clone()?;
+        Ok(())
+    }
 }
 
 /// Forward `TryClone` to `Clone` for element types whose clone either cannot
