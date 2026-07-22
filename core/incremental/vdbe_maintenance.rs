@@ -782,6 +782,39 @@ fn build_select_core(
         }
     }
 
+    // DISTINCT is GROUP BY every output column, kept alive by a hidden
+    // COUNT(*): synthesize that grouping and route it through the aggregate
+    // operator, exactly as the classifier does. DISTINCT over an aggregate
+    // query or an outer join is not incrementally maintainable.
+    let distinct_columns;
+    let distinct_group_by;
+    let (columns, group_by): (&[ast::ResultColumn], &Option<ast::GroupBy>) =
+        if matches!(distinctness, Some(ast::Distinctness::Distinct)) {
+            if has_aggregates {
+                return unsupported("DISTINCT over aggregates");
+            }
+            let left_outer = from.joins.iter().any(|join| {
+                matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(ast::JoinType::LEFT))
+            });
+            if left_outer {
+                return unsupported("DISTINCT over outer joins");
+            }
+            let group_exprs = expand_join_output_exprs(from, schema, columns, resolver)?;
+            distinct_columns = group_exprs
+                .iter()
+                .cloned()
+                .map(|expr| ast::ResultColumn::Expr(Box::new(expr), None))
+                .collect::<Vec<_>>();
+            distinct_group_by = Some(ast::GroupBy {
+                exprs: group_exprs.into_iter().map(Box::new).collect(),
+                having: None,
+            });
+            has_aggregates = true;
+            (&distinct_columns, &distinct_group_by)
+        } else {
+            (columns.as_slice(), group_by)
+        };
+
     if has_aggregates {
         let base_tables: Vec<Arc<BTreeTable>> = std::iter::once(from.select.as_ref())
             .chain(from.joins.iter().map(|join| join.table.as_ref()))
@@ -845,10 +878,6 @@ fn build_select_core(
             input: node,
             projections,
         });
-    }
-
-    if matches!(distinctness, Some(ast::Distinctness::Distinct)) {
-        node = builder.push(dag::OpNode::Distinct { input: node });
     }
 
     Ok(node)
