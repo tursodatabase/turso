@@ -2666,11 +2666,14 @@ impl JoinedTable {
         let Table::BTree(btree) = &self.table else {
             return false;
         };
-        if self.col_used_mask.is_empty() {
-            return false;
-        }
         if index.index_method.is_some() {
             return false;
+        }
+        if self.col_used_mask.is_empty() {
+            // With no referenced columns, a complete index can provide the row-producing
+            // scan without opening the table. Partial-index completeness depends on the
+            // query predicate, so keep this path conservative.
+            return index.where_clause.is_none();
         }
 
         if self.expression_index_usages.is_empty() {

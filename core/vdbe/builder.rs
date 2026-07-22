@@ -1787,9 +1787,12 @@ impl ProgramBuilder {
         self.table_references.contains_table(table)
     }
 
-    /// Returns true if the cursor is a BTreeTable cursor.
+    /// Returns true if the cursor is backed by a table or index B-tree.
     pub fn cursor_is_btree(&self, cursor_id: CursorID) -> bool {
-        matches!(self.cursor_ref[cursor_id].1, CursorType::BTreeTable(_))
+        matches!(
+            self.cursor_ref[cursor_id].1,
+            CursorType::BTreeTable(_) | CursorType::BTreeIndex(_)
+        )
     }
 
     /// Returns the BTreeTable for the given cursor, if it is a BTreeTable cursor.

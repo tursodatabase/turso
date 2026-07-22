@@ -1555,6 +1555,14 @@ fn test_cdc_drop_table_cleans_up_version(db: TempDatabase) {
     // Version entry should be cleaned up
     let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM turso_cdc_version");
     assert_eq!(rows, vec![vec![Value::Integer(0)]]);
+
+    // The cleanup must remove the primary-key index entry as well as the table row.
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT COUNT(*) FROM turso_cdc_version \
+         INDEXED BY sqlite_autoindex_turso_cdc_version_1",
+    );
+    assert_eq!(rows, vec![vec![Value::Integer(0)]]);
 }
 
 // ============================================================================
