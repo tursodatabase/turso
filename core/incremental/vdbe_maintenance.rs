@@ -267,6 +267,39 @@ pub enum ViewShape {
         /// group death.
         scalar: bool,
     },
+    /// A pure UNION ALL whose branches are not all plain filter/project — at
+    /// least one is a join or aggregate. UNION ALL branches are independent
+    /// bags, so each is maintained by its own sub-program writing a disjoint
+    /// rowid slice (`local * n_branches + branch_idx`) of the shared view
+    /// btree, with its own hidden state tables suffixed `__b<idx>`. There is
+    /// no cross-branch merge. (Pure UNION ALL over only filter/project
+    /// branches, and any chain with a deduplicating operator, use
+    /// [`ViewShape::Compound`] instead.)
+    CompoundAll {
+        /// Per-branch maintainable sub-shape, in chain order. Each is one of
+        /// FilterProject, Join, or GroupAggregate.
+        branch_shapes: Vec<ViewShape>,
+    },
+}
+
+/// Build the standalone single-`SELECT` view for one branch of a compound
+/// `SELECT`, so it can be classified and compiled with the ordinary
+/// per-shape machinery.
+fn branch_select(select: &ast::Select, branch_idx: usize) -> ast::Select {
+    let one = if branch_idx == 0 {
+        select.body.select.clone()
+    } else {
+        select.body.compounds[branch_idx - 1].select.clone()
+    };
+    ast::Select {
+        with: None,
+        body: ast::SelectBody {
+            select: one,
+            compounds: Vec::new(),
+        },
+        order_by: Vec::new(),
+        limit: None,
+    }
 }
 
 fn unsupported<T>(what: &str) -> Result<T> {
@@ -641,6 +674,57 @@ pub fn classify_view(
     if !select.body.compounds.is_empty() {
         let operators: Vec<ast::CompoundOperator> =
             select.body.compounds.iter().map(|c| c.operator).collect();
+
+        // A pure UNION ALL whose branches are not all plain filter/project
+        // is maintained as independent per-branch sub-views (no dedup, no
+        // cross-branch merge). Classify each branch with the ordinary
+        // per-shape machinery; if any is a join or aggregate, this is a
+        // CompoundAll. Filter/project-only chains (and any chain with a
+        // deduplicating operator) fall through to the Compound path below.
+        let n_branches = operators.len() + 1;
+        if operators
+            .iter()
+            .all(|op| *op == ast::CompoundOperator::UnionAll)
+        {
+            let mut branch_shapes = Vec::with_capacity(n_branches);
+            let mut arity: Option<usize> = None;
+            for branch_idx in 0..n_branches {
+                let branch = branch_select(select, branch_idx);
+                let branch_arity = crate::util::extract_view_columns(&branch, schema)?
+                    .columns
+                    .len();
+                if *arity.get_or_insert(branch_arity) != branch_arity {
+                    return Err(LimboError::ParseError(format!(
+                        "SELECTs to the left and right of {} do not have the same number of result columns",
+                        operators[branch_idx - 1],
+                    )));
+                }
+                let shape = classify_view(&branch, schema, resolver)?;
+                match &shape {
+                    ViewShape::FilterProject | ViewShape::GroupAggregate { .. } => {}
+                    ViewShape::Join { left_outer, .. } => {
+                        if *left_outer {
+                            // A LEFT-join branch would need both the rowid
+                            // split (inner vs padded) and the branch
+                            // namespace, which the view-rowid transform does
+                            // not compose.
+                            return unsupported("LEFT JOIN branches in a UNION ALL");
+                        }
+                    }
+                    ViewShape::Compound { .. } | ViewShape::CompoundAll { .. } => {
+                        return unsupported("compound SELECTs nested in a UNION ALL branch");
+                    }
+                }
+                branch_shapes.push(shape);
+            }
+            if branch_shapes
+                .iter()
+                .any(|s| !matches!(s, ViewShape::FilterProject))
+            {
+                return Ok(ViewShape::CompoundAll { branch_shapes });
+            }
+        }
+
         // Branches up to and including the right side of the last
         // deduplicating operator are content-keyed: any later UNION ALL
         // appends its rows with multiplicity preserved, while a UNION ALL
@@ -1149,10 +1233,69 @@ pub fn classify_view_for_connection(
 
 /// Whether the view keeps a hidden internal state table.
 pub fn needs_state_table(shape: &ViewShape) -> bool {
+    // CompoundAll has no single view-level state table; each branch's tables
+    // are enumerated by [`hidden_tables`].
     matches!(
         shape,
         ViewShape::GroupAggregate { .. } | ViewShape::Join { .. } | ViewShape::Compound { .. }
     )
+}
+
+/// A hidden state/multiset table a view needs, fully named with its CREATE
+/// SQL. The single source of truth for the DDL the CREATE program emits.
+pub struct HiddenTableDef {
+    pub table_name: String,
+    pub create_sql: String,
+}
+
+/// Enumerate every hidden table a view needs, in creation order. A
+/// non-compound view has at most a state table and a multiset table (empty
+/// branch suffix). A CompoundAll view has none of its own — it enumerates
+/// each branch's tables under that branch's `__b<idx>` suffix, matching the
+/// names the branch sub-programs look up.
+pub fn hidden_tables(view_name: &str, shape: &ViewShape) -> Result<Vec<HiddenTableDef>> {
+    fn tables_for(
+        view_name: &str,
+        suffix: &str,
+        shape: &ViewShape,
+        out: &mut Vec<HiddenTableDef>,
+    ) -> Result<()> {
+        use crate::incremental::view::DBSP_CIRCUIT_VERSION;
+        if needs_state_table(shape) {
+            let table_name = format!(
+                "{}{DBSP_CIRCUIT_VERSION}_{view_name}{suffix}",
+                crate::schema::DBSP_TABLE_PREFIX,
+            );
+            let create_sql = state_table_sql(&table_name, shape)?;
+            out.push(HiddenTableDef {
+                table_name,
+                create_sql,
+            });
+        }
+        if needs_multiset_table(shape) {
+            let table_name = format!(
+                "{}{DBSP_CIRCUIT_VERSION}_{view_name}{suffix}",
+                crate::schema::DBSP_MULTISET_TABLE_PREFIX,
+            );
+            let create_sql = multiset_table_sql(&table_name, shape)?;
+            out.push(HiddenTableDef {
+                table_name,
+                create_sql,
+            });
+        }
+        Ok(())
+    }
+
+    let mut out = Vec::new();
+    match shape {
+        ViewShape::CompoundAll { branch_shapes } => {
+            for (idx, sub) in branch_shapes.iter().enumerate() {
+                tables_for(view_name, &format!("__b{idx}"), sub, &mut out)?;
+            }
+        }
+        _ => tables_for(view_name, "", shape, &mut out)?,
+    }
+    Ok(out)
 }
 
 /// The CREATE TABLE statement for a view's internal state table.
@@ -1238,8 +1381,8 @@ pub fn state_table_sql(state_table_name: &str, shape: &ViewShape) -> Result<Stri
                 key.join(", ")
             ))
         }
-        ViewShape::FilterProject => Err(LimboError::InternalError(
-            "filter/project views have no state table".to_string(),
+        ViewShape::FilterProject | ViewShape::CompoundAll { .. } => Err(LimboError::InternalError(
+            "this view shape has no single state table".to_string(),
         )),
     }
 }
@@ -1334,6 +1477,76 @@ fn collate_clause(collation: CollationSeq) -> String {
 /// `view_root_page` is the root of the view's data btree; `view_columns` are
 /// the view's output columns (the on-disk record is these plus a trailing
 /// weight column).
+
+/// How a branch of a compound view maps its local view rowids into the
+/// shared view btree, and how its hidden state tables are named apart from
+/// sibling branches. The standalone identity ([`BranchNamespace::none`],
+/// scale 1 / offset 0 / empty suffix) leaves the local rowid register
+/// untouched, so a standalone view generates byte-identical bytecode.
+#[derive(Clone)]
+struct BranchNamespace {
+    /// Local rowid `r` maps to view rowid `r * scale + offset`; branches of
+    /// an N-branch compound use `scale = N`, `offset = branch index`, so
+    /// their rowid ranges are disjoint.
+    scale: i64,
+    offset: i64,
+    /// Appended to the view name when forming this branch's hidden-table
+    /// names, keeping each branch's state tables distinct.
+    suffix: String,
+}
+
+impl BranchNamespace {
+    fn none() -> Self {
+        Self {
+            scale: 1,
+            offset: 0,
+            suffix: String::new(),
+        }
+    }
+
+    fn is_identity(&self) -> bool {
+        self.scale == 1 && self.offset == 0
+    }
+
+    /// Emit the view rowid for `local_reg`. Returns `local_reg` unchanged for
+    /// the identity namespace (no instructions); otherwise emits
+    /// `local * scale + offset` into a fresh register and returns it.
+    fn emit_view_rowid(&self, program: &mut ProgramBuilder, local_reg: usize) -> usize {
+        if self.is_identity() {
+            return local_reg;
+        }
+        let dst = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: local_reg,
+            dst_reg: dst,
+            extra_amount: 0,
+        });
+        self.apply_in_place(program, dst);
+        dst
+    }
+
+    /// Map `reg` from a local view rowid to this branch's view rowid in
+    /// place. A no-op for the identity namespace.
+    fn apply_in_place(&self, program: &mut ProgramBuilder, reg: usize) {
+        if self.is_identity() {
+            return;
+        }
+        let scratch = program.alloc_register();
+        program.emit_int(self.scale, scratch);
+        program.emit_insn(Insn::Multiply {
+            lhs: reg,
+            rhs: scratch,
+            dest: reg,
+        });
+        program.emit_int(self.offset, scratch);
+        program.emit_insn(Insn::Add {
+            lhs: reg,
+            rhs: scratch,
+            dest: reg,
+        });
+    }
+}
+
 /// Compile the maintenance (or population) program for a materialized view,
 /// dispatching on its classified shape.
 #[allow(clippy::too_many_arguments)]
@@ -1355,6 +1568,7 @@ pub fn compile_maintenance_program(
             num_view_columns,
             input,
             output,
+            &BranchNamespace::none(),
             schema,
             connection,
         ),
@@ -1372,6 +1586,7 @@ pub fn compile_maintenance_program(
                 view_root_page,
                 num_view_columns,
                 input,
+                &BranchNamespace::none(),
                 schema,
                 connection,
             )
@@ -1390,6 +1605,7 @@ pub fn compile_maintenance_program(
                 view_root_page,
                 num_view_columns,
                 input,
+                &BranchNamespace::none(),
                 schema,
                 connection,
             )
@@ -1412,6 +1628,24 @@ pub fn compile_maintenance_program(
                 connection,
             )
         }
+        shape @ ViewShape::CompoundAll { .. } => {
+            if matches!(output, MaintenanceOutput::EmitRows) {
+                return Err(LimboError::InternalError(
+                    "compound views serve uncommitted reads by recomputing the defining query"
+                        .to_string(),
+                ));
+            }
+            compile_compound_all_program(
+                view_name,
+                select,
+                &shape,
+                view_root_page,
+                num_view_columns,
+                input,
+                schema,
+                connection,
+            )
+        }
     }
 }
 
@@ -1423,9 +1657,48 @@ fn compile_filter_project_program(
     num_view_columns: usize,
     input: MaintenanceInput,
     output: MaintenanceOutput,
+    ns: &BranchNamespace,
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<Program> {
+    let mut program = ProgramBuilder::new_for_subprogram(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts {
+            num_cursors: 2,
+            approx_num_insns: 32 + 8 * num_view_columns,
+            approx_num_labels: 8,
+        },
+    );
+    program.prologue();
+    emit_filter_project(
+        &mut program,
+        view_name,
+        select,
+        view_root_page,
+        num_view_columns,
+        input,
+        output,
+        ns,
+        schema,
+        connection,
+    )?;
+    program.epilogue(schema);
+    program.build(connection.clone(), false, "materialized view maintenance")
+}
+
+fn emit_filter_project(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    select: &ast::Select,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    output: MaintenanceOutput,
+    ns: &BranchNamespace,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<()> {
     let ast::OneSelect::Select {
         columns,
         from,
@@ -1451,17 +1724,6 @@ fn compile_filter_project_program(
             ))
         })?;
     let num_base_columns = base_table.columns().len();
-
-    let mut program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts {
-            num_cursors: 2,
-            approx_num_insns: 32 + 8 * num_view_columns,
-            approx_num_labels: 8,
-        },
-    );
-    program.prologue();
 
     let syms = connection.syms.read();
     let resolver = Resolver::new(
@@ -1595,7 +1857,7 @@ fn compile_filter_project_program(
         )?;
         let pred_true = program.allocate_label();
         translate_condition_expr(
-            &mut program,
+            program,
             &table_references,
             &bound,
             ConditionMetadata {
@@ -1632,7 +1894,7 @@ fn compile_filter_project_program(
                     BindingBehavior::ResultColumnsNotAllowed,
                 )?;
                 translate_expr_no_constant_opt(
-                    &mut program,
+                    program,
                     Some(&table_references),
                     &bound,
                     out_reg,
@@ -1685,9 +1947,13 @@ fn compile_filter_project_program(
             let zero_reg = program.alloc_register();
             program.emit_int(0, zero_reg);
 
+            // The view key namespaces the source rowid into this branch's
+            // slice of a shared compound btree (identity for a standalone
+            // view).
+            let view_key_reg = ns.emit_view_rowid(program, rowid_reg);
             program.emit_insn(Insn::SeekRowid {
                 cursor_id: view_cursor_id,
-                src_reg: rowid_reg,
+                src_reg: view_key_reg,
                 target_pc: notfound_label,
             });
             program.emit_insn(Insn::Column {
@@ -1749,7 +2015,7 @@ fn compile_filter_project_program(
             });
             program.emit_insn(Insn::Insert {
                 cursor: view_cursor_id,
-                key_reg: rowid_reg,
+                key_reg: view_key_reg,
                 record_reg,
                 flag: InsertFlags(
                     InsertFlags::REQUIRE_SEEK
@@ -1768,9 +2034,8 @@ fn compile_filter_project_program(
     });
     program.preassign_label_to_next_insn(end_label);
 
-    program.epilogue(schema);
     drop(syms);
-    program.build(connection.clone(), false, "materialized view maintenance")
+    Ok(())
 }
 
 /// Compile the maintenance (or population) program for a GROUP BY view with
@@ -1804,9 +2069,53 @@ fn compile_group_aggregate_program(
     view_root_page: i64,
     num_view_columns: usize,
     input: MaintenanceInput,
+    ns: &BranchNamespace,
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<Program> {
+    let mut program = ProgramBuilder::new_for_subprogram(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts {
+            num_cursors: 4,
+            // Instruction/label counts are capacity hints only.
+            approx_num_insns: 128 + 32 * num_view_columns,
+            approx_num_labels: 32,
+        },
+    );
+    program.prologue();
+    emit_group_aggregate(
+        &mut program,
+        view_name,
+        select,
+        shape,
+        view_root_page,
+        num_view_columns,
+        input,
+        ns,
+        schema,
+        connection,
+    )?;
+    program.epilogue(schema);
+    program.build(
+        connection.clone(),
+        false,
+        "materialized view aggregate maintenance",
+    )
+}
+
+fn emit_group_aggregate(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    select: &ast::Select,
+    shape: &ViewShape,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    ns: &BranchNamespace,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<()> {
     use crate::function::AccumulatorFunc;
 
     let ViewShape::GroupAggregate {
@@ -1871,11 +2180,13 @@ fn compile_group_aggregate_program(
     let has_multiset = needs_multiset_table(shape);
 
     // The state table and its primary-key index are real schema objects
-    // created by CREATE MATERIALIZED VIEW.
+    // created by CREATE MATERIALIZED VIEW; the namespace suffix keeps each
+    // compound branch's tables distinct.
     let state_table_name = format!(
-        "{}{}_{view_name}",
+        "{}{}_{view_name}{}",
         crate::schema::DBSP_TABLE_PREFIX,
-        crate::incremental::view::DBSP_CIRCUIT_VERSION
+        crate::incremental::view::DBSP_CIRCUIT_VERSION,
+        ns.suffix,
     );
     let state_table = schema.get_btree_table(&state_table_name).ok_or_else(|| {
         LimboError::InternalError(format!(
@@ -1895,9 +2206,10 @@ fn compile_group_aggregate_program(
     // The value multiset table, when the view has MIN/MAX or DISTINCT
     // aggregates.
     let multiset_table_name = format!(
-        "{}{}_{view_name}",
+        "{}{}_{view_name}{}",
         crate::schema::DBSP_MULTISET_TABLE_PREFIX,
-        crate::incremental::view::DBSP_CIRCUIT_VERSION
+        crate::incremental::view::DBSP_CIRCUIT_VERSION,
+        ns.suffix,
     );
     let mm_schema = if has_multiset {
         let table = schema
@@ -1921,17 +2233,6 @@ fn compile_group_aggregate_program(
         None
     };
 
-    let mut program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts {
-            num_cursors: 4,
-            approx_num_insns: 64 + 16 * (num_view_columns + aggregates.len()),
-            approx_num_labels: 16,
-        },
-    );
-    program.prologue();
-
     let syms = connection.syms.read();
     let mut resolver = Resolver::new(
         schema,
@@ -1952,7 +2253,7 @@ fn compile_group_aggregate_program(
     // through the expression cache).
     let (input_cursor_id, mut table_references, join_ctx, num_base_columns) = if joined {
         let (eph_cursor_id, join_ctx, table_references) = emit_join_deltas_to_ephemeral(
-            &mut program,
+            program,
             &resolver,
             view_name,
             from,
@@ -2227,7 +2528,7 @@ fn compile_group_aggregate_program(
             )?;
             let pred_true = program.allocate_label();
             translate_condition_expr(
-                &mut program,
+                program,
                 &table_references,
                 &bound,
                 ConditionMetadata {
@@ -2264,7 +2565,7 @@ fn compile_group_aggregate_program(
                 BindingBehavior::ResultColumnsNotAllowed,
             )?;
             translate_expr_no_constant_opt(
-                &mut program,
+                program,
                 Some(&table_references),
                 &bound,
                 group_start + i,
@@ -2382,7 +2683,7 @@ fn compile_group_aggregate_program(
                         BindingBehavior::ResultColumnsNotAllowed,
                     )?;
                     translate_expr_no_constant_opt(
-                        &mut program,
+                        program,
                         Some(&table_references),
                         &bound,
                         arg_reg,
@@ -2667,9 +2968,10 @@ fn compile_group_aggregate_program(
         // Without HAVING every live group has its view row, so a missing row
         // is corruption; with HAVING the dying group may have been
         // suppressed.
+        let view_rowid_reg = ns.emit_view_rowid(program, state_rowid_reg);
         program.emit_insn(Insn::SeekRowid {
             cursor_id: view_cursor_id,
-            src_reg: state_rowid_reg,
+            src_reg: view_rowid_reg,
             target_pc: if having.is_some() {
                 next_label
             } else {
@@ -2954,9 +3256,10 @@ fn compile_group_aggregate_program(
                 index_name: None,
                 affinity_str: None,
             });
+            let view_rowid_reg = ns.emit_view_rowid(program, state_rowid_reg);
             program.emit_insn(Insn::Insert {
                 cursor: view_cursor_id,
-                key_reg: state_rowid_reg,
+                key_reg: view_rowid_reg,
                 record_reg: view_record_reg,
                 flag: InsertFlags(
                     InsertFlags::REQUIRE_SEEK
@@ -2973,9 +3276,10 @@ fn compile_group_aggregate_program(
                     target_pc: done_label,
                 });
                 program.preassign_label_to_next_insn(suppress_label);
+                let view_rowid_reg = ns.emit_view_rowid(program, state_rowid_reg);
                 program.emit_insn(Insn::SeekRowid {
                     cursor_id: view_cursor_id,
-                    src_reg: state_rowid_reg,
+                    src_reg: view_rowid_reg,
                     target_pc: done_label,
                 });
                 program.emit_insn(Insn::Delete {
@@ -2987,7 +3291,7 @@ fn compile_group_aggregate_program(
             Ok(())
         };
 
-    emit_row_tail(&mut program, next_label)?;
+    emit_row_tail(program, next_label)?;
 
     program.preassign_label_to_next_insn(next_label);
     program.emit_insn(Insn::Next {
@@ -3109,17 +3413,12 @@ fn compile_group_aggregate_program(
             unpacked_count: Some((k + 1) as u16),
             flags: IdxInsertFlags::new(),
         });
-        emit_row_tail(&mut program, ensure_done)?;
+        emit_row_tail(program, ensure_done)?;
         program.preassign_label_to_next_insn(ensure_done);
     }
 
-    program.epilogue(schema);
     drop(syms);
-    program.build(
-        connection.clone(),
-        false,
-        "materialized view aggregate maintenance",
-    )
+    Ok(())
 }
 
 /// Which relation a join phase reads for one side of the join.
@@ -3685,9 +3984,52 @@ fn compile_join_program(
     view_root_page: i64,
     num_view_columns: usize,
     input: MaintenanceInput,
+    ns: &BranchNamespace,
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<Program> {
+    let mut program = ProgramBuilder::new_for_subprogram(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts {
+            num_cursors: 13,
+            approx_num_insns: 128 + 64 * num_view_columns,
+            approx_num_labels: 48,
+        },
+    );
+    program.prologue();
+    emit_join(
+        &mut program,
+        view_name,
+        select,
+        shape,
+        view_root_page,
+        num_view_columns,
+        input,
+        ns,
+        schema,
+        connection,
+    )?;
+    program.epilogue(schema);
+    program.build(
+        connection.clone(),
+        false,
+        "materialized view join maintenance",
+    )
+}
+
+fn emit_join(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    select: &ast::Select,
+    shape: &ViewShape,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    ns: &BranchNamespace,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<()> {
     let ViewShape::Join {
         n_tables,
         left_outer,
@@ -3732,9 +4074,10 @@ fn compile_join_program(
     };
 
     let state_table_name = format!(
-        "{}{}_{view_name}",
+        "{}{}_{view_name}{}",
         crate::schema::DBSP_TABLE_PREFIX,
-        crate::incremental::view::DBSP_CIRCUIT_VERSION
+        crate::incremental::view::DBSP_CIRCUIT_VERSION,
+        ns.suffix,
     );
     let state_table = schema.get_btree_table(&state_table_name).ok_or_else(|| {
         LimboError::InternalError(format!(
@@ -3754,9 +4097,10 @@ fn compile_join_program(
     // auxiliary table.
     let aux = if left_outer {
         let name = format!(
-            "{}{}_{view_name}",
+            "{}{}_{view_name}{}",
             crate::schema::DBSP_MULTISET_TABLE_PREFIX,
-            crate::incremental::view::DBSP_CIRCUIT_VERSION
+            crate::incremental::view::DBSP_CIRCUIT_VERSION,
+            ns.suffix,
         );
         let table = schema.get_btree_table(&name).ok_or_else(|| {
             LimboError::InternalError(format!(
@@ -3772,17 +4116,6 @@ fn compile_join_program(
     } else {
         None
     };
-
-    let mut program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts {
-            num_cursors: 13,
-            approx_num_insns: 128 + 64 * num_view_columns,
-            approx_num_labels: 48,
-        },
-    );
-    program.prologue();
 
     let syms = connection.syms.read();
     let resolver = Resolver::new(
@@ -4085,13 +4418,14 @@ fn compile_join_program(
         collation: None,
     });
     emit_split_view_rowid(
-        &mut program,
+        program,
         left_outer,
         srid_reg,
         two_reg,
         one_reg,
         view_rowid_reg,
         false,
+        ns,
     );
     program.emit_insn(Insn::SeekRowid {
         cursor_id: view_cursor_id,
@@ -4166,13 +4500,14 @@ fn compile_join_program(
         affinity_str: None,
     });
     emit_split_view_rowid(
-        &mut program,
+        program,
         left_outer,
         srid_reg,
         two_reg,
         one_reg,
         view_rowid_reg,
         false,
+        ns,
     );
     program.emit_insn(Insn::Insert {
         cursor: view_cursor_id,
@@ -4318,7 +4653,7 @@ fn compile_join_program(
             if let Some(pad_where) = &pad_where {
                 let pad_pass = program.allocate_label();
                 translate_condition_expr(
-                    &mut program,
+                    program,
                     &pad_references,
                     pad_where,
                     ConditionMetadata {
@@ -4347,13 +4682,14 @@ fn compile_join_program(
             });
             // Padded before, not now: remove the padded view row.
             emit_split_view_rowid(
-                &mut program,
+                program,
                 true,
                 a_srid_reg,
                 two_reg,
                 one_reg,
                 view_rowid_reg,
                 true,
+                ns,
             );
             program.emit_insn(Insn::SeekRowid {
                 cursor_id: view_cursor_id,
@@ -4374,7 +4710,7 @@ fn compile_join_program(
             // so the projection reads the left row with NULLs on the right.
             program.preassign_label_to_next_insn(af_padwrite);
             emit_join_projection(
-                &mut program,
+                program,
                 &resolver,
                 columns,
                 &tables,
@@ -4392,13 +4728,14 @@ fn compile_join_program(
                 affinity_str: None,
             });
             emit_split_view_rowid(
-                &mut program,
+                program,
                 true,
                 a_srid_reg,
                 two_reg,
                 one_reg,
                 view_rowid_reg,
                 true,
+                ns,
             );
             program.emit_insn(Insn::Insert {
                 cursor: view_cursor_id,
@@ -4569,7 +4906,7 @@ fn compile_join_program(
 
     for (sides, negate) in join_subset_phases(n, input) {
         emit_join_phase(
-            &mut program,
+            program,
             &resolver,
             view_name,
             &tables,
@@ -4667,13 +5004,8 @@ fn compile_join_program(
     });
     program.preassign_label_to_next_insn(end_label);
 
-    program.epilogue(schema);
     drop(syms);
-    program.build(
-        connection.clone(),
-        false,
-        "materialized view join maintenance",
-    )
+    Ok(())
 }
 
 /// Emit the projection of a join view's result columns into
@@ -4830,6 +5162,7 @@ fn emit_split_view_rowid(
     one_reg: usize,
     dst: usize,
     append: bool,
+    ns: &BranchNamespace,
 ) {
     if both_tables {
         program.emit_insn(Insn::Multiply {
@@ -4851,6 +5184,10 @@ fn emit_split_view_rowid(
             extra_amount: 0,
         });
     }
+    // Namespace into this branch's slice of the shared compound btree. The
+    // both-tables split and a branch namespace never co-occur (LEFT joins
+    // and dedup compounds are never compound branches).
+    ns.apply_in_place(program, dst);
 }
 
 /// Compile the maintenance (or population) program for a compound SELECT
@@ -5277,6 +5614,7 @@ fn compile_compound_program(
             one_reg,
             view_rowid_reg,
             false,
+            &BranchNamespace::none(),
         );
         program.emit_insn(Insn::SeekRowid {
             cursor_id: view_cursor_id,
@@ -5309,6 +5647,7 @@ fn compile_compound_program(
             one_reg,
             view_rowid_reg,
             false,
+            &BranchNamespace::none(),
         );
         program.emit_insn(Insn::Insert {
             cursor: view_cursor_id,
@@ -5467,6 +5806,7 @@ fn compile_compound_program(
             one_reg,
             view_rowid_reg,
             true,
+            &BranchNamespace::none(),
         );
         program.emit_insn(Insn::SeekRowid {
             cursor_id: view_cursor_id,
@@ -5544,6 +5884,7 @@ fn compile_compound_program(
             one_reg,
             view_rowid_reg,
             true,
+            &BranchNamespace::none(),
         );
         program.emit_insn(Insn::Insert {
             cursor: view_cursor_id,
@@ -5782,6 +6123,99 @@ fn compile_compound_program(
         connection.clone(),
         false,
         "materialized view compound maintenance",
+    )
+}
+
+/// Compile the maintenance (or population) program for a pure UNION ALL
+/// whose branches are not all filter/project. UNION ALL branches form an
+/// independent bag union, so each branch is maintained by its own
+/// sub-program — the ordinary filter/project, join, or aggregate
+/// maintenance — writing a disjoint rowid slice of the shared view btree
+/// (`local * n_branches + branch_idx`) and owning hidden state tables
+/// suffixed `__b<idx>`. The branches share one program (maintenance runs
+/// one program per view) but never interact: there is no cross-branch
+/// merge.
+#[allow(clippy::too_many_arguments)]
+fn compile_compound_all_program(
+    view_name: &str,
+    select: &ast::Select,
+    shape: &ViewShape,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<Program> {
+    let ViewShape::CompoundAll { branch_shapes } = shape else {
+        unreachable!("compile_compound_all_program requires a CompoundAll shape");
+    };
+    let n_branches = branch_shapes.len();
+    let mut program = ProgramBuilder::new_for_subprogram(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts {
+            num_cursors: 6 * n_branches,
+            approx_num_insns: 128 * n_branches + 32 * num_view_columns * n_branches,
+            approx_num_labels: 48 * n_branches,
+        },
+    );
+    program.prologue();
+
+    for (branch_idx, sub) in branch_shapes.iter().enumerate() {
+        let ns = BranchNamespace {
+            scale: n_branches as i64,
+            offset: branch_idx as i64,
+            suffix: format!("__b{branch_idx}"),
+        };
+        let branch = branch_select(select, branch_idx);
+        match sub {
+            ViewShape::FilterProject => emit_filter_project(
+                &mut program,
+                view_name,
+                &branch,
+                view_root_page,
+                num_view_columns,
+                input,
+                MaintenanceOutput::ViewBtree,
+                &ns,
+                schema,
+                connection,
+            )?,
+            ViewShape::Join { .. } => emit_join(
+                &mut program,
+                view_name,
+                &branch,
+                sub,
+                view_root_page,
+                num_view_columns,
+                input,
+                &ns,
+                schema,
+                connection,
+            )?,
+            ViewShape::GroupAggregate { .. } => emit_group_aggregate(
+                &mut program,
+                view_name,
+                &branch,
+                sub,
+                view_root_page,
+                num_view_columns,
+                input,
+                &ns,
+                schema,
+                connection,
+            )?,
+            ViewShape::Compound { .. } | ViewShape::CompoundAll { .. } => {
+                unreachable!("classify_view rejects compound branches in a UNION ALL");
+            }
+        }
+    }
+
+    program.epilogue(schema);
+    program.build(
+        connection.clone(),
+        false,
+        "materialized view compound-all maintenance",
     )
 }
 

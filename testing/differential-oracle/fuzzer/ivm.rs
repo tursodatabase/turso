@@ -146,14 +146,52 @@ fn generate_definition(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<String> 
     }
 
     let table = tables[rng.random_range(0..tables.len())];
-    match rng.random_range(0..13u32) {
+    match rng.random_range(0..14u32) {
         0..=2 => Some(projection(table, rng, false)),
         3..=4 => Some(projection(table, rng, true)),
         5..=7 => Some(aggregate(table, rng)),
         8..=9 => Some(scalar_aggregate(table, rng)),
         10 => union(&tables, rng),
+        11 => compound_all(&tables, rng).or_else(|| Some(projection(table, rng, true))),
         _ => join(&tables, rng).or_else(|| Some(projection(table, rng, true))),
     }
+}
+
+/// `SELECT <aggs> FROM t1 UNION ALL SELECT <aggs> FROM t2` — a pure UNION ALL
+/// whose branches are scalar aggregates (one row per branch, maintained by
+/// each branch's own aggregate sub-program). Both branches use the same
+/// aggregate arity so the compound is valid.
+fn compound_all(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
+    let left = tables[rng.random_range(0..tables.len())];
+    let right = tables[rng.random_range(0..tables.len())];
+    let numeric = |t: &Table| -> Vec<String> {
+        t.columns
+            .iter()
+            .filter(|c| matches!(c.data_type, DataType::Integer | DataType::Real))
+            .map(|c| quoted(&c.name))
+            .collect()
+    };
+    let (ln, rn) = (numeric(left), numeric(right));
+    // A second aggregate column (a SUM) only if both branches have a numeric
+    // column to sum, keeping the arities equal.
+    let with_sum = !ln.is_empty() && !rn.is_empty() && rng.random_bool(0.6);
+
+    fn branch(t: &Table, cols: &[String], with_sum: bool, rng: &mut ChaCha8Rng) -> String {
+        let mut exprs = vec!["COUNT(*)".to_string()];
+        if with_sum {
+            exprs.push(format!("SUM({})", cols[rng.random_range(0..cols.len())]));
+        }
+        let mut sql = format!("SELECT {} FROM {}", exprs.join(", "), quoted(&t.name));
+        if rng.random_bool(0.4) {
+            let col = &t.columns[rng.random_range(0..t.columns.len())];
+            let _ = write!(sql, " WHERE {}", predicate(col, rng));
+        }
+        sql
+    }
+
+    let left_sql = branch(left, &ln, with_sum, rng);
+    let right_sql = branch(right, &rn, with_sum, rng);
+    Some(format!("{left_sql} UNION ALL {right_sql}"))
 }
 
 /// `SELECT c FROM t1 [WHERE ...] UNION [ALL] SELECT c FROM t2 [WHERE ...]`

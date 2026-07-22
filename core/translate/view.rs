@@ -1,4 +1,4 @@
-use crate::incremental::view::{IncrementalView, DBSP_CIRCUIT_VERSION};
+use crate::incremental::view::IncrementalView;
 use crate::schema::{
     BTreeCharacteristics, BTreeTable, SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES,
 };
@@ -97,7 +97,10 @@ pub fn translate_create_materialized_view(
     let shape = resolver.with_schema(database_id, |s| {
         crate::incremental::vdbe_maintenance::classify_view(select_stmt, s, resolver)
     })?;
-    let needs_state_table = crate::incremental::vdbe_maintenance::needs_state_table(&shape);
+    // Every hidden state/multiset table the view needs (per branch for a
+    // compound-all view), each with its CREATE SQL.
+    let hidden_tables =
+        crate::incremental::vdbe_maintenance::hidden_tables(&normalized_view_name, &shape)?;
 
     // Reconstruct the SQL string for storage
     let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);
@@ -111,34 +114,6 @@ pub fn translate_create_materialized_view(
         root: view_root_reg,
         flags: CreateBTreeFlags::new_table(),
     });
-
-    // Btree for the per-group aggregate state, stored as a hidden table:
-    // __turso_internal_dbsp_state_v<version>_<view_name>
-    let dbsp_state_root_reg = if needs_state_table {
-        let reg = program.alloc_register();
-        program.emit_insn(Insn::CreateBtree {
-            db: database_id,
-            root: reg,
-            flags: CreateBTreeFlags::new_table(),
-        });
-        Some(reg)
-    } else {
-        None
-    };
-
-    // Btree for the value multiset, when the view has MIN/MAX or DISTINCT
-    // aggregates: __turso_internal_dbsp_multiset_v<version>_<view_name>
-    let multiset_root_reg = if crate::incremental::vdbe_maintenance::needs_multiset_table(&shape) {
-        let reg = program.alloc_register();
-        program.emit_insn(Insn::CreateBtree {
-            db: database_id,
-            root: reg,
-            flags: CreateBTreeFlags::new_table(),
-        });
-        Some(reg)
-    } else {
-        None
-    };
 
     // Create a proper BTreeTable for the cursor with the actual view columns
     let view_table = Arc::new(BTreeTable::new(
@@ -213,91 +188,41 @@ pub fn translate_create_materialized_view(
         Some(sql),
     )?;
 
-    // GROUP BY views persist per-group aggregate state in a hidden, typed
-    // table (group keys, the group's view rowid, and each aggregate's state
-    // payload), with the PRIMARY KEY over the group columns providing the
-    // group-lookup index.
+    // Each hidden state/multiset table: create its btree, register it and
+    // its automatic primary-key index in sqlite_schema. A GROUP BY view's
+    // state table holds the group keys and aggregate payloads; a join
+    // view's holds the source-rowid tuples; a compound-all view has one set
+    // per branch. All are keyed by a PRIMARY KEY whose automatic index the
+    // maintenance program relies on for lookups.
     let mut parse_schema_names = vec![escape_sql_string_literal(&normalized_view_name)];
-    if let Some(dbsp_state_root_reg) = dbsp_state_root_reg {
-        let dbsp_table_name = ast::Name::exact(format!(
-            "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"
-        ));
-        let dbsp_table_ident = dbsp_table_name.as_ident();
-        let dbsp_sql =
-            crate::incremental::vdbe_maintenance::state_table_sql(&dbsp_table_ident, &shape)?;
-
-        emit_schema_entry(
-            program,
-            resolver,
-            sqlite_schema_cursor_id,
-            None, // cdc_table_cursor_id
-            SchemaEntryType::Table,
-            dbsp_table_name.as_str(),
-            dbsp_table_name.as_str(),
-            dbsp_state_root_reg, // Root for DBSP state table
-            Some(dbsp_sql),
-        )?;
-
-        // Automatic primary-key index over the group columns.
-        let dbsp_index_root_reg = program.alloc_register();
+    for hidden in &hidden_tables {
+        let table_root_reg = program.alloc_register();
         program.emit_insn(Insn::CreateBtree {
             db: database_id,
-            root: dbsp_index_root_reg,
-            flags: CreateBTreeFlags::new_index(),
+            root: table_root_reg,
+            flags: CreateBTreeFlags::new_table(),
         });
-
-        let dbsp_index_name = format!(
-            "{}{}_1",
-            PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
-            &dbsp_table_name.as_str()
-        );
-        emit_schema_entry(
-            program,
-            resolver,
-            sqlite_schema_cursor_id,
-            None, // cdc_table_cursor_id
-            SchemaEntryType::Index,
-            &dbsp_index_name,
-            dbsp_table_name.as_str(),
-            dbsp_index_root_reg,
-            None, // Automatic indexes don't store SQL
-        )?;
-
-        parse_schema_names.push(escape_sql_string_literal(dbsp_table_name.as_str()));
-        parse_schema_names.push(escape_sql_string_literal(&dbsp_index_name));
-    }
-
-    if let Some(multiset_root_reg) = multiset_root_reg {
-        let multiset_table_name = ast::Name::exact(format!(
-            "{}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}",
-            crate::schema::DBSP_MULTISET_TABLE_PREFIX
-        ));
-        let multiset_sql = crate::incremental::vdbe_maintenance::multiset_table_sql(
-            &multiset_table_name.as_ident(),
-            &shape,
-        )?;
         emit_schema_entry(
             program,
             resolver,
             sqlite_schema_cursor_id,
             None,
             SchemaEntryType::Table,
-            multiset_table_name.as_str(),
-            multiset_table_name.as_str(),
-            multiset_root_reg,
-            Some(multiset_sql),
+            &hidden.table_name,
+            &hidden.table_name,
+            table_root_reg,
+            Some(hidden.create_sql.clone()),
         )?;
 
-        let multiset_index_root_reg = program.alloc_register();
+        let index_root_reg = program.alloc_register();
         program.emit_insn(Insn::CreateBtree {
             db: database_id,
-            root: multiset_index_root_reg,
+            root: index_root_reg,
             flags: CreateBTreeFlags::new_index(),
         });
-        let multiset_index_name = format!(
+        let index_name = format!(
             "{}{}_1",
-            PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
-            multiset_table_name.as_str()
+            PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX, &hidden.table_name
         );
         emit_schema_entry(
             program,
@@ -305,14 +230,14 @@ pub fn translate_create_materialized_view(
             sqlite_schema_cursor_id,
             None,
             SchemaEntryType::Index,
-            &multiset_index_name,
-            multiset_table_name.as_str(),
-            multiset_index_root_reg,
+            &index_name,
+            &hidden.table_name,
+            index_root_reg,
             None,
         )?;
 
-        parse_schema_names.push(escape_sql_string_literal(multiset_table_name.as_str()));
-        parse_schema_names.push(escape_sql_string_literal(&multiset_index_name));
+        parse_schema_names.push(escape_sql_string_literal(&hidden.table_name));
+        parse_schema_names.push(escape_sql_string_literal(&index_name));
     }
 
     // Parse schema to load the new view (and its state table, if any)
@@ -538,14 +463,31 @@ pub fn translate_drop_view(
             }
         }
 
+        // Every hidden state/multiset table of this view, including a
+        // compound-all view's per-branch tables (`..._<view>__b<idx>`).
+        // Matched by prefix so the whole family is destroyed, mirroring
+        // Schema::remove_view.
         use crate::incremental::view::DBSP_CIRCUIT_VERSION;
-        vec![
+        let prefixes = [
             format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"),
             format!(
                 "{}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}",
                 crate::schema::DBSP_MULTISET_TABLE_PREFIX
             ),
-        ]
+        ];
+        resolver.with_schema(database_id, |s| {
+            s.tables
+                .keys()
+                .filter(|t| {
+                    prefixes.iter().any(|prefix| {
+                        *t == prefix
+                            || t.strip_prefix(prefix.as_str())
+                                .is_some_and(|rest| rest.starts_with("__b"))
+                    })
+                })
+                .cloned()
+                .collect::<Vec<String>>()
+        })
     } else {
         Vec::new()
     };

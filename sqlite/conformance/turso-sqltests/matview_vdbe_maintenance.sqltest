@@ -1544,6 +1544,123 @@ expect {
     2
 }
 
+# A pure UNION ALL whose branches are aggregates: each branch is maintained
+# by its own aggregate sub-program writing a disjoint rowid slice of the
+# shared view btree, with its own hidden state tables. The branches are
+# independent, so each quarter's totals update in place.
+test matview-vdbe-compound-all-aggregate-branches {
+    CREATE TABLE qa(p TEXT, n INTEGER);
+    CREATE TABLE qb(p TEXT, n INTEGER);
+    INSERT INTO qa VALUES ('x', 10), ('y', 50);
+    INSERT INTO qb VALUES ('x', 15), ('z', 30);
+    CREATE MATERIALIZED VIEW vca AS
+        SELECT 'A' AS q, SUM(n) AS s FROM qa
+        UNION ALL
+        SELECT 'B' AS q, SUM(n) AS s FROM qb;
+    SELECT 'init', * FROM vca ORDER BY q;
+    INSERT INTO qa VALUES ('w', 5);
+    DELETE FROM qb WHERE p = 'x';
+    SELECT 'after', * FROM vca ORDER BY q;
+}
+expect {
+    init|A|60
+    init|B|45
+    after|A|65
+    after|B|30
+}
+
+# A pure UNION ALL whose branches are joins: each branch's join maintenance
+# writes its slice. Duplicates across branches are preserved (UNION ALL),
+# and per-branch state tables track the join pairs independently.
+test matview-vdbe-compound-all-join-branches {
+    CREATE TABLE cu(id INTEGER PRIMARY KEY, name TEXT, kind TEXT);
+    CREATE TABLE ord(id INTEGER PRIMARY KEY, cid INTEGER, amt INTEGER);
+    CREATE TABLE quo(id INTEGER PRIMARY KEY, cid INTEGER, amt INTEGER);
+    INSERT INTO cu VALUES (1,'Alice','premium'), (2,'Bob','regular'), (3,'Charlie','premium');
+    INSERT INTO ord VALUES (1,1,1000), (2,2,500), (3,3,1500);
+    INSERT INTO quo VALUES (1,1,800), (2,2,300), (3,3,2000);
+    CREATE MATERIALIZED VIEW vcj AS
+        SELECT cu.name, 'order' AS t, ord.amt FROM cu JOIN ord ON cu.id = ord.cid WHERE cu.kind = 'premium'
+        UNION ALL
+        SELECT cu.name, 'quote' AS t, quo.amt FROM cu JOIN quo ON cu.id = quo.cid WHERE cu.kind = 'premium';
+    SELECT 'init', * FROM vcj ORDER BY name, t, amt;
+    UPDATE cu SET kind = 'premium' WHERE name = 'Bob';
+    DELETE FROM quo WHERE cid = 3;
+    SELECT 'after', * FROM vcj ORDER BY name, t, amt;
+}
+expect {
+    init|Alice|order|1000
+    init|Alice|quote|800
+    init|Charlie|order|1500
+    init|Charlie|quote|2000
+    after|Alice|order|1000
+    after|Alice|quote|800
+    after|Bob|order|500
+    after|Bob|quote|300
+    after|Charlie|order|1500
+}
+
+# Mixed branch shapes in one UNION ALL: a filter/project branch and an
+# aggregate branch, each maintained independently. Serves same-transaction
+# reads by recomputation, and survives reopen (per-branch state tables and
+# their indexes are reconstructed at schema load).
+test matview-vdbe-compound-all-mixed-branches {
+    CREATE TABLE mt(x INTEGER);
+    INSERT INTO mt VALUES (1), (2), (3);
+    CREATE MATERIALIZED VIEW vmx AS
+        SELECT x FROM mt WHERE x > 1
+        UNION ALL
+        SELECT COUNT(*) FROM mt;
+    SELECT 'init', * FROM vmx ORDER BY 2;
+    BEGIN;
+    INSERT INTO mt VALUES (5);
+    SELECT 'ryw', * FROM vmx ORDER BY 2;
+    ROLLBACK;
+    SELECT 'post', * FROM vmx ORDER BY 2;
+}
+expect {
+    init|2
+    init|3
+    init|3
+    ryw|2
+    ryw|3
+    ryw|4
+    ryw|5
+    post|2
+    post|3
+    post|3
+}
+
+# A LEFT JOIN branch is rejected (the view-rowid transform does not compose
+# the inner/padded split with the branch namespace).
+test matview-vdbe-compound-all-left-join-branch-rejected {
+    CREATE TABLE la(a INTEGER);
+    CREATE TABLE lb(a INTEGER);
+    CREATE TABLE lc(a INTEGER);
+    CREATE MATERIALIZED VIEW badlj AS
+        SELECT la.a FROM la LEFT JOIN lb ON la.a = lb.a
+        UNION ALL
+        SELECT a FROM lc;
+}
+expect error {
+    materialized views with LEFT JOIN branches in a UNION ALL are not yet supported
+}
+
+# A deduplicating operator with a join branch stays rejected: cross-branch
+# content dedup of join output is not supported.
+test matview-vdbe-compound-dedup-join-branch-rejected {
+    CREATE TABLE da(a INTEGER);
+    CREATE TABLE db(a INTEGER);
+    CREATE TABLE dc(a INTEGER);
+    CREATE MATERIALIZED VIEW baddj AS
+        SELECT da.a FROM da JOIN db ON da.a = db.a
+        UNION
+        SELECT a FROM dc;
+}
+expect error {
+    materialized views with join branches in compound SELECTs are not yet supported
+}
+
 # Three-way joins: maintenance runs one delta phase per non-empty subset of
 # the joined tables (seven for three tables), keyed by the rowid triple.
 test matview-vdbe-three-way-join {

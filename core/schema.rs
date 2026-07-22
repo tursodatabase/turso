@@ -1179,7 +1179,12 @@ impl Schema {
                 .or_else(|| table_name.strip_prefix(DBSP_MULTISET_TABLE_PREFIX))
                 .and_then(|suffix| suffix.split_once('_'))
                 .is_some_and(|(version_str, name)| {
-                    name == view_name
+                    // The base state table (`<view>`) or a compound-all
+                    // branch table (`<view>__b<idx>`).
+                    (name == view_name
+                        || name
+                            .strip_prefix(view_name.as_str())
+                            .is_some_and(|rest| rest.starts_with("__b")))
                         && version_str
                             .parse::<u32>()
                             .is_ok_and(|v| v != DBSP_CIRCUIT_VERSION)
@@ -1219,15 +1224,31 @@ impl Schema {
             // Remove from tables
             self.remove_table(&name);
 
-            // Remove the internal tables (aggregate state, value multiset)
-            // and their indexes from the in-memory schema
-            let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}");
-            self.remove_table(&dbsp_table_name);
-            self.remove_indices_for_table(&dbsp_table_name);
-            let multiset_table_name =
-                format!("{DBSP_MULTISET_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}");
-            self.remove_table(&multiset_table_name);
-            self.remove_indices_for_table(&multiset_table_name);
+            // Remove every hidden state/multiset table of this view and its
+            // indexes. A compound-all view has one set per branch, named
+            // `..._<view>__b<idx>`, so match the whole family by the
+            // `<version>_<view>` name part rather than an exact name.
+            let hidden_prefixes = [
+                format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}"),
+                format!("{DBSP_MULTISET_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}"),
+            ];
+            let hidden_tables: Vec<String> = self
+                .tables
+                .keys()
+                .filter(|t| {
+                    hidden_prefixes.iter().any(|prefix| {
+                        // Exact base table, or a `__b<idx>` branch table.
+                        *t == prefix
+                            || t.strip_prefix(prefix.as_str())
+                                .is_some_and(|rest| rest.starts_with("__b"))
+                    })
+                })
+                .cloned()
+                .collect();
+            for table in hidden_tables {
+                self.remove_table(&table);
+                self.remove_indices_for_table(&table);
+            }
 
             // Remove from materialized view tracking
             self.materialized_view_names.remove(&name);
@@ -1955,13 +1976,29 @@ impl Schema {
             let dbsp_state_index_root =
                 dbsp_state_index_roots.get(&view_name).copied().unwrap_or(0);
 
-            // Register the DBSP state index so lookups and integrity check
-            // can use it; its columns come from the state table's PRIMARY KEY.
-            if dbsp_state_index_root > 0 && dbsp_state_root > 0 {
-                let dbsp_table_name =
-                    format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
+            // Register each DBSP state table's primary-key index so lookups
+            // and integrity check can use it; its columns (and collations)
+            // come from the state table's PRIMARY KEY. A compound-all view
+            // has one state table per branch, keyed `<view>__b<idx>`, so
+            // reconstruct the index for the base view and every branch.
+            let state_keys: Vec<String> = dbsp_state_index_roots
+                .keys()
+                .filter(|k| {
+                    **k == view_name
+                        || k.strip_prefix(view_name.as_str())
+                            .is_some_and(|rest| rest.starts_with("__b"))
+                })
+                .cloned()
+                .collect();
+            for key in state_keys {
+                let index_root = dbsp_state_index_roots.get(&key).copied().unwrap_or(0);
+                let table_root = dbsp_state_roots.get(&key).copied().unwrap_or(0);
+                if index_root == 0 || table_root == 0 {
+                    continue;
+                }
+                let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{key}");
                 if let Some(state_table) = self.get_btree_table(&dbsp_table_name) {
-                    let mut index = create_dbsp_state_index(dbsp_state_index_root, &state_table)?;
+                    let mut index = create_dbsp_state_index(index_root, &state_table)?;
                     index.name = format!("sqlite_autoindex_{dbsp_table_name}_1");
                     if let Err(e) = self.add_index(std::sync::Arc::new(index)) {
                         if !e.to_string().contains("already exists") {

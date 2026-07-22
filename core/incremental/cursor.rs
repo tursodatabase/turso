@@ -193,7 +193,8 @@ impl MaterializedViewCursor {
                     }
                     crate::incremental::vdbe_maintenance::ViewShape::GroupAggregate { .. }
                     | crate::incremental::vdbe_maintenance::ViewShape::Join { .. }
-                    | crate::incremental::vdbe_maintenance::ViewShape::Compound { .. } => {
+                    | crate::incremental::vdbe_maintenance::ViewShape::Compound { .. }
+                    | crate::incremental::vdbe_maintenance::ViewShape::CompoundAll { .. } => {
                         // Recompute: the defining query runs on this
                         // connection and therefore sees the transaction's
                         // uncommitted base-table changes. prepare_internal
