@@ -775,13 +775,128 @@ expect {
     ok
 }
 
-test matview-vdbe-join-outer-rejected {
+test matview-vdbe-join-right-outer-rejected {
     CREATE TABLE jl6(x INTEGER);
     CREATE TABLE jr6(y INTEGER);
-    CREATE MATERIALIZED VIEW bad6 AS SELECT x, y FROM jl6 LEFT JOIN jr6 ON x = y;
+    CREATE MATERIALIZED VIEW bad6 AS SELECT x, y FROM jl6 RIGHT JOIN jr6 ON x = y;
 }
 expect error {
-    materialized views with outer joins are not yet supported
+    materialized views with RIGHT or FULL outer joins are not yet supported
+}
+
+# LEFT JOIN: a NULL-padded row exists while its left row has no ON-match.
+# Matches arriving and leaving flip the padded row; the padded row only
+# leaves once the last match is gone.
+test matview-vdbe-left-join-maintenance {
+    CREATE TABLE ll(a INTEGER, b TEXT);
+    CREATE TABLE lr(a INTEGER, c TEXT);
+    INSERT INTO ll VALUES (1,'x'), (2,'y'), (3,'z');
+    INSERT INTO lr VALUES (1,'p'), (2,'q');
+    CREATE MATERIALIZED VIEW vl AS SELECT ll.a, b, c FROM ll LEFT JOIN lr ON ll.a = lr.a;
+    SELECT 'init', * FROM vl ORDER BY 2, 3;
+    INSERT INTO lr VALUES (3,'m'), (3,'n');
+    DELETE FROM lr WHERE c = 'p';
+    INSERT INTO ll VALUES (4,'w');
+    SELECT 'moved', * FROM vl ORDER BY 2, 3;
+    DELETE FROM lr WHERE c = 'm';
+    SELECT 'onegone', * FROM vl ORDER BY 2, 3;
+    DELETE FROM lr WHERE c = 'n';
+    DELETE FROM ll WHERE a = 4;
+    SELECT 'padback', * FROM vl ORDER BY 2, 3;
+}
+expect {
+    init|1|x|p
+    init|2|y|q
+    init|3|z|
+    moved|1|x|
+    moved|2|y|q
+    moved|3|z|m
+    moved|3|z|n
+    moved|4|w|
+    onegone|1|x|
+    onegone|2|y|q
+    onegone|3|z|n
+    onegone|4|w|
+    padback|1|x|
+    padback|2|y|q
+    padback|3|z|
+}
+
+# ON gates matching; WHERE gates output rows. A pair passing ON but failing
+# WHERE still counts as a match (no padded row) and produces nothing; a
+# padded row is subject to WHERE over its NULL-padded image with
+# three-valued logic.
+test matview-vdbe-left-join-on-vs-where {
+    CREATE TABLE wl(a INTEGER, b TEXT);
+    CREATE TABLE wr(a INTEGER, c TEXT);
+    INSERT INTO wl VALUES (1,'x'), (2,'y'), (3,'z');
+    INSERT INTO wr VALUES (1,'p'), (2,'q');
+    CREATE MATERIALIZED VIEW vw1 AS SELECT wl.a, b, c FROM wl LEFT JOIN wr ON wl.a = wr.a WHERE c <> 'q';
+    CREATE MATERIALIZED VIEW vw2 AS SELECT wl.a, b, c FROM wl LEFT JOIN wr ON wl.a = wr.a WHERE c IS NULL;
+    CREATE MATERIALIZED VIEW vw3 AS SELECT wl.a, b, c FROM wl LEFT JOIN wr ON wl.a = wr.a AND wr.c <> 'q';
+    SELECT 'vw1', * FROM vw1 ORDER BY 2;
+    SELECT 'vw2', * FROM vw2 ORDER BY 2;
+    SELECT 'vw3', * FROM vw3 ORDER BY 2;
+    UPDATE wr SET c = 'k' WHERE c = 'q';
+    SELECT 'uw1', * FROM vw1 ORDER BY 2;
+    SELECT 'uw2', * FROM vw2 ORDER BY 2;
+    SELECT 'uw3', * FROM vw3 ORDER BY 2;
+}
+expect {
+    vw1|1|x|p
+    vw2|3|z|
+    vw3|1|x|p
+    vw3|2|y|
+    vw3|3|z|
+    uw1|1|x|p
+    uw1|2|y|k
+    uw2|3|z|
+    uw3|1|x|p
+    uw3|2|y|k
+    uw3|3|z|
+}
+
+# LEFT JOIN composes with USING (star merges the join column) and serves
+# same-transaction reads by recomputation.
+test matview-vdbe-left-join-using-ryw {
+    CREATE TABLE ul2(a INTEGER, b TEXT);
+    CREATE TABLE ur2(a INTEGER, c TEXT);
+    INSERT INTO ul2 VALUES (1,'x'), (2,'y');
+    INSERT INTO ur2 VALUES (1,'p');
+    CREATE MATERIALIZED VIEW vu2 AS SELECT * FROM ul2 LEFT JOIN ur2 USING (a);
+    SELECT 'init', * FROM vu2 ORDER BY 2;
+    BEGIN;
+    INSERT INTO ur2 VALUES (2,'q');
+    SELECT 'ryw', * FROM vu2 ORDER BY 2;
+    ROLLBACK;
+    SELECT 'post', * FROM vu2 ORDER BY 2;
+}
+expect {
+    init|1|x|p
+    init|2|y|
+    ryw|1|x|p
+    ryw|2|y|q
+    post|1|x|p
+    post|2|y|
+}
+
+test matview-vdbe-left-join-aggregate-rejected {
+    CREATE TABLE al(a INTEGER);
+    CREATE TABLE ar(a INTEGER);
+    CREATE MATERIALIZED VIEW bada AS SELECT al.a, COUNT(*) FROM al LEFT JOIN ar ON al.a = ar.a GROUP BY al.a;
+}
+expect error {
+    materialized views with aggregates over outer joins are not yet supported
+}
+
+test matview-vdbe-left-join-three-way-rejected {
+    CREATE TABLE tl(a INTEGER);
+    CREATE TABLE tr1(a INTEGER);
+    CREATE TABLE tr2(a INTEGER);
+    CREATE MATERIALIZED VIEW badt AS SELECT tl.a FROM tl LEFT JOIN tr1 ON tl.a = tr1.a LEFT JOIN tr2 ON tr1.a = tr2.a;
+}
+expect error {
+    materialized views with LEFT JOIN over more than two tables are not yet supported
 }
 
 # USING desugars to equality predicates against the left-most table with
