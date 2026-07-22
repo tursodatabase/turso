@@ -204,19 +204,30 @@ pub enum ViewShape {
         /// Number of joined tables (at least two).
         n_tables: usize,
     },
-    /// UNION or UNION ALL over filter/project branches. UNION ALL rows are
-    /// identified by (branch, source rowid); UNION rows by their output
-    /// content, with the state row's signed multiplicity counting copies
-    /// across branches and the view row existing while it is positive.
-    Union {
-        /// True for UNION (dedup across branches), false for UNION ALL.
-        distinct: bool,
-        /// Number of result columns (with stars expanded), which for UNION
-        /// is also the width of the content key in the state table.
+    /// Compound SELECT (UNION, UNION ALL, INTERSECT, EXCEPT) over
+    /// filter/project branches. Every operator except UNION ALL
+    /// deduplicates, so a content row's membership in the result depends
+    /// only on which branches currently produce it: visibility is a
+    /// left-associative fold of per-branch presence (UNION and UNION ALL
+    /// fold as OR, INTERSECT as AND, EXCEPT as AND NOT). Only a trailing
+    /// run of UNION ALL operators appends rows with their multiplicity
+    /// preserved, identified by (branch, source rowid).
+    Compound {
+        /// One operator per compound entry, in chain order.
+        operators: Vec<ast::CompoundOperator>,
+        /// Number of result columns (with stars expanded), which is also
+        /// the width of the content key in the state table.
         arity: usize,
-        /// Collation each content-key column dedups under (left-most branch
-        /// with a resolved collation wins, matching compound dedup indexes).
-        /// Carried onto the state table's key columns. Empty for UNION ALL.
+        /// Number of leading branches deduplicated by content: everything
+        /// up to and including the right side of the last non-UNION-ALL
+        /// operator. The state table keeps one signed count per prefix
+        /// branch. Zero when the chain is UNION ALL throughout (every
+        /// branch appends).
+        prefix_len: usize,
+        /// Collation each content-key column dedups under (left-most prefix
+        /// branch with a resolved collation wins, matching compound dedup
+        /// indexes). Carried onto the state table's key columns. Empty when
+        /// `prefix_len` is zero.
         key_collations: Vec<CollationSeq>,
     },
     /// Single-table GROUP BY with invertible aggregates.
@@ -528,58 +539,57 @@ pub fn classify_view(
     }
 
     if !select.body.compounds.is_empty() {
-        // UNION and UNION ALL over filter/project branches. Mixed operators
-        // change dedup scope per SQLite's left-associative semantics; only
-        // uniform compounds are supported.
-        let first = select.body.compounds[0].operator;
-        let distinct = match first {
-            ast::CompoundOperator::Union => true,
-            ast::CompoundOperator::UnionAll => false,
-            ast::CompoundOperator::Except | ast::CompoundOperator::Intersect => {
-                return unsupported("INTERSECT/EXCEPT compound SELECTs");
-            }
-        };
-        if select.body.compounds.iter().any(|c| c.operator != first) {
-            return unsupported("mixed UNION/UNION ALL compound SELECTs");
-        }
+        let operators: Vec<ast::CompoundOperator> =
+            select.body.compounds.iter().map(|c| c.operator).collect();
+        // Branches up to and including the right side of the last
+        // deduplicating operator are content-keyed: any later UNION ALL
+        // appends its rows with multiplicity preserved, while a UNION ALL
+        // *before* a deduplicating operator only feeds presence (the dedup
+        // collapses its multiplicities anyway).
+        let prefix_len = operators
+            .iter()
+            .rposition(|op| *op != ast::CompoundOperator::UnionAll)
+            .map_or(0, |last_dedup| last_dedup + 2);
 
         let mut arity: Option<usize> = None;
         let mut folded: Vec<Option<CollationSeq>> = Vec::new();
-        for branch in std::iter::once(&select.body.select)
+        for (branch_idx, branch) in std::iter::once(&select.body.select)
             .chain(select.body.compounds.iter().map(|c| &c.select))
+            .enumerate()
         {
             let (branch_arity, branch_collations) =
                 validate_union_branch(branch, schema, resolver)?;
             if *arity.get_or_insert(branch_arity) != branch_arity {
+                // The operator joining the mismatching branch to the chain.
+                let operator = operators[branch_idx - 1];
                 return Err(LimboError::ParseError(format!(
-                    "SELECTs to the left and right of {} do not have the same number of result columns",
-                    if distinct { "UNION" } else { "UNION ALL" }
+                    "SELECTs to the left and right of {operator} do not have the same number of result columns",
                 )));
             }
-            // Left precedence: the left-most branch that resolves a
-            // collation for a column decides it, like compound dedup
-            // indexes.
-            if folded.is_empty() {
-                folded = branch_collations;
-            } else {
-                for (slot, branch_collation) in folded.iter_mut().zip(branch_collations) {
-                    if slot.is_none() {
-                        *slot = branch_collation;
+            // Left precedence among the deduplicated branches: the left-most
+            // branch that resolves a collation for a column decides it, like
+            // compound dedup indexes. Append-suffix branches do not
+            // participate in dedup comparisons.
+            if branch_idx < prefix_len {
+                if folded.is_empty() {
+                    folded = branch_collations;
+                } else {
+                    for (slot, branch_collation) in folded.iter_mut().zip(branch_collations) {
+                        if slot.is_none() {
+                            *slot = branch_collation;
+                        }
                     }
                 }
             }
         }
-        let key_collations = if distinct {
-            folded
-                .into_iter()
-                .map(|collation| collation.unwrap_or(CollationSeq::Binary))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        return Ok(ViewShape::Union {
-            distinct,
+        let key_collations = folded
+            .into_iter()
+            .map(|collation| collation.unwrap_or(CollationSeq::Binary))
+            .collect();
+        return Ok(ViewShape::Compound {
+            operators,
             arity: arity.expect("at least two branches"),
+            prefix_len,
             key_collations,
         });
     }
@@ -970,7 +980,7 @@ pub fn classify_view_for_connection(
 pub fn needs_state_table(shape: &ViewShape) -> bool {
     matches!(
         shape,
-        ViewShape::GroupAggregate { .. } | ViewShape::Join { .. } | ViewShape::Union { .. }
+        ViewShape::GroupAggregate { .. } | ViewShape::Join { .. } | ViewShape::Compound { .. }
     )
 }
 
@@ -983,9 +993,14 @@ pub fn needs_state_table(shape: &ViewShape) -> bool {
 /// table.
 ///
 /// For a join view: one row per live join-output row, keyed by the pair of
-/// base-table rowids that produced it. For a UNION ALL view: keyed by
-/// (branch, source rowid); for UNION, by the output content, with the
-/// signed multiplicity counting copies across branches.
+/// base-table rowids that produced it.
+///
+/// For a compound view with a dedup prefix: one row per distinct content
+/// key, holding one signed count per prefix branch (the visibility fold
+/// reads them); a pure UNION ALL chain instead keys rows by (branch, source
+/// rowid) with a single multiplicity. A trailing UNION ALL suffix behind a
+/// dedup prefix keeps its (branch, rowid, mult) rows in the auxiliary table
+/// (see [`multiset_table_sql`]).
 ///
 /// In each case the state row's rowid doubles as the row's rowid in the
 /// view btree: state rows are written unconditionally for live groups/pairs,
@@ -1027,24 +1042,27 @@ pub fn state_table_sql(state_table_name: &str, shape: &ViewShape) -> Result<Stri
                 key.join(", ")
             ))
         }
-        ViewShape::Union {
-            distinct,
+        ViewShape::Compound {
             arity,
+            prefix_len,
             key_collations,
+            ..
         } => {
-            let (columns, key): (Vec<String>, Vec<String>) = if *distinct {
-                (
-                    (0..*arity)
-                        .map(|i| format!("c{i}{}", collate_clause(key_collations[i])))
-                        .collect(),
-                    (0..*arity).map(|i| format!("c{i}")).collect(),
-                )
-            } else {
-                let key = vec!["branch".to_string(), "rid".to_string()];
-                (key.clone(), key)
-            };
+            if *prefix_len == 0 {
+                // Pure UNION ALL: (branch, rid) identity, one multiplicity.
+                return Ok(format!(
+                    "CREATE TABLE {state_table_name} (branch, rid, mult, PRIMARY KEY (branch, rid))"
+                ));
+            }
+            let mut columns: Vec<String> = (0..*arity)
+                .map(|i| format!("c{i}{}", collate_clause(key_collations[i])))
+                .collect();
+            for i in 0..*prefix_len {
+                columns.push(format!("cnt{i}"));
+            }
+            let key: Vec<String> = (0..*arity).map(|i| format!("c{i}")).collect();
             Ok(format!(
-                "CREATE TABLE {state_table_name} ({}, mult, PRIMARY KEY ({}))",
+                "CREATE TABLE {state_table_name} ({}, PRIMARY KEY ({}))",
                 columns.join(", "),
                 key.join(", ")
             ))
@@ -1062,10 +1080,21 @@ fn uses_multiset(agg: &Aggregate) -> bool {
     matches!(agg.func, AggFunc::Min | AggFunc::Max) || tracks_distinct_values(agg)
 }
 
-/// Whether the view needs the value-multiset table.
+/// Whether the view needs the auxiliary multiset table: value multiplicities
+/// for MIN/MAX and DISTINCT aggregates, or (branch, rowid) multiplicities
+/// for a compound view's trailing UNION ALL branches behind a dedup prefix
+/// (the content-keyed state table can't hold rows that preserve
+/// multiplicity).
 pub fn needs_multiset_table(shape: &ViewShape) -> bool {
-    matches!(shape, ViewShape::GroupAggregate { aggregates, .. }
-        if aggregates.iter().any(uses_multiset))
+    match shape {
+        ViewShape::GroupAggregate { aggregates, .. } => aggregates.iter().any(uses_multiset),
+        ViewShape::Compound {
+            operators,
+            prefix_len,
+            ..
+        } => *prefix_len > 0 && *prefix_len < operators.len() + 1,
+        _ => false,
+    }
 }
 
 /// The CREATE TABLE statement for a GROUP BY view's value multiset: one row
@@ -1075,29 +1104,36 @@ pub fn needs_multiset_table(shape: &ViewShape) -> bool {
 /// aggregates the multiplicity decides when a value enters or leaves the
 /// accumulator.
 pub fn multiset_table_sql(multiset_table_name: &str, shape: &ViewShape) -> Result<String> {
-    let ViewShape::GroupAggregate {
-        group_collations,
-        multiset_collation,
-        ..
-    } = shape
-    else {
-        return Err(LimboError::InternalError(
-            "only GROUP BY views have multiset tables".to_string(),
-        ));
-    };
-    let mut columns = vec!["agg_id".to_string()];
-    let mut key = vec!["agg_id".to_string()];
-    for (i, collation) in group_collations.iter().enumerate() {
-        columns.push(format!("g{i}{}", collate_clause(*collation)));
-        key.push(format!("g{i}"));
+    match shape {
+        ViewShape::GroupAggregate {
+            group_collations,
+            multiset_collation,
+            ..
+        } => {
+            let mut columns = vec!["agg_id".to_string()];
+            let mut key = vec!["agg_id".to_string()];
+            for (i, collation) in group_collations.iter().enumerate() {
+                columns.push(format!("g{i}{}", collate_clause(*collation)));
+                key.push(format!("g{i}"));
+            }
+            columns.push(format!("val{}", collate_clause(*multiset_collation)));
+            key.push("val".to_string());
+            Ok(format!(
+                "CREATE TABLE {multiset_table_name} ({}, mult, PRIMARY KEY ({}))",
+                columns.join(", "),
+                key.join(", ")
+            ))
+        }
+        // A compound view's trailing UNION ALL branches: a multiset of
+        // (branch, source rowid), each row's rowid doubling as its view
+        // rowid (disambiguated from content-row rowids by the caller).
+        ViewShape::Compound { .. } => Ok(format!(
+            "CREATE TABLE {multiset_table_name} (branch, rid, mult, PRIMARY KEY (branch, rid))"
+        )),
+        _ => Err(LimboError::InternalError(
+            "only GROUP BY and compound views have multiset tables".to_string(),
+        )),
     }
-    columns.push(format!("val{}", collate_clause(*multiset_collation)));
-    key.push("val".to_string());
-    Ok(format!(
-        "CREATE TABLE {multiset_table_name} ({}, mult, PRIMARY KEY ({}))",
-        columns.join(", "),
-        key.join(", ")
-    ))
 }
 
 /// The `COLLATE` clause for a hidden-table key column, empty for the
@@ -1176,22 +1212,17 @@ pub fn compile_maintenance_program(
                 connection,
             )
         }
-        ViewShape::Union {
-            distinct,
-            key_collations,
-            ..
-        } => {
+        shape @ ViewShape::Compound { .. } => {
             if matches!(output, MaintenanceOutput::EmitRows) {
                 return Err(LimboError::InternalError(
-                    "union views serve uncommitted reads by recomputing the defining query"
+                    "compound views serve uncommitted reads by recomputing the defining query"
                         .to_string(),
                 ));
             }
-            compile_union_program(
+            compile_compound_program(
                 view_name,
                 select,
-                distinct,
-                &key_collations,
+                &shape,
                 view_root_page,
                 num_view_columns,
                 input,
@@ -3889,38 +3920,151 @@ fn compile_join_program(
     )
 }
 
-/// Compile the maintenance (or population) program for a UNION or UNION ALL
-/// view over filter/project branches.
+/// Emit `dst = 1` if the count in `src` is positive, else `0`. Counts are
+/// always integers, so three-valued logic never applies.
+fn emit_presence(program: &mut ProgramBuilder, src: usize, zero_reg: usize, dst: usize) {
+    let done = program.allocate_label();
+    program.emit_int(1, dst);
+    program.emit_insn(Insn::Gt {
+        lhs: src,
+        rhs: zero_reg,
+        target_pc: done,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_int(0, dst);
+    program.preassign_label_to_next_insn(done);
+}
+
+/// Emit the left-associative visibility fold over the per-branch counts at
+/// `cnt_start..cnt_start + prefix_len` into `dest`: a content row is in the
+/// compound result iff the fold of per-branch presence is true (UNION and
+/// UNION ALL fold as OR, INTERSECT as AND, EXCEPT as AND NOT).
+fn emit_visibility_fold(
+    program: &mut ProgramBuilder,
+    operators: &[ast::CompoundOperator],
+    prefix_len: usize,
+    cnt_start: usize,
+    zero_reg: usize,
+    scratch_reg: usize,
+    dest: usize,
+) {
+    emit_presence(program, cnt_start, zero_reg, dest);
+    for i in 1..prefix_len {
+        emit_presence(program, cnt_start + i, zero_reg, scratch_reg);
+        match operators[i - 1] {
+            ast::CompoundOperator::Union | ast::CompoundOperator::UnionAll => {
+                program.emit_insn(Insn::Or {
+                    lhs: dest,
+                    rhs: scratch_reg,
+                    dest,
+                });
+            }
+            ast::CompoundOperator::Intersect => {
+                program.emit_insn(Insn::And {
+                    lhs: dest,
+                    rhs: scratch_reg,
+                    dest,
+                });
+            }
+            ast::CompoundOperator::Except => {
+                program.emit_insn(Insn::Not {
+                    reg: scratch_reg,
+                    dest: scratch_reg,
+                });
+                program.emit_insn(Insn::And {
+                    lhs: dest,
+                    rhs: scratch_reg,
+                    dest,
+                });
+            }
+        }
+    }
+}
+
+/// Emit the view rowid for a state rowid in `srid_reg` into `dst`. When the
+/// view keeps both content rows and append rows, their state rowids come
+/// from two independent tables, so they map to disjoint view rowids:
+/// 2*rowid for content rows, 2*rowid + 1 for append rows. With a single
+/// state table the state rowid is the view rowid, as everywhere else.
+#[allow(clippy::too_many_arguments)]
+fn emit_compound_view_rowid(
+    program: &mut ProgramBuilder,
+    both_tables: bool,
+    srid_reg: usize,
+    two_reg: usize,
+    one_reg: usize,
+    dst: usize,
+    append: bool,
+) {
+    if both_tables {
+        program.emit_insn(Insn::Multiply {
+            lhs: srid_reg,
+            rhs: two_reg,
+            dest: dst,
+        });
+        if append {
+            program.emit_insn(Insn::Add {
+                lhs: dst,
+                rhs: one_reg,
+                dest: dst,
+            });
+        }
+    } else {
+        program.emit_insn(Insn::Copy {
+            src_reg: srid_reg,
+            dst_reg: dst,
+            extra_amount: 0,
+        });
+    }
+}
+
+/// Compile the maintenance (or population) program for a compound SELECT
+/// view (UNION, UNION ALL, INTERSECT, EXCEPT) over filter/project branches.
 ///
 /// Each branch is an independent single-table delta stream (or scan during
-/// population), so the view delta is simply the sum of the branch deltas.
-/// Every projected row funnels through one weight-merge subroutine keyed by
-/// the row's identity: (branch, source rowid) for UNION ALL — duplicates
-/// across branches are distinct rows — or the output content itself for
-/// UNION, whose state row's signed multiplicity counts copies across
-/// branches with the view row existing while it is positive. The state
-/// row's rowid doubles as the view rowid, as everywhere else.
+/// population). Branches in the dedup prefix funnel through a per-branch
+/// weight-merge subroutine keyed by the row's output content: the state row
+/// keeps one signed count per prefix branch, and the view row exists while
+/// the visibility fold over those counts is true. Branches in the trailing
+/// UNION ALL suffix keep (branch, source rowid) identity — duplicates are
+/// distinct view rows — through one append-merge subroutine, in the state
+/// table when the whole chain is UNION ALL and in the auxiliary multiset
+/// table when a dedup prefix owns the state table.
 #[allow(clippy::too_many_arguments)]
-fn compile_union_program(
+fn compile_compound_program(
     view_name: &str,
     select: &ast::Select,
-    distinct: bool,
-    key_collations: &[CollationSeq],
+    shape: &ViewShape,
     view_root_page: i64,
     num_view_columns: usize,
     input: MaintenanceInput,
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<Program> {
+    let ViewShape::Compound {
+        operators,
+        prefix_len,
+        key_collations,
+        ..
+    } = shape
+    else {
+        unreachable!("compile_compound_program requires a Compound shape");
+    };
+    let prefix_len = *prefix_len;
     let branches: Vec<&ast::OneSelect> = std::iter::once(&select.body.select)
         .chain(select.body.compounds.iter().map(|c| &c.select))
         .collect();
-    // Width of the row-identity key in the state table.
-    let key_width = if distinct { num_view_columns } else { 2 };
+    let n_branches = branches.len();
+    let has_prefix = prefix_len > 0;
+    let has_append = prefix_len < n_branches;
+    let both_tables = has_prefix && has_append;
+    // Width of the content key: every output column.
+    let k = num_view_columns;
     // With a collated dedup key, values that compare equal can differ in
     // bytes; the stored key is the row's first-seen representative (see the
-    // matching reload in the group-aggregate program). For UNION the output
-    // columns ARE the key, so the reload refreshes both.
+    // matching reload in the group-aggregate program). The output columns
+    // ARE the key, so the reload refreshes both.
     let reload_stored_key = key_collations
         .iter()
         .any(|c| !matches!(c, CollationSeq::Binary | CollationSeq::Unset));
@@ -3944,14 +4088,40 @@ fn compile_union_program(
                 "state table {state_table_name} of materialized view {view_name} has no index"
             ))
         })?;
+    // The append rows' home: the state table for a pure UNION ALL chain,
+    // the auxiliary multiset table when a dedup prefix owns the state table.
+    let (append_table_name, append_table, append_index) = if both_tables {
+        let name = format!(
+            "{}{}_{view_name}",
+            crate::schema::DBSP_MULTISET_TABLE_PREFIX,
+            crate::incremental::view::DBSP_CIRCUIT_VERSION
+        );
+        let table = schema.get_btree_table(&name).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "append table {name} of materialized view {view_name} not found"
+            ))
+        })?;
+        let index = schema.get_indices(&name).next().cloned().ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "append table {name} of materialized view {view_name} has no index"
+            ))
+        })?;
+        (name, table, index)
+    } else {
+        (
+            state_table_name.clone(),
+            state_table.clone(),
+            state_index.clone(),
+        )
+    };
 
     let mut program = ProgramBuilder::new_for_subprogram(
         QueryMode::Normal,
         None,
         ProgramBuilderOpts {
-            num_cursors: 4 + branches.len(),
-            approx_num_insns: 96 + 32 * num_view_columns * branches.len(),
-            approx_num_labels: 16 + 8 * branches.len(),
+            num_cursors: 6 + branches.len(),
+            approx_num_insns: 128 + 48 * num_view_columns * branches.len(),
+            approx_num_labels: 24 + 8 * branches.len(),
         },
     );
     program.prologue();
@@ -3968,19 +4138,40 @@ fn compile_union_program(
         Arc::new(crate::dialect::SqliteDialect),
     );
 
-    let state_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(state_table.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: state_cursor_id,
-        root_page: RegisterOrLiteral::Literal(state_table.root_page),
-        db: 0,
-    });
-    let state_index_cursor_id =
-        program.alloc_cursor_id(CursorType::BTreeIndex(state_index.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: state_index_cursor_id,
-        root_page: RegisterOrLiteral::Literal(state_index.root_page),
-        db: 0,
-    });
+    let content_cursors = if has_prefix {
+        let table_cursor = program.alloc_cursor_id(CursorType::BTreeTable(state_table.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: table_cursor,
+            root_page: RegisterOrLiteral::Literal(state_table.root_page),
+            db: 0,
+        });
+        let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(state_index.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: index_cursor,
+            root_page: RegisterOrLiteral::Literal(state_index.root_page),
+            db: 0,
+        });
+        Some((table_cursor, index_cursor))
+    } else {
+        None
+    };
+    let append_cursors = if has_append {
+        let table_cursor = program.alloc_cursor_id(CursorType::BTreeTable(append_table.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: table_cursor,
+            root_page: RegisterOrLiteral::Literal(append_table.root_page),
+            db: 0,
+        });
+        let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(append_index.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: index_cursor,
+            root_page: RegisterOrLiteral::Literal(append_index.root_page),
+            db: 0,
+        });
+        Some((table_cursor, index_cursor))
+    } else {
+        None
+    };
     let view_btree = Arc::new(synthesized_view_table(
         view_name,
         view_root_page,
@@ -3995,27 +4186,43 @@ fn compile_union_program(
 
     // Register layout, shared by all branches.
     let zero_reg = program.alloc_register();
-    let gosub_return_reg = program.alloc_register();
+    let two_reg = program.alloc_register();
+    let one_reg = program.alloc_register();
     let prev_rowid_scratch = program.alloc_register();
-    // [key.., state_rowid], contiguous for Found/IdxInsert/IdxDelete.
-    let key_start = program.alloc_registers(key_width + 1);
-    let srid_reg = key_start + key_width;
-    // [key.., multiplicity], the state row image.
-    let state_rec_start = program.alloc_registers(key_width + 1);
-    let state_mult_reg = state_rec_start + key_width;
     // [outputs.., weight], contiguous for MakeRecord.
     let out_start = program.alloc_registers(num_view_columns + 1);
     let out_weight_reg = out_start + num_view_columns;
     let w_reg = program.alloc_register();
+    let view_record_reg = program.alloc_register();
+    let view_rowid_reg = program.alloc_register();
+    // Content-merge registers: [key.., state_rowid] contiguous for
+    // Found/IdxInsert/IdxDelete, and [key.., counts..] as the state row
+    // image (the counts live in place at the record tail).
+    let c_return_reg = program.alloc_register();
+    let key_start = program.alloc_registers(k + 1);
+    let c_srid_reg = key_start + k;
+    let state_rec_start = program.alloc_registers(k + prefix_len.max(1));
+    let cnt_start = state_rec_start + k;
+    let v_old_reg = program.alloc_register();
+    let v_new_reg = program.alloc_register();
+    let p_scratch_reg = program.alloc_register();
+    let c_state_record_reg = program.alloc_register();
+    let c_index_record_reg = program.alloc_register();
+    // Append-merge registers: [branch, rid, state_rowid] and the
+    // (branch, rid, mult) state row image.
+    let a_return_reg = program.alloc_register();
+    let akey_start = program.alloc_registers(3);
+    let a_srid_reg = akey_start + 2;
+    let a_rec_start = program.alloc_registers(3);
     let cur_w_reg = program.alloc_register();
     let new_w_reg = program.alloc_register();
-    let state_record_reg = program.alloc_register();
-    let index_record_reg = program.alloc_register();
-    let view_record_reg = program.alloc_register();
+    let a_state_record_reg = program.alloc_register();
+    let a_index_record_reg = program.alloc_register();
 
     program.emit_int(0, zero_reg);
+    program.emit_int(2, two_reg);
+    program.emit_int(1, one_reg);
 
-    let merge_label = program.allocate_label();
     let main_start_label = program.allocate_label();
     let corrupt_label = program.allocate_label();
     let end_label = program.allocate_label();
@@ -4024,230 +4231,503 @@ fn compile_union_program(
         target_pc: main_start_label,
     });
 
-    // Weight-merge subroutine: apply (key, outputs, w) to the state and view
-    // btrees. Signed multiplicities are kept for uniformity with joins; the
-    // per-branch capture-order streams cannot dip below zero on their own.
-    program.preassign_label_to_next_insn(merge_label);
-    let m_found_label = program.allocate_label();
-    let m_update_label = program.allocate_label();
-    let m_visible_label = program.allocate_label();
-    let m_write_label = program.allocate_label();
-    let m_ret_label = program.allocate_label();
-    program.emit_insn(Insn::Found {
-        cursor_id: state_index_cursor_id,
-        target_pc: m_found_label,
-        record_reg: key_start,
-        num_regs: key_width,
-    });
-    program.emit_insn(Insn::NewRowid {
-        cursor: state_cursor_id,
-        rowid_reg: srid_reg,
-        prev_largest_reg: prev_rowid_scratch,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: key_start,
-        dst_reg: state_rec_start,
-        extra_amount: key_width.saturating_sub(1),
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: w_reg,
-        dst_reg: state_mult_reg,
-        extra_amount: 0,
-    });
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: state_rec_start as u16,
-        count: (key_width + 1) as u16,
-        dest_reg: state_record_reg as u16,
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: state_cursor_id,
-        key_reg: srid_reg,
-        record_reg: state_record_reg,
-        flag: InsertFlags(
-            InsertFlags::REQUIRE_SEEK
-                | InsertFlags::SKIP_LAST_ROWID
-                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-        ),
-        table_name: state_table_name.clone(),
-    });
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: key_start as u16,
-        count: (key_width + 1) as u16,
-        dest_reg: index_record_reg as u16,
-        index_name: Some(state_index.name.clone()),
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::IdxInsert {
-        cursor_id: state_index_cursor_id,
-        record_reg: index_record_reg,
-        unpacked_start: Some(key_start),
-        unpacked_count: Some((key_width + 1) as u16),
-        flags: IdxInsertFlags::new(),
-    });
-    program.emit_insn(Insn::Lt {
-        lhs: w_reg,
-        rhs: zero_reg,
-        target_pc: m_ret_label,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: w_reg,
-        dst_reg: out_weight_reg,
-        extra_amount: 0,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: m_write_label,
-    });
+    // Content-merge subroutines, one per prefix branch (the branch decides
+    // which count column the weight lands in): apply (key, outputs, w) to
+    // the content state row, then flip the view row on visibility-fold
+    // transitions. Negative counts are recorded for uniformity with joins;
+    // the per-branch capture-order streams cannot dip below zero on their
+    // own, and a negative count reads as "absent" in the fold.
+    let mut content_merge_labels = Vec::with_capacity(prefix_len);
+    for b in 0..prefix_len {
+        let (state_cursor_id, state_index_cursor_id) =
+            content_cursors.expect("prefix branches imply the content state table");
+        let cm_label = program.allocate_label();
+        program.preassign_label_to_next_insn(cm_label);
+        content_merge_labels.push(cm_label);
 
-    program.preassign_label_to_next_insn(m_found_label);
-    program.emit_insn(Insn::IdxRowId {
-        cursor_id: state_index_cursor_id,
-        dest: srid_reg,
-    });
-    program.emit_insn(Insn::SeekRowid {
-        cursor_id: state_cursor_id,
-        src_reg: srid_reg,
-        target_pc: corrupt_label,
-    });
-    if reload_stored_key {
-        for i in 0..key_width {
+        let found_label = program.allocate_label();
+        let vnew_label = program.allocate_label();
+        let not_all_zero_label = program.allocate_label();
+        let insert_label = program.allocate_label();
+        let ret_label = program.allocate_label();
+
+        program.emit_insn(Insn::Found {
+            cursor_id: state_index_cursor_id,
+            target_pc: found_label,
+            record_reg: key_start,
+            num_regs: k,
+        });
+        // Fresh content row: this branch's count is the weight, the rest 0.
+        program.emit_insn(Insn::NewRowid {
+            cursor: state_cursor_id,
+            rowid_reg: c_srid_reg,
+            prev_largest_reg: prev_rowid_scratch,
+        });
+        for i in 0..prefix_len {
+            program.emit_int(0, cnt_start + i);
+        }
+        program.emit_insn(Insn::Copy {
+            src_reg: w_reg,
+            dst_reg: cnt_start + b,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: key_start,
+            dst_reg: state_rec_start,
+            extra_amount: k.saturating_sub(1),
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: state_rec_start as u16,
+            count: (k + prefix_len) as u16,
+            dest_reg: c_state_record_reg as u16,
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: state_cursor_id,
+            key_reg: c_srid_reg,
+            record_reg: c_state_record_reg,
+            flag: InsertFlags(
+                InsertFlags::REQUIRE_SEEK
+                    | InsertFlags::SKIP_LAST_ROWID
+                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+            ),
+            table_name: state_table_name.clone(),
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: key_start as u16,
+            count: (k + 1) as u16,
+            dest_reg: c_index_record_reg as u16,
+            index_name: Some(state_index.name.clone()),
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: state_index_cursor_id,
+            record_reg: c_index_record_reg,
+            unpacked_start: Some(key_start),
+            unpacked_count: Some((k + 1) as u16),
+            flags: IdxInsertFlags::new(),
+        });
+        program.emit_int(0, v_old_reg);
+        program.emit_insn(Insn::Goto {
+            target_pc: vnew_label,
+        });
+
+        program.preassign_label_to_next_insn(found_label);
+        program.emit_insn(Insn::IdxRowId {
+            cursor_id: state_index_cursor_id,
+            dest: c_srid_reg,
+        });
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: state_cursor_id,
+            src_reg: c_srid_reg,
+            target_pc: corrupt_label,
+        });
+        if reload_stored_key {
+            for i in 0..k {
+                program.emit_insn(Insn::Column {
+                    cursor_id: state_cursor_id,
+                    column: i,
+                    dest: key_start + i,
+                    default: None,
+                });
+            }
+            program.emit_insn(Insn::Copy {
+                src_reg: key_start,
+                dst_reg: out_start,
+                extra_amount: k.saturating_sub(1),
+            });
+        }
+        for i in 0..prefix_len {
             program.emit_insn(Insn::Column {
                 cursor_id: state_cursor_id,
-                column: i,
-                dest: key_start + i,
+                column: k + i,
+                dest: cnt_start + i,
                 default: None,
             });
         }
+        emit_visibility_fold(
+            &mut program,
+            operators,
+            prefix_len,
+            cnt_start,
+            zero_reg,
+            p_scratch_reg,
+            v_old_reg,
+        );
+        program.emit_insn(Insn::Add {
+            lhs: w_reg,
+            rhs: cnt_start + b,
+            dest: cnt_start + b,
+        });
+        // Every count zero: the content row is gone from all branches (and
+        // the fold below reads all-absent as invisible).
+        for i in 0..prefix_len {
+            program.emit_insn(Insn::If {
+                reg: cnt_start + i,
+                target_pc: not_all_zero_label,
+                jump_if_null: false,
+            });
+        }
+        program.emit_insn(Insn::IdxDelete {
+            start_reg: key_start,
+            num_regs: k + 1,
+            cursor_id: state_index_cursor_id,
+            raise_error_if_no_matching_entry: true,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: state_cursor_id,
+            table_name: state_table_name.clone(),
+            is_part_of_update: true,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: vnew_label,
+        });
+
+        program.preassign_label_to_next_insn(not_all_zero_label);
         program.emit_insn(Insn::Copy {
             src_reg: key_start,
-            dst_reg: out_start,
-            extra_amount: key_width.saturating_sub(1),
+            dst_reg: state_rec_start,
+            extra_amount: k.saturating_sub(1),
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: state_rec_start as u16,
+            count: (k + prefix_len) as u16,
+            dest_reg: c_state_record_reg as u16,
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: state_cursor_id,
+            key_reg: c_srid_reg,
+            record_reg: c_state_record_reg,
+            flag: InsertFlags(
+                InsertFlags::REQUIRE_SEEK
+                    | InsertFlags::SKIP_LAST_ROWID
+                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+            ),
+            table_name: state_table_name.clone(),
+        });
+
+        program.preassign_label_to_next_insn(vnew_label);
+        emit_visibility_fold(
+            &mut program,
+            operators,
+            prefix_len,
+            cnt_start,
+            zero_reg,
+            p_scratch_reg,
+            v_new_reg,
+        );
+        // The view row changes only on visibility transitions: a row that
+        // stays visible keeps its stored first-seen content, so there is
+        // nothing to rewrite.
+        program.emit_insn(Insn::Eq {
+            lhs: v_old_reg,
+            rhs: v_new_reg,
+            target_pc: ret_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::If {
+            reg: v_new_reg,
+            target_pc: insert_label,
+            jump_if_null: false,
+        });
+        // Visible before, not now: remove the view row.
+        emit_compound_view_rowid(
+            &mut program,
+            both_tables,
+            c_srid_reg,
+            two_reg,
+            one_reg,
+            view_rowid_reg,
+            false,
+        );
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: view_cursor_id,
+            src_reg: view_rowid_reg,
+            target_pc: corrupt_label,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: view_cursor_id,
+            table_name: view_name.to_string(),
+            is_part_of_update: true,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: ret_label,
+        });
+
+        program.preassign_label_to_next_insn(insert_label);
+        program.emit_int(1, out_weight_reg);
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: out_start as u16,
+            count: (num_view_columns + 1) as u16,
+            dest_reg: view_record_reg as u16,
+            index_name: None,
+            affinity_str: None,
+        });
+        emit_compound_view_rowid(
+            &mut program,
+            both_tables,
+            c_srid_reg,
+            two_reg,
+            one_reg,
+            view_rowid_reg,
+            false,
+        );
+        program.emit_insn(Insn::Insert {
+            cursor: view_cursor_id,
+            key_reg: view_rowid_reg,
+            record_reg: view_record_reg,
+            flag: InsertFlags(
+                InsertFlags::REQUIRE_SEEK
+                    | InsertFlags::SKIP_LAST_ROWID
+                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+            ),
+            table_name: view_name.to_string(),
+        });
+        program.preassign_label_to_next_insn(ret_label);
+        program.emit_insn(Insn::Return {
+            return_reg: c_return_reg,
+            can_fallthrough: false,
         });
     }
-    program.emit_insn(Insn::Column {
-        cursor_id: state_cursor_id,
-        column: key_width,
-        dest: cur_w_reg,
-        default: None,
-    });
-    program.emit_insn(Insn::Add {
-        lhs: w_reg,
-        rhs: cur_w_reg,
-        dest: new_w_reg,
-    });
-    program.emit_insn(Insn::Ne {
-        lhs: new_w_reg,
-        rhs: zero_reg,
-        target_pc: m_update_label,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-    // Multiplicity reached zero: the row is gone. Its view row exists only
-    // if the multiplicity was positive before this contribution.
-    program.emit_insn(Insn::IdxDelete {
-        start_reg: key_start,
-        num_regs: (key_width + 1) as u16 as usize,
-        cursor_id: state_index_cursor_id,
-        raise_error_if_no_matching_entry: true,
-    });
-    program.emit_insn(Insn::Delete {
-        cursor_id: state_cursor_id,
-        table_name: state_table_name.clone(),
-        is_part_of_update: true,
-    });
-    program.emit_insn(Insn::Lt {
-        lhs: cur_w_reg,
-        rhs: zero_reg,
-        target_pc: m_ret_label,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-    program.emit_insn(Insn::SeekRowid {
-        cursor_id: view_cursor_id,
-        src_reg: srid_reg,
-        target_pc: corrupt_label,
-    });
-    program.emit_insn(Insn::Delete {
-        cursor_id: view_cursor_id,
-        table_name: view_name.to_string(),
-        is_part_of_update: true,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: m_ret_label,
-    });
 
-    program.preassign_label_to_next_insn(m_update_label);
-    program.emit_insn(Insn::Copy {
-        src_reg: key_start,
-        dst_reg: state_rec_start,
-        extra_amount: key_width.saturating_sub(1),
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: new_w_reg,
-        dst_reg: state_mult_reg,
-        extra_amount: 0,
-    });
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: state_rec_start as u16,
-        count: (key_width + 1) as u16,
-        dest_reg: state_record_reg as u16,
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: state_cursor_id,
-        key_reg: srid_reg,
-        record_reg: state_record_reg,
-        flag: InsertFlags(
-            InsertFlags::REQUIRE_SEEK
-                | InsertFlags::SKIP_LAST_ROWID
-                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-        ),
-        table_name: state_table_name,
-    });
-    program.emit_insn(Insn::Gt {
-        lhs: new_w_reg,
-        rhs: zero_reg,
-        target_pc: m_visible_label,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: m_ret_label,
-    });
+    // Append-merge subroutine: apply ((branch, rid), outputs, w) with a
+    // single signed multiplicity, the view row existing while it is
+    // positive. Signed multiplicities are kept for uniformity with joins;
+    // the per-branch capture-order streams cannot dip below zero on their
+    // own.
+    let append_merge_label = append_cursors.map(|(append_cursor_id, append_index_cursor_id)| {
+        let am_label = program.allocate_label();
+        program.preassign_label_to_next_insn(am_label);
 
-    program.preassign_label_to_next_insn(m_visible_label);
-    program.emit_insn(Insn::Copy {
-        src_reg: new_w_reg,
-        dst_reg: out_weight_reg,
-        extra_amount: 0,
-    });
-    program.preassign_label_to_next_insn(m_write_label);
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: out_start as u16,
-        count: (num_view_columns + 1) as u16,
-        dest_reg: view_record_reg as u16,
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: view_cursor_id,
-        key_reg: srid_reg,
-        record_reg: view_record_reg,
-        flag: InsertFlags(
-            InsertFlags::REQUIRE_SEEK
-                | InsertFlags::SKIP_LAST_ROWID
-                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-        ),
-        table_name: view_name.to_string(),
-    });
-    program.preassign_label_to_next_insn(m_ret_label);
-    program.emit_insn(Insn::Return {
-        return_reg: gosub_return_reg,
-        can_fallthrough: false,
+        let m_found_label = program.allocate_label();
+        let m_update_label = program.allocate_label();
+        let m_visible_label = program.allocate_label();
+        let m_write_label = program.allocate_label();
+        let m_ret_label = program.allocate_label();
+        program.emit_insn(Insn::Found {
+            cursor_id: append_index_cursor_id,
+            target_pc: m_found_label,
+            record_reg: akey_start,
+            num_regs: 2,
+        });
+        program.emit_insn(Insn::NewRowid {
+            cursor: append_cursor_id,
+            rowid_reg: a_srid_reg,
+            prev_largest_reg: prev_rowid_scratch,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: akey_start,
+            dst_reg: a_rec_start,
+            extra_amount: 1,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: w_reg,
+            dst_reg: a_rec_start + 2,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: a_rec_start as u16,
+            count: 3,
+            dest_reg: a_state_record_reg as u16,
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: append_cursor_id,
+            key_reg: a_srid_reg,
+            record_reg: a_state_record_reg,
+            flag: InsertFlags(
+                InsertFlags::REQUIRE_SEEK
+                    | InsertFlags::SKIP_LAST_ROWID
+                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+            ),
+            table_name: append_table_name.clone(),
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: akey_start as u16,
+            count: 3,
+            dest_reg: a_index_record_reg as u16,
+            index_name: Some(append_index.name.clone()),
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: append_index_cursor_id,
+            record_reg: a_index_record_reg,
+            unpacked_start: Some(akey_start),
+            unpacked_count: Some(3),
+            flags: IdxInsertFlags::new(),
+        });
+        program.emit_insn(Insn::Lt {
+            lhs: w_reg,
+            rhs: zero_reg,
+            target_pc: m_ret_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: w_reg,
+            dst_reg: out_weight_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: m_write_label,
+        });
+
+        program.preassign_label_to_next_insn(m_found_label);
+        program.emit_insn(Insn::IdxRowId {
+            cursor_id: append_index_cursor_id,
+            dest: a_srid_reg,
+        });
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: append_cursor_id,
+            src_reg: a_srid_reg,
+            target_pc: corrupt_label,
+        });
+        program.emit_insn(Insn::Column {
+            cursor_id: append_cursor_id,
+            column: 2,
+            dest: cur_w_reg,
+            default: None,
+        });
+        program.emit_insn(Insn::Add {
+            lhs: w_reg,
+            rhs: cur_w_reg,
+            dest: new_w_reg,
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: new_w_reg,
+            rhs: zero_reg,
+            target_pc: m_update_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        // Multiplicity reached zero: the row is gone. Its view row exists
+        // only if the multiplicity was positive before this contribution.
+        program.emit_insn(Insn::IdxDelete {
+            start_reg: akey_start,
+            num_regs: 3,
+            cursor_id: append_index_cursor_id,
+            raise_error_if_no_matching_entry: true,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: append_cursor_id,
+            table_name: append_table_name.clone(),
+            is_part_of_update: true,
+        });
+        program.emit_insn(Insn::Lt {
+            lhs: cur_w_reg,
+            rhs: zero_reg,
+            target_pc: m_ret_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        emit_compound_view_rowid(
+            &mut program,
+            both_tables,
+            a_srid_reg,
+            two_reg,
+            one_reg,
+            view_rowid_reg,
+            true,
+        );
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: view_cursor_id,
+            src_reg: view_rowid_reg,
+            target_pc: corrupt_label,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: view_cursor_id,
+            table_name: view_name.to_string(),
+            is_part_of_update: true,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: m_ret_label,
+        });
+
+        program.preassign_label_to_next_insn(m_update_label);
+        program.emit_insn(Insn::Copy {
+            src_reg: akey_start,
+            dst_reg: a_rec_start,
+            extra_amount: 1,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: new_w_reg,
+            dst_reg: a_rec_start + 2,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: a_rec_start as u16,
+            count: 3,
+            dest_reg: a_state_record_reg as u16,
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: append_cursor_id,
+            key_reg: a_srid_reg,
+            record_reg: a_state_record_reg,
+            flag: InsertFlags(
+                InsertFlags::REQUIRE_SEEK
+                    | InsertFlags::SKIP_LAST_ROWID
+                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+            ),
+            table_name: append_table_name.clone(),
+        });
+        program.emit_insn(Insn::Gt {
+            lhs: new_w_reg,
+            rhs: zero_reg,
+            target_pc: m_visible_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: m_ret_label,
+        });
+
+        program.preassign_label_to_next_insn(m_visible_label);
+        program.emit_insn(Insn::Copy {
+            src_reg: new_w_reg,
+            dst_reg: out_weight_reg,
+            extra_amount: 0,
+        });
+        program.preassign_label_to_next_insn(m_write_label);
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: out_start as u16,
+            count: (num_view_columns + 1) as u16,
+            dest_reg: view_record_reg as u16,
+            index_name: None,
+            affinity_str: None,
+        });
+        emit_compound_view_rowid(
+            &mut program,
+            both_tables,
+            a_srid_reg,
+            two_reg,
+            one_reg,
+            view_rowid_reg,
+            true,
+        );
+        program.emit_insn(Insn::Insert {
+            cursor: view_cursor_id,
+            key_reg: view_rowid_reg,
+            record_reg: view_record_reg,
+            flag: InsertFlags(
+                InsertFlags::REQUIRE_SEEK
+                    | InsertFlags::SKIP_LAST_ROWID
+                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+            ),
+            table_name: view_name.to_string(),
+        });
+        program.preassign_label_to_next_insn(m_ret_label);
+        program.emit_insn(Insn::Return {
+            return_reg: a_return_reg,
+            can_fallthrough: false,
+        });
+        am_label
     });
 
     program.preassign_label_to_next_insn(main_start_label);
@@ -4417,25 +4897,30 @@ fn compile_union_program(
             "projection produced {num_projected} columns, view declares {num_view_columns}"
         );
 
-        // Row identity: output content for UNION, (branch, rowid) for
-        // UNION ALL.
-        if distinct {
+        // Row identity: output content for dedup-prefix branches,
+        // (branch, rowid) for the trailing UNION ALL branches.
+        if branch_idx < prefix_len {
             program.emit_insn(Insn::Copy {
                 src_reg: out_start,
                 dst_reg: key_start,
-                extra_amount: key_width.saturating_sub(1),
+                extra_amount: k.saturating_sub(1),
+            });
+            program.emit_insn(Insn::Gosub {
+                target_pc: content_merge_labels[branch_idx],
+                return_reg: c_return_reg,
             });
         } else {
-            program.emit_int(branch_idx as i64, key_start);
+            program.emit_int(branch_idx as i64, akey_start);
             program.emit_insn(Insn::RowId {
                 cursor_id: input_cursor_id,
-                dest: key_start + 1,
+                dest: akey_start + 1,
+            });
+            program.emit_insn(Insn::Gosub {
+                target_pc: append_merge_label
+                    .expect("append branches imply the append-merge subroutine"),
+                return_reg: a_return_reg,
             });
         }
-        program.emit_insn(Insn::Gosub {
-            target_pc: merge_label,
-            return_reg: gosub_return_reg,
-        });
 
         program.preassign_label_to_next_insn(next_label);
         program.emit_insn(Insn::Next {
@@ -4462,7 +4947,7 @@ fn compile_union_program(
     program.build(
         connection.clone(),
         false,
-        "materialized view union maintenance",
+        "materialized view compound maintenance",
     )
 }
 
