@@ -2483,6 +2483,7 @@ where
     Ok(std::cmp::Ordering::Equal)
 }
 
+/// Treats `NULL` as equal to itself and smaller than other values.
 pub fn compare_immutable_single<V1, V2>(l: V1, r: V2, collation: CollationSeq) -> std::cmp::Ordering
 where
     V1: AsValueRef,
