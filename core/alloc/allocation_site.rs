@@ -19,6 +19,8 @@ pub enum ValueBlobAllocationSite {
     Hash128,
     RecordDecode,
     CloneFrom,
+    RecordBuild,
+    RecordCopy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
