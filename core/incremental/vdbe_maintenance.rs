@@ -1810,8 +1810,9 @@ pub fn compile_maintenance_program(
 ) -> Result<Program> {
     let dag = build_dag_for_connection(select, schema, connection)?;
     if dag_is_all_linear(&dag) {
-        return compile_dag_program(
+        return compile_dag_view_program(
             view_name,
+            select,
             &dag,
             view_root_page,
             num_view_columns,
@@ -1828,13 +1829,14 @@ pub fn compile_maintenance_program(
                     .to_string(),
             ));
         }
-        return compile_dag_aggregate_program(
+        return compile_dag_view_program(
             view_name,
             select,
             &dag,
             view_root_page,
             num_view_columns,
             input,
+            output,
             schema,
             connection,
         );
@@ -1845,12 +1847,14 @@ pub fn compile_maintenance_program(
                 "join views serve uncommitted reads by recomputing the defining query".to_string(),
             ));
         }
-        return compile_dag_join_program(
+        return compile_dag_view_program(
             view_name,
+            select,
             &dag,
             view_root_page,
             num_view_columns,
             input,
+            output,
             schema,
             connection,
         );
@@ -1864,6 +1868,24 @@ pub fn compile_maintenance_program(
         }
         return compile_dag_compound_program(
             view_name,
+            &dag,
+            view_root_page,
+            num_view_columns,
+            input,
+            schema,
+            connection,
+        );
+    }
+    if dag_is_compound_all(&dag) {
+        if matches!(output, MaintenanceOutput::EmitRows) {
+            return Err(LimboError::InternalError(
+                "compound views serve uncommitted reads by recomputing the defining query"
+                    .to_string(),
+            ));
+        }
+        return compile_dag_compound_all_program(
+            view_name,
+            select,
             &dag,
             view_root_page,
             num_view_columns,
@@ -1993,9 +2015,140 @@ fn dag_is_all_linear(dag: &dag::MaintenanceDag) -> bool {
     })
 }
 
+/// Convert a `Project` node's `(expr, alias)` projections into the
+/// `ResultColumn`s the shared emitters translate.
+fn projections_to_result_columns(
+    projections: &[(ast::Expr, Option<String>)],
+) -> Vec<ast::ResultColumn> {
+    projections
+        .iter()
+        .map(|(expr, alias)| {
+            ast::ResultColumn::Expr(
+                Box::new(expr.clone()),
+                alias.clone().map(|name| ast::As::As(ast::Name::exact(name))),
+            )
+        })
+        .collect()
+}
+
+/// Emit one view — or one compound-all branch — from the sub-tree rooted at
+/// `root` into `program`, dispatching on the operator directly under the
+/// `Project` root: a `Scan` (filter/project), an `Aggregate`, or a `Join`.
+/// The `Filter` between the `Project` and that operator, if present, is the
+/// WHERE for filter/project and joins and the HAVING for aggregates. `select`
+/// supplies the FROM/WHERE the aggregate emitter still reads (the view's
+/// select, or a compound-all branch's).
 #[allow(clippy::too_many_arguments)]
-fn compile_dag_program(
+fn emit_dag_view(
+    program: &mut ProgramBuilder,
     view_name: &str,
+    dag: &dag::MaintenanceDag,
+    root: dag::NodeId,
+    select: &ast::Select,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    output: MaintenanceOutput,
+    ns: &BranchNamespace,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let dag::OpNode::Project { input: proj_input, projections } = &dag.nodes[root] else {
+        return Err(LimboError::InternalError(
+            "view DAG root is not a projection".to_string(),
+        ));
+    };
+    let (op_id, filter): (dag::NodeId, Option<&ast::Expr>) = match &dag.nodes[*proj_input] {
+        dag::OpNode::Filter { input, predicate } => (*input, Some(predicate)),
+        _ => (*proj_input, None),
+    };
+    match &dag.nodes[op_id] {
+        dag::OpNode::Scan { table, identifier } => {
+            let columns = projections_to_result_columns(projections);
+            emit_filter_project(
+                program,
+                view_name,
+                table,
+                identifier,
+                &columns,
+                filter,
+                view_root_page,
+                num_view_columns,
+                input,
+                output,
+                ns,
+                schema,
+                connection,
+            )
+        }
+        dag::OpNode::Aggregate {
+            group_exprs,
+            group_collations,
+            aggregates,
+            scalar,
+            ..
+        } => {
+            let outputs = dag_aggregate_outputs(projections, group_exprs, aggregates);
+            emit_group_aggregate(
+                program,
+                view_name,
+                select,
+                group_exprs,
+                group_collations,
+                aggregates,
+                &outputs,
+                filter,
+                *scalar,
+                view_root_page,
+                num_view_columns,
+                input,
+                ns,
+                schema,
+                connection,
+            )
+        }
+        dag::OpNode::Join {
+            inputs,
+            using,
+            on,
+            left_outer,
+        } => {
+            let mut tables: Vec<JoinTable> = Vec::with_capacity(inputs.len());
+            for (pos, &scan_id) in inputs.iter().enumerate() {
+                let dag::OpNode::Scan { table, identifier } = &dag.nodes[scan_id] else {
+                    return Err(LimboError::InternalError(
+                        "join input is not a base table scan".to_string(),
+                    ));
+                };
+                tables.push((table.clone(), identifier.clone(), using[pos].clone()));
+            }
+            let columns = projections_to_result_columns(projections);
+            emit_join(
+                program,
+                view_name,
+                &columns,
+                &tables,
+                on,
+                filter,
+                *left_outer,
+                view_root_page,
+                num_view_columns,
+                input,
+                ns,
+                schema,
+                connection,
+            )
+        }
+        _ => Err(LimboError::InternalError(
+            "unsupported operator under view projection".to_string(),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_dag_view_program(
+    view_name: &str,
+    select: &ast::Select,
     dag: &dag::MaintenanceDag,
     view_root_page: i64,
     num_view_columns: usize,
@@ -2008,73 +2161,18 @@ fn compile_dag_program(
         QueryMode::Normal,
         None,
         ProgramBuilderOpts {
-            num_cursors: 2,
-            approx_num_insns: 32 + 8 * num_view_columns,
-            approx_num_labels: 8,
+            num_cursors: 13,
+            approx_num_insns: 128 + 64 * num_view_columns,
+            approx_num_labels: 48,
         },
     );
     program.prologue();
-    emit_linear_view(
+    emit_dag_view(
         &mut program,
         view_name,
         dag,
-        view_root_page,
-        num_view_columns,
-        input,
-        output,
-        schema,
-        connection,
-    )?;
-    program.epilogue(schema);
-    program.build(connection.clone(), false, "materialized view dag maintenance")
-}
-
-/// Emit an all-linear DAG (`Scan` -> `Filter`? -> `Project`) as the
-/// filter/project pipeline, feeding the base table, WHERE, and projection
-/// extracted from the nodes into the shared [`emit_filter_project`].
-#[allow(clippy::too_many_arguments)]
-fn emit_linear_view(
-    program: &mut ProgramBuilder,
-    view_name: &str,
-    dag: &dag::MaintenanceDag,
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
-    output: MaintenanceOutput,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<()> {
-    let pending = || {
-        LimboError::InternalError("non-linear operator DAG reached linear codegen".to_string())
-    };
-    let dag::OpNode::Project { input: proj_input, projections } = dag.root_node() else {
-        return Err(pending());
-    };
-    // The projection input is either the WHERE Filter or the Scan directly.
-    let (scan_id, where_clause): (dag::NodeId, Option<&ast::Expr>) = match &dag.nodes[*proj_input] {
-        dag::OpNode::Filter { input, predicate } => (*input, Some(predicate)),
-        dag::OpNode::Scan { .. } => (*proj_input, None),
-        _ => return Err(pending()),
-    };
-    let dag::OpNode::Scan { table, identifier } = &dag.nodes[scan_id] else {
-        return Err(pending());
-    };
-    let columns: Vec<ast::ResultColumn> = projections
-        .iter()
-        .map(|(expr, alias)| {
-            ast::ResultColumn::Expr(
-                Box::new(expr.clone()),
-                alias.clone().map(|name| ast::As::As(ast::Name::exact(name))),
-            )
-        })
-        .collect();
-    emit_filter_project(
-        program,
-        view_name,
-        table,
-        identifier,
-        &columns,
-        where_clause,
+        dag.root,
+        select,
         view_root_page,
         num_view_columns,
         input,
@@ -2082,7 +2180,9 @@ fn emit_linear_view(
         &BranchNamespace::none(),
         schema,
         connection,
-    )
+    )?;
+    program.epilogue(schema);
+    program.build(connection.clone(), false, "materialized view dag maintenance")
 }
 
 /// Whether the DAG is an aggregate view: `Project` root over an `Aggregate`,
@@ -2191,148 +2291,6 @@ fn dag_aggregate_outputs(
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compile_dag_aggregate_program(
-    view_name: &str,
-    select: &ast::Select,
-    dag: &dag::MaintenanceDag,
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<Program> {
-    let dag::OpNode::Project { input: proj_input, projections } = dag.root_node() else {
-        unreachable!("caller checked aggregate shape");
-    };
-    let (agg_id, having): (dag::NodeId, Option<&ast::Expr>) = match &dag.nodes[*proj_input] {
-        dag::OpNode::Filter { input, predicate } => (*input, Some(predicate)),
-        _ => (*proj_input, None),
-    };
-    let dag::OpNode::Aggregate {
-        group_exprs,
-        group_collations,
-        aggregates,
-        scalar,
-        ..
-    } = &dag.nodes[agg_id]
-    else {
-        unreachable!("caller checked aggregate shape");
-    };
-    let outputs = dag_aggregate_outputs(projections, group_exprs, aggregates);
-
-    let mut program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts {
-            num_cursors: 4,
-            approx_num_insns: 128 + 32 * num_view_columns,
-            approx_num_labels: 32,
-        },
-    );
-    program.prologue();
-    emit_group_aggregate(
-        &mut program,
-        view_name,
-        select,
-        group_exprs,
-        group_collations,
-        aggregates,
-        &outputs,
-        having,
-        *scalar,
-        view_root_page,
-        num_view_columns,
-        input,
-        &BranchNamespace::none(),
-        schema,
-        connection,
-    )?;
-    program.epilogue(schema);
-    program.build(
-        connection.clone(),
-        false,
-        "materialized view aggregate maintenance",
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compile_dag_join_program(
-    view_name: &str,
-    dag: &dag::MaintenanceDag,
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<Program> {
-    let dag::OpNode::Project { input: proj_input, projections } = dag.root_node() else {
-        unreachable!("caller checked join shape");
-    };
-    let (join_id, where_clause): (dag::NodeId, Option<&ast::Expr>) = match &dag.nodes[*proj_input] {
-        dag::OpNode::Filter { input, predicate } => (*input, Some(predicate)),
-        _ => (*proj_input, None),
-    };
-    let dag::OpNode::Join {
-        inputs,
-        using,
-        on,
-        left_outer,
-    } = &dag.nodes[join_id]
-    else {
-        unreachable!("caller checked join shape");
-    };
-    let mut tables: Vec<JoinTable> = Vec::with_capacity(inputs.len());
-    for (pos, &scan_id) in inputs.iter().enumerate() {
-        let dag::OpNode::Scan { table, identifier } = &dag.nodes[scan_id] else {
-            return Err(LimboError::InternalError(
-                "join input is not a base table scan".to_string(),
-            ));
-        };
-        tables.push((table.clone(), identifier.clone(), using[pos].clone()));
-    }
-    let columns: Vec<ast::ResultColumn> = projections
-        .iter()
-        .map(|(expr, alias)| {
-            ast::ResultColumn::Expr(
-                Box::new(expr.clone()),
-                alias.clone().map(|name| ast::As::As(ast::Name::exact(name))),
-            )
-        })
-        .collect();
-
-    let mut program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts {
-            num_cursors: 13,
-            approx_num_insns: 128 + 64 * num_view_columns,
-            approx_num_labels: 48,
-        },
-    );
-    program.prologue();
-    emit_join(
-        &mut program,
-        view_name,
-        &columns,
-        &tables,
-        on,
-        where_clause,
-        *left_outer,
-        view_root_page,
-        num_view_columns,
-        input,
-        &BranchNamespace::none(),
-        schema,
-        connection,
-    )?;
-    program.epilogue(schema);
-    program.build(
-        connection.clone(),
-        false,
-        "materialized view join maintenance",
-    )
-}
 
 #[allow(clippy::too_many_arguments)]
 fn compile_dag_compound_program(
@@ -2369,6 +2327,69 @@ fn compile_dag_compound_program(
         input,
         schema,
         connection,
+    )
+}
+
+/// Whether the DAG is a pure UNION ALL over branches that are not all
+/// filter/project (at least one join or aggregate branch): a `SetOp` root
+/// that [`dag_is_compound`] does not cover. Each branch writes a disjoint
+/// rowid slice of the view; there is no cross-branch merge.
+fn dag_is_compound_all(dag: &dag::MaintenanceDag) -> bool {
+    matches!(dag.root_node(), dag::OpNode::SetOp { .. }) && !dag_is_compound(dag)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_dag_compound_all_program(
+    view_name: &str,
+    select: &ast::Select,
+    dag: &dag::MaintenanceDag,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<Program> {
+    let dag::OpNode::SetOp { inputs, .. } = dag.root_node() else {
+        unreachable!("caller checked compound-all shape");
+    };
+    let n_branches = inputs.len();
+    let mut program = ProgramBuilder::new_for_subprogram(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts {
+            num_cursors: 6 * n_branches,
+            approx_num_insns: 128 * n_branches + 32 * num_view_columns * n_branches,
+            approx_num_labels: 48 * n_branches,
+        },
+    );
+    program.prologue();
+    for (branch_idx, &branch_root) in inputs.iter().enumerate() {
+        let ns = BranchNamespace {
+            scale: n_branches as i64,
+            offset: branch_idx as i64,
+            suffix: format!("__b{branch_idx}"),
+        };
+        let branch = branch_select(select, branch_idx);
+        emit_dag_view(
+            &mut program,
+            view_name,
+            dag,
+            branch_root,
+            &branch,
+            view_root_page,
+            num_view_columns,
+            input,
+            MaintenanceOutput::ViewBtree,
+            &ns,
+            schema,
+            connection,
+        )?;
+    }
+    program.epilogue(schema);
+    program.build(
+        connection.clone(),
+        false,
+        "materialized view compound-all maintenance",
     )
 }
 
