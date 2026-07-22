@@ -63,6 +63,19 @@ pub use checkpoint_state_machine::{
     sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
 };
 
+/// Differential-testing accessors for the Aretta Books MVCC
+/// conformance harness. Gated on the `aristo-instr`
+/// feature; never compiled in production builds.
+#[cfg(feature = "aristo-instr")]
+pub mod differential;
+
+// Re-import the snapshot types into scope so the `aristo::instrument::Inspect`
+// derive on `MvStore` can name them in `#[inspect(...)]` tags without
+// qualifying through `self::differential::`. Both types live in
+// `differential.rs` (see ACCESSORS.md rows 1-2).
+#[cfg(feature = "aristo-instr")]
+use self::differential::{FinalStateSnapshot, RecoveredSchemaRecord, TxnSnapshot};
+
 #[cfg(feature = "conn_raw_api")]
 use super::persistent_storage::logical_log::{
     parse_ops_from_plaintext, LogSerializer, LOG_RECORD_PREFIX_SIZE,
@@ -3930,7 +3943,16 @@ impl RootEntry {
 
 /// A multi-version concurrency control database.
 #[derive(Debug)]
+#[cfg_attr(feature = "aristo-instr", derive(aristo::instrument::Inspect))]
 pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
+    #[cfg_attr(
+        feature = "aristo-instr",
+        inspect(
+            ret = Vec<RecoveredSchemaRecord>,
+            with = crate::mvcc::database::differential::project_recovered_schema_records,
+            name = "recovered_schema_records"
+        )
+    )]
     pub rows: SkipMap<RowID, RowVersions<A>, BasicComparator, A>,
     /// Table ID is an opaque identifier that is only meaningful to the MV store.
     /// Each checkpointed MVCC table corresponds to a single B-tree on the pager,
@@ -3957,9 +3979,24 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// a mismatch, since a key inserted at or behind an already-positioned
     /// finger would otherwise be skipped (#7578).
     index_rows_epoch: AtomicU64,
+    #[cfg_attr(
+        feature = "aristo-instr",
+        inspect(
+            ret = Vec<(TxID, TxnSnapshot)>,
+            with = crate::mvcc::database::differential::project_txs
+        )
+    )]
     txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
+    #[cfg_attr(
+        feature = "aristo-instr",
+        inspect(
+            ret = Vec<(TxID, FinalStateSnapshot)>,
+            with = crate::mvcc::database::differential::project_finalized,
+            name = "finalized"
+        )
+    )]
     finalized_tx_states: SkipMap<TxID, TransactionState, BasicComparator, A>,
     /// Allocator backing every skiplist in this store, including lazily
     /// created per-index maps in `index_rows`.
@@ -3967,7 +4004,15 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// Type-erased clone of `alloc` used by logical-log buffers that cross the
     /// durable-storage trait-object and I/O ownership boundaries.
     logical_log_alloc: DynAllocator,
+    #[cfg_attr(
+        feature = "aristo-instr",
+        inspect(ret = u64, with = |a| a.load(crate::sync::atomic::Ordering::Acquire), name = "tx_ids_value")
+    )]
     tx_ids: AtomicU64,
+    #[cfg_attr(
+        feature = "aristo-instr",
+        inspect(ret = u64, with = |a| a.load(crate::sync::atomic::Ordering::Acquire), name = "version_id_counter_value")
+    )]
     version_id_counter: AtomicU64,
     next_rowid: AtomicU64,
     next_table_id: AtomicI64,
@@ -4022,6 +4067,10 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// The timestamp of the last committed transaction.
     /// If there are two concurrent BEGIN (non-CONCURRENT) transactions, and one tries to promote
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
+    #[cfg_attr(
+        feature = "aristo-instr",
+        inspect(ret = u64, with = |a| a.load(crate::sync::atomic::Ordering::Acquire) + 1, name = "peek_next_ts")
+    )]
     last_committed_tx_ts: AtomicU64,
     /// `end_ts` of the most recent tx whose header was written into
     /// `global_header`. Used to gate header writes at both
