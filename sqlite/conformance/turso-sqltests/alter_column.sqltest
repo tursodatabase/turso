@@ -630,6 +630,89 @@ expect {
     ok
 }
 
+test alter-column-rewrites-expression-index-affinity-change {
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE t(x NUMERIC, z INTEGER);
+    CREATE INDEX idx_expr ON t(typeof(x), x);
+    INSERT INTO t VALUES(10,1),(2,2),(30,3);
+    ALTER TABLE t ALTER COLUMN x TO y TEXT;
+    SELECT y FROM t INDEXED BY idx_expr WHERE typeof(y) = 'text' ORDER BY y;
+    PRAGMA integrity_check;
+}
+expect {
+    wal
+    10
+    2
+    30
+    ok
+}
+
+test alter-column-rewrites-partial-index-affinity-change {
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE t(x NUMERIC, z INTEGER);
+    CREATE INDEX idx_partial ON t(z) WHERE typeof(x) = 'text';
+    INSERT INTO t VALUES(10,1),(2,2),(30,3);
+    ALTER TABLE t ALTER COLUMN x TO y TEXT;
+    SELECT z FROM t INDEXED BY idx_partial WHERE typeof(y) = 'text' ORDER BY z;
+    PRAGMA integrity_check;
+}
+expect {
+    wal
+    1
+    2
+    3
+    ok
+}
+
+test alter-column-rewrites-generated-index-affinity-change {
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE t(x NUMERIC, g TEXT GENERATED ALWAYS AS (typeof(x) || ':' || x) VIRTUAL);
+    CREATE INDEX idx_g ON t(g);
+    INSERT INTO t(x) VALUES(10),(2),(30);
+    ALTER TABLE t ALTER COLUMN x TO y TEXT;
+    SELECT g FROM t INDEXED BY idx_g WHERE g >= 'text:' ORDER BY g;
+    PRAGMA integrity_check;
+}
+expect {
+    wal
+    text:10
+    text:2
+    text:30
+    ok
+}
+
+test alter-column-rewrites-indexed-virtual-to-regular {
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE t(id TEXT, g TEXT GENERATED ALWAYS AS ('old:' || id) VIRTUAL);
+    CREATE INDEX idx_g ON t(g);
+    INSERT INTO t(id) VALUES('a'),('b');
+    ALTER TABLE t ALTER COLUMN g TO h TEXT;
+    SELECT id, h FROM t INDEXED BY idx_g WHERE h IS NULL ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    wal
+    a|
+    b|
+    ok
+}
+
+test alter-column-rewrites-indexed-regular-to-virtual {
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE t(a TEXT, b TEXT, c TEXT);
+    CREATE INDEX idx_b ON t(b);
+    INSERT INTO t VALUES('a','stale:2','2'),('a','stale:1','1');
+    ALTER TABLE t ALTER COLUMN b TO d TEXT GENERATED ALWAYS AS (a || ':' || c) VIRTUAL;
+    SELECT d FROM t INDEXED BY idx_b WHERE d >= 'a:' ORDER BY d;
+    PRAGMA integrity_check;
+}
+expect {
+    wal
+    a:1
+    a:2
+    ok
+}
+
 test alter-column-rewrites-indexed-virtual-expression-change {
     PRAGMA journal_mode=WAL;
     CREATE TABLE t(a TEXT, g TEXT GENERATED ALWAYS AS ('old:' || a) VIRTUAL);
@@ -644,6 +727,44 @@ expect {
     new:a
     new:b
     ok
+}
+
+test alter-column-rewrites-partial-index-virtual-expression-change {
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE t(a TEXT, g TEXT GENERATED ALWAYS AS ('old:' || a) VIRTUAL);
+    CREATE INDEX idx_partial ON t(a) WHERE g LIKE 'new:%';
+    INSERT INTO t(a) VALUES('b'),('a');
+    ALTER TABLE t ALTER COLUMN g TO h TEXT GENERATED ALWAYS AS ('new:' || a) VIRTUAL;
+    SELECT a FROM t INDEXED BY idx_partial WHERE h LIKE 'new:%' ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    wal
+    a
+    b
+    ok
+}
+
+test alter-column-rejects-index-rewrite-mvcc {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t(x NUMERIC);
+    CREATE INDEX idx_x ON t(x);
+    INSERT INTO t VALUES(10),(2),(30);
+    ALTER TABLE t ALTER COLUMN x TO y TEXT;
+}
+expect error {
+    Parse error: cannot ALTER COLUMN "x": rebuilding affected indexes is not supported in MVCC mode
+}
+
+test alter-column-rejects-index-only-rewrite-mvcc {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t(a TEXT, g TEXT GENERATED ALWAYS AS ('old:' || a) VIRTUAL);
+    CREATE INDEX idx_g ON t(g);
+    INSERT INTO t(a) VALUES('a'),('b');
+    ALTER TABLE t ALTER COLUMN g TO h TEXT GENERATED ALWAYS AS ('new:' || a) VIRTUAL;
+}
+expect error {
+    Parse error: cannot ALTER COLUMN "g": rebuilding affected indexes is not supported in MVCC mode
 }
 
 test alter-column-text-to-integer-coerces-existing-rows {
