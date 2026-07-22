@@ -1821,6 +1821,24 @@ pub fn compile_maintenance_program(
             connection,
         );
     }
+    if dag_is_aggregate(&dag) {
+        if matches!(output, MaintenanceOutput::EmitRows) {
+            return Err(LimboError::InternalError(
+                "aggregate views serve uncommitted reads by recomputing the defining query"
+                    .to_string(),
+            ));
+        }
+        return compile_dag_aggregate_program(
+            view_name,
+            select,
+            &dag,
+            view_root_page,
+            num_view_columns,
+            input,
+            schema,
+            connection,
+        );
+    }
 
     match classify_view_for_connection(select, schema, connection)? {
         ViewShape::FilterProject => compile_filter_project_program(
@@ -2031,6 +2049,113 @@ fn emit_linear_view(
         &BranchNamespace::none(),
         schema,
         connection,
+    )
+}
+
+/// Whether the DAG is an aggregate view: `Project` root over an `Aggregate`,
+/// optionally with a HAVING `Filter` between them.
+fn dag_is_aggregate(dag: &dag::MaintenanceDag) -> bool {
+    let dag::OpNode::Project { input: proj_input, .. } = dag.root_node() else {
+        return false;
+    };
+    let below = match &dag.nodes[*proj_input] {
+        dag::OpNode::Filter { input, .. } => *input,
+        _ => *proj_input,
+    };
+    matches!(dag.nodes[below], dag::OpNode::Aggregate { .. })
+}
+
+/// Reconstruct the [`OutputColumn`] mapping for an aggregate view from the
+/// `Project` node's expressions, resolving each against the `Aggregate` node's
+/// group keys and aggregate calls (which already collect every aggregate
+/// appearing in the outputs or HAVING).
+fn dag_aggregate_outputs(
+    projections: &[(ast::Expr, Option<String>)],
+    group_exprs: &[ast::Expr],
+    aggregates: &[Aggregate],
+) -> Vec<OutputColumn> {
+    projections
+        .iter()
+        .map(|(expr, _)| {
+            if let Some(idx) = group_exprs
+                .iter()
+                .position(|g| crate::util::exprs_are_equivalent(g, expr))
+            {
+                OutputColumn::Group(idx)
+            } else if let Some(idx) = aggregates
+                .iter()
+                .position(|a| crate::util::exprs_are_equivalent(&a.original_expr, expr))
+            {
+                OutputColumn::Aggregate(idx)
+            } else {
+                OutputColumn::Expr(expr.clone())
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_dag_aggregate_program(
+    view_name: &str,
+    select: &ast::Select,
+    dag: &dag::MaintenanceDag,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<Program> {
+    let dag::OpNode::Project { input: proj_input, projections } = dag.root_node() else {
+        unreachable!("caller checked aggregate shape");
+    };
+    let (agg_id, having): (dag::NodeId, Option<&ast::Expr>) = match &dag.nodes[*proj_input] {
+        dag::OpNode::Filter { input, predicate } => (*input, Some(predicate)),
+        _ => (*proj_input, None),
+    };
+    let dag::OpNode::Aggregate {
+        group_exprs,
+        group_collations,
+        aggregates,
+        scalar,
+        ..
+    } = &dag.nodes[agg_id]
+    else {
+        unreachable!("caller checked aggregate shape");
+    };
+    let outputs = dag_aggregate_outputs(projections, group_exprs, aggregates);
+
+    let mut program = ProgramBuilder::new_for_subprogram(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts {
+            num_cursors: 4,
+            approx_num_insns: 128 + 32 * num_view_columns,
+            approx_num_labels: 32,
+        },
+    );
+    program.prologue();
+    emit_group_aggregate(
+        &mut program,
+        view_name,
+        select,
+        group_exprs,
+        group_collations,
+        aggregates,
+        &outputs,
+        having,
+        *scalar,
+        view_root_page,
+        num_view_columns,
+        input,
+        &BranchNamespace::none(),
+        schema,
+        connection,
+    )?;
+    program.epilogue(schema);
+    program.build(
+        connection.clone(),
+        false,
+        "materialized view aggregate maintenance",
     )
 }
 
@@ -2509,11 +2634,28 @@ fn compile_group_aggregate_program(
         },
     );
     program.prologue();
+    let ViewShape::GroupAggregate {
+        group_exprs,
+        group_collations,
+        aggregates,
+        outputs,
+        having,
+        scalar,
+        ..
+    } = shape
+    else {
+        unreachable!("compile_group_aggregate_program requires a GroupAggregate shape");
+    };
     emit_group_aggregate(
         &mut program,
         view_name,
         select,
-        shape,
+        group_exprs,
+        group_collations,
+        aggregates,
+        outputs,
+        having.as_ref(),
+        *scalar,
         view_root_page,
         num_view_columns,
         input,
@@ -2529,11 +2671,17 @@ fn compile_group_aggregate_program(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_group_aggregate(
     program: &mut ProgramBuilder,
     view_name: &str,
     select: &ast::Select,
-    shape: &ViewShape,
+    group_exprs: &[ast::Expr],
+    group_collations: &[CollationSeq],
+    aggregates: &[Aggregate],
+    outputs: &[OutputColumn],
+    having: Option<&ast::Expr>,
+    scalar: bool,
     view_root_page: i64,
     num_view_columns: usize,
     input: MaintenanceInput,
@@ -2542,20 +2690,6 @@ fn emit_group_aggregate(
     connection: &Arc<Connection>,
 ) -> Result<()> {
     use crate::function::AccumulatorFunc;
-
-    let ViewShape::GroupAggregate {
-        group_exprs,
-        group_collations,
-        aggregates,
-        multiset_collation: _,
-        outputs,
-        having,
-        scalar,
-    } = shape
-    else {
-        unreachable!("compile_group_aggregate_program requires a GroupAggregate shape");
-    };
-    let scalar = *scalar;
     // With a collated key, values that compare equal can differ in bytes.
     // The stored key is the group's first-seen representative: reloading it
     // on every lookup keeps the state row, its index entry, and the view row
@@ -2602,7 +2736,7 @@ fn emit_group_aggregate(
             }))
         })
         .collect();
-    let has_multiset = needs_multiset_table(shape);
+    let has_multiset = aggregates.iter().any(uses_multiset);
 
     // The state table and its primary-key index are real schema objects
     // created by CREATE MATERIALIZED VIEW; the namespace suffix keeps each
@@ -6618,11 +6752,24 @@ fn compile_compound_all_program(
                 schema,
                 connection,
             )?,
-            ViewShape::GroupAggregate { .. } => emit_group_aggregate(
+            ViewShape::GroupAggregate {
+                group_exprs,
+                group_collations,
+                aggregates,
+                outputs,
+                having,
+                scalar,
+                ..
+            } => emit_group_aggregate(
                 &mut program,
                 view_name,
                 &branch,
-                sub,
+                group_exprs,
+                group_collations,
+                aggregates,
+                outputs,
+                having.as_ref(),
+                *scalar,
                 view_root_page,
                 num_view_columns,
                 input,
