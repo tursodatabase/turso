@@ -495,6 +495,17 @@ trait WalCoordination: Debug + Send + Sync {
     fn publish_commit(&self, commit: WalCommitState);
 
     /// Publish the highest frame durably backfilled during checkpoint.
+    #[aristo::intent(
+        "The published backfill marker nbackfills never exceeds the current \
+         generation's committed-frame ceiling max_frame. A backfill count computed \
+         under a WAL generation that a truncate has since restarted — resetting \
+         max_frame — is not applied, so nbackfills cannot advance past the frames \
+         actually committed. An inverted range where nbackfills exceeds max_frame lets \
+         readers look past the live frames and fall back to stale pre-restart pages.",
+        verify = "full",
+        id = "wal_backfill_marker_within_committed_range",
+        parent = "wal_protocol_correctness"
+    )]
     fn publish_backfill(&self, max_frame: u64);
 
     /// Install any backend-specific durable proof before publishing backfill.
