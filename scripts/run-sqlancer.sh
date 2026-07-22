@@ -114,7 +114,7 @@ echo "=== Setting up SQLancer for Limbo ==="
 echo "Platform: $PLATFORM"
 
 # Step 1: Build Limbo JDBC driver if needed
-JAVA_BINDINGS_DIR="$LIMBO_ROOT/bindings/java"
+JAVA_BINDINGS_DIR="$LIMBO_ROOT/sdks/java"
 LIMBO_VERSION=$(grep "^projectVersion=" "$JAVA_BINDINGS_DIR/gradle.properties" | cut -d= -f2)
 LIMBO_JAR="$JAVA_BINDINGS_DIR/build/libs/turso-${LIMBO_VERSION}.jar"
 NATIVE_LIB_DIR="$JAVA_BINDINGS_DIR/libs/$PLATFORM"
@@ -123,8 +123,8 @@ HASH_FILE="$JAVA_BINDINGS_DIR/.build-hash"
 # Compute hash of Rust and Java source to detect changes
 compute_source_hash() {
     {
-        find "$LIMBO_ROOT/core" "$LIMBO_ROOT/bindings/java/rs_src" -name "*.rs" -type f 2>/dev/null
-        find "$LIMBO_ROOT/bindings/java/src" -name "*.java" -type f 2>/dev/null
+        find "$LIMBO_ROOT/core" "$LIMBO_ROOT/sdks/java/rs_src" -name "*.rs" -type f 2>/dev/null
+        find "$LIMBO_ROOT/sdks/java/src" -name "*.java" -type f 2>/dev/null
     } | sort | xargs cat 2>/dev/null | shasum -a 256 | cut -d' ' -f1
 }
 

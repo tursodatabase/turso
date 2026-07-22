@@ -5,7 +5,7 @@
  *
  * Usage: node turso-sql-runner.mjs <database_path> [--readonly]
  *
- * This script expects to be run from the bindings/javascript directory where
+ * This script expects to be run from the sdks/javascript directory where
  * the @tursodatabase/database package is available.
  *
  * Known limitations:

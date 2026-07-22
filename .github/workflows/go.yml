@@ -60,7 +60,7 @@ jobs:
         with:
           go-version: "1.24.10"
           cache: true
-          cache-dependency-path: bindings/go/go.sum
+          cache-dependency-path: sdks/go/go.sum
 
       - name: Build Rust (debug)
         run: cargo build --verbose --locked
@@ -68,7 +68,7 @@ jobs:
       # Linux: use LD_LIBRARY_PATH to point to Rust target dir
       - name: Run Go tests (Linux)
         if: runner.os == 'Linux'
-        working-directory: bindings/go
+        working-directory: sdks/go
         env:
           LOCAL_SYNC_SERVER: ../../target/debug/tursodb
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
@@ -77,7 +77,7 @@ jobs:
       # macOS: use DYLD_LIBRARY_PATH to point to Rust target dir
       - name: Run Go tests (macOS)
         if: runner.os == 'macOS'
-        working-directory: bindings/go
+        working-directory: sdks/go
         env:
           LOCAL_SYNC_SERVER: ../../target/debug/tursodb
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
@@ -86,7 +86,7 @@ jobs:
       # Windows: prepend Rust target dir to PATH so .dll can be found
       - name: Run Go tests (Windows)
         if: runner.os == 'Windows'
-        working-directory: bindings/go
+        working-directory: sdks/go
         shell: pwsh
         run: |
           $env:PATH = "${{ github.workspace }}\target\debug;$env:PATH"
@@ -297,7 +297,7 @@ jobs:
       - name: Create branch
         if: steps.vars.outputs.do_publish == 'true'
         shell: bash
-        working-directory: bindings/go
+        working-directory: sdks/go
         env:
           TARGET_TAG: ${{ steps.vars.outputs.target_tag }}
           TARGET_BRANCH: ${{ steps.vars.outputs.target_branch }}
@@ -323,7 +323,7 @@ jobs:
       - name: Update dependency to freshly built libs
         if: steps.vars.outputs.do_publish == 'true'
         id: update_dep
-        working-directory: bindings/go
+        working-directory: sdks/go
         shell: bash
         env:
           LIBS_BRANCH: ${{ steps.libs_branch.outputs.branch }}
@@ -346,7 +346,7 @@ jobs:
       - name: Push branch and tag with updated go.mod
         if: steps.vars.outputs.do_publish == 'true'
         shell: bash
-        working-directory: bindings/go
+        working-directory: sdks/go
         env:
           TARGET_TAG: ${{ steps.vars.outputs.target_tag }}
           TARGET_BRANCH: ${{ steps.vars.outputs.target_branch }}
@@ -376,6 +376,6 @@ jobs:
 
           if [[ "$TARGET_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([\-+][0-9A-Za-z\.-]+)?$ ]]; then
             # module is in the subdirectory - prepend path to the version tag
-            git tag "bindings/go/$TARGET_TAG"
-            git push origin tag "bindings/go/$TARGET_TAG"
+            git tag "sdks/go/$TARGET_TAG"
+            git push origin tag "sdks/go/$TARGET_TAG"
           fi

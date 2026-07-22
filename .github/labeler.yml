@@ -30,23 +30,23 @@ perf/benchmarks:
 
 go-bindings:
   - changed-files:
-      - any-glob-to-any-file: "bindings/go/**/*"
+      - any-glob-to-any-file: "sdks/go/**/*"
 
 python-bindings:
   - changed-files:
-      - any-glob-to-any-file: "bindings/python/**/*"
+      - any-glob-to-any-file: "sdks/python/**/*"
 
 js-bindings:
   - changed-files:
-      - any-glob-to-any-file: "bindings/javascript/**/*"
+      - any-glob-to-any-file: "sdks/javascript/**/*"
 
 rust-bindings:
   - changed-files:
-      - any-glob-to-any-file: "bindings/rust/**/*"
+      - any-glob-to-any-file: "sdks/rust/**/*"
 
 java-bindings:
   - changed-files:
-      - any-glob-to-any-file: "bindings/java/**/*"
+      - any-glob-to-any-file: "sdks/java/**/*"
 
 parser:
   - changed-files:
@@ -58,7 +58,7 @@ cli:
 
 sqlite3:
   - changed-files:
-      - any-glob-to-any-file: "bindings/c/**/*"
+      - any-glob-to-any-file: "sdks/c/**/*"
 
 core:
   - changed-files:

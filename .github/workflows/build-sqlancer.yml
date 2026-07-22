@@ -6,7 +6,7 @@ on:
     branches:
       - main
     paths:
-      - "bindings/java/**"
+      - "sdks/java/**"
       - "scripts/corruption-debug-tools/**"
       - "testing/sqlancer/**"
       - ".github/workflows/build-sqlancer.yml"

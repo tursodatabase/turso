@@ -1,5 +1,5 @@
 const path = require('path');
-const pkg = require('../../bindings/react-native/package.json');
+const pkg = require('../../sdks/react-native/package.json');
 
 module.exports = {
   project: {
@@ -9,7 +9,7 @@ module.exports = {
   },
   dependencies: {
     [pkg.name]: {
-      root: path.join(__dirname, '../../bindings/react-native/'),
+      root: path.join(__dirname, '../../sdks/react-native/'),
       platforms: {
         // Codegen script incorrectly fails without this
         // So we explicitly specify the platforms with empty object

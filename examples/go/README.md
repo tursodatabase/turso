@@ -40,4 +40,4 @@ go run sync.go    # Linux
 
 ## More Information
 
-See the [Go bindings documentation](../../bindings/go/README.md) for the full API reference.
+See the [Go bindings documentation](../../sdks/go/README.md) for the full API reference.

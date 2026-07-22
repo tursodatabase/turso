@@ -42,10 +42,10 @@ jobs:
           restore-keys: |
             conformance-js-cargo-
       - name: Install JS binding dependencies
-        working-directory: bindings/javascript
+        working-directory: sdks/javascript
         run: yarn install
       - name: Build JS native module
-        working-directory: bindings/javascript
+        working-directory: sdks/javascript
         run: yarn build:native
       - name: Install test dependencies
         working-directory: testing/conformance/javascript
@@ -79,6 +79,6 @@ jobs:
       - name: Install TCL dev headers
         run: sudo apt-get update && sudo apt-get install -y tcl-dev tcl
       - name: Build libturso_tcl
-        run: make -C bindings/tcl build
+        run: make -C sdks/tcl build
       - name: Run SQLite TCL conformance tests
         run: tclsh sqlite/conformance/upstream/all.test

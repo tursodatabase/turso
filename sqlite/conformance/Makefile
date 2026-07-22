@@ -80,7 +80,7 @@ run-rust: build-runner
 	$(TEST_RUNNER) run $(TURSO_TESTS) --backend rust $(MVCC_FLAG) $(ARGS)
 
 # Build JavaScript bindings (requires Node.js and yarn)
-JS_DIR := $(ROOT_DIR)/bindings/javascript
+JS_DIR := $(ROOT_DIR)/sdks/javascript
 build-js-bindings:
 	cd $(JS_DIR) && yarn install && yarn workspace @tursodatabase/database-common build && yarn workspace @tursodatabase/database build:test-helper
 

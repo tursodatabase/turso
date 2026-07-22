@@ -50,7 +50,7 @@ limbo/
 ├── sqlite/
 │   └── parser/     # SQL parser (lexer, AST, grammar)
 ├── cli/            # tursodb CLI (REPL, MCP server, sync server)
-├── bindings/       # Python, JS, Java, .NET, Go, Rust
+├── sdks/           # Python, JS, Java, .NET, Go, Rust
 ├── extensions/     # crypto, regexp, csv, fuzzy, ipaddr, percentile
 ├── testing/        # simulator/, concurrent-simulator/, differential-oracle/
 ├── sync/           # engine/, sdk-kit/ (Turso Cloud sync)
@@ -68,7 +68,7 @@ limbo/
 | WAL/durability | `core/storage/wal.rs` | Write-ahead log, checkpointing |
 | SQL parsing | `sqlite/parser/src/parser.rs` | 11k LOC recursive descent |
 | Add extension | `extensions/core/` | ExtensionApi, scalar/aggregate/vtab traits |
-| Add binding | `bindings/` | PyO3, NAPI, JNI, FRB, CGO patterns |
+| Add SDK | `sdks/` | PyO3, NAPI, JNI, FRB, CGO patterns |
 | Deterministic tests | `testing/simulator/` | Fault injection, differential testing |
 | New SQL tests | `sqlite/conformance/sqlite-sqltests/` | `.sqltest` format preferred |
 | Quick sqlite3 diff | `scripts/diff.sh` | Compare sqlite3 vs tursodb output for a query |

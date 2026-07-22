@@ -9,7 +9,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../../bindings/dotnet/src/Turso.Data/Turso.Data.csproj" />
+    <ProjectReference Include="../../sdks/dotnet/src/Turso.Data/Turso.Data.csproj" />
   </ItemGroup>
 
   <!-- Copy native library to output directory -->

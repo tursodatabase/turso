@@ -13,7 +13,7 @@ This directory contains TCL-based tests that verify Turso's compatibility with S
 Before running tests, build the `libturso_tcl` shared library:
 
 ```bash
-make -C bindings/tcl
+make -C sdks/tcl
 ```
 
 This will:
@@ -23,7 +23,7 @@ This will:
 On Linux without local TCL dev headers, you can build inside Docker:
 
 ```bash
-make -C bindings/tcl docker-build
+make -C sdks/tcl docker-build
 ```
 
 ## Running Tests

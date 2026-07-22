@@ -4,9 +4,9 @@
 /core/translate @jussisaurio
 /extensions/ @PThorpe92
 /core/ext/ @PThorpe92
-/bindings/go @PThorpe92
+/sdks/go @PThorpe92
 
 # These are commented out until they get access from the overlords
-# /bindings/java @seonWKim
+# /sdks/java @seonWKim
 # /simulator/ @alpaylan
 # /core/storage @krishvishal 

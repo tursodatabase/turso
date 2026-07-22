@@ -17,7 +17,7 @@ path = "src/stack_report.rs"
 stacker = ["turso/stacker"]
 
 [dependencies]
-turso = { path = "../../bindings/rust", default-features = false }
+turso = { path = "../../sdks/rust", default-features = false }
 turso_parser = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, default-features = true, features = ["full"] }

@@ -352,7 +352,7 @@ wheels = [
 
 [[package]]
 name = "pyturso"
-source = { editable = "bindings/python" }
+source = { editable = "sdks/python" }
 dependencies = [
     { name = "typing-extensions" },
 ]

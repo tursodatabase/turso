@@ -13,15 +13,15 @@
 #   clean          Remove built artefacts.
 #
 # Usage:
-#   make docker-build            # produce bindings/tcl/libturso_tcl.so
+#   make docker-build            # produce sdks/tcl/libturso_tcl.so
 #   make docker-test             # build + run probe tests
 #   make build                   # local build when TCL headers are available
 #   make clean
 
 ROOT_DIR  := $(shell cd ../.. && pwd)
 TURSO_LIB := $(ROOT_DIR)/target/debug
-SRC       := $(ROOT_DIR)/bindings/tcl/turso_tcl.c
-INCLUDE   := $(ROOT_DIR)/bindings/c/include
+SRC       := $(ROOT_DIR)/sdks/tcl/turso_tcl.c
+INCLUDE   := $(ROOT_DIR)/sdks/c/include
 
 # Default target — local build (no Docker required).
 .PHONY: all
@@ -41,15 +41,15 @@ docker-build:
 	    apt-get update -qq && \
 	    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tcl-dev && \
 	    cargo build -p turso_sqlite3 2>&1 && \
-	    gcc -shared -fPIC -o bindings/tcl/libturso_tcl.so \
-	        bindings/tcl/turso_tcl.c \
-	        -I bindings/c/include \
+	    gcc -shared -fPIC -o sdks/tcl/libturso_tcl.so \
+	        sdks/tcl/turso_tcl.c \
+	        -I sdks/c/include \
 	        -I /usr/include/tcl8.6 \
 	        -L target/debug \
 	        -lturso_sqlite3 \
 	        -Wl,-rpath,'"'"'$$ORIGIN/../../target/debug'"'"' \
 	        2>&1 && \
-	    echo "Build OK: bindings/tcl/libturso_tcl.so" \
+	    echo "Build OK: sdks/tcl/libturso_tcl.so" \
 	  '
 
 # Build the shared library and run the probe tests in one container so the
@@ -64,16 +64,16 @@ docker-test:
 	    apt-get update -qq && \
 	    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tcl-dev && \
 	    cargo build -p turso_sqlite3 2>&1 && \
-	    gcc -shared -fPIC -o bindings/tcl/libturso_tcl.so \
-	        bindings/tcl/turso_tcl.c \
-	        -I bindings/c/include \
+	    gcc -shared -fPIC -o sdks/tcl/libturso_tcl.so \
+	        sdks/tcl/turso_tcl.c \
+	        -I sdks/c/include \
 	        -I /usr/include/tcl8.6 \
 	        -L target/debug \
 	        -lturso_sqlite3 \
 	        -Wl,-rpath,'"'"'$$ORIGIN/../../target/debug'"'"' \
 	        2>&1 && \
-	    echo "Build OK: bindings/tcl/libturso_tcl.so" && \
-	    LD_LIBRARY_PATH=target/debug tclsh bindings/tcl/test_probes.tcl \
+	    echo "Build OK: sdks/tcl/libturso_tcl.so" && \
+	    LD_LIBRARY_PATH=target/debug tclsh sdks/tcl/test_probes.tcl \
 	  '
 
 # ---- Local build (macOS / Linux with TCL dev headers) -----------------------
@@ -87,12 +87,12 @@ ifeq ($(UNAME_S),Darwin)
   TCL_INCLUDE  ?= $(shell pkg-config --cflags tcl 2>/dev/null || echo "-I$(_TCL_SDK_HDR)")
   TCL_LIBS     ?= $(shell pkg-config --libs   tcl 2>/dev/null || echo "-framework Tcl")
   SHARED_FLAG   = -dynamiclib
-  TARGET        = $(ROOT_DIR)/bindings/tcl/libturso_tcl.dylib
+  TARGET        = $(ROOT_DIR)/sdks/tcl/libturso_tcl.dylib
 else
   TCL_INCLUDE  ?= $(shell pkg-config --cflags tcl 2>/dev/null || echo "-I/usr/include/tcl8.6")
   TCL_LIBS     ?= $(shell pkg-config --libs   tcl 2>/dev/null || echo "-ltcl8.6")
   SHARED_FLAG   = -shared -fPIC
-  TARGET        = $(ROOT_DIR)/bindings/tcl/libturso_tcl.so
+  TARGET        = $(ROOT_DIR)/sdks/tcl/libturso_tcl.so
 endif
 
 .PHONY: build
@@ -112,5 +112,5 @@ build:
 
 .PHONY: clean
 clean:
-	rm -f $(ROOT_DIR)/bindings/tcl/libturso_tcl.so \
-	      $(ROOT_DIR)/bindings/tcl/libturso_tcl.dylib
+	rm -f $(ROOT_DIR)/sdks/tcl/libturso_tcl.so \
+	      $(ROOT_DIR)/sdks/tcl/libturso_tcl.dylib

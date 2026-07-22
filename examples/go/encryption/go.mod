@@ -12,4 +12,4 @@ require (
 	golang.org/x/sys v0.38.0 // indirect
 )
 
-replace turso.tech/database/tursogo => ../../bindings/go
+replace turso.tech/database/tursogo => ../../sdks/go

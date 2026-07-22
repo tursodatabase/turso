@@ -45,18 +45,18 @@ jobs:
         run: cargo build -p turso_sqlite3 --features capi --locked
 
       - name: Run C compat tests from Rust
-        working-directory: bindings/c
+        working-directory: sdks/c
         run: cargo test --locked
 
       - name: Run C compat C tests linking against real SQLite
-        working-directory: bindings/c/tests
+        working-directory: sdks/c/tests
         run: |
           make clean
           make LIBS="-lsqlite3"
           ./sqlite3-tests
 
       - name: Run C compat C tests linking against Turso
-        working-directory: bindings/c/tests
+        working-directory: sdks/c/tests
         run: |
           make clean
           make LIBS="-L../../../target/debug -lturso_sqlite3"

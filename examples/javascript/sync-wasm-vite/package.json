@@ -16,6 +16,6 @@
     "vite": "^7.3.2"
   },
   "dependencies": {
-    "@tursodatabase/sync-wasm": "../../../bindings/javascript/sync/packages/wasm"
+    "@tursodatabase/sync-wasm": "../../../sdks/javascript/sync/packages/wasm"
   }
 }

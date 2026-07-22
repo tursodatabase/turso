@@ -10,22 +10,22 @@ Dependencies
 
 This product depends on Error Prone, distributed by the Error Prone project:
 
-* License: licenses/bindings/java/assertj-license.md (Apache License v2.0)
+* License: licenses/sdks/java/assertj-license.md (Apache License v2.0)
 * Homepage: https://github.com/google/error-prone
 
 This product depends on AssertJ, distributed by the AssertJ authors:
 
-* License: licenses/bindings/java/errorprone-license.md (Apache License v2.0)
+* License: licenses/sdks/java/errorprone-license.md (Apache License v2.0)
 * Homepage: https://joel-costigliola.github.io/assertj/
 
 This product depends on logback, distributed by the logback authors:
 
-* License: licenses/bindings/java/logback-license.md (Apache License v2.0)
+* License: licenses/sdks/java/logback-license.md (Apache License v2.0)
 * Homepage: https://github.com/qos-ch/logback?tab=License-1-ov-file
 
 This product depends on spotless, distributed by the diffplug authors:
 
-* License: licenses/bindings/java/spotless-license.md (Apache License v2.0)
+* License: licenses/sdks/java/spotless-license.md (Apache License v2.0)
 * Homepage: https://github.com/diffplug/spotless
 
 
@@ -61,5 +61,5 @@ This project depends on windows-sys, distributed by the Microsoft:
 
 This project depends on SQLAlchemy, distributed by the SQLAlchemy authors:
 
-* License: licenses/bindings/python/sqlalchemy-mit-license.md (MIT License)
+* License: licenses/sdks/python/sqlalchemy-mit-license.md (MIT License)
 * Homepage: https://github.com/sqlalchemy/sqlalchemy

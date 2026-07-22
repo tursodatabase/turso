@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn js_backend_reports_trigger_capability() {
-        let backend = JsBackend::new("node", "bindings/javascript/turso-sql-runner.mjs");
+        let backend = JsBackend::new("node", "sdks/javascript/turso-sql-runner.mjs");
         let capabilities = backend.capabilities();
         assert!(capabilities.contains(&Capability::Trigger));
     }

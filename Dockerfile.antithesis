@@ -48,7 +48,7 @@ RUN if [ "$antithesis" = "true" ]; then \
         cargo build --bin turso_stress --release; \
     fi
 
-WORKDIR /app/bindings/python
+WORKDIR /app/sdks/python
 RUN maturin build
 
 WORKDIR /app/testing/unreliable-libc

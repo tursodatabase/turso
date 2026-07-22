@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  working-directory: bindings/java
+  working-directory: sdks/java
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
 

@@ -20,15 +20,15 @@ from pathlib import Path
 
 # Define all npm package paths in one place
 NPM_PACKAGES = [
-    "bindings/javascript",
-    "bindings/javascript/packages/common",
-    "bindings/javascript/packages/native",
-    "bindings/javascript/packages/wasm",
-    "bindings/javascript/packages/wasm-common",
-    "bindings/javascript/sync/packages/common",
-    "bindings/javascript/sync/packages/native",
-    "bindings/javascript/sync/packages/wasm",
-    "bindings/react-native",
+    "sdks/javascript",
+    "sdks/javascript/packages/common",
+    "sdks/javascript/packages/native",
+    "sdks/javascript/packages/wasm",
+    "sdks/javascript/packages/wasm-common",
+    "sdks/javascript/sync/packages/common",
+    "sdks/javascript/sync/packages/native",
+    "sdks/javascript/sync/packages/wasm",
+    "sdks/react-native",
     "packages/turso-cli",
     "packages/turso-cli/npm/darwin-arm64",
     "packages/turso-cli/npm/darwin-x64",
@@ -49,11 +49,11 @@ NPM_WORKSPACE_PACKAGES = [
 ]
 
 NPM_WORKSPACES = [
-    "bindings/javascript"
+    "sdks/javascript"
 ]
 
-JAVA_GRADLE_PROPERTIES = "bindings/java/gradle.properties"
-DOTNET_DIRECTORY_BUILD_PROPS = "bindings/dotnet/Directory.Build.props"
+JAVA_GRADLE_PROPERTIES = "sdks/java/gradle.properties"
+DOTNET_DIRECTORY_BUILD_PROPS = "sdks/dotnet/Directory.Build.props"
 
 
 def iter_cargo_toml_files():

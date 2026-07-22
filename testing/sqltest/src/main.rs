@@ -367,9 +367,8 @@ async fn run_tests(
                 .await
         }
         "js" => {
-            // Default: script is in the bindings/javascript directory
-            let js_dir =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bindings/javascript");
+            // Default: script is in the sdks/javascript directory
+            let js_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../sdks/javascript");
 
             // Determine script path - use provided or default to bundled script
             let script_path = js_script.unwrap_or_else(|| js_dir.join("turso-sql-runner.mjs"));
@@ -402,7 +401,7 @@ async fn run_tests(
                 eprintln!("  make -C testing/runner build-js-bindings");
                 eprintln!();
                 eprintln!("Or manually:");
-                eprintln!("  cd bindings/javascript");
+                eprintln!("  cd sdks/javascript");
                 eprintln!("  yarn install");
                 eprintln!("  yarn workspace @tursodatabase/database-common build");
                 eprintln!("  yarn workspace @tursodatabase/database build");

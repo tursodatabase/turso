@@ -50,7 +50,7 @@ curl -sL https://raw.githubusercontent.com/tursodatabase/turso-docs/main/api-ref
 dotnet build
 ```
 
-(or `make generate-platform-client` from `bindings/dotnet`).
+(or `make generate-platform-client` from `sdks/dotnet`).
 
 `TursoPlatformClient.Supplement.cs` contains the hand-written `Extensions` union NSwag cannot generate. Use `Extensions.All` to enable every extension or `Extensions.FromNames(...)` for an explicit list.
 

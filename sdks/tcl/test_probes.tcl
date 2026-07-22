@@ -1,4 +1,4 @@
-# Probe tests for the native Turso TCL extension (bindings/tcl/turso_tcl.c).
+# Probe tests for the native Turso TCL extension (sdks/tcl/turso_tcl.c).
 #
 # Validates the three capabilities that the subprocess shim cannot provide:
 #   1. Real engine error codes via [db errorcode].
@@ -6,7 +6,7 @@
 #   3. In-process Tcl function registration via [db func].
 #
 # Run via:
-#   LD_LIBRARY_PATH=target/debug tclsh bindings/tcl/test_probes.tcl
+#   LD_LIBRARY_PATH=target/debug tclsh sdks/tcl/test_probes.tcl
 #
 # Exit code: 0 on success, 1 on any failure.
 

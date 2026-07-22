@@ -20,4 +20,4 @@ require (
 	golang.org/x/text v0.14.0 // indirect
 )
 
-replace turso.tech/database/tursogo => ../bindings/go
+replace turso.tech/database/tursogo => ../../sdks/go

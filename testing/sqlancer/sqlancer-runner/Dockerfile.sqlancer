@@ -34,7 +34,7 @@ COPY . .
 
 
 # Build native library for Linux x86_64
-WORKDIR /app/bindings/java
+WORKDIR /app/sdks/java
 RUN mkdir -p libs/linux_x86 temp \
     && CARGO_TARGET_DIR=temp cargo build --release --target x86_64-unknown-linux-gnu \
     && cp temp/x86_64-unknown-linux-gnu/release/lib_turso_java.so libs/linux_x86/ \
@@ -82,8 +82,8 @@ ENV RUST_BACKTRACE=1
 WORKDIR /app
 
 # Copy native library and JAR from builder
-COPY --from=builder /app/bindings/java/build/libs/turso-*.jar /app/turso.jar
-COPY --from=builder /app/bindings/java/libs/linux_x86/lib_turso_java.so /app/native/
+COPY --from=builder /app/sdks/java/build/libs/turso-*.jar /app/turso.jar
+COPY --from=builder /app/sdks/java/libs/linux_x86/lib_turso_java.so /app/native/
 
 # Set up native library path
 ENV LIMBO_JAR=/app/turso.jar

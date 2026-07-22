@@ -6,7 +6,7 @@ on:
       - "**"
     paths:
       - ".github/workflows/dotnet-publish.yml"
-      - "bindings/dotnet/**"
+      - "sdks/dotnet/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "core/**"
@@ -30,7 +30,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  working-directory: bindings/dotnet
+  working-directory: sdks/dotnet
   # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
   # crate's clang-cl preference fails; force the MSVC compiler instead.
   CC_x86_64_pc_windows_msvc: cl.exe
@@ -163,7 +163,7 @@ jobs:
             -v $HOME/.cargo/registry/cache:/usr/local/cargo/registry/cache \
             -v $HOME/.cargo/registry/index:/usr/local/cargo/registry/index \
             -v ${{ github.workspace }}:/build \
-            -w /build/bindings/dotnet \
+            -w /build/sdks/dotnet \
             ${{ matrix.docker }} \
             bash -lc '
               rustup target add ${{ matrix.target }}
@@ -260,7 +260,7 @@ jobs:
           endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
           trusted-signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ vars.AZURE_SIGNING_CERT_PROFILE }}
-          files: ${{ github.workspace }}/bindings/dotnet/rs_compiled/${{ matrix.target }}/release-official/turso_sdk_kit.dll
+          files: ${{ github.workspace }}/sdks/dotnet/rs_compiled/${{ matrix.target }}/release-official/turso_sdk_kit.dll
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256

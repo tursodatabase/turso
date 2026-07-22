@@ -5,7 +5,7 @@
 Build and install the Python bindings:
 
 ```bash
-cd bindings/python
+cd sdks/python
 pip install maturin
 maturin develop
 ```

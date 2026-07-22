@@ -8,7 +8,7 @@
 BACKEND ?= turso
 
 TURSO_ROOT ?=	../../..
-TURSO_INC=	$(TURSO_ROOT)/bindings/c/include
+TURSO_INC=	$(TURSO_ROOT)/sdks/c/include
 TURSO_PROFILE ?= release
 TURSO_LIB=	$(TURSO_ROOT)/target/$(TURSO_PROFILE)
 

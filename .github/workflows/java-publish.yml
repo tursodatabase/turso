@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 env:
-  working-directory: bindings/java
+  working-directory: sdks/java
 
 jobs:
   # Build native libraries for each platform

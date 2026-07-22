@@ -3,11 +3,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "bindings/java",
-    "bindings/javascript",
-    "bindings/javascript/sync",
-    "bindings/python",
-    "bindings/rust",
+    "sdks/java",
+    "sdks/javascript",
+    "sdks/javascript/sync",
+    "sdks/python",
+    "sdks/rust",
     "cli",
     "core",
     "extensions/completion",
@@ -20,7 +20,7 @@ members = [
     "extensions/fuzzy",
     "macros",
     "testing/simulator",
-    "bindings/c",
+    "sdks/c",
     "testing/stress",
     "testing/sqlite_test_ext",
     "tests",
@@ -53,11 +53,11 @@ members = [
 exclude = ["perf/latency/limbo"]
 
 default-members = [
-    "bindings/java",
-    "bindings/javascript",
-    "bindings/javascript/sync",
-    "bindings/python",
-    "bindings/rust",
+    "sdks/java",
+    "sdks/javascript",
+    "sdks/javascript/sync",
+    "sdks/python",
+    "sdks/rust",
     "cli",
     "core",
     "extensions/completion",
@@ -70,7 +70,7 @@ default-members = [
     "extensions/fuzzy",
     "macros",
     "testing/simulator",
-    "bindings/c",
+    "sdks/c",
     "testing/stress",
     "testing/sqlite_test_ext",
     "tests",
@@ -100,8 +100,8 @@ license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
-turso = { path = "bindings/rust", version = "0.8.0-pre.1" }
-turso_node = { path = "bindings/javascript", version = "0.8.0-pre.1" }
+turso = { path = "sdks/rust", version = "0.8.0-pre.1" }
+turso_node = { path = "sdks/javascript", version = "0.8.0-pre.1" }
 turso_sdk_kit = { path = "sdk-kit", version = "0.8.0-pre.1" }
 turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.8.0-pre.1" }
 turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.8.0-pre.1" }

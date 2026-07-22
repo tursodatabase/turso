@@ -11,8 +11,8 @@
 *.ipynb
 *.o
 *.sqlite
-!bindings/dotnet/src/Turso.Data.Sqlite/
-!bindings/dotnet/src/Turso.Data.Sqlite/**
+!sdks/dotnet/src/Turso.Data.Sqlite/
+!sdks/dotnet/src/Turso.Data.Sqlite/**
 # Python
 .mypy_cache/
 .pytest_cache/
@@ -84,8 +84,8 @@ test.sql
 elle-history-results/
 custom-types-fuzzer-output/
 CLAUDE.md
-bindings/python/dev.py
-bindings/python/implementation-test/
+sdks/python/dev.py
+sdks/python/implementation-test/
 dhat-heap.json
 
 # Aristo runtime, cache, and per-user state: never commit these.

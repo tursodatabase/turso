@@ -14,7 +14,7 @@ on:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
-  working-directory: bindings/react-native
+  working-directory: sdks/react-native
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -52,7 +52,7 @@ jobs:
         with:
           name: ios-libs
           path: |
-            bindings/react-native/libs/ios/
+            sdks/react-native/libs/ios/
           if-no-files-found: error
 
   build-android:
@@ -88,7 +88,7 @@ jobs:
         with:
           name: android-libs
           path: |
-            bindings/react-native/libs/android/
+            sdks/react-native/libs/android/
           if-no-files-found: error
 
   build-typescript:
@@ -120,7 +120,7 @@ jobs:
         with:
           name: typescript-build
           path: |
-            bindings/react-native/lib/
+            sdks/react-native/lib/
           if-no-files-found: error
 
   build-example-ios:
@@ -149,11 +149,11 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ios-libs
-          path: bindings/react-native/libs/ios/
+          path: sdks/react-native/libs/ios/
 
       - name: Fix xcframework after artifact download
         run: |
-          find bindings/react-native/libs/ios/turso-sync-sdk-kit.xcframework \
+          find sdks/react-native/libs/ios/turso-sync-sdk-kit.xcframework \
             -name "turso-sync-sdk-kit" -type f | while read f; do
             chmod +x "$f"
             codesign -f -s - "$f"
@@ -163,7 +163,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: typescript-build
-          path: bindings/react-native/lib/
+          path: sdks/react-native/lib/
 
       - name: Install binding dependencies
         run: npm install
@@ -179,8 +179,8 @@ jobs:
 
       - name: Verify xcframework
         run: |
-          ls -la bindings/react-native/libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64-simulator/turso-sync-sdk-kit.framework/
-          file bindings/react-native/libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64-simulator/turso-sync-sdk-kit.framework/turso-sync-sdk-kit
+          ls -la sdks/react-native/libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64-simulator/turso-sync-sdk-kit.framework/
+          file sdks/react-native/libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64-simulator/turso-sync-sdk-kit.framework/turso-sync-sdk-kit
 
       - name: Build iOS example app
         run: |
@@ -222,19 +222,19 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ios-libs
-          path: bindings/react-native/libs/ios/
+          path: sdks/react-native/libs/ios/
 
       - name: Download Android artifacts
         uses: actions/download-artifact@v4
         with:
           name: android-libs
-          path: bindings/react-native/libs/android/
+          path: sdks/react-native/libs/android/
 
       - name: Download TypeScript build
         uses: actions/download-artifact@v4
         with:
           name: typescript-build
-          path: bindings/react-native/lib/
+          path: sdks/react-native/lib/
 
       - name: Install dependencies
         run: npm install
@@ -277,4 +277,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: npm-package
-          path: bindings/react-native/*.tgz
+          path: sdks/react-native/*.tgz

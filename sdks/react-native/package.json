@@ -50,7 +50,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/tursodatabase/turso.git",
-    "directory": "bindings/react-native"
+    "directory": "sdks/react-native"
   },
   "author": "Turso <info@turso.tech> (https://turso.tech)",
   "license": "MIT",

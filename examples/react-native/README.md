@@ -18,22 +18,22 @@ your target platform. From the repo root:
 
 ```sh
 # Android (all ABIs)
-cd bindings/react-native && make android
+cd sdks/react-native && make android
 
 # iOS (device + simulator)
-cd bindings/react-native && make ios
+cd sdks/react-native && make ios
 ```
 
 ## Install JS dependencies
 
-The example app links to the binding via `file:../../bindings/react-native`.
+The example app links to the binding via `file:../../sdks/react-native`.
 When npm installs it, it runs the binding's `prepare` script which needs
 `react-native-builder-bob` (a devDep of the binding). To avoid a
 `bob: command not found` error, install the binding's dependencies first:
 
 ```sh
 # Step 1: install binding deps (--ignore-scripts avoids chicken-and-egg problem)
-cd bindings/react-native && npm install --ignore-scripts
+cd sdks/react-native && npm install --ignore-scripts
 
 # Step 2: install example app (this will now find bob when prepare runs)
 cd ../../examples/react-native && npm install

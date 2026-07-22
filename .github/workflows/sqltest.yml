@@ -72,7 +72,7 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
-        working-directory: bindings/javascript
+        working-directory: sdks/javascript
     steps:
       - uses: actions/checkout@v4
       - uses: useblacksmith/rust-cache@v3

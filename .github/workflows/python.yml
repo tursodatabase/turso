@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  working-directory: bindings/python
+  working-directory: sdks/python
   PIP_DISABLE_PIP_VERSION_CHECK: "true"
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
@@ -170,7 +170,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}
-          path: bindings/python/dist
+          path: sdks/python/dist
 
   macos:
     runs-on: blacksmith-6vcpu-macos-latest
@@ -200,7 +200,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.target }}
-          path: bindings/python/dist
+          path: sdks/python/dist
 
   sdist:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -220,7 +220,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheels-sdist
-          path: bindings/python/dist
+          path: sdks/python/dist
 
   release:
     name: Release
@@ -231,7 +231,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: bindings/python/dist
+          path: sdks/python/dist
           pattern: wheels-*
           merge-multiple: true
       - name: Publish to PyPI

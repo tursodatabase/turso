@@ -11,6 +11,6 @@
     "test": "echo 'no tests'"
   },
   "dependencies": {
-    "@tursodatabase/database": "../../../bindings/javascript/packages/native"
+    "@tursodatabase/database": "../../../sdks/javascript/packages/native"
   }
 }

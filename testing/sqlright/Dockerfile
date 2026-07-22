@@ -41,14 +41,14 @@ WORKDIR /limbo
 COPY . .
 
 # Remove bindings workspace members but create stubs for workspace deps
-# (testing/stress depends on `turso` which points to bindings/rust)
+# (testing/stress depends on `turso` which points to sdks/rust)
 # Match only indented member lines (start with spaces + quote), not dep lines
 RUN VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1) \
     && sed -i '/^[[:space:]]*"bindings\//d' Cargo.toml \
-    && mkdir -p bindings/rust/src bindings/javascript/src \
-    && printf "[package]\nname = \"turso\"\nversion = \"$VERSION\"\nedition = \"2021\"\n" > bindings/rust/Cargo.toml \
-    && printf "[package]\nname = \"turso_node\"\nversion = \"$VERSION\"\nedition = \"2021\"\n" > bindings/javascript/Cargo.toml \
-    && touch bindings/rust/src/lib.rs bindings/javascript/src/lib.rs
+    && mkdir -p sdks/rust/src sdks/javascript/src \
+    && printf "[package]\nname = \"turso\"\nversion = \"$VERSION\"\nedition = \"2021\"\n" > sdks/rust/Cargo.toml \
+    && printf "[package]\nname = \"turso_node\"\nversion = \"$VERSION\"\nedition = \"2021\"\n" > sdks/javascript/Cargo.toml \
+    && touch sdks/rust/src/lib.rs sdks/javascript/src/lib.rs
 
 # Build SQLRight (clone, patch, compile afl-fuzz)
 RUN cd testing/sqlright && bash setup.sh

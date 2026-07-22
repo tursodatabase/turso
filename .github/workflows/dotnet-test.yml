@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  working-directory: bindings/dotnet
+  working-directory: sdks/dotnet
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
 

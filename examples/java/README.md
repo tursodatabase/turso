@@ -11,9 +11,9 @@
 
 ## Encryption
 
-From the `bindings/java` directory:
+From the `sdks/java` directory:
 
 ```bash
-cd bindings/java
+cd sdks/java
 ./gradlew runEncryptionExample
 ```

@@ -1948,7 +1948,7 @@ DEPENDENCIES:
   - ReactCodegen (from `build/generated/ios/ReactCodegen`)
   - ReactCommon/turbomodule/core (from `../node_modules/react-native/ReactCommon`)
   - ReactNativeDependencies (from `../node_modules/react-native/third-party-podspecs/ReactNativeDependencies.podspec`)
-  - turso-sync-react-native (from `../../../bindings/react-native`)
+  - turso-sync-react-native (from `../../../sdks/react-native`)
   - Yoga (from `../node_modules/react-native/ReactCommon/yoga`)
 
 EXTERNAL SOURCES:
@@ -2100,7 +2100,7 @@ EXTERNAL SOURCES:
   ReactNativeDependencies:
     :podspec: "../node_modules/react-native/third-party-podspecs/ReactNativeDependencies.podspec"
   turso-sync-react-native:
-    :path: "../../../bindings/react-native"
+    :path: "../../../sdks/react-native"
   Yoga:
     :path: "../node_modules/react-native/ReactCommon/yoga"
 

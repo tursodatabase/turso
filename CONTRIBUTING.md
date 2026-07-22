@@ -408,7 +408,7 @@ pip install maturin
 Once Maturin is installed, you can build the crate and install it as a Python module directly into the current virtual environment by running:
 
 ```bash
-cd bindings/python && maturin develop
+cd sdks/python && maturin develop
 ```
 
 ## Fault injection with unreliable libc

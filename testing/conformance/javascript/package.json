@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "@tursodatabase/serverless": "../../../serverless/javascript",
-    "@tursodatabase/database": "../../../bindings/javascript/packages/native",
+    "@tursodatabase/database": "../../../sdks/javascript/packages/native",
     "better-sqlite3": "12.9.0",
     "libsql": "^0.6.0-pre.41",
     "@libsql/client": "^0.15.15"

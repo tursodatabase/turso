@@ -304,11 +304,11 @@ All bindings expose `cdc_operations` as part of sync stats:
 
 | Binding | File |
 |---------|------|
-| Python | `bindings/python/src/turso_sync.rs` |
-| JavaScript | `bindings/javascript/sync/src/lib.rs` |
-| JS (generator) | `bindings/javascript/sync/src/generator.rs` |
-| Go | `bindings/go/bindings_sync.go` |
-| React Native | `bindings/react-native/src/types.ts` |
+| Python | `sdks/python/src/turso_sync.rs` |
+| JavaScript | `sdks/javascript/sync/src/lib.rs` |
+| JS (generator) | `sdks/javascript/sync/src/generator.rs` |
+| Go | `sdks/go/bindings_sync.go` |
+| React Native | `sdks/react-native/src/types.ts` |
 | SDK Kit (C header) | `sync/sdk-kit/turso_sync.h` |
 | SDK Kit (Rust) | `sync/sdk-kit/src/bindings.rs` |
 
@@ -316,7 +316,7 @@ All bindings expose `cdc_operations` as part of sync stats:
 
 - **Integration tests:** `tests/integration/functions/test_cdc.rs` — covers all modes, CRUD, transactions, schema changes, version table, backward compatibility. Registered in `tests/integration/functions/mod.rs`.
 - **Sync engine tests:** `sync/engine/src/database_tape.rs` — CDC table reads, tape iteration, replay of schema changes.
-- **JS binding tests:** `bindings/javascript/sync/packages/{wasm,native}/promise.test.ts`
+- **JS binding tests:** `sdks/javascript/sync/packages/{wasm,native}/promise.test.ts`
 
 Run: `cargo test -- test_cdc` (integration) or `cargo test -p turso_sync_engine -- database_tape` (sync engine).
 

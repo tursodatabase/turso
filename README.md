@@ -45,13 +45,13 @@ See the [FAQ](#faq) for where the project stands on its way to 1.0.
 * **`BEGIN CONCURRENT`** for improved write throughput using multi-version concurrency control (MVCC).
 * **Change data capture (CDC)** for real-time tracking of database changes.
 * **Multi-language support** for
-  * [Go](bindings/go)
-  * [JavaScript](bindings/javascript)
-  * [Java](bindings/java)
-  * [.NET](bindings/dotnet)
-  * [Python](bindings/python)
-  * [Rust](bindings/rust)
-  * [WebAssembly](bindings/javascript)
+  * [Go](sdks/go)
+  * [JavaScript](sdks/javascript)
+  * [Java](sdks/java)
+  * [.NET](sdks/dotnet)
+  * [Python](sdks/python)
+  * [Rust](sdks/rust)
+  * [WebAssembly](sdks/javascript)
 * **Asynchronous I/O** support on Linux with `io_uring`
 * **Cross-platform** support for Linux, macOS, Windows and browsers (through WebAssembly)
 * **Vector support** support including exact search and vector manipulation
@@ -245,7 +245,7 @@ while (reader.Read())
 <br>
 
 We integrated Turso Database into JDBC. For detailed instructions on how to use Turso Database with java, please refer to
-the [README.md under bindings/java](bindings/java/README.md).
+the [README.md under sdks/java](sdks/java/README.md).
 </details>
 
 <details>

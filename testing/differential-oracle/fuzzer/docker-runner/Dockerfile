@@ -13,7 +13,7 @@ FROM chef AS planner
 # cargo-chef requires all this crap to be present in the workspace
 COPY Cargo.toml Cargo.lock ./
 COPY core ./core/
-COPY bindings ./bindings/
+COPY bindings ./sdks/
 COPY extensions ./extensions/
 COPY macros ./macros/
 COPY sync ./sync

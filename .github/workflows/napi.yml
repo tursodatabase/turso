@@ -23,7 +23,7 @@ env:
 
 defaults:
   run:
-    working-directory: bindings/javascript
+    working-directory: sdks/javascript
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -156,7 +156,7 @@ jobs:
             -v ${{ github.workspace }}/.cargo/registry/cache:/usr/local/cargo/registry/cache \
             -v ${{ github.workspace }}/.cargo/registry/index:/usr/local/cargo/registry/index \
             -v ${{ github.workspace }}:/build \
-            -w /build/bindings/javascript \
+            -w /build/sdks/javascript \
             ${{ matrix.settings.docker }} \
             bash -c "${{ matrix.settings.build }}"
       - name: Build
@@ -168,10 +168,10 @@ jobs:
         with:
           name: ${{ matrix.settings.artifact }}
           path: |
-            bindings/javascript/packages/native/turso.*.node
-            bindings/javascript/packages/wasm/turso.*.wasm
-            bindings/javascript/sync/packages/native/sync.*.node
-            bindings/javascript/sync/packages/wasm/sync.*.wasm
+            sdks/javascript/packages/native/turso.*.node
+            sdks/javascript/packages/wasm/turso.*.wasm
+            sdks/javascript/sync/packages/native/sync.*.node
+            sdks/javascript/sync/packages/wasm/sync.*.wasm
           if-no-files-found: error
   test-db-linux-x64-gnu-binding:
     name: Test DB bindings on Linux-x64-gnu - node@${{ matrix.node }}
@@ -197,7 +197,7 @@ jobs:
       - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
-          path: bindings/javascript
+          path: sdks/javascript
           merge-multiple: true
           pattern: 'db*'
       - name: List packages
@@ -230,7 +230,7 @@ jobs:
       - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
-          path: bindings/javascript
+          path: sdks/javascript
           merge-multiple: true
           pattern: 'db*'
       - name: List packages
@@ -250,7 +250,7 @@ jobs:
           - "20"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     # Image ships node 20 + chromium + firefox + system deps. Bump the tag
-    # whenever the `playwright` dep in bindings/javascript/yarn.lock changes.
+    # whenever the `playwright` dep in sdks/javascript/yarn.lock changes.
     container:
       image: mcr.microsoft.com/playwright:v1.61.0-jammy
     # GitHub mounts /github/home (uid 1001) as $HOME, but the image runs as
@@ -268,7 +268,7 @@ jobs:
       - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
-          path: bindings/javascript
+          path: sdks/javascript
           merge-multiple: true
           pattern: 'db*'
       - name: List packages
@@ -314,13 +314,13 @@ jobs:
       - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
-          path: bindings/javascript
+          path: sdks/javascript
           merge-multiple: true
           pattern: 'db*'
       - name: Download all sync artifacts
         uses: actions/download-artifact@v4
         with:
-          path: bindings/javascript
+          path: sdks/javascript
           merge-multiple: true
           pattern: 'sync*'
       - name: List packages
@@ -367,13 +367,13 @@ jobs:
       - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
-          path: bindings/javascript
+          path: sdks/javascript
           merge-multiple: true
           pattern: 'db*'
       - name: Download all sync artifacts
         uses: actions/download-artifact@v4
         with:
-          path: bindings/javascript
+          path: sdks/javascript
           merge-multiple: true
           pattern: 'sync*'
       - name: List packages
@@ -395,7 +395,7 @@ jobs:
           - "20"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     # Image ships node 20 + chromium + firefox + system deps. Bump the tag
-    # whenever the `playwright` dep in bindings/javascript/yarn.lock changes.
+    # whenever the `playwright` dep in sdks/javascript/yarn.lock changes.
     container:
       image: mcr.microsoft.com/playwright:v1.61.0-jammy
     # GitHub mounts /github/home (uid 1001) as $HOME, but the image runs as
@@ -429,13 +429,13 @@ jobs:
       - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
-          path: bindings/javascript
+          path: sdks/javascript
           merge-multiple: true
           pattern: 'db*'
       - name: Download all sync artifacts
         uses: actions/download-artifact@v4
         with:
-          path: bindings/javascript
+          path: sdks/javascript
           merge-multiple: true
           pattern: 'sync*'
       - name: List packages
@@ -470,13 +470,13 @@ jobs:
       - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
-          path: bindings/javascript
+          path: sdks/javascript
           merge-multiple: true
           pattern: 'db*'
       - name: Download all sync artifacts
         uses: actions/download-artifact@v4
         with:
-          path: bindings/javascript
+          path: sdks/javascript
           merge-multiple: true
           pattern: 'sync*'
       - name: List packages

@@ -2,7 +2,7 @@
 # Based on the official SQLite tester.tcl
 #
 # Requires the native TCL extension (libturso_tcl) to be built.
-# Build with: make -C bindings/tcl
+# Build with: make -C sdks/tcl
 
 # Global variables for test execution (safe to re-initialize)
 if {![info exists TC(errors)]} {
@@ -25,8 +25,8 @@ set test_db "test.db"
 # This provides a real in-process sqlite3 command backed by the Turso engine.
 set _native_loaded 0
 foreach _native_candidate [list \
-    [file join $script_dir "bindings" "tcl" "libturso_tcl.so"] \
-    [file join $script_dir "bindings" "tcl" "libturso_tcl.dylib"]] {
+    [file join $script_dir "sdks" "tcl" "libturso_tcl.so"] \
+    [file join $script_dir "sdks" "tcl" "libturso_tcl.dylib"]] {
   if {[file exists $_native_candidate]} {
     if {![catch {load $_native_candidate Tursotcl} _native_load_err]} {
       set _native_loaded 1
@@ -38,10 +38,10 @@ foreach _native_candidate [list \
 }
 if {!$_native_loaded} {
   puts stderr "FATAL: Could not load native TCL extension (libturso_tcl)."
-  puts stderr "Build it with: make -C bindings/tcl"
+  puts stderr "Build it with: make -C sdks/tcl"
   puts stderr "Searched:"
-  puts stderr "  [file join $script_dir bindings tcl libturso_tcl.so]"
-  puts stderr "  [file join $script_dir bindings tcl libturso_tcl.dylib]"
+  puts stderr "  [file join $script_dir sdks tcl libturso_tcl.so]"
+  puts stderr "  [file join $script_dir sdks tcl libturso_tcl.dylib]"
   exit 1
 }
 catch {unset _native_candidate}

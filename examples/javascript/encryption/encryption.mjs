@@ -14,8 +14,8 @@
  *   - Aegis128x4
  */
 
-// Import from local build (run `npm run build` in bindings/javascript/packages/native first)
-import { Database } from "../../../bindings/javascript/packages/native/dist/compat.js";
+// Import from local build (run `npm run build` in sdks/javascript/packages/native first)
+import { Database } from "../../../sdks/javascript/packages/native/dist/compat.js";
 import { unlinkSync, readFileSync } from "node:fs";
 
 const DB_PATH = "encrypted.db";
