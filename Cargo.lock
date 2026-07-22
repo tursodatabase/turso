@@ -3426,6 +3426,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 
 [[package]]
+name = "lber"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2df7f9fd9f64cf8f59e1a4a0753fe7d575a5b38d3d7ac5758dcee9357d83ef0a"
+dependencies = [
+ "bytes",
+ "nom",
+]
+
+[[package]]
+name = "ldap3"
+version = "0.11.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "166199a8207874a275144c8a94ff6eed5fcbf5c52303e4d9b4d53a0c7ac76554"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "futures-util",
+ "lazy_static",
+ "lber",
+ "log",
+ "nom",
+ "percent-encoding",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
 name = "leb128fmt"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7142,6 +7174,18 @@ version = "0.8.0-pre.1"
 dependencies = [
  "jni",
  "thiserror 2.0.16",
+ "turso_core",
+]
+
+[[package]]
+name = "turso-ldap-connector"
+version = "0.7.0-pre.14"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "ldap3",
+ "tempfile",
  "turso_core",
 ]
 
