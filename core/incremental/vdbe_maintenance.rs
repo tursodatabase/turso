@@ -1839,6 +1839,22 @@ pub fn compile_maintenance_program(
             connection,
         );
     }
+    if dag_is_join(&dag) {
+        if matches!(output, MaintenanceOutput::EmitRows) {
+            return Err(LimboError::InternalError(
+                "join views serve uncommitted reads by recomputing the defining query".to_string(),
+            ));
+        }
+        return compile_dag_join_program(
+            view_name,
+            &dag,
+            view_root_page,
+            num_view_columns,
+            input,
+            schema,
+            connection,
+        );
+    }
 
     match classify_view_for_connection(select, schema, connection)? {
         ViewShape::FilterProject => compile_filter_project_program(
@@ -2065,6 +2081,19 @@ fn dag_is_aggregate(dag: &dag::MaintenanceDag) -> bool {
     matches!(dag.nodes[below], dag::OpNode::Aggregate { .. })
 }
 
+/// Whether the DAG is a join view: `Project` root over a `Join`, optionally
+/// with a WHERE `Filter` between them.
+fn dag_is_join(dag: &dag::MaintenanceDag) -> bool {
+    let dag::OpNode::Project { input: proj_input, .. } = dag.root_node() else {
+        return false;
+    };
+    let below = match &dag.nodes[*proj_input] {
+        dag::OpNode::Filter { input, .. } => *input,
+        _ => *proj_input,
+    };
+    matches!(dag.nodes[below], dag::OpNode::Join { .. })
+}
+
 /// Reconstruct the [`OutputColumn`] mapping for an aggregate view from the
 /// `Project` node's expressions, resolving each against the `Aggregate` node's
 /// group keys and aggregate calls (which already collect every aggregate
@@ -2156,6 +2185,84 @@ fn compile_dag_aggregate_program(
         connection.clone(),
         false,
         "materialized view aggregate maintenance",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_dag_join_program(
+    view_name: &str,
+    dag: &dag::MaintenanceDag,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<Program> {
+    let dag::OpNode::Project { input: proj_input, projections } = dag.root_node() else {
+        unreachable!("caller checked join shape");
+    };
+    let (join_id, where_clause): (dag::NodeId, Option<&ast::Expr>) = match &dag.nodes[*proj_input] {
+        dag::OpNode::Filter { input, predicate } => (*input, Some(predicate)),
+        _ => (*proj_input, None),
+    };
+    let dag::OpNode::Join {
+        inputs,
+        using,
+        on,
+        left_outer,
+    } = &dag.nodes[join_id]
+    else {
+        unreachable!("caller checked join shape");
+    };
+    let mut tables: Vec<JoinTable> = Vec::with_capacity(inputs.len());
+    for (pos, &scan_id) in inputs.iter().enumerate() {
+        let dag::OpNode::Scan { table, identifier } = &dag.nodes[scan_id] else {
+            return Err(LimboError::InternalError(
+                "join input is not a base table scan".to_string(),
+            ));
+        };
+        tables.push((table.clone(), identifier.clone(), using[pos].clone()));
+    }
+    let columns: Vec<ast::ResultColumn> = projections
+        .iter()
+        .map(|(expr, alias)| {
+            ast::ResultColumn::Expr(
+                Box::new(expr.clone()),
+                alias.clone().map(|name| ast::As::As(ast::Name::exact(name))),
+            )
+        })
+        .collect();
+
+    let mut program = ProgramBuilder::new_for_subprogram(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts {
+            num_cursors: 13,
+            approx_num_insns: 128 + 64 * num_view_columns,
+            approx_num_labels: 48,
+        },
+    );
+    program.prologue();
+    emit_join(
+        &mut program,
+        view_name,
+        &columns,
+        &tables,
+        on,
+        where_clause,
+        *left_outer,
+        view_root_page,
+        num_view_columns,
+        input,
+        &BranchNamespace::none(),
+        schema,
+        connection,
+    )?;
+    program.epilogue(schema);
+    program.build(
+        connection.clone(),
+        false,
+        "materialized view join maintenance",
     )
 }
 
@@ -3077,7 +3184,7 @@ fn emit_group_aggregate(
     // joined-delta rows.)
     if join_ctx.is_none() {
         if let Some(where_expr) = where_clause {
-            let mut bound = where_expr.as_ref().clone();
+            let mut bound = where_expr.clone();
             bind_and_rewrite_expr(
                 &mut bound,
                 Some(&mut table_references),
@@ -4557,7 +4664,7 @@ fn compile_join_program(
         },
     );
     program.prologue();
-    emit_join(
+    emit_join_from_select(
         &mut program,
         view_name,
         select,
@@ -4577,7 +4684,8 @@ fn compile_join_program(
     )
 }
 
-fn emit_join(
+#[allow(clippy::too_many_arguments)]
+fn emit_join_from_select(
     program: &mut ProgramBuilder,
     view_name: &str,
     select: &ast::Select,
@@ -4589,19 +4697,9 @@ fn emit_join(
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let ViewShape::Join {
-        n_tables,
-        left_outer,
-    } = shape
-    else {
-        unreachable!("compile_join_program requires a Join shape");
+    let ViewShape::Join { left_outer, .. } = shape else {
+        unreachable!("emit_join_from_select requires a Join shape");
     };
-    let n = *n_tables;
-    let left_outer = *left_outer;
-    turso_assert!(
-        !left_outer || n == 2,
-        "classify_view admits LEFT JOIN for exactly two tables"
-    );
     let ast::OneSelect::Select {
         columns,
         from,
@@ -4613,9 +4711,43 @@ fn emit_join(
     };
     let from = from.as_ref().expect("classify_view requires a FROM clause");
     let (tables, on_conditions) = collect_join_tables(from, schema)?;
+    emit_join(
+        program,
+        view_name,
+        columns,
+        &tables,
+        &on_conditions,
+        where_clause.as_deref(),
+        *left_outer,
+        view_root_page,
+        num_view_columns,
+        input,
+        ns,
+        schema,
+        connection,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_join(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    columns: &[ast::ResultColumn],
+    tables: &[JoinTable],
+    on_conditions: &[ast::Expr],
+    where_clause: Option<&ast::Expr>,
+    left_outer: bool,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    ns: &BranchNamespace,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let n = tables.len();
     turso_assert!(
-        tables.len() == n,
-        "classified join table count does not match the FROM clause"
+        !left_outer || n == 2,
+        "classify_view admits LEFT JOIN for exactly two tables"
     );
     // For an inner join ON and WHERE gate matches identically, so they merge
     // into one innermost predicate list. For LEFT JOIN they differ: ON
@@ -4626,10 +4758,7 @@ fn emit_join(
     let conditions: Vec<&ast::Expr> = if left_outer {
         on_conditions.iter().collect()
     } else {
-        on_conditions
-            .iter()
-            .chain(where_clause.as_deref())
-            .collect()
+        on_conditions.iter().chain(where_clause).collect()
     };
 
     let state_table_name = format!(
@@ -4763,7 +4892,7 @@ fn emit_join(
         // aux-merge subroutine evaluates it over (left row, NULL right).
         let pad_where = match where_clause {
             Some(where_expr) => {
-                let mut bound = where_expr.as_ref().clone();
+                let mut bound = where_expr.clone();
                 bind_and_rewrite_expr(
                     &mut bound,
                     Some(&mut pad_references),
@@ -5505,7 +5634,7 @@ fn emit_join(
                     // WHERE gates only the inner view row (the match was
                     // already counted above).
                     if let Some(where_expr) = where_clause {
-                        let mut bound = where_expr.as_ref().clone();
+                        let mut bound = where_expr.clone();
                         bind_and_rewrite_expr(
                             &mut bound,
                             Some(table_references),
@@ -6571,7 +6700,7 @@ fn compile_compound_program(
         }
 
         if let Some(where_expr) = where_clause {
-            let mut bound = where_expr.as_ref().clone();
+            let mut bound = where_expr.clone();
             bind_and_rewrite_expr(
                 &mut bound,
                 Some(&mut table_references),
@@ -6740,7 +6869,7 @@ fn compile_compound_all_program(
                 schema,
                 connection,
             )?,
-            ViewShape::Join { .. } => emit_join(
+            ViewShape::Join { .. } => emit_join_from_select(
                 &mut program,
                 view_name,
                 &branch,
