@@ -506,6 +506,190 @@ fn test_multi_row_partial_conflict(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Upsert DO UPDATE arm conflict semantics (issue #7839)
+// ---------------------------------------------------------------------------
+
+/// The UPDATE arm of an upsert always runs with ABORT conflict resolution,
+/// regardless of the statement-level OR clause (SQLite upsert.c). A constraint
+/// failure raised inside the DO UPDATE arm must roll back the whole statement:
+/// under INSERT OR FAIL rows inserted earlier in the statement must not
+/// persist, and under INSERT OR ROLLBACK the enclosing transaction must not be
+/// rolled back.
+///
+/// `INSERT OR IGNORE` is excluded from the matrix: Turso currently rewrites
+/// its upsert clause to DO NOTHING at translate time, which is a separate
+/// divergence from SQLite not addressed by the DO UPDATE arm fix.
+const UPSERT_ARM_SEED: &str = "INSERT INTO t VALUES(1,1,10),(2,2,20)";
+/// (scenario, DDL, DO UPDATE SET clause, expected error fragment).
+/// In every scenario row (10,5,50) inserts cleanly and row (11,1,60) hits
+/// ON CONFLICT(u); the DO UPDATE arm then violates a different constraint
+/// kind on column c — UNIQUE (c=20 collides with row 2), NOT NULL, or CHECK.
+const UPSERT_ARM_SCENARIOS: &[(&str, &str, &str, &str)] = &[
+    (
+        "unique",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, c INT UNIQUE)",
+        "SET c=20",
+        "UNIQUE constraint failed: t.c",
+    ),
+    (
+        "notnull",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, c INT NOT NULL)",
+        "SET c=NULL",
+        "NOT NULL constraint failed: t.c",
+    ),
+    (
+        "check",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, c INT CHECK(c<100))",
+        "SET c=200",
+        "CHECK constraint failed",
+    ),
+];
+const UPSERT_ARM_CLAUSES: &[(&str, &str)] = &[
+    ("INSERT", "plain"),
+    ("INSERT OR FAIL", "or_fail"),
+    ("INSERT OR ABORT", "or_abort"),
+    ("INSERT OR ROLLBACK", "or_rollback"),
+    ("INSERT OR REPLACE", "or_replace"),
+];
+const UPSERT_ARM_VERIFY: &str = "SELECT id, u, c FROM t ORDER BY id";
+
+#[turso_macros::test]
+fn test_upsert_do_update_arm_always_aborts(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    let mut failures: Vec<String> = Vec::new();
+
+    for &(scenario, ddl, set_clause, expected_msg) in UPSERT_ARM_SCENARIOS {
+        for &(clause, clause_name) in UPSERT_ARM_CLAUSES {
+            let label = format!("upsert_arm_autocommit__{scenario}__{clause_name}");
+
+            let limbo_db = TempDatabase::builder()
+                .with_db_name(format!("{label}.db"))
+                .build();
+            let limbo_conn = limbo_db.connect_limbo();
+            let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+            for setup in [ddl, UPSERT_ARM_SEED] {
+                limbo_conn.execute(setup).unwrap();
+                sqlite_conn.execute_batch(setup).unwrap();
+            }
+
+            let sql = format!(
+                "{clause} INTO t VALUES(10,5,50),(11,1,60) ON CONFLICT(u) DO UPDATE {set_clause}"
+            );
+            // Both engines must reject the statement with the same constraint
+            // violation; the message must keep its SQLite-compatible shape.
+            match limbo_try_exec(&limbo_conn, &sql) {
+                Err(e) if e.contains(expected_msg) => {}
+                other => failures.push(format!(
+                    "[{label}] limbo: expected error containing {expected_msg:?}, got {other:?}"
+                )),
+            }
+            if sqlite_try_exec(&sqlite_conn, &sql).is_ok() {
+                failures.push(format!("[{label}] sqlite unexpectedly succeeded"));
+            }
+
+            if let Some(e) = compare_tables(&label, &sqlite_conn, &limbo_conn, UPSERT_ARM_VERIFY) {
+                failures.push(e);
+            }
+
+            let db_path = limbo_db.path.clone();
+            drop(limbo_conn);
+            drop(limbo_db);
+            let ic = sqlite_integrity_check(&db_path);
+            if ic != "ok" {
+                failures.push(format!("[{label}] integrity_check: {ic}"));
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "{} failure(s) in upsert DO UPDATE arm autocommit test:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    Ok(())
+}
+
+/// Same scenario inside an explicit transaction: the failing DO UPDATE arm
+/// must roll back only its own statement. Rows inserted by earlier statements
+/// of the transaction survive, the transaction stays open, and COMMIT
+/// succeeds — even under INSERT OR ROLLBACK, whose statement-level semantics
+/// would otherwise kill the whole transaction.
+#[turso_macros::test]
+fn test_upsert_do_update_arm_aborts_in_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    let mut failures: Vec<String> = Vec::new();
+
+    for &(scenario, ddl, set_clause, expected_msg) in UPSERT_ARM_SCENARIOS {
+        for &(clause, clause_name) in UPSERT_ARM_CLAUSES {
+            let label = format!("upsert_arm_txn__{scenario}__{clause_name}");
+
+            let limbo_db = TempDatabase::builder()
+                .with_db_name(format!("{label}.db"))
+                .build();
+            let limbo_conn = limbo_db.connect_limbo();
+            let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+            for setup in [ddl, UPSERT_ARM_SEED] {
+                limbo_conn.execute(setup).unwrap();
+                sqlite_conn.execute_batch(setup).unwrap();
+            }
+
+            for stmt in ["BEGIN", "INSERT INTO t VALUES(90,9,90)"] {
+                if let Err(e) = exec_and_compare(&label, &sqlite_conn, &limbo_conn, stmt) {
+                    failures.push(e);
+                }
+            }
+
+            let sql = format!(
+                "{clause} INTO t VALUES(10,5,50),(11,1,60) ON CONFLICT(u) DO UPDATE {set_clause}"
+            );
+            match limbo_try_exec(&limbo_conn, &sql) {
+                Err(e) if e.contains(expected_msg) => {}
+                other => failures.push(format!(
+                    "[{label}] limbo: expected error containing {expected_msg:?}, got {other:?}"
+                )),
+            }
+            if sqlite_try_exec(&sqlite_conn, &sql).is_ok() {
+                failures.push(format!("[{label}] sqlite unexpectedly succeeded"));
+            }
+
+            // The transaction must still be alive with row 90 intact.
+            if let Some(e) = compare_tables(&label, &sqlite_conn, &limbo_conn, UPSERT_ARM_VERIFY) {
+                failures.push(e);
+            }
+            if let Err(e) = exec_and_compare(&label, &sqlite_conn, &limbo_conn, "COMMIT") {
+                failures.push(e);
+            }
+            if let Some(e) = compare_tables(&label, &sqlite_conn, &limbo_conn, UPSERT_ARM_VERIFY) {
+                failures.push(e);
+            }
+
+            let db_path = limbo_db.path.clone();
+            drop(limbo_conn);
+            drop(limbo_db);
+            let ic = sqlite_integrity_check(&db_path);
+            if ic != "ok" {
+                failures.push(format!("[{label}] integrity_check: {ic}"));
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "{} failure(s) in upsert DO UPDATE arm transaction test:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // ROLLBACK inside explicit transaction
 // ---------------------------------------------------------------------------
 

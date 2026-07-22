@@ -3131,8 +3131,23 @@ pub fn halt(
         vtab_rollback_all(&program.connection)?;
     }
 
+    // A Halt for a genuine constraint violation may carry a per-instruction
+    // conflict resolution override in `on_error`: the DO UPDATE arm of an
+    // upsert always runs with ABORT semantics regardless of the statement's
+    // OR clause (issue #7839). Such halts still surface a regular constraint
+    // error — only the effective resolve type changes. RAISE() halts use
+    // SQLITE_CONSTRAINT_TRIGGER/SQLITE_ERROR err_codes, so they are not
+    // affected by this and keep their own error variant below.
+    let constraint_override = match err_code {
+        SQLITE_CONSTRAINT_PRIMARYKEY
+        | SQLITE_CONSTRAINT_UNIQUE
+        | SQLITE_CONSTRAINT_CHECK
+        | SQLITE_CONSTRAINT_NOTNULL => on_error,
+        _ => None,
+    };
+
     // Handle RAISE errors - these carry their own resolve type
-    if let Some(resolve_type) = on_error {
+    if let Some(resolve_type) = on_error.filter(|_| constraint_override.is_none()) {
         // RAISE(IGNORE) signals the parent to skip the current row
         if resolve_type == ResolveType::Ignore {
             return Err(LimboError::RaiseIgnore);
@@ -3186,10 +3201,14 @@ pub fn halt(
 
     // Handle constraint errors
     if let Some(error) = constraint_error {
+        // Make the per-halt override visible to abort(), which otherwise
+        // resolves constraint errors with the statement-level clause.
+        state.constraint_resolve_override = constraint_override;
+        let effective_resolve = constraint_override.unwrap_or(program.resolve_type);
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
         // Note: ON CONFLICT FAIL does NOT apply to FK violations, so we check for those first.
-        if program.resolve_type == ResolveType::Fail && can_autocommit_now {
+        if effective_resolve == ResolveType::Fail && can_autocommit_now {
             // Check for immediate FK violations - FK errors don't respect ON CONFLICT
             if program.connection.foreign_keys_enabled()
                 && state.get_fk_immediate_violations_during_stmt() > 0
@@ -3438,11 +3457,12 @@ pub fn op_halt_if_null(
             target_reg,
             err_code,
             description,
+            on_error,
         },
         insn
     );
     if state.registers[*target_reg].get_value() == &Value::Null {
-        halt(program, state, pager, *err_code, description, None)
+        halt(program, state, pager, *err_code, description, *on_error)
     } else {
         state.pc += 1;
         Ok(InsnFunctionStepResult::Step)

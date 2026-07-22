@@ -2085,11 +2085,13 @@ fn emit_index_column_value_new_image(
 
 /// Emit bytecode for evaluating CHECK constraints.
 /// Assumes the resolver cache is already populated with column-to-register mappings.
+#[allow(clippy::too_many_arguments)]
 fn emit_check_constraint_bytecode(
     program: &mut ProgramBuilder,
     check_constraints: &[CheckConstraint],
     resolver: &mut Resolver,
     or_conflict: ResolveType,
+    halt_on_error: Option<ResolveType>,
     skip_row_label: BranchOffset,
     referenced_tables: Option<&TableReferences>,
     table_name: &str,
@@ -2158,7 +2160,7 @@ fn emit_check_constraint_bytecode(
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
-                    on_error: None,
+                    on_error: halt_on_error,
                     description_reg: None,
                 });
             }
@@ -2191,6 +2193,11 @@ pub(crate) fn emit_check_constraints<'a>(
     column_mappings: impl Iterator<Item = (&'a str, usize)>,
     connection: &Arc<Connection>,
     or_conflict: ResolveType,
+    // Per-instruction conflict resolution override for the emitted Halt, like
+    // `Insn::Halt`'s `on_error`. The DO UPDATE arm of an upsert always runs
+    // with ABORT semantics regardless of the statement's OR clause (issue
+    // #7839); all other callers pass None.
+    halt_on_error: Option<ResolveType>,
     skip_row_label: BranchOffset,
     referenced_tables: Option<&TableReferences>,
 ) -> Result<()> {
@@ -2274,6 +2281,7 @@ pub(crate) fn emit_check_constraints<'a>(
         check_constraints,
         resolver,
         or_conflict,
+        halt_on_error,
         skip_row_label,
         referenced_tables,
         table_name,

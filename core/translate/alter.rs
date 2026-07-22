@@ -672,6 +672,7 @@ fn emit_add_virtual_column_validation(
                 }),
             connection,
             ast::ResolveType::Abort,
+            None,
             skip_row_label,
             None,
         )?;

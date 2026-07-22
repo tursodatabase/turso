@@ -689,6 +689,10 @@ pub fn emit_upsert(
                 target_reg: layout.to_register(new_start, *col_idx),
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
+                // The DO UPDATE arm always runs with ABORT conflict
+                // resolution, regardless of the statement's OR clause
+                // (issue #7839).
+                on_error: Some(ast::ResolveType::Abort),
             });
         }
         if col.is_rowid_alias() {
@@ -791,6 +795,9 @@ pub fn emit_upsert(
             }),
             connection,
             ast::ResolveType::Abort,
+            // The DO UPDATE arm always runs with ABORT conflict resolution,
+            // regardless of the statement's OR clause (issue #7839).
+            Some(ast::ResolveType::Abort),
             ctx.loop_labels.row_done,
             Some(table_references),
         )?;
@@ -1005,7 +1012,9 @@ pub fn emit_upsert(
                     .and_then(|c| c.name.as_deref())
                     .unwrap_or("rowid")
             ),
-            on_error: None,
+            // The DO UPDATE arm always runs with ABORT conflict resolution,
+            // regardless of the statement's OR clause (issue #7839).
+            on_error: Some(ast::ResolveType::Abort),
             description_reg: None,
         });
         program.preassign_label_to_next_insn(ok);
@@ -1153,7 +1162,10 @@ pub fn emit_upsert(
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description,
-                    on_error: None,
+                    // The DO UPDATE arm always runs with ABORT conflict
+                    // resolution, regardless of the statement's OR clause
+                    // (issue #7839).
+                    on_error: Some(ast::ResolveType::Abort),
                     description_reg: None,
                 });
                 program.preassign_label_to_next_insn(ok);

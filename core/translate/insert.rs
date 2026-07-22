@@ -803,6 +803,7 @@ pub fn translate_insert(
         }),
         connection,
         ctx.on_conflict,
+        None,
         ctx.loop_labels.row_done,
         Some(&table_references),
     )?;
@@ -1881,6 +1882,7 @@ fn emit_notnulls(
                     );
                     description
                 },
+                on_error: None,
             });
         }
     }

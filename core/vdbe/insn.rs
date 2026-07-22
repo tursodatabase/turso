@@ -837,6 +837,10 @@ pub enum Insn {
         target_reg: usize,   // P3
         description: String, // p4
         err_code: usize,     // p1
+        /// Per-instruction conflict resolution override, like `Insn::Halt`'s.
+        /// The DO UPDATE arm of an upsert always runs with ABORT semantics
+        /// regardless of the statement's OR clause (issue #7839).
+        on_error: Option<ResolveType>, // P2
     },
 
     /// Start a transaction.

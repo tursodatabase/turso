@@ -770,6 +770,12 @@ pub struct ProgramState {
     /// When a constraint error occurs with FAIL resolve type in autocommit mode,
     /// we need to commit partial changes before returning the error.
     pub(crate) pending_fail_error: Option<LimboError>,
+    /// Per-halt conflict resolution override for constraint errors.
+    /// Set by halt() when the failing Halt carries `on_error` for a genuine
+    /// constraint violation (e.g. an upsert DO UPDATE arm, which always uses
+    /// ABORT semantics regardless of the statement's OR clause, issue #7839);
+    /// read by abort() in place of the statement-level resolve type.
+    pub(crate) constraint_resolve_override: Option<ResolveType>,
     /// Pending CDC info to apply after the program completes successfully.
     /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
     /// transaction rolls back, the connection's CDC state remains unchanged.
@@ -864,6 +870,7 @@ impl ProgramState {
             n_total_change: AtomicI64::new(0),
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
+            constraint_resolve_override: None,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
         }
@@ -995,6 +1002,7 @@ impl ProgramState {
         self.n_total_change.store(0, Ordering::SeqCst);
         *self.explain_state.write() = ExplainState::default();
         self.pending_fail_error = None;
+        self.constraint_resolve_override = None;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
     }
@@ -2600,12 +2608,20 @@ impl Program {
                 // is rolling back the whole MVCC transaction.
             }
             let must_rollback_tx_if_needed = can_autocommit_now || changed_shared_mvcc_auto_txn;
+            // The failing halt may carry a per-instruction conflict resolution
+            // override for its constraint error (upsert DO UPDATE arms always
+            // use ABORT semantics regardless of the statement's OR clause,
+            // issue #7839). It replaces the statement-level resolve type.
+            let stmt_resolve = state
+                .constraint_resolve_override
+                .take()
+                .unwrap_or(self.resolve_type);
             if err.is_some() && !pager.is_checkpointing() {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
                 // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
                 let is_fail_constraint = (matches!(err, Some(LimboError::Constraint(_)))
-                    && self.resolve_type == ResolveType::Fail)
+                    && stmt_resolve == ResolveType::Fail)
                     || matches!(err, Some(LimboError::Raise(ResolveType::Fail, _)));
                 if !is_fail_constraint {
                     if let Err(end_stmt_err) = state.end_statement(
@@ -2667,7 +2683,7 @@ impl Program {
                 Some(LimboError::Constraint(_)) | Some(LimboError::Raise(_, _)) => {
                     let effective_resolve = match err {
                         Some(LimboError::Raise(rt, _)) => *rt,
-                        _ => self.resolve_type,
+                        _ => stmt_resolve,
                     };
                     match effective_resolve {
                         ResolveType::Rollback => {

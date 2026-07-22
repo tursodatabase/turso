@@ -936,15 +936,26 @@ pub fn insn_to_row(
                 err_code,
                 target_reg,
                 description,
-            } => (
-                "HaltIfNull",
-                *err_code as i64,
-                0,
-                *target_reg as i64,
-                Value::build_text(description.clone()),
-                0,
-                "".to_string(),
-            ),
+                on_error,
+            } => {
+                let p2 = match on_error {
+                    Some(ResolveType::Rollback) => 1,
+                    Some(ResolveType::Abort) => 2,
+                    Some(ResolveType::Fail) => 3,
+                    Some(ResolveType::Ignore) => 4,
+                    Some(ResolveType::Replace) => 5,
+                    None => 0,
+                };
+                (
+                    "HaltIfNull",
+                    *err_code as i64,
+                    p2,
+                    *target_reg as i64,
+                    Value::build_text(description.clone()),
+                    0,
+                    "".to_string(),
+                )
+            }
             Insn::Transaction { db, tx_mode, schema_cookie} => (
                 "Transaction",
                 *db as i64,

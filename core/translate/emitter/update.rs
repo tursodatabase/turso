@@ -574,6 +574,7 @@ fn emit_notnull_constraint_check(
                     target_reg,
                     err_code: SQLITE_CONSTRAINT_NOTNULL,
                     description: description(),
+                    on_error: None,
                 });
             }
         }
@@ -582,6 +583,7 @@ fn emit_notnull_constraint_check(
                 target_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: description(),
+                on_error: None,
             });
         }
     }
@@ -1746,6 +1748,7 @@ fn emit_update_insns<'a>(
                     }),
                 connection,
                 or_conflict,
+                None,
                 skip_row_label,
                 Some(&check_constraint_tables),
             )?;

@@ -447,6 +447,7 @@ pub(super) fn emit_domain_cast_constraints(
                 "domain {} does not allow null values",
                 chain.first().map(|td| td.name.as_str()).unwrap_or("?")
             ),
+            on_error: None,
         });
     }
 
