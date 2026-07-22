@@ -1,5 +1,6 @@
 @database :memory:
 
+@skip-if mvcc "rebuilding affected indexes is not supported in MVCC mode"
 test alter-column-rename-and-type {
     CREATE TABLE t (a INTEGER);
     CREATE INDEX i ON t (a);
