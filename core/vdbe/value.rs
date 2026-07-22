@@ -1366,14 +1366,40 @@ impl Value {
         result.map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
-    /// Concatenate another value onto this Text value, converting both to strings.
-    /// Used by GROUP_CONCAT/STRING_AGG to properly handle all value types.
+    /// Fallibly concatenate another value onto this Text value, converting it to a string.
     /// Panics if self is not a Text value.
-    pub fn exec_group_concat(&mut self, other: &Value) {
+    pub fn exec_group_concat(
+        &mut self,
+        other: &Value,
+    ) -> std::result::Result<(), crate::alloc::TryReserveError> {
         let Value::Text(text) = self else {
-            panic!("concat_to_text must be called only on Value::Text");
+            panic!("group_concat accumulator must be a Text value");
         };
-        text.value.to_mut().push_str(&other.to_string());
+        let acc = match &mut text.value {
+            std::borrow::Cow::Owned(s) => s,
+            borrowed => {
+                let mut s = String::new();
+                s.try_reserve(borrowed.len())?;
+                s.push_str(borrowed);
+                *borrowed = std::borrow::Cow::Owned(s);
+                let std::borrow::Cow::Owned(s) = borrowed else {
+                    unreachable!("accumulator was just converted to Owned");
+                };
+                s
+            }
+        };
+        match other {
+            Value::Text(text) => {
+                acc.try_reserve(text.as_str().len())?;
+                acc.push_str(text.as_str());
+            }
+            other => {
+                let rendered = other.to_string();
+                acc.try_reserve(rendered.len())?;
+                acc.push_str(&rendered);
+            }
+        }
+        Ok(())
     }
 
     pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
