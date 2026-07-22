@@ -154,7 +154,7 @@ use crate::{
     json::jsonb_patch, json::jsonb_remove, json::jsonb_replace, json::jsonb_set, json::Conv,
 };
 
-use super::{make_record, Program, ProgramState, Register};
+use super::{Program, ProgramState, Register};
 
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
@@ -2822,7 +2822,18 @@ pub fn op_make_record(
         }
     }
 
-    let record = make_record(&state.registers, &start_reg, &count)?;
+    if dest_reg >= start_reg && dest_reg - start_reg < count {
+        return Err(LimboError::InternalError(format!(
+            "MakeRecord: destination register {dest_reg} overlaps its source range {start_reg}..{}",
+            start_reg + count
+        )));
+    }
+
+    // Serialize into the destination register's spent record buffer: per-row
+    // paths become allocation-free once the buffer has grown to the row size.
+    let buf = state.registers[dest_reg].take_buf();
+    let regs = &state.registers[start_reg..start_reg + count];
+    let record = ImmutableRecord::build_from_registers(regs, buf)?;
     state.registers[dest_reg] = Register::Record(record);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5079,6 +5090,9 @@ pub fn op_row_data(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RowData { cursor_id, dest }, insn);
 
+    // Copy the row into the destination register's spent record buffer: one
+    // payload copy, no allocation once the buffer has grown to the row size.
+    let buf = state.registers[*dest].take_buf();
     let record = {
         let cursor_ref = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "RowData");
         let cursor = cursor_ref.as_btree_mut();
@@ -5089,7 +5103,7 @@ pub fn op_row_data(
             LimboError::InternalError("RowData: cursor has no record".to_string())
         })?;
 
-        record.clone()
+        ImmutableRecord::copy_payload(record.get_payload(), buf)?
     };
 
     let reg = &mut state.registers[*dest];
@@ -17796,6 +17810,32 @@ mod tests {
         };
         assert!(matches!(err, LimboError::Constraint(message) if message == "datatype mismatch"));
         assert_eq!(state.pc, 0);
+    }
+
+    #[test]
+    fn test_make_record_overlapping_dest_returns_error() {
+        let stmt = prepare_test_statement();
+
+        let mut state = ProgramState::new(3, 0);
+        for i in 0..3 {
+            state.set_register(i, Register::Value(Value::from_i64(i as i64)));
+        }
+        let insn = Insn::MakeRecord {
+            start_reg: 0,
+            count: 3,
+            dest_reg: 1,
+            index_name: None,
+            affinity_str: None,
+        };
+
+        let err = match op_make_record(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+            Ok(_) => panic!("overlapping destination register must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, LimboError::InternalError(ref message) if message.contains("overlaps its source range")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

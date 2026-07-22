@@ -916,7 +916,11 @@ def test_csv():
         "Empty CSV table without header should not have columns other than 'c0'",
     )
 
-    turso.run_debug("create virtual table t2 using csv(data='', header=true);")
+    turso.run_test_fn(
+        "create virtual table t2 using csv(data='', header=true);",
+        null,
+        "Create empty CSV table with header",
+    )
     turso.run_test_fn(
         'SELECT "(NULL)" FROM t2;',
         lambda res: res == "",

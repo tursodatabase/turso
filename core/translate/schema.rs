@@ -1708,7 +1708,7 @@ pub fn translate_create_virtual_table(
     let module_name_reg = program.emit_string8_new_reg(module_name_str.clone());
     let table_name_reg = program.emit_string8_new_reg(table_name.clone());
     let args_reg = if !args_vec.is_empty() {
-        let args_start = program.alloc_register();
+        let args_start = program.alloc_registers(args_vec.len());
 
         // Emit string8 instructions for each arg
         for (i, arg) in args_vec.iter().enumerate() {
