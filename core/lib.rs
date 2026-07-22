@@ -322,6 +322,10 @@ pub enum SharedWalCoordinationOpenTelemetryMode {
 pub struct SharedWalOpenTelemetry {
     pub loaded_from_disk_scan: bool,
     pub reopened_max_frame: u64,
+    /// The shared commit version stamp `WalFileShared.metadata.transaction_count`
+    /// (Acquire load) at observation time. Paired with `reopened_max_frame`,
+    /// these advance together on each commit in coherent (untorn) history.
+    pub reopened_transaction_count: u64,
     pub reopened_nbackfills: u64,
     pub reopened_checkpoint_seq: u32,
     pub coordination_open_mode: Option<SharedWalCoordinationOpenTelemetryMode>,
@@ -2705,6 +2709,8 @@ impl Database {
             .loaded_from_disk_scan
             .load(Ordering::Acquire);
         let reopened_max_frame = shared_wal.metadata.max_frame.load(Ordering::Acquire);
+        let reopened_transaction_count =
+            shared_wal.metadata.transaction_count.load(Ordering::Acquire);
         let reopened_nbackfills = shared_wal.metadata.nbackfills.load(Ordering::Acquire);
         let reopened_checkpoint_seq = shared_wal.metadata.wal_header.lock().checkpoint_seq;
         drop(shared_wal);
@@ -2730,11 +2736,24 @@ impl Database {
         Ok(SharedWalOpenTelemetry {
             loaded_from_disk_scan,
             reopened_max_frame,
+            reopened_transaction_count,
             reopened_nbackfills,
             reopened_checkpoint_seq,
             coordination_open_mode,
             sanitized_backfill_proof_on_open,
         })
+    }
+
+    /// Verification-only handle to the shared WAL. The aristo-instr `expose_pub`
+    /// raises this to a public `inspect_shared_wal_handle()` so the conformance
+    /// harness can read the `Inspect`-derived accessors on the very
+    /// `WalFileShared` the engine mutates — `inspect_shared_wal_initialized()`
+    /// and `inspect_shared_wal_frame_cache_snapshot()` (page-cache handle
+    /// precedent: `Pager::inspect_page_cache_handle`).
+    #[cfg(feature = "aristo-instr")]
+    #[aristo::instrument::expose_pub(as = "inspect_shared_wal_handle")]
+    fn shared_wal_handle(&self) -> Arc<RwLock<WalFileShared>> {
+        self.shared_wal.clone()
     }
 
     #[cfg(feature = "simulator")]
