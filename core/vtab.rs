@@ -308,7 +308,7 @@ impl VirtualTableCursor {
         idx_num: i32,
         idx_str: Option<String>,
         arg_count: usize,
-        args: Vec<Value>,
+        args: crate::alloc::Vec<Value>,
     ) -> crate::Result<bool> {
         self.null_flag = false;
         match &mut self.inner {
@@ -527,7 +527,7 @@ impl ExtVirtualTableCursor {
         idx_num: i32,
         idx_str: Option<String>,
         arg_count: usize,
-        args: Vec<Value>,
+        args: crate::alloc::Vec<Value>,
     ) -> crate::Result<bool> {
         tracing::trace!("xFilter");
         let ext_args = args.iter().map(|arg| arg.to_ffi()).collect::<Vec<_>>();
