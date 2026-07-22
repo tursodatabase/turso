@@ -1,19 +1,23 @@
 use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
-use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_ne};
+use crate::{bail_parse_error, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
 };
 
 use super::{
+    index::emit_refill_index,
     schema::{validate_check_expr, SQLITE_TABLEID},
     update::translate_update_for_schema_change,
 };
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
-    schema::{CheckConstraint, Column, ColumnLayout, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
+    schema::{
+        collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Column, ColumnLayout,
+        ForeignKey, Index, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
+    },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
@@ -22,8 +26,8 @@ use crate::{
     },
     util::{
         check_expr_references_column, escape_sql_string_literal, normalize_ident,
-        parse_numeric_literal, rewrite_check_expr_table_refs, rewrite_trigger_cmd_table_refs,
-        rewrite_view_sql_for_column_rename,
+        parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
+        rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
     },
     vdbe::{
         affinity::Affinity,
@@ -1909,6 +1913,19 @@ pub fn translate_alter_table(
                 None
             };
 
+            let indexes_to_rewrite = if let Some(rewritten_table) = &rewritten_table {
+                let indexes = indexes_affected_by_column_rewrite(
+                    &original_btree,
+                    rewritten_table,
+                    &table_indexes,
+                    column_index,
+                )?;
+                validate_indexes_can_be_rewritten(&indexes, from, connection, database_id)?;
+                indexes
+            } else {
+                Vec::new()
+            };
+
             // If renaming, rewrite trigger SQL for all triggers that reference this column
             // We'll collect the triggers to rewrite and update them in sqlite_schema
             let mut triggers_to_rewrite: Vec<(usize, String, String)> = Vec::new();
@@ -2245,6 +2262,13 @@ pub fn translate_alter_table(
                     connection,
                     database_id,
                 );
+                emit_rewrite_table_indexes(
+                    program,
+                    resolver,
+                    database_id,
+                    &Arc::new(rewritten_table),
+                    &indexes_to_rewrite,
+                )?;
             }
 
             if clears_autoincrement_sequence {
@@ -2268,6 +2292,185 @@ pub fn translate_alter_table(
         }
     };
 
+    Ok(())
+}
+
+fn indexes_affected_by_column_rewrite(
+    original_table: &BTreeTable,
+    rewritten_table: &BTreeTable,
+    indexes: &[Arc<Index>],
+    column_index: usize,
+) -> Result<Vec<Arc<Index>>> {
+    let mut affected_columns = original_table.columns_affected_by_update([column_index])?;
+    affected_columns.union_with(&rewritten_table.columns_affected_by_update([column_index])?)?;
+    let affected_names = affected_column_names(original_table, rewritten_table, &affected_columns);
+    let old_column_name = original_table.columns()[column_index]
+        .name
+        .as_deref()
+        .expect("ALTER COLUMN target must be named");
+    let new_column_name = rewritten_table.columns()[column_index]
+        .name
+        .as_deref()
+        .expect("ALTER COLUMN replacement must be named");
+
+    Ok(indexes
+        .iter()
+        .filter(|index| {
+            index_references_rewritten_column(
+                index.as_ref(),
+                original_table,
+                &affected_columns,
+                &affected_names,
+            )
+        })
+        .map(|index| {
+            rewrite_index_for_column_rewrite(
+                index.as_ref(),
+                rewritten_table,
+                old_column_name,
+                new_column_name,
+            )
+        })
+        .collect())
+}
+
+fn affected_column_names(
+    original_table: &BTreeTable,
+    rewritten_table: &BTreeTable,
+    affected_columns: &ColumnMask,
+) -> HashSet<String> {
+    let mut names = HashSet::default();
+    for table in [original_table, rewritten_table] {
+        for (idx, column) in table.columns().iter().enumerate() {
+            if affected_columns.get(idx) {
+                if let Some(name) = &column.name {
+                    names.insert(normalize_ident(name));
+                }
+            }
+        }
+    }
+    names
+}
+
+fn index_references_rewritten_column(
+    index: &Index,
+    table: &BTreeTable,
+    affected_columns: &ColumnMask,
+    affected_names: &HashSet<String>,
+) -> bool {
+    for column in &index.columns {
+        if column.pos_in_table != EXPR_INDEX_SENTINEL && affected_columns.get(column.pos_in_table) {
+            return true;
+        }
+        if let Some(expr) = &column.expr {
+            if expr_references_any_affected_column(expr, table, affected_names) {
+                return true;
+            }
+        }
+    }
+
+    index
+        .where_clause
+        .as_ref()
+        .is_some_and(|expr| expr_references_any_affected_column(expr, table, affected_names))
+}
+
+fn expr_references_any_affected_column(
+    expr: &ast::Expr,
+    table: &BTreeTable,
+    affected_names: &HashSet<String>,
+) -> bool {
+    collect_column_dependencies_of_expr(expr, table.columns())
+        .iter()
+        .any(|name| affected_names.contains(name))
+}
+
+fn rewrite_index_for_column_rewrite(
+    index: &Index,
+    rewritten_table: &BTreeTable,
+    old_column_name: &str,
+    new_column_name: &str,
+) -> Arc<Index> {
+    let mut rewritten_index = index.clone();
+    for column in &mut rewritten_index.columns {
+        if let Some(expr) = &mut column.expr {
+            rename_identifiers(expr.as_mut(), old_column_name, new_column_name);
+            if column.pos_in_table == EXPR_INDEX_SENTINEL {
+                column.name = expr.to_string();
+            }
+        }
+
+        if column.pos_in_table != EXPR_INDEX_SENTINEL {
+            let table_column = &rewritten_table.columns()[column.pos_in_table];
+            if let Some(name) = &table_column.name {
+                column.name = normalize_ident(name);
+            }
+            column.default.clone_from(&table_column.default);
+            column.expr = table_column
+                .generated_expr()
+                .map(|expr| Box::new(expr.clone()));
+        }
+    }
+
+    if let Some(where_clause) = &mut rewritten_index.where_clause {
+        rename_identifiers(where_clause, old_column_name, new_column_name);
+    }
+
+    Arc::new(rewritten_index)
+}
+
+fn validate_indexes_can_be_rewritten(
+    indexes: &[Arc<Index>],
+    column_name: &str,
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
+) -> Result<()> {
+    if !indexes.is_empty() && database_uses_mvcc(connection, database_id) {
+        return Err(LimboError::ParseError(format!(
+            "cannot ALTER COLUMN \"{column_name}\": rebuilding affected indexes is not supported in MVCC mode"
+        )));
+    }
+
+    for index in indexes {
+        if !index.has_rowid {
+            return Err(LimboError::ParseError(format!(
+                "cannot ALTER COLUMN \"{column_name}\": rebuilding affected indexes is not supported for WITHOUT ROWID tables"
+            )));
+        }
+        if index
+            .index_method
+            .as_ref()
+            .is_some_and(|method| !method.definition().backing_btree)
+        {
+            return Err(LimboError::ParseError(format!(
+                "cannot ALTER COLUMN \"{column_name}\": rebuilding affected custom index {} is not supported",
+                index.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn emit_rewrite_table_indexes(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    rewritten_table: &Arc<BTreeTable>,
+    indexes: &[Arc<Index>],
+) -> Result<()> {
+    for index in indexes {
+        let index_cursor_id = program.alloc_cursor_index(None, index)?;
+        emit_refill_index(
+            program,
+            resolver,
+            database_id,
+            rewritten_table,
+            index,
+            index_cursor_id,
+            RegisterOrLiteral::Literal(index.root_page),
+            Some(index.root_page),
+        )?;
+    }
     Ok(())
 }
 
