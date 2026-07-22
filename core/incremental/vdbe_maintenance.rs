@@ -45,6 +45,7 @@ use turso_parser::ast;
 use crate::function::{AggFunc, Func};
 use crate::incremental::dbsp::Delta;
 use crate::schema::{BTreeTable, Schema};
+use crate::translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     bind_and_rewrite_expr, translate_condition_expr, translate_expr_no_constant_opt,
@@ -213,14 +214,28 @@ pub enum ViewShape {
         /// Number of result columns (with stars expanded), which for UNION
         /// is also the width of the content key in the state table.
         arity: usize,
+        /// Collation each content-key column dedups under (left-most branch
+        /// with a resolved collation wins, matching compound dedup indexes).
+        /// Carried onto the state table's key columns. Empty for UNION ALL.
+        key_collations: Vec<CollationSeq>,
     },
     /// Single-table GROUP BY with invertible aggregates.
     GroupAggregate {
         group_exprs: Vec<ast::Expr>,
+        /// Collation each group expression compares under (parallel to
+        /// `group_exprs`), resolved the way regular GROUP BY translation
+        /// resolves it. Carried onto the state table's key columns so the
+        /// hidden index groups exactly like the batch query.
+        group_collations: Vec<CollationSeq>,
         /// `aggregates[0]` is always a hidden COUNT(*) tracking group
         /// liveness (a group's view row exists iff its row count > 0).
         /// Aggregates appearing only in HAVING are also collected here.
         aggregates: Vec<Aggregate>,
+        /// Collation of every multiset-tracked aggregate argument (MIN/MAX
+        /// and DISTINCT aggregates), carried onto the multiset table's `val`
+        /// column. One shared table stores all such values, so aggregates
+        /// with differing argument collations are rejected at classify.
+        multiset_collation: CollationSeq,
         outputs: Vec<OutputColumn>,
         /// HAVING predicate over group expressions and aggregate results;
         /// gates only the view row, not the group's persisted state.
@@ -414,7 +429,7 @@ fn validate_union_branch(
     branch: &ast::OneSelect,
     schema: &Schema,
     resolver: &Resolver,
-) -> Result<usize> {
+) -> Result<(usize, Vec<Option<CollationSeq>>)> {
     let ast::OneSelect::Select {
         distinctness,
         columns,
@@ -455,6 +470,7 @@ fn validate_union_branch(
         check_scalar_expr(where_expr)?;
     }
     let mut arity = 0;
+    let mut collations = Vec::with_capacity(columns.len());
     for column in columns {
         match column {
             ast::ResultColumn::Expr(expr, _) => {
@@ -464,14 +480,27 @@ fn validate_union_branch(
                     return unsupported("aggregate branches in compound SELECTs");
                 }
                 check_scalar_expr(expr)?;
+                collations.extend(resolve_term_collations(
+                    std::slice::from_ref(expr.as_ref()),
+                    from,
+                    schema,
+                    resolver,
+                )?);
                 arity += 1;
             }
             ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => {
                 arity += base_table.columns().len();
+                for column in base_table.columns() {
+                    let collation = column.collation();
+                    if collation.is_custom() {
+                        return unsupported("custom collations on grouping or dedup keys");
+                    }
+                    collations.push(Some(collation));
+                }
             }
         }
     }
-    Ok(arity)
+    Ok((arity, collations))
 }
 
 /// Classify a view definition into its maintainable shape.
@@ -515,20 +544,43 @@ pub fn classify_view(
         }
 
         let mut arity: Option<usize> = None;
+        let mut folded: Vec<Option<CollationSeq>> = Vec::new();
         for branch in std::iter::once(&select.body.select)
             .chain(select.body.compounds.iter().map(|c| &c.select))
         {
-            let branch_arity = validate_union_branch(branch, schema, resolver)?;
+            let (branch_arity, branch_collations) =
+                validate_union_branch(branch, schema, resolver)?;
             if *arity.get_or_insert(branch_arity) != branch_arity {
                 return Err(LimboError::ParseError(format!(
                     "SELECTs to the left and right of {} do not have the same number of result columns",
                     if distinct { "UNION" } else { "UNION ALL" }
                 )));
             }
+            // Left precedence: the left-most branch that resolves a
+            // collation for a column decides it, like compound dedup
+            // indexes.
+            if folded.is_empty() {
+                folded = branch_collations;
+            } else {
+                for (slot, branch_collation) in folded.iter_mut().zip(branch_collations) {
+                    if slot.is_none() {
+                        *slot = branch_collation;
+                    }
+                }
+            }
         }
+        let key_collations = if distinct {
+            folded
+                .into_iter()
+                .map(|collation| collation.unwrap_or(CollationSeq::Binary))
+                .collect()
+        } else {
+            Vec::new()
+        };
         return Ok(ViewShape::Union {
             distinct,
             arity: arity.expect("at least two branches"),
+            key_collations,
         });
     }
 
@@ -619,7 +671,14 @@ pub fn classify_view(
                     base_tables.extend(schema.get_btree_table(name.name.as_str()));
                 }
             }
-            return classify_group_aggregate(columns, group_by, &base_tables, resolver);
+            return classify_group_aggregate(
+                columns,
+                group_by,
+                from,
+                &base_tables,
+                schema,
+                resolver,
+            );
         }
         for column in columns {
             if let ast::ResultColumn::Expr(expr, _) = column {
@@ -695,9 +754,12 @@ pub fn classify_view(
             None,
             &mut [],
         )?;
+        let group_collations = resolve_key_collations(&group_exprs, from, schema, resolver)?;
         return Ok(ViewShape::GroupAggregate {
             group_exprs,
+            group_collations,
             aggregates,
+            multiset_collation: CollationSeq::Binary,
             outputs,
             having: None,
             scalar: false,
@@ -735,7 +797,7 @@ pub fn classify_view(
             .collect(),
         _ => Vec::new(),
     };
-    classify_group_aggregate(columns, group_by, &base_tables, resolver)
+    classify_group_aggregate(columns, group_by, from, &base_tables, schema, resolver)
 }
 
 /// Classify an aggregate query (GROUP BY, scalar aggregates, HAVING) into a
@@ -745,7 +807,9 @@ pub fn classify_view(
 fn classify_group_aggregate(
     columns: &[ast::ResultColumn],
     group_by: &Option<ast::GroupBy>,
+    from: &ast::FromClause,
     base_tables: &[Arc<BTreeTable>],
+    schema: &Schema,
     resolver: &Resolver,
 ) -> Result<ViewShape> {
     let (raw_group_exprs, having_clause): (Vec<ast::Expr>, Option<&ast::Expr>) = match group_by {
@@ -848,9 +912,33 @@ fn classify_group_aggregate(
         validate_supported_aggregate(agg)?;
     }
 
+    let group_collations = resolve_key_collations(&group_exprs, from, schema, resolver)?;
+    let mut multiset_collation = CollationSeq::Binary;
+    let mut multiset_seen = false;
+    for agg in aggregates.iter().filter(|a| uses_multiset(a)) {
+        let collation = match agg.args.first() {
+            Some(arg) => {
+                resolve_key_collations(std::slice::from_ref(arg), from, schema, resolver)?[0]
+            }
+            None => CollationSeq::Binary,
+        };
+        if !multiset_seen {
+            multiset_seen = true;
+            multiset_collation = collation;
+        } else if multiset_collation != collation {
+            // All multiset-tracked values share one table whose `val` column
+            // carries a single collation.
+            return unsupported(
+                "different collations across MIN/MAX or DISTINCT aggregate arguments",
+            );
+        }
+    }
+
     Ok(ViewShape::GroupAggregate {
         group_exprs,
+        group_collations,
         aggregates,
+        multiset_collation,
         outputs,
         having,
         scalar,
@@ -909,12 +997,13 @@ pub fn state_table_sql(state_table_name: &str, shape: &ViewShape) -> Result<Stri
     match shape {
         ViewShape::GroupAggregate {
             group_exprs,
+            group_collations,
             aggregates,
             ..
         } => {
             let mut columns = Vec::new();
-            for i in 0..group_exprs.len() {
-                columns.push(format!("g{i}"));
+            for (i, collation) in group_collations.iter().enumerate() {
+                columns.push(format!("g{i}{}", collate_clause(*collation)));
             }
             for (i, agg) in aggregates.iter().enumerate() {
                 if let Some(width) = crate::vdbe::execute::agg_payload_width(&agg.func) {
@@ -938,15 +1027,25 @@ pub fn state_table_sql(state_table_name: &str, shape: &ViewShape) -> Result<Stri
                 key.join(", ")
             ))
         }
-        ViewShape::Union { distinct, arity } => {
-            let key: Vec<String> = if *distinct {
-                (0..*arity).map(|i| format!("c{i}")).collect()
+        ViewShape::Union {
+            distinct,
+            arity,
+            key_collations,
+        } => {
+            let (columns, key): (Vec<String>, Vec<String>) = if *distinct {
+                (
+                    (0..*arity)
+                        .map(|i| format!("c{i}{}", collate_clause(key_collations[i])))
+                        .collect(),
+                    (0..*arity).map(|i| format!("c{i}")).collect(),
+                )
             } else {
-                vec!["branch".to_string(), "rid".to_string()]
+                let key = vec!["branch".to_string(), "rid".to_string()];
+                (key.clone(), key)
             };
             Ok(format!(
                 "CREATE TABLE {state_table_name} ({}, mult, PRIMARY KEY ({}))",
-                key.join(", "),
+                columns.join(", "),
                 key.join(", ")
             ))
         }
@@ -976,139 +1075,40 @@ pub fn needs_multiset_table(shape: &ViewShape) -> bool {
 /// aggregates the multiplicity decides when a value enters or leaves the
 /// accumulator.
 pub fn multiset_table_sql(multiset_table_name: &str, shape: &ViewShape) -> Result<String> {
-    let ViewShape::GroupAggregate { group_exprs, .. } = shape else {
+    let ViewShape::GroupAggregate {
+        group_collations,
+        multiset_collation,
+        ..
+    } = shape
+    else {
         return Err(LimboError::InternalError(
             "only GROUP BY views have multiset tables".to_string(),
         ));
     };
+    let mut columns = vec!["agg_id".to_string()];
     let mut key = vec!["agg_id".to_string()];
-    for i in 0..group_exprs.len() {
+    for (i, collation) in group_collations.iter().enumerate() {
+        columns.push(format!("g{i}{}", collate_clause(*collation)));
         key.push(format!("g{i}"));
     }
+    columns.push(format!("val{}", collate_clause(*multiset_collation)));
     key.push("val".to_string());
     Ok(format!(
         "CREATE TABLE {multiset_table_name} ({}, mult, PRIMARY KEY ({}))",
-        key.join(", "),
+        columns.join(", "),
         key.join(", ")
     ))
 }
 
-/// Validation of collation-sensitive terms that needs the schema. The
-/// internal state tables compare with default (binary) collation: the
-/// multiset index orders MIN/MAX and DISTINCT-aggregate values, and the
-/// state table's primary key groups the GROUP BY (or SELECT DISTINCT) keys.
-/// A term carrying a non-default collation would therefore be maintained
-/// under the wrong comparison — e.g. a NOCASE group key would split 'a' and
-/// 'A' into two groups while the defining query merges them. Must run at
-/// translate time — rejecting later, inside the CREATE program, corrupts
-/// the database (see validate_and_extract_columns).
-pub fn validate_collation_constraints(
-    select: &ast::Select,
-    shape: &ViewShape,
-    schema: &Schema,
-) -> Result<()> {
-    // UNION dedup keys are the branches' output columns, compared through
-    // the state table's binary-collated primary key.
-    if let ViewShape::Union { distinct: true, .. } = shape {
-        for branch in std::iter::once(&select.body.select)
-            .chain(select.body.compounds.iter().map(|c| &c.select))
-        {
-            let ast::OneSelect::Select { columns, from, .. } = branch else {
-                continue;
-            };
-            let mut branch_tables = Vec::new();
-            if let Some(from) = from {
-                if let ast::SelectTable::Table(name, _, _) = from.select.as_ref() {
-                    branch_tables.extend(schema.get_btree_table(name.name.as_str()));
-                }
-            }
-            for column in columns {
-                let ast::ResultColumn::Expr(expr, _) = column else {
-                    continue;
-                };
-                walk_expr_with_subqueries(expr, &mut |e: &ast::Expr| {
-                    if matches!(e, ast::Expr::Collate(_, _)) {
-                        return unsupported("UNION over collated expressions");
-                    }
-                    Ok(WalkControl::Continue)
-                })?;
-                if let ast::Expr::Id(name) = expr.as_ref() {
-                    let collated = branch_tables.iter().any(|table| {
-                        table.columns().iter().any(|c| {
-                            c.name.as_deref() == Some(name.as_str()) && c.collation_opt().is_some()
-                        })
-                    });
-                    if collated {
-                        return unsupported("UNION over collated columns");
-                    }
-                }
-            }
-        }
-        return Ok(());
+/// The `COLLATE` clause for a hidden-table key column, empty for the
+/// default binary comparison. The name round-trips through
+/// [`CollationSeq::new`] when the generated DDL is parsed back; custom
+/// collations (which do not) are rejected at classify time.
+fn collate_clause(collation: CollationSeq) -> String {
+    match collation {
+        CollationSeq::Binary | CollationSeq::Unset => String::new(),
+        other => format!(" COLLATE \"{}\"", other.name()),
     }
-
-    let ViewShape::GroupAggregate {
-        aggregates,
-        group_exprs,
-        ..
-    } = shape
-    else {
-        return Ok(());
-    };
-    let ast::OneSelect::Select { from, .. } = &select.body.select else {
-        return Ok(());
-    };
-    let Some(from) = from else { return Ok(()) };
-    let mut base_tables = Vec::new();
-    for table in std::iter::once(from.select.as_ref())
-        .chain(from.joins.iter().map(|join| join.table.as_ref()))
-    {
-        if let ast::SelectTable::Table(name, _, _) = table {
-            base_tables.extend(schema.get_btree_table(name.name.as_str()));
-        }
-    }
-
-    let check_term = |term: &ast::Expr, what: &str| -> Result<()> {
-        // Explicit COLLATE anywhere in the term.
-        walk_expr_with_subqueries(term, &mut |e: &ast::Expr| {
-            if matches!(e, ast::Expr::Collate(_, _)) {
-                return unsupported(&format!("{what} over collated expressions"));
-            }
-            Ok(WalkControl::Continue)
-        })?;
-        // A bare (possibly qualified) column reference with a declared
-        // collation on any FROM table.
-        let column_name = match term {
-            ast::Expr::Id(name) => Some(name.as_str()),
-            ast::Expr::Qualified(_, name) => Some(name.as_str()),
-            _ => None,
-        };
-        if let Some(column_name) = column_name {
-            let collated = base_tables.iter().any(|table| {
-                table
-                    .columns()
-                    .iter()
-                    .any(|c| c.name.as_deref() == Some(column_name) && c.collation_opt().is_some())
-            });
-            if collated {
-                return unsupported(&format!("{what} over collated columns"));
-            }
-        }
-        Ok(())
-    };
-
-    for group_expr in group_exprs {
-        check_term(group_expr, "GROUP BY or DISTINCT")?;
-    }
-    for agg in aggregates {
-        if !uses_multiset(agg) {
-            continue;
-        }
-        if let Some(arg) = agg.args.first() {
-            check_term(arg, "MIN/MAX or DISTINCT aggregates")?;
-        }
-    }
-    Ok(())
 }
 
 /// Compile the maintenance (or population) program for a filter/project view.
@@ -1176,7 +1176,11 @@ pub fn compile_maintenance_program(
                 connection,
             )
         }
-        ViewShape::Union { distinct, .. } => {
+        ViewShape::Union {
+            distinct,
+            key_collations,
+            ..
+        } => {
             if matches!(output, MaintenanceOutput::EmitRows) {
                 return Err(LimboError::InternalError(
                     "union views serve uncommitted reads by recomputing the defining query"
@@ -1187,6 +1191,7 @@ pub fn compile_maintenance_program(
                 view_name,
                 select,
                 distinct,
+                &key_collations,
                 view_root_page,
                 num_view_columns,
                 input,
@@ -1593,7 +1598,9 @@ fn compile_group_aggregate_program(
 
     let ViewShape::GroupAggregate {
         group_exprs,
+        group_collations,
         aggregates,
+        multiset_collation: _,
         outputs,
         having,
         scalar,
@@ -1602,6 +1609,15 @@ fn compile_group_aggregate_program(
         unreachable!("compile_group_aggregate_program requires a GroupAggregate shape");
     };
     let scalar = *scalar;
+    // With a collated key, values that compare equal can differ in bytes.
+    // The stored key is the group's first-seen representative: reloading it
+    // on every lookup keeps the state row, its index entry, and the view row
+    // byte-identical, and matches the value batch GROUP BY displays. With
+    // binary keys a matched lookup implies byte equality, so the reload is
+    // skipped.
+    let reload_stored_group = group_collations
+        .iter()
+        .any(|c| !matches!(c, CollationSeq::Binary | CollationSeq::Unset));
     let ast::OneSelect::Select {
         from, where_clause, ..
     } = &select.body.select
@@ -2094,6 +2110,16 @@ fn compile_group_aggregate_program(
         src_reg: state_rowid_reg,
         target_pc: corrupt_label,
     });
+    if reload_stored_group {
+        for i in 0..k {
+            program.emit_insn(Insn::Column {
+                cursor_id: state_cursor_id,
+                column: i,
+                dest: group_start + i,
+                default: None,
+            });
+        }
+    }
     for (i, agg) in aggregates.iter().enumerate() {
         let Some(offset) = payload_offsets[i] else {
             continue; // MIN/MAX: state lives in the multiset table
@@ -2951,6 +2977,71 @@ type JoinTable = (Arc<BTreeTable>, String);
 /// the per-table-position cursor ids, and the phase's table references.
 type JoinPhaseSink<'a> =
     dyn FnMut(&mut ProgramBuilder, &[usize], &mut TableReferences) -> Result<()> + 'a;
+
+/// Resolve the collation each key term compares under in the defining query,
+/// by binding it against the FROM tables and asking the same resolver that
+/// regular GROUP BY / ORDER BY translation asks. The result is carried onto
+/// the hidden state tables' key columns, so their primary-key indexes group
+/// and dedup exactly like the batch query. Custom collations are rejected:
+/// they are connection-local and cannot be embedded in the hidden tables'
+/// CREATE TABLE.
+fn resolve_key_collations(
+    terms: &[ast::Expr],
+    from: &ast::FromClause,
+    schema: &Schema,
+    resolver: &Resolver,
+) -> Result<Vec<CollationSeq>> {
+    Ok(resolve_term_collations(terms, from, schema, resolver)?
+        .into_iter()
+        .map(|collation| collation.unwrap_or(CollationSeq::Binary))
+        .collect())
+}
+
+/// Like [`resolve_key_collations`], but keeps "no collation resolved"
+/// distinct from BINARY: UNION dedup folds branch collations with left
+/// precedence, where an unresolved left column (e.g. a literal) falls
+/// through to the right branch's collation.
+fn resolve_term_collations(
+    terms: &[ast::Expr],
+    from: &ast::FromClause,
+    schema: &Schema,
+    resolver: &Resolver,
+) -> Result<Vec<Option<CollationSeq>>> {
+    let (tables, _) = collect_join_tables(from, schema)?;
+    let joined = tables
+        .iter()
+        .enumerate()
+        .map(|(i, (table, identifier))| {
+            make_joined_table(table, identifier, TableInternalId::from(i))
+        })
+        .collect();
+    let mut table_references = TableReferences::new(joined, vec![]);
+    terms
+        .iter()
+        .map(|term| {
+            let mut bound = term.clone();
+            bind_and_rewrite_expr(
+                &mut bound,
+                Some(&mut table_references),
+                None,
+                resolver,
+                BindingBehavior::ResultColumnsNotAllowed,
+            )?;
+            let collation = get_collseq_from_expr_with_symbols(
+                &bound,
+                &table_references,
+                Some(resolver.symbol_table),
+            )?;
+            if collation.is_some_and(|c| c.is_custom()) {
+                return unsupported("custom collations on grouping or dedup keys");
+            }
+            Ok(collation.map(|c| match c {
+                CollationSeq::Unset => CollationSeq::Binary,
+                other => other,
+            }))
+        })
+        .collect()
+}
 
 /// Extract the joined tables (with their binding identifiers) and the ON
 /// predicates of a join view's FROM clause.
@@ -3814,6 +3905,7 @@ fn compile_union_program(
     view_name: &str,
     select: &ast::Select,
     distinct: bool,
+    key_collations: &[CollationSeq],
     view_root_page: i64,
     num_view_columns: usize,
     input: MaintenanceInput,
@@ -3825,6 +3917,13 @@ fn compile_union_program(
         .collect();
     // Width of the row-identity key in the state table.
     let key_width = if distinct { num_view_columns } else { 2 };
+    // With a collated dedup key, values that compare equal can differ in
+    // bytes; the stored key is the row's first-seen representative (see the
+    // matching reload in the group-aggregate program). For UNION the output
+    // columns ARE the key, so the reload refreshes both.
+    let reload_stored_key = key_collations
+        .iter()
+        .any(|c| !matches!(c, CollationSeq::Binary | CollationSeq::Unset));
 
     let state_table_name = format!(
         "{}{}_{view_name}",
@@ -4013,6 +4112,21 @@ fn compile_union_program(
         src_reg: srid_reg,
         target_pc: corrupt_label,
     });
+    if reload_stored_key {
+        for i in 0..key_width {
+            program.emit_insn(Insn::Column {
+                cursor_id: state_cursor_id,
+                column: i,
+                dest: key_start + i,
+                default: None,
+            });
+        }
+        program.emit_insn(Insn::Copy {
+            src_reg: key_start,
+            dst_reg: out_start,
+            extra_amount: key_width.saturating_sub(1),
+        });
+    }
     program.emit_insn(Insn::Column {
         cursor_id: state_cursor_id,
         column: key_width,
