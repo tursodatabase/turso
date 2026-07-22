@@ -523,6 +523,97 @@ fn validate_union_branch(
     Ok((arity, collations))
 }
 
+/// Expand a join view's result columns into the qualified expressions that
+/// `SELECT DISTINCT` groups by: one per output column, with stars expanded
+/// across every joined table (a USING/NATURAL-merged column appearing once,
+/// from the left-most table, matching the projection). Aggregate result
+/// columns are rejected — `DISTINCT` over an aggregate query dedups the
+/// aggregated rows, which the group machinery cannot express.
+fn expand_join_output_exprs(
+    from: &ast::FromClause,
+    schema: &Schema,
+    columns: &[ast::ResultColumn],
+    resolver: &Resolver,
+) -> Result<Vec<ast::Expr>> {
+    let using_per_table = crate::util::join_using_columns(from, schema)?;
+    // (identifier, table) for every joined table, in FROM order.
+    let mut joined: Vec<(String, Arc<BTreeTable>)> = Vec::with_capacity(from.joins.len() + 1);
+    for select_table in std::iter::once(from.select.as_ref())
+        .chain(from.joins.iter().map(|join| join.table.as_ref()))
+    {
+        let ast::SelectTable::Table(name, alias, _) = select_table else {
+            return unsupported("subqueries or table functions in FROM");
+        };
+        let table = schema.get_btree_table(name.name.as_str()).ok_or_else(|| {
+            LimboError::ParseError(format!(
+                "materialized view base table {} not found",
+                name.name.as_str()
+            ))
+        })?;
+        let identifier = match alias {
+            Some(ast::As::As(a) | ast::As::Elided(a) | ast::As::ImplicitColumnName(a)) => {
+                a.as_str().to_string()
+            }
+            None => table.name.clone(),
+        };
+        joined.push((identifier, table));
+    }
+
+    let qualified = |identifier: &str, column: &crate::schema::Column| -> Result<ast::Expr> {
+        let name = column.name.clone().ok_or_else(|| {
+            LimboError::InternalError("btree table column without a name".to_string())
+        })?;
+        Ok(ast::Expr::Qualified(
+            ast::Name::exact(identifier.to_string()),
+            ast::Name::exact(name),
+        ))
+    };
+
+    let mut group_exprs = Vec::new();
+    for column in columns {
+        match column {
+            ast::ResultColumn::Expr(expr, _) => {
+                let mut aggs = Vec::new();
+                if resolve_window_and_aggregate_functions(expr, resolver, &mut aggs, None, &mut [])?
+                {
+                    return unsupported("DISTINCT over aggregates");
+                }
+                check_scalar_expr(expr)?;
+                group_exprs.push(expr.as_ref().clone());
+            }
+            ast::ResultColumn::Star => {
+                for (table_idx, (identifier, table)) in joined.iter().enumerate() {
+                    let merged = &using_per_table[table_idx];
+                    for column in table.columns() {
+                        if merged.iter().any(|u| {
+                            column
+                                .name
+                                .as_deref()
+                                .is_some_and(|n| n.eq_ignore_ascii_case(u))
+                        }) {
+                            continue;
+                        }
+                        group_exprs.push(qualified(identifier, column)?);
+                    }
+                }
+            }
+            ast::ResultColumn::TableStar(name) => {
+                let target = crate::util::normalize_ident(name.as_str());
+                let Some((identifier, table)) = joined
+                    .iter()
+                    .find(|(identifier, _)| crate::util::normalize_ident(identifier) == target)
+                else {
+                    return Err(LimboError::ParseError(format!("no such table: {target}")));
+                };
+                for column in table.columns() {
+                    group_exprs.push(qualified(identifier, column)?);
+                }
+            }
+        }
+    }
+    Ok(group_exprs)
+}
+
 /// Classify a view definition into its maintainable shape.
 ///
 /// This is the CREATE MATERIALIZED VIEW gate: shapes outside the supported
@@ -697,7 +788,41 @@ pub fn classify_view(
             }
         }
         if select_distinct {
-            return unsupported("DISTINCT over joins");
+            // DISTINCT over a join is GROUP BY every output column over the
+            // join: one group per distinct output row, kept alive by the
+            // hidden COUNT(*). Expand the result columns to qualified
+            // references (stars across every joined table, merged USING
+            // columns once) and route through the shared aggregate path,
+            // whose compile step re-reads the join from the FROM clause.
+            if left_outer {
+                return unsupported("DISTINCT over outer joins");
+            }
+            let group_exprs = expand_join_output_exprs(from, schema, columns, resolver)?;
+            let synthetic_columns: Vec<ast::ResultColumn> = group_exprs
+                .iter()
+                .map(|expr| ast::ResultColumn::Expr(Box::new(expr.clone()), None))
+                .collect();
+            let group_by = ast::GroupBy {
+                exprs: group_exprs.iter().cloned().map(Box::new).collect(),
+                having: None,
+            };
+            let base_tables: Vec<Arc<BTreeTable>> = std::iter::once(from.select.as_ref())
+                .chain(from.joins.iter().map(|join| join.table.as_ref()))
+                .filter_map(|table| match table {
+                    ast::SelectTable::Table(name, _, _) => {
+                        schema.get_btree_table(name.name.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            return classify_group_aggregate(
+                &synthetic_columns,
+                &Some(group_by),
+                from,
+                &base_tables,
+                schema,
+                resolver,
+            );
         }
         let mut contains_aggregates = group_by.is_some();
         for column in columns {

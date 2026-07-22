@@ -986,13 +986,57 @@ expect error {
     NATURAL or USING joins between tables with the same name
 }
 
-test matview-vdbe-join-distinct-rejected {
-    CREATE TABLE jl7(x INTEGER);
-    CREATE TABLE jr7(y INTEGER);
-    CREATE MATERIALIZED VIEW bad7 AS SELECT DISTINCT x, y FROM jl7 JOIN jr7 ON x = y;
+# DISTINCT over a join is GROUP BY every output column over the join: one
+# group per distinct output row, alive while any join pair produces it, so
+# duplicate source rows collapse and the row survives until its last pair
+# is gone.
+test matview-vdbe-join-distinct {
+    CREATE TABLE jl7(a INTEGER, b TEXT);
+    CREATE TABLE jr7(a INTEGER, c TEXT);
+    INSERT INTO jl7 VALUES (1,'x'), (2,'y'), (2,'y');
+    INSERT INTO jr7 VALUES (1,'p'), (1,'p'), (2,'q');
+    CREATE MATERIALIZED VIEW vd7 AS SELECT DISTINCT b, c FROM jl7 JOIN jr7 ON jl7.a = jr7.a;
+    SELECT 'init', * FROM vd7 ORDER BY 2, 3;
+    INSERT INTO jr7 VALUES (2, 'q');
+    DELETE FROM jl7 WHERE b = 'x';
+    INSERT INTO jl7 VALUES (3, 'z');
+    INSERT INTO jr7 VALUES (3, 'w');
+    SELECT 'after', * FROM vd7 ORDER BY 2, 3;
+    DELETE FROM jr7 WHERE c = 'q';
+    SELECT 'gone', * FROM vd7 ORDER BY 2, 3;
+}
+expect {
+    init|x|p
+    init|y|q
+    after|y|q
+    after|z|w
+    gone|z|w
+}
+
+# DISTINCT over a join with USING merges the join column once, then dedups.
+test matview-vdbe-join-distinct-star-using {
+    CREATE TABLE dl(a INTEGER, b TEXT);
+    CREATE TABLE dr(a INTEGER, c TEXT);
+    INSERT INTO dl VALUES (1,'x'), (1,'x');
+    INSERT INTO dr VALUES (1,'p'), (1,'p');
+    CREATE MATERIALIZED VIEW vds AS SELECT DISTINCT * FROM dl JOIN dr USING (a);
+    SELECT * FROM vds ORDER BY 1, 2, 3;
+    INSERT INTO dl VALUES (1, 'z');
+    SELECT * FROM vds ORDER BY 1, 2, 3;
+}
+expect {
+    1|x|p
+    1|x|p
+    1|z|p
+}
+
+test matview-vdbe-join-distinct-aggregate-rejected {
+    CREATE TABLE jl8(x INTEGER);
+    CREATE TABLE jr8(y INTEGER);
+    CREATE MATERIALIZED VIEW bad8 AS SELECT DISTINCT COUNT(*) FROM jl8 JOIN jr8 ON x = y;
 }
 expect error {
-    materialized views with DISTINCT over joins are not yet supported
+    materialized views with DISTINCT over aggregates are not yet supported
 }
 
 # SELECT DISTINCT is maintained as GROUP BY over every result column: one
