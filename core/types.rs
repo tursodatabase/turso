@@ -25,6 +25,7 @@ use crate::vtab::VirtualTableCursor;
 use crate::{Completion, CompletionError, Result, IO};
 use std::borrow::{Borrow, Cow};
 use std::cell::Cell;
+use std::cmp::Ordering;
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::iter::{FusedIterator, Peekable};
