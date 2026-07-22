@@ -176,10 +176,11 @@ fn union(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
         return None;
     }
     let (left, right, lc, rc) = pairs[rng.random_range(0..pairs.len())];
-    let op = if rng.random_bool(0.5) {
-        "UNION"
-    } else {
-        "UNION ALL"
+    let op = match rng.random_range(0..6u8) {
+        0 | 1 => "UNION",
+        2 | 3 => "UNION ALL",
+        4 => "INTERSECT",
+        _ => "EXCEPT",
     };
     let mut sql = format!("SELECT {} FROM {}", quoted(&lc.name), quoted(&left.name));
     if rng.random_bool(0.4) {
@@ -193,6 +194,36 @@ fn union(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
     );
     if rng.random_bool(0.4) {
         let _ = write!(sql, " WHERE {}", predicate(rc, rng));
+    }
+    // Sometimes extend into a mixed three-branch chain.
+    if rng.random_bool(0.3) {
+        let (third, tc) = {
+            let t = tables[rng.random_range(0..tables.len())];
+            let candidates: Vec<_> = t
+                .columns
+                .iter()
+                .filter(|c| c.data_type == lc.data_type)
+                .collect();
+            if candidates.is_empty() {
+                return Some(sql);
+            }
+            (t, candidates[rng.random_range(0..candidates.len())])
+        };
+        let op2 = match rng.random_range(0..4u8) {
+            0 => "UNION",
+            1 => "UNION ALL",
+            2 => "INTERSECT",
+            _ => "EXCEPT",
+        };
+        let _ = write!(
+            sql,
+            " {op2} SELECT {} FROM {}",
+            quoted(&tc.name),
+            quoted(&third.name)
+        );
+        if rng.random_bool(0.4) {
+            let _ = write!(sql, " WHERE {}", predicate(tc, rng));
+        }
     }
     Some(sql)
 }
