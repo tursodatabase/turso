@@ -908,6 +908,7 @@ fn resolve_sorted_columns_with_resolver(
         )?;
     for sc in cols {
         let order = sc.order.unwrap_or(SortOrder::Asc);
+        let nulls = sc.nulls;
         let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref(), resolver)?;
         // Unwrap parentheses for column resolution (SQLite treats (('col')) same as 'col')
         let unwrapped_expr = unwrap_parens(base_expr)?;
@@ -921,6 +922,7 @@ fn resolve_sorted_columns_with_resolver(
                 .push_within_capacity(IndexColumn {
                     name: column_name,
                     order,
+                    nulls,
                     pos_in_table: pos,
                     collation,
                     default: column.default.clone(),
@@ -936,6 +938,7 @@ fn resolve_sorted_columns_with_resolver(
             .push_within_capacity(IndexColumn {
                 name: sc.expr.to_string(),
                 order,
+                nulls,
                 pos_in_table: EXPR_INDEX_SENTINEL,
                 collation: explicit_collation,
                 default: None,

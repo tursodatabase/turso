@@ -1728,6 +1728,7 @@ fn materialized_subquery_ephemeral_index(
             .push_within_capacity(IndexColumn {
                 name: column.name.clone().unwrap_or_default(),
                 order: SortOrder::Asc,
+                nulls: None,
                 pos_in_table: col_pos,
                 collation: column.collation_opt(),
                 default: column.default.clone(),
@@ -1744,6 +1745,7 @@ fn materialized_subquery_ephemeral_index(
             .push_within_capacity(IndexColumn {
                 name: column.name.clone().unwrap_or_default(),
                 order: SortOrder::Asc,
+                nulls: None,
                 pos_in_table: col_pos,
                 collation: column.collation_opt(),
                 default: column.default.clone(),
