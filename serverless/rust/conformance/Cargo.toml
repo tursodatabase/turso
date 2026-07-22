@@ -1,0 +1,26 @@
+# Copyright 2025 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_serverless_conformance"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Conformance tests for the Turso serverless driver and the SQL over HTTP protocol"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+reqwest = { version = "0.13", features = ["json"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+base64 = "0.22"
+tokio = { workspace = true, features = ["full"] }
+turso_serverless = { path = ".." }
