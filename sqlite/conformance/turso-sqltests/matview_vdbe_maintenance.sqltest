@@ -498,6 +498,157 @@ expect {
     1|1
 }
 
+# Expressions over aggregate results are evaluated on the finalized group
+# row, exactly like HAVING: aggregate calls and group expressions inside them
+# resolve to their computed values.
+test matview-vdbe-expr-over-aggregates {
+    CREATE TABLE t40(g TEXT, x INTEGER);
+    INSERT INTO t40 VALUES ('a', 1), ('a', 2), ('b', 10);
+    CREATE MATERIALIZED VIEW v40 AS SELECT g, SUM(x) + 1 AS s1, COUNT(*) * 2 AS c2 FROM t40 GROUP BY g;
+    SELECT 'init', * FROM v40 ORDER BY g;
+    INSERT INTO t40 VALUES ('b', 20), ('c', 5);
+    UPDATE t40 SET x = x + 100 WHERE g = 'a';
+    DELETE FROM t40 WHERE g = 'b' AND x = 10;
+    SELECT 'after', * FROM v40 ORDER BY g;
+}
+expect {
+    init|a|4|4
+    init|b|11|2
+    after|a|204|4
+    after|b|21|2
+    after|c|6|2
+}
+
+# Group expressions and multiple aggregate references may mix inside one
+# output expression; the same aggregate can also appear both plain and
+# inside an expression.
+test matview-vdbe-expr-mixed-group-and-aggregates {
+    CREATE TABLE t41(g TEXT, x INTEGER);
+    INSERT INTO t41 VALUES ('a', 1), ('a', 2), ('b', 10);
+    CREATE MATERIALIZED VIEW v41 AS SELECT g || '!' AS tag, SUM(x) AS s, CASE WHEN SUM(x) > 5 THEN g ELSE 'small' END AS size FROM t41 GROUP BY g;
+    SELECT * FROM v41 ORDER BY s;
+    INSERT INTO t41 VALUES ('a', 10);
+    SELECT * FROM v41 ORDER BY s;
+}
+expect {
+    a!|3|small
+    b!|10|b
+    b!|10|b
+    a!|13|a
+}
+
+# MIN/MAX (multiset-backed) and DISTINCT aggregates work inside output
+# expressions.
+test matview-vdbe-expr-minmax-distinct {
+    CREATE TABLE t42(g TEXT, x INTEGER);
+    INSERT INTO t42 VALUES ('a', 1), ('a', 1), ('a', 5), ('b', 10);
+    CREATE MATERIALIZED VIEW v42 AS SELECT g, MAX(x) - MIN(x) AS spread, COUNT(DISTINCT x) + 100 AS cd FROM t42 GROUP BY g;
+    SELECT 'init', * FROM v42 ORDER BY g;
+    DELETE FROM t42 WHERE g = 'a' AND x = 5;
+    INSERT INTO t42 VALUES ('b', 40);
+    SELECT 'after', * FROM v42 ORDER BY g;
+}
+expect {
+    init|a|4|102
+    init|b|0|101
+    after|a|0|101
+    after|b|30|102
+}
+
+# A view whose only outputs are expressions still maintains group liveness
+# through the hidden COUNT(*): groups die when their last row is retracted.
+test matview-vdbe-expr-only-outputs {
+    CREATE TABLE t43(g TEXT, x INTEGER);
+    INSERT INTO t43 VALUES ('a', 1), ('b', 2);
+    CREATE MATERIALIZED VIEW v43 AS SELECT g, SUM(x) - SUM(x) AS zero FROM t43 GROUP BY g;
+    SELECT * FROM v43 ORDER BY g;
+    DELETE FROM t43 WHERE g = 'b';
+    SELECT * FROM v43 ORDER BY g;
+}
+expect {
+    a|0
+    b|0
+    a|0
+}
+
+# Scalar aggregates (no GROUP BY) support output expressions, including over
+# the empty table where COUNT is 0 and other aggregates are NULL.
+test matview-vdbe-expr-scalar {
+    CREATE TABLE t44(x INTEGER);
+    CREATE MATERIALIZED VIEW v44 AS SELECT SUM(x) * 10 + COUNT(*) AS blend FROM t44;
+    SELECT blend IS NULL FROM v44;
+    INSERT INTO t44 VALUES (1), (2);
+    SELECT * FROM v44;
+    DELETE FROM t44;
+    SELECT blend IS NULL FROM v44;
+}
+expect {
+    1
+    32
+    1
+}
+
+# Expressions over aggregates of a join input compose with the joined-delta
+# path.
+test matview-vdbe-expr-over-join-aggregate {
+    CREATE TABLE t45(g TEXT, x INTEGER);
+    CREATE TABLE t46(g TEXT, y INTEGER);
+    INSERT INTO t45 VALUES ('a', 1), ('a', 2), ('b', 10);
+    INSERT INTO t46 VALUES ('a', 100), ('b', 200), ('b', 300);
+    CREATE MATERIALIZED VIEW v45 AS SELECT t45.g, SUM(x + y) / COUNT(*) AS avg_pair FROM t45 JOIN t46 ON t45.g = t46.g GROUP BY t45.g;
+    SELECT 'init', * FROM v45 ORDER BY g;
+    INSERT INTO t45 VALUES ('b', 20);
+    DELETE FROM t46 WHERE y = 300;
+    SELECT 'after', * FROM v45 ORDER BY g;
+}
+expect {
+    init|a|101
+    init|b|260
+    after|a|101
+    after|b|215
+}
+
+# Expression outputs and HAVING share the finalized-group-row machinery.
+test matview-vdbe-expr-with-having {
+    CREATE TABLE t47(g TEXT, x INTEGER);
+    INSERT INTO t47 VALUES ('a', 1), ('a', 2), ('b', 10);
+    CREATE MATERIALIZED VIEW v47 AS SELECT g, SUM(x) + 1 AS s1 FROM t47 GROUP BY g HAVING COUNT(*) > 1;
+    SELECT * FROM v47 ORDER BY g;
+    INSERT INTO t47 VALUES ('b', 1);
+    DELETE FROM t47 WHERE g = 'a' AND x = 2;
+    SELECT * FROM v47 ORDER BY g;
+}
+expect {
+    a|4
+    b|12
+}
+
+# Expression-output views serve same-transaction reads by recomputation.
+test matview-vdbe-expr-read-your-own-writes {
+    CREATE TABLE t48(g TEXT, x INTEGER);
+    INSERT INTO t48 VALUES ('a', 1), ('a', 2);
+    CREATE MATERIALIZED VIEW v48 AS SELECT g, SUM(x) + 1 AS s1 FROM t48 GROUP BY g;
+    BEGIN;
+    INSERT INTO t48 VALUES ('a', 100);
+    SELECT * FROM v48;
+    ROLLBACK;
+    SELECT * FROM v48;
+}
+expect {
+    a|104
+    a|4
+}
+
+# Bare columns outside GROUP BY remain rejected, even buried inside an
+# otherwise-aggregate expression.
+test matview-vdbe-expr-bare-column-rejected {
+    CREATE TABLE t49(g TEXT, x INTEGER);
+    CREATE MATERIALIZED VIEW v49 AS SELECT g, x + SUM(x) FROM t49 GROUP BY g;
+}
+expect error {
+    non-aggregate result columns not in GROUP BY
+}
+
 # Two-table inner joins: rows are identified by their (left rowid, right
 # rowid) pair, and each side's changes are joined against the other side's
 # post-change state.

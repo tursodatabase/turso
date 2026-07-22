@@ -170,12 +170,18 @@ fn tracks_distinct_values(agg: &Aggregate) -> bool {
 }
 
 /// How each result column of a GROUP BY view is produced.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum OutputColumn {
     /// The i-th GROUP BY expression.
     Group(usize),
     /// The i-th entry of [`ViewShape::GroupAggregate::aggregates`].
     Aggregate(usize),
+    /// An expression over aggregate results and group expressions
+    /// (e.g. `SUM(x) + 1`), evaluated after the group's aggregates are
+    /// finalized; its aggregate calls and group-expression subtrees resolve
+    /// to their computed registers through the expression cache, exactly
+    /// like HAVING.
+    Expr(ast::Expr),
 }
 
 /// Maximum number of tables in a join view: maintenance runs one delta phase
@@ -308,10 +314,11 @@ fn validate_supported_aggregate(agg: &Aggregate) -> Result<()> {
 /// planner's collector; this walk rejects what remains outside them: bare
 /// column references (SQLite's arbitrary-row semantics cannot be maintained
 /// incrementally), subqueries, and bound parameters.
-fn check_having_scalar_context(
+fn check_group_row_expr(
     expr: &ast::Expr,
     group_exprs: &[ast::Expr],
     aggregates: &[Aggregate],
+    bare_column_error: &str,
 ) -> Result<()> {
     walk_expr_with_subqueries(expr, &mut |e: &ast::Expr| {
         if group_exprs
@@ -333,7 +340,7 @@ fn check_having_scalar_context(
                 "materialized views with bound parameters are not supported".to_string(),
             )),
             ast::Expr::Id(_) | ast::Expr::Qualified(_, _) | ast::Expr::DoublyQualified(_, _, _) => {
-                unsupported("HAVING referencing columns outside GROUP BY")
+                unsupported(bare_column_error)
             }
             _ => Ok(WalkControl::Continue),
         }
@@ -795,17 +802,26 @@ fn classify_group_aggregate(
             continue;
         }
         resolve_window_and_aggregate_functions(expr, resolver, &mut aggregates, None, &mut [])?;
-        let Some(idx) = aggregates
+        if let Some(idx) = aggregates
             .iter()
             .position(|a| crate::util::exprs_are_equivalent(&a.original_expr, expr))
-        else {
-            // The column is not one aggregate call: either an expression over
-            // aggregate results, or SQLite's bare-column semantics (an
-            // arbitrary row of the group) — neither is maintainable yet.
-            check_scalar_expr(expr)?;
-            return unsupported("non-aggregate result columns not in GROUP BY");
-        };
-        outputs.push(OutputColumn::Aggregate(idx));
+        {
+            outputs.push(OutputColumn::Aggregate(idx));
+            continue;
+        }
+        // Not one plain aggregate call: allow any expression whose
+        // column-bearing subtrees are group expressions or aggregate calls
+        // (SUM(x) + 1, and the like), evaluated over the finalized group row
+        // — the same rule HAVING follows. What remains outside that is
+        // SQLite's bare-column semantics (a value from an arbitrary row of
+        // the group), which cannot be maintained incrementally.
+        check_group_row_expr(
+            expr,
+            &group_exprs,
+            &aggregates,
+            "non-aggregate result columns not in GROUP BY",
+        )?;
+        outputs.push(OutputColumn::Expr(expr.as_ref().clone()));
     }
 
     let having = match having_clause {
@@ -817,7 +833,12 @@ fn classify_group_aggregate(
                 None,
                 &mut [],
             )?;
-            check_having_scalar_context(having, &group_exprs, &aggregates)?;
+            check_group_row_expr(
+                having,
+                &group_exprs,
+                &aggregates,
+                "HAVING referencing columns outside GROUP BY",
+            )?;
             Some(having.clone())
         }
         None => None,
@@ -2495,47 +2516,46 @@ fn compile_group_aggregate_program(
     });
     program.preassign_label_to_next_insn(skip_index_label);
 
-    // HAVING gates only the view row: the group's state stays maintained
-    // above so the predicate flips the row in and out as aggregates change.
-    // Group expressions and aggregate calls inside the predicate resolve to
+    // HAVING and expression output columns both evaluate over the finalized
+    // group row: group expressions and aggregate calls inside them resolve to
     // their computed registers through the expression cache, exactly like
-    // HAVING translation in a regular GROUP BY query. Bind and seed once —
+    // HAVING translation in a regular GROUP BY query. HAVING gates only the
+    // view row — the group's state stays maintained above so the predicate
+    // flips the row in and out as aggregates change. Bind and seed once —
     // the row tail below is emitted twice for scalar population.
-    let bound_having: Option<ast::Expr> = match having {
-        Some(having_expr) => {
-            for (i, group_expr) in group_exprs.iter().enumerate() {
-                let mut bound = group_expr.clone();
-                bind_and_rewrite_expr(
-                    &mut bound,
-                    Some(&mut table_references),
-                    None,
-                    &resolver,
-                    BindingBehavior::ResultColumnsNotAllowed,
-                )?;
-                resolver.cache_expr_reg(
-                    std::borrow::Cow::Owned(bound),
-                    group_start + i,
-                    false,
-                    None,
-                );
-            }
-            for (i, agg) in aggregates.iter().enumerate() {
-                let mut bound = agg.original_expr.clone();
-                bind_and_rewrite_expr(
-                    &mut bound,
-                    Some(&mut table_references),
-                    None,
-                    &resolver,
-                    BindingBehavior::ResultColumnsNotAllowed,
-                )?;
-                resolver.cache_expr_reg(
-                    std::borrow::Cow::Owned(bound),
-                    agg_value_start + i,
-                    false,
-                    None,
-                );
-            }
-            resolver.enable_expr_to_reg_cache();
+    let has_expr_outputs = outputs.iter().any(|o| matches!(o, OutputColumn::Expr(_)));
+    let mut bound_having: Option<ast::Expr> = None;
+    let mut bound_output_exprs: Vec<Option<ast::Expr>> = vec![None; outputs.len()];
+    if having.is_some() || has_expr_outputs {
+        for (i, group_expr) in group_exprs.iter().enumerate() {
+            let mut bound = group_expr.clone();
+            bind_and_rewrite_expr(
+                &mut bound,
+                Some(&mut table_references),
+                None,
+                &resolver,
+                BindingBehavior::ResultColumnsNotAllowed,
+            )?;
+            resolver.cache_expr_reg(std::borrow::Cow::Owned(bound), group_start + i, false, None);
+        }
+        for (i, agg) in aggregates.iter().enumerate() {
+            let mut bound = agg.original_expr.clone();
+            bind_and_rewrite_expr(
+                &mut bound,
+                Some(&mut table_references),
+                None,
+                &resolver,
+                BindingBehavior::ResultColumnsNotAllowed,
+            )?;
+            resolver.cache_expr_reg(
+                std::borrow::Cow::Owned(bound),
+                agg_value_start + i,
+                false,
+                None,
+            );
+        }
+        resolver.enable_expr_to_reg_cache();
+        if let Some(having_expr) = having {
             let mut bound = having_expr.clone();
             bind_and_rewrite_expr(
                 &mut bound,
@@ -2544,10 +2564,23 @@ fn compile_group_aggregate_program(
                 &resolver,
                 BindingBehavior::ResultColumnsNotAllowed,
             )?;
-            Some(bound)
+            bound_having = Some(bound);
         }
-        None => None,
-    };
+        for (i, output) in outputs.iter().enumerate() {
+            let OutputColumn::Expr(expr) = output else {
+                continue;
+            };
+            let mut bound = expr.clone();
+            bind_and_rewrite_expr(
+                &mut bound,
+                Some(&mut table_references),
+                None,
+                &resolver,
+                BindingBehavior::ResultColumnsNotAllowed,
+            )?;
+            bound_output_exprs[i] = Some(bound);
+        }
+    }
 
     // The row tail: finalize every aggregate's value, evaluate HAVING, and
     // write (or remove) the group's view row. Falls through — and jumps on
@@ -2653,6 +2686,20 @@ fn compile_group_aggregate_program(
                 let src_reg = match output {
                     OutputColumn::Group(group_idx) => group_start + group_idx,
                     OutputColumn::Aggregate(agg_idx) => agg_value_start + agg_idx,
+                    OutputColumn::Expr(_) => {
+                        let bound = bound_output_exprs[out_idx]
+                            .as_ref()
+                            .expect("Expr outputs are bound before the row tail");
+                        translate_expr_no_constant_opt(
+                            program,
+                            Some(&table_references),
+                            bound,
+                            out_start + out_idx,
+                            &resolver,
+                            NoConstantOptReason::RegisterReuse,
+                        )?;
+                        continue;
+                    }
                 };
                 program.emit_insn(Insn::Copy {
                     src_reg,

@@ -279,6 +279,21 @@ fn aggregate(table: &Table, rng: &mut ChaCha8Rng) -> String {
             let col = numeric_cols[rng.random_range(0..numeric_cols.len())];
             exprs.push(format!("COUNT(DISTINCT {}) AS agg_cd", quoted(&col.name)));
         }
+        // Expressions over aggregate results (and the group column),
+        // evaluated on the finalized group row.
+        if rng.random_bool(0.4) {
+            let col = numeric_cols[rng.random_range(0..numeric_cols.len())];
+            let c = quoted(&col.name);
+            let g = quoted(&group_col.name);
+            exprs.push(match rng.random_range(0..4u8) {
+                0 => format!("SUM({c}) + COUNT(*) AS xmix"),
+                1 => format!("MAX({c}) - MIN({c}) AS xspread"),
+                2 => format!("COALESCE(SUM({c}), 0) AS xcoal"),
+                _ => format!("CASE WHEN COUNT(*) > 1 THEN {g} ELSE NULL END AS xcase"),
+            });
+        }
+    } else if rng.random_bool(0.4) {
+        exprs.push("COUNT(*) * 2 + 1 AS xcnt".to_string());
     }
 
     let having = if rng.random_bool(0.4) {
@@ -335,6 +350,14 @@ fn scalar_aggregate(table: &Table, rng: &mut ChaCha8Rng) -> String {
                 };
                 exprs.push(format!("{func}({distinct}{}) AS agg{i}", quoted(&col.name)));
             }
+        }
+        if rng.random_bool(0.3) {
+            let col = numeric_cols[rng.random_range(0..numeric_cols.len())];
+            let c = quoted(&col.name);
+            exprs.push(match rng.random_range(0..2u8) {
+                0 => format!("SUM({c}) + COUNT(*) AS xmix"),
+                _ => format!("COALESCE(MAX({c}), -1) AS xcoal"),
+            });
         }
     }
 
