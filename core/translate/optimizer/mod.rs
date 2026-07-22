@@ -3234,6 +3234,7 @@ fn ephemeral_index_build(
             IndexColumn {
                 name: c.name.clone().unwrap(),
                 order: SortOrder::Asc,
+                nulls: None,
                 pos_in_table: i,
                 collation: c.collation_opt(),
                 default: c.default.clone(),

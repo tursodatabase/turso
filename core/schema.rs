@@ -162,8 +162,8 @@ use std::collections::VecDeque;
 use std::sync::OnceLock;
 use tracing::trace;
 use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, ResolveType, SortOrder,
-    TableInternalId, TypeOperator,
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, NullsOrder, RefAct, ResolveType,
+    SortOrder, TableInternalId, TypeOperator,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -5623,6 +5623,7 @@ pub struct Index {
 pub struct IndexColumn {
     pub name: String,
     pub order: SortOrder,
+    pub nulls: Option<NullsOrder>,
     /// the position of the column in the source table.
     /// for example:
     /// CREATE TABLE t (a,b,c)
@@ -5641,6 +5642,7 @@ impl IndexColumn {
         Self {
             name: name.to_string(),
             order: SortOrder::Asc,
+            nulls: None,
             pos_in_table,
             collation: None,
             default: None,
@@ -5661,6 +5663,7 @@ impl IndexColumn {
             .map(|(i, name)| Self {
                 name: name.to_string(),
                 order: SortOrder::Asc,
+                nulls: None,
                 pos_in_table: i,
                 collation: None,
                 default: None,
@@ -5780,6 +5783,7 @@ impl Index {
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col_name),
                     order: *order,
+                    nulls: None,
                     pos_in_table,
                     collation: collation_overrides
                         .get(i)
@@ -5834,6 +5838,7 @@ impl Index {
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col.name.as_ref().unwrap()),
                     order: *sort_order,
+                    nulls: None,
                     pos_in_table,
                     collation: collation_overrides
                         .get(i)

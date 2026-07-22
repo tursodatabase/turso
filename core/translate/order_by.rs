@@ -203,7 +203,11 @@ impl EmitOrderBy {
             let index_name = format!("heap_sort_{}", program.offset().as_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
             let mut index_columns =
                 Vec::try_with_capacity_ext(order_by.len() + result_columns.len())?;
-            for (column, order, _nulls) in order_by {
+            for (column, order, nulls) in order_by {
+                assert!(
+                    nulls.is_none(),
+                    "nulls should be None when emitting a heap sort"
+                );
                 let collation = get_collseq_from_expr_with_symbols(
                     column,
                     referenced_tables,
@@ -214,6 +218,7 @@ impl EmitOrderBy {
                 index_columns.push(IndexColumn {
                     name: pos_in_table.to_string(),
                     order: *order,
+                    nulls: None,
                     pos_in_table,
                     collation,
                     default: None,
@@ -225,6 +230,7 @@ impl EmitOrderBy {
             index_columns.try_push(IndexColumn {
                 name: pos_in_table.to_string(),
                 order: SortOrder::Asc,
+                nulls: None,
                 pos_in_table,
                 collation: None,
                 default: None,
