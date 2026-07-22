@@ -18,6 +18,7 @@ use crate::{
     vdbe::affinity::Affinity,
     PreparedProgram, Value,
 };
+use bitflags::bitflags;
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
@@ -72,56 +73,59 @@ pub enum SortComparatorType {
     ArrayLt,
 }
 
-/// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CmpInsFlags(usize);
+bitflags! {
+    /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
+    ///
+    /// The bits within [`CmpInsFlags::AFFINITY_MASK`] do not act as independent flags: they store a
+    /// packed [`Affinity`] char code, manipulated via [`CmpInsFlags::with_affinity`] and
+    /// [`CmpInsFlags::get_affinity`]. The remaining named flags are ordinary booleans.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct CmpInsFlags: usize {
+        const NULL_EQ = 0x80;
+        const JUMP_IF_NULL = 0x10;
+        const ARRAY_CMP = 0x100;
+    }
+}
 
 impl CmpInsFlags {
-    const NULL_EQ: usize = 0x80;
-    const JUMP_IF_NULL: usize = 0x10;
+    /// Bits reserved for the packed affinity char code (see [`with_affinity`](Self::with_affinity)).
     const AFFINITY_MASK: usize = 0x47;
-    const ARRAY_CMP: usize = 0x100;
-
-    fn has(&self, flag: usize) -> bool {
-        (self.0 & flag) != 0
-    }
 
     pub fn null_eq(mut self) -> Self {
-        self.0 |= CmpInsFlags::NULL_EQ;
+        self.insert(CmpInsFlags::NULL_EQ);
         self
     }
 
     pub fn jump_if_null(mut self) -> Self {
-        self.0 |= CmpInsFlags::JUMP_IF_NULL;
+        self.insert(CmpInsFlags::JUMP_IF_NULL);
         self
     }
 
     pub fn has_jump_if_null(&self) -> bool {
-        self.has(CmpInsFlags::JUMP_IF_NULL)
+        self.contains(CmpInsFlags::JUMP_IF_NULL)
     }
 
     pub fn has_nulleq(&self) -> bool {
-        self.has(CmpInsFlags::NULL_EQ)
+        self.contains(CmpInsFlags::NULL_EQ)
     }
 
-    pub fn with_affinity(mut self, affinity: Affinity) -> Self {
+    pub fn with_affinity(self, affinity: Affinity) -> Self {
         let aff_code = affinity.as_char_code() as usize;
-        self.0 = (self.0 & !Self::AFFINITY_MASK) | aff_code;
-        self
+        Self::from_bits_retain((self.bits() & !Self::AFFINITY_MASK) | aff_code)
     }
 
     pub fn get_affinity(&self) -> Affinity {
-        let aff_code = (self.0 & Self::AFFINITY_MASK) as u8;
+        let aff_code = (self.bits() & Self::AFFINITY_MASK) as u8;
         Affinity::from_char_code(aff_code)
     }
 
     pub fn array_cmp(mut self) -> Self {
-        self.0 |= Self::ARRAY_CMP;
+        self.insert(Self::ARRAY_CMP);
         self
     }
 
     pub fn has_array_cmp(&self) -> bool {
-        self.has(Self::ARRAY_CMP)
+        self.contains(Self::ARRAY_CMP)
     }
 }
 
