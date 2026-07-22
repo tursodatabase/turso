@@ -1473,7 +1473,15 @@ impl BTreeCursor {
                     "inconsistent overflow chain observed during payload read".to_string(),
                 ));
             }
-            let payload_swap = take_vec(payload);
+            // Take the whole state before the fallible record allocations below,
+            // like the inconsistent-chain branch above: an error must not leave
+            // behind resumable state whose payload was already moved out, or a
+            // retry would silently complete with an empty record.
+            let payload_swap = self
+                .read_overflow_state
+                .take()
+                .expect("read_overflow_state was checked above")
+                .payload;
 
             let mut reuse_immutable = self.get_immutable_record_or_create()?;
             reuse_immutable.as_mut().unwrap().invalidate();
@@ -1486,7 +1494,6 @@ impl BTreeCursor {
                     .start_serialization(&payload_swap)
             )?;
 
-            self.read_overflow_state.take();
             break Ok(IOResult::Done(()));
         }
     }
@@ -10091,6 +10098,66 @@ mod tests {
                 600
             );
             assert_eq!(query_single_text(&conn, "PRAGMA integrity_check"), "ok");
+        }
+
+        /// Regression test: the overflow-read epilogue empties the payload held
+        /// inside `read_overflow_state` before the fallible record allocations
+        /// run. On failure it must clear the state — same invariant the adjacent
+        /// corrupt-chain branch upholds — otherwise a later call resumes against
+        /// the emptied buffer and silently completes with an empty record.
+        #[test]
+        fn overflow_read_epilogue_clears_state_on_allocation_failure() {
+            let pager = setup_test_env(5);
+            let mut cursor = BTreeCursor::new_table(pager.clone(), 1, 5);
+            let usable = cursor.usable_space();
+            let data_per_page = usable - 4;
+
+            // Re-purpose pages 4 and 5 as a valid 2-page overflow chain: 4 -> 5 -> end.
+            let load_and_fill = |id: i64, next: u32, fill: u8| {
+                let (page, c) = cursor.read_page_blocking(id).unwrap();
+                if let Some(c) = c {
+                    pager.io.wait_for_completion(c).unwrap();
+                }
+                while page.is_locked() {
+                    pager.io.step().unwrap();
+                }
+                let buf = page.get_contents().as_ptr();
+                buf[0..4].copy_from_slice(&next.to_be_bytes());
+                buf[4..usable].fill(fill);
+            };
+            load_and_fill(4, 5, b'A');
+            load_and_fill(5, 0, b'B');
+
+            let payload_size = (2 * data_per_page) as u64;
+            let cursor_pager = cursor.pager.clone();
+
+            // Fail the epilogue's record allocation, which runs after the chain
+            // has been fully read and the accumulated payload was already moved
+            // out of `read_overflow_state`.
+            arm_fault(BTreeAllocationSite::RecordPayload);
+            run_until_done(
+                || cursor.process_overflow_read(b"", 4, payload_size),
+                &cursor_pager,
+            )
+            .expect_err("record allocation failure should surface");
+            disarm_fault();
+
+            assert!(
+                cursor.read_overflow_state.is_none(),
+                "failed overflow read left resumable state behind"
+            );
+
+            // A retry must rebuild the record from scratch and see the full chain.
+            run_until_done(
+                || cursor.process_overflow_read(b"", 4, payload_size),
+                &cursor_pager,
+            )
+            .unwrap();
+            let rec_slot = cursor.get_immutable_record_or_create().unwrap();
+            let bytes = rec_slot.as_ref().unwrap().get_payload();
+            assert_eq!(bytes.len(), 2 * data_per_page);
+            assert!(bytes[..data_per_page].iter().all(|&b| b == b'A'));
+            assert!(bytes[data_per_page..].iter().all(|&b| b == b'B'));
         }
     }
 
