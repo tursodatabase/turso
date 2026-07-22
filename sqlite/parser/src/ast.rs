@@ -1400,6 +1400,14 @@ pub enum CreateTypeBody {
     Union(Vec<TypeField>),
 }
 
+/// Time-based partition specification for tables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PartitionSpec {
+    /// Column used for partitioning.
+    pub column: Name,
+}
+
 /// `CREATE TABLE` body
 // https://sqlite.org/lang_createtable.html
 // https://sqlite.org/syntax/create-table-stmt.html
@@ -1414,6 +1422,8 @@ pub enum CreateTableBody {
         constraints: Vec<NamedTableConstraint>,
         /// table options
         options: TableOptions,
+        /// partition specification
+        partition: Option<PartitionSpec>,
     },
     /// `AS` select
     AsSelect(Select),

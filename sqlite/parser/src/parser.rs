@@ -6,8 +6,8 @@ use crate::ast::{
     GeneratedColumnType, GroupBy, Indexed, IndexedColumn, InitDeferredPred, InsertBody,
     JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit, Literal,
     Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder, OneSelect,
-    Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg, ResolveType,
-    ResultColumn, Select, SelectBody, SelectTable, Set, SortOrder, SortedColumn, Stmt,
+    Operator, Over, PartitionSpec, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg,
+    ResolveType, ResultColumn, Select, SelectBody, SelectTable, Set, SortOrder, SortedColumn, Stmt,
     TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent, TriggerTime, Type,
     TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert, UpsertDo,
     UpsertIndex, Variable, Window, WindowDef, With,
@@ -3397,6 +3397,7 @@ impl<'a> Parser<'a> {
     fn parse_table_option(&mut self, options: &mut TableOptions) -> Result<()> {
         match self.peek()? {
             Some(tok) => match tok.token_type.fallback_id_if_ok() {
+                TK_ID if tok.token_type == TK_PARTITION => Ok(()),
                 TK_WITHOUT => {
                     let without_tok = eat_assert!(self, TK_WITHOUT);
                     let rowid_tok = eat_expect!(self, TK_ID);
@@ -3450,6 +3451,21 @@ impl<'a> Parser<'a> {
         }
 
         Ok(result)
+    }
+
+    /// Parse optional PARTITION BY (column) clause.
+    fn parse_partition_spec(&mut self) -> Result<Option<PartitionSpec>> {
+        match self.peek()? {
+            Some(tok) if tok.token_type == TK_PARTITION => {
+                eat_assert!(self, TK_PARTITION);
+                eat_expect!(self, TK_BY);
+                eat_expect!(self, TK_LP);
+                let column = self.parse_nm()?;
+                eat_expect!(self, TK_RP);
+                Ok(Some(PartitionSpec { column }))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn parse_create_table_args(&mut self, tbl_name: &QualifiedName) -> Result<CreateTableBody> {
@@ -3537,10 +3553,13 @@ impl<'a> Parser<'a> {
                     )));
                 }
 
+                let partition = self.parse_partition_spec()?;
+
                 Ok(CreateTableBody::ColumnsAndConstraints {
                     columns,
                     constraints,
                     options,
+                    partition,
                 })
             }
             _ => unreachable!(),
@@ -11485,6 +11504,7 @@ mod tests {
                         ],
                         constraints: vec![],
                         options: TableOptions::empty(),
+                        partition: None,
                     },
                 })],
             ),
@@ -11527,6 +11547,7 @@ mod tests {
                         ],
                         constraints: vec![],
                         options: TableOptions::empty(),
+                        partition: None,
                     },
                 })],
             ),
@@ -11599,6 +11620,7 @@ mod tests {
                             },
                         ],
                         options: TableOptions { without_rowid_text: None, strict_text: Some("STRICT".to_string()) },
+                        partition: None,
                     },
                 })],
             ),
@@ -11658,6 +11680,7 @@ mod tests {
                             },
                         ],
                         options: TableOptions { without_rowid_text: Some("WITHOUT ROWID".to_string()), strict_text: None },
+                        partition: None,
                     },
                 })],
             ),
@@ -11697,6 +11720,7 @@ mod tests {
                             },
                         ],
                         options: TableOptions::empty(),
+                        partition: None,
                     },
                 })],
             ),
@@ -11760,6 +11784,7 @@ mod tests {
                             },
                         ],
                         options: TableOptions::empty(),
+                        partition: None,
                     },
                 })],
             ),
@@ -12859,6 +12884,7 @@ mod tests {
                         ],
                         constraints: vec![],
                         options: TableOptions::empty(),
+                        partition: None,
                     },
                 })],
             ),

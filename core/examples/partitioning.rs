@@ -1,0 +1,302 @@
+//! Example demonstrating time-based table partitioning with mathematical verification.
+//!
+//! This example:
+//! - Creates a partitioned table with sin/cos values
+//! - Inserts data every minute for 20 virtual days (28,800 rows)
+//! - Queries all data across multiple partitions
+//! - Verifies mathematical identity: sin²(x) + cos²(x) = 1
+//!
+//! Run with: cargo run --example partitioning
+
+use std::sync::Arc;
+use turso_core::partition::{DefaultPathResolver, PartitionConfig};
+use turso_core::{Database, LimboError, Numeric, PlatformIO, Result, SqliteDialect, Value};
+
+/// Microseconds per minute
+const MICROS_PER_MINUTE: i64 = 60 * 1_000_000;
+/// Number of days to simulate
+const SIMULATION_DAYS: i64 = 20;
+/// Total number of data points (one per minute for 20 days)
+const TOTAL_POINTS: i64 = SIMULATION_DAYS * 24 * 60; // 28,800 points
+/// Tolerance for floating point comparison
+const EPSILON: f64 = 1e-10;
+
+fn main() -> Result<()> {
+    println!("=== Turso Partitioning: Sin/Cos Verification Example ===\n");
+
+    // Create a temporary directory for our example
+    let temp_dir = tempfile::tempdir().map_err(|error| {
+        LimboError::InternalError(format!("failed to create temporary directory: {error}"))
+    })?;
+    let db_path = temp_dir.path().join("sincos.db");
+    let partitions_dir = temp_dir.path().join("partitions");
+    std::fs::create_dir_all(&partitions_dir).map_err(|error| {
+        LimboError::InternalError(format!("failed to create partition directory: {error}"))
+    })?;
+
+    let db_path_display = db_path.display();
+    let partitions_dir_display = partitions_dir.display();
+    println!("Database path: {db_path_display}");
+    println!("Partitions directory: {partitions_dir_display}");
+    println!("Simulation: {SIMULATION_DAYS} days, {TOTAL_POINTS} data points\n");
+
+    // =========================================================================
+    // PART 1: Create Database and Partitioned Table
+    // =========================================================================
+    println!("--- Part 1: Creating Database and Partitioned Table ---\n");
+
+    let io = Arc::new(PlatformIO::new()?);
+    let db_path_string = db_path.to_string_lossy();
+    let db = Database::open_file(io, &db_path_string, Arc::new(SqliteDialect))?;
+    let conn = db.connect()?;
+
+    // Create a partitioned table for trigonometric data
+    let table_schema = "CREATE TABLE trig_data (
+        id INTEGER PRIMARY KEY,
+        timestamp INTEGER NOT NULL,
+        angle_rad REAL NOT NULL,
+        sin_value REAL NOT NULL,
+        cos_value REAL NOT NULL
+    )";
+
+    conn.execute(format!("{table_schema} PARTITION BY (timestamp)"))?;
+    println!("Created partitioned table: trig_data");
+    println!("  Columns: id, timestamp, angle_rad, sin_value, cos_value");
+
+    // =========================================================================
+    // PART 2: Configure Partition Manager
+    // =========================================================================
+    println!("\n--- Part 2: Configuring Partition Manager ---\n");
+
+    let resolver = Box::new(DefaultPathResolver::daily(partitions_dir));
+    let config = PartitionConfig::new(resolver, table_schema.to_string(), "timestamp".to_string());
+
+    conn.register_partitioned_table("trig_data", config)?;
+    println!("Registered 'trig_data' with daily partitions");
+
+    // =========================================================================
+    // PART 3: Insert Data (every minute for 20 days)
+    // =========================================================================
+    println!("\n--- Part 3: Inserting Data ---\n");
+
+    // Start timestamp: 2025-01-01 00:00:00 UTC
+    let start_timestamp: i64 = 1_735_689_600_000_000;
+
+    println!("Inserting {TOTAL_POINTS} data points (1 per minute for {SIMULATION_DAYS} days)...");
+    let insert_start = std::time::Instant::now();
+
+    let mut inserted_count = 0;
+    let mut current_day = -1i64;
+
+    for i in 0..TOTAL_POINTS {
+        let timestamp = start_timestamp + i * MICROS_PER_MINUTE;
+        let day = i / (24 * 60);
+
+        // Progress indicator per day
+        if day != current_day {
+            current_day = day;
+            if day > 0 && day % 5 == 0 {
+                println!("  Day {day}/{SIMULATION_DAYS} completed...");
+            }
+        }
+
+        // Calculate angle in radians (one full cycle per day)
+        let minutes_in_day = i % (24 * 60);
+        let angle_rad = (minutes_in_day as f64) * 2.0 * std::f64::consts::PI / (24.0 * 60.0);
+
+        let sin_value = angle_rad.sin();
+        let cos_value = angle_rad.cos();
+
+        let insert_sql = format!(
+            "INSERT INTO trig_data (id, timestamp, angle_rad, sin_value, cos_value) \
+             VALUES ({}, {timestamp}, {angle_rad}, {sin_value}, {cos_value})",
+            i + 1
+        );
+
+        conn.execute(&insert_sql)?;
+        inserted_count += 1;
+    }
+
+    let insert_duration = insert_start.elapsed();
+    println!("\nInserted {inserted_count} rows in {insert_duration:.2?}");
+    println!(
+        "  Rate: {:.0} inserts/sec",
+        inserted_count as f64 / insert_duration.as_secs_f64()
+    );
+
+    // =========================================================================
+    // PART 4: List Created Partitions
+    // =========================================================================
+    println!("\n--- Part 4: Partition Summary ---\n");
+
+    let partitions = conn.list_partitions("trig_data")?;
+    println!("Created {} partitions:", partitions.len());
+
+    let mut total_size: u64 = 0;
+    for p in &partitions {
+        println!(
+            "  {} ({} bytes, attached: {})",
+            p.db_alias, p.size_bytes, p.attached
+        );
+        total_size += p.size_bytes;
+    }
+    println!("\nTotal partition size: {} KB", total_size / 1024);
+
+    // =========================================================================
+    // PART 5: Query All Data and Verify
+    // =========================================================================
+    println!("\n--- Part 5: Querying and Verifying Data ---\n");
+
+    let query_start = std::time::Instant::now();
+    let mut all_rows: Vec<(i64, i64, f64, f64, f64)> = Vec::new();
+
+    // The logical table is queried exactly like a regular table. The planner
+    // reads every relevant daily file and applies ordering globally.
+    let mut statement = conn.prepare(
+        "SELECT id, timestamp, angle_rad, sin_value, cos_value \
+         FROM trig_data ORDER BY timestamp",
+    )?;
+    for row in statement.run_collect_rows()? {
+        if let [id, timestamp, angle, sin_value, cos_value] = row.as_slice() {
+            all_rows.push((
+                extract_integer(id)?,
+                extract_integer(timestamp)?,
+                extract_float(angle)?,
+                extract_float(sin_value)?,
+                extract_float(cos_value)?,
+            ));
+        }
+    }
+
+    let query_duration = query_start.elapsed();
+    println!(
+        "Queried {} rows from {} partitions in {:.2?}",
+        all_rows.len(),
+        partitions.len(),
+        query_duration
+    );
+
+    // =========================================================================
+    // PART 6: Mathematical Verification
+    // =========================================================================
+    println!("\n--- Part 6: Mathematical Verification ---\n");
+
+    println!(
+        "Verifying sin²(x) + cos²(x) = 1 for all {} data points...",
+        all_rows.len()
+    );
+
+    let verify_start = std::time::Instant::now();
+    let mut verification_errors = 0;
+    let mut max_deviation: f64 = 0.0;
+    let mut sum_deviation: f64 = 0.0;
+
+    for (id, _ts, angle, sin_val, cos_val) in &all_rows {
+        // Verify: sin²(x) + cos²(x) should equal 1
+        let identity = sin_val * sin_val + cos_val * cos_val;
+        let deviation = (identity - 1.0).abs();
+
+        sum_deviation += deviation;
+        if deviation > max_deviation {
+            max_deviation = deviation;
+        }
+
+        if deviation > EPSILON {
+            if verification_errors < 5 {
+                println!(
+                    "  ERROR at id={id}: angle={angle:.6}, sin={sin_val:.10}, cos={cos_val:.10}, sin²+cos²={identity:.15}"
+                );
+            }
+            verification_errors += 1;
+        }
+
+        // Also verify that sin and cos values are correct
+        let expected_sin = angle.sin();
+        let expected_cos = angle.cos();
+
+        let sin_diff = (sin_val - expected_sin).abs();
+        let cos_diff = (cos_val - expected_cos).abs();
+
+        if sin_diff > EPSILON || cos_diff > EPSILON {
+            if verification_errors < 5 {
+                println!(
+                    "  ERROR at id={id}: sin mismatch ({sin_val:.10} vs {expected_sin:.10}) or cos mismatch ({cos_val:.10} vs {expected_cos:.10})"
+                );
+            }
+            verification_errors += 1;
+        }
+    }
+
+    let verify_duration = verify_start.elapsed();
+    let avg_deviation = if !all_rows.is_empty() {
+        sum_deviation / all_rows.len() as f64
+    } else {
+        0.0
+    };
+
+    println!("\nVerification completed in {verify_duration:.2?}");
+    println!("  Total points verified: {}", all_rows.len());
+    println!("  Expected points: {TOTAL_POINTS}");
+    println!("  Verification errors: {verification_errors}");
+    println!("  Max deviation from identity: {max_deviation:.2e}");
+    println!("  Avg deviation from identity: {avg_deviation:.2e}");
+
+    // =========================================================================
+    // PART 7: Final Summary
+    // =========================================================================
+    println!("\n--- Summary ---\n");
+
+    let success = verification_errors == 0 && all_rows.len() as i64 == TOTAL_POINTS;
+
+    if success {
+        println!("SUCCESS: All {TOTAL_POINTS} data points verified correctly!");
+        println!("  - {} daily partitions created", partitions.len());
+        println!("  - Total storage: {} KB", total_size / 1024);
+        println!("  - sin²(x) + cos²(x) = 1 verified for all points");
+    } else {
+        println!("FAILURE:");
+        if all_rows.len() as i64 != TOTAL_POINTS {
+            println!(
+                "  - Missing data: got {} rows, expected {}",
+                all_rows.len(),
+                TOTAL_POINTS
+            );
+        }
+        if verification_errors > 0 {
+            println!("  - {verification_errors} verification errors");
+        }
+    }
+
+    // =========================================================================
+    // PART 8: Cleanup
+    // =========================================================================
+    println!("\n--- Cleanup ---\n");
+
+    conn.unregister_partitioned_table("trig_data")?;
+    println!("Unregistered 'trig_data' from partition manager");
+
+    println!("\n=== Example Complete ===");
+
+    Ok(())
+}
+
+/// Extract integer from Value
+fn extract_integer(value: &Value) -> Result<i64> {
+    match value {
+        Value::Numeric(Numeric::Integer(integer)) => Ok(*integer),
+        _ => Err(LimboError::ConversionError(
+            "expected an integer query result".to_string(),
+        )),
+    }
+}
+
+/// Extract float from Value
+fn extract_float(value: &Value) -> Result<f64> {
+    match value {
+        Value::Numeric(Numeric::Float(float)) => Ok((*float).into()),
+        Value::Numeric(Numeric::Integer(integer)) => Ok(*integer as f64),
+        _ => Err(LimboError::ConversionError(
+            "expected a numeric query result".to_string(),
+        )),
+    }
+}

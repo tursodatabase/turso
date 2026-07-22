@@ -64,6 +64,8 @@ mod json;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod numeric;
 mod parameters;
+#[cfg(not(target_family = "wasm"))]
+pub mod partition;
 #[cfg(feature = "percentile")]
 mod percentile;
 mod pragma;
@@ -694,6 +696,8 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
     pub path: String,
+    #[cfg(not(target_family = "wasm"))]
+    file_id: Option<io::FileId>,
     wal_path: String,
     pub io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
@@ -792,6 +796,11 @@ impl Database {
         is_memory_like(&self.path)
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn file_id(&self) -> Option<io::FileId> {
+        self.file_id
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         opts: DatabaseOpts,
@@ -806,6 +815,12 @@ impl Database {
     ) -> Result<Self> {
         let path = path.into();
         let wal_path = wal_path.into();
+        #[cfg(not(target_family = "wasm"))]
+        let file_id = if is_memory_like(&path) {
+            None
+        } else {
+            io.file_id(&path).ok()
+        };
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
 
@@ -839,6 +854,8 @@ impl Database {
             mv_store,
             mv_store_allocator,
             path,
+            #[cfg(not(target_family = "wasm"))]
+            file_id,
             wal_path,
             schema: Arc::new(Mutex::new(Arc::new({
                 let mut s = Schema::with_options(enable_custom_types, dialect.as_ref())?;
@@ -2345,6 +2362,12 @@ impl Database {
             n_active_root_statements: AtomicI32::new(0),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
+            #[cfg(not(target_family = "wasm"))]
+            partition_manager: RwLock::new(partition::PartitionManager::new()),
+            #[cfg(not(target_family = "wasm"))]
+            partition_index_requirements: RwLock::new(HashMap::default()),
+            #[cfg(not(target_family = "wasm"))]
+            partition_write_target: RwLock::new(None),
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
@@ -3271,12 +3294,10 @@ impl DatabaseCatalog {
         }
     }
 
-    fn get_pager_by_index(&self, idx: &usize) -> Arc<Pager> {
-        let (_db, pager) = self
-            .index_to_data
+    fn get_pager_by_index(&self, idx: &usize) -> Option<Arc<Pager>> {
+        self.index_to_data
             .get(idx)
-            .expect("If we are looking up a database by index, it must exist.");
-        pager.clone()
+            .map(|(_database, pager)| pager.clone())
     }
 
     fn add(&mut self, s: &str) -> usize {

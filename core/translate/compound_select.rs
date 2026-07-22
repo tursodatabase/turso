@@ -267,6 +267,23 @@ fn emit_compound_select(
         unreachable!()
     };
 
+    if left
+        .iter()
+        .all(|(_, operator)| matches!(operator, CompoundOperator::UnionAll))
+    {
+        return emit_union_all_selects(
+            program,
+            left,
+            *right_most,
+            limit,
+            offset,
+            resolver,
+            limit_ctx,
+            offset_reg,
+            reg_result_cols_start,
+        );
+    }
+
     let compound_select_end = program.allocate_label();
     if let Some(limit_ctx) = &limit_ctx {
         program.emit_insn(Insn::IfNot {
@@ -539,6 +556,97 @@ fn emit_compound_select(
 
     program.preassign_label_to_next_insn(compound_select_end);
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_union_all_selects(
+    program: &mut ProgramBuilder,
+    left: Vec<(SelectPlan, CompoundOperator)>,
+    right_most: SelectPlan,
+    limit: Option<Box<Expr>>,
+    offset: Option<Box<Expr>>,
+    resolver: &Resolver,
+    limit_ctx: Option<LimitCtx>,
+    offset_reg: Option<usize>,
+    reg_result_cols_start: Option<usize>,
+) -> crate::Result<()> {
+    let compound_select_end = program.allocate_label();
+    if let Some(limit_ctx) = &limit_ctx {
+        program.emit_insn(Insn::IfNot {
+            reg: limit_ctx.reg_limit,
+            target_pc: compound_select_end,
+            jump_if_null: false,
+        });
+    }
+
+    let shared_destination = right_most.query_destination.clone();
+    let share_destination = matches!(
+        shared_destination,
+        QueryDestination::EphemeralIndex { .. }
+            | QueryDestination::CoroutineYield { .. }
+            | QueryDestination::EphemeralTable { .. }
+    );
+    let plans = left
+        .into_iter()
+        .map(|(plan, _)| plan)
+        .chain(std::iter::once(right_most));
+
+    for (index, mut plan) in plans.enumerate() {
+        if share_destination {
+            plan.query_destination = shared_destination.clone();
+        }
+
+        let next_select = if index == 0 {
+            None
+        } else {
+            let label = program.allocate_label();
+            if let Some(limit_ctx) = limit_ctx {
+                program.emit_insn(Insn::IfNot {
+                    reg: limit_ctx.reg_limit,
+                    target_pc: label,
+                    jump_if_null: true,
+                });
+            }
+            Some(label)
+        };
+
+        let mut ctx = Box::new(TranslateCtx::new(
+            program,
+            resolver.fork(),
+            plan.table_references.joined_tables().len(),
+            false,
+        ));
+        ctx.reg_result_cols_start = reg_result_cols_start;
+        if let Some(limit_ctx) = limit_ctx {
+            plan.limit.clone_from(&limit);
+            ctx.limit_ctx = Some(limit_ctx);
+        }
+        if offset_reg.is_some() {
+            plan.offset.clone_from(&offset);
+            ctx.reg_offset = offset_reg;
+        }
+
+        emit_explain!(
+            program,
+            true,
+            if index == 0 {
+                "LEFT-MOST SUBQUERY".to_owned()
+            } else {
+                "UNION ALL".to_owned()
+            }
+        );
+        ctx.materialized_build_inputs =
+            emit_materialized_build_inputs(program, &ctx.resolver, &mut plan)?;
+        emit_query(program, &mut plan, &mut ctx)?;
+        program.pop_current_parent_explain();
+
+        if let Some(next_select) = next_select {
+            program.preassign_label_to_next_insn(next_select);
+        }
+    }
+
+    program.preassign_label_to_next_insn(compound_select_end);
     Ok(())
 }
 

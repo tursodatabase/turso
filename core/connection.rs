@@ -2,6 +2,8 @@ use crate::alloc::TryClone;
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
+#[cfg(not(target_family = "wasm"))]
+use crate::partition::PartitionManager;
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
@@ -145,6 +147,9 @@ pub(crate) struct NamedSavepointFrame {
     /// SAVEPOINT begin. Cheap — values are `Arc`. Used by ROLLBACK TO
     /// to restore staged DDL on attached databases.
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+    /// Partition write target selected before this savepoint began.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) partition_write_target: Option<crate::partition::PartitionWriteTarget>,
 }
 
 /// Info returned by `rollback_named_savepoint_frame` so callers can
@@ -153,6 +158,8 @@ pub(crate) struct RollbackFrameInfo {
     pub(crate) main_schema_snapshot: Arc<Schema>,
     pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) partition_write_target: Option<crate::partition::PartitionWriteTarget>,
 }
 
 struct SchemaReparseGuard {
@@ -479,6 +486,16 @@ pub struct Connection {
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
+    /// Partition manager for handling time-partitioned tables.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) partition_manager: RwLock<PartitionManager>,
+    /// Explicit physical indexes required by each partition configuration.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) partition_index_requirements:
+        RwLock<HashMap<String, Vec<Arc<crate::schema::Index>>>>,
+    /// Physical partition selected by the first write in an explicit transaction.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) partition_write_target: RwLock<Option<crate::partition::PartitionWriteTarget>>,
     /// Connection-level named savepoint stack used to mirror savepoint state
     /// onto temp/attached databases that start participating after SAVEPOINT.
     pub(crate) named_savepoints: RwLock<Vec<NamedSavepointFrame>>,
@@ -500,6 +517,121 @@ pub struct Connection {
 // SAFETY: This needs to be audited for thread safety.
 // See: https://github.com/tursodatabase/turso/issues/1552
 crate::assert::assert_send_sync!(Connection);
+
+#[cfg(not(target_family = "wasm"))]
+fn partition_table_schemas_match(
+    logical: &crate::schema::BTreeTable,
+    physical: &crate::schema::BTreeTable,
+) -> bool {
+    let compatible_table = physical.partition_spec.is_none()
+        && logical.has_rowid == physical.has_rowid
+        && logical.is_strict == physical.is_strict
+        && logical.has_autoincrement == physical.has_autoincrement
+        && logical.primary_key_columns == physical.primary_key_columns
+        && logical.unique_sets == physical.unique_sets
+        && logical.rowid_alias_conflict_clause == physical.rowid_alias_conflict_clause
+        && logical.columns().len() == physical.columns().len();
+    let compatible_columns =
+        logical
+            .columns()
+            .iter()
+            .zip(physical.columns())
+            .all(|(left, right)| {
+                left.name
+                    .as_deref()
+                    .zip(right.name.as_deref())
+                    .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+                    && left.ty_str.eq_ignore_ascii_case(&right.ty_str)
+                    && left.affinity() == right.affinity()
+                    && left.primary_key() == right.primary_key()
+                    && left.is_rowid_alias() == right.is_rowid_alias()
+                    && left.notnull() == right.notnull()
+                    && left.explicit_notnull() == right.explicit_notnull()
+                    && left.notnull_conflict_clause == right.notnull_conflict_clause
+                    && left.unique() == right.unique()
+                    && left.collation() == right.collation()
+                    && left.default.as_deref().map(ToString::to_string)
+                        == right.default.as_deref().map(ToString::to_string)
+                    && left.generated_expr().map(ToString::to_string)
+                        == right.generated_expr().map(ToString::to_string)
+                    && left
+                        .ty_params
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        == right
+                            .ty_params
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+            });
+    let compatible_checks = logical.check_constraints.len() == physical.check_constraints.len()
+        && logical
+            .check_constraints
+            .iter()
+            .zip(&physical.check_constraints)
+            .all(|(left, right)| {
+                left.name == right.name
+                    && left.column == right.column
+                    && left.expr.to_string() == right.expr.to_string()
+            });
+    let compatible_foreign_keys = logical.foreign_keys.len() == physical.foreign_keys.len()
+        && logical
+            .foreign_keys
+            .iter()
+            .zip(&physical.foreign_keys)
+            .all(|(left, right)| {
+                left.child_columns == right.child_columns
+                    && left.parent_table.eq_ignore_ascii_case(&right.parent_table)
+                    && left.parent_columns == right.parent_columns
+                    && left.on_delete == right.on_delete
+                    && left.on_update == right.on_update
+                    && left.deferred == right.deferred
+            });
+
+    compatible_table && compatible_columns && compatible_checks && compatible_foreign_keys
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn partition_index_schemas_match(
+    expected: &crate::schema::Index,
+    actual: &crate::schema::Index,
+) -> bool {
+    let compatible_columns = expected.columns.len() == actual.columns.len()
+        && expected
+            .columns
+            .iter()
+            .zip(&actual.columns)
+            .all(|(left, right)| {
+                left.name.eq_ignore_ascii_case(&right.name)
+                    && left.order == right.order
+                    && left.pos_in_table == right.pos_in_table
+                    && left.collation == right.collation
+                    && left.default.as_deref().map(ToString::to_string)
+                        == right.default.as_deref().map(ToString::to_string)
+                    && left.expr.as_deref().map(ToString::to_string)
+                        == right.expr.as_deref().map(ToString::to_string)
+            });
+    let compatible_method = match (&expected.index_method, &actual.index_method) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            let left = left.definition();
+            let right = right.definition();
+            left.method_name == right.method_name && left.backing_btree == right.backing_btree
+        }
+        _ => false,
+    };
+
+    expected.name.eq_ignore_ascii_case(&actual.name)
+        && expected.table_name.eq_ignore_ascii_case(&actual.table_name)
+        && expected.unique == actual.unique
+        && expected.has_rowid == actual.has_rowid
+        && expected.where_clause.as_deref().map(ToString::to_string)
+            == actual.where_clause.as_deref().map(ToString::to_string)
+        && expected.on_conflict == actual.on_conflict
+        && compatible_columns
+        && compatible_method
+}
 
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -1868,6 +2000,861 @@ impl Connection {
         self.fk_deferred_violations.fetch_add(v, Ordering::AcqRel);
     }
 
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn managed_partition_database(
+        &self,
+        _database_id: usize,
+    ) -> Option<(String, String)> {
+        None
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Connection {
+    /// Register a table for time-based partitioning.
+    pub fn register_partitioned_table(
+        &self,
+        table_name: &str,
+        config: crate::partition::PartitionConfig,
+    ) -> Result<()> {
+        if !self.get_auto_commit() {
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot register partitioned table '{table_name}' during an active transaction"
+            )));
+        }
+        if self.n_active_root_statements.load(Ordering::SeqCst) > 0 {
+            return Err(LimboError::TableLocked);
+        }
+
+        let required_indexes = self.validate_partition_config(table_name, &config)?;
+        self.partition_manager
+            .write()
+            .register_table(table_name, config)
+            .map_err(|error| LimboError::InvalidArgument(error.to_string()))?;
+        self.partition_index_requirements
+            .write()
+            .insert(table_name.to_string(), required_indexes);
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn validate_partition_config(
+        &self,
+        table_name: &str,
+        config: &crate::partition::PartitionConfig,
+    ) -> Result<Vec<Arc<crate::schema::Index>>> {
+        let mut schema_parser = turso_parser::parser::Parser::new(config.schema_sql.as_bytes());
+        while let Some(command) = schema_parser.next_cmd()? {
+            let Cmd::Stmt(statement) = command else {
+                return Err(LimboError::InvalidArgument(format!(
+                    "physical schema for partitioned table '{table_name}' may contain only CREATE TABLE and CREATE INDEX statements"
+                )));
+            };
+            if !matches!(
+                statement,
+                ast::Stmt::CreateTable { .. } | ast::Stmt::CreateIndex { .. }
+            ) {
+                return Err(LimboError::InvalidArgument(format!(
+                    "physical schema for partitioned table '{table_name}' may contain only CREATE TABLE and CREATE INDEX statements"
+                )));
+            }
+        }
+
+        let table = self
+            .with_schema(MAIN_DB_ID, |schema| schema.get_btree_table(table_name))
+            .ok_or_else(|| {
+                LimboError::InvalidArgument(format!(
+                    "partitioned table not found in main schema: {table_name}"
+                ))
+            })?;
+        let specification = table.partition_spec.as_ref().ok_or_else(|| {
+            LimboError::InvalidArgument(format!(
+                "table '{table_name}' was not created with PARTITION BY"
+            ))
+        })?;
+        if !specification
+            .column
+            .as_str()
+            .eq_ignore_ascii_case(&config.partition_column)
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "partition configuration for table '{table_name}' uses column '{}', but the schema uses '{}'",
+                config.partition_column,
+                specification.column.as_str()
+            )));
+        }
+        let (_, column) = table.get_column(&config.partition_column).ok_or_else(|| {
+            LimboError::InvalidArgument(format!(
+                "partition column '{}' not found in table '{table_name}'",
+                config.partition_column
+            ))
+        })?;
+        if column.affinity() != crate::vdbe::affinity::Affinity::Integer {
+            return Err(LimboError::InvalidArgument(format!(
+                "partition column '{}.{}' must have INTEGER affinity",
+                table_name, config.partition_column
+            )));
+        }
+        if !column.notnull() {
+            return Err(LimboError::InvalidArgument(format!(
+                "partition column '{}.{}' must be NOT NULL",
+                table_name, config.partition_column
+            )));
+        }
+        if !table.foreign_keys.is_empty() {
+            return Err(LimboError::InvalidArgument(format!(
+                "foreign keys are not supported on partitioned table '{table_name}'"
+            )));
+        }
+
+        let interval_micros = config.path_resolver.interval_micros();
+        if interval_micros <= 0 {
+            return Err(LimboError::InvalidArgument(format!(
+                "partition interval for table '{table_name}' must be positive, got {interval_micros} microseconds"
+            )));
+        }
+
+        #[cfg(feature = "fs")]
+        {
+            let validation_database = Database::open_file(
+                Arc::new(MemoryIO::new()),
+                ":memory:",
+                Arc::new(crate::dialect::SqliteDialect),
+            )?;
+            let validation_connection = validation_database.connect()?;
+            validation_connection
+                .execute(&config.schema_sql)
+                .map_err(|error| {
+                    LimboError::InvalidArgument(format!(
+                        "invalid physical schema for partitioned table '{table_name}': {error}"
+                    ))
+                })?;
+            let physical = validation_connection
+                .with_schema(MAIN_DB_ID, |schema| schema.get_btree_table(table_name))
+                .ok_or_else(|| {
+                    LimboError::InvalidArgument(format!(
+                        "physical partition schema does not create table '{table_name}'"
+                    ))
+                })?;
+            if !partition_table_schemas_match(&table, &physical) {
+                return Err(LimboError::InvalidArgument(format!(
+                    "physical partition schema for table '{table_name}' does not match the logical table"
+                )));
+            }
+            let required_indexes = validation_connection.with_schema(MAIN_DB_ID, |schema| {
+                schema.get_indices(table_name).cloned().collect::<Vec<_>>()
+            });
+            validation_connection.close()?;
+            Ok(required_indexes)
+        }
+
+        #[cfg(not(feature = "fs"))]
+        Ok(Vec::new())
+    }
+
+    /// Unregister a table from partitioning without deleting partition files.
+    pub fn unregister_partitioned_table(&self, table_name: &str) -> Result<()> {
+        if !self.get_auto_commit() {
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot unregister partitioned table '{table_name}' during an active transaction"
+            )));
+        }
+        if self.n_active_root_statements.load(Ordering::SeqCst) > 0 {
+            return Err(LimboError::TableLocked);
+        }
+
+        #[cfg(feature = "fs")]
+        {
+            let partitions = self
+                .partition_manager
+                .read()
+                .partition_files(table_name)
+                .map_err(|error| LimboError::InvalidArgument(error.to_string()))?;
+            for partition in partitions {
+                if partition.attached {
+                    self.detach_partition(table_name, &partition.path)?;
+                }
+            }
+        }
+
+        self.partition_manager
+            .write()
+            .unregister_table(table_name)
+            .map_err(|error| LimboError::InvalidArgument(error.to_string()))?;
+        self.partition_index_requirements.write().remove(table_name);
+        self.bump_prepare_context_generation();
+        Ok(())
+    }
+
+    /// Check if a table is registered for partitioning.
+    pub fn is_table_partitioned(&self, table_name: &str) -> bool {
+        self.partition_manager.read().is_partitioned(table_name)
+    }
+
+    pub(crate) fn managed_partition_database(
+        &self,
+        database_id: usize,
+    ) -> Option<(String, String)> {
+        self.partition_manager
+            .read()
+            .get_partition_table_by_database_id(database_id)
+            .map(|(table_name, partition)| (table_name.to_string(), partition.db_alias.clone()))
+    }
+
+    /// List known partitions for a table.
+    pub fn list_partitions(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<crate::partition::PartitionInfo>> {
+        #[cfg(feature = "fs")]
+        if self.get_auto_commit() {
+            return self.refresh_partitioned_table(table_name);
+        }
+        self.partition_manager
+            .read()
+            .list_partitions(table_name)
+            .map_err(|e| LimboError::InternalError(e.to_string()))
+    }
+
+    /// Ensure a partition descriptor and file exist for the given timestamp.
+    pub fn ensure_partition(
+        &self,
+        table_name: &str,
+        timestamp_micros: i64,
+    ) -> Result<crate::partition::PartitionInfo> {
+        let mut manager = self.partition_manager.write();
+        let partition = manager
+            .ensure_partition(table_name, timestamp_micros)
+            .map_err(|e| LimboError::InternalError(e.to_string()))?;
+        Ok(partition.to_info())
+    }
+
+    pub(crate) fn partition_target(
+        &self,
+        table_name: &str,
+        timestamp_micros: i64,
+    ) -> Result<crate::partition::manager::PartitionTarget> {
+        self.partition_manager
+            .read()
+            .target_for_timestamp(table_name, timestamp_micros)
+            .map_err(|error| LimboError::InvalidArgument(error.to_string()))
+    }
+
+    /// Reconcile only the partition addressed by an insert. Recorder ingestion
+    /// must not scan every retained day before writing the current day.
+    #[cfg(feature = "fs")]
+    pub(crate) fn refresh_partition_target(
+        &self,
+        table_name: &str,
+        target: &crate::partition::manager::PartitionTarget,
+    ) -> Result<()> {
+        let known = self
+            .partition_manager
+            .read()
+            .partition_for_range_start(table_name, target.range_start)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+
+        if let Some(partition) = known {
+            if partition.path != target.path || partition.db_alias != target.db_alias {
+                return Err(LimboError::InternalError(format!(
+                    "partition resolver changed target for table '{table_name}' and range {}",
+                    target.range_start
+                )));
+            }
+
+            let still_present = partition.path.exists();
+            let replaced = still_present && self.partition_file_was_replaced(&partition);
+            if still_present && !replaced {
+                if !partition.attached {
+                    self.attach_partition(table_name, &partition.path)?;
+                }
+                return Ok(());
+            }
+
+            self.detach_partition(table_name, &partition.path)?;
+            self.partition_manager
+                .write()
+                .remove_partition(table_name, &partition.path)
+                .map_err(|error| LimboError::InternalError(error.to_string()))?;
+            crate::partition::with_partition_path_lock(&partition.path, || -> Result<()> {
+                crate::partition::remove_partition_sidecars(&partition.path)
+                    .map_err(|error| LimboError::InternalError(error.to_string()))
+            })?;
+        }
+
+        if target.path.exists() {
+            self.attach_partition(table_name, &target.path)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "fs"))]
+    pub(crate) fn refresh_partition_target(
+        &self,
+        _table_name: &str,
+        _target: &crate::partition::manager::PartitionTarget,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn track_partition_write(
+        &self,
+        table_name: &str,
+        db_alias: &str,
+        range_start: i64,
+    ) -> Result<()> {
+        if self.get_auto_commit() {
+            return Ok(());
+        }
+
+        let mut tracked = self.partition_write_target.write();
+        match tracked.as_ref() {
+            None => {
+                *tracked = Some(crate::partition::PartitionWriteTarget {
+                    table_name: table_name.to_string(),
+                    db_alias: db_alias.to_string(),
+                    range_start,
+                });
+                Ok(())
+            }
+            Some(existing)
+                if existing.table_name == table_name && existing.range_start == range_start =>
+            {
+                Ok(())
+            }
+            Some(existing) => Err(LimboError::InvalidArgument(format!(
+                "cross-partition write transaction is not supported: first target was '{}.{}', attempted '{}.{}'",
+                existing.table_name, existing.db_alias, table_name, db_alias
+            ))),
+        }
+    }
+
+    pub(crate) fn check_partition_write_target(
+        &self,
+        table_name: &str,
+        db_alias: &str,
+        range_start: i64,
+    ) -> Result<()> {
+        if self.get_auto_commit() {
+            return Ok(());
+        }
+        let tracked = self.partition_write_target.read();
+        let Some(existing) = tracked.as_ref() else {
+            return Ok(());
+        };
+        if existing.table_name == table_name && existing.range_start == range_start {
+            return Ok(());
+        }
+        Err(LimboError::InvalidArgument(format!(
+            "cross-partition write transaction is not supported: first target was '{}.{}', attempted '{}.{}'",
+            existing.table_name, existing.db_alias, table_name, db_alias
+        )))
+    }
+
+    pub(crate) fn clear_partition_write_target(&self) {
+        *self.partition_write_target.write() = None;
+    }
+
+    pub(crate) fn partition_write_target_snapshot(
+        &self,
+    ) -> Option<crate::partition::PartitionWriteTarget> {
+        self.partition_write_target.read().clone()
+    }
+
+    pub(crate) fn restore_partition_write_target(
+        &self,
+        target: Option<crate::partition::PartitionWriteTarget>,
+    ) {
+        *self.partition_write_target.write() = target;
+    }
+
+    /// Attach a partition file to this connection.
+    #[cfg(feature = "fs")]
+    pub fn attach_partition(
+        &self,
+        table_name: &str,
+        path: &std::path::Path,
+    ) -> Result<crate::partition::PartitionInfo> {
+        let info = self
+            .partition_manager
+            .write()
+            .attach_partition(table_name, path)
+            .map_err(|e| LimboError::InternalError(e.to_string()))?;
+
+        if info.attached {
+            return Ok(info);
+        }
+
+        if self.is_attached(&info.db_alias) {
+            let (database_id, attached_database) = self
+                .attached_databases
+                .read()
+                .get_database_by_name(&info.db_alias)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "attached database '{}' disappeared from the catalog",
+                        info.db_alias
+                    ))
+                })?;
+            let attached_path =
+                std::fs::canonicalize(&attached_database.path).map_err(|error| {
+                    LimboError::InvalidArgument(format!(
+                        "cannot resolve attached database path '{}': {error}",
+                        attached_database.path
+                    ))
+                })?;
+            let requested_path = std::fs::canonicalize(path).map_err(|error| {
+                LimboError::InvalidArgument(format!(
+                    "cannot resolve partition path '{}': {error}",
+                    path.display()
+                ))
+            })?;
+            if attached_path != requested_path {
+                return Err(LimboError::InvalidArgument(format!(
+                    "database alias '{}' is already attached from '{}'",
+                    info.db_alias,
+                    attached_path.display()
+                )));
+            }
+            self.partition_manager.write().update_partition_database_id(
+                table_name,
+                path,
+                database_id,
+            );
+            return self
+                .partition_manager
+                .read()
+                .get_partition_by_alias(table_name, &info.db_alias)
+                .map(|partition| partition.to_info())
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "partition disappeared after attach: {}",
+                        path.display()
+                    ))
+                });
+        }
+
+        let path_str = path.to_string_lossy();
+        let mut state = AttachDatabaseState::default();
+        loop {
+            match self.attach_database(&path_str, &info.db_alias, &mut state) {
+                Ok(IOResult::Done(())) => break,
+                Ok(IOResult::IO(io)) => io.wait(self.db.io.as_ref())?,
+                Err(e) => {
+                    let _ = self
+                        .partition_manager
+                        .write()
+                        .detach_partition(table_name, path);
+                    return Err(e);
+                }
+            }
+        }
+
+        let database_id = self.get_database_id_by_name(&info.db_alias)?;
+        self.partition_manager
+            .write()
+            .update_partition_database_id(table_name, path, database_id);
+
+        if let Err(error) = self.validate_attached_partition_schema(table_name, database_id) {
+            self.detach_database(&info.db_alias)?;
+            self.partition_manager
+                .write()
+                .detach_partition(table_name, path)
+                .map_err(|detach_error| LimboError::InternalError(detach_error.to_string()))?;
+            return Err(error);
+        }
+
+        self.partition_manager
+            .read()
+            .get_partition_by_alias(table_name, &info.db_alias)
+            .map(|partition| partition.to_info())
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "partition disappeared after attach: {}",
+                    path.display()
+                ))
+            })
+    }
+
+    #[cfg(feature = "fs")]
+    fn validate_attached_partition_schema(
+        &self,
+        table_name: &str,
+        database_id: usize,
+    ) -> Result<()> {
+        let logical = self
+            .with_schema(MAIN_DB_ID, |schema| schema.get_btree_table(table_name))
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "logical partitioned table disappeared: {table_name}"
+                ))
+            })?;
+        let physical = self
+            .with_schema(database_id, |schema| schema.get_btree_table(table_name))
+            .ok_or_else(|| {
+                LimboError::InvalidArgument(format!(
+                    "partition database does not contain table '{table_name}'"
+                ))
+            })?;
+
+        if !partition_table_schemas_match(&logical, &physical) {
+            return Err(LimboError::InvalidArgument(format!(
+                "partition schema for table '{table_name}' does not match the logical table"
+            )));
+        }
+        let required_indexes = self
+            .partition_index_requirements
+            .read()
+            .get(table_name)
+            .cloned()
+            .unwrap_or_default();
+        let physical_indexes = self.with_schema(database_id, |schema| {
+            schema.get_indices(table_name).cloned().collect::<Vec<_>>()
+        });
+        for expected in required_indexes {
+            let compatible = physical_indexes.iter().any(|actual| {
+                expected.name.eq_ignore_ascii_case(&actual.name)
+                    && partition_index_schemas_match(&expected, actual)
+            });
+            if !compatible {
+                return Err(LimboError::InvalidArgument(format!(
+                    "partition schema for table '{table_name}' is missing or changes required index '{}'",
+                    expected.name
+                )));
+            }
+        }
+
+        let (alias, range_start, range_end, partition_column) = {
+            let manager = self.partition_manager.read();
+            let partition = manager
+                .get_partition_by_database_id(table_name, database_id)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "attached database {database_id} has no partition descriptor for table '{table_name}'"
+                    ))
+                })?;
+            let config = manager.get_config(table_name).ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "partition configuration disappeared for table '{table_name}'"
+                ))
+            })?;
+            (
+                partition.db_alias.clone(),
+                partition.range_start,
+                partition.range_end,
+                config.partition_column.clone(),
+            )
+        };
+        let physical_database = self
+            .attached_databases
+            .read()
+            .get_database_by_index(database_id)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "attached database {database_id} disappeared during partition validation"
+                ))
+            })?;
+        let physical_connection = physical_database.connect()?;
+        let mut range_check = physical_connection.prepare(format!(
+            "SELECT 1 FROM {} WHERE {} < {} OR {} >= {} LIMIT 1",
+            crate::util::quote_identifier(table_name),
+            crate::util::quote_identifier(&partition_column),
+            range_start,
+            crate::util::quote_identifier(&partition_column),
+            range_end
+        ))?;
+        let mut contains_out_of_range_row = false;
+        range_check.run_with_row_callback(|_| {
+            contains_out_of_range_row = true;
+            Ok(())
+        })?;
+        drop(range_check);
+        physical_connection.close()?;
+        if contains_out_of_range_row {
+            return Err(LimboError::InvalidArgument(format!(
+                "partition '{alias}' contains rows outside [{range_start}, {range_end}) for '{table_name}.{partition_column}'"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Attach a partition file to this connection.
+    #[cfg(not(feature = "fs"))]
+    pub fn attach_partition(
+        &self,
+        _table_name: &str,
+        _path: &std::path::Path,
+    ) -> Result<crate::partition::PartitionInfo> {
+        Err(LimboError::InvalidArgument(
+            "attach_partition not available in this build (no-fs)".to_string(),
+        ))
+    }
+
+    /// Detach a partition file from this connection.
+    #[cfg(feature = "fs")]
+    pub fn detach_partition(&self, table_name: &str, path: &std::path::Path) -> Result<()> {
+        if !self.get_auto_commit() {
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot detach partition from table '{table_name}' during an active transaction"
+            )));
+        }
+        let (alias, attached) = {
+            let manager = self.partition_manager.read();
+            let partition = manager
+                .get_partition_alias(table_name, path)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!("partition not found: {}", path.display()))
+                })?;
+            let attached = manager
+                .get_partition_by_alias(table_name, &partition)
+                .is_some_and(|partition| partition.attached);
+            (partition, attached)
+        };
+
+        if attached {
+            self.detach_database(&alias)?;
+        }
+        self.partition_manager
+            .write()
+            .detach_partition(table_name, path)
+            .map_err(|e| LimboError::InternalError(e.to_string()))
+    }
+
+    /// Detach and delete a partition file without disturbing other partitions.
+    #[cfg(feature = "fs")]
+    pub fn delete_partition(&self, table_name: &str, path: &std::path::Path) -> Result<()> {
+        if !self.get_auto_commit() {
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot delete partition from table '{table_name}' during an active transaction"
+            )));
+        }
+        self.detach_partition(table_name, path)?;
+
+        #[cfg(feature = "test_helper")]
+        crate::partition::test_hooks::pause_if_requested("after_partition_detach_before_delete");
+
+        crate::partition::with_partition_path_lock(path, || -> Result<()> {
+            if path.exists() {
+                self.db.io.remove_file(path.to_string_lossy().as_ref())?;
+            }
+            crate::partition::remove_partition_sidecars(path)
+                .map_err(|error| LimboError::InternalError(error.to_string()))?;
+            crate::partition::sync_parent_directory(path)
+                .map_err(|error| LimboError::InternalError(error.to_string()))?;
+            Ok(())
+        })?;
+
+        #[cfg(feature = "test_helper")]
+        crate::partition::test_hooks::pause_if_requested(
+            "after_partition_delete_before_catalog_update",
+        );
+
+        self.partition_manager
+            .write()
+            .remove_partition(table_name, path)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        self.bump_prepare_context_generation();
+        Ok(())
+    }
+
+    /// Detach a partition file from this connection.
+    #[cfg(not(feature = "fs"))]
+    pub fn detach_partition(&self, _table_name: &str, _path: &std::path::Path) -> Result<()> {
+        Err(LimboError::InvalidArgument(
+            "detach_partition not available in this build (no-fs)".to_string(),
+        ))
+    }
+
+    #[cfg(not(feature = "fs"))]
+    pub fn delete_partition(&self, _table_name: &str, _path: &std::path::Path) -> Result<()> {
+        Err(LimboError::InvalidArgument(
+            "delete_partition not available in this build (no-fs)".to_string(),
+        ))
+    }
+
+    /// Get information about all attached partitions for a table.
+    pub fn get_attached_partitions(
+        &self,
+        table_name: &str,
+    ) -> Vec<crate::partition::PartitionInfo> {
+        self.partition_manager
+            .read()
+            .get_attached_partitions(table_name)
+            .into_iter()
+            .map(|p| p.to_info())
+            .collect()
+    }
+
+    /// Discover existing partition files on disk.
+    pub fn discover_partitions(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<crate::partition::PartitionInfo>> {
+        self.partition_manager
+            .write()
+            .discover_partitions(table_name)
+            .map_err(|e| LimboError::InternalError(e.to_string()))
+    }
+
+    #[cfg(feature = "fs")]
+    fn partition_file_was_replaced(&self, partition: &crate::partition::PartitionFile) -> bool {
+        if !partition.attached {
+            return false;
+        }
+        let Some(database_id) = partition.database_id else {
+            return false;
+        };
+        let Some(database) = self
+            .attached_databases
+            .read()
+            .get_database_by_index(database_id)
+        else {
+            return true;
+        };
+        let Some(attached_file_id) = database.file_id() else {
+            return false;
+        };
+        match database
+            .io
+            .file_id(partition.path.to_string_lossy().as_ref())
+        {
+            Ok(current_file_id) => current_file_id != attached_file_id,
+            Err(_) => true,
+        }
+    }
+
+    /// Reconcile the logical partition catalog with files currently present on disk.
+    #[cfg(feature = "fs")]
+    pub fn refresh_partitioned_table(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<crate::partition::PartitionInfo>> {
+        if !self.get_auto_commit() {
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot refresh partitioned table '{table_name}' during an active transaction"
+            )));
+        }
+        let (known, discovered) = {
+            let manager = self.partition_manager.read();
+            (
+                manager
+                    .partition_files(table_name)
+                    .map_err(|error| LimboError::InternalError(error.to_string()))?,
+                manager
+                    .discover_partition_files(table_name)
+                    .map_err(|error| LimboError::InternalError(error.to_string()))?,
+            )
+        };
+
+        let discovered_paths: HashSet<std::path::PathBuf> = discovered
+            .iter()
+            .map(|partition| partition.path.clone())
+            .collect();
+        for partition in &known {
+            let still_present = discovered_paths.contains(&partition.path);
+            let replaced = still_present && self.partition_file_was_replaced(partition);
+            if still_present && !replaced {
+                continue;
+            }
+            self.detach_partition(table_name, &partition.path)?;
+            self.partition_manager
+                .write()
+                .remove_partition(table_name, &partition.path)
+                .map_err(|error| LimboError::InternalError(error.to_string()))?;
+            crate::partition::with_partition_path_lock(&partition.path, || -> Result<()> {
+                if replaced || !partition.path.exists() {
+                    crate::partition::remove_partition_sidecars(&partition.path)
+                        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+                }
+                Ok(())
+            })?;
+        }
+
+        for partition in discovered {
+            let already_attached = self
+                .partition_manager
+                .read()
+                .get_partition_by_alias(table_name, &partition.db_alias)
+                .is_some_and(|known| known.attached && known.path == partition.path);
+            if !already_attached {
+                self.attach_partition(table_name, &partition.path)?;
+            }
+        }
+
+        self.partition_manager
+            .read()
+            .list_partitions(table_name)
+            .map_err(|error| LimboError::InternalError(error.to_string()))
+    }
+
+    #[cfg(not(feature = "fs"))]
+    pub fn refresh_partitioned_table(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<crate::partition::PartitionInfo>> {
+        self.list_partitions(table_name)
+    }
+
+    /// Reconcile every registered table before a root statement starts.
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    pub(crate) fn refresh_all_partitioned_tables(&self) -> Result<()> {
+        let tables = self.partition_manager.read().registered_tables();
+        self.refresh_partitioned_tables(&tables)
+    }
+
+    /// Reconcile only the logical tables referenced by the statement being run.
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    pub(crate) fn refresh_partitioned_tables(&self, tables: &[String]) -> Result<()> {
+        for table in tables {
+            if !self.partition_manager.read().is_partitioned(table) {
+                continue;
+            }
+            self.refresh_partitioned_table(table)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(not(feature = "fs"), not(target_family = "wasm")))]
+    pub(crate) fn refresh_all_partitioned_tables(&self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(all(not(feature = "fs"), not(target_family = "wasm")))]
+    pub(crate) fn refresh_partitioned_tables(&self, _tables: &[String]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Route an insert to the correct partition based on timestamp.
+    pub fn route_insert(
+        &self,
+        table_name: &str,
+        timestamp_micros: i64,
+    ) -> Result<crate::partition::PartitionInfo> {
+        self.partition_manager
+            .read()
+            .route_insert(table_name, timestamp_micros)
+            .map(|p| p.to_info())
+            .map_err(|e| LimboError::InternalError(e.to_string()))
+    }
+
+    /// Filter attached partitions by time range.
+    pub fn filter_partitions_by_range(
+        &self,
+        table_name: &str,
+        start: Option<i64>,
+        end: Option<i64>,
+    ) -> Vec<crate::partition::PartitionInfo> {
+        self.partition_manager
+            .read()
+            .filter_by_range(table_name, start, end)
+            .into_iter()
+            .map(|p| p.to_info())
+            .collect()
+    }
+}
+
+impl Connection {
     /// Query the CREATE TYPE SQL definitions stored in __turso_internal_types.
     /// The connection's schema must already contain the table definitions so
     /// that `prepare` can resolve the table name. Returns an empty Vec if the
@@ -3095,7 +4082,15 @@ impl Connection {
                     .map(|temp_db| temp_db.pager.clone())
                     .expect("temp database should be initialized after ensure_temp_database"))
             }
-            _ => Ok(self.attached_databases.read().get_pager_by_index(index)),
+            _ => self
+                .attached_databases
+                .read()
+                .get_pager_by_index(index)
+                .ok_or_else(|| {
+                    LimboError::InvalidArgument(format!(
+                        "database index {index} is no longer attached"
+                    ))
+                }),
         }
     }
 
@@ -4809,6 +5804,8 @@ impl Connection {
             main_schema_snapshot: frame.main_schema_snapshot.clone(),
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
             staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
+            #[cfg(not(target_family = "wasm"))]
+            partition_write_target: frame.partition_write_target.clone(),
         };
         // ROLLBACK TO keeps the target savepoint itself on the stack;
         // only nested savepoints above it are discarded.
@@ -4844,6 +5841,8 @@ impl Connection {
         }
         self.rollback_attached_wal_txns();
         self.set_tx_state(TransactionState::None);
+        #[cfg(not(target_family = "wasm"))]
+        self.clear_partition_write_target();
         self.clear_tx_poison();
     }
 
@@ -4879,6 +5878,8 @@ impl Connection {
         self.set_cdc_transaction_id(-1);
         self.clear_named_savepoints();
         self.clear_deferred_foreign_key_violations();
+        #[cfg(not(target_family = "wasm"))]
+        self.clear_partition_write_target();
     }
 
     /// Iterate over all attached MVCC transactions, calling `f(db_id, tx_id)` for each.

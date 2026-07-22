@@ -11,6 +11,8 @@ pub fn translate_tx_begin(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
+    #[cfg(not(target_family = "wasm"))]
+    program.require_full_partition_refresh();
     program.extend(&ProgramBuilderOpts {
         num_cursors: 0,
         approx_num_insns: 0,

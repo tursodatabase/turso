@@ -159,6 +159,8 @@ use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 use tracing::trace;
+#[cfg(not(target_family = "wasm"))]
+use turso_parser::ast::PartitionSpec;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, ResolveType, SortOrder,
     TableInternalId, TypeOperator,
@@ -1972,6 +1974,8 @@ impl Schema {
                 check_constraints: vec![],
                 rowid_alias_conflict_clause: None,
                 unique_sets: vec![],
+                #[cfg(not(target_family = "wasm"))]
+                partition_spec: None,
                 has_virtual_columns: false,
                 logical_to_physical_map,
                 column_dependencies: Default::default(),
@@ -2700,6 +2704,8 @@ impl TryClone for BTreeTable {
             foreign_keys: self.foreign_keys.try_clone()?,
             check_constraints: self.check_constraints.try_clone()?,
             rowid_alias_conflict_clause: self.rowid_alias_conflict_clause,
+            #[cfg(not(target_family = "wasm"))]
+            partition_spec: self.partition_spec.clone(),
             has_virtual_columns: self.has_virtual_columns,
             logical_to_physical_map: self.logical_to_physical_map.try_clone()?,
             column_dependencies: Default::default(),
@@ -3244,6 +3250,9 @@ pub struct BTreeTable {
     /// ON CONFLICT clause for the INTEGER PRIMARY KEY constraint.
     /// Stored here because rowid-alias PKs have their UniqueSet removed.
     pub rowid_alias_conflict_clause: Option<ResolveType>,
+    /// Time-based partition specification, if this table is partitioned.
+    #[cfg(not(target_family = "wasm"))]
+    pub partition_spec: Option<PartitionSpec>,
     pub has_virtual_columns: bool,
     pub logical_to_physical_map: Vec<usize>,
     column_dependencies: ResetOnClone<OnceLock<GeneratedColGraph>>,
@@ -3308,6 +3317,8 @@ impl BTreeTable {
             foreign_keys,
             check_constraints,
             rowid_alias_conflict_clause,
+            #[cfg(not(target_family = "wasm"))]
+            partition_spec: None,
             has_virtual_columns,
             logical_to_physical_map,
             column_dependencies: Default::default(),
@@ -4363,12 +4374,21 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let is_strict: bool;
     let mut unique_sets_columns: Vec<UniqueSet> = vec![];
     let mut unique_sets_constraints: Vec<UniqueSet> = vec![];
+    #[cfg(not(target_family = "wasm"))]
+    let partition_spec: Option<PartitionSpec>;
     match body {
         CreateTableBody::ColumnsAndConstraints {
             columns,
             constraints,
             options,
+            partition,
         } => {
+            #[cfg(not(target_family = "wasm"))]
+            {
+                partition_spec = partition.clone();
+            }
+            #[cfg(target_family = "wasm")]
+            let _ = partition;
             has_rowid = !options.contains_without_rowid();
             is_strict = options.contains_strict();
             let column_fk_count = columns
@@ -4913,6 +4933,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         },
         check_constraints,
         rowid_alias_conflict_clause,
+        #[cfg(not(target_family = "wasm"))]
+        partition_spec,
         has_virtual_columns: false,
         logical_to_physical_map: vec![],
         column_dependencies: Default::default(),
@@ -5587,6 +5609,8 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         check_constraints: try_vec![]?,
         rowid_alias_conflict_clause: None,
         unique_sets: try_vec![]?,
+        #[cfg(not(target_family = "wasm"))]
+        partition_spec: None,
         has_virtual_columns: false,
         logical_to_physical_map,
         column_dependencies: Default::default(),
@@ -6397,6 +6421,8 @@ mod tests {
             foreign_keys: vec![],
             check_constraints: vec![],
             rowid_alias_conflict_clause: None,
+            #[cfg(not(target_family = "wasm"))]
+            partition_spec: None,
             has_virtual_columns: false,
             logical_to_physical_map,
             column_dependencies: Default::default(),

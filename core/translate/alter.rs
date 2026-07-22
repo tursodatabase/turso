@@ -852,6 +852,11 @@ pub fn translate_alter_table(
         body: alter_table,
     } = alter;
     let database_id = resolver.resolve_existing_table_database_id_qualified(&qualified_name)?;
+    if let Some((logical_table, alias)) = connection.managed_partition_database(database_id) {
+        crate::bail_parse_error!(
+            "direct schema changes to managed partition '{alias}' are not supported; ALTER logical table '{logical_table}' is not supported"
+        );
+    }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
@@ -888,6 +893,14 @@ pub fn translate_alter_table(
     let Some(original_btree) = table.btree() else {
         crate::bail_parse_error!("ALTER TABLE is only supported for BTree tables");
     };
+    #[cfg(not(target_family = "wasm"))]
+    {
+        if original_btree.partition_spec.is_some() {
+            crate::bail_parse_error!(
+                "ALTER TABLE on partitioned table '{table_name}' is not supported"
+            );
+        }
+    }
 
     // Check if this table has dependent materialized views
     let dependent_views = resolver.with_schema(database_id, |s| {

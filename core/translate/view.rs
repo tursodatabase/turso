@@ -63,6 +63,11 @@ pub fn translate_create_materialized_view(
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(view_name)?;
+    if let Some((logical_table, alias)) = connection.managed_partition_database(database_id) {
+        bail_parse_error!(
+            "direct schema changes to managed partition '{alias}' are not supported; views over logical table '{logical_table}' belong in the main database"
+        );
+    }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
@@ -312,8 +317,14 @@ pub fn translate_create_view(
     columns: &[ast::IndexedColumn],
     if_not_exists: bool,
     program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(view_name)?;
+    if let Some((logical_table, alias)) = connection.managed_partition_database(database_id) {
+        bail_parse_error!(
+            "direct schema changes to managed partition '{alias}' are not supported; views over logical table '{logical_table}' belong in the main database"
+        );
+    }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
@@ -420,8 +431,14 @@ pub fn translate_drop_view(
     view_name: &ast::QualifiedName,
     if_exists: bool,
     program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(view_name)?;
+    if let Some((logical_table, alias)) = connection.managed_partition_database(database_id) {
+        bail_parse_error!(
+            "direct schema changes to managed partition '{alias}' are not supported; manage views for logical table '{logical_table}' in the main database"
+        );
+    }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());

@@ -60,6 +60,143 @@ use turso_parser::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
     TriggerTime, Upsert, UpsertDo, With,
 };
+#[cfg(not(target_family = "wasm"))]
+use turso_parser::ast::{Literal, PartitionSpec};
+
+/// Capture every partition key used by an INSERT body.
+#[cfg(not(target_family = "wasm"))]
+fn extract_partition_values(
+    program: &mut ProgramBuilder,
+    body: &InsertBody,
+    columns: &[ast::Name],
+    table: &Arc<BTreeTable>,
+    partition_spec: &PartitionSpec,
+) -> Result<Vec<crate::partition::PartitionInsertValue>> {
+    let partition_col_name = normalize_ident(partition_spec.column.as_str());
+    let partition_col_idx = if columns.is_empty() {
+        table
+            .columns()
+            .iter()
+            .position(|c| {
+                c.name
+                    .as_ref()
+                    .map(|n| normalize_ident(n) == partition_col_name)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                LimboError::ParseError(format!(
+                    "partition column '{partition_col_name}' not found in table '{}'",
+                    table.name
+                ))
+            })?
+    } else {
+        columns
+            .iter()
+            .position(|c| normalize_ident(c.as_str()) == partition_col_name)
+            .ok_or_else(|| {
+                LimboError::ParseError(format!(
+                    "partition column '{partition_col_name}' must be included in INSERT column list"
+                ))
+            })?
+    };
+
+    match body {
+        InsertBody::Select(select, _) => match &select.body.select {
+            OneSelect::Values(rows) => rows
+                .iter()
+                .map(|row| {
+                    let expr = row.get(partition_col_idx).ok_or_else(|| {
+                        LimboError::ParseError(format!(
+                            "partition column index {partition_col_idx} out of bounds in VALUES"
+                        ))
+                    })?;
+                    extract_partition_value(program, expr)
+                })
+                .collect(),
+            OneSelect::Select { .. } => Err(LimboError::ParseError(
+                "INSERT ... SELECT into partitioned tables is not yet supported".to_string(),
+            )),
+        },
+        InsertBody::DefaultValues => Err(LimboError::ParseError(
+            "DEFAULT VALUES cannot be used with partitioned tables".to_string(),
+        )),
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn extract_partition_value(
+    program: &mut ProgramBuilder,
+    expr: &Expr,
+) -> Result<crate::partition::PartitionInsertValue> {
+    use crate::partition::PartitionInsertValue;
+
+    match expr {
+        Expr::Literal(Literal::Numeric(num_str)) => {
+            parse_partition_integer(num_str).map(PartitionInsertValue::Literal)
+        }
+        Expr::Unary(
+            operator @ (ast::UnaryOperator::Negative | ast::UnaryOperator::Positive),
+            inner,
+        ) => {
+            let Expr::Literal(Literal::Numeric(num_str)) = inner.as_ref() else {
+                return Err(LimboError::ParseError(
+                    "partition timestamp must be an integer literal or bound parameter".to_string(),
+                ));
+            };
+            let signed = if matches!(operator, ast::UnaryOperator::Negative) {
+                format!("-{num_str}")
+            } else {
+                num_str.to_string()
+            };
+            parse_partition_integer(&signed).map(PartitionInsertValue::Literal)
+        }
+        Expr::Variable(variable) => Ok(PartitionInsertValue::Parameter(
+            program.register_variable(variable),
+        )),
+        _ => Err(LimboError::ParseError(
+            "partition timestamp must be an integer literal or bound parameter".to_string(),
+        )),
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn parse_partition_integer(value: &str) -> Result<i64> {
+    crate::util::parse_numeric_literal(value)
+        .ok()
+        .and_then(|value| value.as_int())
+        .ok_or_else(|| {
+            LimboError::ParseError(format!(
+                "invalid partition timestamp '{value}' - expected integer microseconds"
+            ))
+        })
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn resolve_partition_values(
+    program: &ProgramBuilder,
+    values: &[crate::partition::PartitionInsertValue],
+) -> Result<Option<Vec<i64>>> {
+    use crate::partition::PartitionInsertValue;
+
+    let mut timestamps = Vec::with_capacity(values.len());
+    for value in values {
+        match value {
+            PartitionInsertValue::Literal(timestamp) => timestamps.push(*timestamp),
+            PartitionInsertValue::Parameter(index) => {
+                let Some(value) = program.partition_binding(*index) else {
+                    return Ok(None);
+                };
+                let Some(timestamp) = value.as_int() else {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "partition timestamp parameter {index} must be a non-NULL integer"
+                    )));
+                };
+                timestamps.push(timestamp);
+            }
+        }
+    }
+    Ok(Some(timestamps))
+}
 
 /// Validate anything with this insert statement that should throw an early parse error
 fn validate(
@@ -221,6 +358,7 @@ impl<'a> InsertEmitCtx<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(target_family = "wasm", allow(unused_mut))]
 #[turso_macros::trace_stack]
 pub fn translate_insert(
     resolver: &mut Resolver,
@@ -263,9 +401,14 @@ pub fn translate_insert(
         // for RETURNING clause subqueries - handled below via with_for_returning.
     }
 
-    let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
+    let mut database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let table_name = &tbl_name.name;
-    let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
+    if let Some((logical_table, alias)) = connection.managed_partition_database(database_id) {
+        crate::bail_parse_error!(
+            "direct writes to managed partition '{alias}' are not supported; INSERT through logical table '{logical_table}'"
+        );
+    }
+    let mut table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", table_name),
     };
@@ -294,9 +437,111 @@ pub fn translate_insert(
         return Ok(());
     }
 
-    let Some(btree_table) = table.btree() else {
+    let Some(mut btree_table) = table.btree() else {
         crate::bail_parse_error!("no such table: {}", table_name);
     };
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        if let Some(partition_spec) = &btree_table.partition_spec {
+            if !connection.is_table_partitioned(table_name.as_str()) {
+                crate::bail_parse_error!(
+                    "INSERT into partitioned table '{}' requires partition configuration",
+                    table_name
+                );
+            }
+
+            let partition_values =
+                extract_partition_values(program, &body, &columns, &btree_table, partition_spec)?;
+            if partition_values.is_empty() {
+                crate::bail_parse_error!("VALUES clause is empty");
+            }
+
+            let timestamps = resolve_partition_values(program, &partition_values)?;
+            let mut compiled_range_start = None;
+            if let Some(timestamps) = timestamps {
+                let first_timestamp = timestamps
+                    .first()
+                    .copied()
+                    .ok_or_else(|| LimboError::ParseError("VALUES clause is empty".to_string()))?;
+                let first_target =
+                    connection.partition_target(table_name.as_str(), first_timestamp)?;
+                for timestamp in timestamps.iter().copied().skip(1) {
+                    let target = connection.partition_target(table_name.as_str(), timestamp)?;
+                    if target.range_start != first_target.range_start {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "one INSERT statement cannot write table '{}' to both '{}' and '{}'",
+                            table_name, first_target.db_alias, target.db_alias
+                        )));
+                    }
+                }
+                if connection.get_auto_commit() {
+                    connection.refresh_partition_target(table_name.as_str(), &first_target)?;
+                }
+                connection.check_partition_write_target(
+                    table_name.as_str(),
+                    &first_target.db_alias,
+                    first_target.range_start,
+                )?;
+
+                let partition_info = connection
+                    .ensure_partition(table_name.as_str(), first_timestamp)
+                    .map_err(|error| {
+                        LimboError::ParseError(format!(
+                            "failed to ensure partition for timestamp {first_timestamp}: {error}"
+                        ))
+                    })?;
+                let partition_path = std::path::PathBuf::from(&partition_info.file_path);
+                if !partition_info.attached {
+                    connection
+                        .attach_partition(table_name.as_str(), &partition_path)
+                        .map_err(|error| {
+                            LimboError::ParseError(format!(
+                                "failed to attach partition {}: {error}",
+                                partition_info.db_alias
+                            ))
+                        })?;
+                }
+
+                database_id = connection
+                    .partition_manager
+                    .read()
+                    .route_insert(table_name.as_str(), first_timestamp)
+                    .map_err(|error| {
+                        LimboError::ParseError(format!("failed to route INSERT: {error}"))
+                    })?
+                    .database_id
+                    .ok_or_else(|| {
+                        LimboError::ParseError(format!(
+                            "partition {} is not attached",
+                            partition_info.db_alias
+                        ))
+                    })?;
+                compiled_range_start = Some(first_target.range_start);
+
+                table = resolver
+                    .with_schema(database_id, |schema| schema.get_table(table_name.as_str()))
+                    .ok_or_else(|| {
+                        LimboError::ParseError(format!(
+                            "partition {} does not contain table '{}'",
+                            partition_info.db_alias, table_name
+                        ))
+                    })?;
+                btree_table = table.btree().ok_or_else(|| {
+                    LimboError::ParseError(format!(
+                        "partition {} table '{}' is not a B-tree table",
+                        partition_info.db_alias, table_name
+                    ))
+                })?;
+            }
+
+            program.set_partitioned_insert(crate::partition::PartitionedInsert {
+                table_name: table_name.as_str().to_string(),
+                values: partition_values,
+                compiled_range_start,
+            });
+        }
+    }
 
     let BoundInsertResult {
         mut values,
