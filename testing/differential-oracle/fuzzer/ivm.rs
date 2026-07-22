@@ -479,6 +479,23 @@ fn join(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
         }
     }
 
+    // Sometimes make it a LEFT JOIN: unmatched left rows appear NULL-padded,
+    // exercising the per-left-row match bookkeeping.
+    if rng.random_bool(0.25) {
+        let mut sql = format!(
+            "SELECT {cols} FROM {lt} AS l LEFT JOIN {rt} AS r ON l.{lc} = r.{rc}",
+            cols = cols.join(", "),
+            lt = quoted(&left.name),
+            rt = quoted(&right.name),
+            lc = quoted(&lc.name),
+            rc = quoted(&rc.name),
+        );
+        if rng.random_bool(0.3) {
+            let _ = write!(sql, " WHERE r.{} IS NULL", quoted(&rc.name));
+        }
+        return Some(sql);
+    }
+
     // When the matched columns share a name (and the tables differ), the
     // join can be spelled with USING: bare * merges the shared column.
     if lc.name.eq_ignore_ascii_case(&rc.name)
