@@ -2099,9 +2099,30 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         .as_ref()
         .is_some_and(|group_by| !group_by.exprs.is_empty());
 
+    // Subqueries inside an aggregate's arguments or FILTER clause are evaluated
+    // per input row by the aggregate step code in the main loop, even when the
+    // aggregate itself belongs to HAVING or ORDER BY. Deferring them to the
+    // grouped output subroutine would emit their materialization after their
+    // first use, so they must keep their phase floor (issue #6807).
+    let mut aggregate_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
+    for agg in &plan.aggregates {
+        for expr in agg.args.iter().chain(agg.filter_expr.iter()) {
+            walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+                if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
+                    aggregate_subquery_ids.push(*subquery_id);
+                }
+                Ok(WalkControl::Continue)
+            })
+            .expect("walking an expression with an infallible visitor cannot fail");
+        }
+    }
+
     for subquery in plan.non_from_clause_subqueries.iter_mut() {
         subquery.eval_phase = match subquery.origin {
-            SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy if has_grouped_output => {
+            SubqueryOrigin::SelectHaving | SubqueryOrigin::SelectOrderBy
+                if has_grouped_output
+                    && !aggregate_subquery_ids.contains(&subquery.internal_id) =>
+            {
                 SubqueryEvalPhase::GroupedOutput
             }
             _ => subquery.origin.phase_floor(),
