@@ -1158,20 +1158,144 @@ expect error {
     SELECTs to the left and right of UNION ALL do not have the same number of result columns
 }
 
-test matview-vdbe-union-mixed-operators-rejected {
-    CREATE TABLE uf(x INTEGER);
-    CREATE MATERIALIZED VIEW bad_u2 AS SELECT x FROM uf UNION ALL SELECT x FROM uf UNION SELECT x FROM uf;
+# INTERSECT keeps a content row visible only while both sides produce it;
+# duplicate source rows do not multiply the result.
+test matview-vdbe-intersect-maintenance {
+    CREATE TABLE ia(x INTEGER);
+    CREATE TABLE ib(x INTEGER);
+    INSERT INTO ia VALUES (1), (2), (2), (3);
+    INSERT INTO ib VALUES (2), (3), (4);
+    CREATE MATERIALIZED VIEW vi AS SELECT x FROM ia INTERSECT SELECT x FROM ib;
+    SELECT 'init', * FROM vi ORDER BY x;
+    INSERT INTO ib VALUES (1);
+    DELETE FROM ib WHERE x = 2;
+    SELECT 'moved', * FROM vi ORDER BY x;
+    DELETE FROM ia WHERE x = 2;
+    INSERT INTO ib VALUES (2);
+    SELECT 'gone', * FROM vi ORDER BY x;
 }
-expect error {
-    materialized views with mixed UNION/UNION ALL compound SELECTs are not yet supported
+expect {
+    init|2
+    init|3
+    moved|1
+    moved|3
+    gone|1
+    gone|3
 }
 
-test matview-vdbe-intersect-rejected {
-    CREATE TABLE ug(x INTEGER);
-    CREATE MATERIALIZED VIEW bad_u3 AS SELECT x FROM ug INTERSECT SELECT x FROM ug;
+# EXCEPT removes a content row the moment the right side produces it, and
+# restores it when the right side stops.
+test matview-vdbe-except-maintenance {
+    CREATE TABLE ea(x INTEGER);
+    CREATE TABLE eb(x INTEGER);
+    INSERT INTO ea VALUES (1), (2), (3);
+    INSERT INTO eb VALUES (2);
+    CREATE MATERIALIZED VIEW ve AS SELECT x FROM ea EXCEPT SELECT x FROM eb;
+    SELECT 'init', * FROM ve ORDER BY x;
+    INSERT INTO eb VALUES (3);
+    SELECT 'shrunk', * FROM ve ORDER BY x;
+    DELETE FROM eb;
+    SELECT 'back', * FROM ve ORDER BY x;
 }
-expect error {
-    materialized views with INTERSECT/EXCEPT compound SELECTs are not yet supported
+expect {
+    init|1
+    init|3
+    shrunk|1
+    back|1
+    back|2
+    back|3
+}
+
+# Mixed chains fold left-associatively: (a UNION b) INTERSECT c, and a
+# UNION ALL before a deduplicating operator only feeds presence.
+test matview-vdbe-compound-mixed-chain {
+    CREATE TABLE ma(x INTEGER);
+    CREATE TABLE mb(x INTEGER);
+    CREATE TABLE mc(x INTEGER);
+    INSERT INTO ma VALUES (1), (2);
+    INSERT INTO mb VALUES (3);
+    INSERT INTO mc VALUES (2), (3), (4);
+    CREATE MATERIALIZED VIEW vm1 AS SELECT x FROM ma UNION SELECT x FROM mb INTERSECT SELECT x FROM mc;
+    CREATE MATERIALIZED VIEW vm2 AS SELECT x FROM ma UNION ALL SELECT x FROM mb INTERSECT SELECT x FROM mc;
+    CREATE MATERIALIZED VIEW vm3 AS SELECT x FROM ma EXCEPT SELECT x FROM mb UNION SELECT x FROM mc;
+    SELECT 'vm1', * FROM vm1 ORDER BY x;
+    SELECT 'vm2', * FROM vm2 ORDER BY x;
+    SELECT 'vm3', * FROM vm3 ORDER BY x;
+    INSERT INTO mb VALUES (2);
+    DELETE FROM mc WHERE x = 3;
+    SELECT 'wm1', * FROM vm1 ORDER BY x;
+    SELECT 'wm2', * FROM vm2 ORDER BY x;
+    SELECT 'wm3', * FROM vm3 ORDER BY x;
+}
+expect {
+    vm1|2
+    vm1|3
+    vm2|2
+    vm2|3
+    vm3|1
+    vm3|2
+    vm3|3
+    vm3|4
+    wm1|2
+    wm2|2
+    wm3|1
+    wm3|2
+    wm3|4
+}
+
+# A UNION prefix with a trailing UNION ALL keeps two kinds of rows: one
+# deduplicated row per distinct prefix content, plus every suffix row with
+# duplicates preserved. Their hidden-state rowids come from two tables and
+# map to disjoint view rowids.
+test matview-vdbe-compound-union-then-all {
+    CREATE TABLE na(x INTEGER);
+    CREATE TABLE nb(x INTEGER);
+    CREATE TABLE nc(x INTEGER);
+    INSERT INTO na VALUES (1), (2);
+    INSERT INTO nb VALUES (2), (3);
+    INSERT INTO nc VALUES (3), (3), (4);
+    CREATE MATERIALIZED VIEW vn AS SELECT x FROM na UNION SELECT x FROM nb UNION ALL SELECT x FROM nc;
+    SELECT 'init', * FROM vn ORDER BY x;
+    DELETE FROM nc WHERE rowid = 1;
+    INSERT INTO na VALUES (3);
+    SELECT 'after', * FROM vn ORDER BY x;
+    DELETE FROM na;
+    DELETE FROM nb;
+    DELETE FROM nc;
+    SELECT COUNT(*) FROM vn;
+}
+expect {
+    init|1
+    init|2
+    init|3
+    init|3
+    init|3
+    init|4
+    after|1
+    after|2
+    after|3
+    after|3
+    after|4
+    0
+}
+
+# Compound views serve same-transaction reads by recomputation.
+test matview-vdbe-compound-read-your-own-writes {
+    CREATE TABLE ra(x INTEGER);
+    CREATE TABLE rb(x INTEGER);
+    INSERT INTO ra VALUES (1), (2);
+    INSERT INTO rb VALUES (2);
+    CREATE MATERIALIZED VIEW vr AS SELECT x FROM ra INTERSECT SELECT x FROM rb;
+    BEGIN;
+    INSERT INTO rb VALUES (1);
+    SELECT * FROM vr ORDER BY x;
+    ROLLBACK;
+    SELECT * FROM vr ORDER BY x;
+}
+expect {
+    1
+    2
+    2
 }
 
 # Three-way joins: maintenance runs one delta phase per non-empty subset of
