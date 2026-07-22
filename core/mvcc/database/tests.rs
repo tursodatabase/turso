@@ -5693,6 +5693,48 @@ fn test_mvcc_cursor_next_yields_with_injected_yield() {
     );
 }
 
+/// Constructs a cursor against a positive root page with no `table_id_to_rootpage` binding and
+/// returns the resulting error. Shared by the two #7949 regression tests below.
+fn unmapped_positive_root_page_cursor_error(db: &MvccTestDb) -> LimboError {
+    db.conn
+        .execute("CREATE TABLE churn(id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+
+    // A positive root page with no binding in `table_id_to_rootpage`.
+    let unmapped_root_page: i64 = 999;
+    assert!(
+        db.mvcc_store
+            .try_get_table_id_from_root_page_at(unmapped_root_page, u64::MAX)
+            .is_none(),
+        "test precondition: root page {unmapped_root_page} must be unmapped",
+    );
+
+    let result = MvccLazyCursor::new(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        unmapped_root_page,
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(
+            db.conn.pager.load().clone(),
+            unmapped_root_page,
+            1,
+        )),
+    );
+
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+
+    match result {
+        Ok(_) => panic!("expected an error for an unmapped positive root page, got Ok"),
+        Err(e) => e,
+    }
+}
+
 pub(crate) fn commit_tx(
     mv_store: Arc<crate::MvStore>,
     conn: &Arc<Connection>,
