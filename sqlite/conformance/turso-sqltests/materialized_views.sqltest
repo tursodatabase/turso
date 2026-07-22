@@ -1151,7 +1151,6 @@ expect {
     6|3|Chair|150
 }
 
-@skip "aggregate branches in compound SELECT views are not supported by the VDBE maintenance codegen yet"
 test matview-union-with-aggregation {
     CREATE TABLE q1_sales(product TEXT, quantity INTEGER, revenue INTEGER);
     CREATE TABLE q2_sales(product TEXT, quantity INTEGER, revenue INTEGER);
@@ -1173,11 +1172,10 @@ test matview-union-with-aggregation {
     SELECT * FROM half_year_summary ORDER BY quarter;
 }
 expect {
-    Q1|68.0|16450.0
-    Q2|105.0|21750.0
+    Q1|68|16450
+    Q2|105|21750
 }
 
-@skip "join branches in compound SELECT views are not supported by the VDBE maintenance codegen yet"
 test matview-union-with-join {
     CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, type TEXT);
     CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, amount INTEGER);
