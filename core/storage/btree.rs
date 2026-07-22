@@ -11093,8 +11093,7 @@ mod tests {
             let index_def = Index {
                 name: "testindex".to_string(),
                 where_clause: None,
-                columns: IndexColumn::new_many((0..10).map(|i| format!("test{i}")))
-                    .collect::<Vec<_>>(),
+                columns: IndexColumn::new_many((0..10).map(|i| format!("test{i}"))),
                 table_name: "test".to_string(),
                 root_page: index_root_page,
                 unique: false,
@@ -11267,7 +11266,7 @@ mod tests {
             let index_def = Index {
                 name: "testindex".to_string(),
                 where_clause: None,
-                columns: IndexColumn::new_many(vec!["testcol"]).collect::<Vec<_>>(),
+                columns: IndexColumn::new_many(vec!["testcol"]),
                 table_name: "test".to_string(),
                 root_page: index_root_page,
                 unique: false,

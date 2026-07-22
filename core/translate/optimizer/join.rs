@@ -3257,7 +3257,7 @@ mod tests {
             name: "idx1".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
-            columns: IndexColumn::new_many(vec!["c1", "c2", "c3"]).collect::<Vec<_>>(),
+            columns: IndexColumn::new_many(vec!["c1", "c2", "c3"]),
             root_page: 2,
             ephemeral: false,
             has_rowid: true,

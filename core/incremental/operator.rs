@@ -46,8 +46,7 @@ pub fn create_dbsp_state_index(root_page: i64) -> Index {
         name: "dbsp_state_pk".to_string(),
         table_name: "dbsp_state".to_string(),
         root_page,
-        columns: IndexColumn::new_many(vec!["operator_id", "zset_id", "element_id"])
-            .collect::<Vec<_>>(),
+        columns: IndexColumn::new_many(vec!["operator_id", "zset_id", "element_id"]),
         unique: true,
         ephemeral: false,
         has_rowid: true,

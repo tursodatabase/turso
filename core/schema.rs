@@ -5648,16 +5648,27 @@ impl IndexColumn {
         }
     }
 
-    /// Similar to [IndexColumn::new], but returns a 0-ordered sequence of columns.
-    pub fn new_many(names: impl IntoIterator<Item = impl ToString>) -> impl Iterator<Item = Self> {
-        names.into_iter().enumerate().map(|(i, name)| Self {
-            name: name.to_string(),
-            order: SortOrder::Asc,
-            pos_in_table: i,
-            collation: None,
-            default: None,
-            expr: None,
-        })
+    pub fn new_many<I>(names: I) -> Vec<Self>
+    where
+        I: IntoIterator,
+        I::Item: ToString,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let iter = names.into_iter();
+        let mut cols = <Vec<_> as TursoVecExt<_>>::with_capacity(iter.len());
+
+        iter.enumerate()
+            .map(|(i, name)| Self {
+                name: name.to_string(),
+                order: SortOrder::Asc,
+                pos_in_table: i,
+                collation: None,
+                default: None,
+                expr: None,
+            })
+            .for_each(|col| cols.push(col));
+
+        cols
     }
 }
 
