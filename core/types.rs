@@ -2360,6 +2360,10 @@ where
 
 pub fn compare_handling_nulls(a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
     let cmp = compare_immutable_single(a, b, key.collation);
+    finish_key_comparison(cmp, a, b, key)
+}
+
+pub fn finish_key_comparison(cmp: Ordering, a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
     if cmp != Ordering::Equal {
         let involves_null = matches!(a, ValueRef::Null) || matches!(b, ValueRef::Null);
         if involves_null {

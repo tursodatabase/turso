@@ -12,7 +12,7 @@ use std::rc::Rc;
 use crate::alloc::vec;
 use crate::alloc::*;
 use crate::io::TempFile;
-use crate::types::{compare_handling_nulls, IOCompletions, ValueIterator};
+use crate::types::{compare_handling_nulls, finish_key_comparison, IOCompletions, ValueIterator};
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, CompletionGroup, File, IO},
@@ -943,19 +943,15 @@ impl ArenaSortableRecord {
             .zip(index_key_info.iter())
             .enumerate()
         {
-            if let Some(Some(comparator)) = comparators.get(i) {
-                let cmp = comparator(&self_val, &other_val).expect("Memory allocation failed here");
-                if cmp != Ordering::Equal {
-                    return cmp;
-                }
+            let cmp = if let Some(Some(comparator)) = comparators.get(i) {
+                let base =
+                    comparator(&self_val, &other_val).expect("Memory allocation failed here");
+                finish_key_comparison(base, &self_val, &other_val, key_info)
+            } else {
+                compare_handling_nulls(&self_val, &other_val, key_info)
             };
-
-            let cmp = compare_handling_nulls(&self_val, &other_val, key_info);
             if cmp != Ordering::Equal {
-                return match key_info.sort_order {
-                    SortOrder::Asc => cmp,
-                    SortOrder::Desc => cmp.reverse(),
-                };
+                return cmp;
             }
         }
 
@@ -1369,5 +1365,94 @@ mod tests {
             values.push(value);
         }
         values
+    }
+
+    fn assert_secondary_key_sort(
+        second_order: SortOrder,
+        second_nulls: Option<turso_parser::ast::NullsOrder>,
+        seconds: &[Value],
+        expected: &[ValueRef],
+    ) {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc, second_order],
+            try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![None, second_nulls].unwrap(),
+            try_vec![None, None].unwrap(),
+            1 << 20,
+            64,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+
+        for second in seconds {
+            let values = try_vec![Value::from_i64(1), second.clone()].unwrap();
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            io.block(|| sorter.insert(&record))
+                .expect("Failed to insert the record");
+        }
+
+        io.block(|| sorter.sort())
+            .expect("Failed to sort the records");
+        assert!(sorter.chunks.is_empty());
+
+        let mut idx = 0;
+        while sorter.has_more() {
+            {
+                let record = sorter.record().unwrap();
+                let vals = record.get_values().unwrap();
+                assert_eq!(vals[0], ValueRef::from_i64(1));
+                assert_eq!(vals[1], expected[idx]);
+            }
+            idx += 1;
+            io.block(|| sorter.next())
+                .expect("Failed to get the next record");
+        }
+        assert_eq!(idx, expected.len());
+    }
+
+    #[test]
+    fn in_memory_sort_applies_desc_on_secondary_key() {
+        let seconds = try_vec![
+            Value::from_i64(10),
+            Value::from_i64(40),
+            Value::from_i64(20),
+            Value::from_i64(30)
+        ]
+        .unwrap();
+        assert_secondary_key_sort(
+            SortOrder::Desc,
+            None,
+            &seconds,
+            &[
+                ValueRef::from_i64(40),
+                ValueRef::from_i64(30),
+                ValueRef::from_i64(20),
+                ValueRef::from_i64(10),
+            ],
+        );
+    }
+
+    #[test]
+    fn in_memory_sort_places_nulls_last_on_desc_secondary_key() {
+        let seconds = try_vec![
+            Value::Null,
+            Value::from_i64(10),
+            Value::Null,
+            Value::from_i64(20)
+        ]
+        .unwrap();
+        assert_secondary_key_sort(
+            SortOrder::Desc,
+            Some(turso_parser::ast::NullsOrder::Last),
+            &seconds,
+            &[
+                ValueRef::from_i64(20),
+                ValueRef::from_i64(10),
+                ValueRef::Null,
+                ValueRef::Null,
+            ],
+        );
     }
 }
