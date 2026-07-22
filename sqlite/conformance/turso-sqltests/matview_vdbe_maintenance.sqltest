@@ -784,6 +784,93 @@ expect error {
     materialized views with outer joins are not yet supported
 }
 
+# USING desugars to equality predicates against the left-most table with
+# each merged column; the star expansion shows the merged column once, and
+# unqualified references to it resolve without ambiguity.
+test matview-vdbe-join-using {
+    CREATE TABLE ul(a INTEGER, b TEXT);
+    CREATE TABLE ur(a INTEGER, c TEXT);
+    INSERT INTO ul VALUES (1, 'x'), (2, 'y');
+    INSERT INTO ur VALUES (1, 'p'), (1, 'q'), (3, 'z');
+    CREATE MATERIALIZED VIEW vu AS SELECT * FROM ul JOIN ur USING (a) WHERE a >= 1;
+    SELECT 'init', * FROM vu ORDER BY 2, 4;
+    INSERT INTO ul VALUES (3, 'w');
+    DELETE FROM ur WHERE c = 'q';
+    SELECT 'after', * FROM vu ORDER BY 2, 4;
+}
+expect {
+    init|1|x|p
+    init|1|x|q
+    after|1|x|p
+    after|3|w|z
+}
+
+# NATURAL is USING over the common column names. table.* keeps the merged
+# column (only bare * merges), matching SQLite.
+test matview-vdbe-join-natural {
+    CREATE TABLE nl(a INTEGER, b TEXT);
+    CREATE TABLE nr(a INTEGER, c TEXT);
+    INSERT INTO nl VALUES (1, 'x');
+    INSERT INTO nr VALUES (1, 'p');
+    CREATE MATERIALIZED VIEW vn1 AS SELECT * FROM nl NATURAL JOIN nr;
+    CREATE MATERIALIZED VIEW vn2 AS SELECT a, nr.*, b FROM nl JOIN nr USING (a);
+    SELECT 'vn1', * FROM vn1;
+    SELECT 'vn2', * FROM vn2;
+    INSERT INTO nl VALUES (2, 'y');
+    INSERT INTO nr VALUES (2, 'q');
+    SELECT 'wn1', * FROM vn1 ORDER BY 2;
+}
+expect {
+    vn1|1|x|p
+    vn2|1|1|p|x
+    wn1|1|x|p
+    wn1|2|y|q
+}
+
+# Chained USING joins merge per join, and aggregates group by the merged
+# column through the shared binding rules.
+test matview-vdbe-join-using-chained-aggregate {
+    CREATE TABLE ca(a INTEGER, b TEXT);
+    CREATE TABLE cb(a INTEGER, c TEXT);
+    CREATE TABLE cc(c TEXT, d INTEGER);
+    INSERT INTO ca VALUES (1, 'x'), (2, 'y');
+    INSERT INTO cb VALUES (1, 'p'), (1, 'q'), (2, 'p');
+    INSERT INTO cc VALUES ('p', 10), ('q', 20);
+    CREATE MATERIALIZED VIEW vc1 AS SELECT * FROM ca JOIN cb USING (a) JOIN cc USING (c);
+    CREATE MATERIALIZED VIEW vc2 AS SELECT c, SUM(d) AS s FROM ca JOIN cb USING (a) JOIN cc USING (c) GROUP BY c;
+    SELECT 'vc1', * FROM vc1 ORDER BY 2, 3;
+    SELECT 'vc2', * FROM vc2 ORDER BY c;
+    DELETE FROM cb WHERE a = 1 AND c = 'q';
+    SELECT 'wc2', * FROM vc2 ORDER BY c;
+}
+expect {
+    vc1|1|x|p|10
+    vc1|1|x|q|20
+    vc1|2|y|p|10
+    vc2|p|20
+    vc2|q|20
+    wc2|p|20
+}
+
+# USING requires the column on both sides; NATURAL or USING between tables
+# with the same identifier cannot qualify the desugared predicates.
+test matview-vdbe-join-using-missing-column-rejected {
+    CREATE TABLE ml(a INTEGER, b TEXT);
+    CREATE TABLE mr(a INTEGER, c TEXT);
+    CREATE MATERIALIZED VIEW badm AS SELECT * FROM ml JOIN mr USING (b);
+}
+expect error {
+    cannot join using column b - column not present in both tables
+}
+
+test matview-vdbe-join-using-self-rejected {
+    CREATE TABLE sl(a INTEGER);
+    CREATE MATERIALIZED VIEW bads AS SELECT * FROM sl JOIN sl USING (a);
+}
+expect error {
+    NATURAL or USING joins between tables with the same name
+}
+
 test matview-vdbe-join-distinct-rejected {
     CREATE TABLE jl7(x INTEGER);
     CREATE TABLE jr7(y INTEGER);

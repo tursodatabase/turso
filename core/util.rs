@@ -1853,6 +1853,90 @@ pub fn validate_select_for_views(
 }
 
 /// Extract column information from a SELECT statement for view creation
+/// Per joined table of a FROM clause, the column names its join constraint
+/// merges: the explicit `USING` names, or the common column names for a
+/// NATURAL join (each resolved against the earlier tables left to right,
+/// the way the planner desugars NATURAL into USING). Entry 0 (the left-most
+/// table) is always empty, as are entries for ON or unconstrained joins.
+/// Validates the SQLite rules: NATURAL takes no ON/USING clause, and every
+/// USING column must be present on both sides.
+pub fn join_using_columns(from: &ast::FromClause, schema: &Schema) -> Result<Vec<Vec<String>>> {
+    let table_columns = |select_table: &ast::SelectTable| -> Vec<Column> {
+        if let ast::SelectTable::Table(name, _, _) = select_table {
+            if let Some(table) = schema.get_table(name.name.as_str()) {
+                return table.columns().to_vec();
+            }
+        }
+        Vec::new()
+    };
+    let mut columns_per_table = vec![table_columns(from.select.as_ref())];
+    let mut using_per_table = vec![Vec::new()];
+    for join in &from.joins {
+        let right_columns = table_columns(join.table.as_ref());
+        let natural = matches!(
+            &join.operator,
+            ast::JoinOperator::TypedJoin(Some(join_type))
+                if join_type.contains(ast::JoinType::NATURAL)
+        );
+        let using_names: Vec<String> = if natural {
+            if join.constraint.is_some() {
+                return Err(LimboError::ParseError(
+                    "a NATURAL join may not have an ON or USING clause".to_string(),
+                ));
+            }
+            // Common non-hidden column names, resolved to the left column's
+            // spelling from the left-most earlier table that has them.
+            let mut names = Vec::new();
+            for right_col in right_columns.iter().filter(|col| !col.hidden()) {
+                'left: for left_columns in &columns_per_table {
+                    for left_col in left_columns.iter().filter(|col| !col.hidden()) {
+                        if left_col
+                            .name
+                            .as_deref()
+                            .zip(right_col.name.as_deref())
+                            .is_some_and(|(l, r)| l.eq_ignore_ascii_case(r))
+                        {
+                            names.push(left_col.name.clone().expect("matched on the name"));
+                            break 'left;
+                        }
+                    }
+                }
+            }
+            names
+        } else if let Some(ast::JoinConstraint::Using(names)) = &join.constraint {
+            let mut resolved = Vec::with_capacity(names.len());
+            for name in names {
+                let normalized = normalize_ident(name.as_str());
+                let in_left = columns_per_table.iter().any(|columns| {
+                    columns.iter().any(|col| {
+                        col.name
+                            .as_deref()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
+                    })
+                });
+                let in_right = right_columns.iter().any(|col| {
+                    col.name
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
+                });
+                if !in_left || !in_right {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot join using column {} - column not present in both tables",
+                        name.as_str()
+                    )));
+                }
+                resolved.push(normalized);
+            }
+            resolved
+        } else {
+            Vec::new()
+        };
+        columns_per_table.push(right_columns);
+        using_per_table.push(using_names);
+    }
+    Ok(using_per_table)
+}
+
 pub fn extract_view_columns(
     select_stmt: &ast::Select,
     schema: &Schema,
@@ -1961,10 +2045,27 @@ pub fn extract_view_columns(
                     });
                 }
                 ast::ResultColumn::Star => {
-                    // For SELECT *, expand to all columns from all tables
+                    // For SELECT *, expand to all columns from all tables.
+                    // A USING (or NATURAL) join merges its columns: the
+                    // right table's copy is not part of the star expansion.
+                    let using_per_table = from
+                        .as_ref()
+                        .map(|from| join_using_columns(from, schema))
+                        .transpose()?
+                        .unwrap_or_default();
                     for (table_idx, table) in tables.iter().enumerate() {
                         if let Some(table_obj) = schema.get_table(&table.name) {
                             for table_column in table_obj.columns() {
+                                if using_per_table.get(table_idx).is_some_and(|using| {
+                                    using.iter().any(|u| {
+                                        table_column
+                                            .name
+                                            .as_deref()
+                                            .is_some_and(|n| n.eq_ignore_ascii_case(u))
+                                    })
+                                }) {
+                                    continue;
+                                }
                                 let col_name =
                                     table_column.name.clone().unwrap_or_else(|| "?".to_string());
 

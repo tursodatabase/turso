@@ -479,6 +479,20 @@ fn join(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
         }
     }
 
+    // When the matched columns share a name (and the tables differ), the
+    // join can be spelled with USING: bare * merges the shared column.
+    if lc.name.eq_ignore_ascii_case(&rc.name)
+        && !left.name.eq_ignore_ascii_case(&right.name)
+        && rng.random_bool(0.5)
+    {
+        return Some(format!(
+            "SELECT * FROM {lt} JOIN {rt} USING ({c})",
+            lt = quoted(&left.name),
+            rt = quoted(&right.name),
+            c = quoted(&lc.name),
+        ));
+    }
+
     // Sometimes aggregate over the join instead of projecting it.
     if rng.random_bool(0.4) {
         let group_col = &left.columns[rng.random_range(0..left.columns.len())];
