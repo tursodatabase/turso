@@ -18,6 +18,7 @@ pub enum ValueBlobAllocationSite {
     JsonbCopy,
     Hash128,
     RecordDecode,
+    CloneFrom,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

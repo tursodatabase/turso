@@ -340,6 +340,62 @@ pub enum Value {
     Blob(#[cfg_attr(feature = "serde", serde(with = "value_blob_serde"))] ValueBlob),
 }
 
+impl TryClone for Value {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        match self {
+            Self::Null => Ok(Self::Null),
+            Self::Numeric(numeric) => Ok(Self::Numeric(*numeric)),
+            Self::Text(text) => {
+                let mut value = String::new();
+                value.try_reserve(text.as_str().len())?;
+                value.push_str(text.as_str());
+                Ok(Self::Text(Text {
+                    value: Cow::Owned(value),
+                    subtype: text.subtype,
+                }))
+            }
+            Self::Blob(blob) => Self::from_slice(blob),
+        }
+    }
+
+    /// Fallibly copies `source` into `self`, reusing the existing Text/Blob
+    /// allocation when the variants match, so hot per-row copies are
+    /// allocation-free once buffers have grown to the row size. On allocation
+    /// failure `self` is left valid but unspecified (an empty Text/Blob).
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
+    fn try_clone_from(&mut self, source: &Self) -> Result<(), Self::Error> {
+        match (self, source) {
+            (Self::Text(dst), Self::Text(src)) => {
+                let src_str = src.as_str();
+                match &mut dst.value {
+                    Cow::Owned(s) => {
+                        s.clear();
+                        s.try_reserve(src_str.len())?;
+                        s.push_str(src_str);
+                    }
+                    borrowed => {
+                        let mut s = String::new();
+                        s.try_reserve(src_str.len())?;
+                        s.push_str(src_str);
+                        *borrowed = Cow::Owned(s);
+                    }
+                }
+                dst.subtype = src.subtype;
+            }
+            (Self::Blob(dst), Self::Blob(src)) => {
+                dst.clear();
+                dst.try_extend(src.iter().copied())?;
+            }
+            (dst, src) => {
+                *dst = src.try_clone()?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum ValueRef<'a> {
     Null,
@@ -4502,6 +4558,65 @@ mod tests {
                 cnt, num_values,
                 "column_count should be {num_values}, not {cnt}"
             );
+        }
+    }
+
+    #[test]
+    fn test_value_try_clone_from_reuses_allocations() {
+        let src = Value::build_text(String::from("short"));
+        let mut dst =
+            Value::build_text(String::from("a destination string with plenty of capacity"));
+        let ptr = match &dst {
+            Value::Text(t) => t.as_str().as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Value::Text(t) => assert_eq!(t.as_str().as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        let mut dst = Value::build_text("static text");
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+
+        let src = Value::Blob(vec![1, 2, 3]);
+        let mut big_blob: ValueBlob = vec![];
+        big_blob.extend(0u8..32);
+        let mut dst = Value::Blob(big_blob);
+        let ptr = match &dst {
+            Value::Blob(b) => b.as_ptr(),
+            _ => unreachable!(),
+        };
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        match &dst {
+            Value::Blob(b) => assert_eq!(b.as_ptr(), ptr),
+            _ => unreachable!(),
+        }
+
+        let src = Value::from_i64(9);
+        let mut dst = Value::build_text("text");
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+        let src = Value::build_text("into an integer slot");
+        let mut dst = Value::from_i64(3);
+        dst.try_clone_from(&src).unwrap();
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn test_value_try_clone() {
+        let values = [
+            Value::Null,
+            Value::from_i64(7),
+            Value::build_text("text"),
+            Value::Blob(vec![1, 2, 3]),
+        ];
+
+        for value in values {
+            assert_eq!(value.try_clone().unwrap(), value);
         }
     }
 }

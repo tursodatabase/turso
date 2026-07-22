@@ -438,6 +438,16 @@ impl TryClone for FallibleElem {
 }
 
 #[test]
+fn try_clone_from_uses_default_replacement() {
+    let source = 7_u32;
+    let mut destination = 3_u32;
+
+    destination.try_clone_from(&source).unwrap();
+
+    assert_eq!(destination, source);
+}
+
+#[test]
 fn vec_try_clone_clones_elements_fallibly() {
     let mut source: Vec<FallibleElem> = self::vec![];
     source.try_push(FallibleElem).unwrap();
