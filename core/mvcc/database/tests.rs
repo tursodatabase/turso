@@ -8170,7 +8170,7 @@ fn test_mvcc_conn_drop_releases_read_tx() {
     conn.execute("CREATE TABLE t(x)").unwrap();
 
     let pager = conn.pager.load();
-    pager.begin_read_tx().unwrap();
+    while let IOResult::IO(_) = pager.begin_read_tx().unwrap() {}
     let wal = pager.wal.as_ref().expect("wal should be enabled").clone();
     assert!(wal.holds_read_lock());
 
@@ -8662,7 +8662,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         on_conflict: None,
     };
 
-    pager.begin_read_tx().unwrap();
+    while let IOResult::IO(_) = pager.begin_read_tx().unwrap() {}
     run_pager_until_done(
         || pager.begin_write_tx(crate::storage::wal::WalAutoActions::all_enabled()),
         pager.as_ref(),
@@ -8704,7 +8704,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
     }
     run_pager_until_done(|| pager.commit_tx(&db.conn, true), pager.as_ref()).unwrap();
 
-    pager.begin_read_tx().unwrap();
+    while let IOResult::IO(_) = pager.begin_read_tx().unwrap() {}
     let mut interior_key = None;
     for key in 1..=600 {
         let record =
@@ -8757,7 +8757,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
     }
     run_pager_until_done(|| pager.commit_tx(&db.conn, true), pager.as_ref()).unwrap();
 
-    pager.begin_read_tx().unwrap();
+    while let IOResult::IO(_) = pager.begin_read_tx().unwrap() {}
     let count_after = run_pager_until_done(|| cursor.write().count(), pager.as_ref()).unwrap();
     assert_eq!(
         count_after, count_before,

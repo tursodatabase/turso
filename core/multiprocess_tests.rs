@@ -1059,7 +1059,7 @@ fn multiprocess_shm_hold_read_tx_child_process() {
     let conn = db.connect().unwrap();
     let pager = conn.pager.load();
     let wal = pager.wal.as_ref().unwrap();
-    wal.begin_read_tx().unwrap();
+    while let crate::types::IOResult::IO(_) = wal.begin_read_tx().unwrap() {}
     std::fs::write(&ready_file, b"ready").unwrap();
     wait_for_file(&release_file);
     wal.end_read_tx();

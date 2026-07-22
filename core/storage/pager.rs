@@ -2920,18 +2920,18 @@ impl Pager {
 
     #[inline(always)]
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn begin_read_tx(&self) -> Result<()> {
+    pub fn begin_read_tx(&self) -> Result<IOResult<()>> {
         let Some(wal) = self.wal.as_ref() else {
-            return Ok(());
+            return Ok(IOResult::Done(()));
         };
-        let changed = wal.begin_read_tx()?;
+        let changed = return_if_io!(wal.begin_read_tx());
         if changed {
             // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
             self.clear_page_cache(false);
             // Invalidate cached schema cookie to force re-read on next access
             self.set_schema_cookie(None);
         }
-        Ok(())
+        Ok(IOResult::Done(()))
     }
 
     /// MVCC-only: refresh connection-private WAL change counters without starting a read tx and invalidate cache if needed.

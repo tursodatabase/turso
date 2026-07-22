@@ -472,18 +472,6 @@ pub trait IO: Clock + Send + Sync {
         ))
     }
 
-    /// Yield the current thread to the scheduler.
-    /// Used for backoff in contended lock acquisition.
-    fn yield_now(&self) {
-        crate::thread::yield_now();
-    }
-
-    /// Sleep for the specified duration.
-    /// Used for progressive backoff in contended lock acquisition.
-    fn sleep(&self, duration: std::time::Duration) {
-        crate::thread::sleep(duration);
-    }
-
     /// Return the file identity for the given path.
     /// Default uses OS-level metadata; non-filesystem backends override
     /// with synthetic hash-based identity.

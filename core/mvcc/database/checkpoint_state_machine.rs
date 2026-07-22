@@ -2087,7 +2087,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     .as_ref()
                     .is_some_and(|wal| wal.holds_read_lock());
                 if !read_tx_active {
-                    self.pager.begin_read_tx()?;
+                    match self.pager.begin_read_tx()? {
+                        IOResult::Done(()) => {}
+                        IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+                    }
                     self.lock_states.pager_read_tx = true;
                 }
 

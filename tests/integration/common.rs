@@ -48,9 +48,6 @@ impl Clock for TestIo {
 }
 
 impl IO for TestIo {
-    // we don't sleep in test io in order to make tests faster
-    fn sleep(&self, _duration: std::time::Duration) {}
-
     fn open_file(
         &self,
         path: &str,
@@ -93,9 +90,6 @@ impl IO for TestIo {
     }
     fn wait_for_completion(&self, c: turso_core::Completion) -> turso_core::Result<()> {
         self.io.wait_for_completion(c)
-    }
-    fn yield_now(&self) {
-        self.io.yield_now();
     }
 }
 
