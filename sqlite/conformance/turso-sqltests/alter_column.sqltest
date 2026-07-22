@@ -630,6 +630,22 @@ expect {
     ok
 }
 
+test alter-column-rewrites-indexed-virtual-expression-change {
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE t(a TEXT, g TEXT GENERATED ALWAYS AS ('old:' || a) VIRTUAL);
+    CREATE INDEX idx_g ON t(g);
+    INSERT INTO t(a) VALUES('a'),('b');
+    ALTER TABLE t ALTER COLUMN g TO h TEXT GENERATED ALWAYS AS ('new:' || a) VIRTUAL;
+    SELECT h FROM t INDEXED BY idx_g WHERE h >= 'new:' ORDER BY h;
+    PRAGMA integrity_check;
+}
+expect {
+    wal
+    new:a
+    new:b
+    ok
+}
+
 test alter-column-text-to-integer-coerces-existing-rows {
     CREATE TABLE t (x TEXT);
     INSERT INTO t VALUES ('42'), ('abc');
