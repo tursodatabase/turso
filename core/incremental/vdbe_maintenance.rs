@@ -43,6 +43,7 @@ use std::sync::Arc;
 use turso_parser::ast;
 
 use crate::function::{AggFunc, Func};
+use crate::incremental::dag;
 use crate::incremental::dbsp::Delta;
 use crate::schema::{BTreeTable, Schema};
 use crate::translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
@@ -645,6 +646,258 @@ fn expand_join_output_exprs(
         }
     }
     Ok(group_exprs)
+}
+
+/// Decompose a view's defining `SELECT` into the incremental operator DAG
+/// (see [`crate::incremental::dag`]). Generic relational-algebra
+/// decomposition — a `SELECT` core lowers to `Scan`(s) → `Join`? →
+/// `Filter`(WHERE) → `Aggregate`? → `Filter`(HAVING) → `Project` →
+/// `Distinct`?, with no per-shape dispatch and no combination-specific
+/// logic. Reuses the per-operator extraction helpers ([`collect_join_tables`],
+/// [`classify_group_aggregate`], [`expand_join_output_exprs`]).
+///
+/// During migration this runs on selects `classify_view` has already
+/// accepted, so it assumes validity and produces structure only; the CREATE
+/// gate's per-operator validation folds in here at cutover.
+#[allow(dead_code)] // wired in by the DAG codegen (next slice)
+pub fn build_dag(
+    select: &ast::Select,
+    schema: &Schema,
+    resolver: &Resolver,
+) -> Result<dag::MaintenanceDag> {
+    let mut builder = dag::DagBuilder::new();
+    let root = build_select(&mut builder, select, schema, resolver)?;
+    Ok(builder.finish(root))
+}
+
+#[allow(dead_code)] // wired in by the DAG codegen (next slice)
+fn build_select(
+    builder: &mut dag::DagBuilder,
+    select: &ast::Select,
+    schema: &Schema,
+    resolver: &Resolver,
+) -> Result<dag::NodeId> {
+    if select.body.compounds.is_empty() {
+        return build_select_core(builder, &select.body.select, schema, resolver);
+    }
+
+    // Compound → one SetOp over each branch's sub-DAG. Both the deduplicating
+    // compounds and pure UNION ALL collapse into this single node; the branch
+    // sub-DAGs may be any shape, since a branch is just another SELECT.
+    let operators: Vec<ast::CompoundOperator> =
+        select.body.compounds.iter().map(|c| c.operator).collect();
+    let n_branches = operators.len() + 1;
+    let mut inputs = Vec::with_capacity(n_branches);
+    for branch_idx in 0..n_branches {
+        inputs.push(build_select(
+            builder,
+            &branch_select(select, branch_idx),
+            schema,
+            resolver,
+        )?);
+    }
+
+    // Leading branches deduplicated by content: up to and including the right
+    // side of the last non-UNION-ALL operator (0 for pure UNION ALL).
+    let prefix_len = operators
+        .iter()
+        .rposition(|op| *op != ast::CompoundOperator::UnionAll)
+        .map_or(0, |last_dedup| last_dedup + 2);
+    let arity = crate::util::extract_view_columns(&branch_select(select, 0), schema)?
+        .columns
+        .len();
+
+    // Content-key collation per column: the left-most deduplicated branch
+    // that resolves a collation wins (matching compound dedup indexes).
+    let mut folded: Vec<Option<CollationSeq>> = Vec::new();
+    for branch_idx in 0..prefix_len {
+        let branch = if branch_idx == 0 {
+            &select.body.select
+        } else {
+            &select.body.compounds[branch_idx - 1].select
+        };
+        let (_, branch_collations) = validate_union_branch(branch, schema, resolver)?;
+        if folded.is_empty() {
+            folded = branch_collations;
+        } else {
+            for (slot, collation) in folded.iter_mut().zip(branch_collations) {
+                if slot.is_none() {
+                    *slot = collation;
+                }
+            }
+        }
+    }
+    let key_collations = folded
+        .into_iter()
+        .map(|collation| collation.unwrap_or(CollationSeq::Binary))
+        .collect();
+
+    Ok(builder.push(dag::OpNode::SetOp {
+        inputs,
+        operators,
+        arity,
+        prefix_len,
+        key_collations,
+    }))
+}
+
+#[allow(dead_code)] // wired in by the DAG codegen (next slice)
+fn build_select_core(
+    builder: &mut dag::DagBuilder,
+    one_select: &ast::OneSelect,
+    schema: &Schema,
+    resolver: &Resolver,
+) -> Result<dag::NodeId> {
+    let ast::OneSelect::Select {
+        distinctness,
+        columns,
+        from,
+        where_clause,
+        group_by,
+        ..
+    } = one_select
+    else {
+        return unsupported("VALUES");
+    };
+    let from = from.as_ref().expect("view definition has a FROM clause");
+
+    // Source: a scan per FROM table, joined when there is more than one.
+    let mut node = build_source(builder, from, schema, resolver)?;
+
+    // WHERE: selection over the source. For a LEFT join this is the Filter
+    // above the join (ON gates matching in the Join node, WHERE gates output
+    // over the padded rows) — pure composition, not a special case.
+    if let Some(where_clause) = where_clause {
+        node = builder.push(dag::OpNode::Filter {
+            input: node,
+            predicate: where_clause.as_ref().clone(),
+        });
+    }
+
+    // Aggregation, if the query groups or references aggregates anywhere.
+    let mut has_aggregates = group_by.is_some();
+    for column in columns {
+        if let ast::ResultColumn::Expr(expr, _) = column {
+            let mut aggs = Vec::new();
+            if resolve_window_and_aggregate_functions(expr, resolver, &mut aggs, None, &mut [])? {
+                has_aggregates = true;
+            }
+        }
+    }
+
+    if has_aggregates {
+        let base_tables: Vec<Arc<BTreeTable>> = std::iter::once(from.select.as_ref())
+            .chain(from.joins.iter().map(|join| join.table.as_ref()))
+            .filter_map(|table| match table {
+                ast::SelectTable::Table(name, _, _) => schema.get_btree_table(name.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Reuse the aggregate-operator extraction (group keys, collected
+        // aggregates, collations); HAVING and the output expressions become
+        // the Filter/Project above, not fields of the operator.
+        let shape = classify_group_aggregate(columns, group_by, from, &base_tables, schema, resolver)?;
+        let ViewShape::GroupAggregate {
+            group_exprs,
+            group_collations,
+            aggregates,
+            multiset_collation,
+            having,
+            scalar,
+            ..
+        } = shape
+        else {
+            unreachable!("classify_group_aggregate returns a GroupAggregate shape");
+        };
+        node = builder.push(dag::OpNode::Aggregate {
+            input: node,
+            group_exprs,
+            group_collations,
+            aggregates,
+            multiset_collation,
+            scalar,
+        });
+        if let Some(having) = having {
+            node = builder.push(dag::OpNode::Filter {
+                input: node,
+                predicate: having,
+            });
+        }
+        // Output expressions over the group row (group keys, aggregate
+        // results, expressions over them). No stars (rejected with GROUP BY).
+        let projections = columns
+            .iter()
+            .map(|column| match column {
+                ast::ResultColumn::Expr(expr, alias) => {
+                    Ok((expr.as_ref().clone(), projection_alias(alias)))
+                }
+                _ => unsupported("star projection combined with GROUP BY"),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        node = builder.push(dag::OpNode::Project {
+            input: node,
+            projections,
+        });
+    } else {
+        // Plain projection, stars expanded across the FROM tables.
+        let projections = expand_join_output_exprs(from, schema, columns, resolver)?
+            .into_iter()
+            .map(|expr| (expr, None))
+            .collect();
+        node = builder.push(dag::OpNode::Project {
+            input: node,
+            projections,
+        });
+    }
+
+    if matches!(distinctness, Some(ast::Distinctness::Distinct)) {
+        node = builder.push(dag::OpNode::Distinct { input: node });
+    }
+
+    Ok(node)
+}
+
+/// Build the FROM source: one [`dag::OpNode::Scan`] per table, combined by a
+/// [`dag::OpNode::Join`] when there is more than one. Returns the source node.
+#[allow(dead_code)] // wired in by the DAG codegen (next slice)
+fn build_source(
+    builder: &mut dag::DagBuilder,
+    from: &ast::FromClause,
+    schema: &Schema,
+    _resolver: &Resolver,
+) -> Result<dag::NodeId> {
+    let (tables, on) = collect_join_tables(from, schema)?;
+    let scans: Vec<dag::NodeId> = tables
+        .iter()
+        .map(|(table, identifier, _)| {
+            builder.push(dag::OpNode::Scan {
+                table: table.clone(),
+                identifier: identifier.clone(),
+            })
+        })
+        .collect();
+    if scans.len() == 1 {
+        return Ok(scans[0]);
+    }
+    let left_outer = from.joins.iter().any(|join| {
+        matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(ast::JoinType::LEFT))
+    });
+    let using = tables.iter().map(|(_, _, u)| u.clone()).collect();
+    Ok(builder.push(dag::OpNode::Join {
+        inputs: scans,
+        using,
+        on,
+        left_outer,
+    }))
+}
+
+/// The output-column name for a projection, from an explicit alias only.
+#[allow(dead_code)] // wired in by the DAG codegen (next slice)
+fn projection_alias(alias: &Option<ast::As>) -> Option<String> {
+    match alias {
+        Some(ast::As::As(name) | ast::As::Elided(name)) => Some(name.as_str().to_string()),
+        _ => None,
+    }
 }
 
 /// Classify a view definition into its maintainable shape.
