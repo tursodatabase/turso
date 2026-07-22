@@ -52,7 +52,8 @@ use crate::translate::expr::{
     BindingBehavior, ConditionMetadata, NoConstantOptReason, WalkControl,
 };
 use crate::translate::plan::{
-    Aggregate, ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
+    Aggregate, ColumnUsedMask, IterationDirection, JoinInfo, JoinedTable, Operation, Scan,
+    TableReferences,
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::turso_assert;
@@ -641,19 +642,39 @@ pub fn classify_view(
                 {
                     return unsupported("outer joins");
                 }
-                if join_type.contains(ast::JoinType::NATURAL) {
-                    return unsupported("NATURAL joins");
-                }
             }
             if !matches!(join.table.as_ref(), ast::SelectTable::Table(_, _, _)) {
                 return unsupported("subqueries or table functions in FROM");
             }
-            match &join.constraint {
-                Some(ast::JoinConstraint::On(expr)) => check_scalar_expr(expr)?,
-                Some(ast::JoinConstraint::Using(_)) => {
-                    return unsupported("USING join constraints");
+            if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
+                check_scalar_expr(expr)?;
+            }
+        }
+        // USING and NATURAL desugar to equality predicates against the
+        // left-most earlier table with each merged column. Validate here —
+        // at translate time — so a bad constraint can never fail inside the
+        // CREATE program. The desugared predicates qualify columns by table
+        // identifier, so duplicate identifiers cannot be resolved.
+        let using_per_table = crate::util::join_using_columns(from, schema)?;
+        if using_per_table.iter().any(|using| !using.is_empty()) {
+            let mut identifiers: Vec<String> = Vec::with_capacity(from.joins.len() + 1);
+            for table in std::iter::once(from.select.as_ref())
+                .chain(from.joins.iter().map(|join| join.table.as_ref()))
+            {
+                if let ast::SelectTable::Table(name, alias, _) = table {
+                    identifiers.push(crate::util::normalize_ident(match alias {
+                        Some(
+                            ast::As::As(alias)
+                            | ast::As::Elided(alias)
+                            | ast::As::ImplicitColumnName(alias),
+                        ) => alias.as_str(),
+                        None => name.name.as_str(),
+                    }));
                 }
-                None => {}
+            }
+            let unique: std::collections::HashSet<&String> = identifiers.iter().collect();
+            if unique.len() != identifiers.len() {
+                return unsupported("NATURAL or USING joins between tables with the same name");
             }
         }
         if select_distinct {
@@ -2978,10 +2999,13 @@ fn join_subset_phases(n_tables: usize, input: MaintenanceInput) -> Vec<(Vec<Join
 }
 
 /// A [`JoinedTable`] scan entry for synthesized maintenance-program table
-/// references.
+/// references. `using` carries the table's merged USING/NATURAL column
+/// names so unqualified references to them bind without ambiguity, exactly
+/// as in the defining query.
 fn make_joined_table(
     table: &Arc<BTreeTable>,
     identifier: &str,
+    using: &[String],
     id: TableInternalId,
 ) -> JoinedTable {
     JoinedTable {
@@ -2992,7 +3016,11 @@ fn make_joined_table(
         table: crate::schema::Table::BTree(table.clone()),
         identifier: identifier.to_string(),
         internal_id: id,
-        join_info: None,
+        join_info: (!using.is_empty()).then(|| JoinInfo {
+            join_type: crate::translate::plan::JoinType::Inner,
+            using: using.iter().map(|n| ast::Name::exact(n.clone())).collect(),
+            no_reorder: false,
+        }),
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
@@ -3001,8 +3029,9 @@ fn make_joined_table(
     }
 }
 
-/// A joined table with the identifier its columns bind under.
-type JoinTable = (Arc<BTreeTable>, String);
+/// A joined table with the identifier its columns bind under and the column
+/// names its USING (or NATURAL) join constraint merges.
+type JoinTable = (Arc<BTreeTable>, String, Vec<String>);
 
 /// Per-match emission hook for [`emit_join_phase`]: receives the program,
 /// the per-table-position cursor ids, and the phase's table references.
@@ -3042,8 +3071,8 @@ fn resolve_term_collations(
     let joined = tables
         .iter()
         .enumerate()
-        .map(|(i, (table, identifier))| {
-            make_joined_table(table, identifier, TableInternalId::from(i))
+        .map(|(i, (table, identifier, using))| {
+            make_joined_table(table, identifier, using, TableInternalId::from(i))
         })
         .collect();
     let mut table_references = TableReferences::new(joined, vec![]);
@@ -3094,29 +3123,56 @@ fn collect_join_tables(
             ))
         })
     };
+    // Per joined table, the columns its USING (or NATURAL) constraint
+    // merges. Each merged column desugars into an equality between the
+    // left-most earlier table that has it and the joined table, exactly the
+    // predicates the planner generates for the defining query.
+    let using_per_table = crate::util::join_using_columns(from, schema)?;
 
-    let mut tables = Vec::with_capacity(from.joins.len() + 1);
+    let mut tables: Vec<JoinTable> = Vec::with_capacity(from.joins.len() + 1);
     let ast::SelectTable::Table(name, alias, _) = from.select.as_ref() else {
         unreachable!("classify_view admits only plain tables in FROM");
     };
     let table = lookup(name)?;
     let identifier = identifier_for(alias, &table);
-    tables.push((table, identifier));
+    tables.push((table, identifier, Vec::new()));
 
     let mut conditions = Vec::new();
-    for join in &from.joins {
+    for (join_idx, join) in from.joins.iter().enumerate() {
         let ast::SelectTable::Table(name, alias, _) = join.table.as_ref() else {
             unreachable!("classify_view admits only plain tables in joins");
         };
         let table = lookup(name)?;
         let identifier = identifier_for(alias, &table);
-        tables.push((table, identifier));
+        let using = using_per_table[join_idx + 1].clone();
+        for column_name in &using {
+            let left_identifier = tables
+                .iter()
+                .find(|(left_table, _, _)| {
+                    left_table.columns().iter().any(|col| {
+                        col.name
+                            .as_deref()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(column_name))
+                    })
+                })
+                .map(|(_, left_identifier, _)| left_identifier.clone())
+                .expect("join_using_columns verified the column exists on the left");
+            conditions.push(ast::Expr::Binary(
+                Box::new(ast::Expr::Qualified(
+                    ast::Name::exact(left_identifier),
+                    ast::Name::exact(column_name.clone()),
+                )),
+                ast::Operator::Equals,
+                Box::new(ast::Expr::Qualified(
+                    ast::Name::exact(identifier.clone()),
+                    ast::Name::exact(column_name.clone()),
+                )),
+            ));
+        }
+        tables.push((table, identifier, using));
         match &join.constraint {
             Some(ast::JoinConstraint::On(expr)) => conditions.push(expr.as_ref().clone()),
-            None => {}
-            Some(ast::JoinConstraint::Using(_)) => {
-                unreachable!("classify_view rejects USING join constraints")
-            }
+            None | Some(ast::JoinConstraint::Using(_)) => {}
         }
     }
     Ok((tables, conditions))
@@ -3153,7 +3209,7 @@ fn emit_join_phase(
         tables
             .iter()
             .zip(&ids)
-            .map(|((table, ident), id)| make_joined_table(table, ident, *id))
+            .map(|((table, ident, using), id)| make_joined_table(table, ident, using, *id))
             .collect(),
         vec![],
     );
@@ -3162,7 +3218,7 @@ fn emit_join_phase(
         .iter()
         .zip(&ids)
         .zip(sides)
-        .map(|(((table, _), id), side)| {
+        .map(|(((table, _, _), id), side)| {
             let cursor_id = match side {
                 JoinSide::Delta => program.alloc_cursor_id_keyed(
                     CursorKey::table(*id),
@@ -3422,9 +3478,9 @@ fn emit_join_deltas_to_ephemeral(
     let having_references = TableReferences::new(
         tables
             .iter()
-            .map(|(table, ident)| {
+            .map(|(table, ident, using)| {
                 let id = program.table_reference_counter.next();
-                make_joined_table(table, ident, id)
+                make_joined_table(table, ident, using, id)
             })
             .collect(),
         vec![],
@@ -3861,8 +3917,18 @@ fn compile_join_program(
                             out_reg += 1;
                         }
                         ast::ResultColumn::Star => {
-                            for ((table, _), cursor_id) in tables.iter().zip(cursors) {
-                                for (i, _col) in table.columns().iter().enumerate() {
+                            // A USING (or NATURAL) join merges its columns:
+                            // the right table's copy is not part of the
+                            // star expansion.
+                            for ((table, _, using), cursor_id) in tables.iter().zip(cursors) {
+                                for (i, col) in table.columns().iter().enumerate() {
+                                    if using.iter().any(|u| {
+                                        col.name
+                                            .as_deref()
+                                            .is_some_and(|n| n.eq_ignore_ascii_case(u))
+                                    }) {
+                                        continue;
+                                    }
                                     program.emit_column_or_rowid(*cursor_id, i, out_reg);
                                     out_reg += 1;
                                 }
@@ -3870,7 +3936,7 @@ fn compile_join_program(
                         }
                         ast::ResultColumn::TableStar(name) => {
                             let target = crate::util::normalize_ident(name.as_str());
-                            let Some(pos) = tables.iter().position(|(_, ident)| {
+                            let Some(pos) = tables.iter().position(|(_, ident, _)| {
                                 crate::util::normalize_ident(ident) == target
                             }) else {
                                 return Err(LimboError::ParseError(format!(
