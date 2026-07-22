@@ -74,9 +74,9 @@ ENV GIT_HASH=${GIT_HASH:-unknown}
 
 WORKDIR /app
 COPY --from=builder /app/target/debug/differential_fuzzer /app/differential_fuzzer
-COPY testing/differential-oracle/fuzzer/docker-runner/package.json testing/differential-oracle/fuzzer/docker-runner/tsconfig.json ./
+COPY sqlite/conformance/differential/fuzzer/docker-runner/package.json sqlite/conformance/differential/fuzzer/docker-runner/tsconfig.json ./
 RUN bun install
-COPY testing/differential-oracle/fuzzer/docker-runner/*.ts ./
+COPY sqlite/conformance/differential/fuzzer/docker-runner/*.ts ./
 
 RUN chmod +x /app/docker-entrypoint.fuzzer.ts
 RUN chmod +x /app/differential_fuzzer
