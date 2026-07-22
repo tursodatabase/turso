@@ -611,6 +611,24 @@ expect {
     text|abc
 }
 
+# Regression test for https://github.com/tursodatabase/turso/issues/6876.
+test alter-column-rewrites-indexed-affinity-change {
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE t(x NUMERIC);
+    CREATE INDEX idx_x ON t(x);
+    INSERT INTO t VALUES(10),(2),(30);
+    ALTER TABLE t ALTER COLUMN x TO y TEXT;
+    SELECT y, typeof(y) FROM t INDEXED BY idx_x WHERE y >= '0' ORDER BY y;
+    PRAGMA integrity_check;
+}
+expect {
+    wal
+    10|text
+    2|text
+    30|text
+    ok
+}
+
 test alter-column-text-to-integer-coerces-existing-rows {
     CREATE TABLE t (x TEXT);
     INSERT INTO t VALUES ('42'), ('abc');
