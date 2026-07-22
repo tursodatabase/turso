@@ -537,8 +537,15 @@ fn join(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
         ));
     }
 
+    // Plain projection, sometimes deduplicated with DISTINCT (grouping by
+    // every output column over the join).
+    let distinct = if rng.random_bool(0.3) {
+        "DISTINCT "
+    } else {
+        ""
+    };
     Some(format!(
-        "SELECT {cols} FROM {lt} AS l JOIN {rt} AS r ON l.{lc} = r.{rc}",
+        "SELECT {distinct}{cols} FROM {lt} AS l JOIN {rt} AS r ON l.{lc} = r.{rc}",
         cols = cols.join(", "),
         lt = quoted(&left.name),
         rt = quoted(&right.name),
