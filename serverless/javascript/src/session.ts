@@ -67,10 +67,10 @@ export interface SessionConfig {
   requestHeaders?: Record<string, string>;
 }
 
-// Rewrite libsql:// URLs to https:// and strip any trailing slashes, since
-// endpoint paths are appended with a leading slash.
+// Rewrite libsql:// and turso:// URLs to https:// and strip any trailing
+// slashes, since endpoint paths are appended with a leading slash.
 function normalizeUrl(url: string): string {
-  return url.replace(/^libsql:\/\//, 'https://').replace(/\/+$/, '');
+  return url.replace(/^(libsql|turso):\/\//, 'https://').replace(/\/+$/, '');
 }
 
 function isValidIdentifier(str: string): boolean {
