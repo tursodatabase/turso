@@ -347,7 +347,7 @@ impl Value {
             return Err(LimboError::TooBig);
         }
 
-        let mut blob = crate::alloc::vec![0; length as usize];
+        let mut blob = crate::alloc::try_vec![0; length as usize]?;
         fill_bytes(&mut blob);
         Ok(Value::Blob(blob))
     }
@@ -939,7 +939,7 @@ impl Value {
             return Err(LimboError::TooBig);
         }
 
-        Ok(Value::Blob(crate::alloc::vec![0; length as usize]))
+        Ok(Value::Blob(crate::alloc::try_vec![0; length as usize]?))
     }
 
     // exec_if returns whether you should jump
