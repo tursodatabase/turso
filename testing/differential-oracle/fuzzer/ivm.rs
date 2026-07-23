@@ -534,6 +534,25 @@ fn join(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
         return Some(sql);
     }
 
+    // Sometimes make it a RIGHT JOIN: unmatched right rows appear NULL-padded
+    // on the left. It is maintained as the swapped LEFT JOIN, so this
+    // exercises the same bookkeeping from the other side. ON-based only, since
+    // the engine rejects RIGHT JOIN with USING/NATURAL.
+    if rng.random_bool(0.25) {
+        let mut sql = format!(
+            "SELECT {cols} FROM {lt} AS l RIGHT JOIN {rt} AS r ON l.{lc} = r.{rc}",
+            cols = cols.join(", "),
+            lt = quoted(&left.name),
+            rt = quoted(&right.name),
+            lc = quoted(&lc.name),
+            rc = quoted(&rc.name),
+        );
+        if rng.random_bool(0.3) {
+            let _ = write!(sql, " WHERE l.{} IS NULL", quoted(&lc.name));
+        }
+        return Some(sql);
+    }
+
     // When the matched columns share a name (and the tables differ), the
     // join can be spelled with USING: bare * merges the shared column.
     if lc.name.eq_ignore_ascii_case(&rc.name)
