@@ -16,7 +16,7 @@ use crate::{
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
-            process_returning_clause, restore_returning_row_image_in_cache,
+            emit_table_column, process_returning_clause, restore_returning_row_image_in_cache,
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
             walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
@@ -941,6 +941,30 @@ pub fn translate_insert(
     // guaranteed to be positioned.
     if matches!(ctx.on_conflict, ResolveType::Replace) || has_ddl_replace {
         insert_flags = insert_flags.require_seek();
+    }
+    // If a REPLACE conflict-resolution delete may have fired trigger programs
+    // (DELETE triggers or FK actions), one of them may have inserted a row with
+    // the rowid we are about to use — including a NewRowid computed before the
+    // delete ran. Silently overwriting it would lose that row, so re-check and
+    // abort like SQLite does in its post-replace constraint recheck.
+    if on_replace
+        && ctx.table.has_rowid
+        && !constraints.constraints_to_check.is_empty()
+        && replace_delete_may_fire_triggers(resolver, connection, ctx.database_id, ctx.table)
+    {
+        let rowid_ok = program.allocate_label();
+        program.emit_insn(Insn::NotExists {
+            cursor: ctx.cursor_id,
+            rowid_reg: insertion.key_register(),
+            target_pc: rowid_ok,
+        });
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+            description: format!("{}.{}", ctx.table.name, insertion.key.column_name()),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(rowid_ok);
     }
     program.emit_insn(Insn::Insert {
         cursor: ctx.cursor_id,
@@ -2928,9 +2952,32 @@ fn emit_pk_uniqueness_check(
                 ctx,
                 preflight.table_references,
             )?;
-            program.emit_insn(Insn::Goto {
-                target_pc: make_record_label,
-            });
+            if replace_delete_may_fire_triggers(
+                resolver,
+                preflight.connection,
+                ctx.database_id,
+                ctx.table,
+            ) {
+                // The delete may have fired trigger programs (DELETE triggers
+                // or FK actions) that re-inserted a row with this rowid.
+                // Re-check; on the recheck a conflict aborts instead of
+                // replacing again (matching SQLite).
+                program.emit_insn(Insn::NotExists {
+                    cursor: ctx.cursor_id,
+                    rowid_reg: insertion.key_register(),
+                    target_pc: make_record_label,
+                });
+                program.emit_insn(Insn::Halt {
+                    err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                    description: format!("{}.{}", ctx.table.name, rowid_column_name),
+                    on_error: None,
+                    description_reg: None,
+                });
+            } else {
+                program.emit_insn(Insn::Goto {
+                    target_pc: make_record_label,
+                });
+            }
             break 'emit_halt;
         }
         if let Some(position) = position.or(upsert_catch_all) {
@@ -3161,7 +3208,32 @@ fn emit_unique_index_check(
                 ctx,
                 preflight.table_references,
             )?;
-            program.emit_insn(Insn::Goto { target_pc: ok });
+            if replace_delete_may_fire_triggers(
+                resolver,
+                preflight.connection,
+                ctx.database_id,
+                ctx.table,
+            ) {
+                // The delete may have fired trigger programs (DELETE triggers
+                // or FK actions) that re-inserted the conflicting key. Re-probe
+                // the index; on the recheck a conflict aborts instead of
+                // replacing again (matching SQLite), otherwise the eager
+                // IdxInsert below would corrupt the unique index.
+                program.emit_insn(Insn::NoConflict {
+                    cursor_id: idx_cursor_id,
+                    target_pc: ok,
+                    record_reg: idx_start_reg,
+                    num_regs: num_cols,
+                });
+                program.emit_insn(Insn::Halt {
+                    err_code: SQLITE_CONSTRAINT_UNIQUE,
+                    description: format_unique_violation_desc(ctx.table.name.as_str(), index),
+                    on_error: None,
+                    description_reg: None,
+                });
+            } else {
+                program.emit_insn(Insn::Goto { target_pc: ok });
+            }
         } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
             // IGNORE: skip this row entirely on unique conflict.
             program.emit_insn(Insn::Goto {
@@ -3776,6 +3848,32 @@ fn emit_update_sqlite_sequence(
     Ok(())
 }
 
+/// Whether the REPLACE conflict-resolution delete of a conflicting row may run
+/// trigger programs that modify the database: DELETE triggers on the table
+/// (which fire during REPLACE only when PRAGMA recursive_triggers is enabled,
+/// matching SQLite), or foreign key actions (which may cascade into other
+/// tables and fire their triggers).
+///
+/// When this returns true, uniqueness must be re-checked after the delete,
+/// because a trigger may have re-inserted the conflicting key. On the recheck,
+/// a conflict aborts the statement (SQLite resolves recheck conflicts with
+/// OE_Abort instead of OE_Replace).
+fn replace_delete_may_fire_triggers(
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    database_id: usize,
+    table: &BTreeTable,
+) -> bool {
+    let has_delete_triggers = connection.recursive_triggers_enabled()
+        && has_triggers_including_temp(resolver, database_id, TriggerEvent::Delete, None, table);
+    let fk_actions_possible = connection.foreign_keys_enabled()
+        && resolver.with_schema(database_id, |s| {
+            s.any_resolved_fks_referencing(table.name.as_str())
+                || s.has_child_fks(table.name.as_str())
+        });
+    has_delete_triggers || fk_actions_possible
+}
+
 fn emit_replace_delete_conflicting_row(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
@@ -3788,6 +3886,94 @@ fn emit_replace_delete_conflicting_row(
         src_reg: ctx.conflict_rowid_reg,
         target_pc: ctx.halt_label,
     });
+
+    // When PRAGMA recursive_triggers is enabled, rows deleted by REPLACE
+    // conflict resolution fire DELETE triggers (matching SQLite: "delete
+    // triggers fire if and only if recursive triggers are enabled").
+    let (before_triggers, after_triggers) = if connection.recursive_triggers_enabled() {
+        (
+            get_triggers_including_temp(
+                resolver,
+                ctx.database_id,
+                TriggerEvent::Delete,
+                TriggerTime::Before,
+                None,
+                ctx.table,
+            ),
+            get_triggers_including_temp(
+                resolver,
+                ctx.database_id,
+                TriggerEvent::Delete,
+                TriggerTime::After,
+                None,
+                ctx.table,
+            ),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let delete_done = program.allocate_label();
+    // Capture the OLD row image for the trigger contexts while the cursor is
+    // positioned on the conflicting row.
+    let trigger_ctx = if before_triggers.is_empty() && after_triggers.is_empty() {
+        None
+    } else {
+        let cols_len = ctx.table.columns().len();
+        let columns_start_reg = program.alloc_registers(cols_len);
+        let internal_id = table_references.joined_tables()[0].internal_id;
+        for (i, column) in ctx.table.columns().iter().enumerate() {
+            emit_table_column(
+                program,
+                ctx.cursor_id,
+                internal_id,
+                table_references,
+                column,
+                i,
+                columns_start_reg + i,
+                resolver,
+            )?;
+        }
+        let old_registers = (0..cols_len)
+            .map(|i| columns_start_reg + i)
+            .chain(std::iter::once(ctx.conflict_rowid_reg))
+            .collect::<Vec<_>>();
+        // The delete happens as part of REPLACE conflict resolution, so the
+        // trigger bodies run with REPLACE conflict handling (SQLite passes
+        // OE_Replace as the trigger orconf), unless an outer statement already
+        // imposed an override.
+        let override_conflict = program
+            .trigger_conflict_override
+            .unwrap_or(ResolveType::Replace);
+        Some(TriggerContext::new_with_override_conflict(
+            Arc::clone(ctx.table),
+            None, // No NEW for DELETE
+            Some(old_registers),
+            override_conflict,
+        ))
+    };
+
+    if !before_triggers.is_empty() {
+        let trigger_ctx = trigger_ctx.as_ref().expect("trigger context must exist");
+        // RAISE(IGNORE) in a BEFORE DELETE trigger skips deleting this row.
+        for trigger in before_triggers {
+            fire_trigger(
+                program,
+                resolver,
+                trigger,
+                trigger_ctx,
+                connection,
+                ctx.database_id,
+                delete_done,
+            )?;
+        }
+        // BEFORE DELETE triggers may have deleted the conflicting row
+        // themselves; re-seek and skip the delete if it is gone.
+        program.emit_insn(Insn::NotExists {
+            cursor: ctx.cursor_id,
+            rowid_reg: ctx.conflict_rowid_reg,
+            target_pc: delete_done,
+        });
+    }
 
     // Phase 1: Before Delete - build parent key registers and handle NoAction/Restrict.
     // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
@@ -3920,6 +4106,25 @@ fn emit_replace_delete_conflicting_row(
         connection,
         ctx.database_id,
     )?;
+
+    if !after_triggers.is_empty() {
+        let trigger_ctx = trigger_ctx.as_ref().expect("trigger context must exist");
+        // RAISE(IGNORE) in an AFTER DELETE trigger only aborts the trigger body.
+        let after_trigger_done = program.allocate_label();
+        for trigger in after_triggers {
+            fire_trigger(
+                program,
+                resolver,
+                trigger,
+                trigger_ctx,
+                connection,
+                ctx.database_id,
+                after_trigger_done,
+            )?;
+        }
+        program.preassign_label_to_next_insn(after_trigger_done);
+    }
+    program.preassign_label_to_next_insn(delete_done);
 
     Ok(())
 }
