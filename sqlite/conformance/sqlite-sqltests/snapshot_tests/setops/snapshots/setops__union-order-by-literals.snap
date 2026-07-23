@@ -1,0 +1,52 @@
+---
+source: setops.sqltest
+expression: SELECT 1 UNION SELECT 2 ORDER BY 1;
+info:
+  statement_type: SELECT
+  database: ':memory:'
+---
+QUERY PLAN
+|--COMPOUND QUERY
+|  |--LEFT-MOST SUBQUERY
+|  |  `--SCAN CONSTANT ROW
+|  `--UNION USING TEMP B-TREE
+|     `--SCAN CONSTANT ROW
+`--USE SORTER FOR ORDER BY
+
+BYTECODE
+addr  opcode          p1  p2  p3  p4        p5  comment
+   0  Init             0  34   0             0  Start at 34
+   1  OpenEphemeral    0   0   0             0  cursor=0 is_table=false
+   2  OpenEphemeral    1   0   0             0  cursor=1 is_table=false
+   3  Integer          1   1   0             0  r[1]=1
+   4  MakeRecord       1   1   2             0  r[2]=mkrec(r[1..1]); for compound_dedupe
+   5  IdxInsert        1   2   0             8  key=r[2]
+   6  Integer          2   1   0             0  r[1]=2
+   7  MakeRecord       1   1   3             0  r[3]=mkrec(r[1..1]); for compound_dedupe
+   8  IdxInsert        1   3   0             8  key=r[3]
+   9  Rewind           1  15   0             0  Rewind  ephemeral(compound_dedupe)
+  10    Column         1   0   1             0  r[1]=ephemeral(compound_dedupe).2
+  11    Copy           1   5   0             0  r[5]=r[1]
+  12    Sequence       0   6   0             0
+  13    MakeRecord     5   2   4             0  r[4]=mkrec(r[5..6]); for compound_collection
+  14    IdxInsert      0   4   0             8  key=r[4]
+  15  Next             1  10   0             0
+  16  Close            1   0   0             0
+  17  SorterOpen       2   2   0  k(2,B,B)   0  cursor=2
+  18  Rewind           0  26   0             0  Rewind  ephemeral(compound_collection)
+  19    Column         0   0   7             0  r[7]=ephemeral(compound_collection).2
+  20    Column         0   1   8             0  r[8]=ephemeral(compound_collection).column 1
+  21    Copy           7   9   0             0  r[9]=r[7]
+  22    Copy           8  10   0             0  r[10]=r[8]
+  23    MakeRecord     9   2  11             0  r[11]=mkrec(r[9..10])
+  24    SorterInsert   2  11   0  0          0  key=r[11]
+  25  Next             0  19   0             0
+  26  Close            0   0   0             0
+  27  OpenPseudo       3  11   2             0  2 columns in r[11]
+  28  SorterSort       2  33   0             0
+  29    SorterData     2  11   3             0  r[11]=data
+  30    Column         3   0  12             0  r[12]=pseudo.column 0
+  31    ResultRow     12   1   0             0  output=r[12]
+  32  SorterNext       2  29   0             0
+  33  Halt             0   0   0             0
+  34  Goto             0   1   0             0
