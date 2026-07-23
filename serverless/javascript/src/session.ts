@@ -67,8 +67,10 @@ export interface SessionConfig {
   requestHeaders?: Record<string, string>;
 }
 
+// Rewrite libsql:// URLs to https:// and strip any trailing slashes, since
+// endpoint paths are appended with a leading slash.
 function normalizeUrl(url: string): string {
-  return url.replace(/^libsql:\/\//, 'https://');
+  return url.replace(/^libsql:\/\//, 'https://').replace(/\/+$/, '');
 }
 
 function isValidIdentifier(str: string): boolean {
@@ -184,7 +186,7 @@ export class Session {
 
     this.baton = response.baton;
     if (response.base_url) {
-      this.baseUrl = response.base_url;
+      this.baseUrl = normalizeUrl(response.base_url);
     }
     this.updateAutocommit(response);
 
@@ -306,7 +308,7 @@ export class Session {
     const { response, entries } = result;
     this.baton = response.baton;
     if (response.base_url) {
-      this.baseUrl = response.base_url;
+      this.baseUrl = normalizeUrl(response.base_url);
     }
 
     return { response, entries: this.trackAutocommit(entries, 1, queryOptions) };
@@ -335,7 +337,7 @@ export class Session {
 
     this.baton = response.baton;
     if (response.base_url) {
-      this.baseUrl = response.base_url;
+      this.baseUrl = normalizeUrl(response.base_url);
     }
     this.updateAutocommit(response);
   }
@@ -532,7 +534,7 @@ export class Session {
     const { response, entries } = batchResult;
     this.baton = response.baton;
     if (response.base_url) {
-      this.baseUrl = response.base_url;
+      this.baseUrl = normalizeUrl(response.base_url);
     }
 
     // One result per user statement, in input order.
@@ -657,7 +659,7 @@ export class Session {
 
     this.baton = seqResponse.baton;
     if (seqResponse.base_url) {
-      this.baseUrl = seqResponse.base_url;
+      this.baseUrl = normalizeUrl(seqResponse.base_url);
     }
     this.updateAutocommit(seqResponse);
 
