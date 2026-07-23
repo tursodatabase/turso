@@ -74,6 +74,8 @@ limbo/
 | Quick sqlite3 diff | `scripts/diff.sh` | Compare sqlite3 vs tursodb output for a query |
 | MVCC testing REPL | `cli/mvcc_repl.rs` | Multi-conn concurrent txn testing REPL        |
 
+Code experts for each component are listed in [EXPERTS.md](EXPERTS.md); consult it to find who knows the area you're touching.
+
 ## Guides
 
 - **[Testing](docs/agent-guides/testing.md)** - test types, when to use, how to write
