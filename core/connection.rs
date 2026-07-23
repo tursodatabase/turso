@@ -2126,6 +2126,18 @@ impl Connection {
         self.pager.load().wal_state()
     }
 
+    /// Verification-only: the aristo-instr `expose_pub` raises this to a public
+    /// `inspect_wal_handle()` returning this connection's WAL handle, so the
+    /// conformance harness can call the public `Wal` trait methods
+    /// (`holds_write_lock`, `installed_snapshot`, `find_frame`) on it. Mirrors
+    /// the page-cache `inspect_page_cache_handle` precedent (delegates to the
+    /// pub(crate) `Pager::wal_handle`).
+    #[cfg(feature = "aristo-instr")]
+    #[aristo::instrument::expose_pub(as = "inspect_wal_handle")]
+    fn wal_handle(&self) -> Option<crate::sync::Arc<dyn crate::storage::wal::Wal>> {
+        self.pager.load().wal_handle()
+    }
+
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<WalFrameInfo> {
         use crate::storage::sqlite3_ondisk::parse_wal_frame_header;

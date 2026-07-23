@@ -3470,6 +3470,15 @@ impl Pager {
         })
     }
 
+    /// Verification-only: clone this pager's WAL handle so the conformance
+    /// harness can call the public `Wal` trait methods (`holds_write_lock`,
+    /// `installed_snapshot`, `find_frame`) on it. Surfaced publicly on
+    /// `Connection` via the aristo-instr `expose_pub` `inspect_wal_handle`.
+    #[cfg(feature = "aristo-instr")]
+    pub(crate) fn wal_handle(&self) -> Option<crate::sync::Arc<dyn crate::storage::wal::Wal>> {
+        self.wal.clone()
+    }
+
     /// Flush all dirty pages to disk (async/re-entrant).
     /// Unlike commit_wal, this function does not commit, checkpoint nor sync the WAL/Database.
     #[instrument(skip_all, level = Level::DEBUG)]

@@ -3484,6 +3484,23 @@ pub struct WalFrameInfo {
     pub db_size: u32,
 }
 
+/// Owned snapshot of the *connection-local installed* WAL read snapshot held on
+/// `WalFile` (the bundle persisted by `install_connection_state` after
+/// `try_begin_read_tx`). Returned by the `Wal::installed_snapshot()` trait
+/// method, reached by the conformance harness through the aristo-instr
+/// `Connection::inspect_wal_handle()` handle accessor. `min_frame` is
+/// `nbackfills + 1`; `max_frame`/`transaction_count` are installed from one
+/// coherent shared sample in untorn history. Verification-only, so gated behind
+/// `aristo-instr` (compiles away in production).
+#[cfg(feature = "aristo-instr")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct WalInstalledSnapshot {
+    pub max_frame: u64,
+    pub min_frame: u64,
+    pub transaction_count: u64,
+    pub checkpoint_seq: u32,
+}
+
 #[derive(Debug, PartialEq)]
 pub struct WalState {
     pub checkpoint_seq_no: u32,
