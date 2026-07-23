@@ -62,6 +62,25 @@ proc reset_db {} {
 }
 
 # Execute SQL and return results
+# Tcl 9 removed the tcl_precision magic variable; its default float
+# formatting (shortest exact representation) matches the old
+# tcl_precision=0 behavior. Define a plain global so upstream tests that
+# save/set/restore tcl_precision keep working.
+if {![info exists ::tcl_precision]} {
+  set ::tcl_precision 0
+}
+
+# Upstream tester.tcl no-op hooks: breakpoint is a debugger anchor and
+# do_not_use_codec only matters for codec-enabled builds.
+proc breakpoint {} {}
+proc do_not_use_codec {} {}
+
+# Modern SQLite builds default to schema file format 4; upstream tests
+# read this to decide format-dependent expectations.
+if {![info exists ::SQLITE_DEFAULT_FILE_FORMAT]} {
+  set ::SQLITE_DEFAULT_FILE_FORMAT 4
+}
+
 proc execsql {sql {db db}} {
   # Evaluate in the caller's scope so that TCL variables referenced inside
   # the SQL (e.g. {SELECT round($x1)}) bind to the caller's values instead
