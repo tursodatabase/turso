@@ -302,3 +302,34 @@ test create-index-sqlite-source-id {
 }
 expect error {
 }
+
+# https://github.com/tursodatabase/turso/issues/7944
+# SQLite rejects NULLS FIRST/LAST in CREATE INDEX with
+# "unsupported use of NULLS FIRST/LAST". Turso must reject it too,
+# otherwise it writes a schema entry that SQLite cannot read back.
+@cross-check-integrity
+test create-index-nulls-first-rejected {
+    CREATE TABLE t1(a);
+    CREATE INDEX idx1 ON t1(a NULLS FIRST);
+}
+expect error {
+    NULLS
+}
+
+@cross-check-integrity
+test create-index-nulls-last-rejected {
+    CREATE TABLE t2(a);
+    CREATE INDEX idx2 ON t2(a NULLS LAST);
+}
+expect error {
+    NULLS
+}
+
+@cross-check-integrity
+test create-index-nulls-first-with-desc-rejected {
+    CREATE TABLE t3(a);
+    CREATE INDEX idx3 ON t3(a DESC NULLS FIRST);
+}
+expect error {
+    NULLS
+}

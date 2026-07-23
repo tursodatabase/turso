@@ -882,11 +882,26 @@ pub fn resolve_sorted_columns(
     resolve_sorted_columns_with_resolver(table, cols, None)
 }
 
+/// SQLite rejects explicit `NULLS FIRST`/`NULLS LAST` wherever an index key
+/// is defined or matched: CREATE INDEX, table PRIMARY KEY/UNIQUE constraints,
+/// and UPSERT conflict targets (see `sqlite3HasExplicitNulls`). Accepting the
+/// clause in schema definitions would store SQL in `sqlite_schema` that
+/// SQLite refuses to load ("malformed database schema").
+pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
+    for sc in cols {
+        if let Some(nulls) = sc.nulls {
+            crate::bail_parse_error!("unsupported use of {}", nulls);
+        }
+    }
+    Ok(())
+}
+
 fn resolve_sorted_columns_with_resolver(
     table: &BTreeTable,
     cols: &[SortedColumn],
     resolver: Option<&Resolver>,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
+    reject_explicit_nulls(cols)?;
     let mut resolved =
         <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
             cols.len(),
