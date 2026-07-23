@@ -36,7 +36,7 @@ source $testdir/selectF.test
 # FIXME: source $testdir/join3.test
 # FIXME: source $testdir/join4.test
 # FIXME: source $testdir/join5.test
-# FIXME: source $testdir/join6.test
+source $testdir/join6.test
 # FIXME: source $testdir/join7.test
 # FIXME: source $testdir/join8.test
 # FIXME: source $testdir/join9.test
