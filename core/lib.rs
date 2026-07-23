@@ -129,6 +129,7 @@ use std::{
 };
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
+use storage::shared_page_cache::{SharedPageCacheGeneration, SharedPageCacheNamespace};
 #[cfg(host_shared_wal)]
 use storage::shared_wal_coordination::MappedSharedWalCoordination;
 use storage::{page_cache::PageCache, sqlite3_ondisk::PageSize};
@@ -162,6 +163,9 @@ pub use io::{
 };
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
+pub use storage::shared_page_cache::{
+    SharedPageCache, SharedPageCacheLookup, SharedPageCacheObserver, SharedPageCacheStats,
+};
 pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},
@@ -697,9 +701,9 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     wal_path: String,
     pub io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
-    // Shared structures of a Database are the parts that are common to multiple threads that might
-    // create DB connections.
-    _shared_page_cache: Arc<RwLock<PageCache>>,
+    /// Optional immutable page-byte cache used by future connection pagers.
+    shared_page_cache: RwLock<Option<SharedPageCacheNamespace>>,
+    shared_page_cache_generation: Arc<SharedPageCacheGeneration>,
 
     /// Optional per-database MVCC durable storage override.
     ///
@@ -769,12 +773,11 @@ impl fmt::Debug for Database {
         };
         debug_struct.field("wal_state", &wal_status);
 
-        // Page cache info (just basic stats, not full contents)
-        let cache_info = match self._shared_page_cache.try_read() {
-            Some(cache) => format!("( capacity {}, used: {} )", cache.capacity(), cache.len()),
-            None => "locked".to_string(),
-        };
-        debug_struct.field("page_cache", &cache_info);
+        let shared_page_cache = self
+            .shared_page_cache
+            .try_read()
+            .map(|cache| cache.is_some());
+        debug_struct.field("shared_page_cache", &shared_page_cache);
 
         debug_struct.field(
             "n_connections",
@@ -790,6 +793,19 @@ impl Database {
     /// Returns true if this database is backed by MemoryIO.
     pub fn is_in_memory_db(&self) -> bool {
         is_memory_like(&self.path)
+    }
+
+    /// Configure an immutable page-byte cache for pagers created by future connections.
+    ///
+    /// Existing connections keep their current pager. Configure this immediately after opening
+    /// the database and before accepting connection requests. Databases opened with encryption
+    /// enabled currently bypass this cache.
+    pub fn set_shared_page_cache(&self, cache: Option<Arc<SharedPageCache>>) -> Result<()> {
+        let namespace = cache
+            .map(|cache| cache.new_namespace(self.shared_page_cache_generation.clone()))
+            .transpose()?;
+        *self.shared_page_cache.write() = namespace;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -811,7 +827,7 @@ impl Database {
 
         let db_size = db_file.size()?;
 
-        let shared_page_cache = Arc::new(RwLock::new(PageCache::default()));
+        let shared_page_cache_generation = Arc::new(SharedPageCacheGeneration::default());
         let syms = SymbolTable::new();
         let arena_size = if std::env::var("TESTING").is_ok_and(|v| v.eq_ignore_ascii_case("true")) {
             BufferPool::TEST_ARENA_SIZE
@@ -845,7 +861,8 @@ impl Database {
                 s.generated_columns_enabled = opts.enable_generated_columns;
                 s
             }))),
-            _shared_page_cache: shared_page_cache,
+            shared_page_cache: RwLock::new(None),
+            shared_page_cache_generation,
             shared_wal,
             #[cfg(host_shared_wal)]
             shared_wal_coordination: OnceLock::new(),
@@ -2166,6 +2183,7 @@ impl Database {
     /// Rebuild the process-local shared WAL view after a caller restores the
     /// database and WAL files outside the pager.
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
+        self.shared_page_cache_generation.advance()?;
         let flags = self.open_flags;
         #[cfg(host_shared_wal)]
         let shared_authority = self.open_shared_wal_coordination_for_open()?;
@@ -2883,8 +2901,13 @@ impl Database {
         } else {
             None
         };
+        let shared_page_cache = if self.opts.enable_encryption {
+            None
+        } else {
+            self.shared_page_cache.read().clone()
+        };
 
-        let pager = Pager::new(
+        let pager = Pager::new_with_shared_page_cache(
             self.db_file.clone(),
             pager_wal,
             self.io.clone(),
@@ -2892,6 +2915,7 @@ impl Database {
             buffer_pool,
             self.init_lock.clone(),
             self.init_page_1.clone(),
+            shared_page_cache,
         )?;
         pager.set_page_size(page_size);
         if let Some(reserved_bytes) = reserved_bytes {

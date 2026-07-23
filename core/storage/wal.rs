@@ -747,6 +747,14 @@ pub trait Wal: Debug + Send + Sync {
     fn is_dirty(&self) -> bool;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
+    /// Return an epoch that changes before database pages or WAL frame ids can be reused.
+    ///
+    /// WAL implementations that cannot provide this invariant leave shared clean-page caching
+    /// disabled for their reads by using the default `None`. Implementations that opt in must
+    /// expose their committed high-water mark through [`Wal::get_max_frame_in_wal`].
+    fn shared_page_cache_epoch(&self) -> Option<u32> {
+        None
+    }
     fn get_max_frame(&self) -> u64;
     /// This connection's frozen `(checkpoint_seq, max_frame)`: for a reader it is the WAL read
     /// mark installed at `begin_read_tx`; for a writer it is the position after its last commit.
@@ -3490,6 +3498,7 @@ impl Wal for WalFile {
                 tracing::debug!(err = ?res.unwrap_err());
                 page.clear_locked();
                 page.clear_wal_tag();
+                page.take_shared_page_publisher();
                 return None; // IO error already captured in completion
             };
             let buf_len = buf.len();
@@ -3499,6 +3508,7 @@ impl Wal for WalFile {
                 );
                 page.clear_locked();
                 page.clear_wal_tag();
+                page.take_shared_page_publisher();
                 return Some(CompletionError::ShortReadWalFrame {
                     offset,
                     expected: buf_len,
@@ -3950,6 +3960,10 @@ impl Wal for WalFile {
 
     fn get_checkpoint_seq(&self) -> u32 {
         self.load_coordination_snapshot().checkpoint_seq
+    }
+
+    fn shared_page_cache_epoch(&self) -> Option<u32> {
+        Some(self.coordination.checkpoint_epoch())
     }
 
     fn get_max_frame(&self) -> u64 {
@@ -5832,6 +5846,7 @@ pub mod test {
             buffer_pool::BufferPool,
             database::{DatabaseFile, DatabaseStorage},
             pager::{allocate_new_page, PageRef},
+            shared_page_cache::{SharedPageCache, SharedPageCacheGeneration, SharedPageVersion},
             sqlite3_ondisk::{self, PageSize, WAL_HEADER_SIZE},
             wal::READMARK_NOT_USED,
         },
@@ -6372,6 +6387,32 @@ pub mod test {
             Err(LimboError::CompletionError(err)) => err,
             other => panic!("expected completion error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn short_wal_read_does_not_publish_shared_cache_bytes() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let cache = Arc::new(SharedPageCache::new(64 * 1024));
+        let namespace = cache
+            .new_namespace(Arc::new(SharedPageCacheGeneration::default()))
+            .unwrap();
+        let page = Arc::new(crate::Page::new(7));
+        page.set_shared_page_publisher(Some(namespace.publisher(
+            7,
+            page_size,
+            SharedPageVersion::Wal {
+                frame_id: 1,
+                checkpoint_epoch: 0,
+            },
+        )));
+
+        let completion = wal.read_frame(1, page.clone(), buffer_pool).unwrap();
+        let error = wait_for_completion_error(&io, completion);
+
+        assert!(matches!(error, CompletionError::ShortReadWalFrame { .. }));
+        assert_eq!(cache.stats().entries, 0);
+        assert!(page.take_shared_page_publisher().is_none());
     }
 
     #[test]

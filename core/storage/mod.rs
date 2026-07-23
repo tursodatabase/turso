@@ -19,6 +19,7 @@ pub(crate) mod journal_mode;
 pub(crate) mod page_cache;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod pager;
+pub(crate) mod shared_page_cache;
 #[cfg(host_shared_wal)]
 #[allow(dead_code)]
 pub(crate) mod shared_wal_coordination;
