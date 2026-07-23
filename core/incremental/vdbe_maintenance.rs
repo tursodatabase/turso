@@ -61,7 +61,7 @@ use crate::turso_assert;
 use crate::util::walk_expr_with_subqueries;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
-use crate::vdbe::Program;
+use crate::vdbe::{BranchOffset, Program};
 use crate::{Connection, LimboError, QueryMode, Result, Value};
 use turso_parser::ast::TableInternalId;
 
@@ -266,6 +266,11 @@ pub enum ViewShape {
         /// empty-input aggregate values (COUNT 0, SUM NULL, ...) instead of
         /// group death.
         scalar: bool,
+        /// The aggregate reads a two-table LEFT (or swapped RIGHT) join whose
+        /// NULL-padded rows must also feed the aggregate. A hidden aux table
+        /// tracks each left row's match count and its padded contribution so
+        /// the padded rows can be added and retracted; created at CREATE time.
+        outer_join: bool,
     },
     /// A pure UNION ALL whose branches are not all plain filter/project — at
     /// least one is a join or aggregate. UNION ALL branches are independent
@@ -817,6 +822,22 @@ fn build_select_core(
     };
 
     if has_aggregates {
+        // A RIGHT-join aggregate would need the LEFT-swap that build_source
+        // applies for a standalone RIGHT join, but the aggregate emitter reads
+        // its join from the FROM clause directly (unswapped), so the padded
+        // side would be wrong. LEFT-join aggregates are supported: the padded
+        // rows feed the aggregate through the aux table.
+        let left_outer = from.joins.iter().any(|join| {
+            matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt))
+                if jt.contains(ast::JoinType::LEFT))
+        });
+        let right_only = from.joins.iter().any(|join| {
+            matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt))
+                if jt.contains(ast::JoinType::RIGHT) && !jt.contains(ast::JoinType::LEFT))
+        });
+        if right_only {
+            return unsupported("aggregates over RIGHT outer joins");
+        }
         let base_tables: Vec<Arc<BTreeTable>> = std::iter::once(from.select.as_ref())
             .chain(from.joins.iter().map(|join| join.table.as_ref()))
             .filter_map(|table| match table {
@@ -827,8 +848,15 @@ fn build_select_core(
         // Reuse the aggregate-operator extraction (group keys, collected
         // aggregates, collations); HAVING and the output expressions become
         // the Filter/Project above, not fields of the operator.
-        let shape =
-            classify_group_aggregate(columns, group_by, from, &base_tables, schema, resolver)?;
+        let shape = classify_group_aggregate(
+            columns,
+            group_by,
+            from,
+            &base_tables,
+            left_outer,
+            schema,
+            resolver,
+        )?;
         let ViewShape::GroupAggregate {
             group_exprs,
             group_collations,
@@ -1211,6 +1239,7 @@ pub fn classify_view(
                 &Some(group_by),
                 from,
                 &base_tables,
+                false,
                 schema,
                 resolver,
             );
@@ -1227,9 +1256,18 @@ pub fn classify_view(
         }
         if contains_aggregates {
             if left_outer {
-                // The joined-delta ephemeral feed assumes inner semantics;
-                // NULL-padded rows never reach the aggregate loop.
-                return unsupported("aggregates over outer joins");
+                // A RIGHT join is maintained as a swapped LEFT join, but the
+                // aggregate feed reads the FROM clause directly (not the
+                // build_dag-swapped inputs), so RIGHT-join aggregates are not
+                // yet wired. LEFT-join aggregates feed the padded rows through
+                // the aux table (see emit_join_deltas_to_ephemeral).
+                let is_left = from.joins.iter().any(|join| {
+                    matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt))
+                        if jt.contains(ast::JoinType::LEFT))
+                });
+                if !is_left {
+                    return unsupported("aggregates over RIGHT outer joins");
+                }
             }
             // Aggregates over a join: the join's deltas feed the group
             // machinery, so this classifies as a GroupAggregate; the compile
@@ -1247,6 +1285,7 @@ pub fn classify_view(
                 group_by,
                 from,
                 &base_tables,
+                left_outer,
                 schema,
                 resolver,
             );
@@ -1333,6 +1372,7 @@ pub fn classify_view(
             multiset_collation: CollationSeq::Binary,
             having: None,
             scalar: false,
+            outer_join: false,
         });
     }
 
@@ -1367,7 +1407,15 @@ pub fn classify_view(
             .collect(),
         _ => Vec::new(),
     };
-    classify_group_aggregate(columns, group_by, from, &base_tables, schema, resolver)
+    classify_group_aggregate(
+        columns,
+        group_by,
+        from,
+        &base_tables,
+        false,
+        schema,
+        resolver,
+    )
 }
 
 /// Classify an aggregate query (GROUP BY, scalar aggregates, HAVING) into a
@@ -1379,6 +1427,7 @@ fn classify_group_aggregate(
     group_by: &Option<ast::GroupBy>,
     from: &ast::FromClause,
     base_tables: &[Arc<BTreeTable>],
+    outer_join: bool,
     schema: &Schema,
     resolver: &Resolver,
 ) -> Result<ViewShape> {
@@ -1478,6 +1527,14 @@ fn classify_group_aggregate(
         validate_supported_aggregate(agg)?;
     }
 
+    if outer_join && aggregates.iter().any(uses_multiset) {
+        // The multiset slot holds the LEFT join's per-left-row padded
+        // bookkeeping, so a value multiset (MIN/MAX or a DISTINCT aggregate)
+        // over the same view has nowhere to live. Supporting both at once
+        // needs a second auxiliary table.
+        return unsupported("MIN/MAX or DISTINCT aggregates over an outer join");
+    }
+
     let group_collations = resolve_key_collations(&group_exprs, from, schema, resolver)?;
     let mut multiset_collation = CollationSeq::Binary;
     let mut multiset_seen = false;
@@ -1507,6 +1564,7 @@ fn classify_group_aggregate(
         multiset_collation,
         having,
         scalar,
+        outer_join,
     })
 }
 
@@ -1701,7 +1759,14 @@ fn uses_multiset(agg: &Aggregate) -> bool {
 /// multiplicity).
 pub fn needs_multiset_table(shape: &ViewShape) -> bool {
     match shape {
-        ViewShape::GroupAggregate { aggregates, .. } => aggregates.iter().any(uses_multiset),
+        // An aggregate over a LEFT join reuses the multiset slot for the
+        // join's per-left-row padded bookkeeping (classify rejects the combo
+        // with a value multiset, so the two never contend for the slot).
+        ViewShape::GroupAggregate {
+            aggregates,
+            outer_join,
+            ..
+        } => *outer_join || aggregates.iter().any(uses_multiset),
         ViewShape::Compound {
             operators,
             prefix_len,
@@ -1720,6 +1785,14 @@ pub fn needs_multiset_table(shape: &ViewShape) -> bool {
 /// accumulator.
 pub fn multiset_table_sql(multiset_table_name: &str, shape: &ViewShape) -> Result<String> {
     match shape {
+        // An aggregate over a LEFT join borrows this slot for the join's
+        // per-left-row padded bookkeeping — the same schema a standalone LEFT
+        // JOIN keeps (see the Join arm below).
+        ViewShape::GroupAggregate {
+            outer_join: true, ..
+        } => Ok(format!(
+            "CREATE TABLE {multiset_table_name} (l_rid, present, matches, padded, PRIMARY KEY (l_rid))"
+        )),
         ViewShape::GroupAggregate {
             group_collations,
             multiset_collation,
@@ -1771,12 +1844,6 @@ fn collate_clause(collation: CollationSeq) -> String {
         other => format!(" COLLATE \"{}\"", other.name()),
     }
 }
-
-/// Compile the maintenance (or population) program for a filter/project view.
-///
-/// `view_root_page` is the root of the view's data btree; `view_columns` are
-/// the view's output columns (the on-disk record is these plus a trailing
-/// weight column).
 
 /// How a branch of a compound view maps its local view rowids into the
 /// shared view btree, and how its hidden state tables are named apart from
@@ -2861,6 +2928,7 @@ fn emit_group_aggregate(
             group_exprs,
             aggregates,
             input,
+            ns,
             schema,
         )?;
         (eph_cursor_id, table_references, Some(join_ctx), 0)
@@ -4419,13 +4487,27 @@ fn emit_join_deltas_to_ephemeral(
     group_exprs: &[ast::Expr],
     aggregates: &[Aggregate],
     input: MaintenanceInput,
+    ns: &BranchNamespace,
     schema: &Schema,
 ) -> Result<(usize, JoinAggCtx, TableReferences)> {
     let (tables, on_conditions) = collect_join_tables(from, schema)?;
-    let conditions: Vec<&ast::Expr> = on_conditions
-        .iter()
-        .chain(where_clause.as_deref())
-        .collect();
+    // A two-table LEFT join feeds the aggregate its NULL-padded rows too. ON
+    // decides a match (suppressing the padded row); WHERE only gates which
+    // rows — inner or padded — reach the aggregate, so it is applied per row
+    // below rather than folded into the join's matching predicates. An inner
+    // join gates matching and output identically, so the two merge.
+    let left_outer = from.joins.iter().any(|join| {
+        matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt))
+            if jt.contains(ast::JoinType::LEFT))
+    });
+    let conditions: Vec<&ast::Expr> = if left_outer {
+        on_conditions.iter().collect()
+    } else {
+        on_conditions
+            .iter()
+            .chain(where_clause.as_deref())
+            .collect()
+    };
 
     let k = group_exprs.len();
     let arg_positions: Vec<Option<usize>> = aggregates
@@ -4458,6 +4540,240 @@ fn emit_join_deltas_to_ephemeral(
     let eph_weight_reg = eph_rec_start + k + n_args;
     let eph_rowid_reg = program.alloc_register();
     let eph_record_reg = program.alloc_register();
+    // The join phase computes each inner match's weight here. It is distinct
+    // from `eph_weight_reg` because a LEFT join's per-match aux gosub (below)
+    // fires before the inner row is written and overwrites `eph_weight_reg`
+    // with the padded row's ±1; the phase weight must survive that.
+    let phase_weight_reg = program.alloc_register();
+
+    // Project the group keys and aggregate arguments of the row under
+    // `table_references` into `dst..dst + k + n_args`. Shared by the inner
+    // phases (over the matched pair) and the padded-row writer (over the left
+    // row with NULLs on the right).
+    let project_group_args = |program: &mut ProgramBuilder,
+                              table_references: &mut TableReferences,
+                              dst: usize|
+     -> Result<()> {
+        for (i, group_expr) in group_exprs.iter().enumerate() {
+            let mut bound = group_expr.clone();
+            bind_and_rewrite_expr(
+                &mut bound,
+                Some(table_references),
+                None,
+                resolver,
+                BindingBehavior::ResultColumnsNotAllowed,
+            )?;
+            translate_expr_no_constant_opt(
+                program,
+                Some(table_references),
+                &bound,
+                dst + i,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+        }
+        for (agg, pos) in aggregates.iter().zip(&arg_positions) {
+            let (Some(arg), Some(pos)) = (agg.args.first(), pos) else {
+                continue;
+            };
+            let mut bound = arg.clone();
+            bind_and_rewrite_expr(
+                &mut bound,
+                Some(table_references),
+                None,
+                resolver,
+                BindingBehavior::ResultColumnsNotAllowed,
+            )?;
+            translate_expr_no_constant_opt(
+                program,
+                Some(table_references),
+                &bound,
+                dst + k + pos,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+        }
+        Ok(())
+    };
+
+    // Append `[g.., args..]` at `eph_rec_start` plus `eph_weight_reg` as a row
+    // of the ephemeral.
+    let emit_eph_insert = |program: &mut ProgramBuilder| {
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: eph_rec_start as u16,
+            count: (k + n_args + 1) as u16,
+            dest_reg: eph_record_reg as u16,
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::NewRowid {
+            cursor: eph_cursor_id,
+            rowid_reg: eph_rowid_reg,
+            prev_largest_reg: 0,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: eph_cursor_id,
+            key_reg: eph_rowid_reg,
+            record_reg: eph_record_reg,
+            flag: InsertFlags::new().is_ephemeral_table_insert(),
+            table_name: String::new(),
+        });
+    };
+
+    // LEFT join: emit the padded-row transitions through the shared
+    // per-left-row aux, whose payload stores each padded row's `[g.., args..]`
+    // so a retraction can be emitted even after the left row is gone.
+    struct EphOuter {
+        aux: LeftJoinAux,
+        main_label: BranchOffset,
+        corrupt_label: BranchOffset,
+        end_label: BranchOffset,
+        left_rowid_reg: usize,
+    }
+    let outer = if left_outer {
+        turso_assert!(
+            tables.len() == 2,
+            "classify admits aggregate over LEFT JOIN for exactly two tables"
+        );
+        let aux_name = format!(
+            "{}{}_{view_name}{}",
+            crate::schema::DBSP_MULTISET_TABLE_PREFIX,
+            crate::incremental::view::DBSP_CIRCUIT_VERSION,
+            ns.suffix,
+        );
+        let aux_table = schema.get_btree_table(&aux_name).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "aux table {aux_name} of materialized view {view_name} not found"
+            ))
+        })?;
+        let aux_index = schema
+            .get_indices(&aux_name)
+            .next()
+            .cloned()
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "aux table {aux_name} of materialized view {view_name} has no index"
+                ))
+            })?;
+
+        let zero_reg = program.alloc_register();
+        let prev_rowid_scratch = program.alloc_register();
+        let left_rowid_reg = program.alloc_register();
+        let corrupt_label = program.allocate_label();
+        let main_label = program.allocate_label();
+        let end_label = program.allocate_label();
+
+        // Padded-row cursors: the left btree (seeked to the padded left row)
+        // and the right btree on its null row, so a projection reads the left
+        // values with NULLs on the right.
+        let pad_ids: Vec<_> = (0..tables.len())
+            .map(|_| program.table_reference_counter.next())
+            .collect();
+        let mut pad_references = TableReferences::new(
+            tables
+                .iter()
+                .zip(&pad_ids)
+                .map(|((table, ident, using), id)| make_joined_table(table, ident, using, *id))
+                .collect(),
+            vec![],
+        );
+        let pad_cursors: Vec<usize> = tables
+            .iter()
+            .zip(&pad_ids)
+            .map(|((table, _, _), id)| {
+                let cursor_id = program.alloc_cursor_id_keyed(
+                    CursorKey::table(*id),
+                    CursorType::BTreeTable(table.clone()),
+                );
+                program.emit_insn(Insn::OpenRead {
+                    cursor_id,
+                    root_page: table.root_page,
+                    db: 0,
+                });
+                cursor_id
+            })
+            .collect();
+        let pad_where = match where_clause {
+            Some(where_expr) => {
+                let mut bound = where_expr.as_ref().clone();
+                bind_and_rewrite_expr(
+                    &mut bound,
+                    Some(&mut pad_references),
+                    None,
+                    resolver,
+                    BindingBehavior::ResultColumnsNotAllowed,
+                )?;
+                Some(bound)
+            }
+            None => None,
+        };
+
+        let aux = LeftJoinAux::open(
+            program,
+            aux_name,
+            &aux_table,
+            &aux_index,
+            k + n_args,
+            zero_reg,
+            prev_rowid_scratch,
+            corrupt_label,
+        );
+        let content_start = aux.content_start;
+        program.emit_int(0, zero_reg);
+        program.emit_insn(Insn::Goto {
+            target_pc: main_label,
+        });
+
+        // Padded add: project the padded row into the aux payload (persisted
+        // by the aux write) and emit it with +1; padded remove: emit the
+        // stored payload with −1.
+        let mut emit_padded_add = |program: &mut ProgramBuilder,
+                                   _pad_cursors: &[usize],
+                                   pad_references: &mut TableReferences,
+                                   _srid: usize|
+         -> Result<()> {
+            project_group_args(program, pad_references, content_start)?;
+            program.emit_insn(Insn::Copy {
+                src_reg: content_start,
+                dst_reg: eph_rec_start,
+                extra_amount: (k + n_args).saturating_sub(1),
+            });
+            program.emit_int(1, eph_weight_reg);
+            emit_eph_insert(program);
+            Ok(())
+        };
+        let mut emit_padded_remove = |program: &mut ProgramBuilder, _srid: usize| -> Result<()> {
+            program.emit_insn(Insn::Copy {
+                src_reg: content_start,
+                dst_reg: eph_rec_start,
+                extra_amount: (k + n_args).saturating_sub(1),
+            });
+            program.emit_int(-1, eph_weight_reg);
+            emit_eph_insert(program);
+            Ok(())
+        };
+        aux.emit_subroutine(
+            program,
+            resolver,
+            &pad_cursors,
+            &mut pad_references,
+            pad_where.as_ref(),
+            &mut emit_padded_add,
+            &mut emit_padded_remove,
+        )?;
+
+        program.preassign_label_to_next_insn(main_label);
+        aux.emit_presence_pass(program, input, &tables[0].0, view_name);
+        Some(EphOuter {
+            aux,
+            main_label,
+            corrupt_label,
+            end_label,
+            left_rowid_reg,
+        })
+    } else {
+        None
+    };
 
     for (sides, negate) in join_subset_phases(tables.len(), input) {
         emit_join_phase(
@@ -4468,69 +4784,74 @@ fn emit_join_deltas_to_ephemeral(
             &conditions,
             &sides,
             negate,
-            eph_weight_reg,
-            &mut |program, _cursors, table_references| {
-                for (i, group_expr) in group_exprs.iter().enumerate() {
-                    let mut bound = group_expr.clone();
-                    bind_and_rewrite_expr(
-                        &mut bound,
-                        Some(table_references),
-                        None,
-                        resolver,
-                        BindingBehavior::ResultColumnsNotAllowed,
-                    )?;
-                    translate_expr_no_constant_opt(
-                        program,
-                        Some(table_references),
-                        &bound,
-                        eph_rec_start + i,
-                        resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
+            phase_weight_reg,
+            &mut |program, cursors, table_references| {
+                let skip_label = program.allocate_label();
+                if let Some(outer) = &outer {
+                    // Count every ON match against its left row (suppresses
+                    // that row's padded output), then let WHERE gate only
+                    // whether this inner row reaches the aggregate. The count
+                    // gosub may write padded rows and clobber eph_weight_reg,
+                    // so the inner weight is copied from phase_weight_reg
+                    // afterwards.
+                    program.emit_insn(Insn::RowId {
+                        cursor_id: cursors[0],
+                        dest: outer.left_rowid_reg,
+                    });
+                    outer
+                        .aux
+                        .emit_count_match(program, outer.left_rowid_reg, phase_weight_reg);
+                    if let Some(where_expr) = where_clause.as_deref() {
+                        let mut bound = where_expr.clone();
+                        bind_and_rewrite_expr(
+                            &mut bound,
+                            Some(table_references),
+                            None,
+                            resolver,
+                            BindingBehavior::ResultColumnsNotAllowed,
+                        )?;
+                        let pass_label = program.allocate_label();
+                        translate_condition_expr(
+                            program,
+                            table_references,
+                            &bound,
+                            ConditionMetadata {
+                                jump_if_condition_is_true: false,
+                                jump_target_when_true: pass_label,
+                                jump_target_when_false: skip_label,
+                                jump_target_when_null: skip_label,
+                            },
+                            resolver,
+                        )?;
+                        program.preassign_label_to_next_insn(pass_label);
+                    }
                 }
-                for (agg, pos) in aggregates.iter().zip(&arg_positions) {
-                    let (Some(arg), Some(pos)) = (agg.args.first(), pos) else {
-                        continue;
-                    };
-                    let mut bound = arg.clone();
-                    bind_and_rewrite_expr(
-                        &mut bound,
-                        Some(table_references),
-                        None,
-                        resolver,
-                        BindingBehavior::ResultColumnsNotAllowed,
-                    )?;
-                    translate_expr_no_constant_opt(
-                        program,
-                        Some(table_references),
-                        &bound,
-                        eph_rec_start + k + pos,
-                        resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
-                }
-                program.emit_insn(Insn::MakeRecord {
-                    start_reg: eph_rec_start as u16,
-                    count: (k + n_args + 1) as u16,
-                    dest_reg: eph_record_reg as u16,
-                    index_name: None,
-                    affinity_str: None,
+                project_group_args(program, table_references, eph_rec_start)?;
+                program.emit_insn(Insn::Copy {
+                    src_reg: phase_weight_reg,
+                    dst_reg: eph_weight_reg,
+                    extra_amount: 0,
                 });
-                program.emit_insn(Insn::NewRowid {
-                    cursor: eph_cursor_id,
-                    rowid_reg: eph_rowid_reg,
-                    prev_largest_reg: 0,
-                });
-                program.emit_insn(Insn::Insert {
-                    cursor: eph_cursor_id,
-                    key_reg: eph_rowid_reg,
-                    record_reg: eph_record_reg,
-                    flag: InsertFlags::new().is_ephemeral_table_insert(),
-                    table_name: String::new(),
-                });
+                emit_eph_insert(program);
+                program.preassign_label_to_next_insn(skip_label);
                 Ok(())
             },
         )?;
+    }
+
+    if let Some(outer) = &outer {
+        program.emit_insn(Insn::Goto {
+            target_pc: outer.end_label,
+        });
+        program.preassign_label_to_next_insn(outer.corrupt_label);
+        program.emit_insn(Insn::Halt {
+            err_code: crate::error::SQLITE_ERROR,
+            description: format!("materialized view {view_name} state is corrupted"),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(outer.end_label);
+        let _ = outer.main_label;
     }
 
     // Table references over the join tables for the caller's HAVING
@@ -4551,10 +4872,513 @@ fn emit_join_deltas_to_ephemeral(
         JoinAggCtx {
             k,
             n_args,
-            arg_positions,
+            arg_positions: arg_positions.clone(),
         },
         having_references,
     ))
+}
+
+/// Consumer hook that materializes one NULL-padded output row: given the
+/// padded-image cursors (left seeked, right on its null row), their table
+/// references, and the aux row's rowid identifying the padded row.
+type PaddedAddFn<'a> =
+    dyn FnMut(&mut ProgramBuilder, &[usize], &mut TableReferences, usize) -> Result<()> + 'a;
+/// Consumer hook that retracts one NULL-padded output row, given the aux
+/// row's rowid.
+type PaddedRemoveFn<'a> = dyn FnMut(&mut ProgramBuilder, usize) -> Result<()> + 'a;
+
+/// Per-left-row NULL-padded bookkeeping for a two-table LEFT (or swapped
+/// RIGHT) join, shared by every consumer of the join's output: the standalone
+/// join view, and an aggregate reading the join.
+///
+/// A LEFT join's output is the inner matches plus one NULL-padded row for each
+/// left row with no ON-match. The inner rows are a plain function of the
+/// current inputs (the delta phases reconstruct them, retractions included,
+/// from the base-table deltas), but a padded row exists only *because* its
+/// left row currently has zero matches — it must appear when the left row
+/// arrives unmatched and disappear the moment a match arrives, the left row
+/// leaves, or (with a WHERE over the padded image) the predicate flips. That
+/// is anti-join maintenance, and it needs state: this auxiliary table keeps,
+/// per left row, its signed presence, its count of ON-matches, and whether its
+/// padded output row is currently live.
+///
+/// The subroutine applies a `(l_rid, dPresent, dMatches)` delta to that state
+/// and, on a transition of "present with zero matches and the padded image
+/// passes WHERE", invokes the consumer's `emit_padded_add` / `padded_remove`
+/// to materialize or retract the one padded output row. Presence deltas come
+/// from the left-input pass ([`Self::emit_presence_pass`]); match deltas come
+/// from each inner join phase ([`Self::emit_count_match`]).
+struct LeftJoinAux {
+    aux_name: String,
+    aux_index_name: String,
+    aux_cursor_id: usize,
+    aux_index_cursor_id: usize,
+    /// Set by the caller before `Gosub(merge_label)`: `[l_rid, aux_rowid]`.
+    akey_start: usize,
+    /// The aux row's rowid slot (`akey_start + 1`), doubling as the padded
+    /// output row's identity for the consumer's add/remove.
+    srid_reg: usize,
+    /// Set by the caller before the gosub: the signed presence delta.
+    dp_reg: usize,
+    /// Set by the caller before the gosub: the signed match-count delta.
+    dm_reg: usize,
+    return_reg: usize,
+    merge_label: BranchOffset,
+    // Working registers, private to the subroutine.
+    rec_start: usize,
+    present_reg: usize,
+    matches_reg: usize,
+    padded_reg: usize,
+    fresh_reg: usize,
+    padded_new_reg: usize,
+    state_record_reg: usize,
+    index_record_reg: usize,
+    /// Optional padded-output payload stored in the aux row after `padded`:
+    /// its first register and width. A consumer that must retract a padded
+    /// row it cannot reproject (e.g. an aggregate feed, whose left row may be
+    /// gone by removal time) writes the payload here on add and reads it back
+    /// on remove. Zero width for the standalone view, which retracts by rowid.
+    content_start: usize,
+    content_width: usize,
+    // Shared scratch owned by the caller.
+    zero_reg: usize,
+    prev_rowid_scratch: usize,
+    corrupt_label: BranchOffset,
+}
+
+impl LeftJoinAux {
+    /// Open the aux table and its index and allocate the subroutine's
+    /// registers. `zero_reg`, `prev_rowid_scratch`, and `corrupt_label` are
+    /// shared with the caller's other subroutines.
+    #[allow(clippy::too_many_arguments)]
+    fn open(
+        program: &mut ProgramBuilder,
+        aux_name: String,
+        aux_table: &Arc<BTreeTable>,
+        aux_index: &Arc<crate::schema::Index>,
+        content_width: usize,
+        zero_reg: usize,
+        prev_rowid_scratch: usize,
+        corrupt_label: BranchOffset,
+    ) -> Self {
+        let aux_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(aux_table.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: aux_cursor_id,
+            root_page: RegisterOrLiteral::Literal(aux_table.root_page),
+            db: 0,
+        });
+        let aux_index_cursor_id =
+            program.alloc_cursor_id(CursorType::BTreeIndex(aux_index.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: aux_index_cursor_id,
+            root_page: RegisterOrLiteral::Literal(aux_index.root_page),
+            db: 0,
+        });
+
+        // [l_rid, aux_rowid], contiguous for Found/IdxInsert/IdxDelete.
+        let akey_start = program.alloc_registers(2);
+        let srid_reg = akey_start + 1;
+        // [l_rid, present, matches, padded, payload..], the aux row image.
+        let rec_start = program.alloc_registers(4 + content_width);
+        let present_reg = rec_start + 1;
+        let matches_reg = rec_start + 2;
+        let padded_reg = rec_start + 3;
+        let content_start = rec_start + 4;
+
+        Self {
+            aux_name,
+            aux_index_name: aux_index.name.clone(),
+            aux_cursor_id,
+            aux_index_cursor_id,
+            akey_start,
+            srid_reg,
+            dp_reg: program.alloc_register(),
+            dm_reg: program.alloc_register(),
+            return_reg: program.alloc_register(),
+            merge_label: program.allocate_label(),
+            rec_start,
+            present_reg,
+            matches_reg,
+            padded_reg,
+            fresh_reg: program.alloc_register(),
+            padded_new_reg: program.alloc_register(),
+            state_record_reg: program.alloc_register(),
+            index_record_reg: program.alloc_register(),
+            content_start,
+            content_width,
+            zero_reg,
+            prev_rowid_scratch,
+            corrupt_label,
+        }
+    }
+
+    /// Emit the aux-merge subroutine (reached by `Gosub(self.merge_label)`).
+    /// `pad_cursors`/`pad_references`/`pad_where` describe the padded image
+    /// (left cursor plus a NULL-row right cursor) over which WHERE is tested;
+    /// `emit_padded_add`/`emit_padded_remove` materialize and retract the one
+    /// padded output row, with `self.srid_reg` holding its identity and (for
+    /// add) `pad_cursors` positioned on the padded image.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_subroutine(
+        &self,
+        program: &mut ProgramBuilder,
+        resolver: &Resolver,
+        pad_cursors: &[usize],
+        pad_references: &mut TableReferences,
+        pad_where: Option<&ast::Expr>,
+        emit_padded_add: &mut PaddedAddFn<'_>,
+        emit_padded_remove: &mut PaddedRemoveFn<'_>,
+    ) -> Result<()> {
+        program.preassign_label_to_next_insn(self.merge_label);
+
+        let af_found = program.allocate_label();
+        let af_have_row = program.allocate_label();
+        let af_transition = program.allocate_label();
+        let af_padwrite = program.allocate_label();
+        let af_store = program.allocate_label();
+        let af_write = program.allocate_label();
+        let af_ret = program.allocate_label();
+
+        program.emit_insn(Insn::Found {
+            cursor_id: self.aux_index_cursor_id,
+            target_pc: af_found,
+            record_reg: self.akey_start,
+            num_regs: 1,
+        });
+        // Fresh left row (or a retraction arriving first: recorded with its
+        // signs).
+        program.emit_int(1, self.fresh_reg);
+        program.emit_insn(Insn::NewRowid {
+            cursor: self.aux_cursor_id,
+            rowid_reg: self.srid_reg,
+            prev_largest_reg: self.prev_rowid_scratch,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: self.akey_start,
+            dst_reg: self.rec_start,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: self.dp_reg,
+            dst_reg: self.present_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: self.dm_reg,
+            dst_reg: self.matches_reg,
+            extra_amount: 0,
+        });
+        program.emit_int(0, self.padded_reg);
+        // The payload is undefined until the row first becomes padded; NULL it
+        // so a persisted-but-never-padded aux row carries defined columns.
+        if self.content_width > 0 {
+            program.emit_insn(Insn::Null {
+                dest: self.content_start,
+                dest_end: Some(self.content_start + self.content_width - 1),
+            });
+        }
+        program.emit_insn(Insn::Goto {
+            target_pc: af_have_row,
+        });
+
+        program.preassign_label_to_next_insn(af_found);
+        program.emit_int(0, self.fresh_reg);
+        program.emit_insn(Insn::IdxRowId {
+            cursor_id: self.aux_index_cursor_id,
+            dest: self.srid_reg,
+        });
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: self.aux_cursor_id,
+            src_reg: self.srid_reg,
+            target_pc: self.corrupt_label,
+        });
+        for (column, dest) in [
+            (1, self.present_reg),
+            (2, self.matches_reg),
+            (3, self.padded_reg),
+        ] {
+            program.emit_insn(Insn::Column {
+                cursor_id: self.aux_cursor_id,
+                column,
+                dest,
+                default: None,
+            });
+        }
+        // Load the stored padded payload so a remove can emit the departing
+        // row's old image without repositioning cursors.
+        for i in 0..self.content_width {
+            program.emit_insn(Insn::Column {
+                cursor_id: self.aux_cursor_id,
+                column: 4 + i,
+                dest: self.content_start + i,
+                default: None,
+            });
+        }
+        program.emit_insn(Insn::Copy {
+            src_reg: self.akey_start,
+            dst_reg: self.rec_start,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Add {
+            lhs: self.dp_reg,
+            rhs: self.present_reg,
+            dest: self.present_reg,
+        });
+        program.emit_insn(Insn::Add {
+            lhs: self.dm_reg,
+            rhs: self.matches_reg,
+            dest: self.matches_reg,
+        });
+
+        program.preassign_label_to_next_insn(af_have_row);
+        program.emit_int(0, self.padded_new_reg);
+        program.emit_insn(Insn::Le {
+            lhs: self.present_reg,
+            rhs: self.zero_reg,
+            target_pc: af_transition,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::If {
+            reg: self.matches_reg,
+            target_pc: af_transition,
+            jump_if_null: false,
+        });
+        // Candidate padded row: position the left cursor on the row (present,
+        // so the post-state btree has it), put the right cursor on its null
+        // row, and let WHERE decide over that image.
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: pad_cursors[0],
+            src_reg: self.akey_start,
+            target_pc: self.corrupt_label,
+        });
+        program.emit_insn(Insn::NullRow {
+            cursor_id: pad_cursors[1],
+        });
+        if let Some(pad_where) = pad_where {
+            let pad_pass = program.allocate_label();
+            translate_condition_expr(
+                program,
+                pad_references,
+                pad_where,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_true: pad_pass,
+                    jump_target_when_false: af_transition,
+                    jump_target_when_null: af_transition,
+                },
+                resolver,
+            )?;
+            program.preassign_label_to_next_insn(pad_pass);
+        }
+        program.emit_int(1, self.padded_new_reg);
+        program.preassign_label_to_next_insn(af_transition);
+        program.emit_insn(Insn::Eq {
+            lhs: self.padded_reg,
+            rhs: self.padded_new_reg,
+            target_pc: af_store,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::If {
+            reg: self.padded_new_reg,
+            target_pc: af_padwrite,
+            jump_if_null: false,
+        });
+        // Padded before, not now: retract the padded output row.
+        emit_padded_remove(program, self.srid_reg)?;
+        program.emit_insn(Insn::Goto {
+            target_pc: af_store,
+        });
+
+        // Not padded before, padded now: materialize it. The only path that
+        // sets `padded_new` positioned the pad cursors, so the consumer reads
+        // the left row with NULLs on the right.
+        program.preassign_label_to_next_insn(af_padwrite);
+        emit_padded_add(program, pad_cursors, pad_references, self.srid_reg)?;
+
+        program.preassign_label_to_next_insn(af_store);
+        // Persist the padded bit the transitions just enacted.
+        program.emit_insn(Insn::Copy {
+            src_reg: self.padded_new_reg,
+            dst_reg: self.padded_reg,
+            extra_amount: 0,
+        });
+        // Delete the aux row once everything it tracks is zero; otherwise
+        // (re)write it.
+        program.emit_insn(Insn::If {
+            reg: self.present_reg,
+            target_pc: af_write,
+            jump_if_null: false,
+        });
+        program.emit_insn(Insn::If {
+            reg: self.matches_reg,
+            target_pc: af_write,
+            jump_if_null: false,
+        });
+        program.emit_insn(Insn::If {
+            reg: self.fresh_reg,
+            target_pc: af_ret,
+            jump_if_null: false,
+        });
+        program.emit_insn(Insn::IdxDelete {
+            start_reg: self.akey_start,
+            num_regs: 2,
+            cursor_id: self.aux_index_cursor_id,
+            raise_error_if_no_matching_entry: true,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: self.aux_cursor_id,
+            table_name: self.aux_name.clone(),
+            is_part_of_update: true,
+        });
+        program.emit_insn(Insn::Goto { target_pc: af_ret });
+
+        program.preassign_label_to_next_insn(af_write);
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: self.rec_start as u16,
+            count: (4 + self.content_width) as u16,
+            dest_reg: self.state_record_reg as u16,
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: self.aux_cursor_id,
+            key_reg: self.srid_reg,
+            record_reg: self.state_record_reg,
+            flag: InsertFlags(
+                InsertFlags::REQUIRE_SEEK
+                    | InsertFlags::SKIP_LAST_ROWID
+                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+            ),
+            table_name: self.aux_name.clone(),
+        });
+        let af_skip_index = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: self.fresh_reg,
+            target_pc: af_skip_index,
+            jump_if_null: true,
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: self.akey_start as u16,
+            count: 2,
+            dest_reg: self.index_record_reg as u16,
+            index_name: Some(self.aux_index_name.clone()),
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: self.aux_index_cursor_id,
+            record_reg: self.index_record_reg,
+            unpacked_start: Some(self.akey_start),
+            unpacked_count: Some(2),
+            flags: IdxInsertFlags::new(),
+        });
+        program.preassign_label_to_next_insn(af_skip_index);
+        program.preassign_label_to_next_insn(af_ret);
+        program.emit_insn(Insn::Return {
+            return_reg: self.return_reg,
+            can_fallthrough: false,
+        });
+        Ok(())
+    }
+
+    /// Emit the left-input presence pass: iterate the left input (transaction
+    /// delta or, during population, the full left btree) and drive a presence
+    /// delta through the subroutine for each left row. A new unmatched left
+    /// row reaches no join phase, so this is where it first appears.
+    fn emit_presence_pass(
+        &self,
+        program: &mut ProgramBuilder,
+        input: MaintenanceInput,
+        left_table: &Arc<BTreeTable>,
+        view_name: &str,
+    ) {
+        let num_left_columns = left_table.columns().len();
+        let input_cursor_id = match input {
+            MaintenanceInput::TransactionDelta => {
+                let cursor_id = program.alloc_cursor_id(CursorType::ViewDelta {
+                    view_name: view_name.to_string(),
+                    table: left_table.clone(),
+                });
+                program.emit_insn(Insn::OpenRead {
+                    cursor_id,
+                    root_page: 0,
+                    db: 0,
+                });
+                cursor_id
+            }
+            MaintenanceInput::BaseTable => {
+                let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(left_table.clone()));
+                program.emit_insn(Insn::OpenRead {
+                    cursor_id,
+                    root_page: left_table.root_page,
+                    db: 0,
+                });
+                cursor_id
+            }
+        };
+        let pass_done = program.allocate_label();
+        let pass_loop = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: input_cursor_id,
+            pc_if_empty: pass_done,
+        });
+        program.preassign_label_to_next_insn(pass_loop);
+        match input {
+            MaintenanceInput::TransactionDelta => {
+                program.emit_insn(Insn::Column {
+                    cursor_id: input_cursor_id,
+                    column: num_left_columns,
+                    dest: self.dp_reg,
+                    default: None,
+                });
+            }
+            MaintenanceInput::BaseTable => {
+                program.emit_int(1, self.dp_reg);
+            }
+        }
+        program.emit_insn(Insn::RowId {
+            cursor_id: input_cursor_id,
+            dest: self.akey_start,
+        });
+        program.emit_int(0, self.dm_reg);
+        program.emit_insn(Insn::Gosub {
+            target_pc: self.merge_label,
+            return_reg: self.return_reg,
+        });
+        program.emit_insn(Insn::Next {
+            cursor_id: input_cursor_id,
+            pc_if_next: pass_loop,
+        });
+        program.preassign_label_to_next_insn(pass_done);
+    }
+
+    /// Emit a match-count delta for the left row at `left_rowid_reg`, weighted
+    /// by the current phase's signed weight. Called from each inner join phase
+    /// so every ON match adjusts its left row's count, whether or not WHERE
+    /// lets the inner row through.
+    fn emit_count_match(
+        &self,
+        program: &mut ProgramBuilder,
+        left_rowid_reg: usize,
+        weight_reg: usize,
+    ) {
+        program.emit_insn(Insn::Copy {
+            src_reg: left_rowid_reg,
+            dst_reg: self.akey_start,
+            extra_amount: 0,
+        });
+        program.emit_int(0, self.dp_reg);
+        program.emit_insn(Insn::Copy {
+            src_reg: weight_reg,
+            dst_reg: self.dm_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Gosub {
+            target_pc: self.merge_label,
+            return_reg: self.return_reg,
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4671,25 +5495,42 @@ fn emit_join(
         db: 0,
     });
 
-    // LEFT JOIN cursors: the aux table with its index, and dedicated left
-    // and right btree read cursors (with their own table references) for
-    // writing the NULL-padded row — the right cursor is put on its null row
-    // so every column read yields NULL.
-    let outer = if let Some((aux_name, aux_table, aux_index)) = &aux {
-        let aux_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(aux_table.clone()));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: aux_cursor_id,
-            root_page: RegisterOrLiteral::Literal(aux_table.root_page),
-            db: 0,
-        });
-        let aux_index_cursor_id =
-            program.alloc_cursor_id(CursorType::BTreeIndex(aux_index.clone()));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: aux_index_cursor_id,
-            root_page: RegisterOrLiteral::Literal(aux_index.root_page),
-            db: 0,
-        });
+    // Register layout, shared by all phases: the merge subroutine reads the
+    // rowid tuple, the projected outputs, and the contribution weight.
+    let zero_reg = program.alloc_register();
+    let gosub_return_reg = program.alloc_register();
+    let prev_rowid_scratch = program.alloc_register();
+    // [rowids.., state_rowid], contiguous for Found/IdxInsert/IdxDelete.
+    let pair_start = program.alloc_registers(n + 1);
+    let srid_reg = pair_start + n;
+    // [outputs.., weight], contiguous for MakeRecord.
+    let out_start = program.alloc_registers(num_view_columns + 1);
+    let out_weight_reg = out_start + num_view_columns;
+    // [rowids.., multiplicity], the state row image.
+    let state_rec_start = program.alloc_registers(n + 1);
+    let state_mult_reg = state_rec_start + n;
+    let w_reg = program.alloc_register();
+    let cur_w_reg = program.alloc_register();
+    let new_w_reg = program.alloc_register();
+    let state_record_reg = program.alloc_register();
+    let index_record_reg = program.alloc_register();
+    let view_record_reg = program.alloc_register();
+    // LEFT JOIN registers: view rowids split across the two state tables
+    // (2*rowid for inner rows, 2*rowid + 1 for padded rows).
+    let view_rowid_reg = program.alloc_register();
+    let two_reg = program.alloc_register();
+    let one_reg = program.alloc_register();
 
+    let merge_label = program.allocate_label();
+    let main_start_label = program.allocate_label();
+    let corrupt_label = program.allocate_label();
+    let end_label = program.allocate_label();
+
+    // LEFT JOIN: dedicated left and right btree read cursors (with their own
+    // table references) for the NULL-padded row — the right cursor is put on
+    // its null row so every column read yields NULL — plus the per-left-row
+    // aux bookkeeping subroutine.
+    let outer = if let Some((aux_name, aux_table, aux_index)) = &aux {
         let pad_ids: Vec<_> = (0..n)
             .map(|_| program.table_reference_counter.next())
             .collect();
@@ -4733,69 +5574,26 @@ fn emit_join(
             }
             None => None,
         };
-        Some((
+        let aux = LeftJoinAux::open(
+            program,
             aux_name.clone(),
-            aux_index.name.clone(),
-            aux_cursor_id,
-            aux_index_cursor_id,
-            pad_references,
-            pad_cursors,
-            pad_where,
-        ))
+            aux_table,
+            aux_index,
+            // The standalone view retracts a padded row by its split rowid, so
+            // it stores no payload.
+            0,
+            zero_reg,
+            prev_rowid_scratch,
+            corrupt_label,
+        );
+        Some((pad_references, pad_cursors, pad_where, aux))
     } else {
         None
     };
 
-    // Register layout, shared by all phases: the merge subroutine reads the
-    // rowid tuple, the projected outputs, and the contribution weight.
-    let zero_reg = program.alloc_register();
-    let gosub_return_reg = program.alloc_register();
-    let prev_rowid_scratch = program.alloc_register();
-    // [rowids.., state_rowid], contiguous for Found/IdxInsert/IdxDelete.
-    let pair_start = program.alloc_registers(n + 1);
-    let srid_reg = pair_start + n;
-    // [outputs.., weight], contiguous for MakeRecord.
-    let out_start = program.alloc_registers(num_view_columns + 1);
-    let out_weight_reg = out_start + num_view_columns;
-    // [rowids.., multiplicity], the state row image.
-    let state_rec_start = program.alloc_registers(n + 1);
-    let state_mult_reg = state_rec_start + n;
-    let w_reg = program.alloc_register();
-    let cur_w_reg = program.alloc_register();
-    let new_w_reg = program.alloc_register();
-    let state_record_reg = program.alloc_register();
-    let index_record_reg = program.alloc_register();
-    let view_record_reg = program.alloc_register();
-    // LEFT JOIN registers: view rowids split across the two state tables
-    // (2*rowid for inner rows, 2*rowid + 1 for padded rows), and the
-    // aux-merge subroutine's working set.
-    let view_rowid_reg = program.alloc_register();
-    let two_reg = program.alloc_register();
-    let one_reg = program.alloc_register();
-    let a_return_reg = program.alloc_register();
-    // [l_rid, aux_rowid], contiguous for Found/IdxInsert/IdxDelete.
-    let akey_start = program.alloc_registers(2);
-    let a_srid_reg = akey_start + 1;
-    // [l_rid, present, matches, padded], the aux row image.
-    let a_rec_start = program.alloc_registers(4);
-    let a_present_reg = a_rec_start + 1;
-    let a_matches_reg = a_rec_start + 2;
-    let a_padded_reg = a_rec_start + 3;
-    let dp_reg = program.alloc_register();
-    let dm_reg = program.alloc_register();
-    let a_fresh_reg = program.alloc_register();
-    let padded_new_reg = program.alloc_register();
-    let a_state_record_reg = program.alloc_register();
-    let a_index_record_reg = program.alloc_register();
-
     program.emit_int(0, zero_reg);
     program.emit_int(2, two_reg);
     program.emit_int(1, one_reg);
-
-    let merge_label = program.allocate_label();
-    let main_start_label = program.allocate_label();
-    let corrupt_label = program.allocate_label();
-    let end_label = program.allocate_label();
 
     program.emit_insn(Insn::Goto {
         target_pc: main_start_label,
@@ -5043,196 +5841,23 @@ fn emit_join(
         can_fallthrough: false,
     });
 
-    // LEFT JOIN aux-merge subroutine: apply (l_rid, dPresent, dMatches) to
-    // the left row's bookkeeping and flip its NULL-padded view row on
-    // transitions of "present with zero matches and WHERE passes over the
-    // padded image". The padded bit is stored: it was decided against an
-    // image that later contributions may not be able to reconstruct (WHERE
-    // is only ever evaluated when the row is present, so the post-state
-    // btree has the image). Negative counts are recorded for uniformity
-    // with the pair map and read as absent.
-    let aux_merge_label = if let Some((
-        aux_name,
-        aux_index_name,
-        aux_cursor_id,
-        aux_index_cursor_id,
-        mut pad_references,
-        pad_cursors,
-        pad_where,
-    )) = outer
-    {
-        {
-            let am_label = program.allocate_label();
-            program.preassign_label_to_next_insn(am_label);
-
-            let af_found = program.allocate_label();
-            let af_have_row = program.allocate_label();
-            let af_transition = program.allocate_label();
-            let af_padwrite = program.allocate_label();
-            let af_store = program.allocate_label();
-            let af_write = program.allocate_label();
-            let af_ret = program.allocate_label();
-
-            program.emit_insn(Insn::Found {
-                cursor_id: aux_index_cursor_id,
-                target_pc: af_found,
-                record_reg: akey_start,
-                num_regs: 1,
-            });
-            // Fresh left row (or a retraction arriving first: recorded with
-            // its signs).
-            program.emit_int(1, a_fresh_reg);
-            program.emit_insn(Insn::NewRowid {
-                cursor: aux_cursor_id,
-                rowid_reg: a_srid_reg,
-                prev_largest_reg: prev_rowid_scratch,
-            });
-            program.emit_insn(Insn::Copy {
-                src_reg: akey_start,
-                dst_reg: a_rec_start,
-                extra_amount: 0,
-            });
-            program.emit_insn(Insn::Copy {
-                src_reg: dp_reg,
-                dst_reg: a_present_reg,
-                extra_amount: 0,
-            });
-            program.emit_insn(Insn::Copy {
-                src_reg: dm_reg,
-                dst_reg: a_matches_reg,
-                extra_amount: 0,
-            });
-            program.emit_int(0, a_padded_reg);
-            program.emit_insn(Insn::Goto {
-                target_pc: af_have_row,
-            });
-
-            program.preassign_label_to_next_insn(af_found);
-            program.emit_int(0, a_fresh_reg);
-            program.emit_insn(Insn::IdxRowId {
-                cursor_id: aux_index_cursor_id,
-                dest: a_srid_reg,
-            });
-            program.emit_insn(Insn::SeekRowid {
-                cursor_id: aux_cursor_id,
-                src_reg: a_srid_reg,
-                target_pc: corrupt_label,
-            });
-            for (column, dest) in [(1, a_present_reg), (2, a_matches_reg), (3, a_padded_reg)] {
-                program.emit_insn(Insn::Column {
-                    cursor_id: aux_cursor_id,
-                    column,
-                    dest,
-                    default: None,
-                });
-            }
-            program.emit_insn(Insn::Copy {
-                src_reg: akey_start,
-                dst_reg: a_rec_start,
-                extra_amount: 0,
-            });
-            program.emit_insn(Insn::Add {
-                lhs: dp_reg,
-                rhs: a_present_reg,
-                dest: a_present_reg,
-            });
-            program.emit_insn(Insn::Add {
-                lhs: dm_reg,
-                rhs: a_matches_reg,
-                dest: a_matches_reg,
-            });
-
-            program.preassign_label_to_next_insn(af_have_row);
-            program.emit_int(0, padded_new_reg);
-            program.emit_insn(Insn::Le {
-                lhs: a_present_reg,
-                rhs: zero_reg,
-                target_pc: af_transition,
-                flags: CmpInsFlags::default(),
-                collation: None,
-            });
-            program.emit_insn(Insn::If {
-                reg: a_matches_reg,
-                target_pc: af_transition,
-                jump_if_null: false,
-            });
-            // Candidate padded row: position the left cursor on the row
-            // (present, so the post-state btree has it), put the right
-            // cursor on its null row, and let WHERE decide over that image.
-            program.emit_insn(Insn::SeekRowid {
-                cursor_id: pad_cursors[0],
-                src_reg: akey_start,
-                target_pc: corrupt_label,
-            });
-            program.emit_insn(Insn::NullRow {
-                cursor_id: pad_cursors[1],
-            });
-            if let Some(pad_where) = &pad_where {
-                let pad_pass = program.allocate_label();
-                translate_condition_expr(
-                    program,
-                    &pad_references,
-                    pad_where,
-                    ConditionMetadata {
-                        jump_if_condition_is_true: false,
-                        jump_target_when_true: pad_pass,
-                        jump_target_when_false: af_transition,
-                        jump_target_when_null: af_transition,
-                    },
-                    &resolver,
-                )?;
-                program.preassign_label_to_next_insn(pad_pass);
-            }
-            program.emit_int(1, padded_new_reg);
-            program.preassign_label_to_next_insn(af_transition);
-            program.emit_insn(Insn::Eq {
-                lhs: a_padded_reg,
-                rhs: padded_new_reg,
-                target_pc: af_store,
-                flags: CmpInsFlags::default(),
-                collation: None,
-            });
-            program.emit_insn(Insn::If {
-                reg: padded_new_reg,
-                target_pc: af_padwrite,
-                jump_if_null: false,
-            });
-            // Padded before, not now: remove the padded view row.
-            emit_split_view_rowid(
-                program,
-                true,
-                a_srid_reg,
-                two_reg,
-                one_reg,
-                view_rowid_reg,
-                true,
-                ns,
-            );
-            program.emit_insn(Insn::SeekRowid {
-                cursor_id: view_cursor_id,
-                src_reg: view_rowid_reg,
-                target_pc: corrupt_label,
-            });
-            program.emit_insn(Insn::Delete {
-                cursor_id: view_cursor_id,
-                table_name: view_name.to_string(),
-                is_part_of_update: true,
-            });
-            program.emit_insn(Insn::Goto {
-                target_pc: af_store,
-            });
-
-            // Not padded before, padded now: write the padded view row. The
-            // only path that sets `padded_new` positioned the pad cursors,
-            // so the projection reads the left row with NULLs on the right.
-            program.preassign_label_to_next_insn(af_padwrite);
+    // LEFT JOIN aux-merge subroutine (in [`LeftJoinAux::emit_subroutine`]):
+    // the standalone view materializes each NULL-padded row into the view
+    // btree at its split rowid (2*aux_rowid + 1) and retracts it by that
+    // rowid, so it never needs the departing row's old image.
+    let outer = if let Some((mut pad_references, pad_cursors, pad_where, aux)) = outer {
+        let mut emit_padded_add = |program: &mut ProgramBuilder,
+                                   pad_cursors: &[usize],
+                                   pad_references: &mut TableReferences,
+                                   srid_reg: usize|
+         -> Result<()> {
             emit_join_projection(
                 program,
                 &resolver,
                 columns,
                 tables,
-                &pad_cursors,
-                &mut pad_references,
+                pad_cursors,
+                pad_references,
                 out_start,
                 num_view_columns,
             )?;
@@ -5247,7 +5872,7 @@ fn emit_join(
             emit_split_view_rowid(
                 program,
                 true,
-                a_srid_reg,
+                srid_reg,
                 two_reg,
                 one_reg,
                 view_rowid_reg,
@@ -5265,90 +5890,42 @@ fn emit_join(
                 ),
                 table_name: view_name.to_string(),
             });
-            program.preassign_label_to_next_insn(af_store);
-            // Persist the padded bit the transitions just enacted.
-            program.emit_insn(Insn::Copy {
-                src_reg: padded_new_reg,
-                dst_reg: a_padded_reg,
-                extra_amount: 0,
-            });
-            // Delete the aux row once everything it tracks is zero;
-            // otherwise (re)write it.
-            program.emit_insn(Insn::If {
-                reg: a_present_reg,
-                target_pc: af_write,
-                jump_if_null: false,
-            });
-            program.emit_insn(Insn::If {
-                reg: a_matches_reg,
-                target_pc: af_write,
-                jump_if_null: false,
-            });
-            program.emit_insn(Insn::If {
-                reg: a_fresh_reg,
-                target_pc: af_ret,
-                jump_if_null: false,
-            });
-            program.emit_insn(Insn::IdxDelete {
-                start_reg: akey_start,
-                num_regs: 2,
-                cursor_id: aux_index_cursor_id,
-                raise_error_if_no_matching_entry: true,
-            });
-            program.emit_insn(Insn::Delete {
-                cursor_id: aux_cursor_id,
-                table_name: aux_name.clone(),
-                is_part_of_update: true,
-            });
-            program.emit_insn(Insn::Goto { target_pc: af_ret });
-
-            program.preassign_label_to_next_insn(af_write);
-            program.emit_insn(Insn::MakeRecord {
-                start_reg: a_rec_start as u16,
-                count: 4,
-                dest_reg: a_state_record_reg as u16,
-                index_name: None,
-                affinity_str: None,
-            });
-            program.emit_insn(Insn::Insert {
-                cursor: aux_cursor_id,
-                key_reg: a_srid_reg,
-                record_reg: a_state_record_reg,
-                flag: InsertFlags(
-                    InsertFlags::REQUIRE_SEEK
-                        | InsertFlags::SKIP_LAST_ROWID
-                        | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-                ),
-                table_name: aux_name,
-            });
-            let af_skip_index = program.allocate_label();
-            program.emit_insn(Insn::IfNot {
-                reg: a_fresh_reg,
-                target_pc: af_skip_index,
-                jump_if_null: true,
-            });
-            program.emit_insn(Insn::MakeRecord {
-                start_reg: akey_start as u16,
-                count: 2,
-                dest_reg: a_index_record_reg as u16,
-                index_name: Some(aux_index_name),
-                affinity_str: None,
-            });
-            program.emit_insn(Insn::IdxInsert {
-                cursor_id: aux_index_cursor_id,
-                record_reg: a_index_record_reg,
-                unpacked_start: Some(akey_start),
-                unpacked_count: Some(2),
-                flags: IdxInsertFlags::new(),
-            });
-            program.preassign_label_to_next_insn(af_skip_index);
-            program.preassign_label_to_next_insn(af_ret);
-            program.emit_insn(Insn::Return {
-                return_reg: a_return_reg,
-                can_fallthrough: false,
-            });
-            Some(am_label)
-        }
+            Ok(())
+        };
+        let mut emit_padded_remove =
+            |program: &mut ProgramBuilder, srid_reg: usize| -> Result<()> {
+                emit_split_view_rowid(
+                    program,
+                    true,
+                    srid_reg,
+                    two_reg,
+                    one_reg,
+                    view_rowid_reg,
+                    true,
+                    ns,
+                );
+                program.emit_insn(Insn::SeekRowid {
+                    cursor_id: view_cursor_id,
+                    src_reg: view_rowid_reg,
+                    target_pc: corrupt_label,
+                });
+                program.emit_insn(Insn::Delete {
+                    cursor_id: view_cursor_id,
+                    table_name: view_name.to_string(),
+                    is_part_of_update: true,
+                });
+                Ok(())
+            };
+        aux.emit_subroutine(
+            program,
+            &resolver,
+            &pad_cursors,
+            &mut pad_references,
+            pad_where.as_ref(),
+            &mut emit_padded_add,
+            &mut emit_padded_remove,
+        )?;
+        Some(aux)
     } else {
         None
     };
@@ -5359,66 +5936,8 @@ fn emit_join(
     // presence (a new unmatched left row reaches no join phase). During
     // population the input is the full left btree, so every left row gets
     // its bookkeeping row before the join phase counts its matches.
-    if let Some(aux_merge_label) = aux_merge_label {
-        let (left_table, _, _) = &tables[0];
-        let num_left_columns = left_table.columns().len();
-        let input_cursor_id = match input {
-            MaintenanceInput::TransactionDelta => {
-                let cursor_id = program.alloc_cursor_id(CursorType::ViewDelta {
-                    view_name: view_name.to_string(),
-                    table: left_table.clone(),
-                });
-                program.emit_insn(Insn::OpenRead {
-                    cursor_id,
-                    root_page: 0,
-                    db: 0,
-                });
-                cursor_id
-            }
-            MaintenanceInput::BaseTable => {
-                let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(left_table.clone()));
-                program.emit_insn(Insn::OpenRead {
-                    cursor_id,
-                    root_page: left_table.root_page,
-                    db: 0,
-                });
-                cursor_id
-            }
-        };
-        let pass_done = program.allocate_label();
-        let pass_loop = program.allocate_label();
-        program.emit_insn(Insn::Rewind {
-            cursor_id: input_cursor_id,
-            pc_if_empty: pass_done,
-        });
-        program.preassign_label_to_next_insn(pass_loop);
-        match input {
-            MaintenanceInput::TransactionDelta => {
-                program.emit_insn(Insn::Column {
-                    cursor_id: input_cursor_id,
-                    column: num_left_columns,
-                    dest: dp_reg,
-                    default: None,
-                });
-            }
-            MaintenanceInput::BaseTable => {
-                program.emit_int(1, dp_reg);
-            }
-        }
-        program.emit_insn(Insn::RowId {
-            cursor_id: input_cursor_id,
-            dest: akey_start,
-        });
-        program.emit_int(0, dm_reg);
-        program.emit_insn(Insn::Gosub {
-            target_pc: aux_merge_label,
-            return_reg: a_return_reg,
-        });
-        program.emit_insn(Insn::Next {
-            cursor_id: input_cursor_id,
-            pc_if_next: pass_loop,
-        });
-        program.preassign_label_to_next_insn(pass_done);
+    if let Some(aux) = &outer {
+        aux.emit_presence_pass(program, input, &tables[0].0, view_name);
     }
 
     for (sides, negate) in join_subset_phases(n, input) {
@@ -5441,25 +5960,10 @@ fn emit_join(
                 }
 
                 let skip_label = program.allocate_label();
-                if left_outer {
+                if let Some(aux) = &outer {
                     // Every ON match adjusts the left row's match count,
                     // whether or not WHERE lets the inner row through.
-                    program.emit_insn(Insn::Copy {
-                        src_reg: pair_start,
-                        dst_reg: akey_start,
-                        extra_amount: 0,
-                    });
-                    program.emit_int(0, dp_reg);
-                    program.emit_insn(Insn::Copy {
-                        src_reg: w_reg,
-                        dst_reg: dm_reg,
-                        extra_amount: 0,
-                    });
-                    program.emit_insn(Insn::Gosub {
-                        target_pc: aux_merge_label
-                            .expect("LEFT JOIN emits the aux-merge subroutine"),
-                        return_reg: a_return_reg,
-                    });
+                    aux.emit_count_match(program, pair_start, w_reg);
                     // WHERE gates only the inner view row (the match was
                     // already counted above).
                     if let Some(where_expr) = where_clause {
