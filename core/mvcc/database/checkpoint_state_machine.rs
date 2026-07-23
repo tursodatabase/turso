@@ -256,6 +256,9 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// (e.g. DROP after our snapshot). Tracked in `dropped_root_pages` until a later
     /// checkpoint frees the btree.
     ended_created_roots: HashSet<i64>,
+    /// Positive roots whose btrees were destroyed in this checkpoint's pager write.
+    /// Only these may be removed from `dropped_root_pages` at publish.
+    freed_root_pages: HashSet<i64>,
 }
 
 /// One pending compaction job in the per-checkpoint sequence sweep.
@@ -833,6 +836,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             owns_checkpoint_in_progress: false,
             staged_roots: crate::alloc::vec![],
             ended_created_roots: HashSet::default(),
+            freed_root_pages: HashSet::default(),
         }
     }
 
@@ -1544,7 +1548,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
         }
 
-        if !self.has_unpublished_schema_changes() && self.ended_created_roots.is_empty() {
+        if !self.has_unpublished_schema_changes()
+            && self.ended_created_roots.is_empty()
+            && self.freed_root_pages.is_empty()
+        {
             return Ok(());
         }
 
@@ -1602,13 +1609,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
         }
 
-        // Clear dropped root pages now that the pager commit contains the btree frees.
-        // integrity_check should now follow the committed freelist state instead.
-        // Re-insert roots we materialized whose schema versions were already ended — those
-        // btrees are still allocated and must stay accounted for until a later destroy.
-        let ended_created_roots = std::mem::take(&mut self.ended_created_roots);
-        schema.dropped_root_pages.clear();
-        schema.dropped_root_pages.extend(ended_created_roots);
+        // Only forget roots whose btrees this checkpoint actually freed. A concurrent
+        // DROP after our snapshot may have added roots we did not destroy (#7957).
+        for root in std::mem::take(&mut self.freed_root_pages) {
+            schema.dropped_root_pages.remove(&root);
+        }
+        // Roots we materialized whose schema versions were already ended are still
+        // allocated and must stay accounted for until a later destroy (#7956).
+        schema
+            .dropped_root_pages
+            .extend(std::mem::take(&mut self.ended_created_roots));
         drop(schema_ref);
         *self.connection.schema.write() = self.connection.db.clone_schema();
         self.connection.bump_prepare_context_generation();
@@ -2224,6 +2234,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_tables.insert(table_id);
+                            self.freed_root_pages.insert(root_page as i64);
                             // Deferred destroy: retire the binding (set its `end` to the drop ts)
                             // but keep it, so a transaction still scanning this table at an older
                             // snapshot resolves the (read-mark-protected) root page. GC'd once
@@ -2290,6 +2301,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_indexes.insert(index_id);
+                            self.freed_root_pages.insert(root_page as i64);
                             // Deferred destroy: retire the binding (set its `end`) but keep it so
                             // a transaction still scanning this index at an older snapshot resolves
                             // the (read-mark-protected) root page. GC'd once `lwm` passes the drop.

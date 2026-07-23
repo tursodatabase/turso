@@ -19627,7 +19627,6 @@ fn test_passive_checkpoint_preserves_drop_committed_after_collection() {
 /// parked after collection must keep the dropped root in `dropped_root_pages`
 /// until a later checkpoint actually frees that btree.
 #[test]
-#[ignore = "known bug: passive checkpoint clears a late DROP's root tracking"]
 fn test_passive_checkpoint_preserves_late_dropped_root_tracking() {
     use crate::StepResult;
 
