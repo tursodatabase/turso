@@ -464,6 +464,8 @@ pub struct Connection {
     pub(super) is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
+    /// Whether pragma recursive_triggers=ON for this connection
+    pub(super) recursive_triggers_pragma: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Number of active top-level write statements on this connection.
     ///
@@ -1845,6 +1847,21 @@ impl Connection {
 
     pub fn foreign_keys_enabled(&self) -> bool {
         self.fk_pragma.load(Ordering::Acquire)
+    }
+
+    /// Set PRAGMA recursive_triggers for this connection. Like in SQLite,
+    /// this controls whether REPLACE conflict-resolution deletes fire DELETE
+    /// triggers. Unlike SQLite, Turso's trigger programs are compiled
+    /// non-recursively, so a trigger never re-fires itself regardless of
+    /// this setting.
+    pub fn set_recursive_triggers_enabled(&self, enable: bool) {
+        self.recursive_triggers_pragma
+            .store(enable, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn recursive_triggers_enabled(&self) -> bool {
+        self.recursive_triggers_pragma.load(Ordering::Acquire)
     }
 
     pub fn set_check_constraints_ignored(&self, ignore: bool) {

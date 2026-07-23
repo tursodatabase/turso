@@ -703,6 +703,11 @@ fn update_pragma(
             connection.set_foreign_keys_enabled(enabled);
             Ok(TransactionMode::None)
         }
+        PragmaName::RecursiveTriggers => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_recursive_triggers_enabled(enabled);
+            Ok(TransactionMode::None)
+        }
         PragmaName::IAmADummy | PragmaName::RequireWhere => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_dml_require_where(enabled);
@@ -1579,6 +1584,14 @@ fn query_pragma(
         }
         PragmaName::ForeignKeys => {
             let enabled = connection.foreign_keys_enabled();
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::RecursiveTriggers => {
+            let enabled = connection.recursive_triggers_enabled();
             let register = program.alloc_register();
             program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);
