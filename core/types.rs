@@ -2498,12 +2498,12 @@ where
     }
 }
 
-pub fn compare_handling_nulls(a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
-    let cmp = compare_immutable_single(a, b, key.collation);
-    finish_key_comparison(cmp, a, b, key)
+pub fn cmp_in_column(a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
+    cmp_with_sort(compare_immutable_single(a, b, key.collation), a, b, key)
 }
 
-pub fn finish_key_comparison(cmp: Ordering, a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
+/// Outputs a modified [Ordering] that takes into account the sort order and the NULLS order.
+pub fn cmp_with_sort(cmp: Ordering, a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
     if cmp != Ordering::Equal {
         let involves_null = matches!(a, ValueRef::Null) || matches!(b, ValueRef::Null);
         if involves_null {

@@ -12,7 +12,7 @@ use std::rc::Rc;
 use crate::alloc::vec;
 use crate::alloc::*;
 use crate::io::TempFile;
-use crate::types::{compare_handling_nulls, finish_key_comparison, IOCompletions, ValueIterator};
+use crate::types::{cmp_in_column, cmp_with_sort, IOCompletions, ValueIterator};
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, CompletionGroup, File, IO},
@@ -946,9 +946,9 @@ impl ArenaSortableRecord {
             let cmp = if let Some(Some(comparator)) = comparators.get(i) {
                 let base =
                     comparator(&self_val, &other_val).expect("Memory allocation failed here");
-                finish_key_comparison(base, &self_val, &other_val, key_info)
+                cmp_with_sort(base, &self_val, &other_val, key_info)
             } else {
-                compare_handling_nulls(&self_val, &other_val, key_info)
+                cmp_in_column(&self_val, &other_val, key_info)
             };
             if cmp != Ordering::Equal {
                 return cmp;
@@ -1152,12 +1152,6 @@ mod tests {
         ) as u64
     }
 
-    /// Reference single-column comparison replicating the full comparator's
-    /// rules (SQL type ordering, ASC/DESC, NULLS FIRST/LAST, binary collation).
-    fn reference_single_key_cmp(a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
-        compare_handling_nulls(a, b, key)
-    }
-
     #[test]
     fn fuzz_normalized_key_invariant() {
         use crate::types::AsValueRef;
@@ -1235,7 +1229,10 @@ mod tests {
             let (norm_b, dec_b) =
                 normalized_first_key(&rb[..ncols], &keys[..ncols], &comparators[..ncols]);
             // The normalized key only ever reflects the first column.
-            let reference = reference_single_key_cmp(&ra[0], &rb[0], &keys[0]);
+            let a = &ra[0];
+            let b = &rb[0];
+            let key = &keys[0];
+            let reference = cmp_in_column(a, b, key);
 
             if ncols > 1 {
                 assert!(
