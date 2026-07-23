@@ -202,7 +202,9 @@ impl MaintenanceDag {
                     }
                     cols
                 }
-                OpNode::Filter { input, .. } | OpNode::Distinct { input } => schemas[*input].clone(),
+                OpNode::Filter { input, .. } | OpNode::Distinct { input } => {
+                    schemas[*input].clone()
+                }
                 OpNode::Project { projections, .. } => projections
                     .iter()
                     .map(|(expr, name)| OutputCol {
@@ -219,7 +221,9 @@ impl MaintenanceDag {
                         for col in &schemas[input] {
                             if pos > 0
                                 && using[pos].iter().any(|u| {
-                                    col.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(u))
+                                    col.name
+                                        .as_deref()
+                                        .is_some_and(|n| n.eq_ignore_ascii_case(u))
                                 })
                             {
                                 continue;
