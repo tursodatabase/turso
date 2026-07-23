@@ -641,6 +641,8 @@ fn is_pg_non_query(sql: &str) -> bool {
         || upper.starts_with("DROP SCHEMA")
         || upper.starts_with("REFRESH MATERIALIZED VIEW")
         || upper.starts_with("COMMENT")
+        || upper.starts_with("GRANT")
+        || upper.starts_with("REVOKE")
 }
 
 fn command_tag(query: &str, affected_rows: usize) -> Tag {
@@ -700,6 +702,10 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         // statement is SELECT ... INTO (writable CTEs are unsupported),
         // which PostgreSQL reports as `SELECT n` like CREATE TABLE AS.
         Tag::new("SELECT").with_rows(affected_rows)
+    } else if upper.starts_with("GRANT") {
+        Tag::new("GRANT")
+    } else if upper.starts_with("REVOKE") {
+        Tag::new("REVOKE")
     } else {
         Tag::new("OK")
     }

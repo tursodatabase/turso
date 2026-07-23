@@ -6,7 +6,7 @@ Sorted by implementation difficulty.
 
 1. ~~**COMMENT ON**~~ — DONE (accepted as a no-op; comments are not persisted)
 2. **PREPARE / EXECUTE / DEALLOCATE** — wire protocol already handles this; just need the SQL syntax to not error
-3. **GRANT/REVOKE** — parse + ignore (single-user system, just don't error)
+3. ~~**GRANT/REVOKE**~~ — DONE (accepted as no-op; single-user system, just don't error)
 4. **More PG system functions** — register existing Turso functions under PG aliases (e.g. `string_agg` → `group_concat`, `regexp_replace`, etc.)
 5. **SET search_path** — intercept in try_prepare_pg, store on connection, use in table resolution
 

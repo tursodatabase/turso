@@ -4402,6 +4402,21 @@ pub fn is_comment_on(parse_result: &ParseResult) -> bool {
     matches!(&nodes[0].0, NodeRef::CommentStmt(_))
 }
 
+/// Returns true if the parse result is a GRANT or REVOKE statement.
+/// Privileges and role membership are accepted but not persisted or enforced.
+pub fn is_grant_or_revoke_stmt(parse_result: &ParseResult) -> bool {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return false;
+    }
+    matches!(
+        &nodes[0].0,
+        NodeRef::GrantStmt(_) | NodeRef::GrantRoleStmt(_)
+    )
+}
+
 /// Extracted COPY FROM statement info for use by the connection layer.
 #[derive(Debug, Clone)]
 pub struct PgCopyFromStmt {

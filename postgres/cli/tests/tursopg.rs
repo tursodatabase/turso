@@ -762,6 +762,21 @@ fn comment_on_is_noop() {
     assert!(out.contains("ok"), "COMMENT ON should be a no-op: {out}");
 }
 
+#[test]
+fn grant_and_revoke_are_noops() {
+    let output = run_tursopg(
+        b"CREATE TABLE docs(id INT, title TEXT);\n\
+          GRANT SELECT ON docs TO reader;\n\
+          REVOKE SELECT ON docs FROM reader;\n\
+          GRANT reader TO alice;\n\
+          REVOKE reader FROM alice;\n\
+          SELECT 'ok';\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains("ok"), "GRANT/REVOKE should be no-ops: {out}");
+}
+
 // ---------------------------------------------------------------------------
 // CREATE TABLE AS / SELECT INTO
 //
@@ -1206,6 +1221,17 @@ fn wire_comment_on_returns_comment_tag() {
 
         let tags = client.query_command_tags("COMMENT ON TABLE docs IS 'documentation'");
         assert_eq!(tags, ["COMMENT"]);
+    });
+}
+
+#[test]
+fn wire_grant_and_revoke_return_command_tags() {
+    with_pg_client(|client| {
+        let tags = client.query_command_tags("GRANT SELECT ON docs TO reader");
+        assert_eq!(tags, ["GRANT"]);
+
+        let tags = client.query_command_tags("REVOKE SELECT ON docs FROM reader");
+        assert_eq!(tags, ["REVOKE"]);
     });
 }
 

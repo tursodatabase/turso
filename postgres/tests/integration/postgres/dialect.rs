@@ -125,6 +125,21 @@ fn test_postgres_comment_on_supported_object_forms_are_noops(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_grant_and_revoke_are_noops(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    for (command, sql) in [
+        ("object grant", "GRANT SELECT ON grant_docs TO reader"),
+        ("object revoke", "REVOKE SELECT ON grant_docs FROM reader"),
+        ("role grant", "GRANT reader TO alice"),
+        ("role revoke", "REVOKE reader FROM alice"),
+    ] {
+        conn.execute(sql)
+            .unwrap_or_else(|err| panic!("{command} should be accepted: {err}"));
+    }
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_arithmetic_expression(db: TempDatabase) {
     let conn = db.connect_postgres();
 
