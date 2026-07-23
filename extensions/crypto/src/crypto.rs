@@ -166,13 +166,13 @@ fn decode_ascii85(input: &str) -> Result<Vec<u8>, Box<dyn StdError>> {
             return Err("Input char is out of range for Ascii85".into());
         }
 
-        decode_digit(digit, &mut counter, &mut chunk, &mut result);
+        decode_digit(digit, &mut counter, &mut chunk, &mut result)?;
     }
 
     let mut to_remove = 0;
 
     while counter != 0 {
-        decode_digit(b'u', &mut counter, &mut chunk, &mut result);
+        decode_digit(b'u', &mut counter, &mut chunk, &mut result)?;
         to_remove += 1;
     }
 
@@ -181,10 +181,19 @@ fn decode_ascii85(input: &str) -> Result<Vec<u8>, Box<dyn StdError>> {
     Ok(result)
 }
 
-fn decode_digit(digit: u8, counter: &mut usize, chunk: &mut u32, result: &mut Vec<u8>) {
+fn decode_digit(
+    digit: u8,
+    counter: &mut usize,
+    chunk: &mut u32,
+    result: &mut Vec<u8>,
+) -> Result<(), Box<dyn StdError>> {
     let byte = digit - 33;
 
-    *chunk += byte as u32 * TABLE[*counter];
+    let term = (byte as u32)
+        .checked_mul(TABLE[*counter])
+        .ok_or("decode overflow")?;
+
+    *chunk = chunk.checked_add(term).ok_or("decode overflow")?;
 
     if *counter == 4 {
         result.extend_from_slice(&chunk.to_be_bytes());
@@ -193,6 +202,8 @@ fn decode_digit(digit: u8, counter: &mut usize, chunk: &mut u32, result: &mut Ve
     } else {
         *counter += 1;
     }
+
+    Ok(())
 }
 
 fn encode_ascii85(input: &[u8]) -> String {
