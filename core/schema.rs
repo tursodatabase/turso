@@ -12,7 +12,9 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
-use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
+use crate::translate::index::{
+    reject_explicit_nulls, resolve_index_method_parameters, resolve_sorted_columns,
+};
 use crate::translate::planner::ROWID_STRS;
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -4403,6 +4405,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     if *auto_increment {
                         has_autoincrement = true;
                     }
+                    reject_explicit_nulls(columns)?;
 
                     let mut pk_collations = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
@@ -4431,6 +4434,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     conflict_clause,
                 } = &c.constraint
                 {
+                    reject_explicit_nulls(columns)?;
                     let mut unique_columns = Vec::try_with_capacity_ext(columns.len())?;
                     let mut unique_collations = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {

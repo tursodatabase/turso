@@ -427,9 +427,12 @@ pub fn resolve_upsert_target(
     upsert: &Upsert,
 ) -> crate::Result<ResolvedUpsertTarget> {
     // Omitted target, catch-all
-    if upsert.index.is_none() {
+    let Some(target) = upsert.index.as_ref() else {
         return Ok(ResolvedUpsertTarget::CatchAll);
-    }
+    };
+    // SQLite rejects explicit NULLS FIRST/LAST in conflict targets
+    // (sqlite3UpsertAnalyzeTarget -> sqlite3HasExplicitNulls).
+    crate::translate::index::reject_explicit_nulls(&target.targets)?;
 
     // Targeted: must match PK, only if PK is a rowid alias
     if upsert_matches_rowid_alias(upsert, table) {

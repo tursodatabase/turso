@@ -276,3 +276,31 @@ expect {
     b
     C
 }
+
+# https://github.com/tursodatabase/turso/issues/7944
+# SQLite rejects NULLS FIRST/LAST in PRIMARY KEY/UNIQUE table constraints
+# (sqlite3HasExplicitNulls). Turso must reject it too, otherwise it stores
+# a schema entry that SQLite refuses to load.
+@cross-check-integrity
+test create_table_primary_key_nulls_last_rejected {
+    CREATE TABLE t_pknulls(a, PRIMARY KEY(a NULLS LAST));
+}
+expect error {
+    NULLS
+}
+
+@cross-check-integrity
+test create_table_unique_nulls_first_rejected {
+    CREATE TABLE t_uqnulls(a, UNIQUE(a NULLS FIRST));
+}
+expect error {
+    NULLS
+}
+
+@cross-check-integrity
+test create_table_unique_desc_nulls_first_rejected {
+    CREATE TABLE t_uqnulls2(a, UNIQUE(a DESC NULLS FIRST));
+}
+expect error {
+    NULLS
+}
