@@ -396,13 +396,13 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
     TursoDb    *tdb = (TursoDb *)cd;
     static const char *cmds[] = {
         "eval", "one", "exists", "changes", "total_changes",
-        "last_insert_rowid", "errorcode", "errmsg", "null",
+        "last_insert_rowid", "errorcode", "errmsg", "null", "nullvalue",
         "func", "function", "close", "limit",
         NULL
     };
     enum {
         CMD_EVAL, CMD_ONE, CMD_EXISTS, CMD_CHANGES, CMD_TOTAL_CHANGES,
-        CMD_LAST_INSERT_ROWID, CMD_ERRORCODE, CMD_ERRMSG, CMD_NULL,
+        CMD_LAST_INSERT_ROWID, CMD_ERRORCODE, CMD_ERRMSG, CMD_NULL, CMD_NULLVALUE,
         CMD_FUNC, CMD_FUNCTION, CMD_CLOSE, CMD_LIMIT
     };
     int cmdIdx;
@@ -445,6 +445,7 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
     /* ---- null value string ---- */
 
     case CMD_NULL:
+    case CMD_NULLVALUE:
         if (objc == 3) {
             if (tdb->null_obj) Tcl_DecrRefCount(tdb->null_obj);
             tdb->null_obj = objv[2];
