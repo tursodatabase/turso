@@ -1,0 +1,446 @@
+@database :memory:
+
+# =====================================================================
+# 1. Schema round-trip: the NULLS clause survives parse -> store -> reparse
+# =====================================================================
+
+test schema-roundtrip-all-variants {
+    CREATE TABLE t(a, b, c);
+    CREATE INDEX i1 ON t(a NULLS LAST);
+    CREATE INDEX i2 ON t(a ASC NULLS LAST);
+    CREATE INDEX i3 ON t(a DESC NULLS FIRST);
+    CREATE INDEX i4 ON t(a NULLS FIRST);
+    CREATE INDEX i5 ON t(a DESC NULLS LAST);
+    CREATE INDEX i6 ON t(a NULLS LAST, b DESC NULLS FIRST, c);
+    CREATE UNIQUE INDEX i7 ON t(b NULLS LAST);
+    CREATE INDEX i8 ON t(a COLLATE NOCASE NULLS LAST);
+    SELECT sql FROM sqlite_schema WHERE type='index' AND sql IS NOT NULL ORDER BY name;
+}
+expect {
+    CREATE INDEX i1 ON t (a NULLS LAST)
+    CREATE INDEX i2 ON t (a ASC NULLS LAST)
+    CREATE INDEX i3 ON t (a DESC NULLS FIRST)
+    CREATE INDEX i4 ON t (a NULLS FIRST)
+    CREATE INDEX i5 ON t (a DESC NULLS LAST)
+    CREATE INDEX i6 ON t (a NULLS LAST, b DESC NULLS FIRST, c)
+    CREATE UNIQUE INDEX i7 ON t (b NULLS LAST)
+    CREATE INDEX i8 ON t (a COLLATE NOCASE NULLS LAST)
+}
+
+test index-xinfo-unaffected-by-nulls {
+    CREATE TABLE t(a, b);
+    CREATE INDEX idx ON t(a NULLS LAST, b DESC NULLS FIRST);
+    PRAGMA index_xinfo(idx);
+}
+expect {
+    0|0|a|0|BINARY|1
+    1|1|b|1|BINARY|1
+    2|-1||0|BINARY|0
+}
+
+setup single_data {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT);
+    INSERT INTO t VALUES (1, NULL), (2, 3), (3, 1), (4, NULL), (5, 2);
+}
+
+@setup single_data
+test asc-nulls-last-index {
+    CREATE INDEX idx ON t(a ASC NULLS LAST);
+    SELECT id, a FROM t ORDER BY a ASC NULLS LAST, id;
+}
+expect {
+    3|1
+    5|2
+    2|3
+    1|
+    4|
+}
+
+@setup single_data
+test asc-nulls-first-index {
+    CREATE INDEX idx ON t(a ASC NULLS FIRST);
+    SELECT id, a FROM t ORDER BY a ASC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    3|1
+    5|2
+    2|3
+}
+
+@setup single_data
+test desc-nulls-first-index {
+    CREATE INDEX idx ON t(a DESC NULLS FIRST);
+    SELECT id, a FROM t ORDER BY a DESC NULLS FIRST, id;
+}
+expect {
+    1|
+    4|
+    2|3
+    5|2
+    3|1
+}
+
+@setup single_data
+test desc-nulls-last-index {
+    CREATE INDEX idx ON t(a DESC NULLS LAST);
+    SELECT id, a FROM t ORDER BY a DESC NULLS LAST, id;
+}
+expect {
+    2|3
+    5|2
+    3|1
+    1|
+    4|
+}
+
+@setup single_data
+test implicit-asc-nulls-last-index {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    SELECT id, a FROM t ORDER BY a NULLS LAST, id;
+}
+expect {
+    3|1
+    5|2
+    2|3
+    1|
+    4|
+}
+
+# Index NULLS LAST, query NULLS LAST
+@setup single_data
+test limit-guard-nulls-last-matches-index {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    SELECT ifnull(a, 'null') FROM t ORDER BY a ASC NULLS LAST LIMIT 2;
+}
+expect {
+    1
+    2
+}
+
+@setup single_data
+test limit-guard-default-order-against-nulls-last-index {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    SELECT ifnull(a, 'null') FROM t ORDER BY a ASC LIMIT 2;
+}
+expect {
+    null
+    null
+}
+
+# Index DESC NULLS FIRST, matching query: NULLs first.
+@setup single_data
+test limit-guard-desc-nulls-first-matches-index {
+    CREATE INDEX idx ON t(a DESC NULLS FIRST);
+    SELECT ifnull(a, 'null') FROM t ORDER BY a DESC NULLS FIRST LIMIT 2;
+}
+expect {
+    null
+    null
+}
+
+# Index DESC NULLS LAST, matching query: largest values first, NULLs excluded.
+@setup single_data
+test limit-guard-desc-nulls-last-matches-index {
+    CREATE INDEX idx ON t(a DESC NULLS LAST);
+    SELECT ifnull(a, 'null') FROM t ORDER BY a DESC NULLS LAST LIMIT 2;
+}
+expect {
+    3
+    2
+}
+
+setup comp_data {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT);
+    INSERT INTO t VALUES (1, NULL, 10), (2, 1, NULL), (3, NULL, 20), (4, 1, 30), (5, 2, NULL), (6, 2, 5);
+}
+
+@setup comp_data
+test composite-both-nulls-last {
+    CREATE INDEX idx ON t(a ASC NULLS LAST, b ASC NULLS LAST);
+    SELECT id, a, b FROM t ORDER BY a ASC NULLS LAST, b ASC NULLS LAST;
+}
+expect {
+    4|1|30
+    2|1|
+    6|2|5
+    5|2|
+    1||10
+    3||20
+}
+
+@setup comp_data
+test composite-mixed-directions-and-nulls {
+    CREATE INDEX idx ON t(a ASC NULLS LAST, b DESC NULLS FIRST);
+    SELECT id, a, b FROM t ORDER BY a ASC NULLS LAST, b DESC NULLS FIRST;
+}
+expect {
+    2|1|
+    4|1|30
+    5|2|
+    6|2|5
+    3||20
+    1||10
+}
+
+# Equality on the leading column + NULLS ordering on the trailing column.
+@setup comp_data
+test composite-eq-prefix-trailing-nulls-last {
+    CREATE INDEX idx ON t(a, b NULLS LAST);
+    SELECT id, a, b FROM t WHERE a = 2 ORDER BY b ASC NULLS LAST;
+}
+expect {
+    6|2|5
+    5|2|
+}
+
+@setup comp_data
+test composite-eq-prefix-trailing-nulls-first {
+    CREATE INDEX idx ON t(a, b NULLS FIRST);
+    SELECT id, a, b FROM t WHERE a = 2 ORDER BY b ASC NULLS FIRST;
+}
+expect {
+    5|2|
+    6|2|5
+}
+
+test unique-nulls-last-allows-multiple-nulls {
+    CREATE TABLE t(a, b);
+    CREATE UNIQUE INDEX idx ON t(a NULLS LAST);
+    INSERT INTO t VALUES (NULL, 1), (NULL, 2), (5, 3);
+    SELECT count(*) FROM t;
+}
+expect {
+    3
+}
+
+test unique-nulls-last-rejects-duplicate-non-null {
+    CREATE TABLE t(a, b);
+    CREATE UNIQUE INDEX idx ON t(a NULLS LAST);
+    INSERT INTO t VALUES (5, 1);
+    INSERT INTO t VALUES (5, 2);
+}
+expect error {
+}
+
+@setup single_data
+test eqp-elide-asc-nulls-last {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    EXPLAIN QUERY PLAN SELECT a FROM t ORDER BY a NULLS LAST;
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX idx
+}
+
+@setup single_data
+test eqp-elide-asc-nulls-last-explicit {
+    CREATE INDEX idx ON t(a ASC NULLS LAST);
+    EXPLAIN QUERY PLAN SELECT a FROM t ORDER BY a ASC NULLS LAST;
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX idx
+}
+
+@setup single_data
+test eqp-elide-desc-nulls-first {
+    CREATE INDEX idx ON t(a DESC NULLS FIRST);
+    EXPLAIN QUERY PLAN SELECT a FROM t ORDER BY a DESC NULLS FIRST;
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX idx
+}
+
+@setup comp_data
+test eqp-elide-composite-eq-prefix-trailing-nulls-last {
+    CREATE INDEX idx ON t(a, b NULLS LAST);
+    EXPLAIN QUERY PLAN SELECT b FROM t WHERE a = 1 ORDER BY b NULLS LAST;
+}
+expect {
+    1|0|0|SEARCH t USING INDEX idx (a=?)
+}
+
+@setup single_data
+test reverse-scan-of-asc-nulls-last-index {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    SELECT ifnull(a, 'null') FROM t ORDER BY a DESC NULLS FIRST LIMIT 3;
+}
+expect {
+    null
+    null
+    3
+}
+
+@setup single_data
+test eqp-elide-reverse-scan-of-asc-nulls-last-index {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    EXPLAIN QUERY PLAN SELECT a FROM t ORDER BY a DESC NULLS FIRST;
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX idx
+}
+
+@setup single_data
+test limit-guard-desc-nulls-first-against-plain-index {
+    CREATE INDEX idx ON t(a);
+    SELECT ifnull(a, 'null') FROM t ORDER BY a DESC NULLS FIRST LIMIT 2;
+}
+expect {
+    null
+    null
+}
+
+@setup single_data
+test limit-guard-desc-nulls-last-against-plain-index {
+    CREATE INDEX idx ON t(a);
+    SELECT ifnull(a, 'null') FROM t ORDER BY a DESC NULLS LAST LIMIT 2;
+}
+expect {
+    3
+    2
+}
+
+@setup single_data
+test range-lower-bound-excludes-nulls-last-block {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    SELECT count(*) FROM t WHERE a > 1;
+}
+expect {
+    2
+}
+
+@setup single_data
+test range-upper-bound-with-nulls-last-index {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    SELECT count(*) FROM t WHERE a < 3;
+}
+expect {
+    2
+}
+
+@setup single_data
+test range-both-bounds-with-desc-nulls-first-index {
+    CREATE INDEX idx ON t(a DESC NULLS FIRST);
+    SELECT count(*) FROM t WHERE a >= 1 AND a <= 3;
+}
+expect {
+    3
+}
+
+@setup single_data
+test is-null-with-nulls-last-index {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    SELECT count(*) FROM t WHERE a IS NULL;
+}
+expect {
+    2
+}
+
+@setup comp_data
+test range-on-trailing-nulls-last-column {
+    CREATE INDEX idx ON t(a, b NULLS LAST);
+    SELECT id, a, b FROM t WHERE a = 2 AND b > 0;
+}
+expect {
+    6|2|5
+}
+
+@setup single_data
+test min-max-with-nulls-last-index {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    SELECT min(a), max(a) FROM t;
+}
+expect {
+    1|3
+}
+
+@setup single_data
+test min-max-with-desc-nulls-first-index {
+    CREATE INDEX idx ON t(a DESC NULLS FIRST);
+    SELECT min(a), max(a) FROM t;
+}
+expect {
+    1|3
+}
+
+test insert-after-create-maintains-nulls-last-order {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT);
+    CREATE INDEX idx ON t(a NULLS LAST);
+    INSERT INTO t VALUES (1, NULL), (2, 3), (3, 1);
+    INSERT INTO t VALUES (4, NULL), (5, 2);
+    SELECT ifnull(a, 'null') FROM t ORDER BY a NULLS LAST LIMIT 3;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup single_data
+test update-moves-rows-across-null-block {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    UPDATE t SET a = 4 WHERE id = 1;
+    UPDATE t SET a = NULL WHERE id = 2;
+    SELECT ifnull(a, 'null') FROM t ORDER BY a NULLS LAST LIMIT 4;
+}
+expect {
+    1
+    2
+    4
+    null
+}
+
+@setup single_data
+test delete-with-nulls-last-index {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    DELETE FROM t WHERE id = 4;
+    DELETE FROM t WHERE id = 2;
+    SELECT ifnull(a, 'null') FROM t ORDER BY a NULLS LAST LIMIT 3;
+}
+expect {
+    1
+    2
+    null
+}
+
+test unique-nulls-last-runtime-duplicate-rejected {
+    CREATE TABLE t(a);
+    CREATE UNIQUE INDEX idx ON t(a NULLS LAST);
+    INSERT INTO t VALUES (5);
+    INSERT INTO t VALUES (NULL), (NULL);
+    INSERT INTO t VALUES (5);
+}
+expect error {
+}
+
+@setup single_data
+test integrity-check-after-nulls-last-maintenance {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    INSERT INTO t VALUES (6, NULL), (7, 0);
+    UPDATE t SET a = NULL WHERE id = 2;
+    DELETE FROM t WHERE id = 1;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@setup single_data
+test expression-index-nulls-last {
+    CREATE INDEX idx ON t(abs(a) NULLS LAST);
+    SELECT ifnull(a, 'null') FROM t ORDER BY abs(a) NULLS LAST LIMIT 3;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup single_data
+test expression-index-nulls-last-range-excludes-nulls {
+    CREATE INDEX idx ON t(abs(a) NULLS LAST);
+    SELECT count(*) FROM t WHERE abs(a) > 1;
+}
+expect {
+    2
+}

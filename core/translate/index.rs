@@ -443,7 +443,7 @@ fn emit_refill_index(
         let order_collations_nulls = idx
             .columns
             .iter()
-            .map(|c| (c.order, c.collation, None))
+            .map(|c| (c.order, c.collation, c.nulls))
             .try_collect()?;
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sorter_cursor_id,

@@ -1616,6 +1616,22 @@ pub enum NullsOrder {
     Last,
 }
 
+impl NullsOrder {
+    pub fn reverse(&self) -> Self {
+        match self {
+            NullsOrder::First => NullsOrder::Last,
+            NullsOrder::Last => NullsOrder::First,
+        }
+    }
+
+    pub fn default_for(order: SortOrder) -> Self {
+        match order {
+            SortOrder::Asc => NullsOrder::First,
+            SortOrder::Desc => NullsOrder::Last,
+        }
+    }
+}
+
 /// `REFERENCES` clause
 // https://sqlite.org/syntax/foreign-key-clause.html
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,4 +1,4 @@
-use crate::schema::Table;
+use crate::schema::{IndexColumn, Table};
 use crate::turso_assert_greater_than_or_equal;
 use crate::{
     schema::{FromClauseSubquery, Index, Schema},
@@ -15,7 +15,7 @@ use crate::{
     },
     util::exprs_are_equivalent,
 };
-use turso_parser::ast::{self, SortOrder, TableInternalId};
+use turso_parser::ast::{self, NullsOrder, SortOrder, TableInternalId};
 
 use super::{
     access_method::AccessMethod,
@@ -552,18 +552,18 @@ fn match_intrinsic_order(
         if expected_order != target_col.order {
             return 0;
         }
-        // If the target requests an explicit NULLS ordering, the intrinsic
-        // order must provide the same. When the intrinsic order has no explicit
-        // NULLS (None), it follows the default (ASC → NULLS FIRST,
-        // DESC → NULLS LAST), so only a matching explicit request is compatible.
-        if let Some(target_nulls) = target_col.nulls_order {
-            let intrinsic_nulls = intrinsic_col.nulls_order.unwrap_or(match expected_order {
-                SortOrder::Asc => ast::NullsOrder::First,
-                SortOrder::Desc => ast::NullsOrder::Last,
-            });
-            if intrinsic_nulls != target_nulls {
-                return 0;
-            }
+        let requested_nulls = target_col
+            .nulls_order
+            .unwrap_or_else(|| ast::NullsOrder::default_for(target_col.order));
+        let intrinsic_nulls = intrinsic_col
+            .nulls_order
+            .unwrap_or_else(|| ast::NullsOrder::default_for(intrinsic_col.order));
+        let delivered_nulls = match iter_dir {
+            IterationDirection::Forwards => intrinsic_nulls,
+            IterationDirection::Backwards => intrinsic_nulls.reverse(),
+        };
+        if requested_nulls != delivered_nulls {
+            return 0;
         }
     }
     target_len
@@ -892,19 +892,12 @@ pub(super) fn btree_access_order_consumed(
                     break;
                 }
 
-                // An index scan delivers NULLs in a fixed position:
-                //   Forward scan  → NULLs first  (B-tree stores NULLs at start)
-                //   Reverse scan  → NULLs last
-                // If the query explicitly requests a different NULLS order,
-                // the index cannot satisfy it and we must fall back to a sorter.
-                if let Some(requested_nulls) = target_col.nulls_order {
-                    let default_nulls = match target_col.order {
-                        SortOrder::Asc => ast::NullsOrder::First,
-                        SortOrder::Desc => ast::NullsOrder::Last,
-                    };
-                    if requested_nulls != default_nulls {
-                        break;
-                    }
+                let requested_nulls = target_col
+                    .nulls_order
+                    .unwrap_or_else(|| ast::NullsOrder::default_for(target_col.order));
+                let delivered_nulls = idx_col.effective_nulls_order_when_iterated(iter_dir);
+                if requested_nulls != delivered_nulls {
+                    break;
                 }
 
                 col_idx += 1;

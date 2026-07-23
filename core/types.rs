@@ -2394,7 +2394,7 @@ impl IndexInfo {
             .map(|c| KeyInfo {
                 sort_order: c.order,
                 collation: c.collation.unwrap_or_default(),
-                nulls_order: None,
+                nulls_order: c.nulls,
             })
             .chain(index.has_rowid.then_some(KeyInfo {
                 sort_order: SortOrder::Asc,
@@ -2439,14 +2439,9 @@ where
     );
     let (l, r) = (l.take(column_info.len()), r.take(column_info.len()));
     for (i, (l, r)) in l.zip(r).enumerate() {
-        let column_order = column_info[i].sort_order;
-        let collation = column_info[i].collation;
-        let cmp = compare_immutable_single(l, r, collation);
+        let cmp = cmp_in_column(&l.as_value_ref(), &r.as_value_ref(), &column_info[i]);
         if !cmp.is_eq() {
-            return match column_order {
-                SortOrder::Asc => cmp,
-                SortOrder::Desc => cmp.reverse(),
-            };
+            return cmp;
         }
     }
     std::cmp::Ordering::Equal
@@ -2471,14 +2466,9 @@ where
             Some(v) => v,
             None => break,
         };
-        let column_order = col_info.sort_order;
-        let collation = col_info.collation;
-        let cmp = compare_immutable_single(l?, r?, collation);
+        let cmp = cmp_in_column(&l?.as_value_ref(), &r?.as_value_ref(), col_info);
         if !cmp.is_eq() {
-            return match column_order {
-                SortOrder::Asc => Ok(cmp),
-                SortOrder::Desc => Ok(cmp.reverse()),
-            };
+            return Ok(cmp);
         }
     }
     Ok(std::cmp::Ordering::Equal)
@@ -2827,7 +2817,6 @@ where
 /// * `serialized` - The left-hand side record in serialized format
 /// * `unpacked` - The right-hand side record as an array of parsed values
 /// * `index_info` - Contains sort order information for each field
-/// * `collations` - Array of collation sequences for string comparisons
 /// * `skip` - Number of initial fields to skip (assumes caller verified equality)
 /// * `tie_breaker` - Result to return when all compared fields are equal
 ///
@@ -2908,18 +2897,15 @@ where
             }
         };
 
+        let key_info = &index_info.key_info[field_idx];
         let comparison = match (&lhs_value, rhs_value) {
-            (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => index_info.key_info[field_idx]
-                .collation
-                .compare_strings(lhs_text, rhs_text),
-
+            (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => {
+                key_info.collation.compare_strings(lhs_text, rhs_text)
+            }
             _ => lhs_value.cmp(rhs_value),
         };
 
-        let final_comparison = match index_info.key_info[field_idx].sort_order {
-            SortOrder::Asc => comparison,
-            SortOrder::Desc => comparison.reverse(),
-        };
+        let final_comparison = cmp_with_sort(comparison, &lhs_value, rhs_value, key_info);
 
         if final_comparison != std::cmp::Ordering::Equal {
             return Ok(final_comparison);

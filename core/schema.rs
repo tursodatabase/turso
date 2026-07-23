@@ -149,7 +149,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
+use crate::translate::plan::{BitSet, ColumnMask, IterationDirection, Plan, TableReferences};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
 };
@@ -5672,6 +5672,22 @@ impl IndexColumn {
             .for_each(|col| cols.push(col));
 
         cols
+    }
+
+    pub fn effective_nulls_order_when_iterated(&self, iter_dir: IterationDirection) -> NullsOrder {
+        match iter_dir {
+            IterationDirection::Forwards => self.effective_nulls_order(),
+            IterationDirection::Backwards => self.effective_nulls_order().reverse(),
+        }
+    }
+
+    fn effective_nulls_order(&self) -> NullsOrder {
+        self.nulls
+            .unwrap_or_else(|| NullsOrder::default_for(self.order))
+    }
+
+    pub fn has_default_nulls_placement(&self) -> bool {
+        self.effective_nulls_order() == NullsOrder::default_for(self.order)
     }
 }
 
