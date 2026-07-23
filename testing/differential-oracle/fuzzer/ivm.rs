@@ -518,17 +518,23 @@ fn join(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
     }
 
     // Sometimes make it a LEFT JOIN: unmatched left rows appear NULL-padded,
-    // exercising the per-left-row match bookkeeping.
+    // exercising the per-left-row match bookkeeping. Sometimes deduplicate it
+    // (DISTINCT), which groups the padded rows by their output content.
     if rng.random_bool(0.25) {
+        let distinct = if rng.random_bool(0.4) {
+            "DISTINCT "
+        } else {
+            ""
+        };
         let mut sql = format!(
-            "SELECT {cols} FROM {lt} AS l LEFT JOIN {rt} AS r ON l.{lc} = r.{rc}",
+            "SELECT {distinct}{cols} FROM {lt} AS l LEFT JOIN {rt} AS r ON l.{lc} = r.{rc}",
             cols = cols.join(", "),
             lt = quoted(&left.name),
             rt = quoted(&right.name),
             lc = quoted(&lc.name),
             rc = quoted(&rc.name),
         );
-        if rng.random_bool(0.3) {
+        if distinct.is_empty() && rng.random_bool(0.3) {
             let _ = write!(sql, " WHERE r.{} IS NULL", quoted(&rc.name));
         }
         return Some(sql);
