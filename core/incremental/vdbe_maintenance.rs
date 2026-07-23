@@ -5384,6 +5384,313 @@ impl LeftJoinAux {
     }
 }
 
+/// A content-keyed z-set **arrangement**: a hidden `(c0..c{w-1}, count)` table
+/// holding a pipeline-breaker operator's current output — one row per distinct
+/// output tuple, with a signed occurrence count. It lets a downstream operator
+/// consume that output the same way it consumes a base table: as current
+/// contents it can probe (rows with a positive count, multiplicity = count)
+/// plus a stream of `(row, weight)` deltas. That single interface is what
+/// composes outer joins and joins of joins — the padded rows an outer join
+/// produces are not a function of the base tables, so a consumer that must
+/// retract one reads its old image from here rather than reconstructing it.
+///
+/// [`Self::emit_apply_subroutine`] applies one `(row, weight)` delta: it folds
+/// the weight into the stored count — mirroring the join state z-set, counts
+/// may dip negative within a transaction and a row is present only while its
+/// count is positive — inserting a row that crosses from zero and deleting one
+/// that crosses to zero, and appends the same `(row, weight)` to an
+/// output-delta ephemeral the consumer reads. Introduced ahead of its
+/// consumers (LEFT-over-3+-tables and FULL joins); unreferenced until then.
+#[allow(dead_code)]
+struct Arrangement {
+    table_name: String,
+    index_name: String,
+    /// The arrangement table (current contents) and its content-key index.
+    cursor_id: usize,
+    index_cursor_id: usize,
+    /// The per-transaction output-delta ephemeral: rows `[c0..c{w-1}, weight]`.
+    delta_cursor_id: usize,
+    /// Number of content columns.
+    width: usize,
+    /// Caller fills `key_start..key_start + width` with the delta row's content
+    /// and `weight_reg` with its signed weight, then `Gosub(apply_label)`.
+    /// `key_start + width` doubles as the row's arrangement rowid slot (so
+    /// `key_start` is the `[content.., rowid]` index record).
+    key_start: usize,
+    weight_reg: usize,
+    apply_label: BranchOffset,
+    return_reg: usize,
+    // Working registers, private to the subroutine.
+    srid_reg: usize,
+    count_reg: usize,
+    new_count_reg: usize,
+    rec_start: usize,
+    table_record_reg: usize,
+    index_record_reg: usize,
+    delta_rec_start: usize,
+    delta_rowid_reg: usize,
+    delta_record_reg: usize,
+    // Shared scratch owned by the caller.
+    zero_reg: usize,
+    prev_rowid_scratch: usize,
+    corrupt_label: BranchOffset,
+}
+
+#[allow(dead_code)]
+impl Arrangement {
+    /// Open the arrangement table, its content-key index, and a fresh
+    /// output-delta ephemeral, and allocate the subroutine's registers.
+    #[allow(clippy::too_many_arguments)]
+    fn open(
+        program: &mut ProgramBuilder,
+        table_name: String,
+        table: &Arc<BTreeTable>,
+        index: &Arc<crate::schema::Index>,
+        width: usize,
+        zero_reg: usize,
+        prev_rowid_scratch: usize,
+        corrupt_label: BranchOffset,
+    ) -> Self {
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id,
+            root_page: RegisterOrLiteral::Literal(table.root_page),
+            db: 0,
+        });
+        let index_cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: index_cursor_id,
+            root_page: RegisterOrLiteral::Literal(index.root_page),
+            db: 0,
+        });
+        let delta_table = Arc::new(synthesized_view_table(
+            &format!("{table_name}_delta"),
+            0,
+            width,
+        ));
+        let delta_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(delta_table));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: delta_cursor_id,
+            is_table: true,
+        });
+
+        // [content.., rowid], contiguous for Found/IdxInsert/IdxDelete.
+        let key_start = program.alloc_registers(width + 1);
+        let srid_reg = key_start + width;
+        // [content.., count], the table row image.
+        let rec_start = program.alloc_registers(width + 1);
+        let count_reg = rec_start + width;
+        // [content.., weight], the delta ephemeral row image.
+        let delta_rec_start = program.alloc_registers(width + 1);
+
+        Self {
+            table_name,
+            index_name: index.name.clone(),
+            cursor_id,
+            index_cursor_id,
+            delta_cursor_id,
+            width,
+            key_start,
+            weight_reg: program.alloc_register(),
+            apply_label: program.allocate_label(),
+            return_reg: program.alloc_register(),
+            srid_reg,
+            count_reg,
+            new_count_reg: program.alloc_register(),
+            rec_start,
+            table_record_reg: program.alloc_register(),
+            index_record_reg: program.alloc_register(),
+            delta_rec_start,
+            delta_rowid_reg: program.alloc_register(),
+            delta_record_reg: program.alloc_register(),
+            zero_reg,
+            prev_rowid_scratch,
+            corrupt_label,
+        }
+    }
+
+    /// Emit the apply-delta subroutine, reached by `Gosub(self.apply_label)`.
+    fn emit_apply_subroutine(&self, program: &mut ProgramBuilder) {
+        program.preassign_label_to_next_insn(self.apply_label);
+        let m_found = program.allocate_label();
+        let m_update = program.allocate_label();
+        let m_delta = program.allocate_label();
+
+        program.emit_insn(Insn::Found {
+            cursor_id: self.index_cursor_id,
+            target_pc: m_found,
+            record_reg: self.key_start,
+            num_regs: self.width,
+        });
+        // Unknown tuple: record its weight as the initial count, whatever the
+        // sign (a retraction can arrive before the matching insertion).
+        program.emit_insn(Insn::NewRowid {
+            cursor: self.cursor_id,
+            rowid_reg: self.srid_reg,
+            prev_largest_reg: self.prev_rowid_scratch,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: self.key_start,
+            dst_reg: self.rec_start,
+            extra_amount: self.width.saturating_sub(1),
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: self.weight_reg,
+            dst_reg: self.count_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: self.rec_start as u16,
+            count: (self.width + 1) as u16,
+            dest_reg: self.table_record_reg as u16,
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: self.cursor_id,
+            key_reg: self.srid_reg,
+            record_reg: self.table_record_reg,
+            flag: InsertFlags(
+                InsertFlags::REQUIRE_SEEK
+                    | InsertFlags::SKIP_LAST_ROWID
+                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+            ),
+            table_name: self.table_name.clone(),
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: self.key_start as u16,
+            count: (self.width + 1) as u16,
+            dest_reg: self.index_record_reg as u16,
+            index_name: Some(self.index_name.clone()),
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: self.index_cursor_id,
+            record_reg: self.index_record_reg,
+            unpacked_start: Some(self.key_start),
+            unpacked_count: Some((self.width + 1) as u16),
+            flags: IdxInsertFlags::new(),
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: m_delta,
+        });
+
+        program.preassign_label_to_next_insn(m_found);
+        program.emit_insn(Insn::IdxRowId {
+            cursor_id: self.index_cursor_id,
+            dest: self.srid_reg,
+        });
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: self.cursor_id,
+            src_reg: self.srid_reg,
+            target_pc: self.corrupt_label,
+        });
+        program.emit_insn(Insn::Column {
+            cursor_id: self.cursor_id,
+            column: self.width,
+            dest: self.count_reg,
+            default: None,
+        });
+        program.emit_insn(Insn::Add {
+            lhs: self.weight_reg,
+            rhs: self.count_reg,
+            dest: self.new_count_reg,
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: self.new_count_reg,
+            rhs: self.zero_reg,
+            target_pc: m_update,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        // Count reached zero: the tuple is gone.
+        program.emit_insn(Insn::IdxDelete {
+            start_reg: self.key_start,
+            num_regs: self.width + 1,
+            cursor_id: self.index_cursor_id,
+            raise_error_if_no_matching_entry: true,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: self.cursor_id,
+            table_name: self.table_name.clone(),
+            is_part_of_update: true,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: m_delta,
+        });
+
+        // Count changed but is nonzero: rewrite the row in place (the content
+        // key, hence the index, is unchanged).
+        program.preassign_label_to_next_insn(m_update);
+        program.emit_insn(Insn::Copy {
+            src_reg: self.key_start,
+            dst_reg: self.rec_start,
+            extra_amount: self.width.saturating_sub(1),
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: self.new_count_reg,
+            dst_reg: self.count_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: self.rec_start as u16,
+            count: (self.width + 1) as u16,
+            dest_reg: self.table_record_reg as u16,
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: self.cursor_id,
+            key_reg: self.srid_reg,
+            record_reg: self.table_record_reg,
+            flag: InsertFlags(
+                InsertFlags::REQUIRE_SEEK
+                    | InsertFlags::SKIP_LAST_ROWID
+                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+            ),
+            table_name: self.table_name.clone(),
+        });
+
+        // Emit the (row, weight) delta to the consumer, whatever the count
+        // transition: multiplicity-sensitive consumers need the signed change
+        // even when the tuple stays present.
+        program.preassign_label_to_next_insn(m_delta);
+        program.emit_insn(Insn::Copy {
+            src_reg: self.key_start,
+            dst_reg: self.delta_rec_start,
+            extra_amount: self.width.saturating_sub(1),
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: self.weight_reg,
+            dst_reg: self.delta_rec_start + self.width,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: self.delta_rec_start as u16,
+            count: (self.width + 1) as u16,
+            dest_reg: self.delta_record_reg as u16,
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::NewRowid {
+            cursor: self.delta_cursor_id,
+            rowid_reg: self.delta_rowid_reg,
+            prev_largest_reg: 0,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: self.delta_cursor_id,
+            key_reg: self.delta_rowid_reg,
+            record_reg: self.delta_record_reg,
+            flag: InsertFlags::new().is_ephemeral_table_insert(),
+            table_name: String::new(),
+        });
+        program.emit_insn(Insn::Return {
+            return_reg: self.return_reg,
+            can_fallthrough: false,
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_join(
     program: &mut ProgramBuilder,
