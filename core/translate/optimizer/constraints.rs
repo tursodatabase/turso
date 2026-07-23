@@ -919,6 +919,11 @@ pub fn constraints_from_where_clause(
                         constraint.usable,
                         "constraint collation must match table column collation"
                     );
+                    if !index.columns[position_in_index].has_default_nulls_placement()
+                        && constraint.operator != ast::Operator::Equals.into()
+                    {
+                        continue;
+                    }
                     if let Some(table_col_pos) = constraint.table_col_pos {
                         let constrained_column = &table_reference.table.columns()[table_col_pos];
                         let table_collation = constrained_column.collation();
