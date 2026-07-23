@@ -390,9 +390,8 @@ impl Session {
                     fatal = Some(error.into());
                     break;
                 }
-                // Reserved terminating entry. Turso Cloud ends the body
-                // without it, so a cleanly ended body counts as complete
-                // (matching the JavaScript driver); truncated bodies
+                // Optional terminating entry (section 7.2.6); a cleanly
+                // ended body is complete without it, and truncated bodies
                 // surface as transport errors through the HTTP framing.
                 CursorEntry::ReplicationIndex {} => {}
                 CursorEntry::Unknown => {}

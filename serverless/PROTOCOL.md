@@ -637,22 +637,26 @@ Reports a fatal error that terminates the cursor. No further entries follow.
 { "type": "error", "error": { "message": "...", "code": "..." } }
 ```
 
-The server MAY also abort the response body without emitting an `error`
-entry, for example when it fails mid-stream. A response body that ends
-without a terminating `error` or `replication_index` entry MUST be treated
-by the client as a fatal error for both the batch and the stream.
+When the server fails mid-stream, it aborts the response body, with or
+without emitting an `error` entry first. Clients rely on the transport to
+report such an abort as a truncated body. A body that the transport
+delivers completely and that did not end with an `error` entry is a
+successfully completed cursor, whether or not it carries a final
+`replication_index` entry (section 7.2.6).
 
 #### 7.2.6 `replication_index`
 
-The final entry of a successfully completed cursor:
+The server SHOULD emit a `replication_index` entry as the final entry of a
+successfully completed cursor:
 
 ```json
 { "type": "replication_index", "replication_index": null }
 ```
 
 The `replication_index` value is reserved and may be a string, a number, or
-`null`. Clients MAY ignore this entry. Clients MUST ignore entry types they
-do not recognize, to allow future extensions.
+`null`. Clients MAY ignore this entry and MUST NOT require it: the server
+MAY end a successfully completed cursor without it. Clients MUST ignore
+entry types they do not recognize, to allow future extensions.
 
 ## 8. Data types
 
