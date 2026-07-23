@@ -14,15 +14,17 @@ use crate::protocol::{
 use crate::rows::Row;
 use crate::{Column, Error, Result};
 
-/// Rewrite `libsql://` and `turso://` URLs to `https://`.
+/// Rewrite `libsql://` and `turso://` URLs to `https://` and strip any
+/// trailing slashes, since endpoint paths are appended with a leading slash.
 pub(crate) fn normalize_url(url: &str) -> String {
-    if let Some(rest) = url.strip_prefix("libsql://") {
+    let url = if let Some(rest) = url.strip_prefix("libsql://") {
         format!("https://{rest}")
     } else if let Some(rest) = url.strip_prefix("turso://") {
         format!("https://{rest}")
     } else {
-        url.trim_end_matches('/').to_string()
-    }
+        url.to_string()
+    };
+    url.trim_end_matches('/').to_string()
 }
 
 /// Connection state observable without a server round trip. Shared between
@@ -210,7 +212,7 @@ impl Session {
     fn update_stream(&mut self, baton: Option<String>, base_url: Option<String>) {
         self.baton = baton;
         if let Some(base_url) = base_url {
-            self.base_url = base_url;
+            self.base_url = normalize_url(&base_url);
         }
     }
 
@@ -449,5 +451,10 @@ mod tests {
     #[test]
     fn normalize_url_strips_trailing_slash() {
         assert_eq!(normalize_url("https://db.turso.io/"), "https://db.turso.io");
+        assert_eq!(
+            normalize_url("libsql://db.turso.io/"),
+            "https://db.turso.io"
+        );
+        assert_eq!(normalize_url("turso://db.turso.io/"), "https://db.turso.io");
     }
 }
