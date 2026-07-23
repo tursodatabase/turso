@@ -112,12 +112,17 @@ pub fn emit_query<'a>(
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
     emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
 
-    // For non-grouped aggregation queries that also have non-aggregate columns,
-    // we need to ensure non-aggregate columns are only emitted once.
-    // This flag helps track whether we've already emitted these columns.
+    // For non-grouped aggregation queries that evaluate non-aggregate
+    // expressions (non-aggregate result columns, or bare column references in
+    // a HAVING without GROUP BY), we need to ensure those expressions are only
+    // evaluated once, against the first row of the implicit group, matching
+    // SQLite's arbitrary-row semantics.
+    // This flag helps track whether we've already evaluated them.
+    // Note: HAVING without GROUP BY sets group_by to Some with empty exprs.
     let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
-        && plan.group_by.is_none()
-        && plan.result_columns.iter().any(|c| !c.contains_aggregates);
+        && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
+        && (plan.result_columns.iter().any(|c| !c.contains_aggregates)
+            || plan.group_by.as_ref().is_some_and(|gb| gb.having.is_some()));
 
     if has_ungrouped_nonagg_cols {
         let flag = program.alloc_register();
