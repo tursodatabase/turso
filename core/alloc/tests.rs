@@ -317,6 +317,33 @@ fn iterator_try_collect_builds_result_collection() {
     assert_eq!(error, Err("bad"));
 }
 
+#[cfg(nightly)]
+#[test]
+fn iterator_try_collect_result_trusted_len_reserves_exact_capacity() {
+    let values = (0..10)
+        .map(Ok::<_, TryReserveError>)
+        .try_collect::<Result<Vec<_>, TryReserveError>>()
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(values.as_slice(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(values.capacity(), values.len());
+}
+
+#[cfg(nightly)]
+#[test]
+fn iterator_try_collect_result_trusted_len_stops_on_error() {
+    let mut consumed = 0;
+    let result = [Ok(1), Err("bad"), Ok(3)]
+        .into_iter()
+        .inspect(|_| consumed += 1)
+        .try_collect::<Result<Vec<_>, &str>>()
+        .unwrap();
+
+    assert_eq!(result, Err("bad"));
+    assert_eq!(consumed, 2);
+}
+
 #[test]
 fn iterator_try_collect_converts_result_error() {
     #[derive(Debug, PartialEq)]
