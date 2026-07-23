@@ -96,8 +96,12 @@ static Tcl_Obj *value_to_obj(void *argv_i)
     case SQLITE_FLOAT:
         return Tcl_NewDoubleObj(sqlite3_value_double(argv_i));
     case SQLITE_TEXT: {
+        /* Pass the length explicitly: turso's sqlite3_value_text does not
+         * NUL-terminate its buffer (unlike SQLite), so length -1 (strlen)
+         * reads past the end and picks up garbage bytes. */
         const char *text = (const char *)sqlite3_value_text(argv_i);
-        return Tcl_NewStringObj(text ? text : "", -1);
+        int nbytes = sqlite3_value_bytes(argv_i);
+        return Tcl_NewStringObj(text ? text : "", text ? nbytes : 0);
     }
     case SQLITE_BLOB: {
         const void *blob = sqlite3_value_blob(argv_i);
@@ -396,13 +400,13 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
     TursoDb    *tdb = (TursoDb *)cd;
     static const char *cmds[] = {
         "eval", "one", "exists", "changes", "total_changes",
-        "last_insert_rowid", "errorcode", "errmsg", "null",
+        "last_insert_rowid", "errorcode", "errmsg", "null", "nullvalue",
         "func", "function", "close", "limit",
         NULL
     };
     enum {
         CMD_EVAL, CMD_ONE, CMD_EXISTS, CMD_CHANGES, CMD_TOTAL_CHANGES,
-        CMD_LAST_INSERT_ROWID, CMD_ERRORCODE, CMD_ERRMSG, CMD_NULL,
+        CMD_LAST_INSERT_ROWID, CMD_ERRORCODE, CMD_ERRMSG, CMD_NULL, CMD_NULLVALUE,
         CMD_FUNC, CMD_FUNCTION, CMD_CLOSE, CMD_LIMIT
     };
     int cmdIdx;
@@ -445,6 +449,7 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
     /* ---- null value string ---- */
 
     case CMD_NULL:
+    case CMD_NULLVALUE:
         if (objc == 3) {
             if (tdb->null_obj) Tcl_DecrRefCount(tdb->null_obj);
             tdb->null_obj = objv[2];
@@ -489,10 +494,13 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
             return TCL_OK;
         }
 
-        /* db eval sql array script — per-row callback */
-        if (objc == 5) {
-            Tcl_Obj *array_name = objv[3];
-            Tcl_Obj *script     = objv[4];
+        /* db eval sql ?array? script — per-row callback. With an array
+         * name, columns land in array(col); without one, each column is
+         * set as a scalar variable named after it, as in the upstream
+         * SQLite TCL binding. */
+        if (objc == 4 || objc == 5) {
+            Tcl_Obj *array_name = (objc == 5) ? objv[3] : NULL;
+            Tcl_Obj *script     = objv[objc - 1];
 
             const char   *remaining = sql;
             int           loop_rc   = TCL_OK;
@@ -522,23 +530,28 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
                 int ncols = sqlite3_column_count(stmt);
 
                 /* Set array(*) to the list of column names. */
-                Tcl_Obj *col_list = Tcl_NewListObj(0, NULL);
                 int i;
-                for (i = 0; i < ncols; i++) {
-                    const char *col = sqlite3_column_name(stmt, i);
-                    Tcl_ListObjAppendElement(interp, col_list,
-                        Tcl_NewStringObj(col ? col : "", -1));
+                if (array_name) {
+                    Tcl_Obj *col_list = Tcl_NewListObj(0, NULL);
+                    for (i = 0; i < ncols; i++) {
+                        const char *col = sqlite3_column_name(stmt, i);
+                        Tcl_ListObjAppendElement(interp, col_list,
+                            Tcl_NewStringObj(col ? col : "", -1));
+                    }
+                    Tcl_ObjSetVar2(interp, array_name,
+                                   Tcl_NewStringObj("*", 1), col_list, 0);
                 }
-                Tcl_ObjSetVar2(interp, array_name,
-                               Tcl_NewStringObj("*", 1), col_list, 0);
 
                 while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
                     for (i = 0; i < ncols; i++) {
                         const char *col = sqlite3_column_name(stmt, i);
                         Tcl_Obj *val = column_to_obj(stmt, i, null_str);
-                        Tcl_ObjSetVar2(interp, array_name,
-                                       Tcl_NewStringObj(col ? col : "", -1),
-                                       val, 0);
+                        Tcl_Obj *col_obj = Tcl_NewStringObj(col ? col : "", -1);
+                        if (array_name) {
+                            Tcl_ObjSetVar2(interp, array_name, col_obj, val, 0);
+                        } else {
+                            Tcl_ObjSetVar2(interp, col_obj, NULL, val, 0);
+                        }
                     }
 
                     loop_rc = Tcl_EvalObjEx(interp, script, 0);
@@ -569,8 +582,8 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
             return TCL_OK;
         }
 
-        /* objc == 4: not a standard form we support */
-        Tcl_WrongNumArgs(interp, 2, objv, "sql ?array script?");
+        /* unreachable: objc validated to 3..5 above */
+        Tcl_WrongNumArgs(interp, 2, objv, "sql ?array? ?script?");
         return TCL_ERROR;
     }
 
