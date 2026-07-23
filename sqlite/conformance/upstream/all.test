@@ -18,7 +18,7 @@ source $testdir/select8.test
 # FIXME: source $testdir/select9.test
 # FIXME: source $testdir/selectA.test
 # FIXME: source $testdir/selectB.test
-# FIXME: source $testdir/selectC.test
+source $testdir/selectC.test
 # FIXME: source $testdir/selectD.test
 # FIXME: source $testdir/selectE.test
 source $testdir/selectF.test
