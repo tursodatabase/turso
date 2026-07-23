@@ -15134,6 +15134,31 @@ pub fn op_alter_column(
 
         btree.prepare_generated_columns()?;
 
+        // Refresh index columns that reference the altered column so future DML
+        // computes index keys from the new column definition: a column that is
+        // (now) virtual generated must carry its resolved generated expression,
+        // and one that is no longer virtual must drop the stale one. See issue #7077.
+        if !*rename {
+            let altered_column = &btree.columns()[*column_index];
+            let new_generated_expr = match altered_column.generated_type() {
+                crate::schema::GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
+                crate::schema::GeneratedType::NotGenerated => None,
+            };
+            let new_default = altered_column.default.clone();
+            if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
+                for idx in idxs {
+                    let idx = Arc::make_mut(idx);
+                    for ic in &mut idx.columns {
+                        if ic.pos_in_table == *column_index {
+                            ic.name.clone_from(&new_name);
+                            ic.expr.clone_from(&new_generated_expr);
+                            ic.default.clone_from(&new_default);
+                        }
+                    }
+                }
+            }
+        }
+
         // Keep primary_key_columns consistent (names may change on rename)
         for (pk_name, _ord) in &mut btree.primary_key_columns {
             if pk_name.eq_ignore_ascii_case(&old_column_name) {
