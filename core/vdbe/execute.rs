@@ -1,6 +1,6 @@
 use crate::alloc::{
-    DynAllocator, TursoAllocExt, TursoIteratorExt, TursoSliceExt, TursoTryWithCapacityExt,
-    TursoVecExt,
+    DynAllocator, TryClone, TursoAllocExt, TursoIteratorExt, TursoSliceExt,
+    TursoTryWithCapacityExt, TursoVecExt,
 };
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
@@ -2631,7 +2631,14 @@ pub fn op_reg_copy_offset(
             state.registers.len()
         )));
     }
-    state.registers[dest] = state.registers[*src].clone();
+    if dest != *src {
+        // try_clone_from reuses the destination register's allocation.
+        let [src, dst] = state
+            .registers
+            .get_disjoint_mut([*src, dest])
+            .expect("RegCopyOffset source and destination registers are distinct");
+        dst.try_clone_from(src)?;
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -11754,7 +11761,16 @@ pub fn op_copy(
         insn
     );
     for i in 0..=*extra_amount {
-        state.registers[*dst_reg + i] = state.registers[*src_reg + i].clone();
+        let (src, dst) = (*src_reg + i, *dst_reg + i);
+        if src == dst {
+            continue;
+        }
+        // try_clone_from reuses the destination register's allocation.
+        let [src, dst] = state
+            .registers
+            .get_disjoint_mut([src, dst])
+            .expect("Copy source and destination registers are distinct");
+        dst.try_clone_from(src)?;
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

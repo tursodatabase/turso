@@ -864,6 +864,29 @@ pub enum AggContext {
     External(ExternalAggState),
 }
 
+impl TryClone for AggContext {
+    type Error = TryReserveError;
+
+    /// Fallible clone: the builtin payload's Vec and each contained Text/Blob
+    /// go through fallible reservation. External state holds only FFI
+    /// pointers and copies without allocating.
+    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        match self {
+            Self::Builtin(payload) => {
+                let mut values = Vec::try_with_capacity_ext(payload.len())?;
+                for value in payload {
+                    let mut copy = Value::Null;
+                    copy.try_clone_from(value)?;
+                    values.push(copy);
+                }
+                Ok(Self::Builtin(values))
+            }
+            Self::External(_) => Ok(self.clone()),
+        }
+    }
+}
+
 impl AggContext {
     pub fn compute_external(&self) -> Result<Value> {
         if let Self::External(ext_state) = self {
@@ -1605,7 +1628,7 @@ mod immutable_record {
 
         /// A record holding a copy of `payload`, serialized into `buf`.
         #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::RecordCopy)]
-        pub fn copy_payload(payload: &[u8], buf: RecordBuf) -> Result<Self> {
+        pub fn copy_payload(payload: &[u8], buf: RecordBuf) -> Result<Self, TryReserveError> {
             let RecordBuf(mut buf) = buf;
             buf.try_extend(payload.iter().copied())?;
             Ok(Self {
