@@ -2336,9 +2336,9 @@ dependencies = [
 
 [[package]]
 name = "futures-core"
-version = "0.3.31"
+version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05f29059c0c2090612e8d742178b0580d2dc940c837851ad723096f87af6663e"
+checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
 
 [[package]]
 name = "futures-executor"
@@ -7216,6 +7216,7 @@ dependencies = [
  "env_logger",
  "fallible-iterator 0.3.0",
  "fastbloom",
+ "futures-core",
  "hex",
  "icu_collator",
  "icu_locale",
