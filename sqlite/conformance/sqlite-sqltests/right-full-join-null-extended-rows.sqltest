@@ -1,0 +1,72 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/7978
+# RIGHT/FULL OUTER JOIN: missing NULL-extended rows and misplaced output
+# columns.
+
+# Case 1: FULL OUTER JOIN must still emit the NULL-extended row for the
+# right table even when the left side of the join produces no rows.
+test full-outer-join-null-extended-row-on-0 {
+    CREATE TABLE t0(a INT);
+    INSERT INTO t0(a) VALUES (1);
+    CREATE TABLE t1(b INT);
+    INSERT INTO t1(b) VALUES (2);
+    CREATE VIEW v2(c) AS SELECT 3 FROM t1;
+    SELECT * FROM t1 JOIN v2 ON 0 FULL OUTER JOIN t0 ON true;
+}
+expect {
+    ||1
+}
+
+test full-outer-join-null-extended-row-on-false {
+    CREATE TABLE t0(a INT);
+    INSERT INTO t0(a) VALUES (1);
+    CREATE TABLE t1(b INT);
+    INSERT INTO t1(b) VALUES (2);
+    CREATE VIEW v2(c) AS SELECT 3 FROM t1;
+    SELECT * FROM t1 JOIN v2 ON false FULL OUTER JOIN t0 ON true;
+}
+expect {
+    ||1
+}
+
+test full-outer-join-null-extended-row-on-1eq0 {
+    CREATE TABLE t0(a INT);
+    INSERT INTO t0(a) VALUES (1);
+    CREATE TABLE t1(b INT);
+    INSERT INTO t1(b) VALUES (2);
+    CREATE VIEW v2(c) AS SELECT 3 FROM t1;
+    SELECT * FROM t1 JOIN v2 ON 1=0 FULL OUTER JOIN t0 ON true;
+}
+expect {
+    ||1
+}
+
+# Case 2: RIGHT JOIN followed by LEFT JOIN USING must keep the values in
+# the correct output columns (c0|x|c1 -> NULL|3|NULL).
+test right-join-then-left-join-using-column-order {
+    CREATE TABLE t1(c0 INT, c1 INT);
+    INSERT INTO t1(c0, c1) VALUES(NULL,11);
+    CREATE TABLE t2(c0 INT NOT NULL);
+    CREATE TABLE t3(x INT);
+    INSERT INTO t3(x) VALUES(3);
+    SELECT * FROM t2 RIGHT JOIN t3 ON true LEFT JOIN t1 USING(c0);
+}
+expect {
+    |3|
+}
+
+# Case 3: unmatched right-table rows must be emitted in right-table scan
+# order, interleaved with matched rows, as SQLite does.
+test right-join-unmatched-row-order {
+    CREATE TABLE a(value TEXT);
+    INSERT INTO a(value) VALUES ('a'),('b'),(NULL);
+    CREATE TABLE b(value TEXT);
+    INSERT INTO b(value) VALUES ('a'),('c'),(NULL);
+    SELECT a.value, b.value FROM a RIGHT JOIN b ON a.value = b.value;
+}
+expect {
+    a|a
+    |c
+    |
+}
