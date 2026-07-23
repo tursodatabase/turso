@@ -2795,7 +2795,25 @@ impl Pager {
         // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
         // Rebuilding init_page_1 must not leak any stale 4 KiB page-1 image into the first write.
         self.dirty_pages.write().clear();
+
+        // Encryption can be configured before a fresh database chooses its page
+        // size, so keep the IO context aligned with the pager before the first
+        // page write.
+        self.reset_page_size_in_encryption_ctx(size);
         Ok(())
+    }
+
+    /// Update the encryption page size in the pager IO context and its WAL copy.
+    ///
+    /// This is a no-op when encryption is not configured.
+    fn reset_page_size_in_encryption_ctx(&self, size: PageSize) {
+        self.io_ctx.write().reset_page_size_in_encryption_ctx(size);
+        if !self.is_encryption_ctx_set() {
+            return;
+        }
+        if let Some(wal) = self.wal.as_ref() {
+            wal.set_io_context(self.io_ctx.read().clone());
+        }
     }
 
     /// Set the initial journal version in page 1 before the database is initialized.
