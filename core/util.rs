@@ -2115,6 +2115,16 @@ fn view_sources_from_clause(
     Ok(sources)
 }
 
+/// Return the column names merged by each table in a NATURAL or USING join.
+///
+/// This shares the view-schema expansion path so materialized-view
+/// maintenance binds merged columns exactly as the defining query does.
+pub fn join_using_columns(from: &ast::FromClause, schema: &Schema) -> Result<Vec<Vec<String>>> {
+    let mut tables = Vec::new();
+    let sources = view_sources_from_clause(from, schema, &HashMap::default(), &mut tables)?;
+    Ok(sources.into_iter().map(|(_, merged)| merged).collect())
+}
+
 fn expand_view_star(sources: &[(ViewSource, Vec<String>)]) -> Vec<ViewColumn> {
     sources
         .iter()

@@ -583,8 +583,16 @@ fn join(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
             let col = r_numeric[rng.random_range(0..r_numeric.len())];
             exprs.push(format!("SUM(r.{}) AS s", quoted(&col.name)));
         }
+        // Sometimes aggregate over a LEFT JOIN: unmatched left rows are
+        // NULL-padded and still feed the aggregate (COUNT counts them, SUM
+        // ignores the NULL), exercising the padded-row aux behind the group.
+        let join_kw = if rng.random_bool(0.5) {
+            "LEFT JOIN"
+        } else {
+            "JOIN"
+        };
         return Some(format!(
-            "SELECT {exprs} FROM {lt} AS l JOIN {rt} AS r ON l.{lc} = r.{rc} GROUP BY l.{g}",
+            "SELECT {exprs} FROM {lt} AS l {join_kw} {rt} AS r ON l.{lc} = r.{rc} GROUP BY l.{g}",
             exprs = exprs.join(", "),
             lt = quoted(&left.name),
             rt = quoted(&right.name),
