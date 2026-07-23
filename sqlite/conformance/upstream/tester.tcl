@@ -63,7 +63,10 @@ proc reset_db {} {
 
 # Execute SQL and return results
 proc execsql {sql {db db}} {
-  return [$db eval $sql]
+  # Evaluate in the caller's scope so that TCL variables referenced inside
+  # the SQL (e.g. {SELECT round($x1)}) bind to the caller's values instead
+  # of silently binding NULL.
+  return [uplevel [list $db eval $sql]]
 }
 
 # Execute SQL and return first value only (similar to db one)
@@ -110,7 +113,9 @@ proc normalize_result {result} {
 
 # Execute SQL and catch errors
 proc catchsql {sql {db db}} {
-  if {[catch {execsql $sql $db} result]} {
+  # Do not route through execsql: its uplevel would land in this frame, one
+  # level short of the caller whose variables the SQL may reference.
+  if {[catch {uplevel [list $db eval $sql]} result]} {
     return [list 1 [normalize_errmsg $result]]
   } else {
     return [list 0 $result]
