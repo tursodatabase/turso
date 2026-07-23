@@ -272,7 +272,14 @@ pub fn execute_interaction_turso(
 
             stack.push(results);
             // TODO: skip integrity check with mvcc
-            if !env.profile.mvcc && env.rng.random_ratio(1, 10) {
+            // Skip inside explicit transactions: this hidden read is invisible to
+            // the shadow model, and right after BEGIN DEFERRED it would pin the
+            // engine's read snapshot earlier than the model's lazily-taken one,
+            // causing false "expected content" mismatches under concurrency.
+            if !env.profile.mvcc
+                && env.rng.random_ratio(1, 10)
+                && !env.conn_db_in_transaction(connection_index)
+            {
                 let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index]
                 else {
                     unreachable!()
@@ -334,7 +341,11 @@ pub fn execute_interaction_turso(
             // Reset fault injection
             env.io.inject_fault(false);
             // TODO: skip integrity check with mvcc
-            if !env.profile.mvcc && env.rng.random_ratio(1, 10) {
+            // Skip inside explicit transactions — see the Query arm above.
+            if !env.profile.mvcc
+                && env.rng.random_ratio(1, 10)
+                && !env.conn_db_in_transaction(connection_index)
+            {
                 limbo_integrity_check(&conn)?;
             }
         }
