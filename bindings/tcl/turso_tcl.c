@@ -96,8 +96,12 @@ static Tcl_Obj *value_to_obj(void *argv_i)
     case SQLITE_FLOAT:
         return Tcl_NewDoubleObj(sqlite3_value_double(argv_i));
     case SQLITE_TEXT: {
+        /* Pass the length explicitly: turso's sqlite3_value_text does not
+         * NUL-terminate its buffer (unlike SQLite), so length -1 (strlen)
+         * reads past the end and picks up garbage bytes. */
         const char *text = (const char *)sqlite3_value_text(argv_i);
-        return Tcl_NewStringObj(text ? text : "", -1);
+        int nbytes = sqlite3_value_bytes(argv_i);
+        return Tcl_NewStringObj(text ? text : "", text ? nbytes : 0);
     }
     case SQLITE_BLOB: {
         const void *blob = sqlite3_value_blob(argv_i);
