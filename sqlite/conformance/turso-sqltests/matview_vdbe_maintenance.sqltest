@@ -775,13 +775,39 @@ expect {
     ok
 }
 
-test matview-vdbe-join-right-outer-rejected {
-    CREATE TABLE jl6(x INTEGER);
-    CREATE TABLE jr6(y INTEGER);
-    CREATE MATERIALIZED VIEW bad6 AS SELECT x, y FROM jl6 RIGHT JOIN jr6 ON x = y;
+# RIGHT JOIN is maintained as a LEFT JOIN with the two tables swapped: an
+# unmatched right row keeps a view row with the left columns NULL.
+test matview-vdbe-join-right-outer {
+    CREATE TABLE jl6(a INTEGER PRIMARY KEY, x INTEGER);
+    CREATE TABLE jr6(b INTEGER PRIMARY KEY, y INTEGER);
+    INSERT INTO jl6 VALUES (1, 10), (2, 20);
+    CREATE MATERIALIZED VIEW v6 AS SELECT a, x, b, y FROM jl6 RIGHT JOIN jr6 ON x = y;
+    INSERT INTO jr6 VALUES (100, 10), (200, 20), (300, 30);
+    DELETE FROM jl6 WHERE a = 1;
+    SELECT a, x, b, y FROM v6 ORDER BY b;
+}
+expect {
+    ||100|10
+    2|20|200|20
+    ||300|30
+}
+
+test matview-vdbe-join-full-outer-rejected {
+    CREATE TABLE jl6f(x INTEGER);
+    CREATE TABLE jr6f(y INTEGER);
+    CREATE MATERIALIZED VIEW bad6f AS SELECT x, y FROM jl6f FULL OUTER JOIN jr6f ON x = y;
 }
 expect error {
-    materialized views with RIGHT or FULL outer joins are not yet supported
+    materialized views with FULL outer joins are not yet supported
+}
+
+test matview-vdbe-join-right-using-rejected {
+    CREATE TABLE jl6u(x INTEGER);
+    CREATE TABLE jr6u(x INTEGER);
+    CREATE MATERIALIZED VIEW bad6u AS SELECT x FROM jl6u RIGHT JOIN jr6u USING (x);
+}
+expect error {
+    materialized views with RIGHT JOIN with USING or NATURAL are not yet supported
 }
 
 # LEFT JOIN: a NULL-padded row exists while its left row has no ON-match.

@@ -787,32 +787,34 @@ fn build_select_core(
     // query or an outer join is not incrementally maintainable.
     let distinct_columns;
     let distinct_group_by;
-    let (columns, group_by): (&[ast::ResultColumn], &Option<ast::GroupBy>) =
-        if matches!(distinctness, Some(ast::Distinctness::Distinct)) {
-            if has_aggregates {
-                return unsupported("DISTINCT over aggregates");
-            }
-            let left_outer = from.joins.iter().any(|join| {
+    let (columns, group_by): (&[ast::ResultColumn], &Option<ast::GroupBy>) = if matches!(
+        distinctness,
+        Some(ast::Distinctness::Distinct)
+    ) {
+        if has_aggregates {
+            return unsupported("DISTINCT over aggregates");
+        }
+        let left_outer = from.joins.iter().any(|join| {
                 matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(ast::JoinType::LEFT))
             });
-            if left_outer {
-                return unsupported("DISTINCT over outer joins");
-            }
-            let group_exprs = expand_join_output_exprs(from, schema, columns, resolver)?;
-            distinct_columns = group_exprs
-                .iter()
-                .cloned()
-                .map(|expr| ast::ResultColumn::Expr(Box::new(expr), None))
-                .collect::<Vec<_>>();
-            distinct_group_by = Some(ast::GroupBy {
-                exprs: group_exprs.into_iter().map(Box::new).collect(),
-                having: None,
-            });
-            has_aggregates = true;
-            (&distinct_columns, &distinct_group_by)
-        } else {
-            (columns.as_slice(), group_by)
-        };
+        if left_outer {
+            return unsupported("DISTINCT over outer joins");
+        }
+        let group_exprs = expand_join_output_exprs(from, schema, columns, resolver)?;
+        distinct_columns = group_exprs
+            .iter()
+            .cloned()
+            .map(|expr| ast::ResultColumn::Expr(Box::new(expr), None))
+            .collect::<Vec<_>>();
+        distinct_group_by = Some(ast::GroupBy {
+            exprs: group_exprs.into_iter().map(Box::new).collect(),
+            having: None,
+        });
+        has_aggregates = true;
+        (&distinct_columns, &distinct_group_by)
+    } else {
+        (columns.as_slice(), group_by)
+    };
 
     if has_aggregates {
         let base_tables: Vec<Arc<BTreeTable>> = std::iter::once(from.select.as_ref())
@@ -825,7 +827,8 @@ fn build_select_core(
         // Reuse the aggregate-operator extraction (group keys, collected
         // aggregates, collations); HAVING and the output expressions become
         // the Filter/Project above, not fields of the operator.
-        let shape = classify_group_aggregate(columns, group_by, from, &base_tables, schema, resolver)?;
+        let shape =
+            classify_group_aggregate(columns, group_by, from, &base_tables, schema, resolver)?;
         let ViewShape::GroupAggregate {
             group_exprs,
             group_collations,
@@ -903,10 +906,24 @@ fn build_source(
     if scans.len() == 1 {
         return Ok(scans[0]);
     }
-    let left_outer = from.joins.iter().any(|join| {
+    let is_left = from.joins.iter().any(|join| {
         matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(ast::JoinType::LEFT))
     });
-    let using = tables.iter().map(|(_, _, u)| u.clone()).collect();
+    let is_right = from.joins.iter().any(|join| {
+        matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt))
+            if jt.contains(ast::JoinType::RIGHT) && !jt.contains(ast::JoinType::LEFT))
+    });
+    let left_outer = is_left || is_right;
+    let mut scans = scans;
+    let mut using: Vec<Vec<String>> = tables.iter().map(|(_, _, u)| u.clone()).collect();
+    if is_right {
+        // A RIGHT JOIN B is maintained as B LEFT JOIN A: swap the inputs so
+        // the padded (unmatched) side is the outer left. classify restricts
+        // RIGHT to two ON-joined tables, so this is a plain reversal and the
+        // root projection still binds output columns by identity.
+        scans.swap(0, 1);
+        using.swap(0, 1);
+    }
     Ok(builder.push(dag::OpNode::Join {
         inputs: scans,
         using,
@@ -1101,14 +1118,28 @@ pub fn classify_view(
                 let is_right = join_type.contains(ast::JoinType::RIGHT);
                 let is_full = (is_left && is_right)
                     || (join_type.contains(ast::JoinType::OUTER) && !is_left && !is_right);
-                if is_right || is_full {
-                    return unsupported("RIGHT or FULL outer joins");
+                if is_full {
+                    return unsupported("FULL outer joins");
                 }
-                if is_left {
-                    // The NULL-padded row bookkeeping tracks one left side;
-                    // LEFT JOIN is supported for exactly two tables.
+                if is_left || is_right {
+                    // The NULL-padded row bookkeeping tracks one outer side;
+                    // outer joins are supported for exactly two tables. A
+                    // RIGHT join is maintained as a LEFT join with the tables
+                    // swapped (build_dag does the swap); the USING/NATURAL
+                    // column merge is order-sensitive and does not survive the
+                    // swap, so RIGHT is restricted to an ON constraint.
                     if from.joins.len() > 1 {
-                        return unsupported("LEFT JOIN over more than two tables");
+                        return unsupported(if is_left {
+                            "LEFT JOIN over more than two tables"
+                        } else {
+                            "RIGHT JOIN over more than two tables"
+                        });
+                    }
+                    if is_right
+                        && (join_type.contains(ast::JoinType::NATURAL)
+                            || matches!(join.constraint, Some(ast::JoinConstraint::Using(_))))
+                    {
+                        return unsupported("RIGHT JOIN with USING or NATURAL");
                     }
                     left_outer = true;
                 }
@@ -1962,7 +1993,9 @@ fn projections_to_result_columns(
         .map(|(expr, alias)| {
             ast::ResultColumn::Expr(
                 Box::new(expr.clone()),
-                alias.clone().map(|name| ast::As::As(ast::Name::exact(name))),
+                alias
+                    .clone()
+                    .map(|name| ast::As::As(ast::Name::exact(name))),
             )
         })
         .collect()
@@ -1990,7 +2023,11 @@ fn emit_dag_view(
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let dag::OpNode::Project { input: proj_input, projections } = &dag.nodes[root] else {
+    let dag::OpNode::Project {
+        input: proj_input,
+        projections,
+    } = &dag.nodes[root]
+    else {
         return Err(LimboError::InternalError(
             "view DAG root is not a projection".to_string(),
         ));
@@ -2119,13 +2156,20 @@ fn compile_dag_view_program(
         connection,
     )?;
     program.epilogue(schema);
-    program.build(connection.clone(), false, "materialized view dag maintenance")
+    program.build(
+        connection.clone(),
+        false,
+        "materialized view dag maintenance",
+    )
 }
 
 /// Whether the DAG is an aggregate view: `Project` root over an `Aggregate`,
 /// optionally with a HAVING `Filter` between them.
 fn dag_is_aggregate(dag: &dag::MaintenanceDag) -> bool {
-    let dag::OpNode::Project { input: proj_input, .. } = dag.root_node() else {
+    let dag::OpNode::Project {
+        input: proj_input, ..
+    } = dag.root_node()
+    else {
         return false;
     };
     let below = match &dag.nodes[*proj_input] {
@@ -2138,7 +2182,10 @@ fn dag_is_aggregate(dag: &dag::MaintenanceDag) -> bool {
 /// Whether the DAG is a join view: `Project` root over a `Join`, optionally
 /// with a WHERE `Filter` between them.
 fn dag_is_join(dag: &dag::MaintenanceDag) -> bool {
-    let dag::OpNode::Project { input: proj_input, .. } = dag.root_node() else {
+    let dag::OpNode::Project {
+        input: proj_input, ..
+    } = dag.root_node()
+    else {
         return false;
     };
     let below = match &dag.nodes[*proj_input] {
@@ -2160,18 +2207,23 @@ fn dag_is_compound(dag: &dag::MaintenanceDag) -> bool {
         id == dag.root
             || matches!(
                 node,
-                dag::OpNode::Scan { .. }
-                    | dag::OpNode::Filter { .. }
-                    | dag::OpNode::Project { .. }
+                dag::OpNode::Scan { .. } | dag::OpNode::Filter { .. } | dag::OpNode::Project { .. }
             )
     })
 }
 
 /// The filter/project [`BranchContent`] a compound `SetOp` branch produces,
 /// read from its `Project` -> `Filter`? -> `Scan` sub-tree.
-fn dag_branch_content(dag: &dag::MaintenanceDag, branch_root: dag::NodeId) -> Result<BranchContent> {
+fn dag_branch_content(
+    dag: &dag::MaintenanceDag,
+    branch_root: dag::NodeId,
+) -> Result<BranchContent> {
     let bad = || LimboError::InternalError("compound branch is not filter/project".to_string());
-    let dag::OpNode::Project { input: proj_input, projections } = &dag.nodes[branch_root] else {
+    let dag::OpNode::Project {
+        input: proj_input,
+        projections,
+    } = &dag.nodes[branch_root]
+    else {
         return Err(bad());
     };
     let (scan_id, where_clause): (dag::NodeId, Option<ast::Expr>) = match &dag.nodes[*proj_input] {
@@ -2187,7 +2239,9 @@ fn dag_branch_content(dag: &dag::MaintenanceDag, branch_root: dag::NodeId) -> Re
         .map(|(expr, alias)| {
             ast::ResultColumn::Expr(
                 Box::new(expr.clone()),
-                alias.clone().map(|name| ast::As::As(ast::Name::exact(name))),
+                alias
+                    .clone()
+                    .map(|name| ast::As::As(ast::Name::exact(name))),
             )
         })
         .collect();
@@ -2227,7 +2281,6 @@ fn dag_aggregate_outputs(
         })
         .collect()
 }
-
 
 #[allow(clippy::too_many_arguments)]
 fn compile_dag_compound_program(
