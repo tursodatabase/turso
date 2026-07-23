@@ -177,6 +177,32 @@ fn vec_collect_std(bencher: Bencher, len: usize) {
     });
 }
 
+#[cfg(nightly)]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_result_collect_trusted_turso(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let values = (0..len)
+            .map(|value| Ok::<_, alloc::TryReserveError>(black_box(value)))
+            .try_collect::<Result<alloc::Vec<_>, alloc::TryReserveError>>()
+            .unwrap()
+            .unwrap();
+        black_box(values)
+    });
+}
+
+#[cfg(nightly)]
+#[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
+fn vec_result_collect_map_while_turso(bencher: Bencher, len: usize) {
+    bencher.bench_local(|| {
+        let values = (0..len)
+            .map(|value| Ok::<_, alloc::TryReserveError>(black_box(value)))
+            .map_while(Result::ok)
+            .try_collect::<alloc::Vec<_>>()
+            .unwrap();
+        black_box(values)
+    });
+}
+
 #[turso_macros::divan_bench(args = [64, 1_024, 16_384])]
 fn vec_extend_turso(bencher: Bencher, len: usize) {
     bencher.bench_local(|| {

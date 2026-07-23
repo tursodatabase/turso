@@ -1399,10 +1399,10 @@ pub fn op_vfilter(
     let has_rows = {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_virtual_mut();
-        let mut args = Vec::with_capacity(*arg_count);
-        for i in 0..*arg_count {
-            args.push(state.registers[args_reg + i].get_value().clone());
-        }
+
+        let args = (0..*arg_count)
+            .map(|i| state.registers[args_reg + i].get_value().try_clone())
+            .try_collect::<Result<crate::alloc::Vec<_>>>()??;
         let idx_str = if let Some(idx_str) = idx_str {
             Some(state.registers[*idx_str].get_value().to_string())
         } else {
@@ -1491,10 +1491,11 @@ pub fn op_vupdate(
             "VUpdate: arg_count must be at least 2 (rowid and insert_rowid)".to_string(),
         ));
     }
-    let mut argv = Vec::with_capacity(*arg_count);
+    let mut argv = crate::alloc::Vec::try_with_capacity_ext(*arg_count)?;
     for i in 0..*arg_count {
         if let Some(value) = state.registers.get(*start_reg + i) {
-            argv.push(value.get_value().clone());
+            argv.push_within_capacity(value.get_value().try_clone()?)
+                .unwrap();
         } else {
             mark_unlikely();
             return Err(LimboError::InternalError(format!(
@@ -15639,11 +15640,25 @@ pub fn op_hash_distinct(
         .get_mut(&data.hash_table_id)
         .expect("hash table exists");
 
+    // Stage the key values in a per-statement scratch Vec; try_clone_from
+    // reuses each slot's allocation across rows.
     let key_values = &mut state.distinct_key_values;
-    key_values.clear();
-    for i in 0..data.num_keys {
-        let reg = &state.registers[data.key_start_reg + i];
-        key_values.push(reg.get_value().clone());
+    key_values.truncate(data.num_keys);
+    for (i, dst) in key_values.iter_mut().enumerate() {
+        dst.try_clone_from(state.registers[data.key_start_reg + i].get_value())?;
+    }
+    // Clone new values
+    if key_values.len() < data.num_keys {
+        key_values.try_reserve(data.num_keys)?;
+        for i in key_values.len()..data.num_keys {
+            key_values
+                .push_within_capacity(
+                    state.registers[data.key_start_reg + i]
+                        .get_value()
+                        .try_clone()?,
+                )
+                .unwrap();
+        }
     }
 
     let mut key_refs: SmallVec<[ValueRef; 2]> = SmallVec::with_capacity(data.num_keys);
@@ -15688,12 +15703,14 @@ fn write_hash_payload_to_registers(
     entry: &HashEntry,
     payload_dest_reg: Option<usize>,
     num_payload: usize,
-) {
+) -> Result<()> {
     if let Some(dest_reg) = payload_dest_reg {
         for (i, value) in entry.payload_values.iter().take(num_payload).enumerate() {
-            registers[dest_reg + i].set_value(value.clone());
+            // try_clone_value_from reuses the destination register's allocation.
+            registers[dest_reg + i].try_clone_value_from(value)?;
         }
     }
+    Ok(())
 }
 
 pub fn op_hash_probe(
@@ -15825,7 +15842,7 @@ pub fn op_hash_probe(
                     entry,
                     payload_dest_reg,
                     num_payload,
-                );
+                )?;
                 state.active_op_state.clear();
                 state.pc += 1;
                 Ok(InsnFunctionStepResult::Step)
@@ -15846,7 +15863,7 @@ pub fn op_hash_probe(
                     entry,
                     payload_dest_reg,
                     num_payload,
-                );
+                )?;
                 state.active_op_state.clear();
                 state.pc += 1;
                 Ok(InsnFunctionStepResult::Step)
@@ -15889,7 +15906,7 @@ pub fn op_hash_next(
                 entry,
                 *payload_dest_reg,
                 *num_payload,
-            );
+            )?;
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
@@ -16054,7 +16071,7 @@ fn advance_unmatched_scan(
         match hash_table.next_unmatched() {
             Some(entry) => {
                 registers[dest_reg].set_int(entry.rowid);
-                write_hash_payload_to_registers(registers, entry, payload_dest_reg, num_payload);
+                write_hash_payload_to_registers(registers, entry, payload_dest_reg, num_payload)?;
                 *pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
             }

@@ -1,7 +1,7 @@
 use std::{alloc::Allocator, iter::TrustedLen, ptr, slice};
 
 use super::super::{
-    TryClone, TursoAllocExt, TursoFromIterator, TursoFromIteratorIn, TursoSliceExt,
+    trusted_len, TryClone, TursoAllocExt, TursoFromIterator, TursoFromIteratorIn, TursoSliceExt,
     TursoTryWithCapacityExt, TursoVecExt, TursoVecInExt,
 };
 use crate::alloc::{TryReserveError, TursoAllocator, Vec};
@@ -397,19 +397,6 @@ where
 
         Ok(())
     }
-}
-
-#[inline]
-fn trusted_len(size_hint: (usize, Option<usize>)) -> Result<usize, TryReserveError> {
-    let (lower, upper) = size_hint;
-    let Some(additional) = upper else {
-        let Err(err) = std::vec::Vec::<u8>::new().try_reserve(usize::MAX) else {
-            unreachable!("reserving usize::MAX bytes must fail");
-        };
-        return Err(TryReserveError::from(err));
-    };
-    debug_assert_eq!(lower, additional);
-    Ok(additional)
 }
 
 #[cold]
