@@ -245,7 +245,7 @@ avoid this window.
 | PRAGMA query_only                | ✅ Yes        |                                              |
 | PRAGMA quick_check               | ✅ Yes        |                                              |
 | PRAGMA read_uncommitted          | ❌ No         |                                              |
-| PRAGMA recursive_triggers        | ❌ No         |                                              |
+| PRAGMA recursive_triggers        | ✅ Yes        | Controls whether REPLACE conflict deletes fire DELETE triggers; trigger self-recursion is not supported |
 | PRAGMA reverse_unordered_selects | ❌ No         |                                              |
 | PRAGMA schema_version            | ✅ Yes        | For writes, emulate defensive mode (always noop)|
 | PRAGMA secure_delete             | ❌ No         |                                              |

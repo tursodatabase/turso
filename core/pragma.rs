@@ -161,6 +161,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::Result0 | PragmaFlags::NoColumns1,
             &["query_only"],
         ),
+        RecursiveTriggers => Pragma::new(
+            PragmaFlags::Result0 | PragmaFlags::NoColumns1,
+            &["recursive_triggers"],
+        ),
         IAmADummy | RequireWhere => Pragma::new(
             PragmaFlags::Result0 | PragmaFlags::NoColumns1,
             &["require_where"],
