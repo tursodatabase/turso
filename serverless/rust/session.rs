@@ -216,6 +216,7 @@ impl Session {
         if track_autocommit {
             requests.push(StreamRequest::GetAutocommit);
         }
+        let request_count = requests.len();
         let response = self
             .post("/v3/pipeline", |baton| {
                 serde_json::to_string(&PipelineRequest { baton, requests })
@@ -228,14 +229,30 @@ impl Session {
             .map_err(|e| Error::Http(format!("invalid pipeline response: {e}")))?;
         self.update_stream(response.baton.take(), response.base_url.take());
         let mut results = response.results;
+        if results.len() != request_count {
+            return Err(Error::Http(format!(
+                "pipeline response has {} results for {request_count} requests",
+                results.len()
+            )));
+        }
         if track_autocommit {
-            if let Some(StreamResult::Ok {
-                response: StreamResponse::GetAutocommit { is_autocommit },
-            }) = results.pop()
-            {
-                self.shared
-                    .autocommit
-                    .store(is_autocommit, Ordering::Relaxed);
+            let result = results
+                .pop()
+                .expect("track_autocommit appended a request, so results is non-empty");
+            match result {
+                StreamResult::Ok {
+                    response: StreamResponse::GetAutocommit { is_autocommit },
+                } => {
+                    self.shared
+                        .autocommit
+                        .store(is_autocommit, Ordering::Relaxed);
+                }
+                StreamResult::Ok { response } => {
+                    return Err(Error::Http(format!(
+                        "expected get_autocommit result in pipeline response, got {response:?}"
+                    )));
+                }
+                StreamResult::Error { error } => return Err(error.into()),
             }
         }
         Ok(results)
