@@ -173,17 +173,16 @@ impl Session {
         }
     }
 
-    /// POST a request that carries the current baton. On a non-200 response
-    /// the stream is treated as lost (section 9.3). If the stream carried no
-    /// client-visible state (autocommit, no stored SQL), a `400`/`404` —
-    /// typically an expired stream (section 4.5) — is retried once on a
-    /// fresh stream, so long-idle connections keep working transparently.
+    /// POST a request that carries the current baton. Any failure, including
+    /// a non-200 response, is fatal for the stream (section 9.3): the error
+    /// surfaces to the caller and the next statement starts a fresh stream.
+    /// The driver never re-sends a request on its own; whether re-running a
+    /// failed statement is safe is the application's call.
     async fn post(
         &mut self,
         path: &str,
-        make_body: impl Fn(Option<String>) -> Result<String>,
+        make_body: impl FnOnce(Option<String>) -> Result<String>,
     ) -> Result<reqwest::Response> {
-        let had_baton = self.baton.is_some();
         let response = match self.send(path, make_body(self.baton.clone())?).await {
             Ok(response) => response,
             Err(e) => {
@@ -191,19 +190,8 @@ impl Session {
                 return Err(e);
             }
         };
-        if response.status().is_success() {
-            return Ok(response);
-        }
-        let status = response.status().as_u16();
-        let retriable = had_baton
-            && self.shared.autocommit.load(Ordering::Relaxed)
-            && (status == 400 || status == 404);
-        self.reset_stream();
-        if !retriable {
-            return Err(Self::http_error(response).await);
-        }
-        let response = self.send(path, make_body(None)?).await?;
         if !response.status().is_success() {
+            self.reset_stream();
             return Err(Self::http_error(response).await);
         }
         Ok(response)
@@ -230,11 +218,8 @@ impl Session {
         }
         let response = self
             .post("/v3/pipeline", |baton| {
-                serde_json::to_string(&PipelineRequest {
-                    baton,
-                    requests: requests.clone(),
-                })
-                .map_err(|e| Error::Error(format!("failed to encode request: {e}")))
+                serde_json::to_string(&PipelineRequest { baton, requests })
+                    .map_err(|e| Error::Error(format!("failed to encode request: {e}")))
             })
             .await?;
         let mut response: PipelineResponse = response
@@ -291,9 +276,7 @@ impl Session {
             .post("/v3/cursor", |baton| {
                 serde_json::to_string(&CursorRequest {
                     baton,
-                    batch: Batch {
-                        steps: steps.clone(),
-                    },
+                    batch: Batch { steps },
                 })
                 .map_err(|e| Error::Error(format!("failed to encode request: {e}")))
             })
