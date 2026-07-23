@@ -327,11 +327,11 @@ fn remove_file_if_present(io: &Arc<dyn turso_core::IO>, path: &str) -> Result<()
 /// created before the apply mutates real files; marker removed before backups
 /// during cleanup) is only meaningful once the containing directory is synced.
 ///
-/// The replace-base guard requires real durable storage (memory paths are
-/// rejected in [`ReplaceBaseApplyGuard::create`]), so a direct `std::fs`
-/// directory fsync is appropriate here even though normal file IO flows through
-/// [`turso_core::IO`], which has no directory concept. On platforms without
-/// POSIX directory-fsync semantics this is a no-op.
+/// Durable replace-base guards use a direct `std::fs` directory fsync even
+/// though normal file IO flows through [`turso_core::IO`], which has no
+/// directory concept. Memory-backed guards skip this barrier because their
+/// backups only need to survive an apply failure in the current process. On
+/// platforms without POSIX directory-fsync semantics this is a no-op.
 fn sync_parent_dir(path: &str) -> Result<()> {
     #[cfg(unix)]
     {
@@ -398,11 +398,6 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
         main_db_path: &str,
         previous_synced_revision: Option<DatabasePullRevision>,
     ) -> Result<Self> {
-        if is_memory(main_db_path) {
-            return Err(Error::DatabaseSyncEngineError(
-                "replace-base local replay preservation requires durable local storage".to_string(),
-            ));
-        }
         let is_memory = is_memory(main_db_path);
         let file_specs = [
             (main_db_path.to_string(), "main-db"),
@@ -452,7 +447,9 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
         // the caller begins mutating the real db/wal/log/meta files. Otherwise a
         // crash mid-apply could leave the real files partially replaced with no
         // recoverable marker to roll them back.
-        sync_parent_dir(main_db_path)?;
+        if !is_memory {
+            sync_parent_dir(main_db_path)?;
+        }
         Ok(Self {
             io,
             sync_engine_io,
@@ -539,7 +536,9 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
             &self.io,
             &create_replace_base_marker_path(&self.main_db_path),
         )?;
-        sync_parent_dir(&self.main_db_path)?;
+        if !is_memory(&self.main_db_path) {
+            sync_parent_dir(&self.main_db_path)?;
+        }
         for file in &self.manifest.files {
             remove_file_if_present(&self.io, &file.backup_path)?;
         }
@@ -1764,6 +1763,38 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     "the logical_mvcc_pull override is not supported for replicas synced with the legacy protocol; remove the override to keep using legacy page sync".to_string(),
                 ));
             }
+            (RemotePullProtocol::Pages, None) => {
+                let (next_revision, result, _) =
+                    pull_updates_v1(ctx, &file.value, "", long_poll_timeout, false).await?;
+                stream_kind = match result {
+                    result @ PullUpdatesV1Result::Pages { .. } => {
+                        stream_kind_for_pull_updates_v1_result(&result)
+                    }
+                    PullUpdatesV1Result::Logical { .. } => {
+                        return Err(Error::DatabaseSyncEngineError(
+                            "server returned a logical stream for a page-stream request"
+                                .to_string(),
+                        ));
+                    }
+                };
+                next_revision
+            }
+            (RemotePullProtocol::Pages, Some(DatabasePullRevision::V1 { revision })) => {
+                let (next_revision, result, _) =
+                    pull_updates_v1(ctx, &file.value, revision, long_poll_timeout, false).await?;
+                stream_kind = match result {
+                    result @ PullUpdatesV1Result::Pages { .. } => {
+                        stream_kind_for_pull_updates_v1_result(&result)
+                    }
+                    PullUpdatesV1Result::Logical { .. } => {
+                        return Err(Error::DatabaseSyncEngineError(
+                            "server returned a logical stream for a page-stream request"
+                                .to_string(),
+                        ));
+                    }
+                };
+                next_revision
+            }
             // First server contact of an auto-mode replica whose remote
             // protocol is not yet known (deferred bootstrap). The request is
             // identical on the wire to the page path's no-revision request;
@@ -1794,15 +1825,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     // including its rejection of replace-base streams.
                     (
                         RemotePullProtocol::Pages | RemotePullProtocol::Unknown,
-                        PullUpdatesV1Result::Pages { replace_base },
-                    ) => {
-                        if *replace_base {
-                            return Err(Error::DatabaseSyncEngineError(
-                                "wait_changes_from_remote does not support replace-base page streams yet".to_string(),
-                            ));
-                        }
-                        DbChangesStreamKind::Pages
-                    }
+                        result @ PullUpdatesV1Result::Pages { .. },
+                    ) => stream_kind_for_pull_updates_v1_result(result),
                     // MVCC remote: the page base applies as replace-base so
                     // local (deferred) changes are preserved and replayed.
                     (RemotePullProtocol::MvccLogical, PullUpdatesV1Result::Pages { .. }) => {
@@ -1816,7 +1840,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 };
                 next_revision
             }
-            (RemotePullProtocol::Pages | RemotePullProtocol::Unknown, _) => {
+            (
+                RemotePullProtocol::Pages | RemotePullProtocol::Unknown,
+                Some(DatabasePullRevision::Legacy { .. }),
+            )
+            | (RemotePullProtocol::Unknown, Some(DatabasePullRevision::V1 { .. })) => {
                 wal_pull_to_file(
                     ctx,
                     &file.value,
@@ -3880,6 +3908,56 @@ mod tests {
     }
 
     #[test]
+    fn replace_base_guard_restores_memory_files_after_apply_failure() {
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+        let sync_io = Arc::new(CapturingSyncEngineIo {
+            response: Mutex::new(None),
+            request: Mutex::new(None),
+        });
+        let sync_stats = SyncEngineIoStats::new(sync_io.clone());
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                super::full_write(
+                    &coro,
+                    io.clone(),
+                    sync_io.clone(),
+                    ":memory:",
+                    true,
+                    b"main-old".to_vec(),
+                )
+                .await?;
+                let guard =
+                    ReplaceBaseApplyGuard::create(&coro, io.clone(), sync_stats, ":memory:", None)
+                        .await?;
+                super::full_write(
+                    &coro,
+                    io.clone(),
+                    sync_io.clone(),
+                    ":memory:",
+                    true,
+                    b"main-new".to_vec(),
+                )
+                .await?;
+
+                guard.restore(&coro).await?;
+
+                let restored = super::full_read(&coro, Some(io), sync_io, ":memory:", true).await?;
+                assert_eq!(restored.as_deref(), Some(b"main-old".as_slice()));
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
+    }
+
+    #[test]
     fn replace_base_guard_recovers_pending_marker() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let main_path = temp_dir
@@ -4030,6 +4108,88 @@ mod tests {
         let mut opts = default_test_opts();
         opts.remote_url = Some("https://example.com".to_string());
         opts.logical_mvcc_pull = Some(true);
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let main_db = main_db.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let engine =
+                    DatabaseSyncEngine::open_db(&coro, io, sync_stats, main_db, opts).await?;
+                let status = engine.wait_changes_from_remote(&coro).await?;
+                assert!(status.file_slot.is_none());
+                assert!(matches!(
+                    status.stream_kind,
+                    DbChangesStreamKind::ReplaceBasePages
+                ));
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
+
+        let (_method, path, body) = sync_io.request.lock().unwrap().clone().unwrap();
+        assert_eq!(path, "/pull-updates");
+        let request = PullUpdatesReqProtoBody::decode(body.unwrap().as_slice()).unwrap();
+        assert_eq!(request.stream_kind, PullUpdatesStreamKind::Pages as i32);
+        assert_eq!(request.client_revision, "");
+        assert_eq!(request.server_revision, "");
+    }
+
+    #[test]
+    fn initial_non_logical_v1_pull_preserves_replace_base_apply_mode() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let main_path = temp_file.path().to_str().unwrap().to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let main_db =
+            turso_core::Database::open_file(io.clone(), &main_path, Arc::new(SqliteDialect))
+                .unwrap();
+
+        let meta = DatabaseMetadata {
+            version: DATABASE_METADATA_VERSION.to_string(),
+            client_unique_id: "initial-page-client".to_string(),
+            synced_revision: None,
+            revert_since_wal_salt: None,
+            revert_since_wal_watermark: 0,
+            last_pull_unix_time: None,
+            last_push_unix_time: None,
+            last_pushed_pull_gen_hint: 0,
+            last_pushed_change_id_hint: 0,
+            last_pushed_replay_floor_change_id_hint: 0,
+            partial_bootstrap_server_revision: None,
+            fresh_bootstrap_pending_cdc_ack: false,
+            remote_pull_protocol: RemotePullProtocol::Pages,
+            logical_table_names_by_stable_id: Default::default(),
+            saved_configuration: Some(DatabaseSavedConfiguration {
+                remote_url: Some("https://example.com".to_string()),
+                partial_sync_prefetch: None,
+                partial_sync_segment_size: None,
+            }),
+        };
+        std::fs::write(create_meta_path(&main_path), meta.dump().unwrap()).unwrap();
+
+        let header = PullUpdatesRespProtoBody {
+            protocol: PullUpdatesProtocol::Pages as i32,
+            server_revision: "g1:o10".to_string(),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+            apply_mode: PullUpdatesApplyMode::ReplaceBase as i32,
+            mvcc_log: None,
+        };
+        let sync_io = Arc::new(CapturingSyncEngineIo {
+            response: Mutex::new(Some(header.encode_length_delimited_to_vec())),
+            request: Mutex::new(None),
+        });
+        let sync_stats = SyncEngineIoStats::new(sync_io.clone());
+        let mut opts = default_test_opts();
+        opts.remote_url = Some("https://example.com".to_string());
+        opts.logical_mvcc_pull = Some(false);
 
         let mut gen = genawaiter::sync::Gen::new({
             let io = io.clone();
