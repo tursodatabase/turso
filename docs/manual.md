@@ -1089,14 +1089,17 @@ When **Change Data Capture (CDC)** is enabled for a connection, Turso automatica
   - `1` → INSERT  
   - `0` → UPDATE (also used for ALTER TABLE)  
   - `-1` → DELETE (also covers DROP TABLE, DROP INDEX)  
+  - `2` → COMMIT (marks a transaction boundary; all other data columns are NULL)  
 
 - **`table_name` (TEXT)**  
   Name of the affected table.  
   - For schema changes (DDL), this is always `"sqlite_schema"`.  
+  - NULL for COMMIT records.  
 
 - **`id` (INTEGER)**  
   Rowid of the affected row in the source table.  
   - For DDL operations: rowid of the `sqlite_schema` entry.  
+  - NULL for COMMIT records.  
   - **Note:** `WITHOUT ROWID` tables are not supported in the tursodb and CDC
 
 - **`before` (BLOB)**  
@@ -1112,12 +1115,18 @@ When **Change Data Capture (CDC)** is enabled for a connection, Turso automatica
 - **`updates` (BLOB)**  
   Granular details about the change.  
   - For UPDATE: shows specific column modifications.  
+  - NULL for COMMIT records.  
 
+- **`change_txn_id` (INTEGER)**  
+  Identifier grouping records that belong to the same transaction.  
+  - All records of a transaction, including its COMMIT record, share the same value (the `change_id` of the first record in the transaction).  
+
+Every transaction ends with a COMMIT record (`change_type = 2`). Statements executed outside an explicit transaction commit individually, so each one produces its own COMMIT record. Inside a `BEGIN ... COMMIT` block, a single COMMIT record is written when the transaction commits. Because a COMMIT record has NULL in all data columns, it appears as a mostly empty row when you select from the CDC table.
 
 > CDC records are visible even before a transaction commits. 
 > Operations that fail (e.g., constraint violations) are not recorded in CDC.
 
-> Changes to the CDC table itself are also logged to CDC table. if CDC is enabled for that connection.
+> Changes to the CDC table itself are never captured, even if CDC is enabled for that connection.
 
 ```zsh
 Example:
@@ -1134,23 +1143,33 @@ UPDATE users SET name='John Doe' WHERE id=1;
 
 DELETE FROM users WHERE id=2;
 
-SELECT * FROM turso_cdc;
-┌───────────┬─────────────┬─────────────┬───────────────┬────┬──────────┬──────────────────────────────────────────────────────────────────────────────┬───────────────┐
-│ change_id │ change_time │ change_type │ table_name    │ id │ before   │ after                                                                        │ updates       │
-├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
-│         1 │  1756713161 │           1 │ sqlite_schema │  2 │          │ ytableusersusersCREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT) │               │
-├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
-│         2 │  1756713176 │           1 │ users         │  1 │          │       John                                                                      │               │
-├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
-│         3 │  1756713176 │           1 │ users         │  2 │          │ Jane                                                                     │               │
-├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
-│         4 │  1756713176 │           0 │ users         │  1 │  John  │         John Doe                                                                  │     John Doe │
-├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
-│         5 │  1756713176 │          -1 │ users         │  2 │ Jane │                                                                              │               │
-└───────────┴─────────────┴─────────────┴───────────────┴────┴──────────┴──────────────────────────────────────────────────────────────────────────────┴───────────────┘
+SELECT change_id, change_time, change_type, table_name, id, change_txn_id FROM turso_cdc;
+┌───────────┬─────────────┬─────────────┬───────────────┬────┬───────────────┐
+│ change_id │ change_time │ change_type │ table_name    │ id │ change_txn_id │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         1 │  1783939853 │           1 │ sqlite_schema │  5 │             1 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         2 │  1783939853 │           2 │               │    │             1 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         3 │  1783939853 │           1 │ users         │  1 │             3 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         4 │  1783939853 │           1 │ users         │  2 │             3 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         5 │  1783939853 │           2 │               │    │             3 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         6 │  1783939853 │           0 │ users         │  1 │             6 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         7 │  1783939853 │           2 │               │    │             6 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         8 │  1783939853 │          -1 │ users         │  2 │             8 │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼───────────────┤
+│         9 │  1783939853 │           2 │               │    │             8 │
+└───────────┴─────────────┴─────────────┴───────────────┴────┴───────────────┘
 turso>
 
 ```
+
+Each statement above runs in autocommit mode, so each one forms its own transaction and is followed by a COMMIT record (`change_type = 2`) with NULL data columns. The two-row `INSERT` is a single statement, so both row records and the COMMIT record share `change_txn_id = 3`.
 
 If you modify your table schema (adding/dropping columns), the `table_columns_json_array()` function returns the current schema, not the historical one. This can lead to incorrect results when decoding older CDC records. Manually track schema versions by storing the output of `table_columns_json_array()` before making schema changes.
 
