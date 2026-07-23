@@ -670,7 +670,9 @@ impl Drop for Buffer {
         match self {
             Self::Heap(buf) | Self::HeapView { data: buf, .. } => {
                 let underlying_len = buf.len();
-                TEMP_BUFFER_CACHE.with(|cache| {
+                // Another TLS value may drop a Buffer after this cache is destroyed.
+                // Avoid panicking from a TLS destructor, which would abort the process.
+                let _ = TEMP_BUFFER_CACHE.try_with(|cache| {
                     let mut cache = cache.borrow_mut();
                     // take ownership of the buffer by swapping it with a dummy
                     let buffer = std::mem::replace(buf, Pin::new(vec![].into_boxed_slice()));
@@ -809,6 +811,24 @@ crate::thread::thread_local! {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+
+    std::thread_local! {
+        static BUFFER_DROPPED_DURING_THREAD_EXIT: RefCell<Option<Buffer>> =
+            const { RefCell::new(None) };
+    }
+
+    #[test]
+    fn heap_buffer_drop_tolerates_thread_local_teardown_order() {
+        std::thread::spawn(|| {
+            // Initialize the owning TLS before the buffer cache. Thread teardown
+            // can then destroy the cache before dropping the buffer it owns.
+            BUFFER_DROPPED_DURING_THREAD_EXIT.with(|slot| {
+                slot.replace(Some(Buffer::new_temporary(4_096)));
+            });
+        })
+        .join()
+        .expect("buffer drop must not panic during thread-local teardown");
+    }
 
     fn shared_bytes(bytes: &[u8]) -> Arc<DynBoxedSlice<u8>> {
         let mut data =
