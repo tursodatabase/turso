@@ -1088,12 +1088,16 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     content_size
                 ))
             })?;
-            // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-            let val = unsafe { std::str::from_utf8_unchecked(data) };
-            Ok((
-                ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
-                content_size,
-            ))
+            match simdutf8::basic::from_utf8(data) {
+                Ok(val) => Ok((
+                    ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
+                    content_size,
+                )),
+                Err(_) => {
+                    mark_unlikely();
+                    Ok((ValueRef::Blob(data), content_size))
+                }
+            }
         }
     }
 }
@@ -1216,12 +1220,16 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-                let val = unsafe { std::str::from_utf8_unchecked(data) };
-                Ok((
-                    ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
-                    content_size,
-                ))
+                match simdutf8::basic::from_utf8(data) {
+                    Ok(val) => Ok((
+                        ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
+                        content_size,
+                    )),
+                    Err(_) => {
+                        mark_unlikely();
+                        Ok((ValueRef::Blob(data), content_size))
+                    }
+                }
             }
             _ => unreachable!(),
         },
