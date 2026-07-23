@@ -1419,7 +1419,11 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
     } else if text.starts_with("-0x") || text.starts_with("-0X") {
         let value = u64::from_str_radix(&text[3..], 16)? as i64;
         if value == i64::MIN {
-            return Err(LimboError::IntegerOverflow);
+            // Negating i64::MIN overflows. SQLite's codeInteger rejects this at
+            // prepare time with "hex literal too big"; do the same.
+            return Err(LimboError::ParseError(format!(
+                "hex literal too big: {text}"
+            )));
         }
         return Ok(Value::from_i64(-value));
     }
@@ -6394,8 +6398,11 @@ pub mod tests {
             parse_numeric_literal("-0x1234").unwrap(),
             Value::from_i64(-4660)
         );
-        // too big hex
-        assert!(parse_numeric_literal("-0x8000000000000000").is_err());
+        // too big hex: matches SQLite's prepare-time error
+        assert!(parse_numeric_literal("-0x8000000000000000")
+            .unwrap_err()
+            .to_string()
+            .contains("hex literal too big: -0x8000000000000000"));
     }
 
     #[test]
