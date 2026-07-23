@@ -19502,7 +19502,6 @@ fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointe
 /// the positive rootpage must not clobber a concurrent DROP's end stamp on that
 /// schema version (which would resurrect the table).
 #[test]
-#[ignore = "known bug: passive checkpoint stale schema publication resurrects DROP"]
 fn test_passive_checkpoint_preserves_drop_committed_after_collection() {
     use crate::StepResult;
 

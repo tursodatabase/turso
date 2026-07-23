@@ -252,6 +252,10 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     owns_checkpoint_in_progress: bool,
     /// Roots allocated this checkpoint; published with `visible_from = durable_txid_max_new`.
     staged_roots: Vec<MVTableId>,
+    /// Positive roots materialized this pass whose schema version was already ended
+    /// (e.g. DROP after our snapshot). Tracked in `dropped_root_pages` until a later
+    /// checkpoint frees the btree.
+    ended_created_roots: HashSet<i64>,
 }
 
 /// One pending compaction job in the per-checkpoint sequence sweep.
@@ -828,6 +832,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             local_schema: None,
             owns_checkpoint_in_progress: false,
             staged_roots: crate::alloc::vec![],
+            ended_created_roots: HashSet::default(),
         }
     }
 
@@ -1515,19 +1520,31 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 .get(&key)
                 .expect("sqlite_schema row not found");
             let mut row_versions = sqlite_schema_row.value().write();
-            // Replace in place (same version id), don't append: a duplicate (id, begin, end)
-            // would leave a phantom current version after a later DELETE (which ends only the
-            // first match), causing spurious write-write conflicts at commit time.
+            // Patch payload in place (same version id), don't append: a duplicate
+            // (id, begin, end) would leave a phantom current version after a later
+            // DELETE (which ends only the first match), causing spurious write-write
+            // conflicts at commit time.
+            //
+            // Only replace the row payload (positive rootpage). Preserve begin/end so a
+            // DROP that committed after our snapshot keeps its end stamp — wholesale
+            // replace of the collected clone would resurrect the table (#7956).
             let vid = row_version.id;
             if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
-                *existing = row_version;
+                existing.row.data = row_version.row.data;
+                if existing.end().is_some() {
+                    if let Some(identity) = sqlite_schema_btree_identity(existing) {
+                        if identity.root_page > 0 {
+                            self.ended_created_roots.insert(identity.root_page);
+                        }
+                    }
+                }
             } else {
                 self.mvstore
                     .insert_version_raw(&mut row_versions, row_version)?;
             }
         }
 
-        if !self.has_unpublished_schema_changes() {
+        if !self.has_unpublished_schema_changes() && self.ended_created_roots.is_empty() {
             return Ok(());
         }
 
@@ -1587,7 +1604,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
         // Clear dropped root pages now that the pager commit contains the btree frees.
         // integrity_check should now follow the committed freelist state instead.
+        // Re-insert roots we materialized whose schema versions were already ended — those
+        // btrees are still allocated and must stay accounted for until a later destroy.
+        let ended_created_roots = std::mem::take(&mut self.ended_created_roots);
         schema.dropped_root_pages.clear();
+        schema.dropped_root_pages.extend(ended_created_roots);
         drop(schema_ref);
         *self.connection.schema.write() = self.connection.db.clone_schema();
         self.connection.bump_prepare_context_generation();
