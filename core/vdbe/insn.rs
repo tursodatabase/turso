@@ -1995,13 +1995,6 @@ const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
 const INSN_VTABLE: [InsnFunction; InsnVariants::COUNT] = get_insn_virtual_table();
 
 impl InsnVariants {
-    // This function is used for testing
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub(crate) const fn to_function_fast(self) -> InsnFunction {
-        INSN_VTABLE[self as usize]
-    }
-
     // This function is used for generating `INSN_VTABLE`.
     // We need to keep this function to make sure we implement all opcodes
     pub(crate) const fn to_function(self) -> InsnFunction {
@@ -2223,8 +2216,6 @@ impl Insn {
 
     #[inline(always)]
     pub const fn to_function(&self) -> InsnFunction {
-        // dont use this because its still using match
-        // InsnVariants::from(self).to_function_fast()
         INSN_VTABLE[self.discriminant() as usize]
     }
 
@@ -2306,22 +2297,4 @@ pub enum Cookie {
     IncrementalVacuum = 7,
     /// The application ID as set by the application_id pragma.
     ApplicationId = 8,
-}
-
-#[cfg(test)]
-mod tests {
-    use strum::VariantArray;
-
-    #[test]
-    fn test_make_sure_correct_insn_table() {
-        for variant in super::InsnVariants::VARIANTS {
-            let func1 = variant.to_function();
-            let func2 = variant.to_function_fast();
-            assert_eq!(
-                func1 as usize, func2 as usize,
-                "Variant {:?} does not match in fast table at index {}",
-                variant, *variant as usize
-            );
-        }
-    }
 }

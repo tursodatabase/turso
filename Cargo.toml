@@ -166,6 +166,12 @@ either = { version = "1.15" }
 loom = { version = "0.7" }
 shuttle = { version = "0.8.1" }
 
+# O0 does no stack slot reuse, which makes stack usage in debug builds
+# excessive enough to overflow on deeply nested queries. O1 keeps debug
+# assertions and debuginfo while reusing stack slots.
+[profile.dev]
+opt-level = 1
+
 [profile.dev.package.similar]
 opt-level = 3
 
