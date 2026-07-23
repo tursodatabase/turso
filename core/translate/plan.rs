@@ -356,6 +356,18 @@ impl SubqueryOrigin {
     }
 }
 
+/// One ORDER BY key of a compound SELECT:
+/// `(result_column_index, sort_order, nulls_order, explicit_collation)`.
+/// The column index is 0-based into the result set. The explicit collation is
+/// set when the term carries a COLLATE override and otherwise the referenced
+/// column's own collation is used.
+pub(crate) type CompoundOrderByKey = (
+    usize,
+    SortOrder,
+    Option<ast::NullsOrder>,
+    Option<CollationSeq>,
+);
+
 /// A query plan is either a SELECT or a DELETE (for now)
 /// Variants are boxed so that moving a `Plan` around the prepare path
 /// (returns from plan builders, argument to emitters) costs a pointer
@@ -369,9 +381,8 @@ pub enum Plan {
         right_most: Box<SelectPlan>,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
-        /// ORDER BY for compound selects. Each entry is (result_column_index, sort_order, nulls_order).
-        /// The column index is 0-based into the result set.
-        order_by: Option<Vec<(usize, SortOrder, Option<ast::NullsOrder>)>>,
+        /// ORDER BY for compound selects, or `None` when the query has none.
+        order_by: Option<Vec<CompoundOrderByKey>>,
     },
     Delete(Box<DeletePlan>),
     Update(Box<UpdatePlan>),

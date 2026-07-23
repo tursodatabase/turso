@@ -222,7 +222,7 @@ impl Display for Plan {
                 }
                 if let Some(order_by) = order_by {
                     writeln!(f, "ORDER BY:")?;
-                    for (expr, dir, nulls) in order_by {
+                    for (expr, dir, nulls, _) in order_by {
                         fmt_order_by_item(f, expr, *dir, *nulls)?;
                     }
                 }
@@ -671,7 +671,7 @@ impl ToTokens for Plan {
                     s.comma(
                         order_by
                             .iter()
-                            .map(|(col_idx, order, nulls)| ast::SortedColumn {
+                            .map(|(col_idx, order, nulls, _)| ast::SortedColumn {
                                 expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
                                     (col_idx + 1).to_string(),
                                 ))),
