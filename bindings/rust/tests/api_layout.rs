@@ -31,6 +31,26 @@ fn root_exports_match_module_definitions() {
     let _ = takes_connection;
 }
 
+/// Pins the value API surface shared with the serverless driver: borrowed
+/// access through ValueRef, type inspection through ValueType, and the
+/// blob conversions.
+#[test]
+fn value_ref_surface() {
+    use turso::value::{Value, ValueRef, ValueType};
+
+    let owned = Value::Text("hi".to_string());
+    let vr = ValueRef::from(&owned);
+    assert!(matches!(vr.data_type(), ValueType::Text));
+    assert_eq!(vr.as_text(), Some("hi".as_bytes()));
+    assert_eq!(Value::from(vr), owned);
+
+    let _: Value = [1u8, 2].into();
+    let vr: ValueRef<'_> = (&[1u8, 2][..]).into();
+    assert!(vr.is_blob());
+    let vr: ValueRef<'_> = Option::<&str>::None.into();
+    assert!(vr.is_null());
+}
+
 /// Pins the pragma_query callback signature: fallible with the crate's own
 /// public Error, so callbacks can use `?` and stop iteration early, and the
 /// same callback works against the serverless driver.

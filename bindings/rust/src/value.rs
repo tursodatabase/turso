@@ -224,6 +224,12 @@ impl From<&[u8]> for Value {
     }
 }
 
+impl<const N: usize> From<[u8; N]> for Value {
+    fn from(value: [u8; N]) -> Value {
+        Value::Blob(value.to_vec())
+    }
+}
+
 impl From<Vec<u8>> for Value {
     fn from(value: Vec<u8>) -> Value {
         Value::Blob(value)

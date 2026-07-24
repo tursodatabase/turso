@@ -31,6 +31,30 @@ fn root_exports_match_module_definitions() {
     let _ = takes_value;
     fn takes_connection(_: turso_serverless::connection::Connection) {}
     let _ = takes_connection;
+
+    let _ = turso_serverless::value::ValueType::Null;
+    fn takes_value_ref(_: turso_serverless::value::ValueRef<'_>) {}
+    let _ = takes_value_ref;
+}
+
+/// Pins the value API surface shared with the embedded driver: borrowed
+/// access through ValueRef, type inspection through ValueType, and the
+/// blob conversions.
+#[test]
+fn value_ref_surface() {
+    use turso_serverless::value::{Value, ValueRef, ValueType};
+
+    let owned = Value::Text("hi".to_string());
+    let vr = ValueRef::from(&owned);
+    assert!(matches!(vr.data_type(), ValueType::Text));
+    assert_eq!(vr.as_text(), Some("hi".as_bytes()));
+    assert_eq!(Value::from(vr), owned);
+
+    let _: Value = [1u8, 2].into();
+    let vr: ValueRef<'_> = (&[1u8, 2][..]).into();
+    assert!(vr.is_blob());
+    let vr: ValueRef<'_> = Option::<&str>::None.into();
+    assert!(vr.is_null());
 }
 
 /// Pins the transaction API surface shared with the embedded driver:
