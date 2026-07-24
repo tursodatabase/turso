@@ -372,33 +372,20 @@ fn emit_loop_source<'a>(
                 .iter()
                 .filter(|rc| rc.contains_aggregates)
             {
-                walk_expr(&rc.expr, &mut |expr: &Expr| -> Result<WalkControl> {
-                    match expr {
-                        Expr::Column { .. } | Expr::RowId { .. } => {
-                            let reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                Some(&plan.table_references),
-                                expr,
-                                reg,
-                                &t_ctx.resolver,
-                            )?;
-                            t_ctx.resolver.cache_scalar_expr_reg(
-                                Cow::Owned(expr.clone()),
-                                reg,
-                                false,
-                                &plan.table_references,
-                            )?;
-                            Ok(WalkControl::SkipChildren)
-                        }
-                        _ => {
-                            if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
-                                return Ok(WalkControl::SkipChildren);
-                            }
-                            Ok(WalkControl::Continue)
-                        }
-                    }
-                })?;
+                cache_nonagg_column_refs_for_post_loop_eval(program, t_ctx, plan, &rc.expr)?;
+            }
+
+            // HAVING without GROUP BY filters the single implicit group after
+            // the main loop has finished, so any bare (non-aggregated) column
+            // references in the HAVING predicates would otherwise be read from
+            // the exhausted cursor and yield NULL. Pre-read them here while
+            // the cursor is still on a valid row (the first row, matching
+            // SQLite's arbitrary-row semantics) and cache the registers so the
+            // post-loop HAVING translation uses them instead.
+            if let Some(group_by) = plan.group_by.as_ref().filter(|gb| gb.exprs.is_empty()) {
+                for expr in group_by.having.iter().flatten() {
+                    cache_nonagg_column_refs_for_post_loop_eval(program, t_ctx, plan, expr)?;
+                }
             }
 
             if let Some(label) = label_emit_nonagg_only_once {
@@ -516,5 +503,48 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
     } else {
         emit_loop(program, t_ctx, plan)?;
     }
+    Ok(())
+}
+
+/// Pre-read bare column references in `expr` while a cursor is still positioned
+/// on a valid row, caching the resulting registers in the resolver's
+/// expression-to-register cache. This is used for expressions that are
+/// evaluated after the main loop of an ungrouped aggregation has finished
+/// (result columns containing aggregates, HAVING without GROUP BY), where the
+/// cursor is exhausted and a direct Column read would yield NULL.
+fn cache_nonagg_column_refs_for_post_loop_eval<'a>(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx<'a>,
+    plan: &'a SelectPlan,
+    expr: &Expr,
+) -> Result<()> {
+    walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        match expr {
+            Expr::Column { .. } | Expr::RowId { .. } => {
+                let reg = program.alloc_register();
+                translate_expr(
+                    program,
+                    Some(&plan.table_references),
+                    expr,
+                    reg,
+                    &t_ctx.resolver,
+                )?;
+                t_ctx.resolver.cache_scalar_expr_reg(
+                    Cow::Owned(expr.clone()),
+                    reg,
+                    false,
+                    &plan.table_references,
+                )?;
+                t_ctx.post_loop_nonagg_regs.push(reg);
+                Ok(WalkControl::SkipChildren)
+            }
+            _ => {
+                if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
+                    return Ok(WalkControl::SkipChildren);
+                }
+                Ok(WalkControl::Continue)
+            }
+        }
+    })?;
     Ok(())
 }

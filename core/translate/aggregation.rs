@@ -55,6 +55,29 @@ pub fn emit_ungrouped_aggregation<'a>(
     // Allocate a label for the end (used by both HAVING and OFFSET to skip row emission)
     let end_label = program.allocate_label();
 
+    // The bare column values pre-read during the main loop are only written on
+    // the first loop iteration. If the loop never ran (once-flag still 0), they
+    // must be set to NULL before HAVING or the result columns read them:
+    // a re-invoked subquery would otherwise observe stale values from a
+    // previous invocation.
+    if !t_ctx.post_loop_nonagg_regs.is_empty() {
+        if let Some(once_flag) = t_ctx.reg_nonagg_emit_once_flag {
+            let skip_null_label = program.allocate_label();
+            program.emit_insn(Insn::If {
+                reg: once_flag,
+                target_pc: skip_null_label,
+                jump_if_null: false,
+            });
+            for reg in t_ctx.post_loop_nonagg_regs.iter().copied() {
+                program.emit_insn(Insn::Null {
+                    dest: reg,
+                    dest_end: None,
+                });
+            }
+            program.preassign_label_to_next_insn(skip_null_label);
+        }
+    }
+
     // Handle HAVING clause without GROUP BY for ungrouped aggregation
     if let Some(group_by) = &plan.group_by {
         if group_by.exprs.is_empty() {
