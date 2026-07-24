@@ -232,3 +232,55 @@ pub(super) fn open_ephemeral_delta(
         requires_positive_first,
     }
 }
+
+pub(super) fn emit_operator_rowid_delta(
+    program: &mut ProgramBuilder,
+    output: &EphemeralDelta,
+    identity_reg: usize,
+    values_start: usize,
+    weight_reg: usize,
+) {
+    turso_assert!(
+        output.identity == DeltaIdentity::OperatorRowid
+            && output.value_start == 1
+            && output.binding_rowid_columns.iter().all(Option::is_none),
+        "arranged operator output streams carry one stable state rowid"
+    );
+    let record_start = program.alloc_registers(output.record_width());
+    program.emit_insn(Insn::Copy {
+        src_reg: identity_reg,
+        dst_reg: record_start,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: values_start,
+        dst_reg: record_start + 1,
+        extra_amount: output.width.saturating_sub(1),
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: weight_reg,
+        dst_reg: record_start + 1 + output.width,
+        extra_amount: 0,
+    });
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: record_start as u16,
+        count: output.record_width() as u16,
+        dest_reg: record_reg as u16,
+        index_name: None,
+        affinity_str: None,
+    });
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: output.cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: output.cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        table_name: String::new(),
+    });
+}
