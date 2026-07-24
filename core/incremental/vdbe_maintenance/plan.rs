@@ -31,10 +31,25 @@ fn unsupported<T>(what: &str) -> Result<T> {
     )))
 }
 
-/// Reject subqueries, bound parameters, and (unless the expression IS a
-/// supported aggregate handled by the caller) aggregate function calls.
-fn check_scalar_expr(expr: &ast::Expr) -> Result<()> {
+/// Validate an expression against the values and rowids published by one
+/// operator edge.
+///
+/// Downstream expression compilation seeds exactly these expressions into
+/// the translator's register cache. Validating the same contract here keeps
+/// composition independent of the upstream operator kind: an aggregate
+/// result remains usable through any number of linear operators, while a
+/// source value that was not published cannot leak across the boundary.
+fn validate_stream_expr(
+    expr: &ast::Expr,
+    input: &NodeOutputContract,
+    unavailable_value: &str,
+) -> Result<()> {
     walk_expr_with_subqueries(expr, &mut |e: &ast::Expr| {
+        let published_value = input.schema.columns.iter().any(|column| {
+            column
+                .as_ref()
+                .is_some_and(|published| crate::util::exprs_are_equivalent(published, e))
+        });
         match e {
             ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
                 return Err(LimboError::ParseError(
@@ -46,6 +61,9 @@ fn check_scalar_expr(expr: &ast::Expr) -> Result<()> {
                     Func::resolve_function(name.as_str(), args.len()),
                     Ok(Some(Func::Agg(_)))
                 ) {
+                    if published_value {
+                        return Ok(WalkControl::SkipChildren);
+                    }
                     return unsupported("expressions over aggregate results");
                 }
             }
@@ -54,6 +72,9 @@ fn check_scalar_expr(expr: &ast::Expr) -> Result<()> {
                     Func::resolve_function(name.as_str(), 0),
                     Ok(Some(Func::Agg(_)))
                 ) {
+                    if published_value {
+                        return Ok(WalkControl::SkipChildren);
+                    }
                     return unsupported("expressions over aggregate results");
                 }
             }
@@ -62,6 +83,31 @@ fn check_scalar_expr(expr: &ast::Expr) -> Result<()> {
                     "materialized views with bound parameters are not supported".to_string(),
                 ));
             }
+            ast::Expr::Id(_) | ast::Expr::Qualified(_, _) | ast::Expr::DoublyQualified(_, _, _) => {
+                return Err(LimboError::InternalError(
+                    "maintenance expression contains an unresolved identifier".to_string(),
+                ));
+            }
+            ast::Expr::Column { .. } => {
+                if !published_value {
+                    return unsupported(unavailable_value);
+                }
+                return Ok(WalkControl::SkipChildren);
+            }
+            ast::Expr::RowId { table, .. } => {
+                let available = published_value
+                    || input
+                        .schema
+                        .bindings
+                        .iter()
+                        .zip(input.binding_rowids.iter())
+                        .any(|(binding, available)| binding.logical_id == *table && *available);
+                if !available {
+                    return unsupported("rowids not published by their input stream");
+                }
+                return Ok(WalkControl::SkipChildren);
+            }
+            _ if published_value => return Ok(WalkControl::SkipChildren),
             _ => {}
         }
         Ok(WalkControl::Continue)
@@ -92,52 +138,7 @@ fn validate_supported_aggregate(agg: &Aggregate) -> Result<()> {
     if agg.args.len() > 1 {
         return unsupported("multi-argument aggregates");
     }
-    for arg in &agg.args {
-        check_scalar_expr(arg)?;
-    }
     Ok(())
-}
-
-/// Validate that a HAVING expression evaluates only group expressions and
-/// aggregate results.
-///
-/// The aggregates themselves were already collected into `aggregates` by the
-/// planner's collector; this walk rejects what remains outside them: bare
-/// column references (SQLite's arbitrary-row semantics cannot be maintained
-/// incrementally), subqueries, and bound parameters.
-fn check_group_row_expr(
-    expr: &ast::Expr,
-    group_exprs: &[ast::Expr],
-    aggregates: &[Aggregate],
-    bare_column_error: &str,
-) -> Result<()> {
-    walk_expr_with_subqueries(expr, &mut |e: &ast::Expr| {
-        if group_exprs
-            .iter()
-            .any(|g| crate::util::exprs_are_equivalent(g, e))
-            || aggregates
-                .iter()
-                .any(|a| crate::util::exprs_are_equivalent(&a.original_expr, e))
-        {
-            return Ok(WalkControl::SkipChildren);
-        }
-        match e {
-            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
-                Err(LimboError::ParseError(
-                    "materialized views with subqueries are not yet supported".to_string(),
-                ))
-            }
-            ast::Expr::Variable(_) => Err(LimboError::ParseError(
-                "materialized views with bound parameters are not supported".to_string(),
-            )),
-            ast::Expr::Id(_)
-            | ast::Expr::Qualified(_, _)
-            | ast::Expr::DoublyQualified(_, _, _)
-            | ast::Expr::Column { .. }
-            | ast::Expr::RowId { .. } => unsupported(bare_column_error),
-            _ => Ok(WalkControl::Continue),
-        }
-    })
 }
 
 /// Lower the main query planner's bound relational plan into the maintenance
@@ -453,8 +454,8 @@ fn build_select_plan_dag(
     let projections = plan
         .result_columns
         .iter()
-        .map(|column| Ok((column.expr.clone(), column.alias.clone())))
-        .collect::<Result<Vec<_>>>()?;
+        .map(|column| column.expr.clone())
+        .collect();
     builder.push(dag::OpNode::Project {
         input: node,
         projections,
@@ -730,287 +731,59 @@ fn validate_planned_node(
     resolver: &Resolver,
 ) -> Result<()> {
     let node = &dag.nodes[node_id];
-    validate_output_schema(dag, node_id)?;
-    if let dag::OpNode::Scan { table, .. } = node {
-        if !table.has_rowid {
-            return unsupported("WITHOUT ROWID base tables");
-        }
-        if table.has_virtual_columns {
-            return unsupported("base tables with virtual generated columns");
-        }
-    }
-    let check_expr = |expr: &ast::Expr| -> Result<()> {
-        if expr_contains_nondeterministic_scalar_function(expr, resolver)? {
-            return unsupported("non-deterministic expressions");
-        }
-        Ok(())
-    };
+    let check_expr =
+        |expr: &ast::Expr, input: dag::NodeId, unavailable_value: &str| -> Result<()> {
+            if expr_contains_nondeterministic_scalar_function(expr, resolver)? {
+                return unsupported("non-deterministic expressions");
+            }
+            validate_stream_expr(
+                expr,
+                &operator_states.for_node(input)?.output,
+                unavailable_value,
+            )
+        };
     match node {
-        dag::OpNode::Filter { predicate, .. } => check_expr(predicate)?,
-        dag::OpNode::Project { projections, .. } => {
-            for (expr, _) in projections {
-                check_expr(expr)?;
+        dag::OpNode::Scan { table, .. } => {
+            if !table.has_rowid {
+                return unsupported("WITHOUT ROWID base tables");
+            }
+            if table.has_virtual_columns {
+                return unsupported("base tables with virtual generated columns");
             }
         }
-        dag::OpNode::Join { on, .. } => {
-            for expr in on {
-                check_expr(expr)?;
-            }
-        }
-        dag::OpNode::Aggregate {
-            group_exprs,
-            aggregates,
-            ..
-        } => {
-            for expr in group_exprs {
-                check_expr(expr)?;
-            }
-            for aggregate in aggregates {
-                for expr in &aggregate.args {
-                    check_expr(expr)?;
-                }
-                if let Some(expr) = &aggregate.filter_expr {
-                    check_expr(expr)?;
-                }
-            }
-        }
-        dag::OpNode::Scan { .. } | dag::OpNode::Alias { .. } | dag::OpNode::SetOp { .. } => {}
-    }
-    validate_composable_delta_node(dag, node_id, operator_states)
-}
-
-fn validate_terminal_delta_identity(
-    operator_states: &OperatorStateCatalog,
-    node_id: dag::NodeId,
-) -> Result<()> {
-    match operator_states.for_node(node_id)?.output.published_identity {
-        DeltaIdentity::BindingRowids(1) | DeltaIdentity::OperatorRowid => Ok(()),
-        DeltaIdentity::BindingRowids(_) | DeltaIdentity::OperatorKey(_) => unsupported(
-            "a root delta with composite identity without an explicit materialized sink",
-        ),
-    }
-}
-
-fn validate_output_schema(dag: &dag::MaintenanceDag, node_id: dag::NodeId) -> Result<()> {
-    let node = &dag.nodes[node_id];
-    let schema = dag.output_schema(node_id);
-    let valid = match node {
-        dag::OpNode::Scan {
-            table,
-            identifier,
-            logical_id,
-        } => {
-            schema.len() == table.columns().len()
-                && schema.bindings.len() == 1
-                && schema.bindings[0].table.root_page == table.root_page
-                && schema.bindings[0].identifier == *identifier
-                && schema.bindings[0].logical_id == *logical_id
-                && schema.columns.iter().enumerate().zip(table.columns()).all(
-                    |((column_index, stream), column)| {
-                        stream.name == column.name
-                            && match (&stream.expr, &column.name) {
-                                (
-                                    Some(ast::Expr::Column {
-                                        table: expr_table,
-                                        column: expr_column,
-                                        is_rowid_alias,
-                                        ..
-                                    }),
-                                    Some(_),
-                                ) => {
-                                    *expr_table == *logical_id
-                                        && *expr_column == column_index
-                                        && *is_rowid_alias == column.is_rowid_alias()
-                                }
-                                (None, None) => true,
-                                _ => false,
-                            }
-                    },
-                )
-        }
-        dag::OpNode::Filter { input, .. } => {
-            schema.columns.len() == dag.output_schema(*input).columns.len()
-                && stream_bindings_match(schema, dag.output_schema(*input))
-                && schema
-                    .columns
-                    .iter()
-                    .zip(&dag.output_schema(*input).columns)
-                    .all(|(left, right)| {
-                        left.name == right.name
-                            && match (&left.expr, &right.expr) {
-                                (Some(left), Some(right)) => {
-                                    crate::util::exprs_are_equivalent(left, right)
-                                }
-                                (None, None) => true,
-                                _ => false,
-                            }
-                    })
-        }
+        dag::OpNode::Filter { input, predicate } => check_expr(
+            predicate,
+            *input,
+            "HAVING referencing columns outside GROUP BY",
+        )?,
         dag::OpNode::Project { input, projections } => {
-            schema.len() == projections.len()
-                && stream_bindings_match(schema, dag.output_schema(*input))
-                && schema
-                    .columns
-                    .iter()
-                    .zip(projections)
-                    .all(|(stream, (expr, name))| {
-                        stream.name == *name
-                            && stream.expr.as_ref().is_some_and(|stream_expr| {
-                                crate::util::exprs_are_equivalent(stream_expr, expr)
-                            })
-                    })
-        }
-        dag::OpNode::Alias {
-            input,
-            table,
-            identifier,
-            logical_id,
-        } => {
-            schema.len() == dag.output_schema(*input).len()
-                && schema.len() == table.columns().len()
-                && schema.bindings.len() == 1
-                && Arc::ptr_eq(&schema.bindings[0].table, table)
-                && schema.bindings[0].identifier == *identifier
-                && schema.bindings[0].logical_id == *logical_id
-                && schema.columns.iter().enumerate().zip(table.columns()).all(
-                    |((column_index, stream), column)| {
-                        stream.name == column.name
-                            && match (&stream.expr, &column.name) {
-                                (
-                                    Some(ast::Expr::Column {
-                                        table: expr_table,
-                                        column: expr_column,
-                                        is_rowid_alias,
-                                        ..
-                                    }),
-                                    Some(_),
-                                ) => {
-                                    *expr_table == *logical_id
-                                        && *expr_column == column_index
-                                        && *is_rowid_alias == column.is_rowid_alias()
-                                }
-                                (None, None) => true,
-                                _ => false,
-                            }
-                    },
-                )
-        }
-        dag::OpNode::Join { inputs, .. } => {
-            schema.len()
-                == inputs
-                    .iter()
-                    .map(|input| dag.output_schema(*input).len())
-                    .sum::<usize>()
-                && schema.bindings.len()
-                    == inputs
-                        .iter()
-                        .map(|input| dag.output_schema(*input).bindings.len())
-                        .sum::<usize>()
-        }
-        dag::OpNode::Aggregate {
-            input,
-            group_exprs,
-            aggregates,
-            ..
-        } => {
-            schema.len() == group_exprs.len() + aggregates.len()
-                && stream_bindings_match(schema, dag.output_schema(*input))
-        }
-        dag::OpNode::SetOp { arity, .. } => schema.len() == *arity,
-    };
-    if !valid {
-        return Err(LimboError::InternalError(format!(
-            "maintenance DAG node {node_id} has an inconsistent output schema"
-        )));
-    }
-    Ok(())
-}
-
-fn stream_bindings_match(left: &dag::StreamSchema, right: &dag::StreamSchema) -> bool {
-    left.bindings.len() == right.bindings.len()
-        && left
-            .bindings
-            .iter()
-            .zip(&right.bindings)
-            .all(|(left, right)| {
-                left.table.root_page == right.table.root_page
-                    && left.identifier == right.identifier
-                    && left.logical_id == right.logical_id
-            })
-}
-
-fn validate_composable_delta_node(
-    dag: &dag::MaintenanceDag,
-    node_id: dag::NodeId,
-    operator_states: &OperatorStateCatalog,
-) -> Result<()> {
-    match &dag.nodes[node_id] {
-        dag::OpNode::Scan { .. } => Ok(()),
-        dag::OpNode::Filter { input, predicate } => {
-            if let dag::OpNode::Aggregate {
-                group_exprs,
-                aggregates,
-                ..
-            } = &dag.nodes[*input]
-            {
-                check_group_row_expr(
-                    predicate,
-                    group_exprs,
-                    aggregates,
-                    "HAVING referencing columns outside GROUP BY",
-                )?;
-            } else {
-                check_scalar_expr(predicate)?;
+            for expr in projections {
+                check_expr(expr, *input, "non-aggregate result columns not in GROUP BY")?;
             }
-            Ok(())
         }
-        dag::OpNode::Project { input, projections } => {
-            let (aggregate, output_filter) = match &dag.nodes[*input] {
-                dag::OpNode::Aggregate { .. } => (Some(*input), None),
-                dag::OpNode::Filter {
-                    input: aggregate,
-                    predicate,
-                } if matches!(dag.nodes[*aggregate], dag::OpNode::Aggregate { .. }) => {
-                    (Some(*aggregate), Some(predicate))
-                }
-                _ => (None, None),
-            };
-            if let Some(aggregate) = aggregate {
-                let dag::OpNode::Aggregate {
-                    group_exprs,
-                    aggregates,
-                    ..
-                } = &dag.nodes[aggregate]
-                else {
-                    unreachable!()
-                };
-                if let Some(predicate) = output_filter {
-                    check_group_row_expr(
-                        predicate,
-                        group_exprs,
-                        aggregates,
-                        "HAVING referencing columns outside GROUP BY",
-                    )?;
-                }
-                for (expr, _) in projections {
-                    check_group_row_expr(
-                        expr,
-                        group_exprs,
-                        aggregates,
-                        "non-aggregate result columns not in GROUP BY",
-                    )?;
-                }
-                return Ok(());
-            }
-            for (expr, _) in projections {
-                check_scalar_expr(expr)?;
-            }
-            Ok(())
-        }
-        dag::OpNode::Alias { .. } => Ok(()),
+        dag::OpNode::Alias { .. } => {}
         dag::OpNode::Join { inputs, on, .. } => {
-            validate_join_node(dag, inputs, on, operator_states)?;
-            Ok(())
+            for &input in inputs {
+                if !operator_states
+                    .for_node(input)?
+                    .exposes_arrangement(&dag.nodes[input])
+                {
+                    return Err(LimboError::InternalError(format!(
+                        "join input DAG node {input} has no declared arrangement"
+                    )));
+                }
+            }
+            let output = &operator_states.for_node(node_id)?.output;
+            for expr in on {
+                if expr_contains_nondeterministic_scalar_function(expr, resolver)? {
+                    return unsupported("non-deterministic expressions");
+                }
+                validate_stream_expr(
+                    expr,
+                    output,
+                    "join predicates referencing values outside their input stream",
+                )?;
+            }
         }
         dag::OpNode::SetOp {
             inputs,
@@ -1049,9 +822,9 @@ fn validate_composable_delta_node(
                     "pure UNION ALL DAG has a non-UNION ALL operator".to_string(),
                 ));
             }
-            Ok(())
         }
         dag::OpNode::Aggregate {
+            input,
             group_exprs,
             group_collations,
             aggregates,
@@ -1077,36 +850,44 @@ fn validate_composable_delta_node(
                 return unsupported("custom collations on aggregate state keys");
             }
             for expr in group_exprs {
-                check_scalar_expr(expr)?;
+                check_expr(
+                    expr,
+                    *input,
+                    "grouping expressions referencing values outside their input stream",
+                )?;
             }
             for aggregate in aggregates {
                 validate_supported_aggregate(aggregate)?;
+                for expr in &aggregate.args {
+                    check_expr(
+                        expr,
+                        *input,
+                        "aggregate arguments referencing values outside their input stream",
+                    )?;
+                }
+                if let Some(expr) = &aggregate.filter_expr {
+                    check_expr(
+                        expr,
+                        *input,
+                        "aggregate filters referencing values outside their input stream",
+                    )?;
+                }
             }
-            Ok(())
         }
-    }
-}
-
-fn validate_join_node(
-    dag: &dag::MaintenanceDag,
-    inputs: &[dag::NodeId; 2],
-    predicates: &[ast::Expr],
-    operator_states: &OperatorStateCatalog,
-) -> Result<()> {
-    for &input in inputs {
-        if !operator_states
-            .for_node(input)?
-            .exposes_arrangement(&dag.nodes[input])
-        {
-            return Err(LimboError::InternalError(format!(
-                "join input DAG node {input} has no declared arrangement"
-            )));
-        }
-    }
-    for predicate in predicates {
-        check_scalar_expr(predicate)?;
     }
     Ok(())
+}
+
+fn validate_terminal_delta_identity(
+    operator_states: &OperatorStateCatalog,
+    node_id: dag::NodeId,
+) -> Result<()> {
+    match operator_states.for_node(node_id)?.output.published_identity {
+        DeltaIdentity::BindingRowids(1) | DeltaIdentity::OperatorRowid => Ok(()),
+        DeltaIdentity::BindingRowids(_) | DeltaIdentity::OperatorKey(_) => unsupported(
+            "a root delta with composite identity without an explicit materialized sink",
+        ),
+    }
 }
 
 fn declared_emitted_identity(
@@ -1680,5 +1461,55 @@ fn collate_clause(collation: CollationSeq) -> String {
     match collation {
         CollationSeq::Binary | CollationSeq::Unset => String::new(),
         other => format!(" COLLATE \"{}\"", other.name()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sum_expr(column: usize) -> ast::Expr {
+        ast::Expr::FunctionCall {
+            name: ast::Name::exact("sum".to_string()),
+            distinctness: None,
+            args: vec![Box::new(ast::Expr::Column {
+                database: None,
+                table: TableInternalId::from(1),
+                column,
+                is_rowid_alias: false,
+            })],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        }
+    }
+
+    #[test]
+    fn expression_validation_depends_only_on_published_values() {
+        let sum = sum_expr(0);
+        let input = NodeOutputContract {
+            schema: Arc::new(dag::StreamSchema {
+                columns: vec![Some(sum.clone())],
+                bindings: Vec::new(),
+            }),
+            binding_rowids: Vec::<bool>::new().into(),
+            emitted_identity: DeltaIdentity::OperatorRowid,
+            published_identity: DeltaIdentity::OperatorRowid,
+        };
+        let expression = ast::Expr::Binary(
+            Box::new(sum),
+            ast::Operator::Add,
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+        );
+
+        validate_stream_expr(&expression, &input, "unpublished value").unwrap();
+
+        let error = validate_stream_expr(&sum_expr(1), &input, "unpublished value").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("expressions over aggregate results"));
     }
 }

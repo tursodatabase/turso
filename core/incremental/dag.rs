@@ -30,17 +30,6 @@ use turso_parser::ast::TableInternalId;
 /// indices, so iterating `0..nodes.len()` visits the DAG in topological order.
 pub type NodeId = usize;
 
-/// One value column in an operator's delta stream.
-///
-/// `expr` is the canonical expression used by downstream operators to bind
-/// this slot. Base-table columns without a SQL name cannot be referenced by a
-/// later expression, so their slot deliberately has no expression.
-#[derive(Debug, Clone)]
-pub struct StreamColumn {
-    pub expr: Option<ast::Expr>,
-    pub name: Option<String>,
-}
-
 /// Base-table namespace needed to bind expressions carried across an
 /// ephemeral operator edge. The physical stream may have one cursor, but its
 /// values retain the logical names from all contributing inputs.
@@ -60,7 +49,10 @@ pub struct StreamBinding {
 /// columns and are therefore not included here.
 #[derive(Debug, Clone)]
 pub struct StreamSchema {
-    pub columns: Vec<StreamColumn>,
+    /// Canonical expression used by downstream operators to bind each value
+    /// slot. Base-table columns without a SQL name cannot be referenced by a
+    /// later expression, so their slot deliberately has no expression.
+    pub columns: Vec<Option<ast::Expr>>,
     pub bindings: Vec<StreamBinding>,
 }
 
@@ -119,11 +111,11 @@ pub enum OpNode {
         predicate: ast::Expr,
     },
 
-    /// Projection (π). Linear. Output schema: `projections` (each an
-    /// expression over the input's output schema, with an optional name).
+    /// Projection (π). Linear. Output schema: `projections`, each an
+    /// expression over the input's output schema.
     Project {
         input: NodeId,
-        projections: Vec<(ast::Expr, Option<String>)>,
+        projections: Vec<ast::Expr>,
     },
 
     /// Rename a derived relation into the namespace exposed by its FROM-clause
@@ -292,14 +284,13 @@ impl DagBuilder {
                     .columns()
                     .iter()
                     .enumerate()
-                    .map(|(column_index, column)| StreamColumn {
-                        expr: column.name.as_ref().map(|_| ast::Expr::Column {
+                    .map(|(column_index, column)| {
+                        column.name.as_ref().map(|_| ast::Expr::Column {
                             database: None,
                             table: *logical_id,
                             column: column_index,
                             is_rowid_alias: column.is_rowid_alias(),
-                        }),
-                        name: column.name.clone(),
+                        })
                     })
                     .collect(),
                 vec![StreamBinding {
@@ -313,13 +304,7 @@ impl DagBuilder {
                 self.output_schemas[*input].bindings.clone(),
             ),
             OpNode::Project { input, projections } => (
-                projections
-                    .iter()
-                    .map(|(expr, name)| StreamColumn {
-                        expr: Some(expr.clone()),
-                        name: name.clone(),
-                    })
-                    .collect(),
+                projections.iter().map(|expr| Some(expr.clone())).collect(),
                 self.output_schemas[*input].bindings.clone(),
             ),
             OpNode::Alias {
@@ -338,14 +323,13 @@ impl DagBuilder {
                         .columns()
                         .iter()
                         .enumerate()
-                        .map(|(column_index, column)| StreamColumn {
-                            expr: column.name.as_ref().map(|_| ast::Expr::Column {
+                        .map(|(column_index, column)| {
+                            column.name.as_ref().map(|_| ast::Expr::Column {
                                 database: None,
                                 table: *logical_id,
                                 column: column_index,
                                 is_rowid_alias: column.is_rowid_alias(),
-                            }),
-                            name: column.name.clone(),
+                            })
                         })
                         .collect(),
                     vec![StreamBinding {
@@ -379,10 +363,7 @@ impl DagBuilder {
                             .iter()
                             .map(|aggregate| aggregate.original_expr.clone()),
                     )
-                    .map(|expr| StreamColumn {
-                        expr: Some(expr),
-                        name: None,
-                    })
+                    .map(Some)
                     .collect(),
                 self.output_schemas[*input].bindings.clone(),
             ),
