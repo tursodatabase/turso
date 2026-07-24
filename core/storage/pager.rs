@@ -2926,7 +2926,11 @@ impl Pager {
         };
         let changed = wal.begin_read_tx()?;
         if changed {
-            // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
+            // Someone else changed the database -> assume our page cache is invalid
+            // (this is default SQLite behavior, we can probably do better with more
+            // granular invalidation).
+            // Reset internal state machines first to release any pinned pages.
+            self.reset_internal_states();
             self.clear_page_cache(false);
             // Invalidate cached schema cookie to force re-read on next access
             self.set_schema_cookie(None);
@@ -5574,6 +5578,10 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rollback(&self, schema_did_change: bool, connection: &Connection, is_write: bool) {
         tracing::debug!(schema_did_change);
+        // Reset internal state machines FIRST to release any pinned pages held by
+        // allocate_page, free_page, etc. This must happen before clear_page_cache
+        // so that pinned pages are unpinned and can be properly cleared.
+        self.reset_internal_states();
         if is_write {
             let clear_dirty = true;
             // The page cache only needs to be cleared if we are rolling back a write transaction.
@@ -5592,7 +5600,6 @@ impl Pager {
                 "dirty pages should be empty for read txn"
             );
         }
-        self.reset_internal_states();
         // Invalidate cached schema cookie since rollback may have restored the database schema cookie
         self.set_schema_cookie(None);
         if schema_did_change {
@@ -5610,8 +5617,43 @@ impl Pager {
         *self.checkpoint_state.write() = CheckpointState::default();
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().reset();
-        *self.allocate_page_state.write() = AllocatePageState::Start;
-        *self.free_page_state.write() = FreePageState::Start;
+        // Release the pins held by suspended allocate_page / free_page state
+        // machines before discarding their state. pin()/unpin() is a manual
+        // atomic counter that is NOT tied to the PageRef's Drop, so simply
+        // overwriting these enums to Start would strand the pins. With the
+        // pin-preserving PageCache::clear(), a stranded pin keeps an
+        // uncommitted freelist page (trunk/leaf) alive across a rollback,
+        // poisoning the freelist. Every caller of this function abandons the
+        // suspended operation (it restarts from Start), so releasing the pins
+        // here is always correct.
+        {
+            let mut allocate_page_state = self.allocate_page_state.write();
+            match &*allocate_page_state {
+                AllocatePageState::SearchAvailableFreeListLeaf { trunk_page } => {
+                    trunk_page.unpin();
+                }
+                AllocatePageState::ReuseFreelistLeaf {
+                    trunk_page,
+                    leaf_page,
+                    ..
+                } => {
+                    trunk_page.unpin();
+                    leaf_page.unpin();
+                }
+                AllocatePageState::Start | AllocatePageState::AllocateNewPage { .. } => {}
+            }
+            *allocate_page_state = AllocatePageState::Start;
+        }
+        {
+            let mut free_page_state = self.free_page_state.write();
+            match &*free_page_state {
+                FreePageState::AddToTrunk { page } | FreePageState::NewTrunk { page } => {
+                    page.unpin();
+                }
+                FreePageState::Start => {}
+            }
+            *free_page_state = FreePageState::Start;
+        }
         *self.spill_state.write() = SpillState::Idle;
         #[cfg(not(feature = "omit_autovacuum"))]
         {
@@ -6498,6 +6540,100 @@ mod ptrmap_tests {
             }
             IOResult::IO(_) => panic!("loaded cache hit must not yield"),
         }
+    }
+
+    /// Regression test for the "Freelist trunk page is not loaded" panic.
+    ///
+    /// `allocate_page` pins the freelist trunk page while its state machine is
+    /// suspended at an I/O yield (state `SearchAvailableFreeListLeaf`). If a
+    /// `begin_read_tx()` (db-changed branch) or `rollback()` then clears the page
+    /// cache while that machine is still suspended, the trunk's buffer is freed;
+    /// on the buggy code the machine later resumed straight into
+    /// `SearchAvailableFreeListLeaf` and hit
+    /// `turso_assert!(trunk_page.is_loaded(), "Freelist trunk page is not loaded")`.
+    ///
+    /// The fix is `reset_internal_states()`, which both callers now run *before*
+    /// clearing the cache: it releases the pins the suspended
+    /// allocate_page/free_page machines hold and resets them to `Start`, so the
+    /// machine can never resume into the freed trunk — it restarts a fresh
+    /// allocation instead. This is why the earlier pin-preserving `PageCache::clear`
+    /// is unnecessary (and was reverted: preserving pinned pages across a rollback
+    /// left uncommitted pages resident whose page-ids got reused once the rollback
+    /// shrank `database_size`, colliding in `force_insert_page`).
+    ///
+    /// This drives the interleaving deterministically at the pager level: no
+    /// materialized views, plain freelist allocation vs. the reset+clear sequence.
+    #[test]
+    fn suspended_allocate_reset_before_clear_releases_pins_and_resets() {
+        let page_size = 4096;
+        let pager = test_pager_setup(page_size, 10);
+
+        // Build a freelist out of two previously-allocated data pages. The first
+        // page freed becomes the freelist trunk; the second becomes a leaf pointer
+        // on that trunk. `allocate_page` will later read the trunk (pinning it) and
+        // then read the leaf.
+        let trunk_id = 5usize;
+        let leaf_id = 4usize;
+        run_until_done(|| pager.free_page(None, trunk_id), &pager).unwrap();
+        run_until_done(|| pager.free_page(None, leaf_id), &pager).unwrap();
+
+        // Arm a one-shot I/O yield on the leaf read. `allocate_page` reaches this
+        // read only after it has pinned the trunk and advanced to
+        // `SearchAvailableFreeListLeaf`, so this suspends the state machine with
+        // the trunk pinned — exactly the window the bug requires.
+        pager.arm_spill_yield_on_read(leaf_id as i64, 0);
+
+        // Drive allocate_page until it suspends inside SearchAvailableFreeListLeaf.
+        loop {
+            match pager.allocate_page().unwrap() {
+                IOResult::Done(_) => {
+                    panic!("allocate_page completed without suspending on the freelist leaf read")
+                }
+                IOResult::IO(io) => {
+                    if matches!(
+                        &*pager.allocate_page_state.read(),
+                        AllocatePageState::SearchAvailableFreeListLeaf { .. }
+                    ) {
+                        break;
+                    }
+                    io.wait(pager.io.as_ref()).unwrap();
+                }
+            }
+        }
+
+        // The trunk page is pinned by the suspended allocate_page state machine.
+        let trunk = pager.cache_get(trunk_id).unwrap().unwrap();
+        assert!(trunk.is_pinned(), "trunk must be pinned by allocate_page");
+        assert!(
+            trunk.is_loaded(),
+            "trunk must be loaded before the reset+clear"
+        );
+
+        // This is the step both begin_read_tx()/rollback() now perform BEFORE
+        // clearing the cache. It must release the pin the suspended allocate_page
+        // holds and reset the machine to Start. On the pre-fix code this only reset
+        // the enum without unpinning, so the trunk stayed pinned (the first
+        // assertion below is RED without the fix).
+        pager.reset_internal_states();
+
+        assert!(
+            !trunk.is_pinned(),
+            "reset_internal_states must release the suspended allocate_page's trunk pin"
+        );
+        assert!(
+            matches!(&*pager.allocate_page_state.read(), AllocatePageState::Start),
+            "reset_internal_states must reset the allocate_page machine to Start"
+        );
+
+        // Now the cache clear that follows in begin_read_tx()/rollback() is safe:
+        // the trunk buffer is freed, but because the machine is at Start it can
+        // never resume into SearchAvailableFreeListLeaf and hit the
+        // "Freelist trunk page is not loaded" assertion. clear must not panic.
+        pager.clear_page_cache(true);
+        assert!(
+            !trunk.is_loaded(),
+            "the unpinned trunk buffer is freed by the clear, which is now safe"
+        );
     }
 }
 
