@@ -2892,15 +2892,6 @@ impl Deref for Program {
     }
 }
 
-pub(crate) fn make_record(
-    registers: &[Register],
-    start_reg: &usize,
-    count: &usize,
-) -> Result<ImmutableRecord> {
-    let regs = &registers[*start_reg..*start_reg + *count];
-    ImmutableRecord::from_registers(regs, regs.len())
-}
-
 /// Split a register slice into an immutable ref and a mutable ref at two distinct indices.
 pub(crate) fn split_registers(
     registers: &mut [Register],

@@ -16,7 +16,6 @@ use crate::types::{
     compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
     SeekResult, Value,
 };
-use crate::vdbe::make_record;
 use crate::vdbe::Register;
 use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
 use std::any::Any;
@@ -1486,7 +1485,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         registers: &[Register],
         op: SeekOp,
     ) -> Result<IOResult<SeekResult>> {
-        let record = make_record(registers, &0, &registers.len())?;
+        let record = ImmutableRecord::from_registers(registers, registers.len())?;
         self.seek(SeekKey::IndexKey(record.as_record_ref()), op)
     }
 
