@@ -7484,6 +7484,7 @@ dependencies = [
 name = "turso_sync_engine"
 version = "0.8.0-pre.1"
 dependencies = [
+ "antithesis_sdk",
  "base64 0.22.1",
  "bytes",
  "crc32c",

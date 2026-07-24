@@ -12,7 +12,7 @@ pub mod server_proto;
 pub mod types;
 pub mod wal_session;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod sparse_io;
 
 pub type Result<T> = std::result::Result<T, errors::Error>;

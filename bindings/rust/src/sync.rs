@@ -1556,6 +1556,129 @@ mod tests {
         }
     }
 
+    /// Partial sync against a file-backed database, exercising the persistent
+    /// sparse IO backend (SparseLinuxIo on Linux, SparseBitmapIo on macOS)
+    /// instead of MemoryIO, including hydration persistence across reopen.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    pub async fn test_sync_partial_file_backed() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("partial.db");
+        let path = path.to_str().unwrap();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        server
+            .db_sql("INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 2000)")
+            .await
+            .unwrap();
+        let opts = PartialSyncOpts {
+            bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix { length: 128 * 1024 }),
+            segment_size: 128 * 1024,
+            prefetch: false,
+        };
+        {
+            let partial_db = crate::sync::Builder::new_remote(path)
+                .with_remote_url(server.db_url())
+                .with_partial_sync_opts_experimental(opts.clone())
+                .build()
+                .await
+                .unwrap();
+            let conn = partial_db.connect().await.unwrap();
+            let _ = all_rows(
+                conn.query("SELECT LENGTH(x) FROM t LIMIT 1", ())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(partial_db.stats().await.unwrap().network_received_bytes < 256 * (1024 + 10));
+            let all = all_rows(
+                conn.query("SELECT SUM(LENGTH(x)) FROM t", ())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(all, vec![vec![Value::Integer(2000 * 1024)]]);
+            assert!(partial_db.stats().await.unwrap().network_received_bytes > 2000 * 1024);
+        }
+        {
+            // Reopen: the previously hydrated pages must be served from the
+            // local sparse file, not re-fetched from the server.
+            let partial_db = crate::sync::Builder::new_remote(path)
+                .with_remote_url(server.db_url())
+                .with_partial_sync_opts_experimental(opts)
+                .build()
+                .await
+                .unwrap();
+            let conn = partial_db.connect().await.unwrap();
+            let all = all_rows(
+                conn.query("SELECT SUM(LENGTH(x)) FROM t", ())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(all, vec![vec![Value::Integer(2000 * 1024)]]);
+            assert!(
+                partial_db.stats().await.unwrap().network_received_bytes < 512 * 1024,
+                "reopen re-fetched the database instead of serving hydrated pages: {} bytes",
+                partial_db.stats().await.unwrap().network_received_bytes
+            );
+        }
+    }
+
+    /// Query bootstrap against a file-backed database. NOTE: the local test
+    /// server ignores `server_query_selector` (only Turso Cloud implements
+    /// it) and answers the empty page bitmap with a full bootstrap, so this
+    /// exercises the Query strategy end to end for correctness but cannot
+    /// assert reduced bootstrap traffic.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    pub async fn test_sync_partial_query_bootstrap_file_backed() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("partial.db");
+        let path = path.to_str().unwrap();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        server
+            .db_sql("INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 2000)")
+            .await
+            .unwrap();
+        let partial_db = crate::sync::Builder::new_remote(path)
+            .with_remote_url(server.db_url())
+            .with_partial_sync_opts_experimental(PartialSyncOpts {
+                bootstrap_strategy: Some(PartialBootstrapStrategy::Query {
+                    query: "SELECT x FROM t LIMIT 16".to_string(),
+                }),
+                segment_size: 128 * 1024,
+                prefetch: false,
+            })
+            .build()
+            .await
+            .unwrap();
+        let conn = partial_db.connect().await.unwrap();
+        let first = all_rows(
+            conn.query("SELECT LENGTH(x) FROM t LIMIT 1", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, vec![vec![Value::Integer(1024)]]);
+        let all = all_rows(
+            conn.query("SELECT SUM(LENGTH(x)) FROM t", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(all, vec![vec![Value::Integer(2000 * 1024)]]);
+        assert!(partial_db.stats().await.unwrap().network_received_bytes > 2000 * 1024);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     pub async fn test_sync_partial_prefetch() {
         let _ = tracing_subscriber::fmt::try_init();
