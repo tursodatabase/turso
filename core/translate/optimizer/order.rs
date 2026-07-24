@@ -43,6 +43,20 @@ pub struct ColumnOrder {
     pub nulls_order: Option<ast::NullsOrder>,
 }
 
+impl ColumnOrder {
+    pub fn effective_nulls_order_when_iterated(&self, iter_dir: IterationDirection) -> NullsOrder {
+        match iter_dir {
+            IterationDirection::Forwards => self.effective_nulls_order(),
+            IterationDirection::Backwards => self.effective_nulls_order().reverse(),
+        }
+    }
+
+    fn effective_nulls_order(&self) -> NullsOrder {
+        self.nulls_order
+            .unwrap_or_else(|| NullsOrder::default_for(self.order))
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 /// If an [OrderTarget] is satisfied, then [EliminatesSort] describes which part
 /// of the query no longer requires sorting.
@@ -552,17 +566,9 @@ fn match_intrinsic_order(
         if expected_order != target_col.order {
             return 0;
         }
-        let requested_nulls = target_col
-            .nulls_order
-            .unwrap_or_else(|| ast::NullsOrder::default_for(target_col.order));
-        let intrinsic_nulls = intrinsic_col
-            .nulls_order
-            .unwrap_or_else(|| ast::NullsOrder::default_for(intrinsic_col.order));
-        let delivered_nulls = match iter_dir {
-            IterationDirection::Forwards => intrinsic_nulls,
-            IterationDirection::Backwards => intrinsic_nulls.reverse(),
-        };
-        if requested_nulls != delivered_nulls {
+        let requested_nulls = target_col.effective_nulls_order();
+        let intrinsic_nulls = intrinsic_col.effective_nulls_order_when_iterated(iter_dir);
+        if requested_nulls != intrinsic_nulls {
             return 0;
         }
     }
@@ -892,11 +898,9 @@ pub(super) fn btree_access_order_consumed(
                     break;
                 }
 
-                let requested_nulls = target_col
-                    .nulls_order
-                    .unwrap_or_else(|| ast::NullsOrder::default_for(target_col.order));
-                let delivered_nulls = idx_col.effective_nulls_order_when_iterated(iter_dir);
-                if requested_nulls != delivered_nulls {
+                let requested_nulls = target_col.effective_nulls_order();
+                let effective_nulls = idx_col.effective_nulls_order_when_iterated(iter_dir);
+                if requested_nulls != effective_nulls {
                     break;
                 }
 
