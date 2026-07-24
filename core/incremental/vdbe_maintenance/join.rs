@@ -1,5 +1,64 @@
 use super::*;
 
+const JOIN_ARITY: usize = 2;
+
+/// One physical input edge of a binary join.
+///
+/// Keeping the delta, logical schema, and maintained arrangement together
+/// prevents emitters from accidentally combining parallel slices belonging
+/// to different inputs.
+struct JoinInputContract {
+    delta: DeltaSource,
+    schema: Arc<dag::StreamSchema>,
+    arrangement: ArrangementHandle,
+}
+
+/// The complete physical contract of one binary join node.
+pub(super) struct JoinContract {
+    inputs: [JoinInputContract; JOIN_ARITY],
+    on: Vec<ast::Expr>,
+}
+
+impl JoinContract {
+    pub(super) fn from_outputs(
+        outputs: [&NodeOutput; JOIN_ARITY],
+        schemas: [Arc<dag::StreamSchema>; JOIN_ARITY],
+        on: &[ast::Expr],
+    ) -> Result<Self> {
+        let input = |position: usize| -> Result<JoinInputContract> {
+            let output = outputs[position];
+            let schema = schemas[position].clone();
+            let arrangement = output.arrangement.clone().ok_or_else(|| {
+                LimboError::InternalError("join input has no materialized arrangement".to_string())
+            })?;
+            if arrangement.value_columns().len() != schema.len() {
+                return Err(LimboError::InternalError(
+                    "join arrangement does not match its logical input width".to_string(),
+                ));
+            }
+            if arrangement.binding_rowid_columns().len() != schema.bindings.len() {
+                return Err(LimboError::InternalError(
+                    "join arrangement does not match its logical binding provenance".to_string(),
+                ));
+            }
+            if arrangement.identity() != output.delta.identity() {
+                return Err(LimboError::InternalError(
+                    "join delta and arrangement expose different identities".to_string(),
+                ));
+            }
+            Ok(JoinInputContract {
+                delta: output.delta.clone(),
+                schema,
+                arrangement,
+            })
+        };
+        Ok(Self {
+            inputs: [input(0)?, input(1)?],
+            on: on.to_vec(),
+        })
+    }
+}
+
 /// Which relation a join phase reads for one side of the join.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JoinSide {
@@ -15,22 +74,23 @@ enum JoinSide {
 ///
 /// Population is one all-arrangement phase with weight +1. Unlike the deleted
 /// n-ary subset expansion, this has constant code size per join node.
-fn binary_join_phases(input: MaintenanceInput) -> Vec<([JoinSide; 2], bool)> {
+fn binary_join_phases(input: MaintenanceInput) -> &'static [([JoinSide; JOIN_ARITY], bool)] {
+    const POPULATION: &[([JoinSide; JOIN_ARITY], bool)] =
+        &[([JoinSide::Btree, JoinSide::Btree], false)];
+    const MAINTENANCE: &[([JoinSide; JOIN_ARITY], bool)] = &[
+        ([JoinSide::Delta, JoinSide::Btree], false),
+        ([JoinSide::Btree, JoinSide::Delta], false),
+        ([JoinSide::Delta, JoinSide::Delta], true),
+    ];
     match input {
-        MaintenanceInput::BaseTable => {
-            vec![([JoinSide::Btree, JoinSide::Btree], false)]
-        }
-        MaintenanceInput::TransactionDelta => vec![
-            ([JoinSide::Delta, JoinSide::Btree], false),
-            ([JoinSide::Btree, JoinSide::Delta], false),
-            ([JoinSide::Delta, JoinSide::Delta], true),
-        ],
+        MaintenanceInput::BaseTable => POPULATION,
+        MaintenanceInput::TransactionDelta => MAINTENANCE,
     }
 }
 
 /// Per-match emission hook for [`emit_join_phase`]: receives the program,
 /// and the per-input physical cursor ids.
-type JoinPhaseSink<'a> = dyn FnMut(&mut ProgramBuilder, &[usize]) -> Result<()> + 'a;
+type JoinPhaseSink<'a> = dyn FnMut(&mut ProgramBuilder, &[usize; JOIN_ARITY]) -> Result<()> + 'a;
 
 fn emit_arrangement_column_value(
     program: &mut ProgramBuilder,
@@ -178,28 +238,19 @@ fn emit_join_phase(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     view_name: &str,
-    deltas: &[DeltaSource],
-    schemas: &[Arc<dag::StreamSchema>],
-    arrangements: &[ArrangementHandle],
-    conditions: &[&ast::Expr],
-    sides: &[JoinSide],
+    contract: &JoinContract,
+    sides: &[JoinSide; JOIN_ARITY],
     negate: bool,
     w_reg: usize,
     sink: &mut JoinPhaseSink<'_>,
 ) -> Result<()> {
-    let n = schemas.len();
-    turso_assert!(
-        n == 2 && deltas.len() == n && arrangements.len() == n && sides.len() == n,
-        "a binary join phase must expose two deltas and arrangements"
-    );
-
     // A physical input may carry several SQL bindings after a previous binary
     // join. Bound expressions are retargeted to fresh phase ids and every
     // column is seeded from the one physical cursor declared by that edge.
     let mut binding_remap = BindingRemap::default();
     let mut phase_bindings = Vec::new();
-    for schema in schemas {
-        for binding in &schema.bindings {
+    for input in &contract.inputs {
+        for binding in &input.schema.bindings {
             let phase_id = program.table_reference_counter.next();
             let previous = binding_remap.insert(binding.logical_id, phase_id);
             turso_assert!(
@@ -219,72 +270,64 @@ fn emit_join_phase(
         vec![],
     );
 
-    let cursor_ids: Vec<usize> = schemas
-        .iter()
-        .zip(deltas)
-        .zip(arrangements)
-        .zip(sides)
-        .map(
-            |(((input_schema, delta), arrangement), side)| -> Result<usize> {
-                let storage = arrangement.table();
-                match side {
-                    JoinSide::Delta => match delta {
-                        DeltaSource::BaseTable {
-                            table: delta_table, ..
-                        } => {
-                            turso_assert!(
-                                input_schema.len() == delta_table.columns().len()
-                                    && (Arc::ptr_eq(storage, delta_table)
-                                        || storage.root_page == delta_table.root_page),
-                                "join delta and arrangement must describe the same relation"
-                            );
-                            let cursor_id = program.alloc_cursor_id(CursorType::ViewDelta {
-                                view_name: view_name.to_string(),
-                                table: delta_table.clone(),
-                            });
-                            program.emit_insn(Insn::OpenRead {
-                                cursor_id,
-                                root_page: 0,
-                                db: 0,
-                            });
-                            Ok(cursor_id)
-                        }
-                        DeltaSource::Ephemeral(channel) => Ok(channel.cursor_id),
-                    },
-                    JoinSide::Btree => {
-                        let cursor_id =
-                            program.alloc_cursor_id(CursorType::BTreeTable(storage.clone()));
-                        program.emit_insn(Insn::OpenRead {
-                            cursor_id,
-                            root_page: storage.root_page,
-                            db: 0,
-                        });
-                        Ok(cursor_id)
-                    }
+    let mut open_input = |position: usize| -> Result<usize> {
+        let input = &contract.inputs[position];
+        let storage = input.arrangement.table();
+        match sides[position] {
+            JoinSide::Delta => match &input.delta {
+                DeltaSource::BaseTable {
+                    table: delta_table, ..
+                } => {
+                    turso_assert!(
+                        input.schema.len() == delta_table.columns().len()
+                            && (Arc::ptr_eq(storage, delta_table)
+                                || storage.root_page == delta_table.root_page),
+                        "join delta and arrangement must describe the same relation"
+                    );
+                    let cursor_id = program.alloc_cursor_id(CursorType::ViewDelta {
+                        view_name: view_name.to_string(),
+                        table: delta_table.clone(),
+                    });
+                    program.emit_insn(Insn::OpenRead {
+                        cursor_id,
+                        root_page: 0,
+                        db: 0,
+                    });
+                    Ok(cursor_id)
                 }
+                DeltaSource::Ephemeral(channel) => Ok(channel.cursor_id),
             },
-        )
-        .collect::<Result<Vec<_>>>()?;
+            JoinSide::Btree => {
+                let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(storage.clone()));
+                program.emit_insn(Insn::OpenRead {
+                    cursor_id,
+                    root_page: storage.root_page,
+                    db: 0,
+                });
+                Ok(cursor_id)
+            }
+        }
+    };
+    let cursor_ids = [open_input(0)?, open_input(1)?];
 
     // Nest delta tables outermost.
-    let mut order: Vec<usize> = (0..n).collect();
+    let mut order = [0, 1];
     order.sort_by_key(|&i| sides[i] == JoinSide::Btree);
 
     let phase_done_label = program.allocate_label();
-    let loop_labels: Vec<_> = (0..n).map(|_| program.allocate_label()).collect();
-    let next_labels: Vec<_> = (0..n).map(|_| program.allocate_label()).collect();
-    let delta_w_regs: Vec<Option<usize>> = sides
-        .iter()
-        .map(|side| (*side == JoinSide::Delta).then(|| program.alloc_register()))
-        .collect();
-    let arrangement_count_regs: Vec<Option<usize>> = arrangements
-        .iter()
-        .zip(sides)
-        .map(|(arrangement, side)| {
-            (*side == JoinSide::Btree && arrangement.count_column().is_some())
-                .then(|| program.alloc_register())
-        })
-        .collect();
+    let loop_labels = std::array::from_fn::<_, JOIN_ARITY, _>(|_| program.allocate_label());
+    let next_labels = std::array::from_fn::<_, JOIN_ARITY, _>(|_| program.allocate_label());
+    let delta_w_regs = std::array::from_fn::<_, JOIN_ARITY, _>(|position| {
+        (sides[position] == JoinSide::Delta).then(|| program.alloc_register())
+    });
+    let arrangement_count_regs = std::array::from_fn::<_, JOIN_ARITY, _>(|position| {
+        (sides[position] == JoinSide::Btree
+            && contract.inputs[position]
+                .arrangement
+                .count_column()
+                .is_some())
+        .then(|| program.alloc_register())
+    });
 
     for (depth, &pos) in order.iter().enumerate() {
         program.emit_insn(Insn::Rewind {
@@ -297,8 +340,8 @@ fn emit_join_phase(
         });
         program.preassign_label_to_next_insn(loop_labels[depth]);
         if let Some(w) = delta_w_regs[pos] {
-            let weight_column = match &deltas[pos] {
-                DeltaSource::BaseTable { .. } => schemas[pos].len(),
+            let weight_column = match &contract.inputs[pos].delta {
+                DeltaSource::BaseTable { .. } => contract.inputs[pos].schema.len(),
                 DeltaSource::Ephemeral(channel) => channel.weight_column,
             };
             program.emit_insn(Insn::Column {
@@ -310,7 +353,7 @@ fn emit_join_phase(
         }
         if let (Some(count_reg), Some(count_column)) = (
             arrangement_count_regs[pos],
-            arrangements[pos].count_column(),
+            contract.inputs[pos].arrangement.count_column(),
         ) {
             program.emit_insn(Insn::Column {
                 cursor_id: cursor_ids[pos],
@@ -326,20 +369,21 @@ fn emit_join_phase(
     // layout (aggregate arrangements can project away accumulator payloads,
     // while ephemeral deltas carry identity before their values).
     resolver.enable_expr_to_reg_cache();
-    for pos in 0..n {
-        for (logical_column, column) in schemas[pos].columns.iter().enumerate() {
+    for pos in 0..JOIN_ARITY {
+        let input = &contract.inputs[pos];
+        for (logical_column, column) in input.schema.columns.iter().enumerate() {
             let Some(expr) = &column.expr else {
                 continue;
             };
-            let physical_column = match (&sides[pos], &deltas[pos]) {
+            let physical_column = match (&sides[pos], &input.delta) {
                 (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
                     channel.value_start + logical_column
                 }
                 (JoinSide::Delta, DeltaSource::BaseTable { .. }) => logical_column,
-                (JoinSide::Btree, _) => arrangements[pos].value_columns()[logical_column],
+                (JoinSide::Btree, _) => input.arrangement.value_columns()[logical_column],
             };
             let value_reg = program.alloc_register();
-            match (&sides[pos], &deltas[pos]) {
+            match (&sides[pos], &input.delta) {
                 (JoinSide::Delta, DeltaSource::Ephemeral(_)) => {
                     program.emit_insn(Insn::Column {
                         cursor_id: cursor_ids[pos],
@@ -353,13 +397,13 @@ fn emit_join_phase(
             let bound = remap_bound_expr(expr, &binding_remap)?;
             resolver.cache_expr_reg(std::borrow::Cow::Owned(bound), value_reg, false, None);
         }
-        for (binding_index, binding) in schemas[pos].bindings.iter().enumerate() {
+        for (binding_index, binding) in input.schema.bindings.iter().enumerate() {
             let rowid_reg = program.alloc_register();
             if !emit_join_input_binding_rowid(
                 program,
                 sides[pos],
-                &deltas[pos],
-                &arrangements[pos],
+                &input.delta,
+                &input.arrangement,
                 cursor_ids[pos],
                 binding_index,
                 rowid_reg,
@@ -385,8 +429,8 @@ fn emit_join_phase(
 
     // ON predicates and WHERE: a FALSE or NULL result means this combination
     // is not a join output.
-    let innermost_next = next_labels[n - 1];
-    for condition in conditions {
+    let innermost_next = next_labels[JOIN_ARITY - 1];
+    for condition in &contract.on {
         let bound = remap_bound_expr(condition, &binding_remap)?;
         let pred_true = program.allocate_label();
         translate_condition_expr(
@@ -423,7 +467,7 @@ fn emit_join_phase(
 
     sink(program, &cursor_ids)?;
 
-    for depth in (0..n).rev() {
+    for depth in (0..JOIN_ARITY).rev() {
         program.preassign_label_to_next_insn(next_labels[depth]);
         program.emit_insn(Insn::Next {
             cursor_id: cursor_ids[order[depth]],
@@ -448,15 +492,15 @@ pub(super) fn emit_join_deltas_to_ephemeral(
     resolver: &mut Resolver,
     view_name: &str,
     output_contract: &NodeOutputContract,
-    deltas: &[DeltaSource],
-    schemas: &[Arc<dag::StreamSchema>],
-    arrangements: &[ArrangementHandle],
-    on_conditions: &[ast::Expr],
+    contract: &JoinContract,
     input: MaintenanceInput,
 ) -> Result<DeltaSource> {
-    let conditions: Vec<&ast::Expr> = on_conditions.iter().collect();
     let width = output_contract.schema.len();
-    let natural_width = schemas.iter().map(|schema| schema.len()).sum::<usize>();
+    let natural_width = contract
+        .inputs
+        .iter()
+        .map(|input| input.schema.len())
+        .sum::<usize>();
     turso_assert!(
         width == natural_width,
         "join physical inputs must match the planned output schema"
@@ -501,15 +545,12 @@ pub(super) fn emit_join_deltas_to_ephemeral(
         });
     };
 
-    for (sides, negate) in binary_join_phases(input) {
+    for &(sides, negate) in binary_join_phases(input) {
         emit_join_phase(
             program,
             resolver,
             view_name,
-            deltas,
-            schemas,
-            arrangements,
-            &conditions,
+            contract,
             &sides,
             negate,
             eph_weight_reg,
@@ -517,10 +558,10 @@ pub(super) fn emit_join_deltas_to_ephemeral(
                 match channel.identity {
                     DeltaIdentity::BindingRowids(expected_width) => {
                         let mut destination = eph_rec_start;
-                        for position in 0..schemas.len() {
+                        for (position, input) in contract.inputs.iter().enumerate() {
                             let source_identity = match sides[position] {
-                                JoinSide::Delta => deltas[position].identity(),
-                                JoinSide::Btree => arrangements[position].identity(),
+                                JoinSide::Delta => input.delta.identity(),
+                                JoinSide::Btree => input.arrangement.identity(),
                             };
                             turso_assert!(
                                 matches!(source_identity, DeltaIdentity::BindingRowids(_)),
@@ -529,8 +570,8 @@ pub(super) fn emit_join_deltas_to_ephemeral(
                             destination += emit_join_input_identity(
                                 program,
                                 sides[position],
-                                &deltas[position],
-                                &arrangements[position],
+                                &input.delta,
+                                &input.arrangement,
                                 cursors[position],
                                 destination,
                             );
@@ -541,17 +582,17 @@ pub(super) fn emit_join_deltas_to_ephemeral(
                         );
                     }
                     DeltaIdentity::OperatorKey(2) => {
-                        for position in 0..schemas.len() {
+                        for (position, input) in contract.inputs.iter().enumerate() {
                             let source_identity = match sides[position] {
-                                JoinSide::Delta => deltas[position].identity(),
-                                JoinSide::Btree => arrangements[position].identity(),
+                                JoinSide::Delta => input.delta.identity(),
+                                JoinSide::Btree => input.arrangement.identity(),
                             };
                             let source_start = program.alloc_registers(source_identity.width());
                             let width = emit_join_input_identity(
                                 program,
                                 sides[position],
-                                &deltas[position],
-                                &arrangements[position],
+                                &input.delta,
+                                &input.arrangement,
                                 cursors[position],
                                 source_start,
                             );
@@ -571,8 +612,8 @@ pub(super) fn emit_join_deltas_to_ephemeral(
                     }
                 }
                 let mut output_binding = 0;
-                for position in 0..schemas.len() {
-                    for input_binding in 0..schemas[position].bindings.len() {
+                for (position, input) in contract.inputs.iter().enumerate() {
+                    for input_binding in 0..input.schema.bindings.len() {
                         if let Some(output_column) = channel.binding_rowid_columns[output_binding] {
                             if output_column < channel.identity_width() {
                                 turso_assert!(
@@ -588,8 +629,8 @@ pub(super) fn emit_join_deltas_to_ephemeral(
                                     emit_join_input_binding_rowid(
                                         program,
                                         sides[position],
-                                        &deltas[position],
-                                        &arrangements[position],
+                                        &input.delta,
+                                        &input.arrangement,
                                         cursors[position],
                                         input_binding,
                                         eph_rec_start + output_column,
@@ -606,10 +647,11 @@ pub(super) fn emit_join_deltas_to_ephemeral(
                     "join input bindings must match its output provenance contract"
                 );
                 let mut destination = eph_value_start;
-                for (position, (input_schema, cursor_id)) in schemas.iter().zip(cursors).enumerate()
+                for (position, (input, cursor_id)) in
+                    contract.inputs.iter().zip(cursors).enumerate()
                 {
-                    for column in 0..input_schema.len() {
-                        match (&sides[position], &deltas[position]) {
+                    for column in 0..input.schema.len() {
+                        match (&sides[position], &input.delta) {
                             (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
                                 program.emit_insn(Insn::Column {
                                     cursor_id: *cursor_id,
@@ -620,7 +662,7 @@ pub(super) fn emit_join_deltas_to_ephemeral(
                             }
                             (JoinSide::Btree, _) => program.emit_column_or_rowid(
                                 *cursor_id,
-                                arrangements[position].value_columns()[column],
+                                input.arrangement.value_columns()[column],
                                 destination,
                             ),
                             (JoinSide::Delta, DeltaSource::BaseTable { .. }) => {
@@ -721,15 +763,18 @@ fn emit_operator_keyed_ephemeral_row(
 
 fn emit_natural_join_values(
     program: &mut ProgramBuilder,
-    schemas: &[Arc<dag::StreamSchema>],
-    arrangements: &[ArrangementHandle],
-    cursors: &[usize],
+    contract: &JoinContract,
+    cursors: &[usize; JOIN_ARITY],
     values_start: usize,
 ) -> usize {
     let mut destination = values_start;
-    for ((schema, arrangement), cursor) in schemas.iter().zip(arrangements).zip(cursors) {
-        for column in 0..schema.len() {
-            program.emit_column_or_rowid(*cursor, arrangement.value_columns()[column], destination);
+    for (input, cursor) in contract.inputs.iter().zip(cursors) {
+        for column in 0..input.schema.len() {
+            program.emit_column_or_rowid(
+                *cursor,
+                input.arrangement.value_columns()[column],
+                destination,
+            );
             destination += 1;
         }
     }
@@ -755,9 +800,6 @@ pub(super) fn emit_left_join_deltas_to_ephemeral(
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<DeltaSource> {
-    let n = contract.schemas.len();
-    turso_assert!(n == 2, "DAG validation admits LEFT JOIN for two inputs");
-
     let output = open_ephemeral_delta(
         program,
         &format!("{view_name}_left_join_delta_{node_id}"),
@@ -767,9 +809,9 @@ pub(super) fn emit_left_join_deltas_to_ephemeral(
         true,
     );
     let natural_width = contract
-        .schemas
+        .inputs
         .iter()
-        .map(|schema| schema.len())
+        .map(|input| input.schema.len())
         .sum::<usize>();
     turso_assert!(
         output.width == natural_width,
@@ -810,7 +852,7 @@ pub(super) fn emit_left_join_deltas_to_ephemeral(
     let corrupt_label = program.allocate_label();
     let main_start_label = program.allocate_label();
     let end_label = program.allocate_label();
-    let pair_identity_start = program.alloc_registers(n);
+    let pair_identity_start = program.alloc_registers(JOIN_ARITY);
     let matched_values_start = program.alloc_registers(natural_width);
     let matched_weight_reg = program.alloc_register();
     let binding_rowid_width = output
@@ -835,20 +877,17 @@ pub(super) fn emit_left_join_deltas_to_ephemeral(
     let matched_binding_rowids_start = program.alloc_registers(binding_rowid_width);
     let matched_binding_rowid_regs = binding_rowid_registers(matched_binding_rowids_start);
 
-    let pad_cursors: Vec<usize> = contract
-        .arrangements
-        .iter()
-        .map(|arrangement| {
-            let table = arrangement.table();
-            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
-            program.emit_insn(Insn::OpenRead {
-                cursor_id,
-                root_page: table.root_page,
-                db: 0,
-            });
-            cursor_id
-        })
-        .collect();
+    let mut open_arrangement = |position: usize| {
+        let table = contract.inputs[position].arrangement.table();
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        program.emit_insn(Insn::OpenRead {
+            cursor_id,
+            root_page: table.root_page,
+            db: 0,
+        });
+        cursor_id
+    };
+    let pad_cursors = [open_arrangement(0), open_arrangement(1)];
     let outer = LeftJoinAux::open(
         program,
         aux_name,
@@ -869,62 +908,58 @@ pub(super) fn emit_left_join_deltas_to_ephemeral(
         target_pc: main_start_label,
     });
 
-    let mut emit_padded_add =
-        |program: &mut ProgramBuilder, pad_cursors: &[usize], srid_reg: usize| -> Result<()> {
-            let end = emit_natural_join_values(
-                program,
-                &contract.schemas,
-                &contract.arrangements,
-                pad_cursors,
-                padded_values_start,
-            );
-            turso_assert!(
-                end == padded_values_start + natural_width,
-                "padded LEFT JOIN row does not match its output schema"
-            );
-            let mut output_binding = 0;
-            for (position, input_schema) in contract.schemas.iter().enumerate() {
-                for input_binding in 0..input_schema.bindings.len() {
-                    if let Some(dest) = padded_binding_rowid_regs[output_binding] {
-                        if position == 0 {
-                            turso_assert!(
-                                emit_join_input_binding_rowid(
-                                    program,
-                                    JoinSide::Btree,
-                                    &contract.deltas[position],
-                                    &contract.arrangements[position],
-                                    pad_cursors[position],
-                                    input_binding,
-                                    dest,
-                                ),
-                                "LEFT JOIN padded row requires its left rowid provenance"
-                            );
-                        } else {
-                            program.emit_insn(Insn::Null {
+    let mut emit_padded_add = |program: &mut ProgramBuilder,
+                               pad_cursors: &[usize; JOIN_ARITY],
+                               srid_reg: usize|
+     -> Result<()> {
+        let end = emit_natural_join_values(program, contract, pad_cursors, padded_values_start);
+        turso_assert!(
+            end == padded_values_start + natural_width,
+            "padded LEFT JOIN row does not match its output schema"
+        );
+        let mut output_binding = 0;
+        for (position, input) in contract.inputs.iter().enumerate() {
+            for input_binding in 0..input.schema.bindings.len() {
+                if let Some(dest) = padded_binding_rowid_regs[output_binding] {
+                    if position == 0 {
+                        turso_assert!(
+                            emit_join_input_binding_rowid(
+                                program,
+                                JoinSide::Btree,
+                                &input.delta,
+                                &input.arrangement,
+                                pad_cursors[position],
+                                input_binding,
                                 dest,
-                                dest_end: None,
-                            });
-                        }
+                            ),
+                            "LEFT JOIN padded row requires its left rowid provenance"
+                        );
+                    } else {
+                        program.emit_insn(Insn::Null {
+                            dest,
+                            dest_end: None,
+                        });
                     }
-                    output_binding += 1;
                 }
+                output_binding += 1;
             }
-            turso_assert!(
-                output_binding == output.schema.bindings.len(),
-                "LEFT JOIN padded row provenance must match its output bindings"
-            );
-            emit_operator_keyed_ephemeral_row(
-                program,
-                &output,
-                1,
-                srid_reg,
-                1,
-                &padded_binding_rowid_regs,
-                padded_values_start,
-                one_reg,
-            );
-            Ok(())
-        };
+        }
+        turso_assert!(
+            output_binding == output.schema.bindings.len(),
+            "LEFT JOIN padded row provenance must match its output bindings"
+        );
+        emit_operator_keyed_ephemeral_row(
+            program,
+            &output,
+            1,
+            srid_reg,
+            1,
+            &padded_binding_rowid_regs,
+            padded_values_start,
+            one_reg,
+        );
+        Ok(())
+    };
     let mut emit_padded_remove = |program: &mut ProgramBuilder, srid_reg: usize| -> Result<()> {
         let negative_one_reg = program.alloc_register();
         program.emit_int(-1, negative_one_reg);
@@ -951,28 +986,24 @@ pub(super) fn emit_left_join_deltas_to_ephemeral(
     outer.emit_presence_pass(
         program,
         input,
-        &contract.deltas[0],
-        &contract.arrangements[0],
-        contract.schemas[0].len(),
+        &contract.inputs[0].delta,
+        &contract.inputs[0].arrangement,
+        contract.inputs[0].schema.len(),
         view_name,
     )?;
 
-    let conditions = contract.on.iter().collect::<Vec<_>>();
-    for (sides, negate) in binary_join_phases(input) {
+    for &(sides, negate) in binary_join_phases(input) {
         emit_join_phase(
             program,
             &mut resolver,
             view_name,
-            &contract.deltas,
-            &contract.schemas,
-            &contract.arrangements,
-            &conditions,
+            contract,
             &sides,
             negate,
             matched_weight_reg,
             &mut |program, cursors| {
-                for (position, cursor) in cursors.iter().enumerate() {
-                    match (&sides[position], &contract.deltas[position]) {
+                for (position, (input, cursor)) in contract.inputs.iter().zip(cursors).enumerate() {
+                    match (&sides[position], &input.delta) {
                         (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
                             turso_assert!(
                                 channel.identity == DeltaIdentity::OperatorRowid,
@@ -993,11 +1024,9 @@ pub(super) fn emit_left_join_deltas_to_ephemeral(
                 }
                 outer.emit_count_match(program, pair_identity_start, matched_weight_reg);
                 let mut destination = matched_values_start;
-                for (position, (input_schema, cursor)) in
-                    contract.schemas.iter().zip(cursors).enumerate()
-                {
-                    for column in 0..input_schema.len() {
-                        match (&sides[position], &contract.deltas[position]) {
+                for (position, (input, cursor)) in contract.inputs.iter().zip(cursors).enumerate() {
+                    for column in 0..input.schema.len() {
+                        match (&sides[position], &input.delta) {
                             (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
                                 program.emit_insn(Insn::Column {
                                     cursor_id: *cursor,
@@ -1008,7 +1037,7 @@ pub(super) fn emit_left_join_deltas_to_ephemeral(
                             }
                             (JoinSide::Btree, _) => program.emit_column_or_rowid(
                                 *cursor,
-                                contract.arrangements[position].value_columns()[column],
+                                input.arrangement.value_columns()[column],
                                 destination,
                             ),
                             (JoinSide::Delta, DeltaSource::BaseTable { .. }) => {
@@ -1023,15 +1052,15 @@ pub(super) fn emit_left_join_deltas_to_ephemeral(
                     "matched LEFT JOIN row does not match its output schema"
                 );
                 let mut output_binding = 0;
-                for (position, input_schema) in contract.schemas.iter().enumerate() {
-                    for input_binding in 0..input_schema.bindings.len() {
+                for (position, input) in contract.inputs.iter().enumerate() {
+                    for input_binding in 0..input.schema.bindings.len() {
                         if let Some(dest) = matched_binding_rowid_regs[output_binding] {
                             turso_assert!(
                                 emit_join_input_binding_rowid(
                                     program,
                                     sides[position],
-                                    &contract.deltas[position],
-                                    &contract.arrangements[position],
+                                    &input.delta,
+                                    &input.arrangement,
                                     cursors[position],
                                     input_binding,
                                     dest,
@@ -1051,7 +1080,7 @@ pub(super) fn emit_left_join_deltas_to_ephemeral(
                     &output,
                     0,
                     pair_identity_start,
-                    n,
+                    JOIN_ARITY,
                     &matched_binding_rowid_regs,
                     matched_values_start,
                     matched_weight_reg,
@@ -1079,7 +1108,8 @@ pub(super) fn emit_left_join_deltas_to_ephemeral(
 /// Consumer hook that materializes one NULL-padded output row: given the
 /// padded-image cursors (left seeked, right on its null row), their table
 /// references, and the aux row's rowid identifying the padded row.
-type PaddedAddFn<'a> = dyn FnMut(&mut ProgramBuilder, &[usize], usize) -> Result<()> + 'a;
+type PaddedAddFn<'a> =
+    dyn FnMut(&mut ProgramBuilder, &[usize; JOIN_ARITY], usize) -> Result<()> + 'a;
 /// Consumer hook that retracts one NULL-padded output row, given the aux
 /// row's rowid.
 type PaddedRemoveFn<'a> = dyn FnMut(&mut ProgramBuilder, usize) -> Result<()> + 'a;
@@ -1212,7 +1242,7 @@ impl LeftJoinAux {
     fn emit_subroutine(
         &self,
         program: &mut ProgramBuilder,
-        pad_cursors: &[usize],
+        pad_cursors: &[usize; JOIN_ARITY],
         emit_padded_add: &mut PaddedAddFn<'_>,
         emit_padded_remove: &mut PaddedRemoveFn<'_>,
     ) -> Result<()> {
