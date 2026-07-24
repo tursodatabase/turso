@@ -1003,8 +1003,11 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Hekaton Section 2.7: "CommitDepSet, that stores transaction IDs of the
     /// transactions that depend on T."
     commit_dep_set: Mutex<HashSet<TxID>>,
-    /// True when this transaction holds `blocking_checkpoint_lock` in read mode
-    /// (truncate / flag-off path only). Passive `begin_tx` does not pin the lock.
+    /// True when this transaction holds `blocking_checkpoint_lock` in read mode.
+    /// Truncate / flag-off transactions acquire it at begin. In passive mode,
+    /// a transaction acquires it lazily before allocating its first temporary
+    /// table ID, then retains it through commit or rollback so a checkpoint
+    /// cannot freeze a snapshot between ID allocation and commit.
     holds_blocking_checkpoint_read: AtomicBool,
     /// `MvStore::schema_generation` captured at `begin_tx` (passive root publication gate).
     schema_generation_at_begin: u64,
@@ -1605,6 +1608,9 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     pager: Arc<Pager>,
     /// Bytes appended to the logical log for this commit; applied to writer offset only after durability and before lock release.
     pending_log_append_bytes: Option<u64>,
+    /// Read side of the passive-checkpoint start fence. Only commits whose
+    /// write set still contains temporary table IDs acquire it.
+    holds_passive_checkpoint_commit_fence: bool,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
     _phantom: PhantomData<Clock>,
@@ -1701,13 +1707,80 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             pager,
             header,
             pending_log_append_bytes: None,
+            holds_passive_checkpoint_commit_fence: false,
             sync_mode,
             _phantom: PhantomData,
         }
     }
 
+    fn try_acquire_passive_checkpoint_commit_fence(&mut self) -> bool {
+        if self.holds_passive_checkpoint_commit_fence {
+            return true;
+        }
+        // Check both sides of the nonblocking read-lock acquisition. A
+        // checkpoint that wins between the first load and the lock acquisition
+        // must be allowed to publish the temporary-ID mappings first.
+        if self
+            .mvcc_store
+            .checkpoint_in_progress
+            .load(Ordering::Acquire)
+        {
+            return false;
+        }
+        if !self.mvcc_store.blocking_checkpoint_lock.read() {
+            return false;
+        }
+        if self
+            .mvcc_store
+            .checkpoint_in_progress
+            .load(Ordering::Acquire)
+        {
+            self.mvcc_store.blocking_checkpoint_lock.unlock();
+            return false;
+        }
+        self.holds_passive_checkpoint_commit_fence = true;
+        true
+    }
+
+    fn release_passive_checkpoint_commit_fence(&mut self) {
+        if self.holds_passive_checkpoint_commit_fence {
+            self.mvcc_store.blocking_checkpoint_lock.unlock();
+            self.holds_passive_checkpoint_commit_fence = false;
+        }
+    }
+
+    fn publish_committed_metadata(&self, end_ts: u64, tx_header: DatabaseHeader) {
+        {
+            // Keep the watermark and matching header publication ordered. An
+            // older commit can finish after a newer one, so neither value may
+            // move backwards.
+            let mut global_header = self.mvcc_store.global_header.write();
+            let last_committed_ts = self
+                .mvcc_store
+                .last_committed_tx_ts
+                .fetch_max(end_ts, Ordering::AcqRel);
+            if last_committed_ts <= end_ts {
+                global_header.replace(tx_header);
+            }
+        }
+        if self.did_commit_schema_change {
+            self.mvcc_store
+                .last_committed_schema_change_ts
+                .fetch_max(end_ts, Ordering::AcqRel);
+        }
+    }
+
     fn cleanup_unfinished_commit(&mut self) {
         if !self.is_finalized {
+            // CommitEnd makes the log frame durable and marks the transaction
+            // Committed before the chunked live-version rewrite. If the
+            // statement is dropped after that point, publish the same metadata
+            // as FinalizeCommit while the temporary-ID fence is still held.
+            if let Some(tx) = self.mvcc_store.txs.get(&self.tx_id) {
+                if let TransactionState::Committed(end_ts) = tx.value().state.load() {
+                    self.publish_committed_metadata(end_ts, *tx.value().header.read());
+                }
+            }
             self.cleanup_mvcc_checkpoint_state();
             if self.pending_log_append_bytes.take().is_some() {
                 if let Err(err) = self.mvcc_store.storage.discard_pending_log_write() {
@@ -1727,6 +1800,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     .set_tx_state(crate::connection::TransactionState::None);
             }
         }
+        self.release_passive_checkpoint_commit_fence();
 
         let tx_id = self.tx_id;
         let db_id = self.db_id;
@@ -2068,6 +2142,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             )
         };
 
+        // A checkpoint can publish a physical root after DDL creates its
+        // replacement sqlite_schema version but before this commit builds the
+        // log record. Normalize every schema version contributed by this
+        // transaction before the identity analysis below; otherwise an ALTER
+        // can look like DELETE(+root) plus INSERT(-temporary) for two different
+        // B-trees.
+        {
+            let write_set = tx.write_set.lock();
+            for (id, row_versions) in &write_set.entries {
+                if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                    continue;
+                }
+                let mut versions = row_versions.write();
+                for version in versions.iter_mut() {
+                    if is_our_begin(version) || is_our_end(version) {
+                        mvcc_store.canonicalize_schema_root_if_published(version)?;
+                    }
+                }
+            }
+        }
+
         let mut btree_ids_created_and_dropped_in_tx: HashSet<MVTableId> = HashSet::default();
         let mut btree_ids_removed_from_schema_by_tx: HashSet<MVTableId> = HashSet::default();
         {
@@ -2134,23 +2229,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             }
         }
 
-        // Remap a table_id to its canonical form for the log. After checkpoint,
-        // a table's in-memory table_id (e.g. -53) may differ from -(root_page)
-        // (e.g. -58). On recovery, bootstrap reconstructs the map using
-        // -(root_page), so log records must use that canonical form to be found.
-        let canonicalize_table_id = |version: &mut RowVersion| {
+        // Remap B-tree identities to their durable form for the log. After a
+        // checkpoint, a table's in-memory table_id (e.g. -53) may differ from
+        // -(root_page) (e.g. -58). sqlite_schema payloads use the positive
+        // physical root. Recovery reconstructs the map from those durable
+        // forms, so retained log records must not keep stale temporary IDs.
+        let canonicalize_btree_ids = |version: &mut RowVersion| -> Result<()> {
             let table_id = version.row.id.table_id;
             if table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                return;
+                return mvcc_store.canonicalize_schema_root_if_published(version);
             }
-            if let Some(entry) = mvcc_store.table_id_to_rootpage.get(&table_id) {
-                if let Some(root_page) = entry.value().root_page {
-                    let canonical = MVTableId::from(-(root_page as i64));
-                    if canonical != table_id {
-                        version.row.id.table_id = canonical;
-                    }
+            if let Some(root_page) = mvcc_store.published_root_page(&table_id) {
+                let canonical = MVTableId::from(-(root_page as i64));
+                if canonical != table_id {
+                    version.row.id.table_id = canonical;
                 }
             }
+            Ok(())
         };
 
         let collect_versions = |row_versions: &RowVersions<A>,
@@ -2300,7 +2395,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 let Some(mut committed_version) = our_committed_image(row_version) else {
                     continue;
                 };
-                canonicalize_table_id(&mut committed_version);
+                canonicalize_btree_ids(&mut committed_version)?;
                 let is_btree_resident_delete_marker =
                     |version: &RowVersion| version.btree_resident && version.end().is_some();
                 let replaces_last = entry_versions.last().is_some_and(|last| {
@@ -2899,7 +2994,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                  ** - Speculative reads/ignores call register_commit_dependency, which
                  **   increments CommitDepCounter and adds to CommitDepSet.
                  ** - WaitForDependencies checks AbortNow and waits for counter == 0.
-                 ** - CommitEnd / rollback_tx drain CommitDepSet, notifying dependents.
+                 ** - FinalizeCommit, abandoned-commit cleanup, and rollback_tx drain
+                 **   CommitDepSet, notifying dependents.
                  **
                  ** TODO: For full serializability (beyond snapshot isolation), we still need:
                  ** 1. Validate if all read versions are still visible by inspecting the read_set
@@ -3019,6 +3115,37 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
+                }
+
+                let references_unpublished_btree =
+                    tx.write_set.lock().iter().any(|(row_id, row_versions)| {
+                        if row_id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                            return !mvcc_store.has_published_root_page(&row_id.table_id);
+                        }
+                        row_versions.read().iter().any(|version| {
+                            let contributed_by_tx = matches!(
+                                version.begin(),
+                                Some(TxTimestampOrID::TxID(tx_id)) if tx_id == self.tx_id
+                            ) || matches!(
+                                version.end(),
+                                Some(TxTimestampOrID::TxID(tx_id)) if tx_id == self.tx_id
+                            );
+                            contributed_by_tx
+                                && sqlite_schema_btree_identity(version).is_some_and(|identity| {
+                                    identity.root_page < 0
+                                        && !mvcc_store.has_published_root_page(&MVTableId::from(
+                                            identity.root_page,
+                                        ))
+                                })
+                        })
+                    });
+                if self
+                    .connection
+                    .experimental_mvcc_passive_checkpoint_enabled()
+                    && references_unpublished_btree
+                    && !self.try_acquire_passive_checkpoint_commit_fence()
+                {
+                    return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
                 }
 
                 // All dependencies resolved. Initialize an empty log record
@@ -3156,6 +3283,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         != Some(tx_header.schema_cookie.get());
                 self.did_commit_schema_change = schema_did_change;
                 if schema_did_change {
+                    self.connection.with_schema_mut(|schema| {
+                        mvcc_store.resolve_schema_negative_roots(schema);
+                    })?;
                     let schema = self.connection.schema.read().clone();
                     self.connection.db.update_schema_if_newer(schema);
                 }
@@ -3217,6 +3347,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 tx_unlocked
                     .state
                     .store(TransactionState::Committed(*end_ts));
+                if self.holds_passive_checkpoint_commit_fence {
+                    // The durable log record contains at least one temporary
+                    // table ID. Publish its timestamp before any yield so a
+                    // checkpoint cannot materialize roots below this frame.
+                    mvcc_store
+                        .last_temporary_id_commit_ts
+                        .fetch_max(*end_ts, Ordering::AcqRel);
+                }
 
                 // Hand off to the chunked rewriter. Between chunks readers
                 // resolve any unwritten TxID refs via `txs[tx_id]` which now
@@ -3231,52 +3369,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             // helper-dispatch reason as BuildLogRecord above.
             CommitState::RewriteLiveVersions(_) => self.step_rewrite_live_versions(mvcc_store),
             CommitState::FinalizeCommit { end_ts } => {
+                let end_ts = *end_ts;
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
                     .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                 let tx_unlocked = tx.value();
 
-                // Hekaton Section 3.3: "The transaction then processes all outgoing
-                // commit dependencies listed in its CommitDepSet. If it committed, it
-                // decrements the target transaction's CommitDepCounter."
-                // IOW since this txn committed, let's signal waiting transactions.
-                let dependents = std::mem::take(&mut *tx_unlocked.commit_dep_set.lock());
-                for dep_tx_id in dependents {
-                    if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
-                        dep_tx_entry
-                            .value()
-                            .commit_dep_counter
-                            .fetch_sub(1, Ordering::AcqRel);
-                    }
-                }
+                mvcc_store.notify_committed_dependents(tx_unlocked);
 
                 mvcc_store.unlock_commit_lock_if_held(tx_unlocked);
 
                 inject_transition_yield!(self, CommitYieldPoint::BeforeGlobalHeaderUpdate);
 
                 let tx_header = *tx_unlocked.header.read();
-                {
-                    // Hold the header lock across the watermark update and header
-                    // publish so the guard decision and replacement are serialized.
-                    let mut global_header = mvcc_store.global_header.write();
-                    // Since we assign a commit timestamp and then we drive the commit to completion,
-                    // it is totally possible for so an older transaction can finish after a newer one.
-                    // In such case, we should not let older commit to set lower value than previous.
-                    // This value is used in checkpointing as a watermark boundary, and an incorrect
-                    // lower value can cause data loss / corruption.
-                    let last_committed_ts = mvcc_store
-                        .last_committed_tx_ts
-                        .fetch_max(*end_ts, Ordering::AcqRel);
-                    if last_committed_ts <= *end_ts {
-                        global_header.replace(tx_header);
-                    }
-                }
-                if self.did_commit_schema_change {
-                    mvcc_store
-                        .last_committed_schema_change_ts
-                        .fetch_max(*end_ts, Ordering::AcqRel);
-                }
+                self.publish_committed_metadata(end_ts, tx_header);
 
                 // We have now updated all the versions with a reference to the
                 // transaction ID to a timestamp and can, therefore, remove the
@@ -3294,6 +3401,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
+                self.release_passive_checkpoint_commit_fence();
                 if mvcc_store.storage.should_checkpoint() {
                     let auto_checkpoint_mode = if self
                         .connection
@@ -3330,7 +3438,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 if mvcc_store.should_gc() {
                     mvcc_store.gc_incremental(MvStore::<Clock>::MAX_CHAINS_PER_GC);
                 }
-                tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, *end_ts);
+                tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, end_ts);
                 self.finalize(mvcc_store)?;
                 Ok(TransitionResult::Done(()))
             }
@@ -3366,6 +3474,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
     }
 
     fn finalize(&mut self, _context: &Self::Context) -> Result<()> {
+        self.release_passive_checkpoint_commit_fence();
         self.is_finalized = true;
         Ok(())
     }
@@ -3961,11 +4070,11 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     exclusive_tx: AtomicU64,
     commit_coordinator: Arc<CommitCoordinator>,
     global_header: Arc<RwLock<Option<DatabaseHeader>>>,
-    /// Held by checkpoints only during the brief in-memory publish phase; the I/O-heavy
-    /// MvStore → WAL write-out runs unlocked, so concurrent `BEGIN CONCURRENT`s aren't
-    /// blocked. Phases: (unlocked) snapshot + collect + write + commit pager txn;
-    /// (locked) publish durable_txid_max / global_header / schema roots; (unlocked) GC,
-    /// CheckpointWal, truncate logical log, TruncateWal.
+    /// A passive checkpoint briefly takes the write side before its snapshot,
+    /// ordering checkpoint start after any commits that still serialize
+    /// temporary table IDs. It takes the write side again for the brief
+    /// in-memory publish phase. The I/O-heavy MvStore to WAL write-out runs
+    /// unlocked, so ordinary concurrent commits are not blocked.
     blocking_checkpoint_lock: Arc<TursoRwLock>,
     /// Passive publish drain: set for the brief in-memory publish window so new `begin_tx`
     /// calls contend out instead of pinning a lifetime checkpoint read guard.
@@ -3973,11 +4082,17 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// Bumped when a passive checkpoint publishes physical btree roots into the shared schema.
     /// Open transactions compare their captured value and get [`LimboError::SchemaUpdated`].
     schema_generation: AtomicU64,
-    /// Single-orchestrator gate: set while a CheckpointStateMachine runs its unlocked
-    /// write-out phase, cleared on completion/error. Commits racing `should_checkpoint()`
-    /// contend on it; only one wins. Needed because the lock no longer guards the start
-    /// of the checkpoint (it's acquired after the pager-write phase, not before).
+    /// Single-orchestrator gate: set while a CheckpointStateMachine runs its
+    /// unlocked write-out phase and cleared on completion/error. Commits that
+    /// still reference temporary table IDs wait for this gate to clear before
+    /// serializing their logical-log record.
     checkpoint_in_progress: AtomicBool,
+    /// Highest commit timestamp whose durable logical-log record contains a
+    /// temporary table ID. A passive checkpoint may publish physical root
+    /// mappings only when its snapshot covers this watermark; otherwise the
+    /// retained log frame could alias the newly published physical root during
+    /// recovery.
+    last_temporary_id_commit_ts: AtomicU64,
     /// The highest transaction ID that has been made durable in the WAL.
     /// Used to skip checkpointing transactions from mv store to WAL that have already been processed.
     durable_txid_max: AtomicU64,
@@ -4173,6 +4288,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             checkpoint_publish_in_progress: AtomicBool::new(false),
             schema_generation: AtomicU64::new(0),
             checkpoint_in_progress: AtomicBool::new(false),
+            last_temporary_id_commit_ts: AtomicU64::new(0),
             durable_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
@@ -4277,9 +4393,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         } else {
             table_id.into()
         };
-        if minimum <= self.next_table_id.load(Ordering::SeqCst) {
-            self.next_table_id.store(minimum - 1, Ordering::SeqCst);
-        }
+        self.next_table_id
+            .fetch_min(minimum.saturating_sub(1), Ordering::SeqCst);
     }
 
     /// Insert a live `table_id -> root_page` binding (bootstrap/recovery, or an
@@ -4301,6 +4416,46 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.table_id_to_rootpage
             .get(table_id)
             .and_then(|entry| entry.value().root_page)
+    }
+
+    /// Return `table_id`'s physical root only after its pager commit has been
+    /// published. A staged allocation must still be treated like a temporary
+    /// ID by commits because checkpoint failure can roll it back.
+    fn published_root_page(&self, table_id: &MVTableId) -> Option<u64> {
+        self.table_id_to_rootpage.get(table_id).and_then(|entry| {
+            let entry = entry.value();
+            if !entry.is_live() || entry.materialized_at == WalPos::STAGED {
+                None
+            } else {
+                entry.root_page
+            }
+        })
+    }
+
+    fn has_published_root_page(&self, table_id: &MVTableId) -> bool {
+        self.published_root_page(table_id).is_some()
+    }
+
+    fn canonicalize_schema_root_if_published(&self, version: &mut RowVersion) -> Result<()> {
+        let Some(identity) = sqlite_schema_btree_identity(version) else {
+            return Ok(());
+        };
+        if identity.root_page >= 0 {
+            return Ok(());
+        }
+        let temporary_id = MVTableId::from(identity.root_page);
+        let Some(root_page) = self.published_root_page(&temporary_id) else {
+            return Ok(());
+        };
+        let record = ImmutableRecordRef::from_bin_record(version.row.payload());
+        let mut values = record.get_values_owned()?;
+        values[3] = crate::Value::from_i64(root_page as i64);
+        let record = ImmutableRecord::from_values(&values, values.len())?;
+        version.row.data = Some(crate::alloc::try_arc_slice_from_slice_in(
+            record.get_payload(),
+            self.allocator(),
+        )?);
+        Ok(())
     }
 
     /// Record that a PASSIVE checkpoint allocated `root_page` for `table_id`. `begin_ts` is the
@@ -4388,10 +4543,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     /// Acquire MVCC's stop-the-world gate for VACUUM.
     ///
-    /// This is the same lock used by MVCC checkpointing. All MVCC transactions
-    /// hold it in read mode for their whole lifetime, so acquiring it in write
-    /// mode proves there are no active MVCC transactions and prevents new ones
-    /// from starting until VACUUM releases it.
+    /// This is the same lock used by MVCC checkpointing. Truncate-mode
+    /// transactions hold it in read mode for their whole lifetime; passive
+    /// transactions acquire it before allocating a temporary table ID. The
+    /// explicit `txs` check below verifies that no other passive transaction is
+    /// active.
     pub(crate) fn try_begin_vacuum_gate(&self) -> Result<()> {
         if !self.blocking_checkpoint_lock.write() {
             return Err(LimboError::Busy);
@@ -4884,8 +5040,48 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// MVCC table ids are always negative. Their corresponding rootpage entry in sqlite_schema
     /// is the same negative value if the table has not been checkpointed yet. Otherwise, the root page
     /// will be positive and corresponds to the actual physical page.
-    pub fn get_next_table_id(&self) -> i64 {
-        self.next_table_id.fetch_sub(1, Ordering::SeqCst)
+    pub fn try_get_next_table_id(&self, tx_id: TxID) -> Result<Option<i64>> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+
+        if !tx
+            .value()
+            .holds_blocking_checkpoint_read
+            .load(Ordering::Acquire)
+        {
+            // Serialize the first temporary-ID allocation with passive
+            // checkpoint snapshot publication. Holding this read guard until
+            // transaction removal covers both directions of the race:
+            //
+            // * an allocation that wins first must commit/rollback before the
+            //   checkpoint can freeze its snapshot;
+            // * a checkpoint that wins first keeps later allocations parked
+            //   until all physical root-page mappings have been published.
+            if self.checkpoint_in_progress.load(Ordering::Acquire)
+                || !self.blocking_checkpoint_lock.read()
+            {
+                return Ok(None);
+            }
+            if self.checkpoint_in_progress.load(Ordering::Acquire) {
+                self.blocking_checkpoint_lock.unlock();
+                return Ok(None);
+            }
+
+            if tx
+                .value()
+                .holds_blocking_checkpoint_read
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                // Another allocator for this transaction installed the
+                // transaction-lifetime guard; drop only our redundant read.
+                self.blocking_checkpoint_lock.unlock();
+            }
+        }
+
+        Ok(Some(self.next_table_id.fetch_sub(1, Ordering::SeqCst)))
     }
 
     pub fn get_next_rowid(&self) -> i64 {
@@ -6040,7 +6236,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             let dep_set = std::mem::take(&mut *tx.commit_dep_set.lock());
             // Invariant: commit_dep_set must be drained before removing the transaction.
-            // CommitEnd and rollback_tx both drain the commit_dep_set to notify dependencies.
+            // Committed finalization or cleanup, and rollback_tx, drain the set to notify
+            // dependencies.
             // If we remove a transaction with non-empty commit_dep_set, those dependencies will wait
             // forever (deadlock).
             turso_assert!(
@@ -6055,6 +6252,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         self.txs.remove(&tx_id);
         Ok(())
+    }
+
+    /// Resolve every outgoing commit dependency after `tx` commits.
+    ///
+    /// Both the normal FinalizeCommit path and abandoned-commit cleanup must
+    /// drain this set before removing the transaction. Otherwise dependents
+    /// wait forever and `remove_tx` rejects the non-empty set.
+    fn notify_committed_dependents(&self, tx: &Transaction<A>) {
+        let dependents = std::mem::take(&mut *tx.commit_dep_set.lock());
+        for dep_tx_id in dependents {
+            if let Some(dep_tx_entry) = self.txs.get(&dep_tx_id) {
+                dep_tx_entry
+                    .value()
+                    .commit_dep_counter
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+        }
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::FinalizedTxStateInsert)]
@@ -6411,6 +6625,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // removed TxID (https://github.com/tursodatabase/turso/issues/7477).
                 self.rewrite_live_versions_for_committed_tx(tx_id, end_ts);
                 if let Some(tx) = self.txs.get(&tx_id) {
+                    self.notify_committed_dependents(tx.value());
                     self.unlock_commit_lock_if_held(tx.value());
                 }
                 if self.is_exclusive_tx(&tx_id) {
@@ -8191,13 +8406,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if root_page >= 0 {
                 return None;
             }
-            self.table_id_to_rootpage
-                .get(&MVTableId::from(root_page))
-                .filter(|e| e.value().is_live())
-                .and_then(|e| e.value().root_page)
-                .map(|r| r as i64)
+            self.published_root_page(&MVTableId::from(root_page))
+                .map(|root| root as i64)
         };
-        for table in schema.tables.values_mut() {
+        for (name, table) in schema.tables.iter_mut() {
+            #[cfg(not(feature = "conn_raw_api"))]
+            let _ = name;
             let needs = table
                 .btree()
                 .is_some_and(|b| resolve(b.root_page).is_some());
@@ -8207,8 +8421,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let table = Arc::make_mut(table);
             if let Some(btree_table) = table.btree_mut() {
                 let btree_table = Arc::make_mut(btree_table);
+                #[cfg(feature = "conn_raw_api")]
+                let old_root_page = btree_table.root_page;
                 if let Some(rp) = resolve(btree_table.root_page) {
                     btree_table.root_page = rp;
+                    #[cfg(feature = "conn_raw_api")]
+                    {
+                        schema.table_names_by_root_page.remove(&old_root_page);
+                        schema
+                            .table_names_by_root_page
+                            .insert(btree_table.root_page, name.clone());
+                    }
                 }
             }
         }
@@ -9734,9 +9957,8 @@ fn register_commit_dependency<A: ConcurrentAllocator>(
         "transaction cannot depend on itself"
     );
     let Some(depended_on) = txs.get(&depended_on_tx_id) else {
-        // Transaction was already committed and removed from the map
-        // (CommitEnd calls remove_tx after setting Committed and draining
-        // CommitDepSet). Dependency is trivially resolved.
+        // The transaction was already finalized or rolled back and removed
+        // after its CommitDepSet was drained. The dependency is resolved.
         return;
     };
     let depended_on = depended_on.value();
