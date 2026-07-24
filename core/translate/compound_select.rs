@@ -776,7 +776,7 @@ fn create_collection_index(
                 .map(|n| n.to_string())
                 .unwrap_or_default(),
             order: SortOrder::Asc,
-            nulls: None,
+            nulls_order: None,
             pos_in_table: i,
             default: None,
             collation: None,

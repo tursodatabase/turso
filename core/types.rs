@@ -2394,7 +2394,7 @@ impl IndexInfo {
             .map(|c| KeyInfo {
                 sort_order: c.order,
                 collation: c.collation.unwrap_or_default(),
-                nulls_order: c.nulls,
+                nulls_order: c.nulls_order,
             })
             .chain(index.has_rowid.then_some(KeyInfo {
                 sort_order: SortOrder::Asc,

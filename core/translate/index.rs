@@ -443,7 +443,7 @@ fn emit_refill_index(
         let order_collations_nulls = idx
             .columns
             .iter()
-            .map(|c| (c.order, c.collation, c.nulls))
+            .map(|c| (c.order, c.collation, c.nulls_order))
             .try_collect()?;
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sorter_cursor_id,
@@ -922,7 +922,7 @@ fn resolve_sorted_columns_with_resolver(
                 .push_within_capacity(IndexColumn {
                     name: column_name,
                     order,
-                    nulls,
+                    nulls_order: nulls,
                     pos_in_table: pos,
                     collation,
                     default: column.default.clone(),
@@ -938,7 +938,7 @@ fn resolve_sorted_columns_with_resolver(
             .push_within_capacity(IndexColumn {
                 name: sc.expr.to_string(),
                 order,
-                nulls,
+                nulls_order: nulls,
                 pos_in_table: EXPR_INDEX_SENTINEL,
                 collation: explicit_collation,
                 default: None,
