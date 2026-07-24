@@ -38,6 +38,9 @@ const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
 const MVCC_TX_TRAILER_SIZE: usize = 8;
 const MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
 
+type SnapshotPage = (u64, Vec<u8>);
+type SnapshotPages = (u64, Vec<SnapshotPage>);
+
 pub struct TursoSyncServer {
     address: String,
     db_path: String,
@@ -535,6 +538,21 @@ impl TursoSyncServer {
             None
         };
 
+        // A missing client revision denotes bootstrap, not "changes after frame 0".
+        // The base database may already contain checkpointed pages which do not
+        // exist in the current WAL, so a WAL-only response would create a sparse
+        // or entirely zero-filled client database.
+        if req.client_revision.is_empty() {
+            let (db_size, pages) =
+                read_snapshot_pages(&conn, server_revision, pages_selector.as_ref())?;
+            return Ok(page_stream_response(
+                server_revision.to_string(),
+                db_size,
+                pages,
+                PullUpdatesApplyMode::ReplaceBase,
+            ));
+        }
+
         let mut seen_pages: HashSet<u32> = HashSet::new();
         let mut pages_to_send: Vec<(u32, Vec<u8>)> = Vec::new();
 
@@ -789,63 +807,18 @@ impl TursoSyncServer {
 
     fn handle_replace_base_pages(&self, server_revision: String) -> Result<HttpResponse> {
         let (db_size, pages) = self.read_replace_base_pages()?;
-
-        let header = PullUpdatesRespProtoBody {
+        Ok(page_stream_response(
             server_revision,
             db_size,
-            raw_encoding: Some(PageSetRawEncodingProto {}),
-            zstd_encoding: None,
-            stream_kind: PullUpdatesStreamKind::Pages as i32,
-            apply_mode: PullUpdatesApplyMode::ReplaceBase as i32,
-            mvcc_log: None,
-        };
-
-        let mut response_body = Vec::new();
-        let header_bytes = header.encode_to_vec();
-        encode_length_delimited(&mut response_body, &header_bytes);
-
-        for (page_id, page) in pages {
-            let page_msg = PageData {
-                page_id,
-                encoded_page: Bytes::from(page),
-            };
-            let page_bytes = page_msg.encode_to_vec();
-            encode_length_delimited(&mut response_body, &page_bytes);
-        }
-
-        Ok(HttpResponse {
-            status: 200,
-            content_type: "application/protobuf".to_string(),
-            body: response_body,
-        })
+            pages,
+            PullUpdatesApplyMode::ReplaceBase,
+        ))
     }
 
-    #[allow(clippy::type_complexity)]
-    fn read_replace_base_pages(&self) -> Result<(u64, Vec<(u64, Vec<u8>)>)> {
+    fn read_replace_base_pages(&self) -> Result<SnapshotPages> {
         let conn = self.conn.lock().unwrap();
         let wal_state = conn.wal_state()?;
-        let frame_watermark = Some(wal_state.max_frame);
-        let db_size = current_snapshot_db_size_pages(&conn, wal_state.max_frame)?;
-        let pages_capacity = usize::try_from(db_size)
-            .map_err(|_| anyhow!("database page count does not fit usize: {db_size}"))?;
-        let mut pages = Vec::with_capacity(pages_capacity);
-
-        for page_no in 1..=db_size {
-            let page_no_u32 = u32::try_from(page_no)
-                .map_err(|_| anyhow!("database page number does not fit u32: {page_no}"))?;
-            let mut page = vec![0; PAGE_SIZE];
-            let found =
-                conn.try_wal_watermark_read_page(page_no_u32, &mut page, frame_watermark)?;
-            if !found {
-                return Err(anyhow!(
-                    "database page {} is missing from replace-base snapshot",
-                    page_no
-                ));
-            }
-            pages.push((page_no - 1, page));
-        }
-
-        Ok((db_size, pages))
+        read_snapshot_pages(&conn, wal_state.max_frame, None)
     }
 }
 
@@ -1116,6 +1089,85 @@ fn current_snapshot_db_size_pages(conn: &Connection, max_frame: u64) -> Result<u
     }
 }
 
+fn read_snapshot_pages(
+    conn: &Connection,
+    frame_watermark: u64,
+    pages_selector: Option<&RoaringBitmap>,
+) -> Result<SnapshotPages> {
+    let db_size = current_snapshot_db_size_pages(conn, frame_watermark)?;
+    let selected_count = pages_selector
+        .map(|selector| selector.len().min(db_size))
+        .unwrap_or(db_size);
+    let pages_capacity = usize::try_from(selected_count)
+        .map_err(|_| anyhow!("database page count does not fit usize: {selected_count}"))?;
+    let mut pages = Vec::with_capacity(pages_capacity);
+
+    let mut read_page = |page_id: u64| -> Result<()> {
+        if page_id >= db_size {
+            return Ok(());
+        }
+        let page_no = page_id + 1;
+        let page_no_u32 = u32::try_from(page_no)
+            .map_err(|_| anyhow!("database page number does not fit u32: {page_no}"))?;
+        let mut page = vec![0; PAGE_SIZE];
+        if !conn.try_wal_watermark_read_page(page_no_u32, &mut page, Some(frame_watermark))? {
+            return Err(anyhow!(
+                "database page {page_no} is missing from snapshot at frame {frame_watermark}"
+            ));
+        }
+        pages.push((page_id, page));
+        Ok(())
+    };
+
+    if let Some(selector) = pages_selector {
+        for page_id in selector.iter() {
+            read_page(u64::from(page_id))?;
+        }
+    } else {
+        for page_id in 0..db_size {
+            read_page(page_id)?;
+        }
+    }
+
+    Ok((db_size, pages))
+}
+
+fn page_stream_response(
+    server_revision: String,
+    db_size: u64,
+    pages: Vec<SnapshotPage>,
+    apply_mode: PullUpdatesApplyMode,
+) -> HttpResponse {
+    let header = PullUpdatesRespProtoBody {
+        server_revision,
+        db_size,
+        raw_encoding: Some(PageSetRawEncodingProto {}),
+        zstd_encoding: None,
+        stream_kind: PullUpdatesStreamKind::Pages as i32,
+        apply_mode: apply_mode as i32,
+        mvcc_log: None,
+    };
+
+    let mut response_body = Vec::new();
+    let header_bytes = header.encode_to_vec();
+    encode_length_delimited(&mut response_body, &header_bytes);
+
+    for (page_id, page) in pages {
+        let page_msg = PageData {
+            page_id,
+            encoded_page: Bytes::from(page),
+        };
+        let page_bytes = page_msg.encode_to_vec();
+        encode_length_delimited(&mut response_body, &page_bytes);
+    }
+
+    HttpResponse {
+        status: 200,
+        content_type: "application/protobuf".to_string(),
+        body: response_body,
+    }
+}
+
 fn db_size_from_page(page: &[u8]) -> u32 {
     u32::from_be_bytes(page[28..32].try_into().unwrap())
 }
@@ -1222,5 +1274,157 @@ fn convert_core_to_value(value: CoreValue) -> Value {
         CoreValue::Blob(b) => Value::Blob {
             value: Bytes::from(b),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use turso_core::{Database, PlatformIO, SqliteDialect};
+
+    fn preexisting_checkpointed_server() -> (TempDir, TursoSyncServer) {
+        let dir = tempfile::tempdir().unwrap();
+        let server_path = dir.path().join("server.db");
+
+        {
+            let sqlite = rusqlite::Connection::open(&server_path).unwrap();
+            sqlite.pragma_update(None, "journal_mode", "wal").unwrap();
+            sqlite
+                .execute_batch(
+                    "
+                    CREATE TABLE notes(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        content TEXT NOT NULL
+                    );
+                    INSERT INTO notes(content) VALUES
+                        ('first'),
+                        ('second'),
+                        ('third');
+                    PRAGMA wal_checkpoint(TRUNCATE);
+                    ",
+                )
+                .unwrap();
+        }
+
+        let db_path = server_path.to_str().unwrap();
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, db_path, Arc::new(SqliteDialect))
+            .expect("open server database");
+        let conn = db.connect().unwrap();
+        assert_eq!(
+            conn.wal_state().unwrap().max_frame,
+            0,
+            "the regression requires all committed pages to exist only in the base database"
+        );
+
+        (
+            dir,
+            TursoSyncServer::new(
+                "unused".to_string(),
+                db_path.to_string(),
+                conn,
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn page_request(
+        server_revision: &str,
+        client_revision: &str,
+        server_pages_selector: Bytes,
+    ) -> PullUpdatesReqProtoBody {
+        PullUpdatesReqProtoBody {
+            encoding: PageUpdatesEncodingReq::Raw as i32,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+            server_revision: server_revision.to_string(),
+            client_revision: client_revision.to_string(),
+            long_poll_timeout_ms: 0,
+            server_pages_selector,
+            server_query_selector: String::new(),
+            client_pages: Bytes::new(),
+        }
+    }
+
+    fn decode_page_response(
+        server: &TursoSyncServer,
+        request: PullUpdatesReqProtoBody,
+    ) -> (PullUpdatesRespProtoBody, Vec<PageData>) {
+        let response = server
+            .handle_pull_updates(&request.encode_to_vec())
+            .unwrap();
+        let mut body = response.body.as_slice();
+        let header = PullUpdatesRespProtoBody::decode_length_delimited(&mut body).unwrap();
+        let mut pages = Vec::new();
+        while !body.is_empty() {
+            pages.push(PageData::decode_length_delimited(&mut body).unwrap());
+        }
+        (header, pages)
+    }
+
+    #[test]
+    fn bootstrap_preexisting_checkpointed_database_sends_complete_snapshot() {
+        let (dir, server) = preexisting_checkpointed_server();
+        let (header, pages) = decode_page_response(&server, page_request("", "", Bytes::new()));
+        assert!(
+            header.db_size > 0,
+            "bootstrap must report the preexisting base database size"
+        );
+        assert_eq!(header.apply_mode, PullUpdatesApplyMode::ReplaceBase as i32);
+        assert_eq!(
+            pages.len() as u64,
+            header.db_size,
+            "a full bootstrap must include every page in the snapshot"
+        );
+
+        let mut client_image = vec![0; header.db_size as usize * PAGE_SIZE];
+        for page in pages {
+            let start = page.page_id as usize * PAGE_SIZE;
+            let end = start + PAGE_SIZE;
+            client_image[start..end].copy_from_slice(&page.encoded_page);
+        }
+
+        let client_path = dir.path().join("client.db");
+        std::fs::write(&client_path, client_image).unwrap();
+        let client = rusqlite::Connection::open(client_path).unwrap();
+        let row_count: i64 = client
+            .query_row("SELECT count(*) FROM notes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 3);
+    }
+
+    #[test]
+    fn bootstrap_preexisting_database_respects_page_selector() {
+        let (_dir, server) = preexisting_checkpointed_server();
+        let mut selector = RoaringBitmap::new();
+        selector.insert(0);
+        let mut selector_bytes = Vec::new();
+        selector.serialize_into(&mut selector_bytes).unwrap();
+
+        let (header, pages) =
+            decode_page_response(&server, page_request("", "", Bytes::from(selector_bytes)));
+        assert!(header.db_size > 1);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].page_id, 0);
+        assert_eq!(&pages[0].encoded_page[..16], b"SQLite format 3\0");
+    }
+
+    #[test]
+    fn nonempty_zero_revision_still_receives_incremental_wal_pages() {
+        let (_dir, server) = preexisting_checkpointed_server();
+        {
+            let conn = server.conn.lock().unwrap();
+            conn.execute("INSERT INTO notes(content) VALUES ('after bootstrap')")
+                .unwrap();
+            assert!(conn.wal_state().unwrap().max_frame > 0);
+        }
+
+        let (header, pages) = decode_page_response(&server, page_request("", "0", Bytes::new()));
+        assert_eq!(header.apply_mode, PullUpdatesApplyMode::Incremental as i32);
+        assert!(
+            !pages.is_empty(),
+            "an established client at revision 0 must receive later WAL changes"
+        );
     }
 }
