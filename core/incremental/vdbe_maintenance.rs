@@ -75,7 +75,7 @@ mod stream;
 use stream::*;
 
 mod join;
-use join::{emit_join_deltas_to_ephemeral, emit_left_join_deltas_to_ephemeral};
+use join::{emit_join_deltas_to_ephemeral, emit_left_join_deltas_to_ephemeral, JoinContract};
 
 /// What the maintenance program reads as its input relation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -217,14 +217,6 @@ impl DeltaSource {
 struct NodeOutput {
     delta: DeltaSource,
     arrangement: Option<ArrangementHandle>,
-}
-
-/// Physical inputs declared by one Join DAG node.
-struct JoinContract {
-    deltas: Vec<DeltaSource>,
-    schemas: Vec<Arc<dag::StreamSchema>>,
-    arrangements: Vec<ArrangementHandle>,
-    on: Vec<ast::Expr>,
 }
 
 /// A [`JoinedTable`] scan entry for synthesized maintenance-program bindings.
@@ -2374,47 +2366,6 @@ fn scan_node_output(
     })
 }
 
-fn join_contract_from_inputs(
-    inputs: &[NodeOutput],
-    input_schemas: &[Arc<dag::StreamSchema>],
-    on: &[ast::Expr],
-) -> Result<JoinContract> {
-    turso_assert!(
-        inputs.len() == 2 && input_schemas.len() == 2,
-        "a binary join must declare exactly two physical inputs"
-    );
-    let mut deltas = Vec::with_capacity(inputs.len());
-    let mut arrangements = Vec::with_capacity(inputs.len());
-    for (input, input_schema) in inputs.iter().zip(input_schemas) {
-        let arrangement = input.arrangement.clone().ok_or_else(|| {
-            LimboError::InternalError("join input has no materialized arrangement".to_string())
-        })?;
-        if arrangement.value_columns().len() != input_schema.len() {
-            return Err(LimboError::InternalError(
-                "join arrangement does not match its logical input width".to_string(),
-            ));
-        }
-        if arrangement.binding_rowid_columns().len() != input_schema.bindings.len() {
-            return Err(LimboError::InternalError(
-                "join arrangement does not match its logical binding provenance".to_string(),
-            ));
-        }
-        if arrangement.identity() != input.delta.identity() {
-            return Err(LimboError::InternalError(
-                "join delta and arrangement expose different identities".to_string(),
-            ));
-        }
-        deltas.push(input.delta.clone());
-        arrangements.push(arrangement);
-    }
-    Ok(JoinContract {
-        deltas,
-        schemas: input_schemas.to_vec(),
-        arrangements,
-        on: on.to_vec(),
-    })
-}
-
 /// Integrate one node's declared delta into its persistent output arrangement.
 ///
 /// Interior arrangements preserve the producer identity so later binary joins
@@ -3330,25 +3281,19 @@ fn emit_declared_delta_nodes_to(
                 }
             }
             dag::OpNode::Join { inputs, on, kind } => {
-                let declared_inputs = inputs
-                    .iter()
-                    .map(|input| {
-                        outputs[*input].as_ref().cloned().ok_or_else(|| {
-                            LimboError::InternalError(format!(
-                                "join DAG node {node_id} input {input} was not compiled"
-                            ))
-                        })
+                let declared_input = |input_id: dag::NodeId| {
+                    outputs[input_id].as_ref().ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "join DAG node {node_id} input {input_id} was not compiled"
+                        ))
                     })
-                    .collect::<Result<Vec<_>>>()?;
-                let input_schemas = inputs
-                    .iter()
-                    .map(|input| {
-                        operator_states
-                            .output_for_node(*input)
-                            .map(|plan| plan.schema.clone())
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let contract = join_contract_from_inputs(&declared_inputs, &input_schemas, on)?;
+                };
+                let declared_inputs = [declared_input(inputs[0])?, declared_input(inputs[1])?];
+                let input_schemas = [
+                    operator_states.output_for_node(inputs[0])?.schema.clone(),
+                    operator_states.output_for_node(inputs[1])?.schema.clone(),
+                ];
+                let contract = JoinContract::from_outputs(declared_inputs, input_schemas, on)?;
                 if *kind == dag::JoinKind::LeftOuter {
                     NodeOutput {
                         delta: emit_left_join_deltas_to_ephemeral(
@@ -3382,10 +3327,7 @@ fn emit_declared_delta_nodes_to(
                             &mut resolver,
                             view_name,
                             output_contract,
-                            &contract.deltas,
-                            &contract.schemas,
-                            &contract.arrangements,
-                            &contract.on,
+                            &contract,
                             input,
                         )?,
                         arrangement: None,
