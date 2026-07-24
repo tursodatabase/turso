@@ -6761,8 +6761,13 @@ fn ordered_set_percentile_disc(values: &[Value], fraction: f64, collation: Colla
     sorted[index.min(n - 1)].clone()
 }
 
-/// Records what a window function needs from one row so its answer can be read
-/// later. Functions without arguments do not read `arg_reg`.
+/// Per-row step for pure window functions (those carried in
+/// `AccumulatorFunc::Window`). Mirrors `op_agg_step` but with no FILTER and
+/// per-function state semantics. State lives in the same
+/// `Register::Aggregate(AggContext::Builtin(_))` slot used by built-in
+/// aggregates so AggValue can read it back via the standard path. The `col`
+/// argument is the register holding the function's single argument (when it
+/// has one — 0-ary functions like row_number ignore it).
 fn op_window_step(
     state: &mut ProgramState,
     acc_reg: usize,
@@ -6855,50 +6860,6 @@ fn op_window_step(
             };
             *pending = 1;
         }
-        // first_value(expr) — captures the argument value of the first row
-        // of the partition once, then never updates. Under our default
-        // RANGE UNBOUNDED PRECEDING TO CURRENT ROW frame this corresponds
-        // to "value at frame start = partition start" (matches SQLite's
-        // first_valueStepFunc behavior on the same frame).
-        //
-        // State: payload[0] = captured value, payload[1] = captured flag
-        // (Integer 0 = not yet captured, 1 = captured). The flag lets us
-        // distinguish "no captures yet" from "captured a NULL".
-        WindowFunc::FirstValue => {
-            if let Register::Value(Value::Null) = state.registers[acc_reg] {
-                state.registers[acc_reg] =
-                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
-                        Value::Null,
-                        Value::from_i64(0),
-                    ]?));
-            }
-            // Most steps past the first per partition are no-ops; check the
-            // capture flag with an immutable borrow first so we don't clone
-            // the arg (potentially a Text/Blob allocation) on every row.
-            let already_captured = {
-                let Register::Aggregate(AggContext::Builtin(payload)) = &state.registers[acc_reg]
-                else {
-                    unreachable!("first_value accumulator must be a Builtin payload");
-                };
-                let Value::Numeric(Numeric::Integer(captured)) = &payload[1] else {
-                    unreachable!("first_value capture flag must be Integer");
-                };
-                *captured != 0
-            };
-            if !already_captured {
-                let arg_value = state.registers[arg_reg].get_value().clone();
-                let Register::Aggregate(AggContext::Builtin(payload)) =
-                    &mut state.registers[acc_reg]
-                else {
-                    unreachable!("first_value accumulator must be a Builtin payload");
-                };
-                payload[0] = arg_value;
-                let Value::Numeric(Numeric::Integer(captured)) = &mut payload[1] else {
-                    unreachable!("first_value capture flag must be Integer");
-                };
-                *captured = 1;
-            }
-        }
         // last_value(expr) — captures the argument value of every source row,
         // so payload[0] always holds the value of the most recently stepped
         // row. With our default RANGE frame, AggValue is called once per
@@ -6915,6 +6876,46 @@ fn op_window_step(
                 unreachable!("last_value accumulator must be a Builtin payload");
             };
             payload[0] = arg_value;
+        }
+        // ntile(N) — mirrors SQLite's NtileCtx (window.c:410). Frame is
+        // ROWS CURRENT ROW TO UNBOUNDED FOLLOWING. The step fires for
+        // every row entering the frame end (i.e. every row in the
+        // partition); the inverse fires for every row leaving the
+        // frame start, advancing the iRow counter that xValue uses to
+        // pick a bucket.
+        //
+        // State (payload):
+        //   [0] = nTotal — partition row count, incremented per step.
+        //   [1] = nParam — the bucket count, captured from arg[0] on
+        //         first step.
+        //   [2] = iRow   — current output-row index within the
+        //         partition, incremented per inverse.
+        WindowFunc::Ntile => {
+            if let Register::Value(Value::Null) = state.registers[acc_reg] {
+                // ntile(N): N is coerced with SQLite's `sqlite3_value_int64`
+                // rules — the leading integer prefix of text, blobs read as
+                // text, floats truncated toward zero — then must be positive.
+                let nparam = extract_int_value(state.registers[arg_reg].get_value());
+                if nparam <= 0 {
+                    return Err(LimboError::InvalidArgument(
+                        "argument of ntile must be a positive integer".into(),
+                    ));
+                }
+                state.registers[acc_reg] =
+                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
+                        Value::from_i64(0),
+                        Value::from_i64(nparam),
+                        Value::from_i64(0),
+                    ]?));
+            }
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                unreachable!("ntile accumulator must be a Builtin payload");
+            };
+            let Value::Numeric(Numeric::Integer(ntotal)) = &mut payload[0] else {
+                unreachable!("ntile nTotal counter must be Integer");
+            };
+            *ntotal += 1;
         }
         other => {
             return Err(LimboError::InternalError(format!(
@@ -7005,6 +7006,42 @@ fn op_window_value(
             };
             std::mem::replace(&mut payload[0], Value::Null)
         }
+        // ntile bucket computation — mirrors SQLite's ntileValueFunc
+        // (window.c:453). The partition is split into nParam buckets;
+        // when nTotal isn't a clean multiple, the first nLarge buckets
+        // get one extra row each (size nSize+1) and the rest get nSize.
+        // iRow is the 0-based output position within the partition.
+        WindowFunc::Ntile => {
+            let Register::Aggregate(AggContext::Builtin(payload)) = &state.registers[acc_reg]
+            else {
+                unreachable!("ntile accumulator must be a Builtin payload (xStep runs first)");
+            };
+            let Value::Numeric(Numeric::Integer(ntotal)) = &payload[0] else {
+                unreachable!("ntile nTotal must be Integer");
+            };
+            let Value::Numeric(Numeric::Integer(nparam)) = &payload[1] else {
+                unreachable!("ntile nParam must be Integer");
+            };
+            let Value::Numeric(Numeric::Integer(irow)) = &payload[2] else {
+                unreachable!("ntile iRow must be Integer");
+            };
+            let ntotal = *ntotal;
+            let nparam = *nparam;
+            let irow = *irow;
+            let nsize = ntotal / nparam;
+            let bucket = if nsize == 0 {
+                irow + 1
+            } else {
+                let nlarge = ntotal - nparam * nsize;
+                let ismall = nlarge * (nsize + 1);
+                if irow < ismall {
+                    1 + irow / (nsize + 1)
+                } else {
+                    1 + nlarge + (irow - ismall) / nsize
+                }
+            };
+            Value::from_i64(bucket)
+        }
         other => {
             return Err(LimboError::InternalError(format!(
                 "window function {other} reached runtime dispatch but has no handler"
@@ -7014,6 +7051,69 @@ fn op_window_value(
     state.registers[dest_reg].set_value(value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Per-row inverse-step for pure window functions. Companion to
+/// `op_window_step`: fires when a row crosses the frame-start cursor on its
+/// way out of the function's frame.
+fn op_window_inverse(
+    state: &mut ProgramState,
+    acc_reg: usize,
+    _arg_reg: usize,
+    func: &WindowFunc,
+) -> Result<InsnFunctionStepResult> {
+    match func {
+        // ntile's xInverse advances iRow — the output-row position
+        // within the partition that xValue reads. xStep has already
+        // populated nTotal and nParam by the time the flush loop fires
+        // inverse, so the payload is always Builtin here.
+        WindowFunc::Ntile => {
+            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
+            else {
+                unreachable!(
+                    "ntile accumulator must be a Builtin payload at inverse (xStep runs first)"
+                );
+            };
+            let Value::Numeric(Numeric::Integer(irow)) = &mut payload[2] else {
+                unreachable!("ntile iRow must be Integer");
+            };
+            *irow += 1;
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        _ => unreachable!("AggInverse fired for {func} but no inverse arm is wired"),
+    }
+}
+
+pub fn op_agg_inverse(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        AggInverse {
+            acc_reg,
+            col,
+            delimiter: _,
+            func,
+            comparator: _,
+        },
+        insn
+    );
+
+    if let AccumulatorFunc::Window(win_func) = func {
+        return op_window_inverse(state, *acc_reg, *col, win_func);
+    }
+
+    // Aggregate window functions all carry RANGE UNBOUNDED PRECEDING TO
+    // CURRENT ROW as their coerced frame, so the frame start never moves
+    // and AggInverse is never emitted for them. Reaching this arm is a
+    // planner bug.
+    unreachable!(
+        "AggInverse fired for aggregate {} but no inverse arm is wired",
+        func.expect_agg()
+    );
 }
 
 pub fn op_agg_step(
