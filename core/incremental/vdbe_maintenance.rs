@@ -71,6 +71,9 @@ use crate::{
 };
 use turso_parser::ast::TableInternalId;
 
+mod stream;
+use stream::*;
+
 /// What the maintenance program reads as its input relation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MaintenanceInput {
@@ -181,7 +184,7 @@ impl DeltaSource {
             };
             return Ok(channel.clone());
         };
-        let sink = open_ephemeral_delta(
+        let channel = open_ephemeral_delta(
             program,
             &format!("{view_name}_scan_delta_{source_node}"),
             source_contract.schema.as_ref().clone(),
@@ -189,16 +192,15 @@ impl DeltaSource {
             source_contract.binding_rowids.clone(),
             false,
         );
-        let channel = sink.ephemeral()?;
         emit_base_scan_delta(
             program,
             view_name,
             table,
             *stored_weight_column,
             input,
-            channel,
+            &channel,
         )?;
-        Ok(channel.clone())
+        Ok(channel)
     }
 }
 
@@ -220,257 +222,6 @@ struct JoinContract {
     schemas: Vec<Arc<dag::StreamSchema>>,
     arrangements: Vec<ArrangementHandle>,
     on: Vec<ast::Expr>,
-}
-
-#[derive(Debug, Clone)]
-struct EphemeralDelta {
-    cursor_id: usize,
-    identity: DeltaIdentity,
-    /// Physical metadata column carrying each logical binding's SQL rowid.
-    /// `None` means this node intentionally does not expose rowid provenance
-    /// for that namespace.
-    binding_rowid_columns: Arc<[Option<usize>]>,
-    value_start: usize,
-    width: usize,
-    weight_column: usize,
-    schema: Arc<dag::StreamSchema>,
-    /// Applying negative join contributions before positive ones can
-    /// transiently retract an as-yet-unknown group. Consumers that merge into
-    /// state must process this stream positive-first.
-    requires_positive_first: bool,
-}
-
-/// Stable transport identity carried ahead of an ephemeral delta's relational
-/// values. Encoding the identity kind as a sum type prevents consumers from
-/// treating an operator-owned state rowid as a SQL binding rowid merely
-/// because both occupy one physical slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeltaIdentity {
-    /// One SQL rowid per logical binding, in binding order.
-    BindingRowids(usize),
-    /// One opaque rowid owned by the emitting stateful operator.
-    OperatorRowid,
-    /// An opaque, fixed-width key owned by an operator. Consumers may carry
-    /// it through linear edges or use it to build an arrangement, but must
-    /// not interpret its slots as SQL binding rowids.
-    OperatorKey(usize),
-}
-
-impl EphemeralDelta {
-    fn identity_width(&self) -> usize {
-        self.identity.width()
-    }
-
-    fn record_width(&self) -> usize {
-        self.weight_column + 1
-    }
-}
-
-impl DeltaIdentity {
-    fn width(self) -> usize {
-        match self {
-            Self::BindingRowids(width) => width,
-            Self::OperatorRowid => 1,
-            Self::OperatorKey(width) => width,
-        }
-    }
-}
-
-fn binding_rowid_metadata_width(identity: DeltaIdentity, binding_rowids: &[bool]) -> usize {
-    if let DeltaIdentity::BindingRowids(width) = identity {
-        turso_assert!(
-            width == binding_rowids.len() && binding_rowids.iter().all(|available| *available),
-            "binding-rowid transport identity must cover every logical binding"
-        );
-        0
-    } else {
-        binding_rowids
-            .iter()
-            .filter(|available| **available)
-            .count()
-    }
-}
-
-/// A maintained integral a stateful operator may probe.
-///
-/// Base tables, aggregate state, and explicit operator-output arrangements
-/// share one logical contract: open one storage relation, map logical values
-/// to physical columns, and optionally expose a signed multiplicity.
-#[derive(Debug, Clone)]
-struct ArrangementHandle {
-    table: Arc<BTreeTable>,
-    identity: DeltaIdentity,
-    identity_columns: Arc<[ArrangementIdentityColumn]>,
-    /// Physical arrangement locations for the SQL rowid of each logical
-    /// binding, independent of the arrangement's transport identity.
-    binding_rowid_columns: Arc<[Option<ArrangementIdentityColumn>]>,
-    /// Physical table columns corresponding to the operator's logical output
-    /// schema. Base arrangements are identity-mapped; aggregate state skips
-    /// accumulator payload columns and explicit output arrangements skip
-    /// their source-identity prefix.
-    value_columns: Arc<[usize]>,
-    /// `None` when each physical row has multiplicity one.
-    count_column: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ArrangementIdentityColumn {
-    RowId,
-    Column(usize),
-}
-
-impl ArrangementHandle {
-    fn table(&self) -> &Arc<BTreeTable> {
-        &self.table
-    }
-
-    fn value_columns(&self) -> &[usize] {
-        &self.value_columns
-    }
-
-    fn identity(&self) -> DeltaIdentity {
-        self.identity
-    }
-
-    fn identity_columns(&self) -> &[ArrangementIdentityColumn] {
-        &self.identity_columns
-    }
-
-    fn binding_rowid_columns(&self) -> &[Option<ArrangementIdentityColumn>] {
-        &self.binding_rowid_columns
-    }
-
-    fn count_column(&self) -> Option<usize> {
-        self.count_column
-    }
-}
-
-fn btree_arrangement(
-    table: Arc<BTreeTable>,
-    identity: DeltaIdentity,
-    identity_columns: Vec<ArrangementIdentityColumn>,
-    binding_rowid_columns: Vec<Option<ArrangementIdentityColumn>>,
-    value_columns: Vec<usize>,
-    count_column: Option<usize>,
-) -> ArrangementHandle {
-    turso_assert!(
-        identity.width() == identity_columns.len(),
-        "arrangement identity layout must match its identity contract"
-    );
-    ArrangementHandle {
-        table,
-        identity,
-        identity_columns: identity_columns.into(),
-        binding_rowid_columns: binding_rowid_columns.into(),
-        value_columns: value_columns.into(),
-        count_column,
-    }
-}
-
-fn base_arrangement(table: Arc<BTreeTable>, count_column: Option<usize>) -> ArrangementHandle {
-    let value_columns = (0..table.columns().len()).collect();
-    btree_arrangement(
-        table,
-        DeltaIdentity::BindingRowids(1),
-        vec![ArrangementIdentityColumn::RowId],
-        vec![Some(ArrangementIdentityColumn::RowId)],
-        value_columns,
-        count_column,
-    )
-}
-
-/// The terminal consumer of an operator's output delta.
-#[derive(Debug, Clone)]
-enum DeltaSink {
-    View { root_page: i64, num_columns: usize },
-    Ephemeral(EphemeralDelta),
-}
-
-impl DeltaSink {
-    fn view(root_page: i64, num_columns: usize) -> Self {
-        Self::View {
-            root_page,
-            num_columns,
-        }
-    }
-
-    fn ephemeral(&self) -> Result<&EphemeralDelta> {
-        match self {
-            Self::Ephemeral(channel) => Ok(channel),
-            Self::View { .. } => Err(LimboError::InternalError(
-                "operator requires an ephemeral delta sink".to_string(),
-            )),
-        }
-    }
-
-    fn source(&self) -> Result<DeltaSource> {
-        Ok(DeltaSource::Ephemeral(self.ephemeral()?.clone()))
-    }
-}
-
-fn open_ephemeral_delta(
-    program: &mut ProgramBuilder,
-    name: &str,
-    schema: dag::StreamSchema,
-    identity: DeltaIdentity,
-    binding_rowids: Arc<[bool]>,
-    requires_positive_first: bool,
-) -> DeltaSink {
-    let schema = Arc::new(schema);
-    let width = schema.len();
-    let identity_width = identity.width();
-    turso_assert!(
-        binding_rowids.len() == schema.bindings.len(),
-        "delta rowid provenance must be parallel to its logical bindings"
-    );
-    let binding_rowid_metadata_width =
-        binding_rowid_metadata_width(identity, binding_rowids.as_ref());
-    let mut next_metadata_column = identity_width;
-    let binding_rowid_columns: Arc<[Option<usize>]> = if binding_rowid_metadata_width == 0
-        && matches!(identity, DeltaIdentity::BindingRowids(_))
-    {
-        (0..binding_rowids.len())
-            .map(Some)
-            .collect::<Vec<_>>()
-            .into()
-    } else {
-        binding_rowids
-            .iter()
-            .map(|available| {
-                available.then(|| {
-                    let column = next_metadata_column;
-                    next_metadata_column += 1;
-                    column
-                })
-            })
-            .collect::<Vec<_>>()
-            .into()
-    };
-    turso_assert!(
-        next_metadata_column == identity_width + binding_rowid_metadata_width,
-        "ephemeral rowid metadata layout must match its planned width"
-    );
-    let table = Arc::new(synthesized_view_table(
-        name,
-        0,
-        next_metadata_column + width,
-    ));
-    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-    program.emit_insn(Insn::OpenEphemeral {
-        cursor_id,
-        is_table: true,
-    });
-    let channel = EphemeralDelta {
-        cursor_id,
-        identity,
-        binding_rowid_columns,
-        value_start: next_metadata_column,
-        width,
-        weight_column: next_metadata_column + width,
-        schema,
-        requires_positive_first,
-    };
-    DeltaSink::Ephemeral(channel)
 }
 
 type BindingRemap = FxHashMap<TableInternalId, TableInternalId>;
@@ -3083,7 +2834,7 @@ fn materialize_declared_output_arrangement(
             input.identity, expected_identity
         )));
     }
-    let arranged_sink = open_ephemeral_delta(
+    let arranged_output = open_ephemeral_delta(
         program,
         &format!("{view_name}_arranged_delta_{node_id}"),
         operator_state.output.schema.as_ref().clone(),
@@ -3091,17 +2842,16 @@ fn materialize_declared_output_arrangement(
         operator_state.output.binding_rowids.clone(),
         input.requires_positive_first,
     );
-    let arranged_output = arranged_sink.ephemeral()?;
     let arrangement = emit_output_arrangement(
         program,
         view_name,
         &input,
-        arranged_output,
+        &arranged_output,
         &arrangement_def.table_name,
         schema,
     )?;
     Ok(NodeOutput {
-        delta: arranged_sink.source()?,
+        delta: DeltaSource::Ephemeral(arranged_output),
         arrangement: Some(arrangement),
     })
 }
@@ -3117,7 +2867,7 @@ fn emit_ephemeral_filter(
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<DeltaSource> {
-    let sink = open_ephemeral_delta(
+    let output = open_ephemeral_delta(
         program,
         &format!("{view_name}_filter_delta_{node_id}"),
         output_contract.schema.as_ref().clone(),
@@ -3125,7 +2875,6 @@ fn emit_ephemeral_filter(
         output_contract.binding_rowids.clone(),
         input.requires_positive_first,
     );
-    let output = sink.ephemeral()?;
 
     let syms = connection.syms.read();
     let mut resolver = Resolver::new(
@@ -3216,7 +2965,7 @@ fn emit_ephemeral_filter(
     });
     program.preassign_label_to_next_insn(end_label);
     drop(syms);
-    sink.source()
+    Ok(DeltaSource::Ephemeral(output))
 }
 
 fn append_alias_values(
@@ -3301,7 +3050,7 @@ fn emit_ephemeral_alias(
     input: &EphemeralDelta,
     output_contract: &NodeOutputContract,
 ) -> Result<DeltaSource> {
-    let sink = open_ephemeral_delta(
+    let output = open_ephemeral_delta(
         program,
         &format!("{view_name}_alias_delta_{node_id}"),
         output_contract.schema.as_ref().clone(),
@@ -3309,9 +3058,8 @@ fn emit_ephemeral_alias(
         output_contract.binding_rowids.clone(),
         input.requires_positive_first,
     );
-    let output = sink.ephemeral()?;
-    append_alias_values(program, input, output)?;
-    sink.source()
+    append_alias_values(program, input, &output)?;
+    Ok(DeltaSource::Ephemeral(output))
 }
 
 fn emit_union_all_to_ephemeral(
@@ -3322,7 +3070,7 @@ fn emit_union_all_to_ephemeral(
     output_contract: &NodeOutputContract,
 ) -> Result<DeltaSource> {
     let requires_positive_first = inputs.iter().any(|input| input.requires_positive_first);
-    let sink = open_ephemeral_delta(
+    let output = open_ephemeral_delta(
         program,
         &format!("{view_name}_union_all_delta_{node_id}"),
         output_contract.schema.as_ref().clone(),
@@ -3330,11 +3078,10 @@ fn emit_union_all_to_ephemeral(
         output_contract.binding_rowids.clone(),
         requires_positive_first,
     );
-    let output = sink.ephemeral()?;
     for (branch, input) in inputs.iter().enumerate() {
-        append_union_all_branch(program, branch, input, output)?;
+        append_union_all_branch(program, branch, input, &output)?;
     }
-    sink.source()
+    Ok(DeltaSource::Ephemeral(output))
 }
 
 /// Append one UNION ALL branch while namespacing its complete source identity
@@ -3506,7 +3253,7 @@ fn emit_declared_delta_nodes_to(
                     operator_states.output_for_node(upstream_id)?,
                     input,
                 )?;
-                let sink = open_ephemeral_delta(
+                let output = open_ephemeral_delta(
                     program,
                     &format!("{view_name}_project_delta_{node_id}"),
                     output_contract.schema.as_ref().clone(),
@@ -3514,17 +3261,16 @@ fn emit_declared_delta_nodes_to(
                     output_contract.binding_rowids.clone(),
                     upstream.requires_positive_first,
                 );
-                let output = sink.ephemeral()?;
                 emit_ephemeral_project(
                     program,
                     &upstream,
                     projections,
-                    output,
+                    &output,
                     schema,
                     connection,
                 )?;
                 NodeOutput {
-                    delta: sink.source()?,
+                    delta: DeltaSource::Ephemeral(output),
                     arrangement: None,
                 }
             }
@@ -3663,7 +3409,7 @@ fn emit_declared_delta_nodes_to(
                     let requires_positive_first = channels
                         .iter()
                         .any(|channel| channel.requires_positive_first);
-                    let sink = open_ephemeral_delta(
+                    let output = open_ephemeral_delta(
                         program,
                         &format!("{view_name}_set_op_delta_{node_id}"),
                         output_contract.schema.as_ref().clone(),
@@ -3671,7 +3417,6 @@ fn emit_declared_delta_nodes_to(
                         output_contract.binding_rowids.clone(),
                         requires_positive_first,
                     );
-                    let output = sink.ephemeral()?;
                     emit_deduplicating_set_op(
                         program,
                         view_name,
@@ -3679,12 +3424,12 @@ fn emit_declared_delta_nodes_to(
                         operators,
                         *prefix_len,
                         key_collations,
-                        output,
+                        &output,
                         operator_states.for_node(node_id)?,
                         schema,
                     )?;
                     NodeOutput {
-                        delta: sink.source()?,
+                        delta: DeltaSource::Ephemeral(output),
                         arrangement: None,
                     }
                 }
@@ -3710,7 +3455,7 @@ fn emit_declared_delta_nodes_to(
                     operator_states.output_for_node(upstream_id)?,
                     input,
                 )?;
-                let sink = open_ephemeral_delta(
+                let output = open_ephemeral_delta(
                     program,
                     &format!("{view_name}_aggregate_delta_{node_id}"),
                     output_contract.schema.as_ref().clone(),
@@ -3718,7 +3463,6 @@ fn emit_declared_delta_nodes_to(
                     output_contract.binding_rowids.clone(),
                     false,
                 );
-                let output = sink.ephemeral()?;
                 let operator_state = operator_states.for_node(node_id)?;
                 emit_group_aggregate(
                     program,
@@ -3728,7 +3472,7 @@ fn emit_declared_delta_nodes_to(
                     group_collations,
                     aggregates,
                     *scalar,
-                    output,
+                    &output,
                     input,
                     operator_state,
                     schema,
@@ -3742,7 +3486,7 @@ fn emit_declared_delta_nodes_to(
                 })?;
                 let value_columns = (0..group_exprs.len() + aggregates.len()).collect();
                 NodeOutput {
-                    delta: sink.source()?,
+                    delta: DeltaSource::Ephemeral(output),
                     arrangement: Some(btree_arrangement(
                         state_table,
                         DeltaIdentity::OperatorRowid,
@@ -3819,7 +3563,7 @@ fn emit_generic_dag_to_sink(
     dag: &dag::MaintenanceDag,
     root: dag::NodeId,
     input: MaintenanceInput,
-    sink: &DeltaSink,
+    sink: &ViewSink,
     operator_states: &OperatorStateCatalog,
     schema: &Schema,
     connection: &Arc<Connection>,
@@ -3872,7 +3616,10 @@ fn compile_generic_dag_program(
         dag,
         root,
         input,
-        &DeltaSink::view(view_root_page, num_view_columns),
+        &ViewSink {
+            root_page: view_root_page,
+            num_columns: num_view_columns,
+        },
         operator_states,
         schema,
         connection,
@@ -4116,7 +3863,7 @@ fn emit_terminal_delta(
     program: &mut ProgramBuilder,
     view_name: &str,
     input: &EphemeralDelta,
-    sink: &DeltaSink,
+    sink: &ViewSink,
 ) -> Result<()> {
     turso_assert!(
         matches!(
@@ -4125,35 +3872,23 @@ fn emit_terminal_delta(
         ) && input.weight_column == input.value_start + input.width,
         "terminal delta streams require one stable operator identity"
     );
-    let num_output_columns = match sink {
-        DeltaSink::View { num_columns, .. } => *num_columns,
-        DeltaSink::Ephemeral(_) => {
-            return Err(LimboError::InternalError(
-                "terminal delta adapter received an interior sink".to_string(),
-            ));
-        }
-    };
+    let num_output_columns = sink.num_columns;
     turso_assert!(
         input.width == num_output_columns,
         "terminal delta width does not match its sink"
     );
 
-    let view_cursor_id = if let DeltaSink::View { root_page, .. } = sink {
-        let table = Arc::new(synthesized_view_table(
-            view_name,
-            *root_page,
-            num_output_columns,
-        ));
-        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id,
-            root_page: RegisterOrLiteral::Literal(*root_page),
-            db: 0,
-        });
-        Some(cursor_id)
-    } else {
-        None
-    };
+    let table = Arc::new(synthesized_view_table(
+        view_name,
+        sink.root_page,
+        num_output_columns,
+    ));
+    let view_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: view_cursor_id,
+        root_page: RegisterOrLiteral::Literal(sink.root_page),
+        db: 0,
+    });
 
     let end_label = program.allocate_label();
     let loop_label = program.allocate_label();
@@ -4235,116 +3970,112 @@ fn emit_terminal_delta(
         program.preassign_label_to_next_insn(pass_ok_label);
     }
 
-    match sink {
-        DeltaSink::View { .. } => {
-            let view_cursor_id = view_cursor_id.expect("view sink opened its btree cursor");
-            let not_found_label = program.allocate_label();
-            let merge_label = program.allocate_label();
-            let write_label = program.allocate_label();
-            let delete_label = program.allocate_label();
-            let current_weight_reg = program.alloc_register();
-            let new_weight_reg = program.alloc_register();
-            let found_reg = program.alloc_register();
-            let zero_reg = program.alloc_register();
-            program.emit_int(0, zero_reg);
+    {
+        let not_found_label = program.allocate_label();
+        let merge_label = program.allocate_label();
+        let write_label = program.allocate_label();
+        let delete_label = program.allocate_label();
+        let current_weight_reg = program.alloc_register();
+        let new_weight_reg = program.alloc_register();
+        let found_reg = program.alloc_register();
+        let zero_reg = program.alloc_register();
+        program.emit_int(0, zero_reg);
 
-            let view_key_reg = identity_reg;
-            program.emit_insn(Insn::SeekRowid {
-                cursor_id: view_cursor_id,
-                src_reg: view_key_reg,
-                target_pc: not_found_label,
-            });
+        let view_key_reg = identity_reg;
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: view_cursor_id,
+            src_reg: view_key_reg,
+            target_pc: not_found_label,
+        });
+        program.emit_insn(Insn::Column {
+            cursor_id: view_cursor_id,
+            column: num_output_columns,
+            dest: current_weight_reg,
+            default: None,
+        });
+        program.emit_int(1, found_reg);
+        program.emit_insn(Insn::Goto {
+            target_pc: merge_label,
+        });
+        program.preassign_label_to_next_insn(not_found_label);
+        program.emit_int(0, current_weight_reg);
+        program.emit_int(0, found_reg);
+        program.preassign_label_to_next_insn(merge_label);
+        program.emit_insn(Insn::Add {
+            lhs: weight_reg,
+            rhs: current_weight_reg,
+            dest: new_weight_reg,
+        });
+        program.emit_insn(Insn::Gt {
+            lhs: new_weight_reg,
+            rhs: zero_reg,
+            target_pc: write_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::If {
+            reg: found_reg,
+            target_pc: delete_label,
+            jump_if_null: false,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: next_label,
+        });
+        program.preassign_label_to_next_insn(delete_label);
+        program.emit_insn(Insn::Delete {
+            cursor_id: view_cursor_id,
+            table_name: view_name.to_string(),
+            is_part_of_update: true,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: next_label,
+        });
+
+        program.preassign_label_to_next_insn(write_label);
+        // On the negative pass, retain the newer image installed by a
+        // positive contribution instead of overwriting it with the
+        // retracted old image.
+        let values_ready_label = program.allocate_label();
+        program.emit_insn(Insn::Gt {
+            lhs: weight_reg,
+            rhs: zero_reg,
+            target_pc: values_ready_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        for column in 0..num_output_columns {
             program.emit_insn(Insn::Column {
                 cursor_id: view_cursor_id,
-                column: num_output_columns,
-                dest: current_weight_reg,
+                column,
+                dest: values_start + column,
                 default: None,
             });
-            program.emit_int(1, found_reg);
-            program.emit_insn(Insn::Goto {
-                target_pc: merge_label,
-            });
-            program.preassign_label_to_next_insn(not_found_label);
-            program.emit_int(0, current_weight_reg);
-            program.emit_int(0, found_reg);
-            program.preassign_label_to_next_insn(merge_label);
-            program.emit_insn(Insn::Add {
-                lhs: weight_reg,
-                rhs: current_weight_reg,
-                dest: new_weight_reg,
-            });
-            program.emit_insn(Insn::Gt {
-                lhs: new_weight_reg,
-                rhs: zero_reg,
-                target_pc: write_label,
-                flags: CmpInsFlags::default(),
-                collation: None,
-            });
-            program.emit_insn(Insn::If {
-                reg: found_reg,
-                target_pc: delete_label,
-                jump_if_null: false,
-            });
-            program.emit_insn(Insn::Goto {
-                target_pc: next_label,
-            });
-            program.preassign_label_to_next_insn(delete_label);
-            program.emit_insn(Insn::Delete {
-                cursor_id: view_cursor_id,
-                table_name: view_name.to_string(),
-                is_part_of_update: true,
-            });
-            program.emit_insn(Insn::Goto {
-                target_pc: next_label,
-            });
-
-            program.preassign_label_to_next_insn(write_label);
-            // On the negative pass, retain the newer image installed by a
-            // positive contribution instead of overwriting it with the
-            // retracted old image.
-            let values_ready_label = program.allocate_label();
-            program.emit_insn(Insn::Gt {
-                lhs: weight_reg,
-                rhs: zero_reg,
-                target_pc: values_ready_label,
-                flags: CmpInsFlags::default(),
-                collation: None,
-            });
-            for column in 0..num_output_columns {
-                program.emit_insn(Insn::Column {
-                    cursor_id: view_cursor_id,
-                    column,
-                    dest: values_start + column,
-                    default: None,
-                });
-            }
-            program.preassign_label_to_next_insn(values_ready_label);
-            program.emit_insn(Insn::Copy {
-                src_reg: new_weight_reg,
-                dst_reg: weight_reg,
-                extra_amount: 0,
-            });
-            let record_reg = program.alloc_register();
-            program.emit_insn(Insn::MakeRecord {
-                start_reg: values_start as u16,
-                count: (num_output_columns + 1) as u16,
-                dest_reg: record_reg as u16,
-                index_name: None,
-                affinity_str: None,
-            });
-            program.emit_insn(Insn::Insert {
-                cursor: view_cursor_id,
-                key_reg: view_key_reg,
-                record_reg,
-                flag: InsertFlags(
-                    InsertFlags::REQUIRE_SEEK
-                        | InsertFlags::SKIP_LAST_ROWID
-                        | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-                ),
-                table_name: view_name.to_string(),
-            });
         }
-        DeltaSink::Ephemeral(_) => unreachable!("rejected above"),
+        program.preassign_label_to_next_insn(values_ready_label);
+        program.emit_insn(Insn::Copy {
+            src_reg: new_weight_reg,
+            dst_reg: weight_reg,
+            extra_amount: 0,
+        });
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: values_start as u16,
+            count: (num_output_columns + 1) as u16,
+            dest_reg: record_reg as u16,
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: view_cursor_id,
+            key_reg: view_key_reg,
+            record_reg,
+            flag: InsertFlags(
+                InsertFlags::REQUIRE_SEEK
+                    | InsertFlags::SKIP_LAST_ROWID
+                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+            ),
+            table_name: view_name.to_string(),
+        });
     }
 
     program.preassign_label_to_next_insn(next_label);
@@ -5863,7 +5594,7 @@ fn emit_join_deltas_to_ephemeral(
         "join physical inputs must match the planned output schema"
     );
 
-    let sink = open_ephemeral_delta(
+    let channel = open_ephemeral_delta(
         program,
         &format!("{view_name}_joined_delta"),
         output_contract.schema.as_ref().clone(),
@@ -5871,7 +5602,6 @@ fn emit_join_deltas_to_ephemeral(
         output_contract.binding_rowids.clone(),
         true,
     );
-    let channel = sink.ephemeral()?;
     let eph_cursor_id = channel.cursor_id;
 
     // [transport identity..., binding rowids..., natural join row..., weight].
@@ -6042,7 +5772,7 @@ fn emit_join_deltas_to_ephemeral(
         )?;
     }
 
-    sink.source()
+    Ok(DeltaSource::Ephemeral(channel))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6160,7 +5890,7 @@ fn emit_left_join_deltas_to_ephemeral(
     let n = contract.schemas.len();
     turso_assert!(n == 2, "DAG validation admits LEFT JOIN for two inputs");
 
-    let sink = open_ephemeral_delta(
+    let output = open_ephemeral_delta(
         program,
         &format!("{view_name}_left_join_delta_{node_id}"),
         output_contract.schema.as_ref().clone(),
@@ -6168,7 +5898,6 @@ fn emit_left_join_deltas_to_ephemeral(
         output_contract.binding_rowids.clone(),
         true,
     );
-    let output = sink.ephemeral()?;
     let natural_width = contract
         .schemas
         .iter()
@@ -6318,7 +6047,7 @@ fn emit_left_join_deltas_to_ephemeral(
             );
             emit_operator_keyed_ephemeral_row(
                 program,
-                output,
+                &output,
                 1,
                 srid_reg,
                 1,
@@ -6333,7 +6062,7 @@ fn emit_left_join_deltas_to_ephemeral(
         program.emit_int(-1, negative_one_reg);
         emit_operator_keyed_ephemeral_row(
             program,
-            output,
+            &output,
             1,
             srid_reg,
             1,
@@ -6451,7 +6180,7 @@ fn emit_left_join_deltas_to_ephemeral(
                 );
                 emit_operator_keyed_ephemeral_row(
                     program,
-                    output,
+                    &output,
                     0,
                     pair_identity_start,
                     n,
@@ -6476,7 +6205,7 @@ fn emit_left_join_deltas_to_ephemeral(
     });
     program.preassign_label_to_next_insn(end_label);
     drop(syms);
-    sink.source()
+    Ok(DeltaSource::Ephemeral(output))
 }
 
 /// Consumer hook that materializes one NULL-padded output row: given the
