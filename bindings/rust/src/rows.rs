@@ -67,7 +67,7 @@ impl Rows {
 }
 
 /// Query result row.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub(crate) values: Vec<turso_sdk_kit::rsapi::Value>,
 }

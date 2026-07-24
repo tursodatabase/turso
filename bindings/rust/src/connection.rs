@@ -177,7 +177,7 @@ impl Connection {
     /// Query a pragma.
     pub async fn pragma_query<F>(&self, pragma_name: &str, mut f: F) -> Result<()>
     where
-        F: FnMut(&Row) -> std::result::Result<(), turso_sdk_kit::rsapi::TursoError>,
+        F: FnMut(&Row) -> Result<()>,
     {
         let sql = format!("PRAGMA {pragma_name}");
         let mut stmt = self.prepare(&sql).await?;

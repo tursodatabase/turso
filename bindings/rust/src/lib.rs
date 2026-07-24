@@ -52,6 +52,9 @@ pub use value::Value;
 
 pub use params::params_from_iter;
 pub use params::IntoParams;
+pub use params::IntoValue;
+pub use params::Params;
+pub use transaction::{Transaction, TransactionBehavior};
 
 use std::fmt::Debug;
 use std::future::Future;
@@ -82,7 +85,15 @@ macro_rules! assert_send_sync {
 
 pub(crate) use assert_send_sync;
 
+/// Errors returned by the embedded driver.
+///
+/// The enum is non-exhaustive: the serverless `turso_serverless::Error`
+/// shares a common subset of variants and each driver keeps
+/// backend-specific ones (this driver's local [`IoError`](Error::IoError),
+/// serverless's HTTP transport error), so matches must have a wildcard arm
+/// and stay compatible with either driver.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("SQL conversion failure: `{0}`")]
     ToSqlConversionFailure(BoxError),
@@ -132,7 +143,7 @@ impl From<turso_sdk_kit::rsapi::TursoError> for Error {
     }
 }
 
-pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type EncryptionOpts = turso_sdk_kit::rsapi::EncryptionOpts;
@@ -549,6 +560,7 @@ impl Statement {
 }
 
 /// Column information.
+#[derive(Clone, Debug)]
 pub struct Column {
     name: String,
     decl_type: Option<String>,
@@ -565,19 +577,6 @@ impl Column {
         self.decl_type.as_deref()
     }
 }
-
-pub trait IntoValue {
-    fn into_value(self) -> Result<Value>;
-}
-
-#[derive(Debug, Clone)]
-pub enum Params {
-    None,
-    Positional(Vec<Value>),
-    Named(Vec<(String, Value)>),
-}
-
-pub struct Transaction {}
 
 #[cfg(test)]
 mod tests {

@@ -2,6 +2,7 @@ use std::str::FromStr;
 
 use crate::{Error, Result};
 
+/// A SQL value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Null,
@@ -37,25 +38,24 @@ impl FromStr for ValueType {
 }
 
 impl Value {
-    /// Returns `true` if the value is [`Null`].
-    ///
-    /// [`Null`]: Value::Null
     #[must_use]
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)
     }
 
-    /// Returns `true` if the value is [`Integer`].
-    ///
-    /// [`Integer`]: Value::Integer
     #[must_use]
     pub fn is_integer(&self) -> bool {
         matches!(self, Self::Integer(..))
     }
 
-    /// Returns `true` if the value is [`Real`].
-    ///
-    /// [`Real`]: Value::Real
+    pub fn as_integer(&self) -> Option<&i64> {
+        if let Self::Integer(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
     #[must_use]
     pub fn is_real(&self) -> bool {
         matches!(self, Self::Real(..))
@@ -69,9 +69,6 @@ impl Value {
         }
     }
 
-    /// Returns `true` if the value is [`Text`].
-    ///
-    /// [`Text`]: Value::Text
     #[must_use]
     pub fn is_text(&self) -> bool {
         matches!(self, Self::Text(..))
@@ -85,17 +82,6 @@ impl Value {
         }
     }
 
-    pub fn as_integer(&self) -> Option<&i64> {
-        if let Self::Integer(v) = self {
-            Some(v)
-        } else {
-            None
-        }
-    }
-
-    /// Returns `true` if the value is [`Blob`].
-    ///
-    /// [`Blob`]: Value::Blob
     #[must_use]
     pub fn is_blob(&self) -> bool {
         matches!(self, Self::Blob(..))
@@ -106,34 +92,6 @@ impl Value {
             Some(v)
         } else {
             None
-        }
-    }
-}
-
-impl From<turso_sdk_kit::rsapi::Value> for Value {
-    fn from(val: turso_sdk_kit::rsapi::Value) -> Self {
-        match val {
-            turso_sdk_kit::rsapi::Value::Null => Value::Null,
-            turso_sdk_kit::rsapi::Value::Numeric(turso_sdk_kit::rsapi::Numeric::Integer(n)) => {
-                Value::Integer(n)
-            }
-            turso_sdk_kit::rsapi::Value::Numeric(turso_sdk_kit::rsapi::Numeric::Float(n)) => {
-                Value::Real(f64::from(n))
-            }
-            turso_sdk_kit::rsapi::Value::Text(t) => Value::Text(t.into()),
-            turso_sdk_kit::rsapi::Value::Blob(items) => Value::Blob(items),
-        }
-    }
-}
-
-impl From<Value> for turso_sdk_kit::rsapi::Value {
-    fn from(val: Value) -> Self {
-        match val {
-            Value::Null => turso_sdk_kit::rsapi::Value::Null,
-            Value::Integer(n) => turso_sdk_kit::rsapi::Value::from_i64(n),
-            Value::Real(n) => turso_sdk_kit::rsapi::Value::from_f64(n),
-            Value::Text(t) => turso_sdk_kit::rsapi::Value::from_text(t),
-            Value::Blob(items) => turso_sdk_kit::rsapi::Value::from_blob(items),
         }
     }
 }
@@ -394,5 +352,194 @@ where
             Some(x) => x.into(),
             None => ValueRef::Null,
         }
+    }
+}
+
+/// Converts a SQL [`Value`] into a Rust type. Used by [`crate::Row::get`].
+pub trait FromValue: Sized {
+    fn from_value(value: Value) -> Result<Self>;
+}
+
+impl FromValue for Value {
+    fn from_value(value: Value) -> Result<Self> {
+        Ok(value)
+    }
+}
+
+impl FromValue for i32 {
+    fn from_value(value: Value) -> Result<Self> {
+        match value {
+            Value::Integer(n) => i32::try_from(n)
+                .map_err(|_| Error::ConversionFailure(format!("integer {n} out of i32 range"))),
+            _ => Err(Error::ConversionFailure(format!(
+                "expected integer, got {value:?}"
+            ))),
+        }
+    }
+}
+
+impl FromValue for i64 {
+    fn from_value(value: Value) -> Result<Self> {
+        match value {
+            Value::Integer(n) => Ok(n),
+            _ => Err(Error::ConversionFailure(format!(
+                "expected integer, got {value:?}"
+            ))),
+        }
+    }
+}
+
+impl FromValue for u32 {
+    fn from_value(value: Value) -> Result<Self> {
+        match value {
+            Value::Integer(n) => u32::try_from(n)
+                .map_err(|_| Error::ConversionFailure(format!("integer {n} out of u32 range"))),
+            _ => Err(Error::ConversionFailure(format!(
+                "expected integer, got {value:?}"
+            ))),
+        }
+    }
+}
+
+impl FromValue for u64 {
+    fn from_value(value: Value) -> Result<Self> {
+        match value {
+            Value::Integer(n) => u64::try_from(n)
+                .map_err(|_| Error::ConversionFailure(format!("integer {n} out of u64 range"))),
+            _ => Err(Error::ConversionFailure(format!(
+                "expected integer, got {value:?}"
+            ))),
+        }
+    }
+}
+
+impl FromValue for f64 {
+    fn from_value(value: Value) -> Result<Self> {
+        match value {
+            Value::Real(n) => Ok(n),
+            Value::Integer(n) => Ok(n as f64),
+            _ => Err(Error::ConversionFailure(format!(
+                "expected float, got {value:?}"
+            ))),
+        }
+    }
+}
+
+impl FromValue for String {
+    fn from_value(value: Value) -> Result<Self> {
+        match value {
+            Value::Text(s) => Ok(s),
+            _ => Err(Error::ConversionFailure(format!(
+                "expected text, got {value:?}"
+            ))),
+        }
+    }
+}
+
+impl FromValue for Vec<u8> {
+    fn from_value(value: Value) -> Result<Self> {
+        match value {
+            Value::Blob(b) => Ok(b),
+            _ => Err(Error::ConversionFailure(format!(
+                "expected blob, got {value:?}"
+            ))),
+        }
+    }
+}
+
+impl<const N: usize> FromValue for [u8; N] {
+    fn from_value(value: Value) -> Result<Self> {
+        match value {
+            Value::Blob(b) => {
+                let len = b.len();
+                b.try_into().map_err(|_| {
+                    Error::ConversionFailure(format!("expected blob of {N} bytes, got {len}"))
+                })
+            }
+            _ => Err(Error::ConversionFailure(format!(
+                "expected blob, got {value:?}"
+            ))),
+        }
+    }
+}
+
+impl FromValue for bool {
+    fn from_value(value: Value) -> Result<Self> {
+        match value {
+            Value::Integer(0) => Ok(false),
+            Value::Integer(1) => Ok(true),
+            Value::Integer(n) => Err(Error::ConversionFailure(format!(
+                "expected 0 or 1 for bool, got {n}"
+            ))),
+            _ => Err(Error::ConversionFailure(format!(
+                "expected integer for bool, got {value:?}"
+            ))),
+        }
+    }
+}
+
+impl<T: FromValue> FromValue for Option<T> {
+    fn from_value(value: Value) -> Result<Self> {
+        match value {
+            Value::Null => Ok(None),
+            other => Ok(Some(T::from_value(other)?)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integer_conversions_are_checked() {
+        assert_eq!(i32::from_value(Value::Integer(-5)).unwrap(), -5);
+        i32::from_value(Value::Integer(i64::from(i32::MAX) + 1)).unwrap_err();
+        i32::from_value(Value::Integer(i64::from(i32::MIN) - 1)).unwrap_err();
+
+        assert_eq!(u32::from_value(Value::Integer(7)).unwrap(), 7);
+        u32::from_value(Value::Integer(-1)).unwrap_err();
+        u32::from_value(Value::Integer(i64::from(u32::MAX) + 1)).unwrap_err();
+
+        assert_eq!(
+            u64::from_value(Value::Integer(i64::MAX)).unwrap(),
+            i64::MAX as u64
+        );
+        u64::from_value(Value::Integer(-1)).unwrap_err();
+    }
+
+    #[test]
+    fn f64_accepts_integers() {
+        assert_eq!(f64::from_value(Value::Integer(3)).unwrap(), 3.0);
+        assert_eq!(f64::from_value(Value::Real(1.5)).unwrap(), 1.5);
+        f64::from_value(Value::Text("x".to_string())).unwrap_err();
+    }
+
+    #[test]
+    fn bool_accepts_only_zero_and_one() {
+        assert!(!bool::from_value(Value::Integer(0)).unwrap());
+        assert!(bool::from_value(Value::Integer(1)).unwrap());
+        bool::from_value(Value::Integer(2)).unwrap_err();
+        bool::from_value(Value::Integer(-1)).unwrap_err();
+        bool::from_value(Value::Text("true".to_string())).unwrap_err();
+    }
+
+    #[test]
+    fn fixed_size_byte_arrays_require_exact_length() {
+        assert_eq!(
+            <[u8; 3]>::from_value(Value::Blob(vec![1, 2, 3])).unwrap(),
+            [1, 2, 3]
+        );
+        <[u8; 3]>::from_value(Value::Blob(vec![1, 2])).unwrap_err();
+        <[u8; 3]>::from_value(Value::Integer(1)).unwrap_err();
+    }
+
+    #[test]
+    fn option_maps_null() {
+        assert_eq!(Option::<i64>::from_value(Value::Null).unwrap(), None);
+        assert_eq!(
+            Option::<i64>::from_value(Value::Integer(4)).unwrap(),
+            Some(4)
+        );
     }
 }

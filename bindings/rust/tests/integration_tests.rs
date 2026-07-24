@@ -1969,3 +1969,27 @@ async fn test_typed_numeric_row_conversions() {
     assert_eq!(row.get::<f64>(4).unwrap(), -1.0);
     assert_eq!(row.get::<f64>(9).unwrap(), 9_007_199_254_740_993_i64 as f64);
 }
+
+#[tokio::test]
+async fn test_pragma_query_callback_error_stops_iteration() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    let mut seen = 0;
+    conn.pragma_query("journal_mode", |row| {
+        seen += 1;
+        row.get_value(0).map(|_| ())
+    })
+    .await
+    .unwrap();
+    assert_eq!(seen, 1);
+
+    // An error returned by the callback stops iteration and propagates.
+    let err = conn
+        .pragma_query("journal_mode", |_| {
+            Err(Error::Misuse("stop iteration".to_string()))
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Misuse(msg) if msg == "stop iteration"));
+}

@@ -18,9 +18,9 @@ All language harnesses share one operation vocabulary,
 [`spec/ops.json`](spec/ops.json), described in
 [`operations.md`](operations.md). This directory holds only the shared
 spec; each harness lives next to the driver it tests. The JavaScript
-harness is in [`serverless/javascript/differential`](../../javascript/differential);
-harnesses for other serverless drivers join their drivers as those land
-(for example `serverless/rust/differential`).
+harness is in [`serverless/javascript/differential`](../../javascript/differential)
+and the Rust harness in [`serverless/rust/differential`](../../rust/differential);
+harnesses for other serverless drivers join their drivers as those land.
 
 ## Running against `@tursodatabase/serverless`
 
@@ -77,13 +77,32 @@ $ HEGEL_NUM_RUNS=100 npm test
 Every case can issue dozens of HTTP round trips, so wall clock time scales
 with both the iteration count and your latency to the database region.
 
+## Running against `turso_serverless`
+
+The Rust harness compares the embedded `turso` crate, running on an
+in-memory database, against `turso_serverless` talking to the same scratch
+database as above. It reads the same environment variables and skips
+itself when they are not set:
+
+```console
+$ export TURSO_DATABASE_URL="$(turso db show --url serverless-differential)"
+$ export TURSO_AUTH_TOKEN="$(turso db tokens create serverless-differential)"
+$ cargo test -p turso_serverless_differential
+```
+
+`HEGEL_NUM_RUNS` controls the iteration count here too. The properties are
+driven by [hegel](https://crates.io/crates/hegeltest), which shrinks a
+failing case to a minimal operation sequence and stores it locally so the
+next run replays it first.
+
 ## What the harness checks
 
 - **API parity**: random operation sequences (DDL, DML, queries, parameter
   binding, transactions, batches, triggers, error cases) must produce
   identical results from both drivers: success or failure, column names and
   counts, row counts, value type tags, cell values (with float epsilon),
-  affected row counts, and last insert rowids.
+  affected row counts, and last insert rowids. The Rust harness also
+  compares declared column types.
 - **Error recovery**: after any failing statement, the connection must still
   execute the next statement. Errors must never wedge a stream.
 - **DDL in transactions**: a `CREATE TABLE` inside a transaction must be
