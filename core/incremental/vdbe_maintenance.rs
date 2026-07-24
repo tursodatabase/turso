@@ -38,41 +38,32 @@
 //! first. The [`DeltaCursor`] therefore iterates the captured `Delta`
 //! verbatim, without consolidation.
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use turso_parser::ast;
 
-use crate::function::{AggFunc, Func};
 use crate::incremental::dag;
-use crate::incremental::view::{CapturedDelta, ChangeEvent, SpillSegment, TableChangeId};
-use crate::io::{Buffer, Completion, File};
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::Arc;
-use crate::translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
-    expr_contains_nondeterministic_scalar_function, translate_condition_expr,
-    translate_expr_no_constant_opt, walk_expr_mut, ConditionMetadata, NoConstantOptReason,
-    WalkControl,
+    translate_condition_expr, translate_expr_no_constant_opt, walk_expr_mut, ConditionMetadata,
+    NoConstantOptReason, WalkControl,
 };
 use crate::translate::plan::{
-    Aggregate, ColumnUsedMask, IterationDirection, JoinedTable, Operation, Plan, QueryDestination,
-    Scan, SelectPlan, TableReferences,
+    ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
-use crate::translate::planner::resolve_window_and_aggregate_functions;
-use crate::translate::select::prepare_select_plan;
 use crate::turso_assert;
-use crate::types::ImmutableRecord;
-use crate::util::walk_expr_with_subqueries;
 use crate::vdbe::builder::{CursorType, ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
-use crate::vdbe::{BranchOffset, PreparedProgram, Program};
-use crate::{
-    CompletionError, Connection, IOCompletions, IOResult, LimboError, QueryMode, Result, Value,
-};
+use crate::vdbe::{PreparedProgram, Program};
+use crate::{Connection, LimboError, QueryMode, Result};
 use turso_parser::ast::TableInternalId;
 
 mod stream;
-use stream::*;
+use stream::{
+    base_arrangement, btree_arrangement, open_ephemeral_delta, synthesized_view_table,
+    ArrangementHandle, ArrangementIdentityColumn, DeltaIdentity, EphemeralDelta, ViewSink,
+};
 
 mod join;
 use join::{emit_join_deltas_to_ephemeral, emit_left_join_deltas_to_ephemeral, JoinContract};
@@ -85,7 +76,7 @@ use set_op::emit_set_op_to_ephemeral;
 
 mod plan;
 pub use plan::{plan_view, MaintenancePlan, OperatorStateCatalog};
-use plan::{tracks_distinct_values, uses_multiset, NodeOutputContract, OperatorStateDef};
+use plan::{NodeOutputContract, OperatorStateDef};
 
 mod delta_cursor;
 pub use delta_cursor::DeltaCursor;
@@ -2048,33 +2039,4 @@ fn emit_terminal_delta(
     }
     program.preassign_label_to_next_insn(end_label);
     Ok(())
-}
-
-/// A minimal BTreeTable describing the view's on-disk layout (output columns
-/// plus the trailing weight column), used only to size the write cursor.
-fn synthesized_view_table(view_name: &str, root_page: i64, num_view_columns: usize) -> BTreeTable {
-    use crate::schema::BTreeCharacteristics;
-    // Declared type is empty (BLOB affinity) so nothing about this synthetic
-    // schema can coerce the values the maintenance program writes.
-    let mut columns: Vec<crate::schema::Column> = (0..num_view_columns)
-        .map(|i| {
-            crate::schema::Column::new_default_text(Some(format!("c{i}")), String::new(), None)
-        })
-        .collect();
-    columns.push(crate::schema::Column::new_default_text(
-        Some("__ivm_weight".to_string()),
-        String::new(),
-        None,
-    ));
-    BTreeTable::new(
-        root_page,
-        view_name.to_string(),
-        Vec::new(),
-        columns,
-        BTreeCharacteristics::HAS_ROWID,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
 }

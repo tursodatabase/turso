@@ -1,4 +1,16 @@
-use super::*;
+use super::plan::{NodeOutputContract, OperatorStateDef};
+use super::stream::{
+    emit_operator_rowid_delta, open_ephemeral_delta, DeltaIdentity, EphemeralDelta,
+};
+use super::DeltaSource;
+use crate::incremental::dag;
+use crate::schema::Schema;
+use crate::translate::collate::CollationSeq;
+use crate::turso_assert;
+use crate::vdbe::builder::{CursorType, ProgramBuilder};
+use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
+use crate::{LimboError, Result};
+use turso_parser::ast;
 
 /// Emit one compound-query node from its already-materialized branch deltas.
 ///
