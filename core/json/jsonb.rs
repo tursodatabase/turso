@@ -1,4 +1,7 @@
-use crate::alloc::{TryClone, TryReserveError, TursoAllocExt, TursoTryWithCapacityExt};
+use crate::alloc::{
+    TryClone, TryReserveError, TursoAllocExt, TursoFromIterator, TursoTryWithCapacityExt,
+    TursoVecExt,
+};
 use crate::json::error::{Error as PError, Result as PResult};
 use crate::json::Conv;
 use crate::types::{value_blob_from_slice, ValueBlob};
@@ -2296,7 +2299,7 @@ impl Jsonb {
         if payload_size <= 11 && !size_might_change {
             let header_byte = (element_type as u8) | ((payload_size as u8) << 4);
             if cursor == self.len() {
-                self.data.push(header_byte);
+                self.data.try_push(header_byte)?;
             } else {
                 self.data[cursor] = header_byte;
             }
@@ -2308,7 +2311,7 @@ impl Jsonb {
         let header_len = header_bytes.len();
 
         if cursor == self.len() {
-            self.data.extend_from_slice(header_bytes);
+            self.data.try_extend(header_bytes.iter().copied())?;
             return Ok(header_len);
         }
 
@@ -2323,6 +2326,7 @@ impl Jsonb {
 
         match new_len.cmp(&old_len) {
             std::cmp::Ordering::Greater => {
+                self.data.try_reserve(new_len - old_len)?;
                 self.data.splice(
                     cursor + old_len..cursor + old_len,
                     std::iter::repeat_n(0, new_len - old_len),
