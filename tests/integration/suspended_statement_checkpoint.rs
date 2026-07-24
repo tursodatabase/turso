@@ -199,3 +199,104 @@ fn test_wal_checkpoint_with_suspended_write_statement_keeps_statement_resumable(
         );
     }
 }
+
+/// Read-statement variant — and the nastier failure mode: for a suspended
+/// SELECT there are no dirty pages, so checkpoint Finalize's
+/// `PageCache::clear(false)` actually SUCCEEDS. The checkpoint reports
+/// success (busy=0) and the resumed SELECT silently returns FEWER ROWS than
+/// the table contains — wrong results with no error at all.
+///
+/// SQLite refuses this exact interleaving: with a half-stepped statement
+/// holding the connection's read transaction, `PRAGMA wal_checkpoint`
+/// returns SQLITE_LOCKED ("database table is locked") from
+/// `sqlite3BtreeCheckpoint`'s `inTransaction != TRANS_NONE` guard, and the
+/// suspended statement resumes unharmed (verified against SQLite 3.45.1).
+/// Turso's `op_checkpoint` guard only checks `!auto_commit`, which misses the
+/// implicit read transaction held by the suspended sibling statement.
+#[test]
+fn test_wal_checkpoint_with_suspended_read_statement_returns_all_rows() {
+    for target_io in 1..=64 {
+        let io = Arc::new(MemoryYieldIO::new());
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir
+            .path()
+            .join(format!("suspended-read-ckpt-{target_io}.db"));
+        let path = path.to_str().unwrap();
+
+        {
+            let conn = open_conn(io.clone(), path);
+            conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB)")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES
+                 (1, zeroblob(9000)),
+                 (2, zeroblob(9000)),
+                 (3, zeroblob(9000))",
+            )
+            .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+
+        // Fresh connection: cold cache, so the SELECT yields StepResult::IO
+        // on every page it reads.
+        let conn = open_conn(io.clone(), path);
+        let mut stmt = conn.prepare("SELECT id, length(b) FROM t").unwrap();
+
+        let mut io_count = 0;
+        let mut rows = 0usize;
+        let mut suspended = false;
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::IO => {
+                    io_count += 1;
+                    if io_count == target_io {
+                        suspended = true;
+                        break;
+                    }
+                    io.step().unwrap();
+                }
+                StepResult::Row => rows += 1,
+                StepResult::Done => break,
+                StepResult::Yield => {}
+                other => panic!("unexpected step result: {other:?}"),
+            }
+        }
+        if !suspended {
+            assert!(
+                target_io > 1,
+                "SELECT finished without any I/O; the sweep never ran"
+            );
+            break;
+        }
+
+        // Checkpoint on the same connection while the SELECT is suspended.
+        // Its outcome is immaterial; the property under test is that it must
+        // not corrupt the suspended statement.
+        let _ = conn
+            .prepare("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap()
+            .run_collect_rows();
+
+        // Resume the SELECT. On main the cursor was invalidated and the page
+        // cache cleared under it, and the scan silently terminates early.
+        loop {
+            match stmt
+                .step()
+                .unwrap_or_else(|e| panic!("target_io={target_io}: resumed SELECT failed: {e}"))
+            {
+                StepResult::IO => io.step().unwrap(),
+                StepResult::Row => rows += 1,
+                StepResult::Done => break,
+                StepResult::Yield => {}
+                other => panic!("unexpected step result on resume: {other:?}"),
+            }
+        }
+        drop(stmt);
+
+        assert_eq!(
+            rows, 3,
+            "target_io={target_io}: SELECT suspended across a checkpoint silently lost rows"
+        );
+    }
+}
