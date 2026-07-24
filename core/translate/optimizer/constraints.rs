@@ -220,6 +220,8 @@ pub struct ConstraintRef {
     pub index_col_pos: usize,
     /// The sort order of the constrained column in the index. Always ascending for rowid indices.
     pub sort_order: SortOrder,
+    /// Where the constrained index column stores NULLs in its forward layout.
+    pub nulls_order: ast::NullsOrder,
 }
 
 /// A collection of [ConstraintRef]s for a given index, or if index is None, for the table's rowid index.
@@ -899,6 +901,7 @@ pub fn constraints_from_where_clause(
                     constraint_vec_pos: i,
                     index_col_pos: 0,
                     sort_order: SortOrder::Asc,
+                    nulls_order: ast::NullsOrder::First,
                 });
             }
             for index in available_indexes
@@ -919,14 +922,6 @@ pub fn constraints_from_where_clause(
                         constraint.usable,
                         "constraint collation must match table column collation"
                     );
-                    if !index.columns[position_in_index].has_default_nulls_placement()
-                        && constraint.operator != ast::Operator::Equals.into()
-                    {
-                        // TODO (Mikaël) for this initial pass, we don't use Gt or Lt constraints on
-                        //  ASC NULLS LAST or DESC NULLS FIRST columns. This will require adapting
-                        //  code in seek.rs.
-                        continue;
-                    }
                     if let Some(table_col_pos) = constraint.table_col_pos {
                         let constrained_column = &table_reference.table.columns()[table_col_pos];
                         let table_collation = constrained_column.collation();
@@ -971,6 +966,7 @@ pub fn constraints_from_where_clause(
                             constraint_vec_pos: i,
                             index_col_pos: position_in_index,
                             sort_order: index.columns[position_in_index].order,
+                            nulls_order: index.columns[position_in_index].effective_nulls_order(),
                         });
                     }
                 }
@@ -1030,6 +1026,8 @@ pub struct RangeConstraintRef {
     pub index_col_pos: usize,
     /// sort order for the column in the index definition
     pub sort_order: SortOrder,
+    /// where the index column stores NULLs in its forward layout
+    pub nulls_order: ast::NullsOrder,
     /// equality constraint
     pub eq: Option<EqConstraintRef>,
     /// lower bound constraint (either > or >=)
@@ -1042,15 +1040,21 @@ pub struct RangeConstraintRef {
 /// Represent seek range which can be used in query planning to emit range scan over table or index
 pub struct SeekRangeConstraint {
     pub sort_order: SortOrder,
+    pub nulls_order: ast::NullsOrder,
     pub eq: Option<(ast::Operator, ast::Expr, Affinity)>,
     pub lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
     pub upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
 }
 
 impl SeekRangeConstraint {
-    pub fn new_eq(sort_order: SortOrder, eq: (ast::Operator, ast::Expr, Affinity)) -> Self {
+    pub fn new_eq(
+        sort_order: SortOrder,
+        nulls_order: ast::NullsOrder,
+        eq: (ast::Operator, ast::Expr, Affinity),
+    ) -> Self {
         Self {
             sort_order,
+            nulls_order,
             eq: Some(eq),
             lower_bound: None,
             upper_bound: None,
@@ -1058,12 +1062,14 @@ impl SeekRangeConstraint {
     }
     pub fn new_range(
         sort_order: SortOrder,
+        nulls_order: ast::NullsOrder,
         lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
         upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
     ) -> Self {
         turso_assert!(lower_bound.is_some() || upper_bound.is_some());
         Self {
             sort_order,
+            nulls_order,
             eq: None,
             lower_bound,
             upper_bound,
@@ -1082,12 +1088,14 @@ impl RangeConstraintRef {
         if let Some(ref eq) = self.eq {
             return SeekRangeConstraint::new_eq(
                 self.sort_order,
+                self.nulls_order,
                 constraints[eq.constraint_pos]
                     .get_constraining_expr(where_clause, referenced_tables),
             );
         }
         SeekRangeConstraint::new_range(
             self.sort_order,
+            self.nulls_order,
             self.lower_bound
                 .map(|x| constraints[x].get_constraining_expr(where_clause, referenced_tables)),
             self.upper_bound
@@ -1193,6 +1201,7 @@ pub fn usable_constraints_for_lhs_mask(
                 table_col_pos,
                 index_col_pos: cref.index_col_pos,
                 sort_order: cref.sort_order,
+                nulls_order: cref.nulls_order,
                 eq: Some(EqConstraintRef {
                     constraint_pos: cref.constraint_vec_pos,
                     is_const: constraints[cref.constraint_vec_pos].lhs_mask.is_empty(),
@@ -1205,6 +1214,7 @@ pub fn usable_constraints_for_lhs_mask(
                     table_col_pos,
                     index_col_pos: cref.index_col_pos,
                     sort_order: cref.sort_order,
+                    nulls_order: cref.nulls_order,
                     eq: None,
                     lower_bound: Some(cref.constraint_vec_pos),
                     upper_bound: None,
@@ -1214,6 +1224,7 @@ pub fn usable_constraints_for_lhs_mask(
                 table_col_pos,
                 index_col_pos: cref.index_col_pos,
                 sort_order: cref.sort_order,
+                nulls_order: cref.nulls_order,
                 eq: None,
                 lower_bound: None,
                 upper_bound: Some(cref.constraint_vec_pos),
@@ -1894,6 +1905,7 @@ fn find_best_index_for_constraint(
             table_col_pos: None,
             index_col_pos: 0,
             sort_order: SortOrder::Asc,
+            nulls_order: ast::NullsOrder::First,
             eq: if operator.as_ast_operator() == Some(ast::Operator::Equals) {
                 Some(EqConstraintRef {
                     constraint_pos: 0,
@@ -1924,6 +1936,7 @@ fn find_best_index_for_constraint(
             table_col_pos: Some(col_pos),
             index_col_pos: 0,
             sort_order: SortOrder::Asc,
+            nulls_order: ast::NullsOrder::First,
             eq: if operator.as_ast_operator() == Some(ast::Operator::Equals) {
                 Some(EqConstraintRef {
                     constraint_pos: 0,
@@ -1960,6 +1973,7 @@ fn find_best_index_for_constraint(
                         table_col_pos: Some(col_pos),
                         index_col_pos: 0,
                         sort_order: index.columns[0].order,
+                        nulls_order: index.columns[0].effective_nulls_order(),
                         eq: if operator.as_ast_operator() == Some(ast::Operator::Equals) {
                             Some(EqConstraintRef {
                                 constraint_pos: 0,
