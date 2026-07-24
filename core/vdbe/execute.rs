@@ -16453,7 +16453,13 @@ pub fn op_max_pgcnt(
     Ok(InsnFunctionStepResult::Step)
 }
 
-/// State machine for PRAGMA journal_mode changes
+/// State machine for PRAGMA journal_mode changes.
+///
+/// For a WAL→MVCC switch the durable page-1 header flip is the *last* step
+/// (`UpdateHeader`/`WritePage` run only after the MV store is installed and
+/// fully bootstrapped). Every earlier state is reversible in memory, so if the
+/// statement yields and is abandoned mid-switch the database simply stays in
+/// WAL mode (#7596).
 #[derive(Debug, Clone, Copy, Default)]
 pub enum OpJournalModeSubState {
     /// Initial state - read header to get current mode
@@ -16461,14 +16467,24 @@ pub enum OpJournalModeSubState {
     Start,
     /// Checkpointing WAL/MVCC before mode change
     Checkpoint,
+    /// (MVCC target only) Install the shared `MvStore` and demote the
+    /// connection while the on-disk header still says WAL.
+    InstallMvStore,
+    /// (MVCC target only) Write a fresh logical-log header before bootstrap,
+    /// so bootstrap (and any later recovery) always sees a valid logical log.
+    InitLogicalLog,
+    /// (MVCC target only) Sync the freshly written logical-log header.
+    SyncLogicalLog,
+    /// (MVCC target only) Bootstrap the MV store, still in WAL mode on disk.
+    BootstrapMvStore,
     /// Update the header with new version and get page reference
     UpdateHeader,
-    /// Write page 1 to disk
+    /// Write page 1 to disk. For an MVCC switch this is the point of no
+    /// return: everything else is already done, so once this write is
+    /// submitted the switch is complete.
     WritePage,
     /// Finalize - clear cache and setup new mode
     Finalize,
-    /// Bootstrap the MV store after switching to MVCC mode
-    BootstrapMvStore,
 }
 
 /// Holds the state for the journal mode change operation
@@ -16485,10 +16501,12 @@ pub struct OpJournalModeState {
     pub bootstrap_state: BootstrapState,
     /// Page reference for writing header
     pub page_ref: Option<PageRef>,
-    /// Abandonment guard for the WAL→MVCC switch. Armed in `Finalize` once the
-    /// store is installed and the connection demoted; disarmed only on
-    /// successful bootstrap. If the statement is reset/dropped while parked at a
-    /// bootstrap yield, dropping this guard restores in-memory state.
+    /// Abandonment guard for the WAL→MVCC switch. Armed in `InstallMvStore`,
+    /// before the shared store is installed and the connection demoted;
+    /// disarmed in `WritePage` once the durable page-1 header flip is
+    /// submitted. If the statement is reset/dropped (or errors) at any yield
+    /// in between, dropping this guard restores in-memory state and the
+    /// database simply stays in WAL mode.
     pub bootstrap_guard: Option<MvccBootstrapGuard>,
 }
 
@@ -16505,15 +16523,22 @@ impl OpJournalModeState {
     }
 }
 
-/// Restores in-memory MVCC state if a `PRAGMA journal_mode=mvcc` bootstrap is
-/// abandoned (statement reset/dropped) or errors after the connection has been
-/// demoted and the shared `MvStore` installed.
+/// Restores in-memory MVCC state if a `PRAGMA journal_mode=mvcc` switch is
+/// abandoned (statement reset/dropped) or errors before the durable page-1
+/// header flip is submitted.
 ///
-/// Without this, `ProgramState::reset()` would clear `active_op_state` while
-/// leaving `is_mvcc_bootstrap_connection` set forever (silently bypassing MVCC)
-/// and the DB-wide `mv_store` installed but un-bootstrapped (`global_header =
-/// None`), which other connections can trip an assertion on at commit. Mirrors
-/// `MvccVacuumGuard` in `vacuum.rs`.
+/// The switch installs the shared `MvStore`, demotes the connection, and
+/// bootstraps the store while the on-disk header still says WAL; the page-1
+/// version flip is the last step. Until that write is submitted every effect
+/// is reversible in memory, so abandoning the statement must re-promote the
+/// connection if it is still demoted (bootstrap promotes itself only at
+/// `Recover`) and uninstall the store: without this,
+/// `is_mvcc_bootstrap_connection` would stay set forever (silently bypassing
+/// MVCC) and other connections on the same `Database` could trip an assertion
+/// on an un-bootstrapped store (`global_header = None`) at commit. The
+/// database then just stays in WAL mode (#7596). Never performs I/O — once
+/// the header write is in flight the guard has already been disarmed.
+/// Mirrors `MvccVacuumGuard` in `vacuum.rs`.
 pub struct MvccBootstrapGuard {
     connection: Arc<Connection>,
     completed: bool,
@@ -16537,17 +16562,47 @@ impl Drop for MvccBootstrapGuard {
         if self.completed {
             return;
         }
-        // Bootstrap did not finish: re-promote the connection if it is still
-        // demoted (bootstrap promotes itself only at `Recover`) and uninstall
-        // the un-bootstrapped store so neither this connection nor others on
-        // the same `Database` observe a demoted-but-unbootstrapped MVCC store.
-        // The on-disk header already reads MVCC, so the database recovers on
-        // the next fresh open via the regular MVCC bootstrap path.
+        // The switch did not reach the page-1 header flip: undo the in-memory
+        // effects so the connection (and the shared `Database`) stay in plain
+        // WAL mode, matching the on-disk header.
         if self.connection.is_mvcc_bootstrap_connection() {
             self.connection.promote_to_regular_connection();
         }
         self.connection.db.mv_store.store(None);
     }
+}
+
+/// Next journal-mode sub-state after the pre-switch checkpoint: a WAL→MVCC
+/// switch installs and bootstraps the MV store first (keeping the on-disk
+/// header in WAL mode), every other transition goes straight to the header
+/// update.
+fn journal_mode_state_after_checkpoint(
+    new_mode: Option<journal_mode::JournalMode>,
+) -> OpJournalModeSubState {
+    if matches!(new_mode, Some(journal_mode::JournalMode::Mvcc)) {
+        OpJournalModeSubState::InstallMvStore
+    } else {
+        OpJournalModeSubState::UpdateHeader
+    }
+}
+
+/// Open (but do not install) the shared `MvStore` for a WAL→MVCC journal-mode
+/// switch on `connection`'s database.
+fn open_mv_store_for_journal_switch(
+    connection: &Arc<Connection>,
+    pager: &Pager,
+) -> Result<Arc<MvStore>> {
+    let db_path = connection.get_database_canonical_path();
+    let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
+    journal_mode::open_mv_store(
+        pager.io.clone(),
+        &db_path,
+        connection.db.open_flags,
+        connection.db.durable_storage.clone(),
+        enc_ctx,
+        connection.db.mv_store_allocator.clone(),
+        connection.db.experimental_mvcc_passive_checkpoint_enabled(),
+    )
 }
 
 pub fn op_journal_mode(
@@ -16565,7 +16620,10 @@ pub fn op_journal_mode(
             Ok(result)
         }
         Err(err) => {
-            // Reset state on error
+            // Reset state on error. If a WAL→MVCC switch was in progress and
+            // had not yet submitted the page-1 header flip, this drops the
+            // armed `MvccBootstrapGuard`, which restores in-memory state so
+            // the database stays in WAL mode.
             state.active_op_state.clear();
             Err(err)
         }
@@ -16711,7 +16769,9 @@ fn op_journal_mode_inner(
                     return_if_io!(ckpt_sm.step(&()));
                     state.active_op_state.journal_mode().checkpoint_sm = None;
                     state.active_op_state.journal_mode().sub_state =
-                        OpJournalModeSubState::UpdateHeader;
+                        journal_mode_state_after_checkpoint(
+                            state.active_op_state.journal_mode().new_mode,
+                        );
                 } else {
                     // WAL checkpoint
                     let checkpoint_result = pager.checkpoint(
@@ -16723,8 +16783,29 @@ fn op_journal_mode_inner(
                     );
                     return_if_io!(checkpoint_result);
                     state.active_op_state.journal_mode().sub_state =
-                        OpJournalModeSubState::UpdateHeader;
+                        journal_mode_state_after_checkpoint(
+                            state.active_op_state.journal_mode().new_mode,
+                        );
                 }
+            }
+
+            OpJournalModeSubState::InstallMvStore => {
+                // WAL→MVCC: install the shared store and demote the connection
+                // while the on-disk header still says WAL. Everything from here
+                // until `WritePage` submits the page-1 flip is reversible in
+                // memory; the armed guard undoes it if the statement is
+                // abandoned, leaving the database in plain WAL mode (#7596).
+                let mv_store = open_mv_store_for_journal_switch(&program.connection, pager)?;
+                // Arm the abandonment guard *before* the store install +
+                // demote so a reset/drop at any subsequent yield restores
+                // in-memory state.
+                let guard = MvccBootstrapGuard::new(program.connection.clone());
+                program.connection.db.mv_store.store(Some(mv_store.clone()));
+                program.connection.demote_to_mvcc_connection();
+                state.active_op_state.journal_mode().bootstrap_guard = Some(guard);
+                state.active_op_state.journal_mode().bootstrap_state = BootstrapState::default();
+                state.active_op_state.journal_mode().sub_state =
+                    OpJournalModeSubState::InitLogicalLog;
             }
 
             OpJournalModeSubState::UpdateHeader => {
@@ -16758,6 +16839,37 @@ fn op_journal_mode_inner(
 
             OpJournalModeSubState::WritePage => {
                 // Write page 1 to disk to flush the header
+                let new_mode = state
+                    .active_op_state
+                    .journal_mode()
+                    .new_mode
+                    .expect("new_mode should be set");
+                if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
+                    // The MV store is installed and fully bootstrapped, so the
+                    // page-1 write below is the final step of the switch.
+                    // Propagate the version flip to the store's cached header
+                    // (bootstrap captured it from the pager before the flip)
+                    // so MVCC header reads — e.g. a later `PRAGMA
+                    // journal_mode` query — report MVCC.
+                    let raw_version = RawVersion::from(
+                        new_mode
+                            .as_version()
+                            .expect("Should be a supported Journal Mode"),
+                    );
+                    let mv_store_guard = program.connection.db.get_mv_store();
+                    let mv_store = mv_store_guard.as_ref().ok_or_else(|| {
+                        LimboError::InternalError(
+                            "MVCC journal mode switch missing MV store".to_string(),
+                        )
+                    })?;
+                    mv_store.with_header_mut(
+                        |header| {
+                            header.read_version = raw_version;
+                            header.write_version = raw_version;
+                        },
+                        None,
+                    )?;
+                }
                 let page = state
                     .active_op_state
                     .journal_mode()
@@ -16765,6 +16877,19 @@ fn op_journal_mode_inner(
                     .as_ref()
                     .expect("page_ref should be set");
                 let completion = begin_write_btree_page(pager, page)?;
+                if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
+                    // The page-1 flip is submitted: the switch is complete
+                    // (the IO layer finishes the write regardless of whether
+                    // the statement keeps being driven), so disarm the
+                    // abandonment guard.
+                    let guard = state
+                        .active_op_state
+                        .journal_mode()
+                        .bootstrap_guard
+                        .as_mut()
+                        .expect("WAL→MVCC abandonment guard must be armed by InstallMvStore");
+                    guard.complete();
+                }
                 state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::Finalize;
                 return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
                     completion,
@@ -16778,39 +16903,13 @@ fn op_journal_mode_inner(
                     .new_mode
                     .expect("new_mode should be set");
 
-                // Clear page cache
+                // Clear page cache. For the WAL→MVCC switch this also drops
+                // the dirty page-1 copy left behind by the direct header
+                // write, so it cannot be re-flushed later.
                 pager.clear_page_cache(true);
 
-                // Setup new mode
-                if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
-                    let db_path = program.connection.get_database_canonical_path();
-                    let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
-                    let mv_store = journal_mode::open_mv_store(
-                        pager.io.clone(),
-                        &db_path,
-                        program.connection.db.open_flags,
-                        program.connection.db.durable_storage.clone(),
-                        enc_ctx,
-                        program.connection.db.mv_store_allocator.clone(),
-                        program
-                            .connection
-                            .db
-                            .experimental_mvcc_passive_checkpoint_enabled(),
-                    )?;
-                    // Arm the abandonment guard *before* the irreversible
-                    // store install + demote so a reset/drop at any subsequent
-                    // bootstrap yield restores in-memory state.
-                    let guard = MvccBootstrapGuard::new(program.connection.clone());
-                    program.connection.db.mv_store.store(Some(mv_store.clone()));
-                    program.connection.demote_to_mvcc_connection();
-                    state.active_op_state.journal_mode().bootstrap_guard = Some(guard);
-                    state.active_op_state.journal_mode().bootstrap_state =
-                        BootstrapState::default();
-                    state.active_op_state.journal_mode().sub_state =
-                        OpJournalModeSubState::BootstrapMvStore;
-                    continue;
-                }
-
+                // Setup new mode. For MVCC the store was already installed and
+                // bootstrapped before the header flip; nothing left to do.
                 if matches!(new_mode, journal_mode::JournalMode::Wal) {
                     program.connection.db.mv_store.store(None);
                 }
@@ -16821,6 +16920,61 @@ fn op_journal_mode_inner(
                 state.pc += 1;
 
                 return Ok(InsnFunctionStepResult::Step);
+            }
+
+            OpJournalModeSubState::InitLogicalLog => {
+                // Make the logical-log header durable *before* bootstrap runs,
+                // so bootstrap never observes WAL frames without a valid
+                // logical log. Any WAL frames committed by interleaved
+                // same-connection writes around the switch are then reconciled
+                // by bootstrap's interrupted-checkpoint recovery instead of
+                // tripping its fail-closed "WAL frames without logical log
+                // header" corruption check (#7596).
+                let completion = {
+                    let mv_store_guard = program.connection.db.get_mv_store();
+                    let Some(mv_store) = mv_store_guard.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "MVCC journal mode switch missing MV store".to_string(),
+                        ));
+                    };
+                    if mv_store.get_logical_log_file().size()?
+                        < crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE as u64
+                    {
+                        Some(mv_store.reset_logical_log_after_external_restore()?)
+                    } else {
+                        // A complete header (or more) already exists on disk;
+                        // never clobber it, bootstrap validates it instead.
+                        None
+                    }
+                };
+                if let Some(completion) = completion {
+                    state.active_op_state.journal_mode().sub_state =
+                        OpJournalModeSubState::SyncLogicalLog;
+                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
+                        completion,
+                    )));
+                }
+                state.active_op_state.journal_mode().sub_state =
+                    OpJournalModeSubState::BootstrapMvStore;
+            }
+
+            OpJournalModeSubState::SyncLogicalLog => {
+                let completion = {
+                    let mv_store_guard = program.connection.db.get_mv_store();
+                    let Some(mv_store) = mv_store_guard.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "MVCC journal mode switch missing MV store".to_string(),
+                        ));
+                    };
+                    mv_store.sync_logical_log_after_external_restore(&program.connection)?
+                };
+                state.active_op_state.journal_mode().sub_state =
+                    OpJournalModeSubState::BootstrapMvStore;
+                if let Some(completion) = completion {
+                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
+                        completion,
+                    )));
+                }
             }
 
             OpJournalModeSubState::BootstrapMvStore => {
@@ -16835,22 +16989,12 @@ fn op_journal_mode_inner(
                     &mut state.active_op_state.journal_mode().bootstrap_state
                 ));
 
-                // Bootstrap finished: disarm the abandonment guard so it does
-                // not roll back the now-published MVCC store on drop.
-                if let Some(guard) = state
-                    .active_op_state
-                    .journal_mode()
-                    .bootstrap_guard
-                    .as_mut()
-                {
-                    guard.complete();
-                }
-
-                let ret: &'static str = journal_mode::JournalMode::Mvcc.into();
-                state.registers[*dest].set_text(Text::new(ret))?;
-                state.pc += 1;
-
-                return Ok(InsnFunctionStepResult::Step);
+                // Bootstrap finished, but the on-disk header still says WAL.
+                // Keep the abandonment guard armed and flip the header as the
+                // final step; a drop before `WritePage` submits the flip still
+                // unwinds cleanly back to WAL mode.
+                state.active_op_state.journal_mode().sub_state =
+                    OpJournalModeSubState::UpdateHeader;
             }
         }
     }

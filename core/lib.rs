@@ -1829,8 +1829,10 @@ impl Database {
                     // override happens later in `Validate`), so capturing
                     // `is_readonly` across the `_init` yields is stable.
                     let pager = return_if_io!(self._init_nonblock(init, encryption_key));
-                    let log_exists =
-                        journal_mode::logical_log_exists(std::path::Path::new(&self.path));
+                    let log_exists = journal_mode::logical_log_exists(
+                        self.io.as_ref(),
+                        std::path::Path::new(&self.path),
+                    );
                     let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
                     turso_assert!(pager.wal.is_none(), "Pager should have no WAL yet");
                     *st = HeaderValidationState::Validate {
@@ -1994,14 +1996,29 @@ impl Database {
                         Version::Mvcc => false,
                     };
 
-                    // In WAL mode, a logical log is always unexpected.
-                    // In MVCC mode, WAL and logical-log coexistence can happen across interrupted checkpoint
-                    // recovery and is reconciled in MvStore::bootstrap().
+                    // In WAL mode, a logical log with committed frames is always
+                    // unexpected: those transactions would be silently invisible.
+                    // In MVCC mode, WAL and logical-log coexistence can happen across
+                    // interrupted checkpoint recovery and is reconciled in
+                    // MvStore::bootstrap(). A header-only logical log next to a
+                    // WAL-mode database is the benign leftover of a
+                    // `PRAGMA journal_mode=mvcc` switch abandoned before the final
+                    // page-1 header flip; ignore it (a later switch to MVCC rewrites
+                    // or validates it).
                     if !open_mv_store && log_exists {
-                        return Err(LimboError::Corrupt(format!(
-                            "MVCC logical log file exists for database {}, but database header indicates WAL mode. The database may be corrupted.",
+                        if journal_mode::logical_log_has_frames(
+                            self.io.as_ref(),
+                            std::path::Path::new(&self.path),
+                        ) {
+                            return Err(LimboError::Corrupt(format!(
+                                "MVCC logical log file with committed frames exists for database {}, but database header indicates WAL mode. The database may be corrupted.",
+                                self.path
+                            )));
+                        }
+                        tracing::warn!(
+                            "ignoring header-only MVCC logical log next to WAL-mode database {}; likely left by an abandoned PRAGMA journal_mode=mvcc switch",
                             self.path
-                        )));
+                        );
                     }
 
                     let page = header.page().clone();
@@ -2204,7 +2221,8 @@ impl Database {
         self.shared_wal
             .write()
             .replace_after_external_restore(new_shared_wal.into_inner());
-        if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
+        if self.mvcc_enabled()
+            || journal_mode::logical_log_exists(self.io.as_ref(), std::path::Path::new(&self.path))
         {
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
