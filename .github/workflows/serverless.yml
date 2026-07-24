@@ -71,18 +71,17 @@ jobs:
         id: provision
         env:
           TURSO_API_TOKEN: ${{ secrets.TURSO_API_TOKEN }}
+          TURSO_ORG: ${{ secrets.TURSO_ORG }}
           TURSO_GROUP: ${{ secrets.TURSO_GROUP }}
         run: |
-          if [ -z "$TURSO_API_TOKEN" ]; then
-            echo "::error::TURSO_API_TOKEN is not configured"
-            exit 1
-          fi
-          if [ -z "$TURSO_GROUP" ]; then
-            echo "::error::TURSO_GROUP is not configured"
-            exit 1
-          fi
+          for var in TURSO_API_TOKEN TURSO_ORG TURSO_GROUP; do
+            if [ -z "${!var}" ]; then
+              echo "::error::$var is not configured"
+              exit 1
+            fi
+          done
 
-          turso org switch turso
+          turso org switch "$TURSO_ORG"
           turso db create "$TURSO_DATABASE_NAME" --group "$TURSO_GROUP" --wait
           echo "created=true" >> "$GITHUB_OUTPUT"
 
