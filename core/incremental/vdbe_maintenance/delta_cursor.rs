@@ -1,4 +1,9 @@
-use super::*;
+use crate::incremental::view::{CapturedDelta, ChangeEvent, SpillSegment, TableChangeId};
+use crate::io::{Buffer, Completion, File};
+use crate::sync::Arc;
+use crate::turso_assert;
+use crate::types::ImmutableRecord;
+use crate::{CompletionError, IOCompletions, IOResult, LimboError, Result, Value};
 
 #[derive(Debug)]
 struct PendingDeltaRead {

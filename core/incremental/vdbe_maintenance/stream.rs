@@ -1,4 +1,9 @@
-use super::*;
+use crate::incremental::dag;
+use crate::schema::{BTreeCharacteristics, BTreeTable, Column};
+use crate::sync::Arc;
+use crate::turso_assert;
+use crate::vdbe::builder::{CursorType, ProgramBuilder};
+use crate::vdbe::insn::{InsertFlags, Insn};
 
 #[derive(Debug, Clone)]
 pub(super) struct EphemeralDelta {
@@ -283,4 +288,32 @@ pub(super) fn emit_operator_rowid_delta(
         flag: InsertFlags::new().is_ephemeral_table_insert(),
         table_name: String::new(),
     });
+}
+
+/// A minimal table description for an ephemeral delta or materialized-view
+/// sink. Empty declared types preserve the values produced by SQL evaluation.
+pub(super) fn synthesized_view_table(
+    view_name: &str,
+    root_page: i64,
+    num_view_columns: usize,
+) -> BTreeTable {
+    let mut columns: Vec<Column> = (0..num_view_columns)
+        .map(|i| Column::new_default_text(Some(format!("c{i}")), String::new(), None))
+        .collect();
+    columns.push(Column::new_default_text(
+        Some("__ivm_weight".to_string()),
+        String::new(),
+        None,
+    ));
+    BTreeTable::new(
+        root_page,
+        view_name.to_string(),
+        Vec::new(),
+        columns,
+        BTreeCharacteristics::HAS_ROWID,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    )
 }
