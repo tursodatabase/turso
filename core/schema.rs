@@ -5674,7 +5674,7 @@ pub struct Index {
 pub struct IndexColumn {
     pub name: String,
     pub order: SortOrder,
-    pub nulls: Option<NullsOrder>,
+    pub nulls_order: Option<NullsOrder>,
     /// the position of the column in the source table.
     /// for example:
     /// CREATE TABLE t (a,b,c)
@@ -5693,7 +5693,7 @@ impl IndexColumn {
         Self {
             name: name.to_string(),
             order: SortOrder::Asc,
-            nulls: None,
+            nulls_order: None,
             pos_in_table,
             collation: None,
             default: None,
@@ -5714,7 +5714,7 @@ impl IndexColumn {
             .map(|(i, name)| Self {
                 name: name.to_string(),
                 order: SortOrder::Asc,
-                nulls: None,
+                nulls_order: None,
                 pos_in_table: i,
                 collation: None,
                 default: None,
@@ -5733,7 +5733,7 @@ impl IndexColumn {
     }
 
     fn effective_nulls_order(&self) -> NullsOrder {
-        self.nulls
+        self.nulls_order
             .unwrap_or_else(|| NullsOrder::default_for(self.order))
     }
 
@@ -5850,7 +5850,7 @@ impl Index {
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col_name),
                     order: *order,
-                    nulls: None,
+                    nulls_order: None,
                     pos_in_table,
                     collation: constraint_columns
                         .get(i)
@@ -5904,7 +5904,7 @@ impl Index {
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col.name.as_ref().unwrap()),
                     order: *sort_order,
-                    nulls: None,
+                    nulls_order: None,
                     pos_in_table,
                     collation: constraint_columns
                         .get(i)

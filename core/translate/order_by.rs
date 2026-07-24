@@ -218,7 +218,7 @@ impl EmitOrderBy {
                 index_columns.push(IndexColumn {
                     name: pos_in_table.to_string(),
                     order: *order,
-                    nulls: None,
+                    nulls_order: None,
                     pos_in_table,
                     collation,
                     default: None,
@@ -230,7 +230,7 @@ impl EmitOrderBy {
             index_columns.try_push(IndexColumn {
                 name: pos_in_table.to_string(),
                 order: SortOrder::Asc,
-                nulls: None,
+                nulls_order: None,
                 pos_in_table,
                 collation: None,
                 default: None,

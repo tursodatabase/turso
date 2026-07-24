@@ -30,7 +30,7 @@ pub(super) fn open_in_seek_source_cursor(
                 columns: crate::alloc::try_vec![IndexColumn {
                     name: String::new(),
                     order: SortOrder::Asc,
-                    nulls: None,
+                    nulls_order: None,
                     pos_in_table: 0,
                     collation,
                     default: None,
