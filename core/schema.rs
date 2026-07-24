@@ -3,7 +3,9 @@ use crate::alloc::TursoFromIterator;
 use crate::alloc::*;
 use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::incremental::view::IncrementalView;
-use crate::incremental::view::{create_dbsp_state_index, DBSP_CIRCUIT_VERSION};
+use crate::incremental::view::{
+    create_dbsp_state_index, dbsp_version_marker_table_name, DBSP_CIRCUIT_VERSION,
+};
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;
@@ -181,6 +183,9 @@ pub const DBSP_MULTISET_TABLE_PREFIX: &str = "__turso_internal_dbsp_multiset_v";
 /// Hidden z-set integral for an operator output consumed as a join
 /// arrangement.
 pub const DBSP_ARRANGEMENT_TABLE_PREFIX: &str = "__turso_internal_dbsp_arrangement_v";
+/// Hidden storage-version marker owned by every materialized view, including
+/// views whose maintenance circuit has no stateful operators.
+pub const DBSP_METADATA_TABLE_PREFIX: &str = "__turso_internal_dbsp_metadata_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
 // Prefix for the hidden sequence *name* owned by an AUTOINCREMENT table.
@@ -1169,20 +1174,29 @@ impl Schema {
         self.incremental_views.get(&name).cloned()
     }
 
-    /// Check if DBSP state table exists with the current version
-    /// Whether the view's persisted state matches the current storage
-    /// version. Filter/project views have no state table at all, so
-    /// compatibility means "no state table from a *different* version
-    /// exists" rather than "the current version's table exists".
-    pub fn has_compatible_dbsp_state_table(&self, view_name: &str) -> bool {
-        !self.dbsp_state_version_mismatch(view_name)
+    /// Whether the view has its current storage marker and no hidden operator
+    /// storage from an incompatible version.
+    pub fn has_compatible_materialized_view_storage(&self, view_name: &str) -> bool {
+        let view_name = normalize_ident(view_name);
+        self.tables
+            .contains_key(&dbsp_version_marker_table_name(&view_name))
+            && !self.dbsp_storage_version_mismatch(&view_name)
     }
 
-    /// True when a state or multiset table for this view exists under a
-    /// different storage version than the current one.
-    pub(crate) fn dbsp_state_version_mismatch(&self, view_name: &str) -> bool {
+    /// True when a metadata marker or operator table for this view exists
+    /// under a different storage version than the current one.
+    pub(crate) fn dbsp_storage_version_mismatch(&self, view_name: &str) -> bool {
         let view_name = normalize_ident(view_name);
         self.tables.keys().any(|table_name| {
+            if let Some((version_str, stored_view_name)) = table_name
+                .strip_prefix(DBSP_METADATA_TABLE_PREFIX)
+                .and_then(|suffix| suffix.split_once('_'))
+            {
+                return stored_view_name == view_name
+                    && version_str
+                        .parse::<u32>()
+                        .is_ok_and(|version| version != DBSP_CIRCUIT_VERSION);
+            }
             table_name
                 .strip_prefix(DBSP_TABLE_PREFIX)
                 .or_else(|| table_name.strip_prefix(DBSP_MULTISET_TABLE_PREFIX))
@@ -1245,21 +1259,13 @@ impl Schema {
             // Remove from tables
             self.remove_table(&name);
 
-            // Remove every hidden state/multiset table of this view and its
-            // indexes. Node-owned tables are named
-            // `..._<view>__n<node_id>`; legacy compound branches used
-            // `..._<view>__b<idx>`.
+            // Remove every version marker and hidden operator table of this
+            // view, including incompatible older storage versions.
             let hidden_tables: Vec<String> = self
                 .tables
                 .keys()
-                .filter(|t| {
-                    t.strip_prefix(DBSP_TABLE_PREFIX)
-                        .or_else(|| t.strip_prefix(DBSP_MULTISET_TABLE_PREFIX))
-                        .or_else(|| t.strip_prefix(DBSP_ARRANGEMENT_TABLE_PREFIX))
-                        .and_then(|suffix| suffix.split_once('_'))
-                        .is_some_and(|(_, stored_name)| {
-                            crate::incremental::view::state_key_belongs_to_view(stored_name, &name)
-                        })
+                .filter(|table_name| {
+                    crate::incremental::view::state_table_belongs_to_view(table_name, &name)
                 })
                 .cloned()
                 .collect();
@@ -2143,10 +2149,10 @@ impl Schema {
         for (view_name, (sql, main_root)) in
             Self::order_persisted_materialized_views(materialized_view_info)?
         {
-            // A state table left behind by a different storage version makes
-            // the view unusable until it is recreated. Filter/project views
-            // legitimately have no state table.
-            if self.dbsp_state_version_mismatch(&view_name) {
+            // The marker is mandatory even when the circuit has no stateful
+            // operators, so absence and mismatched operator storage are both
+            // incompatible.
+            if !self.has_compatible_materialized_view_storage(&view_name) {
                 tracing::warn!(
                     "Materialized view '{}' was created with an incompatible storage version; \
                      DROP and recreate it",
@@ -6302,6 +6308,37 @@ mod tests {
         assert!(!schema.materialized_view_exists("old_view"));
         assert!(!schema.incompatible_views.contains("old_view"));
         assert!(schema.get_dependent_materialized_views("base").is_empty());
+    }
+
+    #[test]
+    fn stateless_materialized_view_requires_current_version_marker() -> Result<()> {
+        fn add_marker(schema: &mut Schema, name: &str, root_page: i64) -> Result<()> {
+            let sql = format!(
+                "CREATE TABLE {} (version INTEGER)",
+                crate::util::quote_identifier(name)
+            );
+            schema.add_btree_table(Arc::new(BTreeTable::from_sql(&sql, root_page)?))
+        }
+
+        let mut schema = Schema::new();
+        assert!(!schema.has_compatible_materialized_view_storage("stateless"));
+
+        let old_version = DBSP_CIRCUIT_VERSION - 1;
+        let other_view_marker = format!("{DBSP_METADATA_TABLE_PREFIX}{old_version}_stateless__n1");
+        add_marker(&mut schema, &other_view_marker, 2)?;
+        assert!(
+            !schema.dbsp_storage_version_mismatch("stateless"),
+            "a similarly prefixed view must not own this view's version marker"
+        );
+
+        let current_marker = dbsp_version_marker_table_name("stateless");
+        add_marker(&mut schema, &current_marker, 3)?;
+        assert!(schema.has_compatible_materialized_view_storage("stateless"));
+
+        let old_marker = format!("{DBSP_METADATA_TABLE_PREFIX}{old_version}_stateless");
+        add_marker(&mut schema, &old_marker, 4)?;
+        assert!(!schema.has_compatible_materialized_view_storage("stateless"));
+        Ok(())
     }
 
     use crate::alloc::vec;

@@ -107,7 +107,6 @@ pub fn translate_create_materialized_view(
         )));
     }
     let hidden_tables = maintenance_plan
-        .operator_states
         .hidden_tables()
         .cloned()
         .collect::<Vec<_>>();
@@ -198,13 +197,9 @@ pub fn translate_create_materialized_view(
         Some(sql),
     )?;
 
-    // Each hidden state/multiset table: create its btree, register it and
-    // its automatic primary-key index in sqlite_schema. A GROUP BY view's
-    // state table holds the group keys and aggregate payloads; a join
-    // view's holds the source-rowid tuples. Every table is owned by one DAG
-    // node, so several stateful operators can coexist without relying on
-    // branch-specific naming. All are keyed by a PRIMARY KEY whose automatic
-    // index the maintenance program relies on for lookups.
+    // Create the version marker and node-owned operator storage described by
+    // the maintenance plan. Stateful tables expose a primary-key index used by
+    // codegen; the marker only persists compatibility metadata.
     let mut parse_schema_names = vec![escape_sql_string_literal(&normalized_view_name)];
     for hidden in &hidden_tables {
         let table_root_reg = program.alloc_register();
@@ -225,30 +220,31 @@ pub fn translate_create_materialized_view(
             Some(hidden.create_sql.clone()),
         )?;
 
-        let index_root_reg = program.alloc_register();
-        program.emit_insn(Insn::CreateBtree {
-            db: database_id,
-            root: index_root_reg,
-            flags: CreateBTreeFlags::new_index(),
-        });
-        let index_name = format!(
-            "{}{}_1",
-            PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX, &hidden.table_name
-        );
-        emit_schema_entry(
-            program,
-            resolver,
-            sqlite_schema_cursor_id,
-            None,
-            SchemaEntryType::Index,
-            &index_name,
-            &hidden.table_name,
-            index_root_reg,
-            None,
-        )?;
-
         parse_schema_names.push(escape_sql_string_literal(&hidden.table_name));
-        parse_schema_names.push(escape_sql_string_literal(&index_name));
+        if hidden.primary_key_index {
+            let index_root_reg = program.alloc_register();
+            program.emit_insn(Insn::CreateBtree {
+                db: database_id,
+                root: index_root_reg,
+                flags: CreateBTreeFlags::new_index(),
+            });
+            let index_name = format!(
+                "{}{}_1",
+                PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX, &hidden.table_name
+            );
+            emit_schema_entry(
+                program,
+                resolver,
+                sqlite_schema_cursor_id,
+                None,
+                SchemaEntryType::Index,
+                &index_name,
+                &hidden.table_name,
+                index_root_reg,
+                None,
+            )?;
+            parse_schema_names.push(escape_sql_string_literal(&index_name));
+        }
     }
 
     // Parse schema to load the new view (and its state table, if any)

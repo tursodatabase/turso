@@ -539,6 +539,7 @@ fn plan_expr_collation(
 pub struct HiddenTableDef {
     pub table_name: String,
     pub create_sql: String,
+    pub primary_key_index: bool,
 }
 
 /// Persistent storage and output contract assigned to one DAG node.
@@ -613,7 +614,7 @@ impl OperatorStateCatalog {
         Ok(state)
     }
 
-    pub fn hidden_tables(&self) -> impl Iterator<Item = &HiddenTableDef> {
+    fn hidden_tables(&self) -> impl Iterator<Item = &HiddenTableDef> {
         self.nodes.iter().flat_map(|state| {
             state
                 .state_table
@@ -634,6 +635,13 @@ pub struct MaintenancePlan {
     pub dag: dag::MaintenanceDag,
     pub operator_states: OperatorStateCatalog,
     pub output_arity: usize,
+    version_marker: HiddenTableDef,
+}
+
+impl MaintenancePlan {
+    pub fn hidden_tables(&self) -> impl Iterator<Item = &HiddenTableDef> {
+        std::iter::once(&self.version_marker).chain(self.operator_states.hidden_tables())
+    }
 }
 
 /// Validate a view and build its executable maintenance plan.
@@ -659,11 +667,23 @@ pub fn plan_view(
     let dag = build_dag_from_plan(&relational_plan, resolver)?;
     let operator_states = plan_operator_states(view_name, &dag, resolver)?;
     let output_arity = dag.root_schema().len();
+    let version_marker = version_marker_table(view_name);
     Ok(MaintenancePlan {
         dag,
         operator_states,
         output_arity,
+        version_marker,
     })
+}
+
+fn version_marker_table(view_name: &str) -> HiddenTableDef {
+    let table_name = crate::incremental::view::dbsp_version_marker_table_name(view_name);
+    let table_ident = crate::util::quote_identifier(&table_name);
+    HiddenTableDef {
+        create_sql: format!("CREATE TABLE {table_ident} (version INTEGER)"),
+        table_name,
+        primary_key_index: false,
+    }
 }
 
 /// Validate one fully planned node.
@@ -1303,6 +1323,7 @@ fn plan_operator_states(
             Some(HiddenTableDef {
                 create_sql: state_table_sql(&table_name, node)?,
                 table_name,
+                primary_key_index: true,
             })
         } else {
             None
@@ -1333,6 +1354,7 @@ fn plan_operator_states(
                         },
                 )?,
                 table_name,
+                primary_key_index: true,
             })
         } else {
             None
@@ -1352,6 +1374,7 @@ fn plan_operator_states(
                     binding_rowid_metadata_width(emitted_identity, &binding_rowids),
                 )?,
                 table_name,
+                primary_key_index: true,
             })
         } else {
             None

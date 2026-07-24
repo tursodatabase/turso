@@ -22,6 +22,33 @@ expect {
     10|z
 }
 
+# Even a stateless circuit persists its storage version. Missing this marker
+# made old filter/project views appear compatible after identity or lowering
+# changes because they had no operator-state tables to carry the version.
+test matview-vdbe-stateless-version-marker {
+    CREATE TABLE versioned_base(id INTEGER PRIMARY KEY, enabled INTEGER);
+    CREATE MATERIALIZED VIEW versioned_stateless AS
+      SELECT id FROM versioned_base WHERE enabled <> 0;
+    SELECT type, name, tbl_name
+      FROM sqlite_schema
+     WHERE name = '__turso_internal_dbsp_metadata_v12_versioned_stateless';
+    SELECT COUNT(*)
+      FROM sqlite_schema
+     WHERE tbl_name = '__turso_internal_dbsp_metadata_v12_versioned_stateless';
+    INSERT INTO versioned_base VALUES (1, 1);
+    SELECT * FROM versioned_stateless;
+    DROP VIEW versioned_stateless;
+    SELECT COUNT(*)
+      FROM sqlite_schema
+     WHERE name = '__turso_internal_dbsp_metadata_v12_versioned_stateless';
+}
+expect {
+    table|__turso_internal_dbsp_metadata_v12_versioned_stateless|__turso_internal_dbsp_metadata_v12_versioned_stateless
+    1
+    1
+    0
+}
+
 test matview-vdbe-update-across-filter-boundary {
     CREATE TABLE t2(a INTEGER, b TEXT);
     INSERT INTO t2 VALUES (1,'in'),(5,'out');
@@ -2485,11 +2512,11 @@ test matview-vdbe-filtered-derived-input-arrangement {
     SELECT * FROM arranged_join ORDER BY 1;
     SELECT COUNT(*)
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_arrangement_v11_arranged_join__n%';
+     WHERE name LIKE '__turso_internal_dbsp_arrangement_v12_arranged_join__n%';
     DROP VIEW arranged_join;
     SELECT COUNT(*)
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_arrangement_v11_arranged_join__n%';
+     WHERE name LIKE '__turso_internal_dbsp_arrangement_v12_arranged_join__n%';
 }
 expect {
     1|ten
@@ -2849,17 +2876,17 @@ test matview-vdbe-node-owned-hidden-state {
       SELECT node_a.k FROM node_a JOIN node_b ON node_a.k = node_b.k;
     SELECT name
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_state_v11_node_catalog__n%'
-        OR name LIKE '__turso_internal_dbsp_arrangement_v11_node_catalog__n%'
+     WHERE name LIKE '__turso_internal_dbsp_state_v12_node_catalog__n%'
+        OR name LIKE '__turso_internal_dbsp_arrangement_v12_node_catalog__n%'
      ORDER BY name;
     DROP VIEW node_catalog;
     SELECT COUNT(*)
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_state_v11_node_catalog__n%';
+     WHERE name LIKE '__turso_internal_dbsp_state_v12_node_catalog__n%';
 }
 expect {
-    __turso_internal_dbsp_arrangement_v11_node_catalog__n8
-    __turso_internal_dbsp_state_v11_node_catalog__n1
+    __turso_internal_dbsp_arrangement_v12_node_catalog__n8
+    __turso_internal_dbsp_state_v12_node_catalog__n1
     0
 }
 
