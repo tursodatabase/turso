@@ -5,25 +5,16 @@
 //! operation). Each node consumes the delta stream(s) of its input node(s) and
 //! produces its own delta stream; the root node's stream is the view's change.
 //! This is the DBSP circuit model — see `docs/ivm-delta-flow-design.md` — and
-//! it replaces the per-shape classifier: a composite query is maintained by
-//! composing the incremental maintenance of its operators, so combinations
-//! (aggregate-over-join, DISTINCT-over-join, set-ops over either) stop being
-//! special cases.
+//! it is the replacement boundary for the deleted per-shape classifier.
 //!
-//! This module owns only the *structure*. The delta-stream wiring and bytecode
-//! emission live in `vdbe_maintenance`: codegen walks this DAG in topological
-//! order (node index order, since inputs are always built before their
-//! consumers) and emits each node into one shared program.
+//! This module owns only the *structure*. Delta-stream wiring, validation,
+//! hidden-state derivation, and bytecode emission live in
+//! `vdbe_maintenance`, all consuming this representation.
 //!
 //! Expressions are `ast::Expr` throughout, bound through the shared translator
 //! — deliberately *not* a parallel expression layer. The old engine's
 //! `LogicalExpr` and interpreted operators (deleted at `5e17d8ea0`) are not
 //! resurrected; only its DAG composition model is.
-//!
-//! Introduced ahead of its consumers: the builder (decomposition) and the
-//! DAG-walk codegen land in follow-up slices of the delta-flow resurrection.
-//! Until codegen consumes it, the representation is unreferenced.
-#![allow(dead_code)]
 
 use std::sync::Arc;
 
@@ -32,10 +23,62 @@ use turso_parser::ast;
 use crate::schema::BTreeTable;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::Aggregate;
+use crate::{error::LimboError, Result};
+use turso_parser::ast::TableInternalId;
 
 /// Index into [`MaintenanceDag::nodes`]. A node's inputs always have smaller
 /// indices, so iterating `0..nodes.len()` visits the DAG in topological order.
 pub type NodeId = usize;
+
+/// One value column in an operator's delta stream.
+///
+/// `expr` is the canonical expression used by downstream operators to bind
+/// this slot. Base-table columns without a SQL name cannot be referenced by a
+/// later expression, so their slot deliberately has no expression.
+#[derive(Debug, Clone)]
+pub struct StreamColumn {
+    pub expr: Option<ast::Expr>,
+    pub name: Option<String>,
+}
+
+/// Base-table namespace needed to bind expressions carried across an
+/// ephemeral operator edge. The physical stream may have one cursor, but its
+/// values retain the logical names from all contributing inputs.
+#[derive(Debug, Clone)]
+pub struct StreamBinding {
+    pub table: Arc<BTreeTable>,
+    pub identifier: String,
+    /// Stable logical binding assigned by the main planner. Physical emitter
+    /// phases remap this id mechanically to their local cursor binding; names
+    /// are presentation metadata and are never resolved again.
+    pub logical_id: TableInternalId,
+}
+
+/// The value layout of an operator's delta stream.
+///
+/// Row identity and z-set weight are transport metadata rather than relational
+/// columns and are therefore not included here.
+#[derive(Debug, Clone)]
+pub struct StreamSchema {
+    pub columns: Vec<StreamColumn>,
+    pub bindings: Vec<StreamBinding>,
+}
+
+impl StreamSchema {
+    pub fn len(&self) -> usize {
+        self.columns.len()
+    }
+}
+
+/// Join semantics supported by one maintenance node.
+///
+/// FULL is intentionally absent: it must lower to outer-join/anti-join
+/// arrangements plus a set operator, not become another boolean on this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    LeftOuter,
+}
 
 /// One incremental operator in the maintenance DAG.
 ///
@@ -45,8 +88,9 @@ pub type NodeId = usize;
 /// an `Aggregate` must expose its natural join row (every input column) so
 /// the `Aggregate` can read it, and a view's output expressions (`SUM(x)+1`)
 /// are a `Project` over the `Aggregate`. HAVING is a `Filter` over the
-/// `Aggregate`. This is what lets any operator feed any other; there is no
-/// combination-specific node.
+/// `Aggregate`. This is the stream contract needed for any operator to feed
+/// any other. Unsupported SQL is rejected while lowering or validating this
+/// graph, before hidden storage or bytecode is emitted.
 ///
 /// Every node has a natural **output schema** (its column list), computed by
 /// the builder. An operator's expressions bind against its *input* node's
@@ -64,6 +108,7 @@ pub enum OpNode {
         table: Arc<BTreeTable>,
         /// The identifier columns bind under (alias or table name).
         identifier: String,
+        logical_id: TableInternalId,
     },
 
     /// Selection (σ). Linear — its incremental form is itself applied to the
@@ -81,15 +126,26 @@ pub enum OpNode {
         projections: Vec<(ast::Expr, Option<String>)>,
     },
 
+    /// Rename a derived relation into the namespace exposed by its FROM-clause
+    /// alias. This is a physical stream boundary, not SQL evaluation: values
+    /// are copied unchanged while the output schema receives the derived
+    /// table's bound column identities.
+    Alias {
+        input: NodeId,
+        table: Arc<BTreeTable>,
+        identifier: String,
+        logical_id: TableInternalId,
+    },
+
     /// Join (⋈), n-ary over its inputs, with arbitrary ON predicates. Pure:
     /// no projection, no WHERE (those are `Project`/`Filter` above). Output
     /// schema: the concatenation of the input schemas. The bilinear delta
     /// decomposition and the source-rowid-tuple pair map live in the codegen.
     ///
-    /// Inputs are currently [`OpNode::Scan`]s (base tables are arrangements
-    /// for free). Joining an *interior* operator needs that operator's
-    /// integral materialized as an arrangement — a later generalization the
-    /// interface admits, not a new special case.
+    /// Inputs expose both a delta stream and, where available, an arrangement.
+    /// Scans use base-table btrees for free; aggregates expose their persisted
+    /// finalized rows. Other interior operators require an explicit output
+    /// arrangement before a downstream join can consume them.
     Join {
         inputs: Vec<NodeId>,
         /// Merged USING/NATURAL column names per input (parallel to `inputs`).
@@ -97,8 +153,8 @@ pub enum OpNode {
         /// ON predicates, desugared from USING/NATURAL; bind against the
         /// concatenated input schema.
         on: Vec<ast::Expr>,
-        /// A two-table LEFT join (NULL-padded rows for unmatched left rows).
-        left_outer: bool,
+        /// A LEFT join is binary. N-ary nodes are inner joins only.
+        kind: JoinKind,
     },
 
     /// Aggregation (γ), including scalar aggregates. Keeps its own integral
@@ -118,16 +174,11 @@ pub enum OpNode {
         scalar: bool,
     },
 
-    /// Duplicate elimination (δ) — `SELECT DISTINCT`. Output schema: its
-    /// input's. (Modeled distinctly from `Aggregate`, though it is the
-    /// degenerate GROUP-BY-over-all-columns; the codegen may share machinery.)
-    Distinct { input: NodeId },
-
-    /// A compound set operation (UNION / UNION ALL / INTERSECT / EXCEPT) over
-    /// branch inputs of any shape. Keeps its own integral (per-branch presence
-    /// counts for the deduplicated prefix; multiplicity for the trailing
-    /// UNION ALL), so each branch feeds only its delta stream. Output schema:
-    /// the shared branch schema.
+    /// A compound set operation (UNION / UNION ALL / INTERSECT / EXCEPT).
+    /// Every branch emits through the same typed stream contract.
+    /// Keeps its own integral (per-branch presence counts for the
+    /// deduplicated prefix; multiplicity for the trailing UNION ALL). Output
+    /// schema: the shared branch schema.
     SetOp {
         /// Branch inputs, in chain order.
         inputs: Vec<NodeId>,
@@ -149,8 +200,8 @@ impl OpNode {
             OpNode::Scan { .. } => &[],
             OpNode::Filter { input, .. }
             | OpNode::Project { input, .. }
-            | OpNode::Aggregate { input, .. }
-            | OpNode::Distinct { input } => std::slice::from_ref(input),
+            | OpNode::Alias { input, .. }
+            | OpNode::Aggregate { input, .. } => std::slice::from_ref(input),
             OpNode::Join { inputs, .. } | OpNode::SetOp { inputs, .. } => inputs,
         }
     }
@@ -161,105 +212,17 @@ impl OpNode {
 #[derive(Debug, Clone)]
 pub struct MaintenanceDag {
     pub nodes: Vec<OpNode>,
+    output_schemas: Vec<StreamSchema>,
     pub root: NodeId,
 }
 
-/// A column of a node's output relation. `identity` is the base-column
-/// expression that produces the column; a parent operator binds its
-/// expressions by matching sub-expressions against these identities.
-#[derive(Debug, Clone)]
-pub struct OutputCol {
-    pub identity: ast::Expr,
-    pub name: Option<String>,
-}
-
 impl MaintenanceDag {
-    pub fn root_node(&self) -> &OpNode {
-        &self.nodes[self.root]
+    pub fn output_schema(&self, node: NodeId) -> &StreamSchema {
+        &self.output_schemas[node]
     }
 
-    /// The output schema of every node, indexed by `NodeId`. Computed in one
-    /// forward pass since inputs precede their consumers.
-    pub fn output_schemas(&self) -> crate::Result<Vec<Vec<OutputCol>>> {
-        let mut schemas: Vec<Vec<OutputCol>> = Vec::with_capacity(self.nodes.len());
-        for node in &self.nodes {
-            let schema = match node {
-                OpNode::Scan { table, identifier } => {
-                    let mut cols = Vec::with_capacity(table.columns().len());
-                    for column in table.columns() {
-                        let name = column.name.clone().ok_or_else(|| {
-                            crate::LimboError::InternalError(
-                                "btree table column without a name".to_string(),
-                            )
-                        })?;
-                        cols.push(OutputCol {
-                            identity: ast::Expr::Qualified(
-                                ast::Name::exact(identifier.clone()),
-                                ast::Name::exact(name.clone()),
-                            ),
-                            name: Some(name),
-                        });
-                    }
-                    cols
-                }
-                OpNode::Filter { input, .. } | OpNode::Distinct { input } => {
-                    schemas[*input].clone()
-                }
-                OpNode::Project { projections, .. } => projections
-                    .iter()
-                    .map(|(expr, name)| OutputCol {
-                        identity: expr.clone(),
-                        name: name.clone(),
-                    })
-                    .collect(),
-                OpNode::Join { inputs, using, .. } => {
-                    // Concatenate input schemas; a USING/NATURAL-merged column
-                    // appears once (dropped from all but the first input that
-                    // has it), matching star expansion.
-                    let mut cols = Vec::new();
-                    for (pos, &input) in inputs.iter().enumerate() {
-                        for col in &schemas[input] {
-                            if pos > 0
-                                && using[pos].iter().any(|u| {
-                                    col.name
-                                        .as_deref()
-                                        .is_some_and(|n| n.eq_ignore_ascii_case(u))
-                                })
-                            {
-                                continue;
-                            }
-                            cols.push(col.clone());
-                        }
-                    }
-                    cols
-                }
-                OpNode::Aggregate {
-                    group_exprs,
-                    aggregates,
-                    ..
-                } => {
-                    // Group keys, then one column per aggregate (identity is
-                    // the aggregate call, so a parent's `SUM(x)` binds here).
-                    let mut cols: Vec<OutputCol> = group_exprs
-                        .iter()
-                        .map(|expr| OutputCol {
-                            identity: expr.clone(),
-                            name: None,
-                        })
-                        .collect();
-                    for agg in aggregates {
-                        cols.push(OutputCol {
-                            identity: agg.original_expr.clone(),
-                            name: None,
-                        });
-                    }
-                    cols
-                }
-                OpNode::SetOp { inputs, .. } => schemas[inputs[0]].clone(),
-            };
-            schemas.push(schema);
-        }
-        Ok(schemas)
+    pub fn root_schema(&self) -> &StreamSchema {
+        self.output_schema(self.root)
     }
 }
 
@@ -268,6 +231,7 @@ impl MaintenanceDag {
 #[derive(Default)]
 pub struct DagBuilder {
     nodes: Vec<OpNode>,
+    output_schemas: Vec<StreamSchema>,
 }
 
 impl DagBuilder {
@@ -276,21 +240,156 @@ impl DagBuilder {
     }
 
     /// Append a node whose inputs were already pushed, returning its id.
-    pub fn push(&mut self, node: OpNode) -> NodeId {
-        debug_assert!(
-            node.inputs().iter().all(|&i| i < self.nodes.len()),
-            "operator inputs must be built before the operator"
-        );
+    pub fn push(&mut self, node: OpNode) -> Result<NodeId> {
+        if !node.inputs().iter().all(|&input| input < self.nodes.len()) {
+            return Err(LimboError::InternalError(
+                "operator inputs must be built before the operator".to_string(),
+            ));
+        }
+        let output_schema = self.derive_output_schema(&node)?;
         self.nodes.push(node);
-        self.nodes.len() - 1
+        self.output_schemas.push(output_schema);
+        Ok(self.nodes.len() - 1)
     }
 
     /// Finalize with `root` as the output node.
-    pub fn finish(self, root: NodeId) -> MaintenanceDag {
-        debug_assert_eq!(root, self.nodes.len() - 1, "root must be the last node");
-        MaintenanceDag {
-            nodes: self.nodes,
-            root,
+    pub fn finish(self, root: NodeId) -> Result<MaintenanceDag> {
+        if root + 1 != self.nodes.len() || self.nodes.len() != self.output_schemas.len() {
+            return Err(LimboError::InternalError(
+                "maintenance DAG root must be the last node".to_string(),
+            ));
         }
+        Ok(MaintenanceDag {
+            nodes: self.nodes,
+            output_schemas: self.output_schemas,
+            root,
+        })
+    }
+
+    fn derive_output_schema(&self, node: &OpNode) -> Result<StreamSchema> {
+        let (columns, bindings) = match node {
+            OpNode::Scan {
+                table,
+                identifier,
+                logical_id,
+            } => (
+                table
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(column_index, column)| StreamColumn {
+                        expr: column.name.as_ref().map(|_| ast::Expr::Column {
+                            database: None,
+                            table: *logical_id,
+                            column: column_index,
+                            is_rowid_alias: column.is_rowid_alias(),
+                        }),
+                        name: column.name.clone(),
+                    })
+                    .collect(),
+                vec![StreamBinding {
+                    table: table.clone(),
+                    identifier: identifier.clone(),
+                    logical_id: *logical_id,
+                }],
+            ),
+            OpNode::Filter { input, .. } => (
+                self.output_schemas[*input].columns.clone(),
+                self.output_schemas[*input].bindings.clone(),
+            ),
+            OpNode::Project { input, projections } => (
+                projections
+                    .iter()
+                    .map(|(expr, name)| StreamColumn {
+                        expr: Some(expr.clone()),
+                        name: name.clone(),
+                    })
+                    .collect(),
+                self.output_schemas[*input].bindings.clone(),
+            ),
+            OpNode::Alias {
+                input,
+                table,
+                identifier,
+                logical_id,
+            } => {
+                if self.output_schemas[*input].len() != table.columns().len() {
+                    return Err(LimboError::InternalError(
+                        "derived-table alias arity does not match its input stream".to_string(),
+                    ));
+                }
+                (
+                    table
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .map(|(column_index, column)| StreamColumn {
+                            expr: column.name.as_ref().map(|_| ast::Expr::Column {
+                                database: None,
+                                table: *logical_id,
+                                column: column_index,
+                                is_rowid_alias: column.is_rowid_alias(),
+                            }),
+                            name: column.name.clone(),
+                        })
+                        .collect(),
+                    vec![StreamBinding {
+                        table: table.clone(),
+                        identifier: identifier.clone(),
+                        logical_id: *logical_id,
+                    }],
+                )
+            }
+            OpNode::Join { inputs, .. } => (
+                inputs
+                    .iter()
+                    .flat_map(|input| self.output_schemas[*input].columns.iter().cloned())
+                    .collect(),
+                inputs
+                    .iter()
+                    .flat_map(|input| self.output_schemas[*input].bindings.iter().cloned())
+                    .collect(),
+            ),
+            OpNode::Aggregate {
+                input,
+                group_exprs,
+                aggregates,
+                ..
+            } => (
+                group_exprs
+                    .iter()
+                    .cloned()
+                    .chain(
+                        aggregates
+                            .iter()
+                            .map(|aggregate| aggregate.original_expr.clone()),
+                    )
+                    .map(|expr| StreamColumn {
+                        expr: Some(expr),
+                        name: None,
+                    })
+                    .collect(),
+                self.output_schemas[*input].bindings.clone(),
+            ),
+            OpNode::SetOp { inputs, arity, .. } => {
+                let Some(first) = inputs.first() else {
+                    return Err(LimboError::InternalError(
+                        "set-op DAG must have at least one input".to_string(),
+                    ));
+                };
+                for input in inputs {
+                    if self.output_schemas[*input].len() != *arity {
+                        return Err(LimboError::InternalError(
+                            "set-op DAG inputs have inconsistent output schemas".to_string(),
+                        ));
+                    }
+                }
+                (
+                    self.output_schemas[*first].columns.clone(),
+                    self.output_schemas[*first].bindings.clone(),
+                )
+            }
+        };
+        Ok(StreamSchema { columns, bindings })
     }
 }

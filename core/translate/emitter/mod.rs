@@ -1426,7 +1426,6 @@ fn emit_cdc_insns_v1(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn emit_cdc_insns_v2(
     program: &mut ProgramBuilder,
     resolver: &Resolver,

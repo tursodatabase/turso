@@ -1,7 +1,4 @@
-use crate::incremental::view::IncrementalView;
-use crate::schema::{
-    BTreeCharacteristics, BTreeTable, SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES,
-};
+use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType, RESERVED_TABLE_PREFIXES};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::{
@@ -9,7 +6,8 @@ use crate::translate::{
     schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
 };
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    escape_sql_string_literal, extract_view_columns, normalize_ident,
+    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
@@ -29,8 +27,9 @@ fn validate_materialized(
                 .to_string(),
         ));
     }
-    // The DBSP incremental maintenance runtime (populate_from_table, etc.) assumes
-    // the main database pager/schema. Block attached databases until that is fixed.
+    // Compiled maintenance programs currently bind every persistent cursor to
+    // the main pager/schema. Block attached databases until those handles
+    // carry a database id.
     if database_id != crate::MAIN_DB_ID {
         crate::bail_parse_error!("materialized views are not supported on attached databases");
     }
@@ -44,7 +43,7 @@ fn validate_materialized(
     // Check if view already exists (including broken sqlite_schema rows,
     // which must be dropped before the name can be reused)
     if resolver.with_schema(database_id, |s| {
-        s.get_materialized_view(normalized_view_name).is_some()
+        s.materialized_view_exists(normalized_view_name)
             || s.broken_views.contains(normalized_view_name)
     }) {
         return Err(crate::LimboError::ParseError(format!(
@@ -70,7 +69,7 @@ pub fn translate_create_materialized_view(
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
             s.get_view(&normalized_view_name).is_some()
-                || s.is_materialized_view(&normalized_view_name)
+                || s.materialized_view_exists(&normalized_view_name)
                 || s.broken_views.contains(&normalized_view_name)
         })
     {
@@ -85,22 +84,33 @@ pub fn translate_create_materialized_view(
     // Check for cross-database table references first
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
 
-    let view_column_schema = resolver.with_schema(database_id, |s| {
-        IncrementalView::validate_and_extract_columns(select_stmt, s, resolver)
-    })?;
+    let view_column_schema =
+        resolver.with_schema(database_id, |s| extract_view_columns(select_stmt, s))?;
     let view_columns = view_column_schema.flat_columns();
 
-    // The classified shape decides what internal storage the view needs:
-    // filter/project views are maintained purely in the view btree, while
-    // GROUP BY views persist per-group aggregate state and join views a
-    // rowid-pair map.
-    let shape = resolver.with_schema(database_id, |s| {
-        crate::incremental::vdbe_maintenance::classify_view(select_stmt, s, resolver)
+    // One plan owns validation, the executable operator DAG, and the hidden
+    // storage derived from that DAG. CREATE must not independently classify
+    // the SQL and guess which tables codegen will later open.
+    let maintenance_plan = resolver.with_schema(database_id, |_| {
+        crate::incremental::vdbe_maintenance::plan_view(
+            &normalized_view_name,
+            select_stmt,
+            resolver,
+            &connection,
+        )
     })?;
-    // Every hidden state/multiset table the view needs (per branch for a
-    // compound-all view), each with its CREATE SQL.
-    let hidden_tables =
-        crate::incremental::vdbe_maintenance::hidden_tables(&normalized_view_name, &shape)?;
+    if maintenance_plan.output_arity != view_columns.len() {
+        return Err(crate::LimboError::InternalError(format!(
+            "materialized view result schema has {} columns but its maintenance DAG emits {}",
+            view_columns.len(),
+            maintenance_plan.output_arity,
+        )));
+    }
+    let hidden_tables = maintenance_plan
+        .operator_states
+        .hidden_tables()
+        .cloned()
+        .collect::<Vec<_>>();
 
     // Reconstruct the SQL string for storage
     let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);
@@ -191,9 +201,10 @@ pub fn translate_create_materialized_view(
     // Each hidden state/multiset table: create its btree, register it and
     // its automatic primary-key index in sqlite_schema. A GROUP BY view's
     // state table holds the group keys and aggregate payloads; a join
-    // view's holds the source-rowid tuples; a compound-all view has one set
-    // per branch. All are keyed by a PRIMARY KEY whose automatic index the
-    // maintenance program relies on for lookups.
+    // view's holds the source-rowid tuples. Every table is owned by one DAG
+    // node, so several stateful operators can coexist without relying on
+    // branch-specific naming. All are keyed by a PRIMARY KEY whose automatic
+    // index the maintenance program relies on for lookups.
     let mut parse_schema_names = vec![escape_sql_string_literal(&normalized_view_name)];
     for hidden in &hidden_tables {
         let table_root_reg = program.alloc_register();
@@ -283,7 +294,7 @@ fn validate_create_view(
     // the user must DROP VIEW it first.
     if resolver.with_schema(database_id, |s| {
         s.get_view(normalized_view_name).is_some()
-            || s.is_materialized_view(normalized_view_name)
+            || s.materialized_view_exists(normalized_view_name)
             || s.broken_views.contains(normalized_view_name)
     }) {
         return Err(crate::LimboError::ParseError(format!(
@@ -315,7 +326,7 @@ pub fn translate_create_view(
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
             s.get_view(&normalized_view_name).is_some()
-                || s.is_materialized_view(&normalized_view_name)
+                || s.materialized_view_exists(&normalized_view_name)
                 || s.broken_views.contains(&normalized_view_name)
         })
     {
@@ -428,7 +439,7 @@ pub fn translate_drop_view(
         resolver.with_schema(database_id, |s| {
             (
                 s.get_view(&normalized_view_name).is_some(),
-                s.is_materialized_view(&normalized_view_name),
+                s.materialized_view_exists(&normalized_view_name),
                 s.broken_views.contains(&normalized_view_name),
             )
         });
@@ -443,6 +454,18 @@ pub fn translate_drop_view(
     if !view_exists && if_exists {
         // View doesn't exist but IF EXISTS was specified, nothing to do
         return Ok(());
+    }
+
+    if is_materialized_view {
+        let dependent_views = resolver.with_schema(database_id, |s| {
+            s.get_dependent_materialized_views(&normalized_view_name)
+        });
+        if !dependent_views.is_empty() {
+            return Err(crate::LimboError::ParseError(format!(
+                "cannot drop materialized view \"{normalized_view_name}\": it has dependent materialized view(s): {}",
+                dependent_views.join(", ")
+            )));
+        }
     }
 
     // If this is a materialized view, we need to destroy its btree as well
@@ -461,29 +484,29 @@ pub fn translate_drop_view(
                     is_temp: 0,
                 });
             }
+        } else if let Some(root_page) = resolver.with_schema(database_id, |s| {
+            s.incompatible_materialized_view_root(&normalized_view_name)
+        }) {
+            program.emit_insn(Insn::Destroy {
+                db: database_id,
+                root: root_page,
+                former_root_reg: 0,
+                is_temp: 0,
+            });
         }
 
-        // Every hidden state/multiset table of this view, including a
-        // compound-all view's per-branch tables (`..._<view>__b<idx>`).
-        // Matched by prefix so the whole family is destroyed, mirroring
-        // Schema::remove_view.
-        use crate::incremental::view::DBSP_CIRCUIT_VERSION;
-        let prefixes = [
-            format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"),
-            format!(
-                "{}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}",
-                crate::schema::DBSP_MULTISET_TABLE_PREFIX
-            ),
-        ];
+        // Every node-owned hidden state/multiset table of this view, including
+        // incompatible older storage versions. Ownership parses the complete
+        // node/branch suffix so similarly prefixed view names cannot steal
+        // each other's state.
         resolver.with_schema(database_id, |s| {
             s.tables
                 .keys()
-                .filter(|t| {
-                    prefixes.iter().any(|prefix| {
-                        *t == prefix
-                            || t.strip_prefix(prefix.as_str())
-                                .is_some_and(|rest| rest.starts_with("__b"))
-                    })
+                .filter(|table_name| {
+                    crate::incremental::view::state_table_belongs_to_view(
+                        table_name,
+                        &normalized_view_name,
+                    )
                 })
                 .cloned()
                 .collect::<Vec<String>>()

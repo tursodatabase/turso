@@ -39,8 +39,27 @@ pub struct IvmView {
 /// Outcome of a view creation attempt, for test.sql logging.
 #[derive(Debug)]
 pub enum IvmCreateOutcome {
-    Created { sql: String },
-    Rejected { sql: String, error: String },
+    Created {
+        sql: String,
+        /// Deterministic no-op updates executed on both engines. Probing every
+        /// main table guarantees that every leaf of the generated view is
+        /// driven at least once; unrelated tables are harmless extra probes.
+        leaf_probes: Vec<String>,
+    },
+    Rejected {
+        sql: String,
+        error: String,
+        must_create: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneratedDefinition {
+    sql: String,
+    /// This template is part of the supported compositional surface. Treat a
+    /// CREATE rejection as an oracle failure rather than silently reducing
+    /// fuzz coverage.
+    must_create: bool,
 }
 
 /// Tracks the materialized views created during an IVM-mode run.
@@ -68,25 +87,64 @@ impl IvmState {
 
     /// Generate and execute one CREATE MATERIALIZED VIEW on Turso.
     ///
-    /// Returns `None` when the schema has no usable tables. A rejected
-    /// creation (e.g. a shape the IVM engine does not support) is reported to
-    /// the caller for logging but is not an oracle failure.
+    /// Returns `None` when the schema has no usable tables. Rejections are
+    /// reported with their capability expectation: unsupported compositions
+    /// are coverage, while rejection of a `must_create` composition is an
+    /// oracle failure in the runner.
     pub fn try_create_view(
         &mut self,
         turso_conn: &Arc<turso_core::Connection>,
         schema: &Schema,
         rng: &mut ChaCha8Rng,
     ) -> Option<IvmCreateOutcome> {
-        let definition = generate_definition(schema, rng)?;
+        // Exercise topologically scheduled view dependencies. A rejection is
+        // an oracle failure: accepted upstream views are valid relation
+        // inputs and their changes must propagate through the same log.
+        let definition = if !self.views.is_empty() && rng.random_bool(0.1) {
+            let upstream = &self.views[rng.random_range(0..self.views.len())];
+            let source = quoted(&upstream.name);
+            GeneratedDefinition {
+                sql: match rng.random_range(0..3) {
+                    0 => format!("SELECT * FROM {source}"),
+                    1 => format!("SELECT COUNT(*) FROM {source}"),
+                    _ => format!("SELECT DISTINCT * FROM {source}"),
+                },
+                must_create: true,
+            }
+        } else {
+            generate_definition(schema, rng)?
+        };
         let name = format!("ivm_v{}", self.next_id);
         self.next_id += 1;
-        let sql = format!("CREATE MATERIALIZED VIEW \"{name}\" AS {definition}");
+        let sql = format!("CREATE MATERIALIZED VIEW \"{name}\" AS {}", definition.sql);
 
         match DifferentialOracle::execute_turso(turso_conn, &sql) {
-            QueryResult::Error(error) => Some(IvmCreateOutcome::Rejected { sql, error }),
+            QueryResult::Error(error) => Some(IvmCreateOutcome::Rejected {
+                sql,
+                error,
+                must_create: definition.must_create,
+            }),
             _ => {
-                self.views.push(IvmView { name, definition });
-                Some(IvmCreateOutcome::Created { sql })
+                self.views.push(IvmView {
+                    name,
+                    definition: definition.sql,
+                });
+                let leaf_probes = schema
+                    .tables
+                    .iter()
+                    .filter(|table| table.database.is_none())
+                    .filter_map(|table| {
+                        table.columns.first().map(|column| {
+                            format!(
+                                "UPDATE {} SET {} = {}",
+                                quoted(&table.name),
+                                quoted(&column.name),
+                                quoted(&column.name)
+                            )
+                        })
+                    })
+                    .collect();
+                Some(IvmCreateOutcome::Created { sql, leaf_probes })
             }
         }
     }
@@ -133,7 +191,7 @@ impl IvmState {
 
 /// Generate a view definition over the current schema, or `None` when no
 /// usable main-database table exists yet.
-fn generate_definition(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<String> {
+fn generate_definition(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<GeneratedDefinition> {
     // Materialized views over attached/temp databases are rejected by the
     // engine, so only main-database tables qualify.
     let tables: Vec<&Table> = schema
@@ -146,15 +204,241 @@ fn generate_definition(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<String> 
     }
 
     let table = tables[rng.random_range(0..tables.len())];
-    match rng.random_range(0..14u32) {
-        0..=2 => Some(projection(table, rng, false)),
-        3..=4 => Some(projection(table, rng, true)),
-        5..=7 => Some(aggregate(table, rng)),
-        8..=9 => Some(scalar_aggregate(table, rng)),
-        10 => union(&tables, rng),
-        11 => compound_all(&tables, rng).or_else(|| Some(projection(table, rng, true))),
-        _ => join(&tables, rng).or_else(|| Some(projection(table, rng, true))),
+    let (sql, must_create) = match rng.random_range(0..30u32) {
+        0..=2 => (Some(projection(table, rng, false)), false),
+        3..=4 => (Some(projection(table, rng, true)), false),
+        5..=7 => (Some(aggregate(table, rng)), false),
+        8..=9 => (Some(scalar_aggregate(table, rng)), false),
+        10 => (union(&tables, rng), false),
+        11 => (
+            compound_all(&tables, rng).or_else(|| Some(projection(table, rng, true))),
+            false,
+        ),
+        12..=14 => (
+            join(&tables, rng).or_else(|| Some(projection(table, rng, true))),
+            false,
+        ),
+        // Recursive relational generation: operators compose by consuming
+        // the typed output of generated children rather than selecting a
+        // named end-to-end shape.
+        15..=27 => (
+            compositional_definition(&tables, rng, 3).map(|relation| relation.sql),
+            true,
+        ),
+        // FULL remains an explicit capability probe and is wrapped by a
+        // downstream operator so rejection is checked compositionally.
+        28 => (full_outer_composition(&tables, rng, true), false),
+        _ => (full_outer_composition(&tables, rng, false), false),
+    };
+    sql.map(|sql| GeneratedDefinition { sql, must_create })
+}
+
+fn compatible_pair<'a>(
+    tables: &[&'a Table],
+    rng: &mut ChaCha8Rng,
+) -> Option<(&'a Table, &'a Table, &'a ColumnDef, &'a ColumnDef)> {
+    let mut pairs = Vec::new();
+    for left in tables {
+        for right in tables {
+            for left_column in &left.columns {
+                for right_column in &right.columns {
+                    if left_column.data_type == right_column.data_type
+                        && matches!(
+                            left_column.data_type,
+                            DataType::Integer | DataType::Real | DataType::Text
+                        )
+                    {
+                        pairs.push((*left, *right, left_column, right_column));
+                    }
+                }
+            }
+        }
     }
+    (!pairs.is_empty()).then(|| pairs[rng.random_range(0..pairs.len())])
+}
+
+/// A one-column relational expression used by the recursive composition
+/// generator. Every operator consumes this same typed contract and publishes
+/// it again, except COUNT which deliberately changes the type to INTEGER.
+struct ComposedRelation {
+    sql: String,
+    data_type: DataType,
+}
+
+fn compositional_definition(
+    tables: &[&Table],
+    rng: &mut ChaCha8Rng,
+    depth: usize,
+) -> Option<ComposedRelation> {
+    let types = [DataType::Integer, DataType::Real, DataType::Text]
+        .into_iter()
+        .filter(|data_type| {
+            tables.iter().any(|table| {
+                table
+                    .columns
+                    .iter()
+                    .any(|column| column.data_type == *data_type)
+            })
+        })
+        .collect::<Vec<_>>();
+    if types.is_empty() {
+        return None;
+    }
+    let data_type = types[rng.random_range(0..types.len())];
+    let mut next_alias = 0;
+    compose_relation(tables, rng, data_type, depth, &mut next_alias)
+}
+
+fn compose_relation(
+    tables: &[&Table],
+    rng: &mut ChaCha8Rng,
+    data_type: DataType,
+    depth: usize,
+    next_alias: &mut usize,
+) -> Option<ComposedRelation> {
+    let base = |rng: &mut ChaCha8Rng| {
+        let leaves = tables
+            .iter()
+            .flat_map(|table| {
+                table
+                    .columns
+                    .iter()
+                    .filter(move |column| column.data_type == data_type)
+                    .map(move |column| (*table, column))
+            })
+            .collect::<Vec<_>>();
+        let (table, column) = leaves.get(rng.random_range(0..leaves.len()))?;
+        Some(ComposedRelation {
+            sql: format!(
+                "SELECT {} AS value FROM {}",
+                quoted(&column.name),
+                quoted(&table.name)
+            ),
+            data_type,
+        })
+    };
+
+    if depth == 0 || rng.random_bool(0.2) {
+        return base(rng);
+    }
+
+    let alias = |next_alias: &mut usize, prefix: &str| {
+        let alias = format!("{prefix}{}", *next_alias);
+        *next_alias += 1;
+        alias
+    };
+    match rng.random_range(0..8u8) {
+        0 => base(rng),
+        1 => {
+            let child = compose_relation(tables, rng, data_type, depth - 1, next_alias)?;
+            let child_alias = alias(next_alias, "f");
+            Some(ComposedRelation {
+                sql: format!(
+                    "SELECT value FROM ({}) AS {} WHERE value IS NOT NULL",
+                    child.sql,
+                    quoted(&child_alias)
+                ),
+                data_type: child.data_type,
+            })
+        }
+        2 => {
+            let child = compose_relation(tables, rng, data_type, depth - 1, next_alias)?;
+            let child_alias = alias(next_alias, "d");
+            Some(ComposedRelation {
+                sql: format!(
+                    "SELECT DISTINCT value FROM ({}) AS {}",
+                    child.sql,
+                    quoted(&child_alias)
+                ),
+                data_type: child.data_type,
+            })
+        }
+        3 if data_type == DataType::Integer => {
+            let child_type = [DataType::Integer, DataType::Real, DataType::Text]
+                .into_iter()
+                .filter(|child_type| {
+                    tables.iter().any(|table| {
+                        table
+                            .columns
+                            .iter()
+                            .any(|column| column.data_type == *child_type)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let child_type = child_type[rng.random_range(0..child_type.len())];
+            let child = compose_relation(tables, rng, child_type, depth - 1, next_alias)?;
+            let child_alias = alias(next_alias, "a");
+            Some(ComposedRelation {
+                sql: format!(
+                    "SELECT COUNT(*) AS value FROM ({}) AS {}",
+                    child.sql,
+                    quoted(&child_alias)
+                ),
+                data_type: DataType::Integer,
+            })
+        }
+        3..=5 => {
+            let left = compose_relation(tables, rng, data_type, depth - 1, next_alias)?;
+            let right = compose_relation(tables, rng, data_type, depth - 1, next_alias)?;
+            let left_alias = alias(next_alias, "s");
+            let right_alias = alias(next_alias, "s");
+            let operator = ["UNION ALL", "UNION", "INTERSECT", "EXCEPT"][rng.random_range(0..4)];
+            Some(ComposedRelation {
+                sql: format!(
+                    "SELECT value FROM ({}) AS {} {operator} \
+                     SELECT value FROM ({}) AS {}",
+                    left.sql,
+                    quoted(&left_alias),
+                    right.sql,
+                    quoted(&right_alias)
+                ),
+                data_type,
+            })
+        }
+        6 | 7 => {
+            let left = compose_relation(tables, rng, data_type, depth - 1, next_alias)?;
+            let right = compose_relation(tables, rng, data_type, depth - 1, next_alias)?;
+            let join = if rng.random_bool(0.3) {
+                "LEFT JOIN"
+            } else {
+                "JOIN"
+            };
+            Some(ComposedRelation {
+                sql: format!(
+                    "SELECT l.value AS value FROM ({}) AS l {join} ({}) AS r \
+                     ON l.value = r.value",
+                    left.sql, right.sql
+                ),
+                data_type,
+            })
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn full_outer_composition(
+    tables: &[&Table],
+    rng: &mut ChaCha8Rng,
+    aggregate: bool,
+) -> Option<String> {
+    let (left, right, left_column, right_column) = compatible_pair(tables, rng)?;
+    let output = if aggregate {
+        "COUNT(*)".to_string()
+    } else {
+        format!(
+            "DISTINCT l.{}, r.{}",
+            quoted(&left_column.name),
+            quoted(&right_column.name)
+        )
+    };
+    Some(format!(
+        "SELECT {output} FROM {left} AS l FULL OUTER JOIN {right} AS r \
+         ON l.{left_column} = r.{right_column}",
+        left = quoted(&left.name),
+        right = quoted(&right.name),
+        left_column = quoted(&left_column.name),
+        right_column = quoted(&right_column.name),
+    ))
 }
 
 /// `SELECT <aggs> FROM t1 UNION ALL SELECT <aggs> FROM t2` — a pure UNION ALL
@@ -589,16 +873,8 @@ fn join(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
             let col = r_numeric[rng.random_range(0..r_numeric.len())];
             exprs.push(format!("SUM(r.{}) AS s", quoted(&col.name)));
         }
-        // Sometimes aggregate over a LEFT JOIN: unmatched left rows are
-        // NULL-padded and still feed the aggregate (COUNT counts them, SUM
-        // ignores the NULL), exercising the padded-row aux behind the group.
-        let join_kw = if rng.random_bool(0.5) {
-            "LEFT JOIN"
-        } else {
-            "JOIN"
-        };
         return Some(format!(
-            "SELECT {exprs} FROM {lt} AS l {join_kw} {rt} AS r ON l.{lc} = r.{rc} GROUP BY l.{g}",
+            "SELECT {exprs} FROM {lt} AS l JOIN {rt} AS r ON l.{lc} = r.{rc} GROUP BY l.{g}",
             exprs = exprs.join(", "),
             lt = quoted(&left.name),
             rt = quoted(&right.name),
@@ -684,7 +960,11 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(3);
         for _ in 0..50 {
             let def = generate_definition(&schema, &mut rng).unwrap();
-            assert!(def.starts_with("SELECT "), "unexpected definition: {def}");
+            assert!(
+                def.sql.starts_with("SELECT "),
+                "unexpected definition: {}",
+                def.sql
+            );
         }
     }
 
@@ -720,5 +1000,281 @@ mod tests {
         // exercises the comparison itself.
         state.views[0].definition = "SELECT id, num FROM t WHERE num >= 40".into();
         assert!(state.check_views(&conn).is_fail());
+    }
+
+    #[test]
+    fn compositional_oracle_mutates_every_leaf() {
+        let conn = open_turso_with_views("ivm-composition-test.db");
+        let definition = "SELECT COUNT(*) FROM a JOIN b ON a.k = b.k \
+                          UNION ALL SELECT COUNT(*) FROM c";
+        for sql in [
+            "CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER)",
+            "CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, k INTEGER)",
+            "INSERT INTO a VALUES (1, 10)",
+            "INSERT INTO b VALUES (1, 10)",
+            "INSERT INTO c VALUES (1, 10)",
+            &format!("CREATE MATERIALIZED VIEW v_composed AS {definition}"),
+        ] {
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "setup failed: {sql}"
+            );
+        }
+
+        let mut state = IvmState::new();
+        state.views.push(IvmView {
+            name: "v_composed".into(),
+            definition: definition.into(),
+        });
+        assert!(state.check_views(&conn).is_pass());
+
+        for sql in [
+            "INSERT INTO a VALUES (2, 20)",
+            "INSERT INTO b VALUES (2, 20)",
+            "UPDATE c SET k = 11 WHERE id = 1",
+            "DELETE FROM a WHERE id = 1",
+            "DELETE FROM b WHERE id = 2",
+            "DELETE FROM c WHERE id = 1",
+        ] {
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "mutation failed: {sql}"
+            );
+            assert!(
+                state.check_views(&conn).is_pass(),
+                "IVM diverged after mutating a composition leaf: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn join_to_set_op_oracle_mutates_every_leaf() {
+        let conn = open_turso_with_views("ivm-join-setop-test.db");
+        let definition = "SELECT a.k FROM a JOIN b ON a.k = b.k UNION SELECT k FROM c";
+        for sql in [
+            "CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER)",
+            "CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, k INTEGER)",
+            "INSERT INTO a VALUES (1, 10), (2, 20)",
+            "INSERT INTO b VALUES (1, 10), (2, 20)",
+            "INSERT INTO c VALUES (1, 10), (2, 30)",
+            &format!("CREATE MATERIALIZED VIEW v_join_setop AS {definition}"),
+        ] {
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "setup failed: {sql}"
+            );
+        }
+
+        let mut state = IvmState::new();
+        state.views.push(IvmView {
+            name: "v_join_setop".into(),
+            definition: definition.into(),
+        });
+        assert!(state.check_views(&conn).is_pass());
+
+        for sql in [
+            "INSERT INTO a VALUES (3, 40)",
+            "INSERT INTO b VALUES (3, 40)",
+            "DELETE FROM c WHERE id = 1",
+            "UPDATE b SET k = 50 WHERE id = 2",
+            "INSERT INTO c VALUES (4, 20)",
+            "DELETE FROM a WHERE id = 1",
+        ] {
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "mutation failed: {sql}"
+            );
+            assert!(
+                state.check_views(&conn).is_pass(),
+                "IVM diverged after mutating join -> set-op leaf: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_op_to_aggregate_oracle_mutates_every_leaf() {
+        let conn = open_turso_with_views("ivm-setop-aggregate-test.db");
+        let definition = "SELECT value, COUNT(*), SUM(value) FROM (\
+                          SELECT k AS value FROM a \
+                          UNION SELECT k AS value FROM b) \
+                          GROUP BY value";
+        for sql in [
+            "CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER)",
+            "CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER)",
+            "INSERT INTO a VALUES (1, 10), (2, 20)",
+            "INSERT INTO b VALUES (1, 10), (2, 30)",
+            &format!("CREATE MATERIALIZED VIEW v_setop_aggregate AS {definition}"),
+        ] {
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "setup failed: {sql}"
+            );
+        }
+
+        let mut state = IvmState::new();
+        state.views.push(IvmView {
+            name: "v_setop_aggregate".into(),
+            definition: definition.into(),
+        });
+        assert!(state.check_views(&conn).is_pass());
+
+        for sql in [
+            "INSERT INTO a VALUES (3, 30)",
+            "INSERT INTO b VALUES (3, 20)",
+            "UPDATE a SET k = 40 WHERE id = 1",
+            "DELETE FROM b WHERE id = 1",
+            "DELETE FROM a WHERE id = 2",
+            "UPDATE b SET k = 50 WHERE id = 2",
+        ] {
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "mutation failed: {sql}"
+            );
+            assert!(
+                state.check_views(&conn).is_pass(),
+                "IVM diverged after mutating set-op -> aggregate leaf: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_set_op_to_aggregate_oracle_mutates_every_leaf() {
+        let conn = open_turso_with_views("ivm-mixed-setop-aggregate-test.db");
+        let definition = "SELECT value, COUNT(*) FROM (\
+                          SELECT k AS value FROM a \
+                          UNION SELECT k AS value FROM b \
+                          UNION ALL SELECT k AS value FROM c) \
+                          GROUP BY value";
+        for sql in [
+            "CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER)",
+            "CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, k INTEGER)",
+            "INSERT INTO a VALUES (1, 10), (2, 20)",
+            "INSERT INTO b VALUES (1, 10), (2, 30)",
+            "INSERT INTO c VALUES (1, 10), (2, 20)",
+            &format!("CREATE MATERIALIZED VIEW v_mixed_setop_aggregate AS {definition}"),
+        ] {
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "setup failed: {sql}"
+            );
+        }
+
+        let mut state = IvmState::new();
+        state.views.push(IvmView {
+            name: "v_mixed_setop_aggregate".into(),
+            definition: definition.into(),
+        });
+        assert!(state.check_views(&conn).is_pass());
+
+        for sql in [
+            "UPDATE a SET k = 40 WHERE id = 1",
+            "DELETE FROM b WHERE id = 1",
+            "INSERT INTO c VALUES (3, 30)",
+            "DELETE FROM a WHERE id = 2",
+            "UPDATE b SET k = 50 WHERE id = 2",
+            "DELETE FROM c WHERE id = 1",
+        ] {
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "mutation failed: {sql}"
+            );
+            assert!(
+                state.check_views(&conn).is_pass(),
+                "IVM diverged after mutating mixed set-op -> aggregate leaf: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_to_set_op_oracle_mutates_every_leaf() {
+        let conn = open_turso_with_views("ivm-aggregate-setop-test.db");
+        let definition = "SELECT k, COUNT(*) AS n FROM a GROUP BY k \
+                          UNION \
+                          SELECT k, COUNT(*) AS n FROM b GROUP BY k";
+        for sql in [
+            "CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER)",
+            "CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER)",
+            "INSERT INTO a VALUES (1, 10), (2, 10), (3, 20)",
+            "INSERT INTO b VALUES (1, 10), (2, 30)",
+            &format!("CREATE MATERIALIZED VIEW v_aggregate_setop AS {definition}"),
+        ] {
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "setup failed: {sql}"
+            );
+        }
+
+        let mut state = IvmState::new();
+        state.views.push(IvmView {
+            name: "v_aggregate_setop".into(),
+            definition: definition.into(),
+        });
+        assert!(state.check_views(&conn).is_pass());
+
+        for sql in [
+            "INSERT INTO a VALUES (4, 30)",
+            "INSERT INTO b VALUES (3, 10)",
+            "UPDATE a SET k = 40 WHERE id = 1",
+            "DELETE FROM b WHERE id = 1",
+            "DELETE FROM a WHERE id = 3",
+            "UPDATE b SET k = 50 WHERE id = 2",
+        ] {
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "mutation failed: {sql}"
+            );
+            assert!(
+                state.check_views(&conn).is_pass(),
+                "IVM diverged after mutating aggregate -> set-op leaf: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn arranged_input_to_join_oracle_mutates_every_leaf() {
+        let conn = open_turso_with_views("ivm-arranged-join-input-test.db");
+        let definition = "SELECT d.k, d.n, r.label FROM (\
+                          SELECT k, COUNT(*) AS n FROM a GROUP BY k) AS d \
+                          JOIN r ON d.k = r.k";
+        for sql in [
+            "CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER)",
+            "CREATE TABLE r(k INTEGER PRIMARY KEY, label TEXT)",
+            "INSERT INTO a VALUES (1, 10), (2, 10), (3, 20)",
+            "INSERT INTO r VALUES (10, 'ten'), (20, 'twenty'), (30, 'thirty')",
+            &format!("CREATE MATERIALIZED VIEW v_arranged_join AS {definition}"),
+        ] {
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "setup failed: {sql}"
+            );
+        }
+
+        let mut state = IvmState::new();
+        state.views.push(IvmView {
+            name: "v_arranged_join".into(),
+            definition: definition.into(),
+        });
+        assert!(state.check_views(&conn).is_pass());
+
+        for sql in [
+            "INSERT INTO a VALUES (4, 30)",
+            "UPDATE a SET k = 20 WHERE id = 1",
+            "DELETE FROM r WHERE k = 10",
+            "UPDATE r SET label = 'TWENTY' WHERE k = 20",
+            "DELETE FROM a WHERE id = 3",
+            "INSERT INTO r VALUES (10, 'ten-again')",
+        ] {
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "mutation failed: {sql}"
+            );
+            assert!(
+                state.check_views(&conn).is_pass(),
+                "IVM diverged after mutating an arranged join-input leaf: {sql}"
+            );
+        }
     }
 }

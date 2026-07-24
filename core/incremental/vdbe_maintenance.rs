@@ -28,9 +28,9 @@
 //!
 //! Programs are built with [`ProgramBuilder::new_for_subprogram`], so they
 //! emit no transaction instructions and their `Halt` does not commit: they
-//! always run inside an already-open write transaction — at commit time for
-//! maintenance (`apply_view_deltas`), or inside the CREATE MATERIALIZED VIEW
-//! statement for initial population.
+//! always run inside an already-open write transaction — at statement
+//! completion (or before an in-statement view read), or inside the CREATE
+//! MATERIALIZED VIEW statement for initial population.
 //!
 //! Delta rows must be applied in capture order: an UPDATE is captured as
 //! delete(old image) followed by insert(new image) under the same rowid, and
@@ -38,35 +38,41 @@
 //! first. The [`DeltaCursor`] therefore iterates the captured `Delta`
 //! verbatim, without consolidation.
 
-use std::sync::Arc;
-
+use rustc_hash::{FxHashMap, FxHashSet};
 use turso_parser::ast;
 
 use crate::function::{AggFunc, Func};
 use crate::incremental::dag;
-use crate::incremental::dbsp::Delta;
+use crate::incremental::view::{CapturedDelta, ChangeEvent, SpillSegment, TableChangeId};
+use crate::io::{Buffer, Completion, File};
 use crate::schema::{BTreeTable, Schema};
+use crate::sync::Arc;
 use crate::translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, translate_condition_expr, translate_expr_no_constant_opt,
-    BindingBehavior, ConditionMetadata, NoConstantOptReason, WalkControl,
+    expr_contains_nondeterministic_scalar_function, translate_condition_expr,
+    translate_expr_no_constant_opt, walk_expr_mut, ConditionMetadata, NoConstantOptReason,
+    WalkControl,
 };
 use crate::translate::plan::{
-    Aggregate, ColumnUsedMask, IterationDirection, JoinInfo, JoinedTable, Operation, Scan,
-    TableReferences,
+    Aggregate, ColumnUsedMask, IterationDirection, JoinInfo, JoinedTable, Operation, Plan,
+    QueryDestination, Scan, SelectPlan, TableReferences,
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
+use crate::translate::select::prepare_select_plan;
 use crate::turso_assert;
+use crate::types::ImmutableRecord;
 use crate::util::walk_expr_with_subqueries;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
-use crate::vdbe::{BranchOffset, Program};
-use crate::{Connection, LimboError, QueryMode, Result, Value};
+use crate::vdbe::{BranchOffset, PreparedProgram, Program};
+use crate::{
+    CompletionError, Connection, IOCompletions, IOResult, LimboError, QueryMode, Result, Value,
+};
 use turso_parser::ast::TableInternalId;
 
 /// What the maintenance program reads as its input relation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MaintenanceInput {
     /// The transaction's captured delta for the view's base table:
     /// rows are (rowid, base column values..., weight).
@@ -76,24 +82,445 @@ pub enum MaintenanceInput {
     BaseTable,
 }
 
-/// Where the maintenance program's output goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MaintenanceOutput {
-    /// Weight-merge into the view's btree (commit-time maintenance and
-    /// initial population).
-    ViewBtree,
-    /// Emit each transformed row as a result row `(rowid, columns.., weight)`
-    /// without touching any btree. Used to overlay uncommitted transaction
-    /// changes for same-transaction reads of the view.
-    EmitRows,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MaintenanceProgramCacheKey {
+    view_name: String,
+    schema_version: u32,
+    root_page: i64,
+    num_columns: usize,
+    input: MaintenanceInput,
 }
 
-/// Read-only cursor over a captured [`Delta`] for one base table, in capture
-/// order. Exposes the base columns at their table positions and the weight as
-/// one extra trailing column; the delta row's key is exposed as the rowid.
+/// Per-connection prepared maintenance programs, invalidated by the schema
+/// cookie and normal prepared-statement context generation.
+pub(crate) struct MaintenanceProgramCache {
+    entries: crate::sync::RwLock<FxHashMap<MaintenanceProgramCacheKey, Arc<PreparedProgram>>>,
+}
+
+impl MaintenanceProgramCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: crate::sync::RwLock::new(FxHashMap::default()),
+        }
+    }
+
+    fn get(
+        &self,
+        key: &MaintenanceProgramCacheKey,
+        connection: &Connection,
+    ) -> Option<Arc<PreparedProgram>> {
+        self.entries
+            .read()
+            .get(key)
+            .filter(|program| program.is_compatible_with(connection))
+            .cloned()
+    }
+
+    fn insert(&self, key: MaintenanceProgramCacheKey, program: Arc<PreparedProgram>) {
+        let mut entries = self.entries.write();
+        entries.retain(|existing, _| existing.schema_version == key.schema_version);
+        entries.insert(key, program);
+    }
+}
+
+/// A delta-producing relation consumed by a maintenance operator.
+///
+/// This is derived exclusively from DAG edges. Emitters must not recover their
+/// input by inspecting the original SELECT: doing so makes the DAG descriptive
+/// rather than executable and reintroduces per-shape composition.
+#[derive(Debug, Clone)]
+enum DeltaSource {
+    BaseTable {
+        table: Arc<BTreeTable>,
+        identifier: String,
+        logical_id: TableInternalId,
+        /// Physical multiplicity column when this scan reads another
+        /// materialized view. Transaction-delta cursors always expose their
+        /// signed weight immediately after the logical columns.
+        stored_weight_column: Option<usize>,
+    },
+    /// A z-set stream emitted by an upstream operator in this program.
+    Ephemeral(EphemeralDelta),
+}
+
+impl DeltaSource {
+    fn identity(&self) -> DeltaIdentity {
+        match self {
+            Self::BaseTable { .. } => DeltaIdentity::BindingRowids(1),
+            Self::Ephemeral(channel) => channel.identity,
+        }
+    }
+
+    fn sole_binding(&self) -> Result<(Arc<BTreeTable>, String, TableInternalId)> {
+        match self {
+            Self::BaseTable {
+                table,
+                identifier,
+                logical_id,
+                ..
+            } => Ok((table.clone(), identifier.clone(), *logical_id)),
+            Self::Ephemeral(channel) => {
+                if channel.schema.bindings.len() != 1 {
+                    return Err(LimboError::InternalError(
+                        "arranged input must expose exactly one logical binding".to_string(),
+                    ));
+                }
+                let binding = &channel.schema.bindings[0];
+                Ok((
+                    binding.table.clone(),
+                    binding.identifier.clone(),
+                    binding.logical_id,
+                ))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn materialize(
+        &self,
+        program: &mut ProgramBuilder,
+        view_name: &str,
+        source_node: dag::NodeId,
+        source_schema: &dag::StreamSchema,
+        input: MaintenanceInput,
+    ) -> Result<EphemeralDelta> {
+        let Self::BaseTable {
+            table,
+            stored_weight_column,
+            ..
+        } = self
+        else {
+            let Self::Ephemeral(channel) = self else {
+                unreachable!()
+            };
+            return Ok(channel.clone());
+        };
+        let sink = open_ephemeral_delta(
+            program,
+            &format!("{view_name}_scan_delta_{source_node}"),
+            source_schema.clone(),
+            DeltaIdentity::BindingRowids(1),
+            false,
+        );
+        let channel = sink.ephemeral()?;
+        emit_base_scan_delta(
+            program,
+            view_name,
+            table,
+            *stored_weight_column,
+            input,
+            channel,
+        )?;
+        Ok(channel.clone())
+    }
+}
+
+/// The physical result of compiling one DAG node.
+///
+/// `delta` is the node's transaction change stream. `arrangement` is the
+/// maintained integral downstream stateful operators may probe. Linear nodes
+/// deliberately have no arrangement: producing one requires an explicit
+/// materialization operator rather than silently reopening an ancestor table.
+#[derive(Debug, Clone)]
+struct NodeOutput {
+    delta: DeltaSource,
+    arrangement: Option<ArrangementHandle>,
+}
+
+/// Physical inputs declared by one Join DAG node.
+struct JoinContract {
+    deltas: Vec<DeltaSource>,
+    tables: Vec<JoinTable>,
+    arrangements: Vec<ArrangementHandle>,
+    on: Vec<ast::Expr>,
+}
+
+#[derive(Debug, Clone)]
+struct EphemeralDelta {
+    cursor_id: usize,
+    identity: DeltaIdentity,
+    value_start: usize,
+    width: usize,
+    weight_column: usize,
+    schema: Arc<dag::StreamSchema>,
+    /// Applying negative join contributions before positive ones can
+    /// transiently retract an as-yet-unknown group. Consumers that merge into
+    /// state must process this stream positive-first.
+    requires_positive_first: bool,
+}
+
+/// Stable transport identity carried ahead of an ephemeral delta's relational
+/// values. Encoding the identity kind as a sum type prevents consumers from
+/// treating an operator-owned state rowid as a SQL binding rowid merely
+/// because both occupy one physical slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeltaIdentity {
+    /// One SQL rowid per logical binding, in binding order.
+    BindingRowids(usize),
+    /// One opaque rowid owned by the emitting stateful operator.
+    OperatorRowid,
+    /// An opaque, fixed-width key owned by an operator. Consumers may carry
+    /// it through linear edges or use it to build an arrangement, but must
+    /// not interpret its slots as SQL binding rowids.
+    OperatorKey(usize),
+}
+
+impl EphemeralDelta {
+    fn identity_width(&self) -> usize {
+        self.identity.width()
+    }
+}
+
+impl DeltaIdentity {
+    fn width(self) -> usize {
+        match self {
+            Self::BindingRowids(width) => width,
+            Self::OperatorRowid => 1,
+            Self::OperatorKey(width) => width,
+        }
+    }
+}
+
+/// A maintained integral a stateful operator may probe.
+///
+/// Base tables, aggregate state, and explicit operator-output arrangements
+/// share one logical contract: open one storage relation, map logical values
+/// to physical columns, and optionally expose a signed multiplicity.
+#[derive(Debug, Clone)]
+struct ArrangementHandle {
+    table: Arc<BTreeTable>,
+    /// Physical table columns corresponding to the operator's logical output
+    /// schema. Base arrangements are identity-mapped; aggregate state skips
+    /// accumulator payload columns and explicit output arrangements skip
+    /// their source-identity prefix.
+    value_columns: Arc<[usize]>,
+    /// `None` when each physical row has multiplicity one.
+    count_column: Option<usize>,
+}
+
+impl ArrangementHandle {
+    fn table(&self) -> &Arc<BTreeTable> {
+        &self.table
+    }
+
+    fn value_columns(&self) -> &[usize] {
+        &self.value_columns
+    }
+
+    fn count_column(&self) -> Option<usize> {
+        self.count_column
+    }
+}
+
+fn btree_arrangement(
+    table: Arc<BTreeTable>,
+    value_columns: Vec<usize>,
+    count_column: Option<usize>,
+) -> ArrangementHandle {
+    ArrangementHandle {
+        table,
+        value_columns: value_columns.into(),
+        count_column,
+    }
+}
+
+fn base_arrangement(table: Arc<BTreeTable>, count_column: Option<usize>) -> ArrangementHandle {
+    let value_columns = (0..table.columns().len()).collect();
+    btree_arrangement(table, value_columns, count_column)
+}
+
+/// The terminal consumer of an operator's output delta.
+#[derive(Debug, Clone)]
+enum DeltaSink {
+    View { root_page: i64, num_columns: usize },
+    Ephemeral(EphemeralDelta),
+}
+
+impl DeltaSink {
+    fn view(root_page: i64, num_columns: usize) -> Self {
+        Self::View {
+            root_page,
+            num_columns,
+        }
+    }
+
+    fn ephemeral(&self) -> Result<&EphemeralDelta> {
+        match self {
+            Self::Ephemeral(channel) => Ok(channel),
+            Self::View { .. } => Err(LimboError::InternalError(
+                "operator requires an ephemeral delta sink".to_string(),
+            )),
+        }
+    }
+
+    fn source(&self) -> Result<DeltaSource> {
+        Ok(DeltaSource::Ephemeral(self.ephemeral()?.clone()))
+    }
+}
+
+fn open_ephemeral_delta(
+    program: &mut ProgramBuilder,
+    name: &str,
+    schema: dag::StreamSchema,
+    identity: DeltaIdentity,
+    requires_positive_first: bool,
+) -> DeltaSink {
+    let schema = Arc::new(schema);
+    let width = schema.len();
+    let identity_width = identity.width();
+    let table = Arc::new(synthesized_view_table(name, 0, identity_width + width));
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id,
+        is_table: true,
+    });
+    let channel = EphemeralDelta {
+        cursor_id,
+        identity,
+        value_start: identity_width,
+        width,
+        weight_column: identity_width + width,
+        schema,
+        requires_positive_first,
+    };
+    DeltaSink::Ephemeral(channel)
+}
+
+type BindingRemap = FxHashMap<TableInternalId, TableInternalId>;
+
+fn stream_table_references(
+    program: &mut ProgramBuilder,
+    schema: &dag::StreamSchema,
+) -> (TableReferences, BindingRemap) {
+    let mut remap = FxHashMap::default();
+    let tables = schema
+        .bindings
+        .iter()
+        .map(|binding| {
+            let phase_id = program.table_reference_counter.next();
+            let previous = remap.insert(binding.logical_id, phase_id);
+            turso_assert!(
+                previous.is_none(),
+                "a stream schema must expose each logical binding exactly once"
+            );
+            make_joined_table(&binding.table, &binding.identifier, &[], phase_id)
+        })
+        .collect();
+    (TableReferences::new(tables, vec![]), remap)
+}
+
+/// Retarget a planner-bound expression to one emitter phase's cursor
+/// bindings. This is a mechanical id substitution: identifier spelling,
+/// DQS, aliases, and rowid-name resolution never run a second time.
+fn remap_bound_expr(expr: &ast::Expr, remap: &BindingRemap) -> Result<ast::Expr> {
+    let mut bound = expr.clone();
+    walk_expr_mut(&mut bound, &mut |node| {
+        let logical_id = match node {
+            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => Some(table),
+            ast::Expr::Id(_) | ast::Expr::Qualified(_, _) | ast::Expr::DoublyQualified(_, _, _) => {
+                return Err(LimboError::InternalError(
+                    "maintenance DAG contains an unresolved identifier".to_string(),
+                ));
+            }
+            _ => None,
+        };
+        if let Some(logical_id) = logical_id {
+            *logical_id = *remap.get(logical_id).ok_or_else(|| {
+                LimboError::InternalError(
+                    "maintenance expression references a binding outside its declared input"
+                        .to_string(),
+                )
+            })?;
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(bound)
+}
+
+fn seed_ephemeral_stream_cache<'a>(
+    program: &mut ProgramBuilder,
+    channel: &EphemeralDelta,
+    remap: &BindingRemap,
+    resolver: &mut Resolver<'a>,
+) -> Result<()> {
+    resolver.enable_expr_to_reg_cache();
+    for (column, stream_column) in channel.schema.columns.iter().enumerate() {
+        let Some(expr) = &stream_column.expr else {
+            continue;
+        };
+        let value_reg = program.alloc_register();
+        program.emit_insn(Insn::Column {
+            cursor_id: channel.cursor_id,
+            column: channel.value_start + column,
+            dest: value_reg,
+            default: None,
+        });
+        let bound = remap_bound_expr(expr, remap)?;
+        resolver.cache_expr_reg(std::borrow::Cow::Owned(bound), value_reg, false, None);
+    }
+    let DeltaIdentity::BindingRowids(identity_width) = channel.identity else {
+        return Ok(());
+    };
+    turso_assert!(
+        identity_width == channel.schema.bindings.len(),
+        "binding-rowid identity must have one rowid per binding",
+        {
+            "identity_width": identity_width,
+            "binding_count": channel.schema.bindings.len()
+        }
+    );
+    for (identity_column, binding) in channel
+        .schema
+        .bindings
+        .iter()
+        .take(identity_width)
+        .enumerate()
+    {
+        if !binding.table.has_rowid {
+            continue;
+        }
+        let value_reg = program.alloc_register();
+        program.emit_insn(Insn::Column {
+            cursor_id: channel.cursor_id,
+            column: identity_column,
+            dest: value_reg,
+            default: None,
+        });
+        let phase_id = *remap.get(&binding.logical_id).ok_or_else(|| {
+            LimboError::InternalError(
+                "rowid stream identity has no phase-local binding".to_string(),
+            )
+        })?;
+        let expr = ast::Expr::RowId {
+            database: None,
+            table: phase_id,
+        };
+        resolver.cache_expr_reg(std::borrow::Cow::Owned(expr), value_reg, false, None);
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
+struct PendingDeltaRead {
+    completion: Completion,
+    buffer: Arc<Buffer>,
+}
+
+/// Read-only cursor over a transaction's captured changes for one base table,
+/// in capture order. Spill segments are loaded asynchronously one bounded
+/// batch at a time, followed by the in-memory tail. Exposes base columns at
+/// their table positions and the weight as one extra trailing column.
 pub struct DeltaCursor {
-    /// (rowid, row image, weight) in capture order.
+    file: Option<Arc<dyn File>>,
+    spill_segments: Vec<SpillSegment>,
+    table_id: Option<TableChangeId>,
+    next_segment: usize,
+    pending_read: Option<PendingDeltaRead>,
+    tail: Arc<Vec<ChangeEvent>>,
+    tail_positions: Vec<usize>,
+    tail_loaded: bool,
+    reading_tail: bool,
+    /// Current spill batch, or the in-memory tail.
     rows: Vec<(i64, Vec<Value>, isize)>,
     /// Number of base-table columns; the weight is column `num_columns`.
     num_columns: usize,
@@ -104,14 +531,26 @@ pub struct DeltaCursor {
 }
 
 impl DeltaCursor {
-    pub fn new(delta: Delta, num_columns: usize) -> Self {
-        let rows = delta
-            .changes
-            .into_iter()
-            .map(|(row, weight)| (row.rowid, row.values, weight))
+    pub(crate) fn new(delta: CapturedDelta, num_columns: usize) -> Self {
+        let tail_positions = delta
+            .tail
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                (Some(&event.table_id) == delta.table_id.as_ref()).then_some(index)
+            })
             .collect();
         Self {
-            rows,
+            file: delta.file,
+            spill_segments: delta.spilled,
+            table_id: delta.table_id,
+            next_segment: 0,
+            pending_read: None,
+            tail: delta.tail,
+            tail_positions,
+            tail_loaded: false,
+            reading_tail: false,
+            rows: Vec::new(),
             num_columns,
             pos: 0,
             positioned: false,
@@ -119,49 +558,227 @@ impl DeltaCursor {
     }
 
     pub fn empty(num_columns: usize) -> Self {
-        Self::new(Delta::new(), num_columns)
+        Self::new(CapturedDelta::empty(), num_columns)
     }
 
     /// Position at the first row. Returns false when the delta is empty.
-    pub fn rewind(&mut self) -> bool {
+    pub fn rewind(&mut self) -> Result<IOResult<bool>> {
+        if !self.positioned || self.pending_read.is_none() {
+            self.next_segment = 0;
+            self.pending_read = None;
+            self.tail_loaded = false;
+            self.reading_tail = false;
+            self.rows.clear();
+        }
         self.pos = 0;
         self.positioned = true;
-        !self.rows.is_empty()
+        self.load_next_batch()
     }
 
     /// Advance to the next row. Returns false when exhausted.
-    pub fn next(&mut self) -> bool {
+    pub fn next(&mut self) -> Result<IOResult<bool>> {
         turso_assert!(self.positioned, "DeltaCursor::next before rewind");
-        if self.pos < self.rows.len() {
+        let batch_len = if self.reading_tail {
+            self.tail_positions.len()
+        } else {
+            self.rows.len()
+        };
+        if self.pos < batch_len {
             self.pos += 1;
         }
-        self.pos < self.rows.len()
+        if self.pos < batch_len {
+            return Ok(IOResult::Done(true));
+        }
+        self.load_next_batch()
     }
 
-    fn current(&self) -> &(i64, Vec<Value>, isize) {
+    fn load_next_batch(&mut self) -> Result<IOResult<bool>> {
+        loop {
+            if let Some(pending) = self.pending_read.take() {
+                if !pending.completion.finished() {
+                    let completion = pending.completion.clone();
+                    self.pending_read = Some(pending);
+                    return Ok(IOResult::IO(IOCompletions::Single(completion)));
+                }
+                if let Some(error) = pending.completion.get_error() {
+                    return Err(LimboError::CompletionError(error));
+                }
+                let segment = &self.spill_segments[self.next_segment];
+                self.rows = parse_spilled_delta(
+                    pending.buffer.as_slice(),
+                    segment,
+                    self.table_id.as_ref(),
+                )?;
+                self.reading_tail = false;
+                self.next_segment += 1;
+                self.pos = 0;
+                if !self.rows.is_empty() {
+                    return Ok(IOResult::Done(true));
+                }
+                continue;
+            }
+
+            if self.next_segment < self.spill_segments.len() {
+                let segment = &self.spill_segments[self.next_segment];
+                if segment.rows == 0
+                    || self
+                        .table_id
+                        .as_ref()
+                        .is_none_or(|table_id| !segment.table_ids.contains(table_id))
+                {
+                    self.next_segment += 1;
+                    continue;
+                }
+                let file = self.file.as_ref().ok_or_else(|| {
+                    LimboError::InternalError("spilled view delta has no backing file".to_string())
+                })?;
+                let buffer = Arc::new(Buffer::new_temporary(segment.len));
+                let expected = segment.len;
+                let completion = Completion::new_read(buffer.clone(), move |result| {
+                    let Ok((_buffer, bytes_read)) = result else {
+                        return None;
+                    };
+                    if bytes_read as usize != expected {
+                        return Some(CompletionError::ShortRead {
+                            page_idx: 0,
+                            expected,
+                            actual: bytes_read as usize,
+                        });
+                    }
+                    None
+                });
+                let completion = file.pread(segment.offset, completion)?;
+                self.pending_read = Some(PendingDeltaRead {
+                    completion: completion.clone(),
+                    buffer,
+                });
+                if !completion.finished() {
+                    return Ok(IOResult::IO(IOCompletions::Single(completion)));
+                }
+                continue;
+            }
+
+            if !self.tail_loaded {
+                self.tail_loaded = true;
+                self.reading_tail = true;
+                self.pos = 0;
+                if !self.tail_positions.is_empty() {
+                    return Ok(IOResult::Done(true));
+                }
+            }
+            self.reading_tail = false;
+            self.rows.clear();
+            self.pos = 0;
+            return Ok(IOResult::Done(false));
+        }
+    }
+
+    fn assert_current(&self) {
         turso_assert!(self.positioned, "DeltaCursor read before rewind");
-        turso_assert!(self.pos < self.rows.len(), "DeltaCursor read past end");
-        &self.rows[self.pos]
+        let len = if self.reading_tail {
+            self.tail_positions.len()
+        } else {
+            self.rows.len()
+        };
+        turso_assert!(self.pos < len, "DeltaCursor read past end");
     }
 
     pub fn rowid(&self) -> i64 {
-        self.current().0
+        self.assert_current();
+        if self.reading_tail {
+            self.tail[self.tail_positions[self.pos]].rowid
+        } else {
+            self.rows[self.pos].0
+        }
     }
 
     pub fn column(&self, idx: usize) -> Value {
-        let (_, values, weight) = self.current();
+        self.assert_current();
+        let (values, weight) = if self.reading_tail {
+            let event = &self.tail[self.tail_positions[self.pos]];
+            (&event.values, event.weight)
+        } else {
+            let (_, values, weight) = &self.rows[self.pos];
+            (values, *weight)
+        };
         if idx == self.num_columns {
-            return Value::from_i64(*weight as i64);
+            return Value::from_i64(weight as i64);
         }
         let num_columns = self.num_columns;
         turso_assert!(
             idx < num_columns,
             "DeltaCursor column {idx} out of range ({num_columns} columns + weight)"
         );
-        // Row images are captured as full records, but be tolerant of short
-        // rows the same way btree Column is: missing trailing columns are NULL.
-        values.get(idx).cloned().unwrap_or(Value::Null)
+        turso_assert!(
+            values.len() == num_columns,
+            "captured row image width mismatch",
+            { "actual": values.len(), "expected": num_columns }
+        );
+        values[idx].clone()
     }
+}
+
+fn parse_spilled_delta(
+    bytes: &[u8],
+    segment: &SpillSegment,
+    table_id: Option<&TableChangeId>,
+) -> Result<Vec<(i64, Vec<Value>, isize)>> {
+    let mut rows = Vec::new();
+    let mut offset = 0;
+    for _ in 0..segment.rows {
+        let size_bytes = bytes.get(offset..offset + 8).ok_or_else(|| {
+            LimboError::Corrupt("truncated materialized-view delta frame".to_string())
+        })?;
+        let payload_len = u64::from_le_bytes(size_bytes.try_into().expect("eight-byte slice"));
+        let payload_len = usize::try_from(payload_len).map_err(|_| {
+            LimboError::Corrupt("oversized materialized-view delta frame".to_string())
+        })?;
+        offset += 8;
+        let payload = bytes.get(offset..offset + payload_len).ok_or_else(|| {
+            LimboError::Corrupt("truncated materialized-view delta record".to_string())
+        })?;
+        offset += payload_len;
+        let mut record = ImmutableRecord::new(payload_len)?;
+        record.start_serialization(payload)?;
+        let mut values = record.get_values_owned()?;
+        if values.len() < 3 {
+            return Err(LimboError::Corrupt(
+                "materialized-view delta record lacks table identity, rowid, or weight".to_string(),
+            ));
+        }
+        let event_table_id = match values.remove(0) {
+            Value::Numeric(crate::numeric::Numeric::Integer(root_page)) => {
+                TableChangeId::RootPage(root_page)
+            }
+            #[cfg(test)]
+            Value::Text(name) => TableChangeId::Name(name.as_str().to_string()),
+            _ => {
+                return Err(LimboError::Corrupt(
+                    "materialized-view delta table identity has an invalid type".to_string(),
+                ));
+            }
+        };
+        let rowid = match values.remove(0) {
+            Value::Numeric(crate::numeric::Numeric::Integer(value)) => value,
+            _ => {
+                return Err(LimboError::Corrupt(
+                    "materialized-view delta rowid is not an integer".to_string(),
+                ));
+            }
+        };
+        let weight = match values.remove(0) {
+            Value::Numeric(crate::numeric::Numeric::Integer(value)) => value as isize,
+            _ => {
+                return Err(LimboError::Corrupt(
+                    "materialized-view delta weight is not an integer".to_string(),
+                ));
+            }
+        };
+        if Some(&event_table_id) == table_id {
+            rows.push((rowid, values, weight));
+        }
+    }
+    Ok(rows)
 }
 
 /// Whether an aggregate's accumulator must see each distinct argument value
@@ -172,140 +789,9 @@ fn tracks_distinct_values(agg: &Aggregate) -> bool {
     agg.distinctness.is_distinct() && !matches!(agg.func, AggFunc::Min | AggFunc::Max)
 }
 
-/// How each result column of a GROUP BY view is produced.
-#[derive(Debug, Clone)]
-#[allow(clippy::large_enum_variant)]
-pub enum OutputColumn {
-    /// The i-th GROUP BY expression.
-    Group(usize),
-    /// The i-th entry of [`ViewShape::GroupAggregate::aggregates`].
-    Aggregate(usize),
-    /// An expression over aggregate results and group expressions
-    /// (e.g. `SUM(x) + 1`), evaluated after the group's aggregates are
-    /// finalized; its aggregate calls and group-expression subtrees resolve
-    /// to their computed registers through the expression cache, exactly
-    /// like HAVING.
-    Expr(ast::Expr),
-}
-
 /// Maximum number of tables in a join view: maintenance runs one delta phase
 /// per non-empty subset of the joined tables, so programs grow as 2^N - 1.
 pub const MAX_JOIN_TABLES: usize = 4;
-
-/// The maintainable shape of a view definition, decided at CREATE time.
-#[derive(Debug, Clone)]
-#[allow(clippy::large_enum_variant)]
-pub enum ViewShape {
-    /// Single-table SELECT with optional WHERE: rows map 1:1 to base rows.
-    FilterProject,
-    /// Join of up to [`MAX_JOIN_TABLES`] tables with arbitrary ON
-    /// predicates. Join rows are identified by their source-rowid tuple
-    /// through a hidden state table whose rowid doubles as the view rowid
-    /// and whose signed multiplicity absorbs transient dips from the delta
-    /// phase decomposition.
-    Join {
-        /// Number of joined tables (at least two).
-        n_tables: usize,
-        /// A two-table LEFT JOIN. The auxiliary table tracks each left
-        /// row's presence and its count of ON-matches: a NULL-padded view
-        /// row exists while the row is present with zero matches (and the
-        /// WHERE clause passes over the padded image). Inner rows keep the
-        /// pair-map machinery; the two tables' rowids map to disjoint view
-        /// rowids.
-        left_outer: bool,
-    },
-    /// Compound SELECT (UNION, UNION ALL, INTERSECT, EXCEPT) over
-    /// filter/project branches. Every operator except UNION ALL
-    /// deduplicates, so a content row's membership in the result depends
-    /// only on which branches currently produce it: visibility is a
-    /// left-associative fold of per-branch presence (UNION and UNION ALL
-    /// fold as OR, INTERSECT as AND, EXCEPT as AND NOT). Only a trailing
-    /// run of UNION ALL operators appends rows with their multiplicity
-    /// preserved, identified by (branch, source rowid).
-    Compound {
-        /// One operator per compound entry, in chain order.
-        operators: Vec<ast::CompoundOperator>,
-        /// Number of result columns (with stars expanded), which is also
-        /// the width of the content key in the state table.
-        arity: usize,
-        /// Number of leading branches deduplicated by content: everything
-        /// up to and including the right side of the last non-UNION-ALL
-        /// operator. The state table keeps one signed count per prefix
-        /// branch. Zero when the chain is UNION ALL throughout (every
-        /// branch appends).
-        prefix_len: usize,
-        /// Collation each content-key column dedups under (left-most prefix
-        /// branch with a resolved collation wins, matching compound dedup
-        /// indexes). Carried onto the state table's key columns. Empty when
-        /// `prefix_len` is zero.
-        key_collations: Vec<CollationSeq>,
-    },
-    /// Single-table GROUP BY with invertible aggregates.
-    GroupAggregate {
-        group_exprs: Vec<ast::Expr>,
-        /// Collation each group expression compares under (parallel to
-        /// `group_exprs`), resolved the way regular GROUP BY translation
-        /// resolves it. Carried onto the state table's key columns so the
-        /// hidden index groups exactly like the batch query.
-        group_collations: Vec<CollationSeq>,
-        /// `aggregates[0]` is always a hidden COUNT(*) tracking group
-        /// liveness (a group's view row exists iff its row count > 0).
-        /// Aggregates appearing only in HAVING are also collected here.
-        aggregates: Vec<Aggregate>,
-        /// Collation of every multiset-tracked aggregate argument (MIN/MAX
-        /// and DISTINCT aggregates), carried onto the multiset table's `val`
-        /// column. One shared table stores all such values, so aggregates
-        /// with differing argument collations are rejected at classify.
-        multiset_collation: CollationSeq,
-        /// HAVING predicate over group expressions and aggregate results;
-        /// gates only the view row, not the group's persisted state.
-        having: Option<ast::Expr>,
-        /// Aggregates without GROUP BY: the single group, keyed by a
-        /// synthetic constant group expression, exists even over an empty
-        /// input — its row is created at population and never deleted, with
-        /// empty-input aggregate values (COUNT 0, SUM NULL, ...) instead of
-        /// group death.
-        scalar: bool,
-        /// The aggregate reads a two-table LEFT (or swapped RIGHT) join whose
-        /// NULL-padded rows must also feed the aggregate. A hidden aux table
-        /// tracks each left row's match count and its padded contribution so
-        /// the padded rows can be added and retracted; created at CREATE time.
-        outer_join: bool,
-    },
-    /// A pure UNION ALL whose branches are not all plain filter/project — at
-    /// least one is a join or aggregate. UNION ALL branches are independent
-    /// bags, so each is maintained by its own sub-program writing a disjoint
-    /// rowid slice (`local * n_branches + branch_idx`) of the shared view
-    /// btree, with its own hidden state tables suffixed `__b<idx>`. There is
-    /// no cross-branch merge. (Pure UNION ALL over only filter/project
-    /// branches, and any chain with a deduplicating operator, use
-    /// [`ViewShape::Compound`] instead.)
-    CompoundAll {
-        /// Per-branch maintainable sub-shape, in chain order. Each is one of
-        /// FilterProject, Join, or GroupAggregate.
-        branch_shapes: Vec<ViewShape>,
-    },
-}
-
-/// Build the standalone single-`SELECT` view for one branch of a compound
-/// `SELECT`, so it can be classified and compiled with the ordinary
-/// per-shape machinery.
-fn branch_select(select: &ast::Select, branch_idx: usize) -> ast::Select {
-    let one = if branch_idx == 0 {
-        select.body.select.clone()
-    } else {
-        select.body.compounds[branch_idx - 1].select.clone()
-    };
-    ast::Select {
-        with: None,
-        body: ast::SelectBody {
-            select: one,
-            compounds: Vec::new(),
-        },
-        order_by: Vec::new(),
-        limit: None,
-    }
-}
 
 fn unsupported<T>(what: &str) -> Result<T> {
     Err(LimboError::ParseError(format!(
@@ -412,457 +898,303 @@ fn check_group_row_expr(
             ast::Expr::Variable(_) => Err(LimboError::ParseError(
                 "materialized views with bound parameters are not supported".to_string(),
             )),
-            ast::Expr::Id(_) | ast::Expr::Qualified(_, _) | ast::Expr::DoublyQualified(_, _, _) => {
-                unsupported(bare_column_error)
-            }
+            ast::Expr::Id(_)
+            | ast::Expr::Qualified(_, _)
+            | ast::Expr::DoublyQualified(_, _, _)
+            | ast::Expr::Column { .. }
+            | ast::Expr::RowId { .. } => unsupported(bare_column_error),
             _ => Ok(WalkControl::Continue),
         }
     })
 }
 
-/// Resolve one GROUP BY term the way the planner does before classification
-/// compares it against result columns: an integer literal is a 1-based
-/// result-column reference, and an identifier that does not name a base-table
-/// column resolves to a result-column alias (canonical columns take
-/// precedence, mirroring `BindingBehavior::TryCanonicalColumnsFirst`).
-fn resolve_group_by_term(
-    term: &ast::Expr,
-    columns: &[ast::ResultColumn],
-    base_tables: &[Arc<BTreeTable>],
-) -> Result<ast::Expr> {
-    let column_expr = |idx: usize| -> Result<ast::Expr> {
-        match &columns[idx] {
-            ast::ResultColumn::Expr(expr, _) => Ok(expr.as_ref().clone()),
-            ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => {
-                unsupported("star projections combined with GROUP BY")
+/// Lower the main query planner's bound relational plan into the maintenance
+/// DAG. Parser spelling (aliases, stars, USING expansion, ordinal GROUP BY,
+/// and compound arity) has already been resolved by this point.
+fn build_dag_from_plan(plan: &Plan, resolver: &Resolver) -> Result<dag::MaintenanceDag> {
+    let mut builder = dag::DagBuilder::new();
+    let root = build_plan_dag_node(&mut builder, plan, resolver)?;
+    builder.finish(root)
+}
+
+fn build_plan_dag_node(
+    builder: &mut dag::DagBuilder,
+    plan: &Plan,
+    resolver: &Resolver,
+) -> Result<dag::NodeId> {
+    let root = match plan {
+        Plan::Select(select) => build_select_plan_dag(builder, select, resolver)?,
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            let mut inputs = Vec::with_capacity(left.len() + 1);
+            for (branch, _) in left {
+                inputs.push(build_select_plan_dag(builder, branch, resolver)?);
             }
-        }
-    };
-    match term {
-        ast::Expr::Literal(ast::Literal::Numeric(num)) => {
-            if let Ok(column_number) = num.parse::<usize>() {
-                if column_number == 0 || column_number > columns.len() {
-                    return Err(LimboError::ParseError(format!(
-                        "1st GROUP BY term out of range - should be between 1 and {}",
-                        columns.len()
-                    )));
-                }
-                return column_expr(column_number - 1);
-            }
-            Ok(term.clone())
-        }
-        ast::Expr::Id(name) => {
-            let target = crate::util::normalize_ident(name.as_str());
-            let is_base_column = base_tables.iter().any(|table| {
-                table.columns().iter().any(|c| {
-                    c.name
-                        .as_deref()
-                        .is_some_and(|n| crate::util::normalize_ident(n) == target)
-                })
-            });
-            if !is_base_column {
-                for (idx, column) in columns.iter().enumerate() {
-                    if let ast::ResultColumn::Expr(
-                        _,
-                        Some(ast::As::As(alias) | ast::As::Elided(alias)),
-                    ) = column
-                    {
-                        if crate::util::normalize_ident(alias.as_str()) == target {
-                            return column_expr(idx);
+            inputs.push(build_select_plan_dag(builder, right_most, resolver)?);
+
+            let operators: Vec<_> = left.iter().map(|(_, operator)| *operator).collect();
+            let prefix_len = operators
+                .iter()
+                .rposition(|operator| *operator != ast::CompoundOperator::UnionAll)
+                .map_or(0, |last_dedup| last_dedup + 2);
+            let arity = right_most.result_columns.len();
+            let key_collations = if prefix_len == 0 {
+                Vec::new()
+            } else {
+                let mut folded = vec![None; arity];
+                for branch in left
+                    .iter()
+                    .map(|(branch, _)| branch)
+                    .chain(std::iter::once(right_most.as_ref()))
+                    .take(prefix_len)
+                {
+                    for (index, column) in branch.result_columns.iter().enumerate() {
+                        if folded[index].is_none() {
+                            folded[index] = plan_expr_collation(
+                                &column.expr,
+                                &branch.table_references,
+                                resolver,
+                            )?;
                         }
                     }
                 }
-            }
-            Ok(term.clone())
+                folded
+                    .into_iter()
+                    .map(|collation| collation.unwrap_or(CollationSeq::Binary))
+                    .collect()
+            };
+            builder.push(dag::OpNode::SetOp {
+                inputs,
+                operators,
+                arity,
+                prefix_len,
+                key_collations,
+            })?
         }
-        _ => Ok(term.clone()),
-    }
+        Plan::Delete(_) | Plan::Update(_) => {
+            return Err(LimboError::InternalError(
+                "materialized view planner produced a DML plan".to_string(),
+            ));
+        }
+    };
+    Ok(root)
 }
 
-/// Validate one branch of a UNION/UNION ALL view: a single-table
-/// filter/project SELECT, mirroring the FilterProject shape. Returns the
-/// branch's result-column count (with stars expanded) for the compound
-/// arity check.
-fn validate_union_branch(
-    branch: &ast::OneSelect,
-    schema: &Schema,
-    resolver: &Resolver,
-) -> Result<(usize, Vec<Option<CollationSeq>>)> {
-    let ast::OneSelect::Select {
-        distinctness,
+fn synthesized_derived_table(name: &str, columns: Vec<crate::schema::Column>) -> BTreeTable {
+    BTreeTable::new(
+        0,
+        name.to_string(),
+        Vec::new(),
         columns,
-        from,
-        where_clause,
-        group_by,
-        window_clause,
-        ..
-    } = branch
-    else {
-        return unsupported("VALUES");
-    };
-    if matches!(distinctness, Some(ast::Distinctness::Distinct)) {
-        return unsupported("DISTINCT branches in compound SELECTs");
+        crate::schema::BTreeCharacteristics::empty(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    )
+}
+
+fn build_select_plan_dag(
+    builder: &mut dag::DagBuilder,
+    plan: &SelectPlan,
+    resolver: &Resolver,
+) -> Result<dag::NodeId> {
+    if !plan.order_by.is_empty() {
+        return unsupported("ORDER BY");
     }
-    if !window_clause.is_empty() {
+    if plan.limit.is_some() || plan.offset.is_some() {
+        return unsupported("LIMIT or OFFSET");
+    }
+    if !plan.values.is_empty() {
+        return unsupported("VALUES");
+    }
+    if plan.window.is_some() {
         return unsupported("window functions");
     }
-    if group_by.is_some() {
-        return unsupported("GROUP BY branches in compound SELECTs");
+    if !plan.non_from_clause_subqueries.is_empty() {
+        return unsupported("subqueries");
     }
-    let Some(from) = from else {
-        return unsupported("no FROM clause");
-    };
-    if !from.joins.is_empty() {
-        return unsupported("join branches in compound SELECTs");
+
+    let joined_tables = plan.table_references.joined_tables();
+    if joined_tables.is_empty() {
+        return unsupported("SELECT without a FROM clause");
     }
-    let ast::SelectTable::Table(name, _, _) = from.select.as_ref() else {
-        return unsupported("subqueries or table functions in FROM");
-    };
-    let base_table = schema.get_btree_table(name.name.as_str()).ok_or_else(|| {
-        LimboError::ParseError(format!(
-            "materialized view base table {} not found",
-            name.name.as_str()
-        ))
-    })?;
-    if let Some(where_expr) = where_clause {
-        check_scalar_expr(where_expr)?;
-    }
-    let mut arity = 0;
-    let mut collations = Vec::with_capacity(columns.len());
-    for column in columns {
-        match column {
-            ast::ResultColumn::Expr(expr, _) => {
-                let mut aggs = Vec::new();
-                if resolve_window_and_aggregate_functions(expr, resolver, &mut aggs, None, &mut [])?
-                {
-                    return unsupported("aggregate branches in compound SELECTs");
+    for joined in joined_tables {
+        if let Some(join) = &joined.join_info {
+            match join.join_type {
+                crate::translate::plan::JoinType::Inner
+                | crate::translate::plan::JoinType::LeftOuter => {}
+                crate::translate::plan::JoinType::FullOuter => {
+                    // FULL must eventually lower to the arrangement/set-op
+                    // composition. Treating it as the existing LEFT flag
+                    // loses the right-side padded delta and is incorrect.
+                    return unsupported("FULL OUTER joins");
                 }
-                check_scalar_expr(expr)?;
-                collations.extend(resolve_term_collations(
-                    std::slice::from_ref(expr.as_ref()),
-                    from,
-                    schema,
-                    resolver,
-                )?);
-                arity += 1;
-            }
-            ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => {
-                arity += base_table.columns().len();
-                for column in base_table.columns() {
-                    let collation = column.collation();
-                    if collation.is_custom() {
-                        return unsupported("custom collations on grouping or dedup keys");
-                    }
-                    collations.push(Some(collation));
+                crate::translate::plan::JoinType::Semi | crate::translate::plan::JoinType::Anti => {
+                    return unsupported("semi or anti joins");
                 }
             }
         }
     }
-    Ok((arity, collations))
-}
 
-/// Expand a join view's result columns into the qualified expressions that
-/// `SELECT DISTINCT` groups by: one per output column, with stars expanded
-/// across every joined table (a USING/NATURAL-merged column appearing once,
-/// from the left-most table, matching the projection). Aggregate result
-/// columns are rejected — `DISTINCT` over an aggregate query dedups the
-/// aggregated rows, which the group machinery cannot express.
-fn expand_join_output_exprs(
-    from: &ast::FromClause,
-    schema: &Schema,
-    columns: &[ast::ResultColumn],
-    resolver: &Resolver,
-) -> Result<Vec<ast::Expr>> {
-    let using_per_table = crate::util::join_using_columns(from, schema)?;
-    // (identifier, table) for every joined table, in FROM order.
-    let mut joined: Vec<(String, Arc<BTreeTable>)> = Vec::with_capacity(from.joins.len() + 1);
-    for select_table in std::iter::once(from.select.as_ref())
-        .chain(from.joins.iter().map(|join| join.table.as_ref()))
-    {
-        let ast::SelectTable::Table(name, alias, _) = select_table else {
-            return unsupported("subqueries or table functions in FROM");
-        };
-        let table = schema.get_btree_table(name.name.as_str()).ok_or_else(|| {
-            LimboError::ParseError(format!(
-                "materialized view base table {} not found",
-                name.name.as_str()
-            ))
-        })?;
-        let identifier = match alias {
-            Some(ast::As::As(a) | ast::As::Elided(a) | ast::As::ImplicitColumnName(a)) => {
-                a.as_str().to_string()
+    let mut inputs = Vec::with_capacity(joined_tables.len());
+    let mut using = Vec::with_capacity(joined_tables.len());
+    for joined in joined_tables {
+        let input = match &joined.table {
+            crate::schema::Table::BTree(table) => builder.push(dag::OpNode::Scan {
+                table: table.clone(),
+                identifier: joined.identifier.clone(),
+                logical_id: joined.internal_id,
+            })?,
+            crate::schema::Table::FromClauseSubquery(subquery) => {
+                let input = build_plan_dag_node(builder, &subquery.plan, resolver)?;
+                let table = Arc::new(synthesized_derived_table(
+                    &subquery.name,
+                    subquery.columns.clone(),
+                ));
+                builder.push(dag::OpNode::Alias {
+                    input,
+                    table,
+                    identifier: joined.identifier.clone(),
+                    logical_id: joined.internal_id,
+                })?
             }
-            None => table.name.clone(),
+            crate::schema::Table::Virtual(_) => return unsupported("virtual-table FROM sources"),
         };
-        joined.push((identifier, table));
+        inputs.push(input);
+        using.push(
+            joined
+                .join_info
+                .as_ref()
+                .map(|join| {
+                    join.using
+                        .iter()
+                        .map(|name| name.as_str().to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
     }
 
-    let qualified = |identifier: &str, column: &crate::schema::Column| -> Result<ast::Expr> {
-        let name = column.name.clone().ok_or_else(|| {
-            LimboError::InternalError("btree table column without a name".to_string())
-        })?;
-        Ok(ast::Expr::Qualified(
-            ast::Name::exact(identifier.to_string()),
-            ast::Name::exact(name),
-        ))
-    };
-
-    let mut group_exprs = Vec::new();
-    for column in columns {
-        match column {
-            ast::ResultColumn::Expr(expr, _) => {
-                let mut aggs = Vec::new();
-                if resolve_window_and_aggregate_functions(expr, resolver, &mut aggs, None, &mut [])?
-                {
-                    return unsupported("DISTINCT over aggregates");
-                }
-                check_scalar_expr(expr)?;
-                group_exprs.push(expr.as_ref().clone());
-            }
-            ast::ResultColumn::Star => {
-                for (table_idx, (identifier, table)) in joined.iter().enumerate() {
-                    let merged = &using_per_table[table_idx];
-                    for column in table.columns() {
-                        if merged.iter().any(|u| {
-                            column
-                                .name
-                                .as_deref()
-                                .is_some_and(|n| n.eq_ignore_ascii_case(u))
-                        }) {
-                            continue;
-                        }
-                        group_exprs.push(qualified(identifier, column)?);
-                    }
-                }
-            }
-            ast::ResultColumn::TableStar(name) => {
-                let target = crate::util::normalize_ident(name.as_str());
-                let Some((identifier, table)) = joined
-                    .iter()
-                    .find(|(identifier, _)| crate::util::normalize_ident(identifier) == target)
-                else {
-                    return Err(LimboError::ParseError(format!("no such table: {target}")));
-                };
-                for column in table.columns() {
-                    group_exprs.push(qualified(identifier, column)?);
-                }
-            }
+    let kind = if joined_tables.iter().any(|table| {
+        table
+            .join_info
+            .as_ref()
+            .is_some_and(|join| join.join_type == crate::translate::plan::JoinType::LeftOuter)
+    }) {
+        if inputs.len() != 2 {
+            return unsupported("LEFT JOIN over more than two tables");
         }
-    }
-    Ok(group_exprs)
-}
-
-/// Decompose a view's defining `SELECT` into the incremental operator DAG
-/// (see [`crate::incremental::dag`]). Generic relational-algebra
-/// decomposition — a `SELECT` core lowers to `Scan`(s) → `Join`? →
-/// `Filter`(WHERE) → `Aggregate`? → `Filter`(HAVING) → `Project` →
-/// `Distinct`?, with no per-shape dispatch and no combination-specific
-/// logic. Reuses the per-operator extraction helpers ([`collect_join_tables`],
-/// [`classify_group_aggregate`], [`expand_join_output_exprs`]).
-///
-/// During migration this runs on selects `classify_view` has already
-/// accepted, so it assumes validity and produces structure only; the CREATE
-/// gate's per-operator validation folds in here at cutover.
-pub fn build_dag(
-    select: &ast::Select,
-    schema: &Schema,
-    resolver: &Resolver,
-) -> Result<dag::MaintenanceDag> {
-    let mut builder = dag::DagBuilder::new();
-    let root = build_select(&mut builder, select, schema, resolver)?;
-    Ok(builder.finish(root))
-}
-
-fn build_select(
-    builder: &mut dag::DagBuilder,
-    select: &ast::Select,
-    schema: &Schema,
-    resolver: &Resolver,
-) -> Result<dag::NodeId> {
-    if select.body.compounds.is_empty() {
-        return build_select_core(builder, &select.body.select, schema, resolver);
-    }
-
-    // Compound → one SetOp over each branch's sub-DAG. Both the deduplicating
-    // compounds and pure UNION ALL collapse into this single node; the branch
-    // sub-DAGs may be any shape, since a branch is just another SELECT.
-    let operators: Vec<ast::CompoundOperator> =
-        select.body.compounds.iter().map(|c| c.operator).collect();
-    let n_branches = operators.len() + 1;
-    let mut inputs = Vec::with_capacity(n_branches);
-    for branch_idx in 0..n_branches {
-        inputs.push(build_select(
-            builder,
-            &branch_select(select, branch_idx),
-            schema,
-            resolver,
-        )?);
-    }
-
-    // Leading branches deduplicated by content: up to and including the right
-    // side of the last non-UNION-ALL operator (0 for pure UNION ALL).
-    let prefix_len = operators
-        .iter()
-        .rposition(|op| *op != ast::CompoundOperator::UnionAll)
-        .map_or(0, |last_dedup| last_dedup + 2);
-    let arity = crate::util::extract_view_columns(&branch_select(select, 0), schema)?
-        .columns
-        .len();
-
-    // Content-key collation per column: the left-most deduplicated branch
-    // that resolves a collation wins (matching compound dedup indexes).
-    let mut folded: Vec<Option<CollationSeq>> = Vec::new();
-    for branch_idx in 0..prefix_len {
-        let branch = if branch_idx == 0 {
-            &select.body.select
+        dag::JoinKind::LeftOuter
+    } else {
+        dag::JoinKind::Inner
+    };
+    let mut on = Vec::new();
+    let mut filters = Vec::new();
+    for term in &plan.where_clause {
+        let expr = term.expr.clone();
+        if inputs.len() > 1 && (kind == dag::JoinKind::Inner || term.from_outer_join.is_some()) {
+            on.push(expr);
         } else {
-            &select.body.compounds[branch_idx - 1].select
-        };
-        let (_, branch_collations) = validate_union_branch(branch, schema, resolver)?;
-        if folded.is_empty() {
-            folded = branch_collations;
-        } else {
-            for (slot, collation) in folded.iter_mut().zip(branch_collations) {
-                if slot.is_none() {
-                    *slot = collation;
-                }
-            }
+            filters.push(expr);
         }
     }
-    let key_collations = folded
-        .into_iter()
-        .map(|collation| collation.unwrap_or(CollationSeq::Binary))
-        .collect();
 
-    Ok(builder.push(dag::OpNode::SetOp {
-        inputs,
-        operators,
-        arity,
-        prefix_len,
-        key_collations,
-    }))
-}
-
-fn build_select_core(
-    builder: &mut dag::DagBuilder,
-    one_select: &ast::OneSelect,
-    schema: &Schema,
-    resolver: &Resolver,
-) -> Result<dag::NodeId> {
-    let ast::OneSelect::Select {
-        distinctness,
-        columns,
-        from,
-        where_clause,
-        group_by,
-        ..
-    } = one_select
-    else {
-        return unsupported("VALUES");
+    let mut node = if inputs.len() == 1 {
+        inputs[0]
+    } else {
+        builder.push(dag::OpNode::Join {
+            inputs,
+            using,
+            on,
+            kind,
+        })?
     };
-    let from = from.as_ref().expect("view definition has a FROM clause");
-
-    // Source: a scan per FROM table, joined when there is more than one.
-    let mut node = build_source(builder, from, schema, resolver)?;
-
-    // WHERE: selection over the source. For a LEFT join this is the Filter
-    // above the join (ON gates matching in the Join node, WHERE gates output
-    // over the padded rows) — pure composition, not a special case.
-    if let Some(where_clause) = where_clause {
+    if let Some(predicate) = combine_predicates(filters) {
         node = builder.push(dag::OpNode::Filter {
             input: node,
-            predicate: where_clause.as_ref().clone(),
-        });
+            predicate,
+        })?;
     }
 
-    // Aggregation, if the query groups or references aggregates anywhere.
-    let mut has_aggregates = group_by.is_some();
-    for column in columns {
-        if let ast::ResultColumn::Expr(expr, _) = column {
-            let mut aggs = Vec::new();
-            if resolve_window_and_aggregate_functions(expr, resolver, &mut aggs, None, &mut [])? {
-                has_aggregates = true;
-            }
-        }
+    let is_distinct = plan.distinctness.is_distinct();
+    if is_distinct && (plan.group_by.is_some() || !plan.aggregates.is_empty()) {
+        return unsupported("DISTINCT over aggregates");
     }
-
-    // DISTINCT is GROUP BY every output column, kept alive by a hidden
-    // COUNT(*): synthesize that grouping and route it through the aggregate
-    // operator, exactly as the classifier does. DISTINCT over an aggregate
-    // query is not incrementally maintainable; over a LEFT join it maintains
-    // fine (the padded rows are just more group inputs), while a RIGHT join
-    // is rejected below with the other aggregate-over-RIGHT shapes.
-    let distinct_columns;
-    let distinct_group_by;
-    let (columns, group_by): (&[ast::ResultColumn], &Option<ast::GroupBy>) =
-        if matches!(distinctness, Some(ast::Distinctness::Distinct)) {
-            if has_aggregates {
-                return unsupported("DISTINCT over aggregates");
+    let is_aggregate = plan.group_by.is_some() || !plan.aggregates.is_empty() || is_distinct;
+    if is_aggregate {
+        let (group_exprs, group_collations, scalar) = if is_distinct {
+            let mut exprs = Vec::with_capacity(plan.result_columns.len());
+            let mut collations = Vec::with_capacity(plan.result_columns.len());
+            for column in &plan.result_columns {
+                collations.push(
+                    plan_expr_collation(&column.expr, &plan.table_references, resolver)?
+                        .unwrap_or(CollationSeq::Binary),
+                );
+                exprs.push(column.expr.clone());
             }
-            let group_exprs = expand_join_output_exprs(from, schema, columns, resolver)?;
-            distinct_columns = group_exprs
-                .iter()
-                .cloned()
-                .map(|expr| ast::ResultColumn::Expr(Box::new(expr), None))
-                .collect::<Vec<_>>();
-            distinct_group_by = Some(ast::GroupBy {
-                exprs: group_exprs.into_iter().map(Box::new).collect(),
-                having: None,
-            });
-            has_aggregates = true;
-            (&distinct_columns, &distinct_group_by)
+            (exprs, collations, false)
+        } else if plan
+            .group_by
+            .as_ref()
+            .is_some_and(|group_by| !group_by.exprs.is_empty())
+        {
+            let group_by = plan.group_by.as_ref().unwrap();
+            let mut exprs = Vec::with_capacity(group_by.exprs.len());
+            let mut collations = Vec::with_capacity(group_by.exprs.len());
+            for expr in &group_by.exprs {
+                collations.push(
+                    plan_expr_collation(expr, &plan.table_references, resolver)?
+                        .unwrap_or(CollationSeq::Binary),
+                );
+                exprs.push(expr.clone());
+            }
+            (exprs, collations, false)
         } else {
-            (columns.as_slice(), group_by)
+            (
+                vec![ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))],
+                vec![CollationSeq::Binary],
+                true,
+            )
         };
 
-    if has_aggregates {
-        // A RIGHT-join aggregate would need the LEFT-swap that build_source
-        // applies for a standalone RIGHT join, but the aggregate emitter reads
-        // its join from the FROM clause directly (unswapped), so the padded
-        // side would be wrong. LEFT-join aggregates are supported: the padded
-        // rows feed the aggregate through the aux table.
-        let left_outer = from.joins.iter().any(|join| {
-            matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt))
-                if jt.contains(ast::JoinType::LEFT))
-        });
-        let right_only = from.joins.iter().any(|join| {
-            matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt))
-                if jt.contains(ast::JoinType::RIGHT) && !jt.contains(ast::JoinType::LEFT))
-        });
-        if right_only {
-            return unsupported("aggregates over RIGHT outer joins");
+        let mut multiset_collation = None;
+        for aggregate in plan
+            .aggregates
+            .iter()
+            .filter(|aggregate| uses_multiset(aggregate))
+        {
+            let collation = aggregate
+                .args
+                .first()
+                .map(|argument| {
+                    plan_expr_collation(argument, &plan.table_references, resolver)
+                        .map(|collation| collation.unwrap_or(CollationSeq::Binary))
+                })
+                .transpose()?
+                .unwrap_or(CollationSeq::Binary);
+            if multiset_collation.is_some_and(|existing| existing != collation) {
+                return unsupported(
+                    "different collations across MIN/MAX or DISTINCT aggregate arguments",
+                );
+            }
+            multiset_collation = Some(collation);
         }
-        let base_tables: Vec<Arc<BTreeTable>> = std::iter::once(from.select.as_ref())
-            .chain(from.joins.iter().map(|join| join.table.as_ref()))
-            .filter_map(|table| match table {
-                ast::SelectTable::Table(name, _, _) => schema.get_btree_table(name.name.as_str()),
-                _ => None,
-            })
-            .collect();
-        // Reuse the aggregate-operator extraction (group keys, collected
-        // aggregates, collations); HAVING and the output expressions become
-        // the Filter/Project above, not fields of the operator.
-        let shape = classify_group_aggregate(
-            columns,
-            group_by,
-            from,
-            &base_tables,
-            left_outer,
-            schema,
-            resolver,
-        )?;
-        let ViewShape::GroupAggregate {
-            group_exprs,
-            group_collations,
-            aggregates,
-            multiset_collation,
-            having,
-            scalar,
-            ..
-        } = shape
-        else {
-            unreachable!("classify_group_aggregate returns a GroupAggregate shape");
-        };
+        let multiset_collation = multiset_collation.unwrap_or(CollationSeq::Binary);
+        let mut aggregates = hidden_count_aggregate(resolver)?;
+        for aggregate in &plan.aggregates {
+            let mut normalized = aggregate.clone();
+            normalized.fraction_reg = None;
+            if !aggregates.iter().any(|existing| {
+                crate::util::exprs_are_equivalent(
+                    &existing.original_expr,
+                    &normalized.original_expr,
+                )
+            }) {
+                aggregates.push(normalized);
+            }
+        }
         node = builder.push(dag::OpNode::Aggregate {
             input: node,
             group_exprs,
@@ -870,597 +1202,42 @@ fn build_select_core(
             aggregates,
             multiset_collation,
             scalar,
-        });
-        if let Some(having) = having {
-            node = builder.push(dag::OpNode::Filter {
-                input: node,
-                predicate: having,
-            });
+        })?;
+
+        if let Some(having) = plan
+            .group_by
+            .as_ref()
+            .and_then(|group_by| group_by.having.as_ref())
+        {
+            let normalized = having.iter().cloned().collect::<Vec<_>>();
+            if let Some(predicate) = combine_predicates(normalized) {
+                node = builder.push(dag::OpNode::Filter {
+                    input: node,
+                    predicate,
+                })?;
+            }
         }
-        // Output expressions over the group row (group keys, aggregate
-        // results, expressions over them). No stars (rejected with GROUP BY).
-        let projections = columns
-            .iter()
-            .map(|column| match column {
-                ast::ResultColumn::Expr(expr, alias) => {
-                    Ok((expr.as_ref().clone(), projection_alias(alias)))
-                }
-                _ => unsupported("star projection combined with GROUP BY"),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        node = builder.push(dag::OpNode::Project {
-            input: node,
-            projections,
-        });
-    } else {
-        // Plain projection, stars expanded across the FROM tables.
-        let projections = expand_join_output_exprs(from, schema, columns, resolver)?
-            .into_iter()
-            .map(|expr| (expr, None))
-            .collect();
-        node = builder.push(dag::OpNode::Project {
-            input: node,
-            projections,
-        });
     }
 
-    Ok(node)
+    let projections = plan
+        .result_columns
+        .iter()
+        .map(|column| Ok((column.expr.clone(), column.alias.clone())))
+        .collect::<Result<Vec<_>>>()?;
+    builder.push(dag::OpNode::Project {
+        input: node,
+        projections,
+    })
 }
 
-/// Build the FROM source: one [`dag::OpNode::Scan`] per table, combined by a
-/// [`dag::OpNode::Join`] when there is more than one. Returns the source node.
-fn build_source(
-    builder: &mut dag::DagBuilder,
-    from: &ast::FromClause,
-    schema: &Schema,
-    _resolver: &Resolver,
-) -> Result<dag::NodeId> {
-    let (tables, on) = collect_join_tables(from, schema)?;
-    let scans: Vec<dag::NodeId> = tables
-        .iter()
-        .map(|(table, identifier, _)| {
-            builder.push(dag::OpNode::Scan {
-                table: table.clone(),
-                identifier: identifier.clone(),
-            })
-        })
-        .collect();
-    if scans.len() == 1 {
-        return Ok(scans[0]);
-    }
-    let is_left = from.joins.iter().any(|join| {
-        matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(ast::JoinType::LEFT))
-    });
-    let is_right = from.joins.iter().any(|join| {
-        matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt))
-            if jt.contains(ast::JoinType::RIGHT) && !jt.contains(ast::JoinType::LEFT))
-    });
-    let left_outer = is_left || is_right;
-    let mut scans = scans;
-    let mut using: Vec<Vec<String>> = tables.iter().map(|(_, _, u)| u.clone()).collect();
-    if is_right {
-        // A RIGHT JOIN B is maintained as B LEFT JOIN A: swap the inputs so
-        // the padded (unmatched) side is the outer left. classify restricts
-        // RIGHT to two ON-joined tables, so this is a plain reversal and the
-        // root projection still binds output columns by identity.
-        scans.swap(0, 1);
-        using.swap(0, 1);
-    }
-    Ok(builder.push(dag::OpNode::Join {
-        inputs: scans,
-        using,
-        on,
-        left_outer,
+fn combine_predicates(mut predicates: Vec<ast::Expr>) -> Option<ast::Expr> {
+    let first = predicates.pop()?;
+    Some(predicates.into_iter().fold(first, |right, left| {
+        ast::Expr::Binary(Box::new(left), ast::Operator::And, Box::new(right))
     }))
 }
 
-/// The output-column name for a projection, from an explicit alias only.
-fn projection_alias(alias: &Option<ast::As>) -> Option<String> {
-    match alias {
-        Some(ast::As::As(name) | ast::As::Elided(name)) => Some(name.as_str().to_string()),
-        _ => None,
-    }
-}
-
-/// Classify a view definition into its maintainable shape.
-///
-/// This is the CREATE MATERIALIZED VIEW gate: shapes outside the supported
-/// set are rejected outright rather than silently mis-maintained. The set
-/// grows as codegen for more operators lands (MIN/MAX, joins, set ops).
-///
-/// Aggregate recognition uses the planner's collector so it cannot drift
-/// from what a regular GROUP BY query would compute; the `resolver` is what
-/// the collector needs to resolve (and here, reject) extension functions.
-pub fn classify_view(
-    select: &ast::Select,
-    schema: &Schema,
-    resolver: &Resolver,
-) -> Result<ViewShape> {
-    if select.with.is_some() {
-        return unsupported("WITH clauses");
-    }
-    if !select.order_by.is_empty() {
-        return unsupported("ORDER BY");
-    }
-    if select.limit.is_some() {
-        return unsupported("LIMIT");
-    }
-
-    if !select.body.compounds.is_empty() {
-        let operators: Vec<ast::CompoundOperator> =
-            select.body.compounds.iter().map(|c| c.operator).collect();
-
-        // A pure UNION ALL whose branches are not all plain filter/project
-        // is maintained as independent per-branch sub-views (no dedup, no
-        // cross-branch merge). Classify each branch with the ordinary
-        // per-shape machinery; if any is a join or aggregate, this is a
-        // CompoundAll. Filter/project-only chains (and any chain with a
-        // deduplicating operator) fall through to the Compound path below.
-        let n_branches = operators.len() + 1;
-        if operators
-            .iter()
-            .all(|op| *op == ast::CompoundOperator::UnionAll)
-        {
-            let mut branch_shapes = Vec::with_capacity(n_branches);
-            let mut arity: Option<usize> = None;
-            for branch_idx in 0..n_branches {
-                let branch = branch_select(select, branch_idx);
-                let branch_arity = crate::util::extract_view_columns(&branch, schema)?
-                    .columns
-                    .len();
-                if *arity.get_or_insert(branch_arity) != branch_arity {
-                    return Err(LimboError::ParseError(format!(
-                        "SELECTs to the left and right of {} do not have the same number of result columns",
-                        operators[branch_idx - 1],
-                    )));
-                }
-                let shape = classify_view(&branch, schema, resolver)?;
-                match &shape {
-                    ViewShape::FilterProject | ViewShape::GroupAggregate { .. } => {}
-                    ViewShape::Join { left_outer, .. } => {
-                        if *left_outer {
-                            // A LEFT-join branch would need both the rowid
-                            // split (inner vs padded) and the branch
-                            // namespace, which the view-rowid transform does
-                            // not compose.
-                            return unsupported("LEFT JOIN branches in a UNION ALL");
-                        }
-                    }
-                    ViewShape::Compound { .. } | ViewShape::CompoundAll { .. } => {
-                        return unsupported("compound SELECTs nested in a UNION ALL branch");
-                    }
-                }
-                branch_shapes.push(shape);
-            }
-            if branch_shapes
-                .iter()
-                .any(|s| !matches!(s, ViewShape::FilterProject))
-            {
-                return Ok(ViewShape::CompoundAll { branch_shapes });
-            }
-        }
-
-        // Branches up to and including the right side of the last
-        // deduplicating operator are content-keyed: any later UNION ALL
-        // appends its rows with multiplicity preserved, while a UNION ALL
-        // *before* a deduplicating operator only feeds presence (the dedup
-        // collapses its multiplicities anyway).
-        let prefix_len = operators
-            .iter()
-            .rposition(|op| *op != ast::CompoundOperator::UnionAll)
-            .map_or(0, |last_dedup| last_dedup + 2);
-
-        let mut arity: Option<usize> = None;
-        let mut folded: Vec<Option<CollationSeq>> = Vec::new();
-        for (branch_idx, branch) in std::iter::once(&select.body.select)
-            .chain(select.body.compounds.iter().map(|c| &c.select))
-            .enumerate()
-        {
-            let (branch_arity, branch_collations) =
-                validate_union_branch(branch, schema, resolver)?;
-            if *arity.get_or_insert(branch_arity) != branch_arity {
-                // The operator joining the mismatching branch to the chain.
-                let operator = operators[branch_idx - 1];
-                return Err(LimboError::ParseError(format!(
-                    "SELECTs to the left and right of {operator} do not have the same number of result columns",
-                )));
-            }
-            // Left precedence among the deduplicated branches: the left-most
-            // branch that resolves a collation for a column decides it, like
-            // compound dedup indexes. Append-suffix branches do not
-            // participate in dedup comparisons.
-            if branch_idx < prefix_len {
-                if folded.is_empty() {
-                    folded = branch_collations;
-                } else {
-                    for (slot, branch_collation) in folded.iter_mut().zip(branch_collations) {
-                        if slot.is_none() {
-                            *slot = branch_collation;
-                        }
-                    }
-                }
-            }
-        }
-        let key_collations = folded
-            .into_iter()
-            .map(|collation| collation.unwrap_or(CollationSeq::Binary))
-            .collect();
-        return Ok(ViewShape::Compound {
-            operators,
-            arity: arity.expect("at least two branches"),
-            prefix_len,
-            key_collations,
-        });
-    }
-
-    let ast::OneSelect::Select {
-        distinctness,
-        columns,
-        from,
-        where_clause,
-        group_by,
-        window_clause,
-        ..
-    } = &select.body.select
-    else {
-        return unsupported("VALUES");
-    };
-
-    // SELECT ALL is the default semantics spelled out; only DISTINCT changes
-    // the shape (handled below once the FROM structure is known).
-    let select_distinct = matches!(distinctness, Some(ast::Distinctness::Distinct));
-    if !window_clause.is_empty() {
-        return unsupported("window functions");
-    }
-
-    let Some(from) = from else {
-        return unsupported("no FROM clause");
-    };
-    if !matches!(from.select.as_ref(), ast::SelectTable::Table(_, _, _)) {
-        return unsupported("subqueries or table functions in FROM");
-    }
-
-    if let Some(where_expr) = where_clause {
-        check_scalar_expr(where_expr)?;
-    }
-
-    if !from.joins.is_empty() {
-        // Maintenance runs one delta phase per non-empty subset of the
-        // joined tables (2^N - 1), so the table count is capped.
-        if from.joins.len() > MAX_JOIN_TABLES - 1 {
-            return Err(LimboError::ParseError(format!(
-                "materialized views with joins over more than {MAX_JOIN_TABLES} tables are not yet supported",
-            )));
-        }
-        let mut left_outer = false;
-        for join in &from.joins {
-            if let ast::JoinOperator::TypedJoin(join_type) = &join.operator {
-                let join_type = join_type.unwrap_or(ast::JoinType::INNER);
-                let is_left = join_type.contains(ast::JoinType::LEFT);
-                let is_right = join_type.contains(ast::JoinType::RIGHT);
-                let is_full = (is_left && is_right)
-                    || (join_type.contains(ast::JoinType::OUTER) && !is_left && !is_right);
-                if is_full {
-                    return unsupported("FULL outer joins");
-                }
-                if is_left || is_right {
-                    // The NULL-padded row bookkeeping tracks one outer side;
-                    // outer joins are supported for exactly two tables. A
-                    // RIGHT join is maintained as a LEFT join with the tables
-                    // swapped (build_dag does the swap); the USING/NATURAL
-                    // column merge is order-sensitive and does not survive the
-                    // swap, so RIGHT is restricted to an ON constraint.
-                    if from.joins.len() > 1 {
-                        return unsupported(if is_left {
-                            "LEFT JOIN over more than two tables"
-                        } else {
-                            "RIGHT JOIN over more than two tables"
-                        });
-                    }
-                    if is_right
-                        && (join_type.contains(ast::JoinType::NATURAL)
-                            || matches!(join.constraint, Some(ast::JoinConstraint::Using(_))))
-                    {
-                        return unsupported("RIGHT JOIN with USING or NATURAL");
-                    }
-                    left_outer = true;
-                }
-            }
-            if !matches!(join.table.as_ref(), ast::SelectTable::Table(_, _, _)) {
-                return unsupported("subqueries or table functions in FROM");
-            }
-            if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
-                check_scalar_expr(expr)?;
-            }
-        }
-        // USING and NATURAL desugar to equality predicates against the
-        // left-most earlier table with each merged column. Validate here —
-        // at translate time — so a bad constraint can never fail inside the
-        // CREATE program. The desugared predicates qualify columns by table
-        // identifier, so duplicate identifiers cannot be resolved.
-        let using_per_table = crate::util::join_using_columns(from, schema)?;
-        if using_per_table.iter().any(|using| !using.is_empty()) {
-            let mut identifiers: Vec<String> = Vec::with_capacity(from.joins.len() + 1);
-            for table in std::iter::once(from.select.as_ref())
-                .chain(from.joins.iter().map(|join| join.table.as_ref()))
-            {
-                if let ast::SelectTable::Table(name, alias, _) = table {
-                    identifiers.push(crate::util::normalize_ident(match alias {
-                        Some(
-                            ast::As::As(alias)
-                            | ast::As::Elided(alias)
-                            | ast::As::ImplicitColumnName(alias),
-                        ) => alias.as_str(),
-                        None => name.name.as_str(),
-                    }));
-                }
-            }
-            let unique: std::collections::HashSet<&String> = identifiers.iter().collect();
-            if unique.len() != identifiers.len() {
-                return unsupported("NATURAL or USING joins between tables with the same name");
-            }
-        }
-        if select_distinct {
-            // DISTINCT over a join is GROUP BY every output column over the
-            // join: one group per distinct output row, kept alive by the
-            // hidden COUNT(*). Expand the result columns to qualified
-            // references (stars across every joined table, merged USING
-            // columns once) and route through the shared aggregate path,
-            // whose compile step re-reads the join from the FROM clause.
-            if left_outer {
-                // A RIGHT join is maintained as a swapped LEFT join, but the
-                // aggregate feed reads the FROM clause unswapped, so only LEFT
-                // is supported here (mirrors the aggregate-over-join gate).
-                let is_left = from.joins.iter().any(|join| {
-                    matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt))
-                        if jt.contains(ast::JoinType::LEFT))
-                });
-                if !is_left {
-                    return unsupported("DISTINCT over RIGHT outer joins");
-                }
-            }
-            let group_exprs = expand_join_output_exprs(from, schema, columns, resolver)?;
-            let synthetic_columns: Vec<ast::ResultColumn> = group_exprs
-                .iter()
-                .map(|expr| ast::ResultColumn::Expr(Box::new(expr.clone()), None))
-                .collect();
-            let group_by = ast::GroupBy {
-                exprs: group_exprs.iter().cloned().map(Box::new).collect(),
-                having: None,
-            };
-            let base_tables: Vec<Arc<BTreeTable>> = std::iter::once(from.select.as_ref())
-                .chain(from.joins.iter().map(|join| join.table.as_ref()))
-                .filter_map(|table| match table {
-                    ast::SelectTable::Table(name, _, _) => {
-                        schema.get_btree_table(name.name.as_str())
-                    }
-                    _ => None,
-                })
-                .collect();
-            return classify_group_aggregate(
-                &synthetic_columns,
-                &Some(group_by),
-                from,
-                &base_tables,
-                left_outer,
-                schema,
-                resolver,
-            );
-        }
-        let mut contains_aggregates = group_by.is_some();
-        for column in columns {
-            if let ast::ResultColumn::Expr(expr, _) = column {
-                let mut aggs = Vec::new();
-                if resolve_window_and_aggregate_functions(expr, resolver, &mut aggs, None, &mut [])?
-                {
-                    contains_aggregates = true;
-                }
-            }
-        }
-        if contains_aggregates {
-            if left_outer {
-                // A RIGHT join is maintained as a swapped LEFT join, but the
-                // aggregate feed reads the FROM clause directly (not the
-                // build_dag-swapped inputs), so RIGHT-join aggregates are not
-                // yet wired. LEFT-join aggregates feed the padded rows through
-                // the aux table (see emit_join_deltas_to_ephemeral).
-                let is_left = from.joins.iter().any(|join| {
-                    matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt))
-                        if jt.contains(ast::JoinType::LEFT))
-                });
-                if !is_left {
-                    return unsupported("aggregates over RIGHT outer joins");
-                }
-            }
-            // Aggregates over a join: the join's deltas feed the group
-            // machinery, so this classifies as a GroupAggregate; the compile
-            // step re-reads the join structure from the FROM clause.
-            let mut base_tables = Vec::new();
-            for table in std::iter::once(from.select.as_ref())
-                .chain(from.joins.iter().map(|join| join.table.as_ref()))
-            {
-                if let ast::SelectTable::Table(name, _, _) = table {
-                    base_tables.extend(schema.get_btree_table(name.name.as_str()));
-                }
-            }
-            return classify_group_aggregate(
-                columns,
-                group_by,
-                from,
-                &base_tables,
-                left_outer,
-                schema,
-                resolver,
-            );
-        }
-        for column in columns {
-            if let ast::ResultColumn::Expr(expr, _) = column {
-                check_scalar_expr(expr)?;
-            }
-        }
-        return Ok(ViewShape::Join {
-            n_tables: from.joins.len() + 1,
-            left_outer,
-        });
-    }
-
-    // SELECT DISTINCT over plain projections is GROUP BY every result column:
-    // one group per distinct output row, kept alive by the hidden COUNT(*)
-    // while any source row still produces it. DISTINCT over an aggregate
-    // query dedups the aggregated rows themselves, which the group machinery
-    // cannot express.
-    if select_distinct {
-        if group_by.is_some() {
-            return unsupported("DISTINCT over aggregates");
-        }
-        let mut group_exprs = Vec::with_capacity(columns.len());
-        for column in columns {
-            match column {
-                ast::ResultColumn::Expr(expr, _) => {
-                    let mut aggs = Vec::new();
-                    if resolve_window_and_aggregate_functions(
-                        expr,
-                        resolver,
-                        &mut aggs,
-                        None,
-                        &mut [],
-                    )? {
-                        return unsupported("DISTINCT over aggregates");
-                    }
-                    check_scalar_expr(expr)?;
-                    group_exprs.push(expr.as_ref().clone());
-                }
-                ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => {
-                    let ast::SelectTable::Table(name, _, _) = from.select.as_ref() else {
-                        unreachable!("single-table FROM checked above");
-                    };
-                    let base_table =
-                        schema.get_btree_table(name.name.as_str()).ok_or_else(|| {
-                            LimboError::ParseError(format!(
-                                "materialized view base table {} not found",
-                                name.name.as_str()
-                            ))
-                        })?;
-                    for column in base_table.columns() {
-                        let name = column.name.clone().ok_or_else(|| {
-                            LimboError::InternalError(
-                                "btree table column without a name".to_string(),
-                            )
-                        })?;
-                        group_exprs.push(ast::Expr::Id(ast::Name::exact(name)));
-                    }
-                }
-            }
-        }
-        let count_star = ast::Expr::FunctionCallStar {
-            name: ast::Name::exact("count".to_string()),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        };
-        let mut aggregates = Vec::new();
-        resolve_window_and_aggregate_functions(
-            &count_star,
-            resolver,
-            &mut aggregates,
-            None,
-            &mut [],
-        )?;
-        let group_collations = resolve_key_collations(&group_exprs, from, schema, resolver)?;
-        return Ok(ViewShape::GroupAggregate {
-            group_exprs,
-            group_collations,
-            aggregates,
-            multiset_collation: CollationSeq::Binary,
-            having: None,
-            scalar: false,
-            outer_join: false,
-        });
-    }
-
-    // HAVING without GROUP BY parses as a GroupBy node with no expressions;
-    // it makes the query an aggregate query just like an aggregate call does.
-    let scalar = group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty());
-    if scalar && group_by.as_ref().is_none_or(|gb| gb.having.is_none()) {
-        let mut contains_aggregates = false;
-        for column in columns {
-            if let ast::ResultColumn::Expr(expr, _) = column {
-                let mut aggs = Vec::new();
-                if resolve_window_and_aggregate_functions(expr, resolver, &mut aggs, None, &mut [])?
-                {
-                    contains_aggregates = true;
-                }
-            }
-        }
-        if !contains_aggregates {
-            for column in columns {
-                if let ast::ResultColumn::Expr(expr, _) = column {
-                    check_scalar_expr(expr)?;
-                }
-            }
-            return Ok(ViewShape::FilterProject);
-        }
-    }
-
-    let base_tables: Vec<Arc<BTreeTable>> = match from.select.as_ref() {
-        ast::SelectTable::Table(name, _, _) => schema
-            .get_btree_table(name.name.as_str())
-            .into_iter()
-            .collect(),
-        _ => Vec::new(),
-    };
-    classify_group_aggregate(
-        columns,
-        group_by,
-        from,
-        &base_tables,
-        false,
-        schema,
-        resolver,
-    )
-}
-
-/// Classify an aggregate query (GROUP BY, scalar aggregates, HAVING) into a
-/// [`ViewShape::GroupAggregate`], shared by the single-table and join paths.
-/// `base_tables` are the FROM tables, used to resolve GROUP BY terms the way
-/// the planner does (ordinals and aliases with canonical-column precedence).
-fn classify_group_aggregate(
-    columns: &[ast::ResultColumn],
-    group_by: &Option<ast::GroupBy>,
-    from: &ast::FromClause,
-    base_tables: &[Arc<BTreeTable>],
-    outer_join: bool,
-    schema: &Schema,
-    resolver: &Resolver,
-) -> Result<ViewShape> {
-    let (raw_group_exprs, having_clause): (Vec<ast::Expr>, Option<&ast::Expr>) = match group_by {
-        Some(group_by) => {
-            let exprs = group_by
-                .exprs
-                .iter()
-                .map(|e| resolve_group_by_term(e, columns, base_tables))
-                .collect::<Result<Vec<_>>>()?;
-            (exprs, group_by.having.as_deref())
-        }
-        None => (Vec::new(), None),
-    };
-
-    // Scalar aggregates form one group keyed by a synthetic constant, so the
-    // single row flows through the same state-table machinery as GROUP BY.
-    let scalar = raw_group_exprs.is_empty();
-    let group_exprs: Vec<ast::Expr> = if scalar {
-        vec![ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))]
-    } else {
-        raw_group_exprs
-    };
-    for g in &group_exprs {
-        check_scalar_expr(g)?;
-    }
-
-    // aggregates[0] is the hidden liveness COUNT(*); its expression form lets
-    // an explicit COUNT(*) in the SELECT list or HAVING dedup onto the same
-    // accumulator through the collector.
+fn hidden_count_aggregate(resolver: &Resolver) -> Result<Vec<Aggregate>> {
     let count_star = ast::Expr::FunctionCallStar {
         name: ast::Name::exact("count".to_string()),
         filter_over: ast::FunctionTail {
@@ -1470,193 +1247,810 @@ fn classify_group_aggregate(
     };
     let mut aggregates = Vec::new();
     resolve_window_and_aggregate_functions(&count_star, resolver, &mut aggregates, None, &mut [])?;
-    turso_assert!(
-        aggregates.len() == 1 && matches!(aggregates[0].func, AggFunc::Count0),
-        "count(*) must collect as the single hidden liveness aggregate"
-    );
-
-    // Collect aggregates referenced by the result columns and validate that
-    // every column is a group key, a plain aggregate, or an expression over
-    // them (SUM(x) + 1, and the like — the rule HAVING also follows). Bare
-    // columns outside GROUP BY carry SQLite's arbitrary-row semantics, which
-    // cannot be maintained incrementally. The output-column mapping itself is
-    // derived from the DAG's projection at codegen time, not stored here.
-    for column in columns {
-        let ast::ResultColumn::Expr(expr, _) = column else {
-            return unsupported("star projections combined with GROUP BY");
-        };
-        if group_exprs
-            .iter()
-            .any(|g| crate::util::exprs_are_equivalent(g, expr))
-        {
-            continue;
-        }
-        resolve_window_and_aggregate_functions(expr, resolver, &mut aggregates, None, &mut [])?;
-        if aggregates
-            .iter()
-            .any(|a| crate::util::exprs_are_equivalent(&a.original_expr, expr))
-        {
-            continue;
-        }
-        check_group_row_expr(
-            expr,
-            &group_exprs,
-            &aggregates,
-            "non-aggregate result columns not in GROUP BY",
-        )?;
-    }
-
-    let having = match having_clause {
-        Some(having) => {
-            resolve_window_and_aggregate_functions(
-                having,
-                resolver,
-                &mut aggregates,
-                None,
-                &mut [],
-            )?;
-            check_group_row_expr(
-                having,
-                &group_exprs,
-                &aggregates,
-                "HAVING referencing columns outside GROUP BY",
-            )?;
-            Some(having.clone())
-        }
-        None => None,
-    };
-
-    for agg in &aggregates {
-        validate_supported_aggregate(agg)?;
-    }
-
-    if outer_join && aggregates.iter().any(uses_multiset) {
-        // The multiset slot holds the LEFT join's per-left-row padded
-        // bookkeeping, so a value multiset (MIN/MAX or a DISTINCT aggregate)
-        // over the same view has nowhere to live. Supporting both at once
-        // needs a second auxiliary table.
-        return unsupported("MIN/MAX or DISTINCT aggregates over an outer join");
-    }
-
-    let group_collations = resolve_key_collations(&group_exprs, from, schema, resolver)?;
-    let mut multiset_collation = CollationSeq::Binary;
-    let mut multiset_seen = false;
-    for agg in aggregates.iter().filter(|a| uses_multiset(a)) {
-        let collation = match agg.args.first() {
-            Some(arg) => {
-                resolve_key_collations(std::slice::from_ref(arg), from, schema, resolver)?[0]
-            }
-            None => CollationSeq::Binary,
-        };
-        if !multiset_seen {
-            multiset_seen = true;
-            multiset_collation = collation;
-        } else if multiset_collation != collation {
-            // All multiset-tracked values share one table whose `val` column
-            // carries a single collation.
-            return unsupported(
-                "different collations across MIN/MAX or DISTINCT aggregate arguments",
-            );
-        }
-    }
-
-    Ok(ViewShape::GroupAggregate {
-        group_exprs,
-        group_collations,
-        aggregates,
-        multiset_collation,
-        having,
-        scalar,
-        outer_join,
-    })
+    Ok(aggregates)
 }
 
-/// [`classify_view`] with a transient resolver built from a connection, for
-/// callers outside the translate layer (maintenance compilation, cursors).
-pub fn classify_view_for_connection(
-    select: &ast::Select,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<ViewShape> {
-    let syms = connection.syms.read();
-    let resolver = Resolver::new(
-        schema,
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        &syms,
-        connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
-    );
-    classify_view(select, schema, &resolver)
-}
-
-/// Whether the view keeps a hidden internal state table.
-pub fn needs_state_table(shape: &ViewShape) -> bool {
-    // CompoundAll has no single view-level state table; each branch's tables
-    // are enumerated by [`hidden_tables`].
-    matches!(
-        shape,
-        ViewShape::GroupAggregate { .. } | ViewShape::Join { .. } | ViewShape::Compound { .. }
-    )
+fn plan_expr_collation(
+    expr: &ast::Expr,
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<Option<CollationSeq>> {
+    let collation = get_collseq_from_expr_with_symbols(expr, tables, Some(resolver.symbol_table))?;
+    if collation.is_some_and(|collation| collation.is_custom()) {
+        return unsupported("custom collations on grouping or dedup keys");
+    }
+    Ok(collation.map(|collation| match collation {
+        CollationSeq::Unset => CollationSeq::Binary,
+        other => other,
+    }))
 }
 
 /// A hidden state/multiset table a view needs, fully named with its CREATE
 /// SQL. The single source of truth for the DDL the CREATE program emits.
+#[derive(Debug, Clone)]
 pub struct HiddenTableDef {
     pub table_name: String,
     pub create_sql: String,
 }
 
-/// Enumerate every hidden table a view needs, in creation order. A
-/// non-compound view has at most a state table and a multiset table (empty
-/// branch suffix). A CompoundAll view has none of its own — it enumerates
-/// each branch's tables under that branch's `__b<idx>` suffix, matching the
-/// names the branch sub-programs look up.
-pub fn hidden_tables(view_name: &str, shape: &ViewShape) -> Result<Vec<HiddenTableDef>> {
-    fn tables_for(
-        view_name: &str,
-        suffix: &str,
-        shape: &ViewShape,
-        out: &mut Vec<HiddenTableDef>,
-    ) -> Result<()> {
-        use crate::incremental::view::DBSP_CIRCUIT_VERSION;
-        if needs_state_table(shape) {
-            let table_name = format!(
-                "{}{DBSP_CIRCUIT_VERSION}_{view_name}{suffix}",
-                crate::schema::DBSP_TABLE_PREFIX,
-            );
-            let create_sql = state_table_sql(&table_name, shape)?;
-            out.push(HiddenTableDef {
-                table_name,
-                create_sql,
-            });
-        }
-        if needs_multiset_table(shape) {
-            let table_name = format!(
-                "{}{DBSP_CIRCUIT_VERSION}_{view_name}{suffix}",
-                crate::schema::DBSP_MULTISET_TABLE_PREFIX,
-            );
-            let create_sql = multiset_table_sql(&table_name, shape)?;
-            out.push(HiddenTableDef {
-                table_name,
-                create_sql,
-            });
-        }
-        Ok(())
+/// Persistent storage assigned to one DAG node.
+///
+/// `state_table` is the operator's primary integral. `auxiliary_table` is the
+/// aggregate value multiset, the LEFT-join unmatched-row bookkeeping, or the
+/// trailing-UNION-ALL identity multiset associated with that same node.
+/// `arrangement_table` is the node's explicitly materialized output integral
+/// when a downstream join or terminal sink needs a one-rowid identity and the
+/// operator has no native arrangement.
+#[derive(Debug, Clone)]
+struct OperatorStateDef {
+    node_id: dag::NodeId,
+    /// Identity emitted by the relational operator before an optional output
+    /// arrangement.
+    emitted_identity: DeltaIdentity,
+    /// Identity published on the node's DAG edge. An explicit arrangement
+    /// replaces the producer identity with its own stable rowid.
+    output_identity: DeltaIdentity,
+    state_table: Option<HiddenTableDef>,
+    auxiliary_table: Option<HiddenTableDef>,
+    arrangement_table: Option<HiddenTableDef>,
+}
+
+impl OperatorStateDef {
+    fn exposes_arrangement(&self, node: &dag::OpNode) -> bool {
+        node_has_native_arrangement(node) || self.arrangement_table.is_some()
     }
 
-    let mut out = Vec::new();
-    match shape {
-        ViewShape::CompoundAll { branch_shapes } => {
-            for (idx, sub) in branch_shapes.iter().enumerate() {
-                tables_for(view_name, &format!("__b{idx}"), sub, &mut out)?;
+    fn state_table_name(&self) -> Result<&str> {
+        self.state_table
+            .as_ref()
+            .map(|table| table.table_name.as_str())
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "maintenance DAG node {} has no primary state table",
+                    self.node_id
+                ))
+            })
+    }
+
+    fn auxiliary_table_name(&self) -> Result<&str> {
+        self.auxiliary_table
+            .as_ref()
+            .map(|table| table.table_name.as_str())
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "maintenance DAG node {} has no auxiliary state table",
+                    self.node_id
+                ))
+            })
+    }
+}
+
+/// Node-indexed inventory shared by CREATE and maintenance code generation.
+///
+/// The vector has exactly one entry per DAG node, so codegen cannot recover
+/// storage by reclassifying a branch or reconstructing a name.
+#[derive(Debug, Clone)]
+pub struct OperatorStateCatalog {
+    nodes: Vec<OperatorStateDef>,
+}
+
+impl OperatorStateCatalog {
+    fn for_node(&self, node_id: dag::NodeId) -> Result<&OperatorStateDef> {
+        let state = self.nodes.get(node_id).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "maintenance state catalog has no DAG node {node_id}"
+            ))
+        })?;
+        if state.node_id != node_id {
+            return Err(LimboError::InternalError(format!(
+                "maintenance state catalog entry {} is stored at node {node_id}",
+                state.node_id
+            )));
+        }
+        Ok(state)
+    }
+
+    pub fn hidden_tables(&self) -> impl Iterator<Item = &HiddenTableDef> {
+        self.nodes.iter().flat_map(|state| {
+            state
+                .state_table
+                .iter()
+                .chain(state.auxiliary_table.iter())
+                .chain(state.arrangement_table.iter())
+        })
+    }
+}
+
+/// The single CREATE/compile-time description of an incremental view.
+///
+/// Validation builds the DAG once, storage is derived from that DAG, and
+/// codegen consumes the same representation. Keeping these together prevents
+/// the accepted-query set, hidden schema, and bytecode dispatcher from
+/// evolving as three independent shape classifiers.
+pub struct MaintenancePlan {
+    pub dag: dag::MaintenanceDag,
+    pub operator_states: OperatorStateCatalog,
+    pub output_arity: usize,
+}
+
+/// Validate a view and build its executable maintenance plan.
+pub fn plan_view(
+    view_name: &str,
+    select: &ast::Select,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<MaintenancePlan> {
+    let mut planner_program = ProgramBuilder::new_for_subprogram(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts::new(8, 32, 8),
+    );
+    let relational_plan = prepare_select_plan(
+        select.clone(),
+        resolver,
+        &mut planner_program,
+        &[],
+        QueryDestination::ResultRows,
+        connection,
+    )?;
+    let dag = build_dag_from_plan(&relational_plan, resolver)?;
+    let operator_states = plan_operator_states(view_name, &dag, resolver)?;
+    let output_arity = dag.root_schema().len();
+    Ok(MaintenancePlan {
+        dag,
+        operator_states,
+        output_arity,
+    })
+}
+
+/// Validate one fully planned node.
+///
+/// Planning visits nodes in topological order and calls this immediately
+/// after assigning the node's identity, state, and arrangement contract.
+/// Validation therefore cannot accept a shape that has no physical contract,
+/// and it may inspect only contracts already established for declared inputs.
+fn validate_planned_node(
+    dag: &dag::MaintenanceDag,
+    node_id: dag::NodeId,
+    operator_states: &OperatorStateCatalog,
+    resolver: &Resolver,
+) -> Result<()> {
+    let node = &dag.nodes[node_id];
+    validate_output_schema(dag, node_id)?;
+    if let dag::OpNode::Scan { table, .. } = node {
+        if !table.has_rowid {
+            return unsupported("WITHOUT ROWID base tables");
+        }
+        if table.has_virtual_columns {
+            return unsupported("base tables with virtual generated columns");
+        }
+    }
+    let check_expr = |expr: &ast::Expr| -> Result<()> {
+        if expr_contains_nondeterministic_scalar_function(expr, resolver)? {
+            return unsupported("non-deterministic expressions");
+        }
+        Ok(())
+    };
+    match node {
+        dag::OpNode::Filter { predicate, .. } => check_expr(predicate)?,
+        dag::OpNode::Project { projections, .. } => {
+            for (expr, _) in projections {
+                check_expr(expr)?;
             }
         }
-        _ => tables_for(view_name, "", shape, &mut out)?,
+        dag::OpNode::Join { on, .. } => {
+            for expr in on {
+                check_expr(expr)?;
+            }
+        }
+        dag::OpNode::Aggregate {
+            group_exprs,
+            aggregates,
+            ..
+        } => {
+            for expr in group_exprs {
+                check_expr(expr)?;
+            }
+            for aggregate in aggregates {
+                for expr in &aggregate.args {
+                    check_expr(expr)?;
+                }
+                if let Some(expr) = &aggregate.filter_expr {
+                    check_expr(expr)?;
+                }
+            }
+        }
+        dag::OpNode::Scan { .. } | dag::OpNode::Alias { .. } | dag::OpNode::SetOp { .. } => {}
     }
-    Ok(out)
+    validate_composable_delta_node(dag, node_id, operator_states)
+}
+
+fn validate_terminal_delta_identity(
+    operator_states: &OperatorStateCatalog,
+    node_id: dag::NodeId,
+) -> Result<()> {
+    match operator_states.for_node(node_id)?.output_identity {
+        DeltaIdentity::BindingRowids(1) | DeltaIdentity::OperatorRowid => Ok(()),
+        DeltaIdentity::BindingRowids(_) | DeltaIdentity::OperatorKey(_) => unsupported(
+            "a root delta with composite identity without an explicit materialized sink",
+        ),
+    }
+}
+
+fn validate_output_schema(dag: &dag::MaintenanceDag, node_id: dag::NodeId) -> Result<()> {
+    let node = &dag.nodes[node_id];
+    let schema = dag.output_schema(node_id);
+    let valid = match node {
+        dag::OpNode::Scan {
+            table,
+            identifier,
+            logical_id,
+        } => {
+            schema.len() == table.columns().len()
+                && schema.bindings.len() == 1
+                && schema.bindings[0].table.root_page == table.root_page
+                && schema.bindings[0].identifier == *identifier
+                && schema.bindings[0].logical_id == *logical_id
+                && schema.columns.iter().enumerate().zip(table.columns()).all(
+                    |((column_index, stream), column)| {
+                        stream.name == column.name
+                            && match (&stream.expr, &column.name) {
+                                (
+                                    Some(ast::Expr::Column {
+                                        table: expr_table,
+                                        column: expr_column,
+                                        is_rowid_alias,
+                                        ..
+                                    }),
+                                    Some(_),
+                                ) => {
+                                    *expr_table == *logical_id
+                                        && *expr_column == column_index
+                                        && *is_rowid_alias == column.is_rowid_alias()
+                                }
+                                (None, None) => true,
+                                _ => false,
+                            }
+                    },
+                )
+        }
+        dag::OpNode::Filter { input, .. } => {
+            schema.columns.len() == dag.output_schema(*input).columns.len()
+                && stream_bindings_match(schema, dag.output_schema(*input))
+                && schema
+                    .columns
+                    .iter()
+                    .zip(&dag.output_schema(*input).columns)
+                    .all(|(left, right)| {
+                        left.name == right.name
+                            && match (&left.expr, &right.expr) {
+                                (Some(left), Some(right)) => {
+                                    crate::util::exprs_are_equivalent(left, right)
+                                }
+                                (None, None) => true,
+                                _ => false,
+                            }
+                    })
+        }
+        dag::OpNode::Project { input, projections } => {
+            schema.len() == projections.len()
+                && stream_bindings_match(schema, dag.output_schema(*input))
+                && schema
+                    .columns
+                    .iter()
+                    .zip(projections)
+                    .all(|(stream, (expr, name))| {
+                        stream.name == *name
+                            && stream.expr.as_ref().is_some_and(|stream_expr| {
+                                crate::util::exprs_are_equivalent(stream_expr, expr)
+                            })
+                    })
+        }
+        dag::OpNode::Alias {
+            input,
+            table,
+            identifier,
+            logical_id,
+        } => {
+            schema.len() == dag.output_schema(*input).len()
+                && schema.len() == table.columns().len()
+                && schema.bindings.len() == 1
+                && Arc::ptr_eq(&schema.bindings[0].table, table)
+                && schema.bindings[0].identifier == *identifier
+                && schema.bindings[0].logical_id == *logical_id
+                && schema.columns.iter().enumerate().zip(table.columns()).all(
+                    |((column_index, stream), column)| {
+                        stream.name == column.name
+                            && match (&stream.expr, &column.name) {
+                                (
+                                    Some(ast::Expr::Column {
+                                        table: expr_table,
+                                        column: expr_column,
+                                        is_rowid_alias,
+                                        ..
+                                    }),
+                                    Some(_),
+                                ) => {
+                                    *expr_table == *logical_id
+                                        && *expr_column == column_index
+                                        && *is_rowid_alias == column.is_rowid_alias()
+                                }
+                                (None, None) => true,
+                                _ => false,
+                            }
+                    },
+                )
+        }
+        dag::OpNode::Join { inputs, .. } => {
+            schema.len()
+                == inputs
+                    .iter()
+                    .map(|input| dag.output_schema(*input).len())
+                    .sum::<usize>()
+                && schema.bindings.len()
+                    == inputs
+                        .iter()
+                        .map(|input| dag.output_schema(*input).bindings.len())
+                        .sum::<usize>()
+        }
+        dag::OpNode::Aggregate {
+            input,
+            group_exprs,
+            aggregates,
+            ..
+        } => {
+            schema.len() == group_exprs.len() + aggregates.len()
+                && stream_bindings_match(schema, dag.output_schema(*input))
+        }
+        dag::OpNode::SetOp { arity, .. } => schema.len() == *arity,
+    };
+    if !valid {
+        return Err(LimboError::InternalError(format!(
+            "maintenance DAG node {node_id} has an inconsistent output schema"
+        )));
+    }
+    Ok(())
+}
+
+fn stream_bindings_match(left: &dag::StreamSchema, right: &dag::StreamSchema) -> bool {
+    left.bindings.len() == right.bindings.len()
+        && left
+            .bindings
+            .iter()
+            .zip(&right.bindings)
+            .all(|(left, right)| {
+                left.table.root_page == right.table.root_page
+                    && left.identifier == right.identifier
+                    && left.logical_id == right.logical_id
+            })
+}
+
+fn validate_composable_delta_node(
+    dag: &dag::MaintenanceDag,
+    node_id: dag::NodeId,
+    operator_states: &OperatorStateCatalog,
+) -> Result<()> {
+    match &dag.nodes[node_id] {
+        dag::OpNode::Scan { .. } => Ok(()),
+        dag::OpNode::Filter { input, predicate } => {
+            if let dag::OpNode::Aggregate {
+                group_exprs,
+                aggregates,
+                ..
+            } = &dag.nodes[*input]
+            {
+                check_group_row_expr(
+                    predicate,
+                    group_exprs,
+                    aggregates,
+                    "HAVING referencing columns outside GROUP BY",
+                )?;
+            } else {
+                check_scalar_expr(predicate)?;
+            }
+            Ok(())
+        }
+        dag::OpNode::Project { input, projections } => {
+            let (aggregate, output_filter) = match &dag.nodes[*input] {
+                dag::OpNode::Aggregate { .. } => (Some(*input), None),
+                dag::OpNode::Filter {
+                    input: aggregate,
+                    predicate,
+                } if matches!(dag.nodes[*aggregate], dag::OpNode::Aggregate { .. }) => {
+                    (Some(*aggregate), Some(predicate))
+                }
+                _ => (None, None),
+            };
+            if let Some(aggregate) = aggregate {
+                let dag::OpNode::Aggregate {
+                    group_exprs,
+                    aggregates,
+                    ..
+                } = &dag.nodes[aggregate]
+                else {
+                    unreachable!()
+                };
+                if let Some(predicate) = output_filter {
+                    check_group_row_expr(
+                        predicate,
+                        group_exprs,
+                        aggregates,
+                        "HAVING referencing columns outside GROUP BY",
+                    )?;
+                }
+                for (expr, _) in projections {
+                    check_group_row_expr(
+                        expr,
+                        group_exprs,
+                        aggregates,
+                        "non-aggregate result columns not in GROUP BY",
+                    )?;
+                }
+                return Ok(());
+            }
+            for (expr, _) in projections {
+                check_scalar_expr(expr)?;
+            }
+            Ok(())
+        }
+        dag::OpNode::Alias { .. } => Ok(()),
+        dag::OpNode::Join {
+            inputs,
+            using,
+            on,
+            kind,
+        } => {
+            validate_join_node(dag, inputs, using, on, *kind, operator_states)?;
+            Ok(())
+        }
+        dag::OpNode::SetOp {
+            inputs,
+            operators,
+            arity,
+            prefix_len,
+            key_collations,
+        } => {
+            if inputs.len() != operators.len() + 1
+                || *prefix_len > inputs.len()
+                || *prefix_len == 1
+                || inputs
+                    .iter()
+                    .any(|input| dag.output_schema(*input).len() != *arity)
+            {
+                return Err(LimboError::InternalError(
+                    "composable set-op has inconsistent physical metadata".to_string(),
+                ));
+            }
+            if (*prefix_len == 0 && !key_collations.is_empty())
+                || (*prefix_len > 0 && key_collations.len() != *arity)
+            {
+                return Err(LimboError::InternalError(
+                    "composable set-op has an invalid collation layout".to_string(),
+                ));
+            }
+            if key_collations.iter().any(|collation| collation.is_custom()) {
+                return unsupported("custom collations on grouping or dedup keys");
+            }
+            if *prefix_len == 0
+                && operators
+                    .iter()
+                    .any(|operator| *operator != ast::CompoundOperator::UnionAll)
+            {
+                return Err(LimboError::InternalError(
+                    "pure UNION ALL DAG has a non-UNION ALL operator".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        dag::OpNode::Aggregate {
+            group_exprs,
+            group_collations,
+            aggregates,
+            ..
+        } => {
+            if group_exprs.len() != group_collations.len() {
+                return Err(LimboError::InternalError(
+                    "aggregate DAG has inconsistent group collation layout".to_string(),
+                ));
+            }
+            if group_collations
+                .iter()
+                .any(|collation| collation.is_custom())
+            {
+                return unsupported("custom collations on grouping or dedup keys");
+            }
+            for expr in group_exprs {
+                check_scalar_expr(expr)?;
+            }
+            for aggregate in aggregates {
+                validate_supported_aggregate(aggregate)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_join_node(
+    dag: &dag::MaintenanceDag,
+    inputs: &[dag::NodeId],
+    using: &[Vec<String>],
+    predicates: &[ast::Expr],
+    kind: dag::JoinKind,
+    operator_states: &OperatorStateCatalog,
+) -> Result<()> {
+    if inputs.len() > MAX_JOIN_TABLES {
+        return unsupported(&format!("joins over more than {MAX_JOIN_TABLES} tables"));
+    }
+    if kind == dag::JoinKind::LeftOuter && inputs.len() != 2 {
+        return Err(LimboError::InternalError(
+            "a LEFT JOIN maintenance node must be binary".to_string(),
+        ));
+    }
+    let mut identifiers = Vec::with_capacity(inputs.len());
+    for &input in inputs {
+        if !operator_states
+            .for_node(input)?
+            .exposes_arrangement(&dag.nodes[input])
+        {
+            return Err(LimboError::InternalError(format!(
+                "join input DAG node {input} has no declared arrangement"
+            )));
+        }
+        let bindings = &dag.output_schema(input).bindings;
+        if bindings.len() != 1 {
+            return unsupported("join inputs with multiple logical namespaces");
+        }
+        identifiers.push(crate::util::normalize_ident(&bindings[0].identifier));
+    }
+    if using.iter().any(|columns| !columns.is_empty()) {
+        identifiers.sort();
+        if identifiers.windows(2).any(|pair| pair[0] == pair[1]) {
+            return unsupported("NATURAL or USING joins between tables with the same name");
+        }
+    }
+    for predicate in predicates {
+        check_scalar_expr(predicate)?;
+    }
+    Ok(())
+}
+
+fn declared_emitted_identity(
+    node: &dag::OpNode,
+    prior_states: &[OperatorStateDef],
+) -> Result<DeltaIdentity> {
+    let identity = match node {
+        dag::OpNode::Scan { .. } => DeltaIdentity::BindingRowids(1),
+        dag::OpNode::Filter { input, .. } | dag::OpNode::Project { input, .. } => {
+            prior_states
+                .get(*input)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "maintenance DAG input node {input} has no identity contract"
+                    ))
+                })?
+                .output_identity
+        }
+        dag::OpNode::Alias { input, .. } => {
+            let upstream = prior_states
+                .get(*input)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "maintenance DAG input node {input} has no identity contract"
+                    ))
+                })?
+                .output_identity;
+            alias_identity(upstream)
+        }
+        dag::OpNode::Join {
+            inputs,
+            kind: dag::JoinKind::Inner,
+            ..
+        } => DeltaIdentity::BindingRowids(inputs.len()),
+        // Matched and NULL-padded rows share `(kind, packed source identity)`.
+        dag::OpNode::Join {
+            kind: dag::JoinKind::LeftOuter,
+            ..
+        } => DeltaIdentity::OperatorKey(2),
+        dag::OpNode::Aggregate { .. } => DeltaIdentity::OperatorRowid,
+        dag::OpNode::SetOp { prefix_len, .. } if *prefix_len > 0 => DeltaIdentity::OperatorRowid,
+        // Pure UNION ALL namespaces every branch's packed source identity.
+        dag::OpNode::SetOp { .. } => DeltaIdentity::OperatorKey(2),
+    };
+    Ok(identity)
+}
+
+/// A derived-table alias replaces all of its input bindings with one new SQL
+/// namespace. The physical source key remains stable, but its slots can no
+/// longer be interpreted as one rowid per output binding.
+fn alias_identity(upstream: DeltaIdentity) -> DeltaIdentity {
+    match upstream {
+        DeltaIdentity::BindingRowids(width) => DeltaIdentity::OperatorKey(width),
+        identity => identity,
+    }
+}
+
+fn node_has_native_arrangement(node: &dag::OpNode) -> bool {
+    matches!(
+        node,
+        dag::OpNode::Scan { .. } | dag::OpNode::Aggregate { .. }
+    )
+}
+
+fn node_is_join_input(dag: &dag::MaintenanceDag, node_id: dag::NodeId) -> bool {
+    dag.nodes.iter().any(|node| {
+        matches!(
+            node,
+            dag::OpNode::Join { inputs, .. } if inputs.contains(&node_id)
+        )
+    })
+}
+
+/// Whether this node must persist its output integral for a downstream join
+/// or terminal sink.
+///
+/// This demand is derived from DAG edges once and shared by validation,
+/// hidden-table creation, and codegen. Pure UNION ALL uses a branch id plus
+/// packed upstream identity, so even branches with different identity widths
+/// expose one fixed arrangement key.
+fn node_requires_output_arrangement(
+    dag: &dag::MaintenanceDag,
+    node_id: dag::NodeId,
+    emitted_identity: DeltaIdentity,
+) -> bool {
+    if matches!(
+        dag.nodes[node_id],
+        dag::OpNode::Join {
+            kind: dag::JoinKind::LeftOuter,
+            ..
+        } | dag::OpNode::SetOp { prefix_len: 0, .. }
+    ) {
+        return true;
+    }
+    // Preserve binding rowids through consumers that may reference them.
+    // Composite identities are normalized only when they reach a terminal
+    // sink or must back a downstream join arrangement.
+    if node_id == dag.root
+        && !matches!(
+            emitted_identity,
+            DeltaIdentity::BindingRowids(1) | DeltaIdentity::OperatorRowid
+        )
+    {
+        return true;
+    }
+    if !node_is_join_input(dag, node_id) || node_has_native_arrangement(&dag.nodes[node_id]) {
+        return false;
+    }
+    true
+}
+
+/// Build the persistent-state inventory in DAG order.
+///
+/// Aggregate and deduplicating set operators own their native integral.
+/// Joins and pure UNION ALL publish through ordinary output arrangements, so
+/// storage selection depends only on node and edge contracts.
+fn plan_operator_states(
+    view_name: &str,
+    dag: &dag::MaintenanceDag,
+    resolver: &Resolver,
+) -> Result<OperatorStateCatalog> {
+    use crate::incremental::view::DBSP_CIRCUIT_VERSION;
+
+    let mut catalog = OperatorStateCatalog {
+        nodes: Vec::with_capacity(dag.nodes.len()),
+    };
+    let mut hidden_names = FxHashSet::default();
+    for (node_id, node) in dag.nodes.iter().enumerate() {
+        let emitted_identity = declared_emitted_identity(node, &catalog.nodes)?;
+        let needs_state = node_requires_primary_state(dag, node_id);
+        let state_table = if needs_state {
+            let table_name = format!(
+                "{}{DBSP_CIRCUIT_VERSION}_{view_name}__n{node_id}",
+                crate::schema::DBSP_TABLE_PREFIX,
+            );
+            Some(HiddenTableDef {
+                create_sql: state_table_sql(&table_name, node)?,
+                table_name,
+            })
+        } else {
+            None
+        };
+        let auxiliary_table = if node_needs_auxiliary_state(node) {
+            let table_name = format!(
+                "{}{DBSP_CIRCUIT_VERSION}_{view_name}__n{node_id}",
+                crate::schema::DBSP_MULTISET_TABLE_PREFIX,
+            );
+            Some(HiddenTableDef {
+                create_sql: multiset_table_sql(
+                    &table_name,
+                    node,
+                    dag.output_schema(node_id).len(),
+                )?,
+                table_name,
+            })
+        } else {
+            None
+        };
+        let arrangement_table = if node_requires_output_arrangement(dag, node_id, emitted_identity)
+        {
+            let identity_width = emitted_identity.width();
+            let table_name = format!(
+                "{}{DBSP_CIRCUIT_VERSION}_{view_name}__n{node_id}",
+                crate::schema::DBSP_ARRANGEMENT_TABLE_PREFIX,
+            );
+            Some(HiddenTableDef {
+                create_sql: arrangement_table_sql(
+                    &table_name,
+                    identity_width,
+                    dag.output_schema(node_id).len(),
+                )?,
+                table_name,
+            })
+        } else {
+            None
+        };
+        let output_identity = if arrangement_table.is_some() {
+            DeltaIdentity::OperatorRowid
+        } else {
+            emitted_identity
+        };
+        let state = OperatorStateDef {
+            node_id,
+            emitted_identity,
+            output_identity,
+            state_table,
+            auxiliary_table,
+            arrangement_table,
+        };
+        for table in state
+            .state_table
+            .iter()
+            .chain(state.auxiliary_table.iter())
+            .chain(state.arrangement_table.iter())
+        {
+            if !hidden_names.insert(table.table_name.clone()) {
+                return Err(LimboError::InternalError(format!(
+                    "duplicate maintenance state table {}",
+                    table.table_name
+                )));
+            }
+        }
+        catalog.nodes.push(state);
+        validate_planned_node(dag, node_id, &catalog, resolver)?;
+    }
+    validate_terminal_delta_identity(&catalog, dag.root)?;
+    Ok(catalog)
+}
+
+fn arrangement_table_sql(
+    table_name: &str,
+    identity_width: usize,
+    value_width: usize,
+) -> Result<String> {
+    if identity_width == 0 {
+        return Err(LimboError::InternalError(
+            "an output arrangement requires a non-empty stable identity".to_string(),
+        ));
+    }
+    let table_ident = crate::util::quote_identifier(table_name);
+    let mut columns = (0..identity_width)
+        .map(|i| format!("i{i}"))
+        .collect::<Vec<_>>();
+    columns.extend((0..value_width).map(|i| format!("c{i}")));
+    columns.push("mult".to_string());
+    let key = columns[..identity_width + value_width].to_vec();
+    Ok(format!(
+        "CREATE TABLE {table_ident} ({}, PRIMARY KEY ({}))",
+        columns.join(", "),
+        key.join(", ")
+    ))
+}
+
+fn node_requires_primary_state(dag: &dag::MaintenanceDag, node_id: dag::NodeId) -> bool {
+    match &dag.nodes[node_id] {
+        dag::OpNode::Aggregate { .. } => true,
+        dag::OpNode::SetOp { prefix_len, .. } => *prefix_len > 0,
+        _ => false,
+    }
 }
 
 /// The CREATE TABLE statement for a view's internal state table.
@@ -1667,25 +2061,19 @@ pub fn hidden_tables(view_name: &str, shape: &ViewShape) -> Result<Vec<HiddenTab
 /// aggregates contribute no columns here — their state is the value multiset
 /// table.
 ///
-/// For a join view: one row per live join-output row, keyed by the pair of
-/// base-table rowids that produced it.
-///
 /// For a compound view with a dedup prefix: one row per distinct content
 /// key, holding one signed count per prefix branch (the visibility fold
-/// reads them); a pure UNION ALL chain instead keys rows by (branch, source
-/// rowid) with a single multiplicity. A trailing UNION ALL suffix behind a
-/// dedup prefix keeps its (branch, rowid, mult) rows in the auxiliary table
-/// (see [`multiset_table_sql`]).
+/// reads them). A trailing UNION ALL suffix keeps its
+/// (branch, source-identity, multiplicity) rows in the auxiliary table (see
+/// [`multiset_table_sql`]); pure UNION ALL is stateless branch composition.
 ///
-/// In each case the state row's rowid doubles as the row's rowid in the
-/// view btree: state rows are written unconditionally for live groups/pairs,
-/// so their rowids are unique, stable, and — unlike a separately reserved
-/// rowid — cannot collide when HAVING suppresses a group's view row.
+/// In each case the state row's rowid is the operator output identity.
 ///
 /// Declared column types are empty so nothing coerces the stored values.
-pub fn state_table_sql(state_table_name: &str, shape: &ViewShape) -> Result<String> {
-    match shape {
-        ViewShape::GroupAggregate {
+fn state_table_sql(state_table_name: &str, node: &dag::OpNode) -> Result<String> {
+    let state_table_ident = crate::util::quote_identifier(state_table_name);
+    match node {
+        dag::OpNode::Aggregate {
             group_exprs,
             group_collations,
             aggregates,
@@ -1694,6 +2082,9 @@ pub fn state_table_sql(state_table_name: &str, shape: &ViewShape) -> Result<Stri
             let mut columns = Vec::new();
             for (i, collation) in group_collations.iter().enumerate() {
                 columns.push(format!("g{i}{}", collate_clause(*collation)));
+            }
+            for i in 0..aggregates.len() {
+                columns.push(format!("v{i}"));
             }
             for (i, agg) in aggregates.iter().enumerate() {
                 if let Some(width) = crate::vdbe::execute::agg_payload_width(&agg.func) {
@@ -1704,29 +2095,20 @@ pub fn state_table_sql(state_table_name: &str, shape: &ViewShape) -> Result<Stri
             }
             let key: Vec<String> = (0..group_exprs.len()).map(|i| format!("g{i}")).collect();
             Ok(format!(
-                "CREATE TABLE {state_table_name} ({}, PRIMARY KEY ({}))",
+                "CREATE TABLE {state_table_ident} ({}, PRIMARY KEY ({}))",
                 columns.join(", "),
                 key.join(", ")
             ))
         }
-        ViewShape::Join { n_tables, .. } => {
-            let key: Vec<String> = (0..*n_tables).map(|i| format!("r{i}")).collect();
-            Ok(format!(
-                "CREATE TABLE {state_table_name} ({}, mult, PRIMARY KEY ({}))",
-                key.join(", "),
-                key.join(", ")
-            ))
-        }
-        ViewShape::Compound {
+        dag::OpNode::SetOp {
             arity,
             prefix_len,
             key_collations,
             ..
         } => {
             if *prefix_len == 0 {
-                // Pure UNION ALL: (branch, rid) identity, one multiplicity.
-                return Ok(format!(
-                    "CREATE TABLE {state_table_name} (branch, rid, mult, PRIMARY KEY (branch, rid))"
+                return Err(LimboError::InternalError(
+                    "pure UNION ALL is a stateless branch composition".to_string(),
                 ));
             }
             let mut columns: Vec<String> = (0..*arity)
@@ -1737,13 +2119,13 @@ pub fn state_table_sql(state_table_name: &str, shape: &ViewShape) -> Result<Stri
             }
             let key: Vec<String> = (0..*arity).map(|i| format!("c{i}")).collect();
             Ok(format!(
-                "CREATE TABLE {state_table_name} ({}, PRIMARY KEY ({}))",
+                "CREATE TABLE {state_table_ident} ({}, PRIMARY KEY ({}))",
                 columns.join(", "),
                 key.join(", ")
             ))
         }
-        ViewShape::FilterProject | ViewShape::CompoundAll { .. } => Err(LimboError::InternalError(
-            "this view shape has no single state table".to_string(),
+        _ => Err(LimboError::InternalError(
+            "this DAG operator has no state table".to_string(),
         )),
     }
 }
@@ -1755,27 +2137,21 @@ fn uses_multiset(agg: &Aggregate) -> bool {
     matches!(agg.func, AggFunc::Min | AggFunc::Max) || tracks_distinct_values(agg)
 }
 
-/// Whether the view needs the auxiliary multiset table: value multiplicities
-/// for MIN/MAX and DISTINCT aggregates, or (branch, rowid) multiplicities
-/// for a compound view's trailing UNION ALL branches behind a dedup prefix
-/// (the content-keyed state table can't hold rows that preserve
-/// multiplicity).
-pub fn needs_multiset_table(shape: &ViewShape) -> bool {
-    match shape {
-        // An aggregate over a LEFT join reuses the multiset slot for the
-        // join's per-left-row padded bookkeeping (classify rejects the combo
-        // with a value multiset, so the two never contend for the slot).
-        ViewShape::GroupAggregate {
-            aggregates,
-            outer_join,
-            ..
-        } => *outer_join || aggregates.iter().any(uses_multiset),
-        ViewShape::Compound {
+/// Whether this operator needs auxiliary state.
+///
+/// Aggregate value multisets are part of aggregate semantics. A mixed set-op's
+/// trailing UNION ALL identity map is also part of its output contract: the
+/// operator must publish one stable identity whether its consumer is another
+/// operator or the terminal view.
+fn node_needs_auxiliary_state(node: &dag::OpNode) -> bool {
+    match node {
+        dag::OpNode::Aggregate { aggregates, .. } => aggregates.iter().any(uses_multiset),
+        dag::OpNode::SetOp {
             operators,
             prefix_len,
             ..
         } => *prefix_len > 0 && *prefix_len < operators.len() + 1,
-        ViewShape::Join { left_outer, .. } => *left_outer,
+        dag::OpNode::Join { kind, .. } => *kind == dag::JoinKind::LeftOuter,
         _ => false,
     }
 }
@@ -1786,17 +2162,14 @@ pub fn needs_multiset_table(shape: &ViewShape) -> bool {
 /// retracting the current extreme never needs a rescan in Rust; for DISTINCT
 /// aggregates the multiplicity decides when a value enters or leaves the
 /// accumulator.
-pub fn multiset_table_sql(multiset_table_name: &str, shape: &ViewShape) -> Result<String> {
-    match shape {
-        // An aggregate over a LEFT join borrows this slot for the join's
-        // per-left-row padded bookkeeping — the same schema a standalone LEFT
-        // JOIN keeps (see the Join arm below).
-        ViewShape::GroupAggregate {
-            outer_join: true, ..
-        } => Ok(format!(
-            "CREATE TABLE {multiset_table_name} (l_rid, present, matches, padded, PRIMARY KEY (l_rid))"
-        )),
-        ViewShape::GroupAggregate {
+fn multiset_table_sql(
+    multiset_table_name: &str,
+    node: &dag::OpNode,
+    output_width: usize,
+) -> Result<String> {
+    let multiset_table_ident = crate::util::quote_identifier(multiset_table_name);
+    match node {
+        dag::OpNode::Aggregate {
             group_collations,
             multiset_collation,
             ..
@@ -1810,27 +2183,31 @@ pub fn multiset_table_sql(multiset_table_name: &str, shape: &ViewShape) -> Resul
             columns.push(format!("val{}", collate_clause(*multiset_collation)));
             key.push("val".to_string());
             Ok(format!(
-                "CREATE TABLE {multiset_table_name} ({}, mult, PRIMARY KEY ({}))",
+                "CREATE TABLE {multiset_table_ident} ({}, mult, PRIMARY KEY ({}))",
                 columns.join(", "),
                 key.join(", ")
             ))
         }
         // A compound view's trailing UNION ALL branches: a multiset of
-        // (branch, source rowid), each row's rowid doubling as its view
-        // rowid (disambiguated from content-row rowids by the caller).
-        ViewShape::Compound { .. } => Ok(format!(
-            "CREATE TABLE {multiset_table_name} (branch, rid, mult, PRIMARY KEY (branch, rid))"
+        // (branch, packed source identity), each row's rowid doubling as its
+        // view rowid (disambiguated from content-row rowids by the caller).
+        // Packing makes the contract independent of whether a branch carries
+        // one scan rowid or an N-way join identity tuple.
+        dag::OpNode::SetOp { .. } => Ok(format!(
+            "CREATE TABLE {multiset_table_ident} (branch, source_identity, mult, PRIMARY KEY (branch, source_identity))"
         )),
         // A LEFT JOIN view's per-left-row bookkeeping: signed presence,
-        // count of ON-matches, and whether its NULL-padded view row is
-        // currently written. The padded row exists while the left row is
-        // present with zero matches and WHERE passes over the padded image;
-        // the stored bit records the current state because WHERE was
-        // evaluated against an image that later contributions may no longer
-        // be able to reconstruct.
-        ViewShape::Join { .. } => Ok(format!(
-            "CREATE TABLE {multiset_table_name} (l_rid, present, matches, padded, PRIMARY KEY (l_rid))"
-        )),
+        // count of ON-matches, and whether its NULL-padded row is currently
+        // published. The payload preserves that image so downstream
+        // operators can consume its retraction after the left row departs.
+        dag::OpNode::Join { .. } => {
+            let payload = (0..output_width)
+                .map(|i| format!(", c{i}"))
+                .collect::<String>();
+            Ok(format!(
+                "CREATE TABLE {multiset_table_ident} (l_rid, present, matches, padded{payload}, PRIMARY KEY (l_rid))"
+            ))
+        }
         _ => Err(LimboError::InternalError(
             "only GROUP BY, compound, and LEFT JOIN views have multiset tables".to_string(),
         )),
@@ -1848,77 +2225,6 @@ fn collate_clause(collation: CollationSeq) -> String {
     }
 }
 
-/// How a branch of a compound view maps its local view rowids into the
-/// shared view btree, and how its hidden state tables are named apart from
-/// sibling branches. The standalone identity ([`BranchNamespace::none`],
-/// scale 1 / offset 0 / empty suffix) leaves the local rowid register
-/// untouched, so a standalone view generates byte-identical bytecode.
-#[derive(Clone)]
-struct BranchNamespace {
-    /// Local rowid `r` maps to view rowid `r * scale + offset`; branches of
-    /// an N-branch compound use `scale = N`, `offset = branch index`, so
-    /// their rowid ranges are disjoint.
-    scale: i64,
-    offset: i64,
-    /// Appended to the view name when forming this branch's hidden-table
-    /// names, keeping each branch's state tables distinct.
-    suffix: String,
-}
-
-impl BranchNamespace {
-    fn none() -> Self {
-        Self {
-            scale: 1,
-            offset: 0,
-            suffix: String::new(),
-        }
-    }
-
-    fn is_identity(&self) -> bool {
-        self.scale == 1 && self.offset == 0
-    }
-
-    /// Emit the view rowid for `local_reg`. Returns `local_reg` unchanged for
-    /// the identity namespace (no instructions); otherwise emits
-    /// `local * scale + offset` into a fresh register and returns it.
-    fn emit_view_rowid(&self, program: &mut ProgramBuilder, local_reg: usize) -> usize {
-        if self.is_identity() {
-            return local_reg;
-        }
-        let dst = program.alloc_register();
-        program.emit_insn(Insn::Copy {
-            src_reg: local_reg,
-            dst_reg: dst,
-            extra_amount: 0,
-        });
-        self.apply_in_place(program, dst);
-        dst
-    }
-
-    /// Map `reg` from a local view rowid to this branch's view rowid in
-    /// place. A no-op for the identity namespace.
-    fn apply_in_place(&self, program: &mut ProgramBuilder, reg: usize) {
-        if self.is_identity() {
-            return;
-        }
-        let scratch = program.alloc_register();
-        program.emit_int(self.scale, scratch);
-        program.emit_insn(Insn::Multiply {
-            lhs: reg,
-            rhs: scratch,
-            dest: reg,
-        });
-        program.emit_int(self.offset, scratch);
-        program.emit_insn(Insn::Add {
-            lhs: reg,
-            rhs: scratch,
-            dest: reg,
-        });
-    }
-}
-
-/// Compile the maintenance (or population) program for a materialized view,
-/// dispatching on its classified shape.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_maintenance_program(
     view_name: &str,
@@ -1926,109 +2232,86 @@ pub fn compile_maintenance_program(
     view_root_page: i64,
     num_view_columns: usize,
     input: MaintenanceInput,
-    output: MaintenanceOutput,
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<Program> {
-    let dag = build_dag_for_connection(select, schema, connection)?;
-    if dag_is_all_linear(&dag) {
-        return compile_dag_view_program(
-            view_name,
-            select,
-            &dag,
-            view_root_page,
-            num_view_columns,
-            input,
-            output,
-            schema,
-            connection,
-        );
+    let key = MaintenanceProgramCacheKey {
+        view_name: view_name.to_string(),
+        schema_version: schema.schema_version,
+        root_page: view_root_page,
+        num_columns: num_view_columns,
+        input,
+    };
+    if let Some(prepared) = connection.maintenance_program_cache.get(&key, connection) {
+        return Ok(prepared.bind(connection.clone()));
     }
-    if dag_is_aggregate(&dag) {
-        if matches!(output, MaintenanceOutput::EmitRows) {
-            return Err(LimboError::InternalError(
-                "aggregate views serve uncommitted reads by recomputing the defining query"
-                    .to_string(),
-            ));
-        }
-        return compile_dag_view_program(
-            view_name,
-            select,
-            &dag,
-            view_root_page,
-            num_view_columns,
-            input,
-            output,
-            schema,
-            connection,
-        );
-    }
-    if dag_is_join(&dag) {
-        if matches!(output, MaintenanceOutput::EmitRows) {
-            return Err(LimboError::InternalError(
-                "join views serve uncommitted reads by recomputing the defining query".to_string(),
-            ));
-        }
-        return compile_dag_view_program(
-            view_name,
-            select,
-            &dag,
-            view_root_page,
-            num_view_columns,
-            input,
-            output,
-            schema,
-            connection,
-        );
-    }
-    if dag_is_compound(&dag) {
-        if matches!(output, MaintenanceOutput::EmitRows) {
-            return Err(LimboError::InternalError(
-                "compound views serve uncommitted reads by recomputing the defining query"
-                    .to_string(),
-            ));
-        }
-        return compile_dag_compound_program(
-            view_name,
-            &dag,
-            view_root_page,
-            num_view_columns,
-            input,
-            schema,
-            connection,
-        );
-    }
-    if dag_is_compound_all(&dag) {
-        if matches!(output, MaintenanceOutput::EmitRows) {
-            return Err(LimboError::InternalError(
-                "compound views serve uncommitted reads by recomputing the defining query"
-                    .to_string(),
-            ));
-        }
-        return compile_dag_compound_all_program(
-            view_name,
-            select,
-            &dag,
-            view_root_page,
-            num_view_columns,
-            input,
-            schema,
-            connection,
-        );
-    }
-
-    Err(LimboError::InternalError(format!(
-        "materialized view {view_name} has no maintainable operator DAG shape"
-    )))
+    let program = compile_maintenance_program_uncached(
+        view_name,
+        select,
+        view_root_page,
+        num_view_columns,
+        input,
+        schema,
+        connection,
+    )?;
+    connection
+        .maintenance_program_cache
+        .insert(key, program.prepared().clone());
+    Ok(program)
 }
 
-/// [`build_dag`] with a transient resolver from a connection, mirroring
-/// [`classify_view_for_connection`].
-fn build_dag_for_connection(
+#[allow(clippy::too_many_arguments)]
+fn compile_maintenance_program_uncached(
+    view_name: &str,
+    select: &ast::Select,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<Program> {
+    let plan = build_plan_for_connection(view_name, select, schema, connection)?;
+    compile_maintenance_plan(
+        view_name,
+        view_root_page,
+        num_view_columns,
+        input,
+        &plan,
+        schema,
+        connection,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_maintenance_plan(
+    view_name: &str,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    plan: &MaintenancePlan,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<Program> {
+    compile_generic_dag_program(
+        view_name,
+        &plan.dag,
+        plan.dag.root,
+        view_root_page,
+        num_view_columns,
+        input,
+        &plan.operator_states,
+        schema,
+        connection,
+    )
+}
+
+/// Build the bound maintenance plan with a transient connection resolver.
+fn build_plan_for_connection(
+    view_name: &str,
     select: &ast::Select,
     schema: &Schema,
     connection: &Arc<Connection>,
-) -> Result<dag::MaintenanceDag> {
+) -> Result<MaintenancePlan> {
     let syms = connection.syms.read();
     let resolver = Resolver::new(
         schema,
@@ -2040,164 +2323,1153 @@ fn build_dag_for_connection(
         connection.get_dqs_dml().into(),
         Arc::new(crate::dialect::SqliteDialect),
     );
-    build_dag(select, schema, &resolver)
+    plan_view(view_name, select, &resolver, connection)
 }
 
-/// Whether every node is a `Scan`, `Filter`, or `Project`.
-fn dag_is_all_linear(dag: &dag::MaintenanceDag) -> bool {
-    dag.nodes.iter().all(|node| {
-        matches!(
-            node,
-            dag::OpNode::Scan { .. } | dag::OpNode::Filter { .. } | dag::OpNode::Project { .. }
-        )
+fn scan_node_output(
+    dag: &dag::MaintenanceDag,
+    node_id: dag::NodeId,
+    schema: &Schema,
+) -> Result<NodeOutput> {
+    let dag::OpNode::Scan {
+        table,
+        identifier,
+        logical_id,
+    } = &dag.nodes[node_id]
+    else {
+        return Err(LimboError::InternalError(format!(
+            "maintenance DAG node {node_id} is not a scan"
+        )));
+    };
+    let stored_weight_column = schema
+        .is_materialized_view(&table.name)
+        .then(|| table.columns().len());
+    Ok(NodeOutput {
+        delta: DeltaSource::BaseTable {
+            table: table.clone(),
+            identifier: identifier.clone(),
+            logical_id: *logical_id,
+            stored_weight_column,
+        },
+        arrangement: Some(base_arrangement(table.clone(), stored_weight_column)),
     })
 }
 
-/// Convert a `Project` node's `(expr, alias)` projections into the
-/// `ResultColumn`s the shared emitters translate.
-fn projections_to_result_columns(
-    projections: &[(ast::Expr, Option<String>)],
-) -> Vec<ast::ResultColumn> {
-    projections
-        .iter()
-        .map(|(expr, alias)| {
-            ast::ResultColumn::Expr(
-                Box::new(expr.clone()),
-                alias
-                    .clone()
-                    .map(|name| ast::As::As(ast::Name::exact(name))),
-            )
-        })
-        .collect()
+fn join_contract_from_inputs(
+    inputs: &[NodeOutput],
+    using: &[Vec<String>],
+    on: &[ast::Expr],
+) -> Result<JoinContract> {
+    turso_assert!(
+        inputs.len() == using.len(),
+        "join USING metadata must be parallel to its inputs"
+    );
+    let mut deltas = Vec::with_capacity(inputs.len());
+    let mut tables = Vec::with_capacity(inputs.len());
+    let mut arrangements = Vec::with_capacity(inputs.len());
+    for (position, input) in inputs.iter().enumerate() {
+        let (table, identifier, logical_id) = input.delta.sole_binding()?;
+        let arrangement = input.arrangement.clone().ok_or_else(|| {
+            LimboError::InternalError("join input has no materialized arrangement".to_string())
+        })?;
+        if arrangement.value_columns().len() != table.columns().len() {
+            return Err(LimboError::InternalError(
+                "join arrangement does not match its logical input width".to_string(),
+            ));
+        }
+        deltas.push(input.delta.clone());
+        tables.push((table, identifier, using[position].clone(), logical_id));
+        arrangements.push(arrangement);
+    }
+    Ok(JoinContract {
+        deltas,
+        tables,
+        arrangements,
+        on: on.to_vec(),
+    })
 }
 
-/// Emit one view — or one compound-all branch — from the sub-tree rooted at
-/// `root` into `program`, dispatching on the operator directly under the
-/// `Project` root: a `Scan` (filter/project), an `Aggregate`, or a `Join`.
-/// The `Filter` between the `Project` and that operator, if present, is the
-/// WHERE for filter/project and joins and the HAVING for aggregates. `select`
-/// supplies the FROM/WHERE the aggregate emitter still reads (the view's
-/// select, or a compound-all branch's).
+/// Integrate one node's declared delta into its persistent output
+/// arrangement and republish the same `(values, weight)` changes with the
+/// arrangement rowid as their stable identity.
+///
+/// The source identity is only the key used to find the arrangement row. The
+/// downstream identity is always the arrangement's own rowid, so consumers do
+/// not need to know whether the producer was a scan, join, aggregate, or
+/// another arranged operator.
 #[allow(clippy::too_many_arguments)]
-fn emit_dag_view(
+fn emit_output_arrangement(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    input: &EphemeralDelta,
+    output: &EphemeralDelta,
+    arrangement_table_name: &str,
+    schema: &Schema,
+) -> Result<ArrangementHandle> {
+    let identity_width = input.identity_width();
+    if identity_width == 0 {
+        return Err(LimboError::InternalError(
+            "an arranged delta must carry a stable source identity".to_string(),
+        ));
+    }
+    turso_assert!(
+        output.identity == DeltaIdentity::OperatorRowid
+            && output.value_start == 1
+            && output.width == input.width
+            && output.weight_column == input.width + 1,
+        "output arrangement must publish rowid, values, and weight"
+    );
+
+    let table = schema
+        .get_btree_table(arrangement_table_name)
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "output arrangement {arrangement_table_name} of materialized view {view_name} not found"
+            ))
+        })?;
+    let index = schema
+        .get_indices(arrangement_table_name)
+        .next()
+        .cloned()
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "output arrangement {arrangement_table_name} of materialized view {view_name} has no index"
+            ))
+        })?;
+    let expected_columns = identity_width + input.width + 1;
+    if table.columns().len() != expected_columns {
+        return Err(LimboError::InternalError(format!(
+            "output arrangement {arrangement_table_name} has {} columns, expected {expected_columns}",
+            table.columns().len()
+        )));
+    }
+
+    let table_cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: table_cursor,
+        root_page: RegisterOrLiteral::Literal(table.root_page),
+        db: 0,
+    });
+    let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: index_cursor,
+        root_page: RegisterOrLiteral::Literal(index.root_page),
+        db: 0,
+    });
+
+    // The relational arrangement key is `(source identity, full row value)`.
+    // A stable source identity can change values during an update, and the
+    // old/new images must integrate independently.
+    let key_width = identity_width + input.width;
+    let lookup_start = program.alloc_registers(key_width + 1);
+    let input_values_start = lookup_start + identity_width;
+    let arrangement_rowid_reg = lookup_start + key_width;
+    let contribution_reg = program.alloc_register();
+    let current_mult_reg = program.alloc_register();
+    let new_mult_reg = program.alloc_register();
+    let zero_reg = program.alloc_register();
+    let one_reg = program.alloc_register();
+    let is_new_reg = program.alloc_register();
+    let previous_rowid_reg = program.alloc_register();
+    // [source identity..., persisted values..., multiplicity].
+    let state_record_start = program.alloc_registers(expected_columns);
+    let state_mult_reg = state_record_start + key_width;
+    let state_record_reg = program.alloc_register();
+    let index_record_reg = program.alloc_register();
+    // [arrangement rowid, delta values..., delta weight].
+    let output_record_start = program.alloc_registers(1 + input.width + 1);
+    let output_values_start = output_record_start + 1;
+    let output_weight_reg = output_values_start + input.width;
+    let output_record_reg = program.alloc_register();
+    let output_rowid_reg = program.alloc_register();
+
+    let end_label = program.allocate_label();
+    let loop_label = program.allocate_label();
+    let next_label = program.allocate_label();
+    let found_label = program.allocate_label();
+    let update_label = program.allocate_label();
+    let write_state_label = program.allocate_label();
+    let emit_label = program.allocate_label();
+    let corrupt_label = program.allocate_label();
+
+    program.emit_int(0, zero_reg);
+    program.emit_int(1, one_reg);
+    program.emit_insn(Insn::Rewind {
+        cursor_id: input.cursor_id,
+        pc_if_empty: end_label,
+    });
+    program.preassign_label_to_next_insn(loop_label);
+    for column in 0..identity_width {
+        program.emit_insn(Insn::Column {
+            cursor_id: input.cursor_id,
+            column,
+            dest: lookup_start + column,
+            default: None,
+        });
+    }
+    for column in 0..input.width {
+        program.emit_insn(Insn::Column {
+            cursor_id: input.cursor_id,
+            column: input.value_start + column,
+            dest: input_values_start + column,
+            default: None,
+        });
+    }
+    program.emit_insn(Insn::Column {
+        cursor_id: input.cursor_id,
+        column: input.weight_column,
+        dest: contribution_reg,
+        default: None,
+    });
+    program.emit_insn(Insn::Eq {
+        lhs: contribution_reg,
+        rhs: zero_reg,
+        target_pc: next_label,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+
+    program.emit_insn(Insn::Found {
+        cursor_id: index_cursor,
+        target_pc: found_label,
+        record_reg: lookup_start,
+        num_regs: key_width,
+    });
+    program.emit_insn(Insn::NewRowid {
+        cursor: table_cursor,
+        rowid_reg: arrangement_rowid_reg,
+        prev_largest_reg: previous_rowid_reg,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: contribution_reg,
+        dst_reg: new_mult_reg,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: one_reg,
+        dst_reg: is_new_reg,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: lookup_start,
+        dst_reg: state_record_start,
+        extra_amount: key_width - 1,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: write_state_label,
+    });
+
+    program.preassign_label_to_next_insn(found_label);
+    program.emit_insn(Insn::Copy {
+        src_reg: zero_reg,
+        dst_reg: is_new_reg,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::IdxRowId {
+        cursor_id: index_cursor,
+        dest: arrangement_rowid_reg,
+    });
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: table_cursor,
+        src_reg: arrangement_rowid_reg,
+        target_pc: corrupt_label,
+    });
+    program.emit_insn(Insn::Column {
+        cursor_id: table_cursor,
+        column: key_width,
+        dest: current_mult_reg,
+        default: None,
+    });
+    program.emit_insn(Insn::Add {
+        lhs: contribution_reg,
+        rhs: current_mult_reg,
+        dest: new_mult_reg,
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: new_mult_reg,
+        rhs: zero_reg,
+        target_pc: update_label,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::IdxDelete {
+        start_reg: lookup_start,
+        num_regs: key_width + 1,
+        cursor_id: index_cursor,
+        raise_error_if_no_matching_entry: true,
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id: table_cursor,
+        table_name: arrangement_table_name.to_string(),
+        is_part_of_update: true,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: emit_label,
+    });
+
+    program.preassign_label_to_next_insn(update_label);
+    program.emit_insn(Insn::Copy {
+        src_reg: lookup_start,
+        dst_reg: state_record_start,
+        extra_amount: key_width - 1,
+    });
+
+    program.preassign_label_to_next_insn(write_state_label);
+    program.emit_insn(Insn::Copy {
+        src_reg: new_mult_reg,
+        dst_reg: state_mult_reg,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: state_record_start as u16,
+        count: expected_columns as u16,
+        dest_reg: state_record_reg as u16,
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: table_cursor,
+        key_reg: arrangement_rowid_reg,
+        record_reg: state_record_reg,
+        flag: InsertFlags(
+            InsertFlags::REQUIRE_SEEK
+                | InsertFlags::SKIP_LAST_ROWID
+                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+        ),
+        table_name: arrangement_table_name.to_string(),
+    });
+    // New rows need a primary-key index entry; replacing an existing table
+    // row leaves its identity and index entry unchanged.
+    program.emit_insn(Insn::Eq {
+        lhs: is_new_reg,
+        rhs: zero_reg,
+        target_pc: emit_label,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: lookup_start as u16,
+        count: (key_width + 1) as u16,
+        dest_reg: index_record_reg as u16,
+        index_name: Some(index.name.clone()),
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::IdxInsert {
+        cursor_id: index_cursor,
+        record_reg: index_record_reg,
+        unpacked_start: Some(lookup_start),
+        unpacked_count: Some((key_width + 1) as u16),
+        flags: IdxInsertFlags::new(),
+    });
+
+    program.preassign_label_to_next_insn(emit_label);
+    program.emit_insn(Insn::Copy {
+        src_reg: arrangement_rowid_reg,
+        dst_reg: output_record_start,
+        extra_amount: 0,
+    });
+    if input.width > 0 {
+        program.emit_insn(Insn::Copy {
+            src_reg: input_values_start,
+            dst_reg: output_values_start,
+            extra_amount: input.width - 1,
+        });
+    }
+    program.emit_insn(Insn::Copy {
+        src_reg: contribution_reg,
+        dst_reg: output_weight_reg,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: output_record_start as u16,
+        count: (1 + input.width + 1) as u16,
+        dest_reg: output_record_reg as u16,
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::NewRowid {
+        cursor: output.cursor_id,
+        rowid_reg: output_rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: output.cursor_id,
+        key_reg: output_rowid_reg,
+        record_reg: output_record_reg,
+        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        table_name: String::new(),
+    });
+
+    program.preassign_label_to_next_insn(next_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: input.cursor_id,
+        pc_if_next: loop_label,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: end_label,
+    });
+    program.preassign_label_to_next_insn(corrupt_label);
+    program.emit_insn(Insn::Halt {
+        err_code: crate::error::SQLITE_ERROR,
+        description: format!("materialized view {view_name} output arrangement is corrupted"),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(end_label);
+
+    let value_columns = (identity_width..identity_width + input.width).collect();
+    Ok(btree_arrangement(
+        table,
+        value_columns,
+        Some(identity_width + input.width),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_declared_output_arrangement(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    dag: &dag::MaintenanceDag,
+    node_id: dag::NodeId,
+    output: NodeOutput,
+    maintenance_input: MaintenanceInput,
+    operator_state: &OperatorStateDef,
+    schema: &Schema,
+) -> Result<NodeOutput> {
+    let Some(arrangement_def) = &operator_state.arrangement_table else {
+        return Ok(output);
+    };
+    let input = output.delta.materialize(
+        program,
+        view_name,
+        node_id,
+        dag.output_schema(node_id),
+        maintenance_input,
+    )?;
+    let expected_identity = operator_state.emitted_identity;
+    if input.identity != expected_identity {
+        return Err(LimboError::InternalError(format!(
+            "maintenance DAG node {node_id} emits {:?}, expected {:?}",
+            input.identity, expected_identity
+        )));
+    }
+    let arranged_sink = open_ephemeral_delta(
+        program,
+        &format!("{view_name}_arranged_delta_{node_id}"),
+        dag.output_schema(node_id).clone(),
+        DeltaIdentity::OperatorRowid,
+        input.requires_positive_first,
+    );
+    let arranged_output = arranged_sink.ephemeral()?;
+    let arrangement = emit_output_arrangement(
+        program,
+        view_name,
+        &input,
+        &arranged_output,
+        &arrangement_def.table_name,
+        schema,
+    )?;
+    Ok(NodeOutput {
+        delta: arranged_sink.source()?,
+        arrangement: Some(arrangement),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_ephemeral_filter(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    node_id: dag::NodeId,
+    input: &EphemeralDelta,
+    predicate: &ast::Expr,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<DeltaSource> {
+    let sink = open_ephemeral_delta(
+        program,
+        &format!("{view_name}_filter_delta_{node_id}"),
+        input.schema.as_ref().clone(),
+        input.identity,
+        input.requires_positive_first,
+    );
+    let output = sink.ephemeral()?;
+
+    let syms = connection.syms.read();
+    let mut resolver = Resolver::new(
+        schema,
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        &syms,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        Arc::new(crate::dialect::SqliteDialect),
+    );
+    let (table_references, binding_remap) = stream_table_references(program, &input.schema);
+
+    let end_label = program.allocate_label();
+    let loop_label = program.allocate_label();
+    let next_label = program.allocate_label();
+    let pass_label = program.allocate_label();
+    let record_start = program.alloc_registers(input.identity_width() + input.width + 1);
+    let record_reg = program.alloc_register();
+    let rowid_reg = program.alloc_register();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: input.cursor_id,
+        pc_if_empty: end_label,
+    });
+    program.preassign_label_to_next_insn(loop_label);
+    seed_ephemeral_stream_cache(program, input, &binding_remap, &mut resolver)?;
+    let bound_predicate = remap_bound_expr(predicate, &binding_remap)?;
+    translate_condition_expr(
+        program,
+        &table_references,
+        &bound_predicate,
+        ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_true: pass_label,
+            jump_target_when_false: next_label,
+            jump_target_when_null: next_label,
+        },
+        &resolver,
+    )?;
+    program.preassign_label_to_next_insn(pass_label);
+
+    for column in 0..input.identity_width() {
+        program.emit_insn(Insn::Column {
+            cursor_id: input.cursor_id,
+            column,
+            dest: record_start + column,
+            default: None,
+        });
+    }
+    for column in 0..input.width {
+        program.emit_insn(Insn::Column {
+            cursor_id: input.cursor_id,
+            column: input.value_start + column,
+            dest: record_start + input.identity_width() + column,
+            default: None,
+        });
+    }
+    program.emit_insn(Insn::Column {
+        cursor_id: input.cursor_id,
+        column: input.weight_column,
+        dest: record_start + input.identity_width() + input.width,
+        default: None,
+    });
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: record_start as u16,
+        count: (input.identity_width() + input.width + 1) as u16,
+        dest_reg: record_reg as u16,
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::NewRowid {
+        cursor: output.cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: output.cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        table_name: String::new(),
+    });
+    program.preassign_label_to_next_insn(next_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: input.cursor_id,
+        pc_if_next: loop_label,
+    });
+    program.preassign_label_to_next_insn(end_label);
+    drop(syms);
+    sink.source()
+}
+
+fn append_alias_values(
+    program: &mut ProgramBuilder,
+    input: &EphemeralDelta,
+    output: &EphemeralDelta,
+) -> Result<()> {
+    if input.width != output.width
+        || output.identity != alias_identity(input.identity)
+        || output.identity_width() != input.identity_width()
+        || output.value_start != output.identity_width()
+    {
+        return Err(LimboError::InternalError(
+            "alias stream copy has incompatible input/output layouts".to_string(),
+        ));
+    }
+
+    let end_label = program.allocate_label();
+    let loop_label = program.allocate_label();
+    let record_start = program.alloc_registers(output.identity_width() + output.width + 1);
+    let record_reg = program.alloc_register();
+    let rowid_reg = program.alloc_register();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: input.cursor_id,
+        pc_if_empty: end_label,
+    });
+    program.preassign_label_to_next_insn(loop_label);
+    for column in 0..output.identity_width() {
+        program.emit_insn(Insn::Column {
+            cursor_id: input.cursor_id,
+            column,
+            dest: record_start + column,
+            default: None,
+        });
+    }
+    for column in 0..input.width {
+        program.emit_insn(Insn::Column {
+            cursor_id: input.cursor_id,
+            column: input.value_start + column,
+            dest: record_start + output.value_start + column,
+            default: None,
+        });
+    }
+    program.emit_insn(Insn::Column {
+        cursor_id: input.cursor_id,
+        column: input.weight_column,
+        dest: record_start + output.weight_column,
+        default: None,
+    });
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: record_start as u16,
+        count: (output.identity_width() + output.width + 1) as u16,
+        dest_reg: record_reg as u16,
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::NewRowid {
+        cursor: output.cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: output.cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        table_name: String::new(),
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id: input.cursor_id,
+        pc_if_next: loop_label,
+    });
+    program.preassign_label_to_next_insn(end_label);
+    Ok(())
+}
+
+fn emit_ephemeral_alias(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    node_id: dag::NodeId,
+    input: &EphemeralDelta,
+    output_schema: dag::StreamSchema,
+) -> Result<DeltaSource> {
+    let sink = open_ephemeral_delta(
+        program,
+        &format!("{view_name}_alias_delta_{node_id}"),
+        output_schema,
+        alias_identity(input.identity),
+        input.requires_positive_first,
+    );
+    let output = sink.ephemeral()?;
+    append_alias_values(program, input, &output)?;
+    sink.source()
+}
+
+fn emit_union_all_to_ephemeral(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    node_id: dag::NodeId,
+    inputs: &[EphemeralDelta],
+    output_schema: dag::StreamSchema,
+) -> Result<DeltaSource> {
+    let requires_positive_first = inputs.iter().any(|input| input.requires_positive_first);
+    let sink = open_ephemeral_delta(
+        program,
+        &format!("{view_name}_union_all_delta_{node_id}"),
+        output_schema,
+        DeltaIdentity::OperatorKey(2),
+        requires_positive_first,
+    );
+    let output = sink.ephemeral()?;
+    for (branch, input) in inputs.iter().enumerate() {
+        append_union_all_branch(program, branch, input, &output)?;
+    }
+    sink.source()
+}
+
+/// Append one UNION ALL branch while namespacing its complete source identity
+/// into the fixed `(branch, packed identity)` key declared by the set-op.
+fn append_union_all_branch(
+    program: &mut ProgramBuilder,
+    branch: usize,
+    input: &EphemeralDelta,
+    output: &EphemeralDelta,
+) -> Result<()> {
+    if input.width != output.width
+        || input.identity_width() == 0
+        || output.identity != DeltaIdentity::OperatorKey(2)
+        || output.value_start != 2
+    {
+        return Err(LimboError::InternalError(
+            "UNION ALL branch has an incompatible delta identity".to_string(),
+        ));
+    }
+
+    let end_label = program.allocate_label();
+    let loop_label = program.allocate_label();
+    let record_start = program.alloc_registers(2 + output.width + 1);
+    let source_identity_start = program.alloc_registers(input.identity_width());
+    let record_reg = program.alloc_register();
+    let rowid_reg = program.alloc_register();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: input.cursor_id,
+        pc_if_empty: end_label,
+    });
+    program.preassign_label_to_next_insn(loop_label);
+    program.emit_int(branch as i64, record_start);
+    for column in 0..input.identity_width() {
+        program.emit_insn(Insn::Column {
+            cursor_id: input.cursor_id,
+            column,
+            dest: source_identity_start + column,
+            default: None,
+        });
+    }
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: source_identity_start as u16,
+        count: input.identity_width() as u16,
+        dest_reg: (record_start + 1) as u16,
+        index_name: None,
+        affinity_str: None,
+    });
+    for column in 0..input.width {
+        program.emit_insn(Insn::Column {
+            cursor_id: input.cursor_id,
+            column: input.value_start + column,
+            dest: record_start + output.value_start + column,
+            default: None,
+        });
+    }
+    program.emit_insn(Insn::Column {
+        cursor_id: input.cursor_id,
+        column: input.weight_column,
+        dest: record_start + output.weight_column,
+        default: None,
+    });
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: record_start as u16,
+        count: (2 + output.width + 1) as u16,
+        dest_reg: record_reg as u16,
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::NewRowid {
+        cursor: output.cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: output.cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        table_name: String::new(),
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id: input.cursor_id,
+        pc_if_next: loop_label,
+    });
+    program.preassign_label_to_next_insn(end_label);
+    Ok(())
+}
+
+/// Emit every ancestor needed by `target` once, in DAG topological order.
+///
+/// The output table is keyed by [`dag::NodeId`], making fan-out explicit:
+/// downstream nodes consume the already-compiled [`NodeOutput`] of each
+/// declared input rather than recursively re-emitting its subtree.
+#[allow(clippy::too_many_arguments)]
+fn emit_declared_delta_nodes_to(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    dag: &dag::MaintenanceDag,
+    target: dag::NodeId,
+    input: MaintenanceInput,
+    operator_states: &OperatorStateCatalog,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<NodeOutput> {
+    let mut required = vec![false; dag.nodes.len()];
+    let mut pending = vec![target];
+    while let Some(node_id) = pending.pop() {
+        if std::mem::replace(&mut required[node_id], true) {
+            continue;
+        }
+        pending.extend_from_slice(dag.nodes[node_id].inputs());
+    }
+
+    let mut outputs: Vec<Option<NodeOutput>> = vec![None; dag.nodes.len()];
+    for node_id in 0..=target {
+        if !required[node_id] {
+            continue;
+        }
+        let output = match &dag.nodes[node_id] {
+            dag::OpNode::Scan { .. } => scan_node_output(dag, node_id, schema)?,
+            dag::OpNode::Filter {
+                input: upstream,
+                predicate,
+            } => {
+                let upstream_id = *upstream;
+                let upstream = outputs[upstream_id].as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "filter DAG node {node_id} input {upstream} was not compiled"
+                    ))
+                })?;
+                let upstream = upstream.delta.materialize(
+                    program,
+                    view_name,
+                    upstream_id,
+                    dag.output_schema(upstream_id),
+                    input,
+                )?;
+                NodeOutput {
+                    delta: emit_ephemeral_filter(
+                        program, view_name, node_id, &upstream, predicate, schema, connection,
+                    )?,
+                    arrangement: None,
+                }
+            }
+            dag::OpNode::Project {
+                input: upstream,
+                projections,
+            } => {
+                let upstream_id = *upstream;
+                let upstream_output = outputs[upstream_id].as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "project DAG node {node_id} input {upstream} was not compiled"
+                    ))
+                })?;
+                let upstream = upstream_output.delta.materialize(
+                    program,
+                    view_name,
+                    upstream_id,
+                    dag.output_schema(upstream_id),
+                    input,
+                )?;
+                let sink = open_ephemeral_delta(
+                    program,
+                    &format!("{view_name}_project_delta_{node_id}"),
+                    dag.output_schema(node_id).clone(),
+                    upstream.identity,
+                    upstream.requires_positive_first,
+                );
+                let output = sink.ephemeral()?;
+                emit_ephemeral_project(
+                    program,
+                    &upstream,
+                    projections,
+                    &output,
+                    schema,
+                    connection,
+                )?;
+                NodeOutput {
+                    delta: sink.source()?,
+                    arrangement: None,
+                }
+            }
+            dag::OpNode::Alias {
+                input: upstream, ..
+            } => {
+                let upstream_id = *upstream;
+                let upstream_output = outputs[upstream_id].as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "alias DAG node {node_id} input {upstream} was not compiled"
+                    ))
+                })?;
+                let upstream = upstream_output.delta.materialize(
+                    program,
+                    view_name,
+                    upstream_id,
+                    dag.output_schema(upstream_id),
+                    input,
+                )?;
+                NodeOutput {
+                    delta: emit_ephemeral_alias(
+                        program,
+                        view_name,
+                        node_id,
+                        &upstream,
+                        dag.output_schema(node_id).clone(),
+                    )?,
+                    arrangement: None,
+                }
+            }
+            dag::OpNode::Join {
+                inputs,
+                using,
+                on,
+                kind,
+            } => {
+                let declared_inputs = inputs
+                    .iter()
+                    .map(|input| {
+                        outputs[*input].as_ref().cloned().ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "join DAG node {node_id} input {input} was not compiled"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let contract = join_contract_from_inputs(&declared_inputs, using, on)?;
+                if *kind == dag::JoinKind::LeftOuter {
+                    NodeOutput {
+                        delta: emit_left_join_deltas_to_ephemeral(
+                            program,
+                            view_name,
+                            node_id,
+                            &contract,
+                            dag.output_schema(node_id).clone(),
+                            input,
+                            operator_states.for_node(node_id)?,
+                            schema,
+                            connection,
+                        )?,
+                        arrangement: None,
+                    }
+                } else {
+                    let syms = connection.syms.read();
+                    let mut resolver = Resolver::new(
+                        schema,
+                        connection.database_schemas(),
+                        &connection.temp.database,
+                        connection.attached_databases(),
+                        &syms,
+                        connection.experimental_custom_types_enabled(),
+                        connection.get_dqs_dml().into(),
+                        Arc::new(crate::dialect::SqliteDialect),
+                    );
+                    NodeOutput {
+                        delta: emit_join_deltas_to_ephemeral(
+                            program,
+                            &mut resolver,
+                            view_name,
+                            &contract.deltas,
+                            &contract.tables,
+                            &contract.arrangements,
+                            &contract.on,
+                            input,
+                        )?,
+                        arrangement: None,
+                    }
+                }
+            }
+            dag::OpNode::SetOp {
+                inputs: set_inputs,
+                operators,
+                prefix_len,
+                key_collations,
+                ..
+            } => {
+                let mut channels = Vec::with_capacity(set_inputs.len());
+                for upstream_id in set_inputs {
+                    let upstream = outputs[*upstream_id].as_ref().ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "set-op DAG node {node_id} input {upstream_id} was not compiled"
+                        ))
+                    })?;
+                    channels.push(upstream.delta.materialize(
+                        program,
+                        view_name,
+                        *upstream_id,
+                        dag.output_schema(*upstream_id),
+                        input,
+                    )?);
+                }
+                if *prefix_len == 0 {
+                    if operators
+                        .iter()
+                        .any(|operator| *operator != ast::CompoundOperator::UnionAll)
+                    {
+                        return Err(LimboError::InternalError(
+                            "stateless set-op has a deduplicating operator".to_string(),
+                        ));
+                    }
+                    NodeOutput {
+                        delta: emit_union_all_to_ephemeral(
+                            program,
+                            view_name,
+                            node_id,
+                            &channels,
+                            dag.output_schema(node_id).clone(),
+                        )?,
+                        arrangement: None,
+                    }
+                } else {
+                    let requires_positive_first = channels
+                        .iter()
+                        .any(|channel| channel.requires_positive_first);
+                    let sink = open_ephemeral_delta(
+                        program,
+                        &format!("{view_name}_set_op_delta_{node_id}"),
+                        dag.output_schema(node_id).clone(),
+                        DeltaIdentity::OperatorRowid,
+                        requires_positive_first,
+                    );
+                    let output = sink.ephemeral()?;
+                    emit_deduplicating_set_op(
+                        program,
+                        view_name,
+                        &channels,
+                        operators,
+                        *prefix_len,
+                        key_collations,
+                        &output,
+                        operator_states.for_node(node_id)?,
+                        schema,
+                    )?;
+                    NodeOutput {
+                        delta: sink.source()?,
+                        arrangement: None,
+                    }
+                }
+            }
+            dag::OpNode::Aggregate {
+                input: upstream,
+                group_exprs,
+                group_collations,
+                aggregates,
+                scalar,
+                ..
+            } => {
+                let upstream_id = *upstream;
+                let upstream = outputs[upstream_id].as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "aggregate DAG node {node_id} input {upstream} was not compiled"
+                    ))
+                })?;
+                let upstream = upstream.delta.materialize(
+                    program,
+                    view_name,
+                    upstream_id,
+                    dag.output_schema(upstream_id),
+                    input,
+                )?;
+                let sink = open_ephemeral_delta(
+                    program,
+                    &format!("{view_name}_aggregate_delta_{node_id}"),
+                    dag.output_schema(node_id).clone(),
+                    DeltaIdentity::OperatorRowid,
+                    false,
+                );
+                let output = sink.ephemeral()?;
+                let operator_state = operator_states.for_node(node_id)?;
+                emit_group_aggregate(
+                    program,
+                    view_name,
+                    &DeltaSource::Ephemeral(upstream),
+                    group_exprs,
+                    group_collations,
+                    aggregates,
+                    *scalar,
+                    &output,
+                    input,
+                    operator_state,
+                    schema,
+                    connection,
+                )?;
+                let state_table_name = operator_state.state_table_name()?;
+                let state_table = schema.get_btree_table(state_table_name).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "aggregate arrangement table {state_table_name} not found"
+                    ))
+                })?;
+                let value_columns = (0..group_exprs.len() + aggregates.len()).collect();
+                NodeOutput {
+                    delta: sink.source()?,
+                    arrangement: Some(btree_arrangement(state_table, value_columns, None)),
+                }
+            }
+        };
+        let operator_state = operator_states.for_node(node_id)?;
+        if output.delta.identity() != operator_state.emitted_identity {
+            return Err(LimboError::InternalError(format!(
+                "maintenance DAG node {node_id} emitted {:?}, but its declared identity is {:?}",
+                output.delta.identity(),
+                operator_state.emitted_identity
+            )));
+        }
+        let output = materialize_declared_output_arrangement(
+            program,
+            view_name,
+            dag,
+            node_id,
+            output,
+            input,
+            operator_state,
+            schema,
+        )?;
+        if output.delta.identity() != operator_state.output_identity {
+            return Err(LimboError::InternalError(format!(
+                "maintenance DAG node {node_id} published {:?}, but its edge contract is {:?}",
+                output.delta.identity(),
+                operator_state.output_identity
+            )));
+        }
+        outputs[node_id] = Some(output);
+    }
+
+    outputs[target].take().ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "maintenance DAG target node {target} was not compiled"
+        ))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_generic_dag_to_sink(
     program: &mut ProgramBuilder,
     view_name: &str,
     dag: &dag::MaintenanceDag,
     root: dag::NodeId,
-    select: &ast::Select,
-    view_root_page: i64,
-    num_view_columns: usize,
     input: MaintenanceInput,
-    output: MaintenanceOutput,
-    ns: &BranchNamespace,
+    sink: &DeltaSink,
+    operator_states: &OperatorStateCatalog,
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let dag::OpNode::Project {
-        input: proj_input,
-        projections,
-    } = &dag.nodes[root]
-    else {
-        return Err(LimboError::InternalError(
-            "view DAG root is not a projection".to_string(),
-        ));
-    };
-    let (op_id, filter): (dag::NodeId, Option<&ast::Expr>) = match &dag.nodes[*proj_input] {
-        dag::OpNode::Filter { input, predicate } => (*input, Some(predicate)),
-        _ => (*proj_input, None),
-    };
-    match &dag.nodes[op_id] {
-        dag::OpNode::Scan { table, identifier } => {
-            let columns = projections_to_result_columns(projections);
-            emit_filter_project(
-                program,
-                view_name,
-                table,
-                identifier,
-                &columns,
-                filter,
-                view_root_page,
-                num_view_columns,
-                input,
-                output,
-                ns,
-                schema,
-                connection,
-            )
-        }
-        dag::OpNode::Aggregate {
-            group_exprs,
-            group_collations,
-            aggregates,
-            scalar,
-            ..
-        } => {
-            let outputs = dag_aggregate_outputs(projections, group_exprs, aggregates);
-            emit_group_aggregate(
-                program,
-                view_name,
-                select,
-                group_exprs,
-                group_collations,
-                aggregates,
-                &outputs,
-                filter,
-                *scalar,
-                view_root_page,
-                num_view_columns,
-                input,
-                ns,
-                schema,
-                connection,
-            )
-        }
-        dag::OpNode::Join {
-            inputs,
-            using,
-            on,
-            left_outer,
-        } => {
-            let mut tables: Vec<JoinTable> = Vec::with_capacity(inputs.len());
-            for (pos, &scan_id) in inputs.iter().enumerate() {
-                let dag::OpNode::Scan { table, identifier } = &dag.nodes[scan_id] else {
-                    return Err(LimboError::InternalError(
-                        "join input is not a base table scan".to_string(),
-                    ));
-                };
-                tables.push((table.clone(), identifier.clone(), using[pos].clone()));
-            }
-            let columns = projections_to_result_columns(projections);
-            emit_join(
-                program,
-                view_name,
-                &columns,
-                &tables,
-                on,
-                filter,
-                *left_outer,
-                view_root_page,
-                num_view_columns,
-                input,
-                ns,
-                schema,
-                connection,
-            )
-        }
-        _ => Err(LimboError::InternalError(
-            "unsupported operator under view projection".to_string(),
-        )),
-    }
+    let node_output = emit_declared_delta_nodes_to(
+        program,
+        view_name,
+        dag,
+        root,
+        input,
+        operator_states,
+        schema,
+        connection,
+    )?;
+    let stream =
+        node_output
+            .delta
+            .materialize(program, view_name, root, dag.output_schema(root), input)?;
+    emit_terminal_delta(program, view_name, &stream, sink)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compile_dag_view_program(
+fn compile_generic_dag_program(
     view_name: &str,
-    select: &ast::Select,
     dag: &dag::MaintenanceDag,
+    root: dag::NodeId,
     view_root_page: i64,
     num_view_columns: usize,
     input: MaintenanceInput,
-    output: MaintenanceOutput,
+    operator_states: &OperatorStateCatalog,
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<Program> {
@@ -2211,17 +3483,14 @@ fn compile_dag_view_program(
         },
     );
     program.prologue();
-    emit_dag_view(
+    emit_generic_dag_to_sink(
         &mut program,
         view_name,
         dag,
-        dag.root,
-        select,
-        view_root_page,
-        num_view_columns,
+        root,
         input,
-        output,
-        &BranchNamespace::none(),
+        &DeltaSink::view(view_root_page, num_view_columns),
+        operator_states,
         schema,
         connection,
     )?;
@@ -2229,298 +3498,32 @@ fn compile_dag_view_program(
     program.build(
         connection.clone(),
         false,
-        "materialized view dag maintenance",
+        "materialized view generic DAG maintenance",
     )
 }
 
-/// Whether the DAG is an aggregate view: `Project` root over an `Aggregate`,
-/// optionally with a HAVING `Filter` between them.
-fn dag_is_aggregate(dag: &dag::MaintenanceDag) -> bool {
-    let dag::OpNode::Project {
-        input: proj_input, ..
-    } = dag.root_node()
-    else {
-        return false;
-    };
-    let below = match &dag.nodes[*proj_input] {
-        dag::OpNode::Filter { input, .. } => *input,
-        _ => *proj_input,
-    };
-    matches!(dag.nodes[below], dag::OpNode::Aggregate { .. })
-}
-
-/// Whether the DAG is a join view: `Project` root over a `Join`, optionally
-/// with a WHERE `Filter` between them.
-fn dag_is_join(dag: &dag::MaintenanceDag) -> bool {
-    let dag::OpNode::Project {
-        input: proj_input, ..
-    } = dag.root_node()
-    else {
-        return false;
-    };
-    let below = match &dag.nodes[*proj_input] {
-        dag::OpNode::Filter { input, .. } => *input,
-        _ => *proj_input,
-    };
-    matches!(dag.nodes[below], dag::OpNode::Join { .. })
-}
-
-/// Whether the DAG is a set-op view over filter/project branches: a `SetOp`
-/// root whose every other node is linear. A `SetOp` with a join or aggregate
-/// branch (`CompoundAll` over non-filter/project branches) is not handled by
-/// [`emit_compound_program`] and stays on the per-shape path.
-fn dag_is_compound(dag: &dag::MaintenanceDag) -> bool {
-    if !matches!(dag.root_node(), dag::OpNode::SetOp { .. }) {
-        return false;
-    }
-    dag.nodes.iter().enumerate().all(|(id, node)| {
-        id == dag.root
-            || matches!(
-                node,
-                dag::OpNode::Scan { .. } | dag::OpNode::Filter { .. } | dag::OpNode::Project { .. }
-            )
-    })
-}
-
-/// The filter/project [`BranchContent`] a compound `SetOp` branch produces,
-/// read from its `Project` -> `Filter`? -> `Scan` sub-tree.
-fn dag_branch_content(
-    dag: &dag::MaintenanceDag,
-    branch_root: dag::NodeId,
-) -> Result<BranchContent> {
-    let bad = || LimboError::InternalError("compound branch is not filter/project".to_string());
-    let dag::OpNode::Project {
-        input: proj_input,
-        projections,
-    } = &dag.nodes[branch_root]
-    else {
-        return Err(bad());
-    };
-    let (scan_id, where_clause): (dag::NodeId, Option<ast::Expr>) = match &dag.nodes[*proj_input] {
-        dag::OpNode::Filter { input, predicate } => (*input, Some(predicate.clone())),
-        dag::OpNode::Scan { .. } => (*proj_input, None),
-        _ => return Err(bad()),
-    };
-    let dag::OpNode::Scan { table, identifier } = &dag.nodes[scan_id] else {
-        return Err(bad());
-    };
-    let columns = projections
-        .iter()
-        .map(|(expr, alias)| {
-            ast::ResultColumn::Expr(
-                Box::new(expr.clone()),
-                alias
-                    .clone()
-                    .map(|name| ast::As::As(ast::Name::exact(name))),
-            )
-        })
-        .collect();
-    Ok(BranchContent {
-        base_table: table.clone(),
-        identifier: identifier.clone(),
-        columns,
-        where_clause,
-    })
-}
-
-/// Reconstruct the [`OutputColumn`] mapping for an aggregate view from the
-/// `Project` node's expressions, resolving each against the `Aggregate` node's
-/// group keys and aggregate calls (which already collect every aggregate
-/// appearing in the outputs or HAVING).
-fn dag_aggregate_outputs(
-    projections: &[(ast::Expr, Option<String>)],
-    group_exprs: &[ast::Expr],
-    aggregates: &[Aggregate],
-) -> Vec<OutputColumn> {
-    projections
-        .iter()
-        .map(|(expr, _)| {
-            if let Some(idx) = group_exprs
-                .iter()
-                .position(|g| crate::util::exprs_are_equivalent(g, expr))
-            {
-                OutputColumn::Group(idx)
-            } else if let Some(idx) = aggregates
-                .iter()
-                .position(|a| crate::util::exprs_are_equivalent(&a.original_expr, expr))
-            {
-                OutputColumn::Aggregate(idx)
-            } else {
-                OutputColumn::Expr(expr.clone())
-            }
-        })
-        .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compile_dag_compound_program(
-    view_name: &str,
-    dag: &dag::MaintenanceDag,
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<Program> {
-    let dag::OpNode::SetOp {
-        inputs,
-        operators,
-        prefix_len,
-        key_collations,
-        ..
-    } = dag.root_node()
-    else {
-        unreachable!("caller checked compound shape");
-    };
-    let branches = inputs
-        .iter()
-        .map(|&branch_root| dag_branch_content(dag, branch_root))
-        .collect::<Result<Vec<_>>>()?;
-    emit_compound_program(
-        view_name,
-        &branches,
-        operators,
-        *prefix_len,
-        key_collations,
-        view_root_page,
-        num_view_columns,
-        input,
-        schema,
-        connection,
-    )
-}
-
-/// Whether the DAG is a pure UNION ALL over branches that are not all
-/// filter/project (at least one join or aggregate branch): a `SetOp` root
-/// that [`dag_is_compound`] does not cover. Each branch writes a disjoint
-/// rowid slice of the view; there is no cross-branch merge.
-fn dag_is_compound_all(dag: &dag::MaintenanceDag) -> bool {
-    matches!(dag.root_node(), dag::OpNode::SetOp { .. }) && !dag_is_compound(dag)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compile_dag_compound_all_program(
-    view_name: &str,
-    select: &ast::Select,
-    dag: &dag::MaintenanceDag,
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<Program> {
-    let dag::OpNode::SetOp { inputs, .. } = dag.root_node() else {
-        unreachable!("caller checked compound-all shape");
-    };
-    let n_branches = inputs.len();
-    let mut program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts {
-            num_cursors: 6 * n_branches,
-            approx_num_insns: 128 * n_branches + 32 * num_view_columns * n_branches,
-            approx_num_labels: 48 * n_branches,
-        },
-    );
-    program.prologue();
-    for (branch_idx, &branch_root) in inputs.iter().enumerate() {
-        let ns = BranchNamespace {
-            scale: n_branches as i64,
-            offset: branch_idx as i64,
-            suffix: format!("__b{branch_idx}"),
-        };
-        let branch = branch_select(select, branch_idx);
-        emit_dag_view(
-            &mut program,
-            view_name,
-            dag,
-            branch_root,
-            &branch,
-            view_root_page,
-            num_view_columns,
-            input,
-            MaintenanceOutput::ViewBtree,
-            &ns,
-            schema,
-            connection,
-        )?;
-    }
-    program.epilogue(schema);
-    program.build(
-        connection.clone(),
-        false,
-        "materialized view compound-all maintenance",
-    )
-}
-
-// A single-table filter/project maintenance pipeline. Parameterized on its
-// base table and its WHERE/projection so it serves both the standalone
-// filter/project view (via `emit_filter_project_from_select`) and the DAG
-// codegen's linear pipeline (a `Scan` → `Filter`? → `Project` chain).
-#[allow(clippy::too_many_arguments)]
-fn emit_filter_project(
+// Emit a Scan node into its declared ephemeral delta channel.
+fn emit_base_scan_delta(
     program: &mut ProgramBuilder,
     view_name: &str,
     base_table: &Arc<BTreeTable>,
-    identifier: &str,
-    columns: &[ast::ResultColumn],
-    where_clause: Option<&ast::Expr>,
-    view_root_page: i64,
-    num_view_columns: usize,
+    stored_weight_column: Option<usize>,
     input: MaintenanceInput,
-    output: MaintenanceOutput,
-    ns: &BranchNamespace,
-    schema: &Schema,
-    connection: &Arc<Connection>,
+    output: &EphemeralDelta,
 ) -> Result<()> {
-    let num_base_columns = base_table.columns().len();
-
-    let syms = connection.syms.read();
-    let resolver = Resolver::new(
-        schema,
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        &syms,
-        connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
+    turso_assert!(
+        output.identity == DeltaIdentity::BindingRowids(1)
+            && output.value_start == 1
+            && output.width == base_table.columns().len()
+            && output.weight_column == output.width + 1,
+        "scan delta channel must contain rowid, base columns, and weight"
     );
-
-    // The input relation binds like a scan of the base table, so WHERE and
-    // projection expressions resolve exactly as they would in the defining
-    // query. The alias (if any) from the view definition is preserved.
-    let table_ref_id = program.table_reference_counter.next();
-    let mut table_references = TableReferences::new(
-        vec![JoinedTable {
-            op: Operation::Scan(Scan::BTreeTable {
-                iter_dir: IterationDirection::Forwards,
-                index: None,
-            }),
-            table: crate::schema::Table::BTree(base_table.clone()),
-            identifier: identifier.to_string(),
-            internal_id: table_ref_id,
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            column_use_counts: Vec::new(),
-            expression_index_usages: Vec::new(),
-            database_id: 0,
-            indexed: None,
-        }],
-        vec![],
-    );
-
     let input_cursor_id = match input {
         MaintenanceInput::TransactionDelta => {
-            let cursor_id = program.alloc_cursor_id_keyed(
-                CursorKey::table(table_ref_id),
-                CursorType::ViewDelta {
-                    view_name: view_name.to_string(),
-                    table: base_table.clone(),
-                },
-            );
-            // root_page is unused for delta cursors; the open dispatches on
-            // the cursor type and reads the connection's captured deltas.
+            let cursor_id = program.alloc_cursor_id(CursorType::ViewDelta {
+                view_name: view_name.to_string(),
+                table: base_table.clone(),
+            });
             program.emit_insn(Insn::OpenRead {
                 cursor_id,
                 root_page: 0,
@@ -2529,10 +3532,7 @@ fn emit_filter_project(
             cursor_id
         }
         MaintenanceInput::BaseTable => {
-            let cursor_id = program.alloc_cursor_id_keyed(
-                CursorKey::table(table_ref_id),
-                CursorType::BTreeTable(base_table.clone()),
-            );
+            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(base_table.clone()));
             program.emit_insn(Insn::OpenRead {
                 cursor_id,
                 root_page: base_table.root_page,
@@ -2542,182 +3542,350 @@ fn emit_filter_project(
         }
     };
 
-    // Write cursor over the view btree (btree output only). The synthesized
-    // table exists only to size the cursor: view records are the output
-    // columns plus the weight.
-    let view_cursor_id = match output {
-        MaintenanceOutput::ViewBtree => {
-            let view_btree = Arc::new(synthesized_view_table(
-                view_name,
-                view_root_page,
-                num_view_columns,
-            ));
-            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(view_btree));
-            program.emit_insn(Insn::OpenWrite {
-                cursor_id,
-                root_page: RegisterOrLiteral::Literal(view_root_page),
-                db: 0,
-            });
-            Some(cursor_id)
-        }
-        MaintenanceOutput::EmitRows => None,
-    };
-
     let end_label = program.allocate_label();
     let loop_label = program.allocate_label();
-    let next_label = program.allocate_label();
-
     program.emit_insn(Insn::Rewind {
         cursor_id: input_cursor_id,
         pc_if_empty: end_label,
     });
     program.preassign_label_to_next_insn(loop_label);
 
-    // Weight of the current input row.
-    let weight_reg = program.alloc_register();
+    let record_start = program.alloc_registers(output.identity_width() + output.width + 1);
+    let weight_reg = record_start + output.weight_column;
+    program.emit_insn(Insn::RowId {
+        cursor_id: input_cursor_id,
+        dest: record_start,
+    });
+    for column in 0..output.width {
+        program.emit_column_or_rowid(
+            input_cursor_id,
+            column,
+            record_start + output.value_start + column,
+        );
+    }
     match input {
         MaintenanceInput::TransactionDelta => {
             program.emit_insn(Insn::Column {
                 cursor_id: input_cursor_id,
-                column: num_base_columns,
+                column: base_table.columns().len(),
                 dest: weight_reg,
                 default: None,
             });
         }
         MaintenanceInput::BaseTable => {
-            program.emit_int(1, weight_reg);
+            if let Some(column) = stored_weight_column {
+                program.emit_insn(Insn::Column {
+                    cursor_id: input_cursor_id,
+                    column,
+                    dest: weight_reg,
+                    default: None,
+                });
+            } else {
+                program.emit_int(1, weight_reg);
+            }
         }
     }
 
-    // WHERE: rows whose predicate is FALSE or NULL do not belong to the view.
-    if let Some(where_expr) = where_clause {
-        let mut bound = where_expr.clone();
-        bind_and_rewrite_expr(
-            &mut bound,
-            Some(&mut table_references),
-            None,
-            &resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
-        let pred_true = program.allocate_label();
-        translate_condition_expr(
-            program,
-            &table_references,
-            &bound,
-            ConditionMetadata {
-                jump_if_condition_is_true: false,
-                jump_target_when_true: pred_true,
-                jump_target_when_false: next_label,
-                jump_target_when_null: next_label,
-            },
-            &resolver,
-        )?;
-        program.preassign_label_to_next_insn(pred_true);
-    }
-
-    let rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::RowId {
-        cursor_id: input_cursor_id,
-        dest: rowid_reg,
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: record_start as u16,
+        count: (output.identity_width() + output.width + 1) as u16,
+        dest_reg: record_reg as u16,
+        index_name: None,
+        affinity_str: None,
     });
-
-    // Projection into a contiguous register block, with one extra slot at the
-    // end for the merged weight so MakeRecord can consume the whole range.
-    let out_start_reg = program.alloc_registers(num_view_columns + 1);
-    let new_weight_reg = out_start_reg + num_view_columns;
-    let mut out_reg = out_start_reg;
-    for column in columns {
-        match column {
-            ast::ResultColumn::Expr(expr, _) => {
-                let mut bound = expr.as_ref().clone();
-                bind_and_rewrite_expr(
-                    &mut bound,
-                    Some(&mut table_references),
-                    None,
-                    &resolver,
-                    BindingBehavior::ResultColumnsNotAllowed,
-                )?;
-                translate_expr_no_constant_opt(
-                    program,
-                    Some(&table_references),
-                    &bound,
-                    out_reg,
-                    &resolver,
-                    NoConstantOptReason::RegisterReuse,
-                )?;
-                out_reg += 1;
-            }
-            ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => {
-                for (i, _col) in base_table.columns().iter().enumerate() {
-                    program.emit_column_or_rowid(input_cursor_id, i, out_reg);
-                    out_reg += 1;
-                }
-            }
-        }
-    }
-    let num_projected = out_reg - out_start_reg;
+    let output_rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: output.cursor_id,
+        rowid_reg: output_rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: output.cursor_id,
+        key_reg: output_rowid_reg,
+        record_reg,
+        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        table_name: String::new(),
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id: input_cursor_id,
+        pc_if_next: loop_label,
+    });
+    program.preassign_label_to_next_insn(end_label);
+    Ok(())
+}
+#[allow(clippy::too_many_arguments)]
+fn emit_ephemeral_project(
+    program: &mut ProgramBuilder,
+    input: &EphemeralDelta,
+    projections: &[(ast::Expr, Option<String>)],
+    output: &EphemeralDelta,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let num_output_columns = output.width;
     turso_assert!(
-        num_projected == num_view_columns,
-        "projection produced {num_projected} columns, view declares {num_view_columns}"
+        projections.len() == num_output_columns,
+        "projection output does not match its sink schema"
     );
 
-    match output {
-        MaintenanceOutput::EmitRows => {
-            // rowid_reg is allocated immediately before the out block, so
-            // [rowid, out.., weight] is one contiguous range. The input
-            // weight is copied into the trailing slot and the whole row is
-            // emitted for the caller to collect.
-            debug_assert_eq!(rowid_reg + 1, out_start_reg);
-            program.emit_insn(Insn::Copy {
-                src_reg: weight_reg,
-                dst_reg: new_weight_reg,
-                extra_amount: 0,
-            });
-            program.emit_insn(Insn::ResultRow {
-                start_reg: rowid_reg,
-                count: num_view_columns + 2,
-            });
+    let syms = connection.syms.read();
+    let mut resolver = Resolver::new(
+        schema,
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        &syms,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        Arc::new(crate::dialect::SqliteDialect),
+    );
+    let (table_references, binding_remap) = stream_table_references(program, &input.schema);
+
+    let end_label = program.allocate_label();
+    let loop_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: input.cursor_id,
+        pc_if_empty: end_label,
+    });
+    program.preassign_label_to_next_insn(loop_label);
+    seed_ephemeral_stream_cache(program, input, &binding_remap, &mut resolver)?;
+
+    let identity_start = program.alloc_registers(input.identity_width());
+    for column in 0..input.identity_width() {
+        program.emit_insn(Insn::Column {
+            cursor_id: input.cursor_id,
+            column,
+            dest: identity_start + column,
+            default: None,
+        });
+    }
+    let out_start = program.alloc_registers(num_output_columns + 1);
+    let new_weight_reg = out_start + num_output_columns;
+    for (index, (expr, _)) in projections.iter().enumerate() {
+        let bound = remap_bound_expr(expr, &binding_remap)?;
+        translate_expr_no_constant_opt(
+            program,
+            Some(&table_references),
+            &bound,
+            out_start + index,
+            &resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+    }
+    let weight_reg = program.alloc_register();
+    program.emit_insn(Insn::Column {
+        cursor_id: input.cursor_id,
+        column: input.weight_column,
+        dest: weight_reg,
+        default: None,
+    });
+
+    turso_assert!(
+        output.identity == input.identity
+            && output.value_start == input.identity_width()
+            && output.weight_column == input.identity_width() + num_output_columns,
+        "linear projection sink must preserve its input identity"
+    );
+    debug_assert_eq!(identity_start + input.identity_width(), out_start);
+    program.emit_insn(Insn::Copy {
+        src_reg: weight_reg,
+        dst_reg: new_weight_reg,
+        extra_amount: 0,
+    });
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: identity_start as u16,
+        count: (input.identity_width() + num_output_columns + 1) as u16,
+        dest_reg: record_reg as u16,
+        index_name: None,
+        affinity_str: None,
+    });
+    let output_rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: output.cursor_id,
+        rowid_reg: output_rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: output.cursor_id,
+        key_reg: output_rowid_reg,
+        record_reg,
+        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        table_name: String::new(),
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id: input.cursor_id,
+        pc_if_next: loop_label,
+    });
+    program.preassign_label_to_next_insn(end_label);
+    drop(syms);
+    Ok(())
+}
+
+/// Consume a fully evaluated one-identity delta stream at the maintenance
+/// program boundary. Operator code owns expression evaluation; this adapter
+/// only binds the root's standard `(identity, values, weight)` contract to a
+/// persistent view.
+fn emit_terminal_delta(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    input: &EphemeralDelta,
+    sink: &DeltaSink,
+) -> Result<()> {
+    turso_assert!(
+        matches!(
+            input.identity,
+            DeltaIdentity::BindingRowids(1) | DeltaIdentity::OperatorRowid
+        ) && input.value_start == 1,
+        "terminal delta streams require one stable operator identity"
+    );
+    let num_output_columns = match sink {
+        DeltaSink::View { num_columns, .. } => *num_columns,
+        DeltaSink::Ephemeral(_) => {
+            return Err(LimboError::InternalError(
+                "terminal delta adapter received an interior sink".to_string(),
+            ));
         }
-        MaintenanceOutput::ViewBtree => {
-            // Merge (rowid, out.., weight) into the view btree.
-            let view_cursor_id = view_cursor_id.expect("btree output mode opened the view cursor");
-            let notfound_label = program.allocate_label();
+    };
+    turso_assert!(
+        input.width == num_output_columns,
+        "terminal delta width does not match its sink"
+    );
+
+    let view_cursor_id = if let DeltaSink::View { root_page, .. } = sink {
+        let table = Arc::new(synthesized_view_table(
+            view_name,
+            *root_page,
+            num_output_columns,
+        ));
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id,
+            root_page: RegisterOrLiteral::Literal(*root_page),
+            db: 0,
+        });
+        Some(cursor_id)
+    } else {
+        None
+    };
+
+    let end_label = program.allocate_label();
+    let loop_label = program.allocate_label();
+    let next_label = program.allocate_label();
+    let row_start = program.alloc_registers(1 + num_output_columns + 1);
+    let identity_reg = row_start;
+    let values_start = row_start + 1;
+    let weight_reg = values_start + num_output_columns;
+
+    // Join phase decomposition can retract a cross-generation identity before
+    // inserting it. Apply positive contributions first at the persistent
+    // boundary so an unknown negative is never discarded before its matching
+    // positive arrives.
+    let pass_reg = input.requires_positive_first.then(|| {
+        let pass_reg = program.alloc_register();
+        program.emit_int(0, pass_reg);
+        pass_reg
+    });
+    let pass_start_label = program.allocate_label();
+    program.preassign_label_to_next_insn(pass_start_label);
+    let pass_done_label = if pass_reg.is_some() {
+        program.allocate_label()
+    } else {
+        end_label
+    };
+    program.emit_insn(Insn::Rewind {
+        cursor_id: input.cursor_id,
+        pc_if_empty: pass_done_label,
+    });
+    program.preassign_label_to_next_insn(loop_label);
+    program.emit_insn(Insn::Column {
+        cursor_id: input.cursor_id,
+        column: 0,
+        dest: identity_reg,
+        default: None,
+    });
+    for column in 0..num_output_columns {
+        program.emit_insn(Insn::Column {
+            cursor_id: input.cursor_id,
+            column: input.value_start + column,
+            dest: values_start + column,
+            default: None,
+        });
+    }
+    program.emit_insn(Insn::Column {
+        cursor_id: input.cursor_id,
+        column: input.weight_column,
+        dest: weight_reg,
+        default: None,
+    });
+    if let Some(pass_reg) = pass_reg {
+        let negative_pass_label = program.allocate_label();
+        let pass_ok_label = program.allocate_label();
+        let zero_reg = program.alloc_register();
+        program.emit_int(0, zero_reg);
+        program.emit_insn(Insn::If {
+            reg: pass_reg,
+            target_pc: negative_pass_label,
+            jump_if_null: false,
+        });
+        program.emit_insn(Insn::Lt {
+            lhs: weight_reg,
+            rhs: zero_reg,
+            target_pc: next_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: pass_ok_label,
+        });
+        program.preassign_label_to_next_insn(negative_pass_label);
+        program.emit_insn(Insn::Gt {
+            lhs: weight_reg,
+            rhs: zero_reg,
+            target_pc: next_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.preassign_label_to_next_insn(pass_ok_label);
+    }
+
+    match sink {
+        DeltaSink::View { .. } => {
+            let view_cursor_id = view_cursor_id.expect("view sink opened its btree cursor");
+            let not_found_label = program.allocate_label();
             let merge_label = program.allocate_label();
             let write_label = program.allocate_label();
             let delete_label = program.allocate_label();
-
-            let cur_weight_reg = program.alloc_register();
+            let current_weight_reg = program.alloc_register();
+            let new_weight_reg = program.alloc_register();
             let found_reg = program.alloc_register();
             let zero_reg = program.alloc_register();
             program.emit_int(0, zero_reg);
 
-            // The view key namespaces the source rowid into this branch's
-            // slice of a shared compound btree (identity for a standalone
-            // view).
-            let view_key_reg = ns.emit_view_rowid(program, rowid_reg);
+            let view_key_reg = identity_reg;
             program.emit_insn(Insn::SeekRowid {
                 cursor_id: view_cursor_id,
                 src_reg: view_key_reg,
-                target_pc: notfound_label,
+                target_pc: not_found_label,
             });
             program.emit_insn(Insn::Column {
                 cursor_id: view_cursor_id,
-                column: num_view_columns,
-                dest: cur_weight_reg,
+                column: num_output_columns,
+                dest: current_weight_reg,
                 default: None,
             });
             program.emit_int(1, found_reg);
             program.emit_insn(Insn::Goto {
                 target_pc: merge_label,
             });
-            program.preassign_label_to_next_insn(notfound_label);
-            program.emit_int(0, cur_weight_reg);
+            program.preassign_label_to_next_insn(not_found_label);
+            program.emit_int(0, current_weight_reg);
             program.emit_int(0, found_reg);
             program.preassign_label_to_next_insn(merge_label);
-
             program.emit_insn(Insn::Add {
                 lhs: weight_reg,
-                rhs: cur_weight_reg,
+                rhs: current_weight_reg,
                 dest: new_weight_reg,
             });
             program.emit_insn(Insn::Gt {
@@ -2727,9 +3895,6 @@ fn emit_filter_project(
                 flags: CmpInsFlags::default(),
                 collation: None,
             });
-            // new_weight <= 0: remove the row if it existed; a retraction of
-            // a row the view never held (weight <= 0 and not found) is a
-            // no-op, matching the previous engine's write_row behavior.
             program.emit_insn(Insn::If {
                 reg: found_reg,
                 target_pc: delete_label,
@@ -2749,10 +3914,35 @@ fn emit_filter_project(
             });
 
             program.preassign_label_to_next_insn(write_label);
+            // On the negative pass, retain the newer image installed by a
+            // positive contribution instead of overwriting it with the
+            // retracted old image.
+            let values_ready_label = program.allocate_label();
+            program.emit_insn(Insn::Gt {
+                lhs: weight_reg,
+                rhs: zero_reg,
+                target_pc: values_ready_label,
+                flags: CmpInsFlags::default(),
+                collation: None,
+            });
+            for column in 0..num_output_columns {
+                program.emit_insn(Insn::Column {
+                    cursor_id: view_cursor_id,
+                    column,
+                    dest: values_start + column,
+                    default: None,
+                });
+            }
+            program.preassign_label_to_next_insn(values_ready_label);
+            program.emit_insn(Insn::Copy {
+                src_reg: new_weight_reg,
+                dst_reg: weight_reg,
+                extra_amount: 0,
+            });
             let record_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: out_start_reg as u16,
-                count: (num_view_columns + 1) as u16,
+                start_reg: values_start as u16,
+                count: (num_output_columns + 1) as u16,
                 dest_reg: record_reg as u16,
                 index_name: None,
                 affinity_str: None,
@@ -2769,16 +3959,27 @@ fn emit_filter_project(
                 table_name: view_name.to_string(),
             });
         }
+        DeltaSink::Ephemeral(_) => unreachable!("rejected above"),
     }
 
     program.preassign_label_to_next_insn(next_label);
     program.emit_insn(Insn::Next {
-        cursor_id: input_cursor_id,
+        cursor_id: input.cursor_id,
         pc_if_next: loop_label,
     });
+    if let Some(pass_reg) = pass_reg {
+        program.preassign_label_to_next_insn(pass_done_label);
+        program.emit_insn(Insn::If {
+            reg: pass_reg,
+            target_pc: end_label,
+            jump_if_null: false,
+        });
+        program.emit_int(1, pass_reg);
+        program.emit_insn(Insn::Goto {
+            target_pc: pass_start_label,
+        });
+    }
     program.preassign_label_to_next_insn(end_label);
-
-    drop(syms);
     Ok(())
 }
 
@@ -2786,21 +3987,19 @@ fn emit_filter_project(
 fn emit_group_aggregate(
     program: &mut ProgramBuilder,
     view_name: &str,
-    select: &ast::Select,
+    source: &DeltaSource,
     group_exprs: &[ast::Expr],
     group_collations: &[CollationSeq],
     aggregates: &[Aggregate],
-    outputs: &[OutputColumn],
-    having: Option<&ast::Expr>,
     scalar: bool,
-    view_root_page: i64,
-    num_view_columns: usize,
+    output: &EphemeralDelta,
     input: MaintenanceInput,
-    ns: &BranchNamespace,
+    operator_state: &OperatorStateDef,
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<()> {
     use crate::function::AccumulatorFunc;
+    let num_view_columns = output.width;
     // With a collated key, values that compare equal can differ in bytes.
     // The stored key is the group's first-seen representative: reloading it
     // on every lookup keeps the state row, its index entry, and the view row
@@ -2810,20 +4009,10 @@ fn emit_group_aggregate(
     let reload_stored_group = group_collations
         .iter()
         .any(|c| !matches!(c, CollationSeq::Binary | CollationSeq::Unset));
-    let ast::OneSelect::Select {
-        from, where_clause, ..
-    } = &select.body.select
-    else {
-        unreachable!("classify_view admits only OneSelect::Select");
-    };
-    let from = from.as_ref().expect("classify_view requires a FROM clause");
-    // Aggregates over a join read their input from a joined-delta ephemeral
-    // table instead of directly from a base table's delta or btree.
-    let joined = !from.joins.is_empty();
 
     turso_assert!(
-        num_view_columns == outputs.len(),
-        "view column count does not match classified outputs"
+        num_view_columns == group_exprs.len() + aggregates.len(),
+        "aggregate output stream must use the node's natural schema"
     );
     let k = group_exprs.len();
     // Payload aggregates persist fixed-width state in the group state table;
@@ -2850,14 +4039,8 @@ fn emit_group_aggregate(
     let has_multiset = aggregates.iter().any(uses_multiset);
 
     // The state table and its primary-key index are real schema objects
-    // created by CREATE MATERIALIZED VIEW; the namespace suffix keeps each
-    // compound branch's tables distinct.
-    let state_table_name = format!(
-        "{}{}_{view_name}{}",
-        crate::schema::DBSP_TABLE_PREFIX,
-        crate::incremental::view::DBSP_CIRCUIT_VERSION,
-        ns.suffix,
-    );
+    // created by CREATE MATERIALIZED VIEW and assigned to this DAG node.
+    let state_table_name = operator_state.state_table_name()?.to_string();
     let state_table = schema.get_btree_table(&state_table_name).ok_or_else(|| {
         LimboError::InternalError(format!(
             "state table {state_table_name} of materialized view {view_name} not found"
@@ -2875,22 +4058,24 @@ fn emit_group_aggregate(
 
     // The value multiset table, when the view has MIN/MAX or DISTINCT
     // aggregates.
-    let multiset_table_name = format!(
-        "{}{}_{view_name}{}",
-        crate::schema::DBSP_MULTISET_TABLE_PREFIX,
-        crate::incremental::view::DBSP_CIRCUIT_VERSION,
-        ns.suffix,
-    );
+    let multiset_table_name = operator_state
+        .auxiliary_table
+        .as_ref()
+        .map(|table| table.table_name.clone());
     let mm_schema = if has_multiset {
-        let table = schema
-            .get_btree_table(&multiset_table_name)
-            .ok_or_else(|| {
-                LimboError::InternalError(format!(
+        let multiset_table_name = multiset_table_name.as_ref().ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "aggregate DAG node {} requires a multiset table",
+                operator_state.node_id
+            ))
+        })?;
+        let table = schema.get_btree_table(multiset_table_name).ok_or_else(|| {
+            LimboError::InternalError(format!(
                 "multiset table {multiset_table_name} of materialized view {view_name} not found"
             ))
-            })?;
+        })?;
         let index = schema
-            .get_indices(&multiset_table_name)
+            .get_indices(multiset_table_name)
             .next()
             .cloned()
             .ok_or_else(|| {
@@ -2915,95 +4100,21 @@ fn emit_group_aggregate(
         Arc::new(crate::dialect::SqliteDialect),
     );
 
-    // Input relation: for a single table, its transaction delta or a full
-    // scan; for a join, the joined-delta ephemeral table built below. The
-    // table references are what group/argument/HAVING expressions bind
-    // against — for joins the values are pre-evaluated into the ephemeral
-    // rows, so only HAVING still binds against them (and resolves entirely
-    // through the expression cache).
-    let (input_cursor_id, mut table_references, join_ctx, num_base_columns) = if joined {
-        let (eph_cursor_id, join_ctx, table_references) = emit_join_deltas_to_ephemeral(
-            program,
-            &resolver,
-            view_name,
-            from,
-            where_clause,
-            group_exprs,
-            aggregates,
-            input,
-            ns,
-            schema,
-        )?;
-        (eph_cursor_id, table_references, Some(join_ctx), 0)
-    } else {
-        let ast::SelectTable::Table(base_name, base_alias, _) = from.select.as_ref() else {
-            unreachable!("classify_view admits only plain tables in FROM");
-        };
-        let base_table = schema
-            .get_btree_table(base_name.name.as_str())
-            .ok_or_else(|| {
-                LimboError::ParseError(format!(
-                    "materialized view base table {} not found",
-                    base_name.name.as_str()
-                ))
-            })?;
-        let num_base_columns = base_table.columns().len();
-        let table_ref_id = program.table_reference_counter.next();
-        let identifier = match base_alias {
-            Some(ast::As::As(name) | ast::As::Elided(name) | ast::As::ImplicitColumnName(name)) => {
-                name.as_str().to_string()
-            }
-            None => base_table.name.clone(),
-        };
-        let table_references = TableReferences::new(
-            vec![JoinedTable {
-                op: Operation::Scan(Scan::BTreeTable {
-                    iter_dir: IterationDirection::Forwards,
-                    index: None,
-                }),
-                table: crate::schema::Table::BTree(base_table.clone()),
-                identifier,
-                internal_id: table_ref_id,
-                join_info: None,
-                col_used_mask: ColumnUsedMask::default(),
-                column_use_counts: Vec::new(),
-                expression_index_usages: Vec::new(),
-                database_id: 0,
-                indexed: None,
-            }],
-            vec![],
-        );
-        let cursor_id = match input {
-            MaintenanceInput::TransactionDelta => {
-                let cursor_id = program.alloc_cursor_id_keyed(
-                    CursorKey::table(table_ref_id),
-                    CursorType::ViewDelta {
-                        view_name: view_name.to_string(),
-                        table: base_table,
-                    },
-                );
-                program.emit_insn(Insn::OpenRead {
-                    cursor_id,
-                    root_page: 0,
-                    db: 0,
-                });
-                cursor_id
-            }
-            MaintenanceInput::BaseTable => {
-                let cursor_id = program.alloc_cursor_id_keyed(
-                    CursorKey::table(table_ref_id),
-                    CursorType::BTreeTable(base_table.clone()),
-                );
-                program.emit_insn(Insn::OpenRead {
-                    cursor_id,
-                    root_page: base_table.root_page,
-                    db: 0,
-                });
-                cursor_id
-            }
-        };
-        (cursor_id, table_references, None, num_base_columns)
+    let channel = match source {
+        DeltaSource::Ephemeral(channel) => channel.clone(),
+        DeltaSource::BaseTable { .. } => {
+            return Err(LimboError::InternalError(
+                "aggregate base-table input was not emitted to a typed stream".to_string(),
+            ));
+        }
     };
+    turso_assert!(
+        channel.weight_column == channel.value_start + channel.width
+            && channel.schema.len() == channel.width,
+        "aggregate delta channel layout must match its declared input"
+    );
+    let input_cursor_id = channel.cursor_id;
+    let (table_references, binding_remap) = stream_table_references(program, &channel.schema);
 
     let state_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(state_table.clone()));
     program.emit_insn(Insn::OpenWrite {
@@ -3018,18 +4129,6 @@ fn emit_group_aggregate(
         root_page: RegisterOrLiteral::Literal(state_index.root_page),
         db: 0,
     });
-    let view_btree = Arc::new(synthesized_view_table(
-        view_name,
-        view_root_page,
-        num_view_columns,
-    ));
-    let view_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(view_btree));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: view_cursor_id,
-        root_page: RegisterOrLiteral::Literal(view_root_page),
-        db: 0,
-    });
-
     let mut mm_cursors = None;
     let mut mm_index_name = String::new();
     if let Some((mm_table, mm_index)) = &mm_schema {
@@ -3059,23 +4158,28 @@ fn emit_group_aggregate(
     let arg_reg = program.alloc_register();
     // Accumulators, one per aggregate (index 0 = hidden liveness COUNT(*)).
     let acc_start = program.alloc_registers(aggregates.len());
-    // State record image: [g.., payloads..], contiguous for MakeRecord.
-    let state_rec_start = program.alloc_registers(k + total_payload);
+    // State record image: [g.., finalized aggregate values, payloads..].
+    // Keeping the natural output first makes the state table directly
+    // scannable as the aggregate node's arrangement.
+    let state_rec_start = program.alloc_registers(k + total_payload + aggregates.len());
     let group_start = state_rec_start;
-    let payload_start = state_rec_start + k;
+    let persisted_value_start = state_rec_start + k;
+    let payload_start = persisted_value_start + aggregates.len();
     // Index key image: [g.., state_rowid], contiguous for IdxInsert/IdxDelete.
     // The state rowid doubles as the group's view-btree rowid (see
     // aggregate_state_table_sql).
     let index_rec_start = program.alloc_registers(k + 1);
     let state_rowid_reg = index_rec_start + k;
-    // Finalized value of each aggregate for the current group; group outputs
-    // and HAVING both read from here.
+    // Finalized value of each aggregate for the current group.
     let agg_value_start = program.alloc_registers(aggregates.len());
-    // View row image: [outputs.., weight].
+    // Natural aggregate delta: [groups.., aggregate values.., weight].
     let out_start = program.alloc_registers(num_view_columns + 1);
+    // Natural aggregate row used when publishing an old arrangement row:
+    // [groups.., aggregate values.., weight].
+    let old_out_start = program.alloc_registers(k + aggregates.len() + 1);
+    let old_out_weight_reg = old_out_start + k + aggregates.len();
     let state_record_reg = program.alloc_register();
     let index_record_reg = program.alloc_register();
-    let view_record_reg = program.alloc_register();
     // Multiset record image: [agg_id, g.., val, mult-or-rowid], contiguous.
     let mm_rec_start = program.alloc_registers(1 + k + 2);
     let mm_val_reg = mm_rec_start + 1 + k;
@@ -3106,7 +4210,7 @@ fn emit_group_aggregate(
     // group's (and multiset value's) running weight stays non-negative, and
     // since aggregate contributions carry their own values, reordering them
     // is sound.
-    let pass_reg = join_ctx.as_ref().map(|_| {
+    let pass_reg = channel.requires_positive_first.then(|| {
         let pass_reg = program.alloc_register();
         program.emit_int(0, pass_reg);
         pass_reg
@@ -3132,16 +4236,15 @@ fn emit_group_aggregate(
     });
 
     // Weight of the current input row.
-    if let Some(join_ctx) = &join_ctx {
-        program.emit_insn(Insn::Column {
-            cursor_id: input_cursor_id,
-            column: join_ctx.k + join_ctx.n_args,
-            dest: weight_reg,
-            default: None,
-        });
-        // Pass filter: pass 0 skips negative contributions, pass 1 skips
-        // positive ones.
-        let pass_reg = pass_reg.expect("pass register allocated for joins");
+    program.emit_insn(Insn::Column {
+        cursor_id: input_cursor_id,
+        column: channel.weight_column,
+        dest: weight_reg,
+        default: None,
+    });
+    // Pass filter: pass 0 skips negative contributions, pass 1 skips
+    // positive ones.
+    if let Some(pass_reg) = pass_reg {
         let negative_pass_label = program.allocate_label();
         let pass_ok_label = program.allocate_label();
         program.emit_insn(Insn::If {
@@ -3168,82 +4271,20 @@ fn emit_group_aggregate(
             collation: None,
         });
         program.preassign_label_to_next_insn(pass_ok_label);
-    } else {
-        match input {
-            MaintenanceInput::TransactionDelta => {
-                program.emit_insn(Insn::Column {
-                    cursor_id: input_cursor_id,
-                    column: num_base_columns,
-                    dest: weight_reg,
-                    default: None,
-                });
-            }
-            MaintenanceInput::BaseTable => {
-                program.emit_int(1, weight_reg);
-            }
-        }
     }
 
-    // WHERE: rows whose predicate is FALSE or NULL do not reach the group.
-    // (For joins, ON and WHERE were already applied while building the
-    // joined-delta rows.)
-    if join_ctx.is_none() {
-        if let Some(where_expr) = where_clause {
-            let mut bound = where_expr.clone();
-            bind_and_rewrite_expr(
-                &mut bound,
-                Some(&mut table_references),
-                None,
-                &resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            )?;
-            let pred_true = program.allocate_label();
-            translate_condition_expr(
-                program,
-                &table_references,
-                &bound,
-                ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_true: pred_true,
-                    jump_target_when_false: next_label,
-                    jump_target_when_null: next_label,
-                },
-                &resolver,
-            )?;
-            program.preassign_label_to_next_insn(pred_true);
-        }
-    }
+    seed_ephemeral_stream_cache(program, &channel, &binding_remap, &mut resolver)?;
 
-    // Group key expressions (pre-evaluated into the leading joined-delta
-    // columns for joins).
-    if join_ctx.is_some() {
-        for i in 0..k {
-            program.emit_insn(Insn::Column {
-                cursor_id: input_cursor_id,
-                column: i,
-                dest: group_start + i,
-                default: None,
-            });
-        }
-    } else {
-        for (i, group_expr) in group_exprs.iter().enumerate() {
-            let mut bound = group_expr.clone();
-            bind_and_rewrite_expr(
-                &mut bound,
-                Some(&mut table_references),
-                None,
-                &resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            )?;
-            translate_expr_no_constant_opt(
-                program,
-                Some(&table_references),
-                &bound,
-                group_start + i,
-                &resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-        }
+    for (i, group_expr) in group_exprs.iter().enumerate() {
+        let bound = remap_bound_expr(group_expr, &binding_remap)?;
+        translate_expr_no_constant_opt(
+            program,
+            Some(&table_references),
+            &bound,
+            group_start + i,
+            &resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
     }
 
     // Group lookup via the state table's primary-key index.
@@ -3265,6 +4306,10 @@ fn emit_group_aggregate(
         collation: None,
     });
     program.emit_int(0, found_reg);
+    program.emit_insn(Insn::Null {
+        dest: persisted_value_start,
+        dest_end: Some(persisted_value_start + aggregates.len() - 1),
+    });
     // A fresh group's DISTINCT accumulators may never be stepped in the apply
     // loop (a NULL argument contributes nothing), but the write path stores
     // every payload accumulator, so materialize empty contexts now. Stepping
@@ -3312,7 +4357,7 @@ fn emit_group_aggregate(
         for j in 0..payload_widths[i].expect("offset implies width") {
             program.emit_insn(Insn::Column {
                 cursor_id: state_cursor_id,
-                column: k + offset + j,
+                column: k + aggregates.len() + offset + j,
                 dest: payload_start + offset + j,
                 default: None,
             });
@@ -3323,48 +4368,51 @@ fn emit_group_aggregate(
             func: AccumulatorFunc::Agg(agg.func.clone()),
         });
     }
+    for i in 0..aggregates.len() {
+        program.emit_insn(Insn::Column {
+            cursor_id: state_cursor_id,
+            column: k + i,
+            dest: persisted_value_start + i,
+            default: None,
+        });
+    }
+    program.emit_insn(Insn::Copy {
+        src_reg: group_start,
+        dst_reg: old_out_start,
+        extra_amount: k.saturating_sub(1),
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: persisted_value_start,
+        dst_reg: old_out_start + k,
+        extra_amount: aggregates.len().saturating_sub(1),
+    });
+    program.emit_int(-1, old_out_weight_reg);
+    emit_ephemeral_row_with_identity(
+        program,
+        output,
+        state_rowid_reg,
+        old_out_start,
+        old_out_weight_reg,
+    );
 
     program.preassign_label_to_next_insn(apply_label);
     for (i, agg) in aggregates.iter().enumerate() {
         let is_minmax = matches!(agg.func, AggFunc::Min | AggFunc::Max);
         let is_distinct = tracks_distinct_values(agg);
-        let col_reg = if let Some(join_ctx) = &join_ctx {
-            // Argument values were pre-evaluated into the joined-delta row.
-            match join_ctx.arg_positions[i] {
-                Some(pos) => {
-                    program.emit_insn(Insn::Column {
-                        cursor_id: input_cursor_id,
-                        column: k + pos,
-                        dest: arg_reg,
-                        default: None,
-                    });
-                    arg_reg
-                }
-                None => null_arg_reg,
+        let col_reg = match agg.args.first() {
+            Some(arg_expr) => {
+                let bound = remap_bound_expr(arg_expr, &binding_remap)?;
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(&table_references),
+                    &bound,
+                    arg_reg,
+                    &resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
+                arg_reg
             }
-        } else {
-            match agg.args.first() {
-                Some(arg_expr) => {
-                    let mut bound = arg_expr.clone();
-                    bind_and_rewrite_expr(
-                        &mut bound,
-                        Some(&mut table_references),
-                        None,
-                        &resolver,
-                        BindingBehavior::ResultColumnsNotAllowed,
-                    )?;
-                    translate_expr_no_constant_opt(
-                        program,
-                        Some(&table_references),
-                        &bound,
-                        arg_reg,
-                        &resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
-                    arg_reg
-                }
-                None => null_arg_reg,
-            }
+            None => null_arg_reg,
         };
 
         if is_minmax || is_distinct {
@@ -3377,7 +4425,7 @@ fn emit_group_aggregate(
             // on delta rows carrying unit weights (each captured DML op is
             // one row of weight +1 or -1, and population scans weigh +1).
             let (mm_table_cursor_id, mm_index_cursor_id) = mm_cursors
-                .expect("classify_view guarantees the multiset table for multiset aggregates");
+                .expect("DAG validation guarantees a multiset table for multiset aggregates");
             let done_label = program.allocate_label();
             let mm_found_label = program.allocate_label();
             let mm_upsert_label = program.allocate_label();
@@ -3490,7 +4538,10 @@ fn emit_group_aggregate(
             });
             program.emit_insn(Insn::Delete {
                 cursor_id: mm_table_cursor_id,
-                table_name: multiset_table_name.clone(),
+                table_name: multiset_table_name
+                    .as_ref()
+                    .expect("multiset users require an auxiliary table")
+                    .clone(),
                 is_part_of_update: true,
             });
             program.emit_insn(Insn::Goto {
@@ -3516,7 +4567,10 @@ fn emit_group_aggregate(
                         | InsertFlags::SKIP_LAST_ROWID
                         | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
                 ),
-                table_name: multiset_table_name.clone(),
+                table_name: multiset_table_name
+                    .as_ref()
+                    .expect("multiset users require an auxiliary table")
+                    .clone(),
             });
             // Only a freshly-inserted value needs an index entry; an
             // existing value's entry is already present.
@@ -3599,7 +4653,8 @@ fn emit_group_aggregate(
             collation: None,
         });
 
-        // Group emptied: remove its state row, index entry, and view row. A
+        // Group emptied: remove its state row and index entry. The old
+        // arrangement row was already retracted above. A
         // fresh group cannot reach zero (its first change was an insert), so
         // found_reg is always set here; stay total anyway.
         let do_delete_label = program.allocate_label();
@@ -3636,31 +4691,13 @@ fn emit_group_aggregate(
             table_name: state_table_name.clone(),
             is_part_of_update: true,
         });
-        // Without HAVING every live group has its view row, so a missing row
-        // is corruption; with HAVING the dying group may have been
-        // suppressed.
-        let view_rowid_reg = ns.emit_view_rowid(program, state_rowid_reg);
-        program.emit_insn(Insn::SeekRowid {
-            cursor_id: view_cursor_id,
-            src_reg: view_rowid_reg,
-            target_pc: if having.is_some() {
-                next_label
-            } else {
-                corrupt_label
-            },
-        });
-        program.emit_insn(Insn::Delete {
-            cursor_id: view_cursor_id,
-            table_name: view_name.to_string(),
-            is_part_of_update: true,
-        });
         program.emit_insn(Insn::Goto {
             target_pc: next_label,
         });
         program.preassign_label_to_next_insn(write_label);
     }
 
-    // Group live: persist aggregate state and (re)write the view row.
+    // Group live: persist aggregate state and publish its natural delta.
     let have_rowids_label = program.allocate_label();
     program.emit_insn(Insn::If {
         reg: found_reg,
@@ -3683,24 +4720,6 @@ fn emit_group_aggregate(
             func: AccumulatorFunc::Agg(agg.func.clone()),
         });
     }
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: state_rec_start as u16,
-        count: (k + total_payload) as u16,
-        dest_reg: state_record_reg as u16,
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: state_cursor_id,
-        key_reg: state_rowid_reg,
-        record_reg: state_record_reg,
-        flag: InsertFlags(
-            InsertFlags::REQUIRE_SEEK
-                | InsertFlags::SKIP_LAST_ROWID
-                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-        ),
-        table_name: state_table_name.clone(),
-    });
     let skip_index_label = program.allocate_label();
     program.emit_insn(Insn::If {
         reg: found_reg,
@@ -3728,241 +4747,135 @@ fn emit_group_aggregate(
     });
     program.preassign_label_to_next_insn(skip_index_label);
 
-    // HAVING and expression output columns both evaluate over the finalized
-    // group row: group expressions and aggregate calls inside them resolve to
-    // their computed registers through the expression cache, exactly like
-    // HAVING translation in a regular GROUP BY query. HAVING gates only the
-    // view row — the group's state stays maintained above so the predicate
-    // flips the row in and out as aggregates change. Bind and seed once —
-    // the row tail below is emitted twice for scalar population.
-    let has_expr_outputs = outputs.iter().any(|o| matches!(o, OutputColumn::Expr(_)));
-    let mut bound_having: Option<ast::Expr> = None;
-    let mut bound_output_exprs: Vec<Option<ast::Expr>> = vec![None; outputs.len()];
-    if having.is_some() || has_expr_outputs {
-        for (i, group_expr) in group_exprs.iter().enumerate() {
-            let mut bound = group_expr.clone();
-            bind_and_rewrite_expr(
-                &mut bound,
-                Some(&mut table_references),
-                None,
-                &resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            )?;
-            resolver.cache_expr_reg(std::borrow::Cow::Owned(bound), group_start + i, false, None);
-        }
+    // Finalize every aggregate and publish the node's natural row. HAVING is
+    // an ordinary downstream Filter node in the maintenance DAG.
+    let emit_row_tail = |program: &mut ProgramBuilder| -> Result<()> {
         for (i, agg) in aggregates.iter().enumerate() {
-            let mut bound = agg.original_expr.clone();
-            bind_and_rewrite_expr(
-                &mut bound,
-                Some(&mut table_references),
-                None,
-                &resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            )?;
-            resolver.cache_expr_reg(
-                std::borrow::Cow::Owned(bound),
-                agg_value_start + i,
-                false,
-                None,
-            );
-        }
-        resolver.enable_expr_to_reg_cache();
-        if let Some(having_expr) = having {
-            let mut bound = having_expr.clone();
-            bind_and_rewrite_expr(
-                &mut bound,
-                Some(&mut table_references),
-                None,
-                &resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            )?;
-            bound_having = Some(bound);
-        }
-        for (i, output) in outputs.iter().enumerate() {
-            let OutputColumn::Expr(expr) = output else {
-                continue;
-            };
-            let mut bound = expr.clone();
-            bind_and_rewrite_expr(
-                &mut bound,
-                Some(&mut table_references),
-                None,
-                &resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            )?;
-            bound_output_exprs[i] = Some(bound);
-        }
-    }
-
-    // The row tail: finalize every aggregate's value, evaluate HAVING, and
-    // write (or remove) the group's view row. Falls through — and jumps on
-    // suppression — to `done_label`, which the caller places right after.
-    let emit_row_tail =
-        |program: &mut ProgramBuilder, done_label: crate::vdbe::BranchOffset| -> Result<()> {
-            for (i, agg) in aggregates.iter().enumerate() {
-                let value_reg = agg_value_start + i;
-                if matches!(agg.func, AggFunc::Min | AggFunc::Max) {
-                    // The group's extreme is the first (MIN) or last (MAX)
-                    // multiset entry with the (agg_id, group..) prefix.
-                    let (_, mm_index_cursor_id) =
-                        mm_cursors.expect("MIN/MAX aggregates imply the multiset table");
-                    let empty_label = program.allocate_label();
-                    let have_label = program.allocate_label();
-                    program.emit_int(i as i64, mm_rec_start);
-                    program.emit_insn(Insn::Copy {
-                        src_reg: group_start,
-                        dst_reg: mm_rec_start + 1,
-                        extra_amount: k.saturating_sub(1),
-                    });
-                    match agg.func {
-                        AggFunc::Min => {
-                            program.emit_insn(Insn::SeekGE {
-                                is_index: true,
-                                cursor_id: mm_index_cursor_id,
-                                start_reg: mm_rec_start,
-                                num_regs: 1 + k,
-                                target_pc: empty_label,
-                                eq_only: false,
-                            });
-                            // Positioned past the group: no values.
-                            program.emit_insn(Insn::IdxGT {
-                                cursor_id: mm_index_cursor_id,
-                                start_reg: mm_rec_start,
-                                num_regs: 1 + k,
-                                target_pc: empty_label,
-                            });
-                        }
-                        AggFunc::Max => {
-                            program.emit_insn(Insn::SeekLE {
-                                is_index: true,
-                                cursor_id: mm_index_cursor_id,
-                                start_reg: mm_rec_start,
-                                num_regs: 1 + k,
-                                target_pc: empty_label,
-                                eq_only: false,
-                            });
-                            // Positioned before the group: no values.
-                            program.emit_insn(Insn::IdxLT {
-                                cursor_id: mm_index_cursor_id,
-                                start_reg: mm_rec_start,
-                                num_regs: 1 + k,
-                                target_pc: empty_label,
-                            });
-                        }
-                        _ => unreachable!(),
-                    }
-                    program.emit_insn(Insn::Column {
-                        cursor_id: mm_index_cursor_id,
-                        column: 1 + k,
-                        dest: value_reg,
-                        default: None,
-                    });
-                    program.emit_insn(Insn::Goto {
-                        target_pc: have_label,
-                    });
-                    program.preassign_label_to_next_insn(empty_label);
-                    program.emit_insn(Insn::Null {
-                        dest: value_reg,
-                        dest_end: None,
-                    });
-                    program.preassign_label_to_next_insn(have_label);
-                } else {
-                    program.emit_insn(Insn::AggValue {
-                        acc_reg: acc_start + i,
-                        dest_reg: value_reg,
-                        func: AccumulatorFunc::Agg(agg.func.clone()),
-                    });
-                }
-            }
-
-            let suppress_label = bound_having.as_ref().map(|_| program.allocate_label());
-            if let Some(bound) = &bound_having {
-                let suppress_label = suppress_label.expect("allocated above");
-                let pass_label = program.allocate_label();
-                translate_condition_expr(
-                    program,
-                    &table_references,
-                    bound,
-                    ConditionMetadata {
-                        jump_if_condition_is_true: false,
-                        jump_target_when_true: pass_label,
-                        jump_target_when_false: suppress_label,
-                        jump_target_when_null: suppress_label,
-                    },
-                    &resolver,
-                )?;
-                program.preassign_label_to_next_insn(pass_label);
-            }
-
-            for (out_idx, output) in outputs.iter().enumerate() {
-                let src_reg = match output {
-                    OutputColumn::Group(group_idx) => group_start + group_idx,
-                    OutputColumn::Aggregate(agg_idx) => agg_value_start + agg_idx,
-                    OutputColumn::Expr(_) => {
-                        let bound = bound_output_exprs[out_idx]
-                            .as_ref()
-                            .expect("Expr outputs are bound before the row tail");
-                        translate_expr_no_constant_opt(
-                            program,
-                            Some(&table_references),
-                            bound,
-                            out_start + out_idx,
-                            &resolver,
-                            NoConstantOptReason::RegisterReuse,
-                        )?;
-                        continue;
-                    }
-                };
+            let value_reg = agg_value_start + i;
+            if matches!(agg.func, AggFunc::Min | AggFunc::Max) {
+                // The group's extreme is the first (MIN) or last (MAX)
+                // multiset entry with the (agg_id, group..) prefix.
+                let (_, mm_index_cursor_id) =
+                    mm_cursors.expect("MIN/MAX aggregates imply the multiset table");
+                let empty_label = program.allocate_label();
+                let have_label = program.allocate_label();
+                program.emit_int(i as i64, mm_rec_start);
                 program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: out_start + out_idx,
-                    extra_amount: 0,
+                    src_reg: group_start,
+                    dst_reg: mm_rec_start + 1,
+                    extra_amount: k.saturating_sub(1),
                 });
-            }
-            program.emit_int(1, out_start + num_view_columns);
-            program.emit_insn(Insn::MakeRecord {
-                start_reg: out_start as u16,
-                count: (num_view_columns + 1) as u16,
-                dest_reg: view_record_reg as u16,
-                index_name: None,
-                affinity_str: None,
-            });
-            let view_rowid_reg = ns.emit_view_rowid(program, state_rowid_reg);
-            program.emit_insn(Insn::Insert {
-                cursor: view_cursor_id,
-                key_reg: view_rowid_reg,
-                record_reg: view_record_reg,
-                flag: InsertFlags(
-                    InsertFlags::REQUIRE_SEEK
-                        | InsertFlags::SKIP_LAST_ROWID
-                        | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-                ),
-                table_name: view_name.to_string(),
-            });
-
-            if let Some(suppress_label) = suppress_label {
-                // Group failed HAVING: remove its previously-visible row, if
-                // any.
+                match agg.func {
+                    AggFunc::Min => {
+                        program.emit_insn(Insn::SeekGE {
+                            is_index: true,
+                            cursor_id: mm_index_cursor_id,
+                            start_reg: mm_rec_start,
+                            num_regs: 1 + k,
+                            target_pc: empty_label,
+                            eq_only: false,
+                        });
+                        // Positioned past the group: no values.
+                        program.emit_insn(Insn::IdxGT {
+                            cursor_id: mm_index_cursor_id,
+                            start_reg: mm_rec_start,
+                            num_regs: 1 + k,
+                            target_pc: empty_label,
+                        });
+                    }
+                    AggFunc::Max => {
+                        program.emit_insn(Insn::SeekLE {
+                            is_index: true,
+                            cursor_id: mm_index_cursor_id,
+                            start_reg: mm_rec_start,
+                            num_regs: 1 + k,
+                            target_pc: empty_label,
+                            eq_only: false,
+                        });
+                        // Positioned before the group: no values.
+                        program.emit_insn(Insn::IdxLT {
+                            cursor_id: mm_index_cursor_id,
+                            start_reg: mm_rec_start,
+                            num_regs: 1 + k,
+                            target_pc: empty_label,
+                        });
+                    }
+                    _ => unreachable!(),
+                }
+                program.emit_insn(Insn::Column {
+                    cursor_id: mm_index_cursor_id,
+                    column: 1 + k,
+                    dest: value_reg,
+                    default: None,
+                });
                 program.emit_insn(Insn::Goto {
-                    target_pc: done_label,
+                    target_pc: have_label,
                 });
-                program.preassign_label_to_next_insn(suppress_label);
-                let view_rowid_reg = ns.emit_view_rowid(program, state_rowid_reg);
-                program.emit_insn(Insn::SeekRowid {
-                    cursor_id: view_cursor_id,
-                    src_reg: view_rowid_reg,
-                    target_pc: done_label,
+                program.preassign_label_to_next_insn(empty_label);
+                program.emit_insn(Insn::Null {
+                    dest: value_reg,
+                    dest_end: None,
                 });
-                program.emit_insn(Insn::Delete {
-                    cursor_id: view_cursor_id,
-                    table_name: view_name.to_string(),
-                    is_part_of_update: true,
+                program.preassign_label_to_next_insn(have_label);
+            } else {
+                program.emit_insn(Insn::AggValue {
+                    acc_reg: acc_start + i,
+                    dest_reg: value_reg,
+                    func: AccumulatorFunc::Agg(agg.func.clone()),
                 });
             }
-            Ok(())
-        };
+        }
 
-    emit_row_tail(program, next_label)?;
+        program.emit_insn(Insn::Copy {
+            src_reg: agg_value_start,
+            dst_reg: persisted_value_start,
+            extra_amount: aggregates.len().saturating_sub(1),
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: state_rec_start as u16,
+            count: (k + total_payload + aggregates.len()) as u16,
+            dest_reg: state_record_reg as u16,
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: state_cursor_id,
+            key_reg: state_rowid_reg,
+            record_reg: state_record_reg,
+            flag: InsertFlags(
+                InsertFlags::REQUIRE_SEEK
+                    | InsertFlags::SKIP_LAST_ROWID
+                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+            ),
+            table_name: state_table_name.clone(),
+        });
+
+        if k > 0 {
+            program.emit_insn(Insn::Copy {
+                src_reg: group_start,
+                dst_reg: out_start,
+                extra_amount: k - 1,
+            });
+        }
+        if !aggregates.is_empty() {
+            program.emit_insn(Insn::Copy {
+                src_reg: agg_value_start,
+                dst_reg: out_start + k,
+                extra_amount: aggregates.len() - 1,
+            });
+        }
+        program.emit_int(1, out_start + num_view_columns);
+        emit_ephemeral_row_with_identity(
+            program,
+            output,
+            state_rowid_reg,
+            out_start,
+            out_start + num_view_columns,
+        );
+        Ok(())
+    };
+
+    emit_row_tail(program)?;
 
     program.preassign_label_to_next_insn(next_label);
     program.emit_insn(Insn::Next {
@@ -4042,28 +4955,14 @@ fn emit_group_aggregate(
                 func: AccumulatorFunc::Agg(agg.func.clone()),
             });
         }
+        program.emit_insn(Insn::Null {
+            dest: persisted_value_start,
+            dest_end: Some(persisted_value_start + aggregates.len() - 1),
+        });
         program.emit_insn(Insn::NewRowid {
             cursor: state_cursor_id,
             rowid_reg: state_rowid_reg,
             prev_largest_reg: prev_rowid_scratch,
-        });
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: state_rec_start as u16,
-            count: (k + total_payload) as u16,
-            dest_reg: state_record_reg as u16,
-            index_name: None,
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::Insert {
-            cursor: state_cursor_id,
-            key_reg: state_rowid_reg,
-            record_reg: state_record_reg,
-            flag: InsertFlags(
-                InsertFlags::REQUIRE_SEEK
-                    | InsertFlags::SKIP_LAST_ROWID
-                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-            ),
-            table_name: state_table_name,
         });
         program.emit_insn(Insn::Copy {
             src_reg: group_start,
@@ -4084,7 +4983,7 @@ fn emit_group_aggregate(
             unpacked_count: Some((k + 1) as u16),
             flags: IdxInsertFlags::new(),
         });
-        emit_row_tail(program, ensure_done)?;
+        emit_row_tail(program)?;
         program.preassign_label_to_next_insn(ensure_done);
     }
 
@@ -4103,7 +5002,7 @@ enum JoinSide {
 }
 
 /// The delta phases of an N-way inner join. With the base btrees holding
-/// post-change state at commit time, the view delta is the
+/// post-change state when the batch is applied, the view delta is the
 /// inclusion–exclusion sum over every non-empty subset S of the joined
 /// tables: join the deltas of the tables in S against the post-state btrees
 /// of the rest, signed (-1)^(|S|+1). The two-table case is the familiar
@@ -4162,152 +5061,12 @@ fn make_joined_table(
 
 /// A joined table with the identifier its columns bind under and the column
 /// names its USING (or NATURAL) join constraint merges.
-type JoinTable = (Arc<BTreeTable>, String, Vec<String>);
+type JoinTable = (Arc<BTreeTable>, String, Vec<String>, TableInternalId);
 
 /// Per-match emission hook for [`emit_join_phase`]: receives the program,
 /// the per-table-position cursor ids, and the phase's table references.
 type JoinPhaseSink<'a> =
-    dyn FnMut(&mut ProgramBuilder, &[usize], &mut TableReferences) -> Result<()> + 'a;
-
-/// Resolve the collation each key term compares under in the defining query,
-/// by binding it against the FROM tables and asking the same resolver that
-/// regular GROUP BY / ORDER BY translation asks. The result is carried onto
-/// the hidden state tables' key columns, so their primary-key indexes group
-/// and dedup exactly like the batch query. Custom collations are rejected:
-/// they are connection-local and cannot be embedded in the hidden tables'
-/// CREATE TABLE.
-fn resolve_key_collations(
-    terms: &[ast::Expr],
-    from: &ast::FromClause,
-    schema: &Schema,
-    resolver: &Resolver,
-) -> Result<Vec<CollationSeq>> {
-    Ok(resolve_term_collations(terms, from, schema, resolver)?
-        .into_iter()
-        .map(|collation| collation.unwrap_or(CollationSeq::Binary))
-        .collect())
-}
-
-/// Like [`resolve_key_collations`], but keeps "no collation resolved"
-/// distinct from BINARY: UNION dedup folds branch collations with left
-/// precedence, where an unresolved left column (e.g. a literal) falls
-/// through to the right branch's collation.
-fn resolve_term_collations(
-    terms: &[ast::Expr],
-    from: &ast::FromClause,
-    schema: &Schema,
-    resolver: &Resolver,
-) -> Result<Vec<Option<CollationSeq>>> {
-    let (tables, _) = collect_join_tables(from, schema)?;
-    let joined = tables
-        .iter()
-        .enumerate()
-        .map(|(i, (table, identifier, using))| {
-            make_joined_table(table, identifier, using, TableInternalId::from(i))
-        })
-        .collect();
-    let mut table_references = TableReferences::new(joined, vec![]);
-    terms
-        .iter()
-        .map(|term| {
-            let mut bound = term.clone();
-            bind_and_rewrite_expr(
-                &mut bound,
-                Some(&mut table_references),
-                None,
-                resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            )?;
-            let collation = get_collseq_from_expr_with_symbols(
-                &bound,
-                &table_references,
-                Some(resolver.symbol_table),
-            )?;
-            if collation.is_some_and(|c| c.is_custom()) {
-                return unsupported("custom collations on grouping or dedup keys");
-            }
-            Ok(collation.map(|c| match c {
-                CollationSeq::Unset => CollationSeq::Binary,
-                other => other,
-            }))
-        })
-        .collect()
-}
-
-/// Extract the joined tables (with their binding identifiers) and the ON
-/// predicates of a join view's FROM clause.
-fn collect_join_tables(
-    from: &ast::FromClause,
-    schema: &Schema,
-) -> Result<(Vec<JoinTable>, Vec<ast::Expr>)> {
-    let identifier_for = |alias: &Option<ast::As>, table: &Arc<BTreeTable>| match alias {
-        Some(ast::As::As(name) | ast::As::Elided(name) | ast::As::ImplicitColumnName(name)) => {
-            name.as_str().to_string()
-        }
-        None => table.name.clone(),
-    };
-    let lookup = |name: &ast::QualifiedName| {
-        schema.get_btree_table(name.name.as_str()).ok_or_else(|| {
-            LimboError::ParseError(format!(
-                "materialized view base table {} not found",
-                name.name.as_str()
-            ))
-        })
-    };
-    // Per joined table, the columns its USING (or NATURAL) constraint
-    // merges. Each merged column desugars into an equality between the
-    // left-most earlier table that has it and the joined table, exactly the
-    // predicates the planner generates for the defining query.
-    let using_per_table = crate::util::join_using_columns(from, schema)?;
-
-    let mut tables: Vec<JoinTable> = Vec::with_capacity(from.joins.len() + 1);
-    let ast::SelectTable::Table(name, alias, _) = from.select.as_ref() else {
-        unreachable!("classify_view admits only plain tables in FROM");
-    };
-    let table = lookup(name)?;
-    let identifier = identifier_for(alias, &table);
-    tables.push((table, identifier, Vec::new()));
-
-    let mut conditions = Vec::new();
-    for (join_idx, join) in from.joins.iter().enumerate() {
-        let ast::SelectTable::Table(name, alias, _) = join.table.as_ref() else {
-            unreachable!("classify_view admits only plain tables in joins");
-        };
-        let table = lookup(name)?;
-        let identifier = identifier_for(alias, &table);
-        let using = using_per_table[join_idx + 1].clone();
-        for column_name in &using {
-            let left_identifier = tables
-                .iter()
-                .find(|(left_table, _, _)| {
-                    left_table.columns().iter().any(|col| {
-                        col.name
-                            .as_deref()
-                            .is_some_and(|n| n.eq_ignore_ascii_case(column_name))
-                    })
-                })
-                .map(|(_, left_identifier, _)| left_identifier.clone())
-                .expect("join_using_columns verified the column exists on the left");
-            conditions.push(ast::Expr::Binary(
-                Box::new(ast::Expr::Qualified(
-                    ast::Name::exact(left_identifier),
-                    ast::Name::exact(column_name.clone()),
-                )),
-                ast::Operator::Equals,
-                Box::new(ast::Expr::Qualified(
-                    ast::Name::exact(identifier.clone()),
-                    ast::Name::exact(column_name.clone()),
-                )),
-            ));
-        }
-        tables.push((table, identifier, using));
-        match &join.constraint {
-            Some(ast::JoinConstraint::On(expr)) => conditions.push(expr.as_ref().clone()),
-            None | Some(ast::JoinConstraint::Using(_)) => {}
-        }
-    }
-    Ok((tables, conditions))
-}
+    dyn FnMut(&mut ProgramBuilder, &[usize], &mut TableReferences, &Resolver) -> Result<()> + 'a;
 
 /// Emit one join delta phase: nested loops over every joined table — reading
 /// the transaction delta for tables in the phase's subset and the post-state
@@ -4319,9 +5078,11 @@ fn collect_join_tables(
 #[allow(clippy::too_many_arguments)]
 fn emit_join_phase(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     view_name: &str,
+    deltas: &[DeltaSource],
     tables: &[JoinTable],
+    arrangements: &[ArrangementHandle],
     conditions: &[&ast::Expr],
     sides: &[JoinSide],
     negate: bool,
@@ -4329,6 +5090,10 @@ fn emit_join_phase(
     sink: &mut JoinPhaseSink<'_>,
 ) -> Result<()> {
     let n = tables.len();
+    turso_assert!(
+        deltas.len() == n && arrangements.len() == n,
+        "every join input must expose a delta and an arrangement"
+    );
 
     // Fresh table references per phase: the same logical table reads from a
     // different relation (delta vs btree) in each phase, and cursors are
@@ -4336,44 +5101,71 @@ fn emit_join_phase(
     let ids: Vec<_> = (0..n)
         .map(|_| program.table_reference_counter.next())
         .collect();
+    let binding_remap = tables
+        .iter()
+        .zip(&ids)
+        .map(|((_, _, _, logical_id), phase_id)| (*logical_id, *phase_id))
+        .collect::<BindingRemap>();
     let mut table_references = TableReferences::new(
         tables
             .iter()
             .zip(&ids)
-            .map(|((table, ident, using), id)| make_joined_table(table, ident, using, *id))
+            .map(|((table, ident, using, _), id)| make_joined_table(table, ident, using, *id))
             .collect(),
         vec![],
     );
 
     let cursor_ids: Vec<usize> = tables
         .iter()
+        .zip(deltas)
+        .zip(arrangements)
         .zip(&ids)
         .zip(sides)
-        .map(|(((table, _, _), id), side)| {
-            let cursor_id = match side {
-                JoinSide::Delta => program.alloc_cursor_id_keyed(
-                    CursorKey::table(*id),
-                    CursorType::ViewDelta {
-                        view_name: view_name.to_string(),
-                        table: table.clone(),
+        .map(
+            |(((((table, _, _, _), delta), arrangement), id), side)| -> Result<usize> {
+                let storage = arrangement.table();
+                match side {
+                    JoinSide::Delta => match delta {
+                        DeltaSource::BaseTable {
+                            table: delta_table, ..
+                        } => {
+                            turso_assert!(
+                                Arc::ptr_eq(table, delta_table)
+                                    || table.root_page == delta_table.root_page,
+                                "join delta and arrangement must describe the same relation"
+                            );
+                            let cursor_id = program.alloc_cursor_id_keyed(
+                                CursorKey::table(*id),
+                                CursorType::ViewDelta {
+                                    view_name: view_name.to_string(),
+                                    table: delta_table.clone(),
+                                },
+                            );
+                            program.emit_insn(Insn::OpenRead {
+                                cursor_id,
+                                root_page: 0,
+                                db: 0,
+                            });
+                            Ok(cursor_id)
+                        }
+                        DeltaSource::Ephemeral(channel) => Ok(channel.cursor_id),
                     },
-                ),
-                JoinSide::Btree => program.alloc_cursor_id_keyed(
-                    CursorKey::table(*id),
-                    CursorType::BTreeTable(table.clone()),
-                ),
-            };
-            program.emit_insn(Insn::OpenRead {
-                cursor_id,
-                root_page: match side {
-                    JoinSide::Delta => 0,
-                    JoinSide::Btree => table.root_page,
-                },
-                db: 0,
-            });
-            cursor_id
-        })
-        .collect();
+                    JoinSide::Btree => {
+                        let cursor_id = program.alloc_cursor_id_keyed(
+                            CursorKey::table(*id),
+                            CursorType::BTreeTable(storage.clone()),
+                        );
+                        program.emit_insn(Insn::OpenRead {
+                            cursor_id,
+                            root_page: storage.root_page,
+                            db: 0,
+                        });
+                        Ok(cursor_id)
+                    }
+                }
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
 
     // Nest delta tables outermost.
     let mut order: Vec<usize> = (0..n).collect();
@@ -4385,6 +5177,14 @@ fn emit_join_phase(
     let delta_w_regs: Vec<Option<usize>> = sides
         .iter()
         .map(|side| (*side == JoinSide::Delta).then(|| program.alloc_register()))
+        .collect();
+    let arrangement_count_regs: Vec<Option<usize>> = arrangements
+        .iter()
+        .zip(sides)
+        .map(|(arrangement, side)| {
+            (*side == JoinSide::Btree && arrangement.count_column().is_some())
+                .then(|| program.alloc_register())
+        })
         .collect();
 
     for (depth, &pos) in order.iter().enumerate() {
@@ -4398,12 +5198,90 @@ fn emit_join_phase(
         });
         program.preassign_label_to_next_insn(loop_labels[depth]);
         if let Some(w) = delta_w_regs[pos] {
+            let weight_column = match &deltas[pos] {
+                DeltaSource::BaseTable { .. } => tables[pos].0.columns().len(),
+                DeltaSource::Ephemeral(channel) => channel.weight_column,
+            };
             program.emit_insn(Insn::Column {
                 cursor_id: cursor_ids[pos],
-                column: tables[pos].0.columns().len(),
+                column: weight_column,
                 dest: w,
                 default: None,
             });
+        }
+        if let (Some(count_reg), Some(count_column)) = (
+            arrangement_count_regs[pos],
+            arrangements[pos].count_column(),
+        ) {
+            program.emit_insn(Insn::Column {
+                cursor_id: cursor_ids[pos],
+                column: count_column,
+                dest: count_reg,
+                default: None,
+            });
+        }
+    }
+
+    // Bind every logical column to the physical arrangement/delta slot used
+    // in this phase. This keeps expression translation independent of record
+    // layout (aggregate arrangements can project away accumulator payloads,
+    // while ephemeral deltas carry identity before their values).
+    resolver.enable_expr_to_reg_cache();
+    for pos in 0..n {
+        let (table, _, _, _) = &tables[pos];
+        let phase_id = ids[pos];
+        for (logical_column, column) in table.columns().iter().enumerate() {
+            if column.name.is_none() {
+                continue;
+            }
+            let physical_column = match (&sides[pos], &deltas[pos]) {
+                (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
+                    channel.value_start + logical_column
+                }
+                (JoinSide::Delta, DeltaSource::BaseTable { .. }) => logical_column,
+                (JoinSide::Btree, _) => arrangements[pos].value_columns()[logical_column],
+            };
+            let value_reg = program.alloc_register();
+            match (&sides[pos], &deltas[pos]) {
+                (JoinSide::Delta, DeltaSource::Ephemeral(_)) => {
+                    program.emit_insn(Insn::Column {
+                        cursor_id: cursor_ids[pos],
+                        column: physical_column,
+                        dest: value_reg,
+                        default: None,
+                    });
+                }
+                _ => program.emit_column_or_rowid(cursor_ids[pos], physical_column, value_reg),
+            }
+            let expr = ast::Expr::Column {
+                database: None,
+                table: phase_id,
+                column: logical_column,
+                is_rowid_alias: column.is_rowid_alias(),
+            };
+            resolver.cache_expr_reg(std::borrow::Cow::Owned(expr), value_reg, false, None);
+        }
+        if let (JoinSide::Delta, DeltaSource::Ephemeral(channel)) = (&sides[pos], &deltas[pos]) {
+            turso_assert!(
+                channel.identity_width() == 1,
+                "arranged join inputs must publish one stable rowid"
+            );
+            let rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::Column {
+                cursor_id: cursor_ids[pos],
+                column: 0,
+                dest: rowid_reg,
+                default: None,
+            });
+            resolver.cache_expr_reg(
+                std::borrow::Cow::Owned(ast::Expr::RowId {
+                    database: None,
+                    table: phase_id,
+                }),
+                rowid_reg,
+                false,
+                None,
+            );
         }
     }
 
@@ -4411,14 +5289,7 @@ fn emit_join_phase(
     // is not a join output.
     let innermost_next = next_labels[n - 1];
     for condition in conditions {
-        let mut bound = (*condition).clone();
-        bind_and_rewrite_expr(
-            &mut bound,
-            Some(&mut table_references),
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
+        let bound = remap_bound_expr(condition, &binding_remap)?;
         let pred_true = program.allocate_label();
         translate_condition_expr(
             program,
@@ -4444,8 +5315,15 @@ fn emit_join_phase(
             dest: w_reg,
         });
     }
+    for count in arrangement_count_regs.iter().flatten() {
+        program.emit_insn(Insn::Multiply {
+            lhs: w_reg,
+            rhs: *count,
+            dest: w_reg,
+        });
+    }
 
-    sink(program, &cursor_ids, &mut table_references)?;
+    sink(program, &cursor_ids, &mut table_references, resolver)?;
 
     for depth in (0..n).rev() {
         program.preassign_label_to_next_insn(next_labels[depth]);
@@ -4458,153 +5336,81 @@ fn emit_join_phase(
     Ok(())
 }
 
-/// Layout of the joined-delta ephemeral rows feeding an aggregate-over-join
-/// view: `[group keys.., aggregate arguments.., weight]`.
-struct JoinAggCtx {
-    /// Number of group-key columns.
-    k: usize,
-    /// Number of pre-evaluated aggregate-argument columns.
-    n_args: usize,
-    /// For each aggregate, the position of its argument within the argument
-    /// block; None for argument-less aggregates (COUNT(*)).
-    arg_positions: Vec<Option<usize>>,
-}
-
-/// Emit the join half of an aggregate-over-join program: the join delta
-/// phases evaluate each matched pair's group keys, aggregate arguments, and
-/// contribution weight — with both sides' cursors positioned, so expressions
-/// over either table bind normally — and append them as rows of an ephemeral
-/// table. The caller's aggregate loop then consumes those rows exactly like
-/// unit-weight delta rows, reading values by column position.
+/// Emit a join's natural delta row into a typed ephemeral stream. The join
+/// knows only its declared inputs and predicates; downstream group keys,
+/// aggregate arguments, filters, and projections are evaluated by their own
+/// operators from this stream.
 ///
-/// Returns the ephemeral cursor, the row layout, and a table-references
-/// instance over both join tables for binding HAVING (whose column-bearing
-/// subtrees all resolve through the expression cache, never the cursors).
+/// Returns the ephemeral cursor and its row layout. The cursor's
+/// [`dag::StreamSchema`] owns the logical binding namespace used by the
+/// aggregate consumer.
 #[allow(clippy::too_many_arguments)]
 fn emit_join_deltas_to_ephemeral(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     view_name: &str,
-    from: &ast::FromClause,
-    where_clause: &Option<Box<ast::Expr>>,
-    group_exprs: &[ast::Expr],
-    aggregates: &[Aggregate],
+    deltas: &[DeltaSource],
+    tables: &[JoinTable],
+    arrangements: &[ArrangementHandle],
+    on_conditions: &[ast::Expr],
     input: MaintenanceInput,
-    ns: &BranchNamespace,
-    schema: &Schema,
-) -> Result<(usize, JoinAggCtx, TableReferences)> {
-    let (tables, on_conditions) = collect_join_tables(from, schema)?;
-    // A two-table LEFT join feeds the aggregate its NULL-padded rows too. ON
-    // decides a match (suppressing the padded row); WHERE only gates which
-    // rows — inner or padded — reach the aggregate, so it is applied per row
-    // below rather than folded into the join's matching predicates. An inner
-    // join gates matching and output identically, so the two merge.
-    let left_outer = from.joins.iter().any(|join| {
-        matches!(&join.operator, ast::JoinOperator::TypedJoin(Some(jt))
-            if jt.contains(ast::JoinType::LEFT))
-    });
-    let conditions: Vec<&ast::Expr> = if left_outer {
-        on_conditions.iter().collect()
-    } else {
-        on_conditions
-            .iter()
-            .chain(where_clause.as_deref())
-            .collect()
-    };
+) -> Result<DeltaSource> {
+    let conditions: Vec<&ast::Expr> = on_conditions.iter().collect();
 
-    let k = group_exprs.len();
-    let arg_positions: Vec<Option<usize>> = aggregates
-        .iter()
-        .scan(0usize, |pos, agg| {
-            Some(agg.args.first().map(|_| {
-                let this = *pos;
-                *pos += 1;
-                this
-            }))
-        })
-        .collect();
-    let n_args = arg_positions.iter().flatten().count();
+    // The relational value schema excludes source identity; rowids travel in
+    // the channel's identity prefix.
+    let mut stream_columns = Vec::new();
+    for (table, _, _, logical_id) in tables {
+        for (logical_column, column) in table.columns().iter().enumerate() {
+            let name = column.name.clone().ok_or_else(|| {
+                LimboError::InternalError(
+                    "join stream contains an unaddressable column".to_string(),
+                )
+            })?;
+            stream_columns.push(dag::StreamColumn {
+                expr: Some(ast::Expr::Column {
+                    database: None,
+                    table: *logical_id,
+                    column: logical_column,
+                    is_rowid_alias: column.is_rowid_alias(),
+                }),
+                name: Some(name),
+            });
+        }
+    }
+    let width = stream_columns.len();
 
-    // The ephemeral rows are [g.., args.., weight]; the synthesized table's
-    // trailing weight column provides the extra slot.
-    let eph_table = Arc::new(synthesized_view_table(
+    let sink = open_ephemeral_delta(
+        program,
         &format!("{view_name}_joined_delta"),
-        0,
-        k + n_args,
-    ));
-    let eph_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(eph_table));
-    program.emit_insn(Insn::OpenEphemeral {
-        cursor_id: eph_cursor_id,
-        is_table: true,
-    });
+        dag::StreamSchema {
+            columns: stream_columns,
+            bindings: tables
+                .iter()
+                .map(|(table, identifier, _, logical_id)| dag::StreamBinding {
+                    table: table.clone(),
+                    identifier: identifier.clone(),
+                    logical_id: *logical_id,
+                })
+                .collect(),
+        },
+        DeltaIdentity::BindingRowids(tables.len()),
+        true,
+    );
+    let channel = sink.ephemeral()?;
+    let eph_cursor_id = channel.cursor_id;
 
-    // [g.., args.., weight], contiguous for MakeRecord.
-    let eph_rec_start = program.alloc_registers(k + n_args + 1);
-    let eph_weight_reg = eph_rec_start + k + n_args;
+    // [input rowids.., natural join row.., weight].
+    let eph_rec_start = program.alloc_registers(channel.identity_width() + width + 1);
+    let eph_value_start = eph_rec_start + channel.identity_width();
+    let eph_weight_reg = eph_value_start + width;
     let eph_rowid_reg = program.alloc_register();
     let eph_record_reg = program.alloc_register();
-    // The join phase computes each inner match's weight here. It is distinct
-    // from `eph_weight_reg` because a LEFT join's per-match aux gosub (below)
-    // fires before the inner row is written and overwrites `eph_weight_reg`
-    // with the padded row's ±1; the phase weight must survive that.
-    let phase_weight_reg = program.alloc_register();
 
-    // Project the group keys and aggregate arguments of the row under
-    // `table_references` into `dst..dst + k + n_args`. Shared by the inner
-    // phases (over the matched pair) and the padded-row writer (over the left
-    // row with NULLs on the right).
-    let project_group_args = |program: &mut ProgramBuilder,
-                              table_references: &mut TableReferences,
-                              dst: usize|
-     -> Result<()> {
-        for (i, group_expr) in group_exprs.iter().enumerate() {
-            let mut bound = group_expr.clone();
-            bind_and_rewrite_expr(
-                &mut bound,
-                Some(table_references),
-                None,
-                resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            )?;
-            translate_expr_no_constant_opt(
-                program,
-                Some(table_references),
-                &bound,
-                dst + i,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-        }
-        for (agg, pos) in aggregates.iter().zip(&arg_positions) {
-            let (Some(arg), Some(pos)) = (agg.args.first(), pos) else {
-                continue;
-            };
-            let mut bound = arg.clone();
-            bind_and_rewrite_expr(
-                &mut bound,
-                Some(table_references),
-                None,
-                resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            )?;
-            translate_expr_no_constant_opt(
-                program,
-                Some(table_references),
-                &bound,
-                dst + k + pos,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-        }
-        Ok(())
-    };
-
-    // Append `[g.., args..]` at `eph_rec_start` plus `eph_weight_reg` as a row
-    // of the ephemeral.
     let emit_eph_insert = |program: &mut ProgramBuilder| {
         program.emit_insn(Insn::MakeRecord {
             start_reg: eph_rec_start as u16,
-            count: (k + n_args + 1) as u16,
+            count: (channel.identity_width() + width + 1) as u16,
             dest_reg: eph_record_reg as u16,
             index_name: None,
             affinity_str: None,
@@ -4623,262 +5429,433 @@ fn emit_join_deltas_to_ephemeral(
         });
     };
 
-    // LEFT join: emit the padded-row transitions through the shared
-    // per-left-row aux, whose payload stores each padded row's `[g.., args..]`
-    // so a retraction can be emitted even after the left row is gone.
-    struct EphOuter {
-        aux: LeftJoinAux,
-        main_label: BranchOffset,
-        corrupt_label: BranchOffset,
-        end_label: BranchOffset,
-        left_rowid_reg: usize,
-    }
-    let outer = if left_outer {
-        turso_assert!(
-            tables.len() == 2,
-            "classify admits aggregate over LEFT JOIN for exactly two tables"
-        );
-        let aux_name = format!(
-            "{}{}_{view_name}{}",
-            crate::schema::DBSP_MULTISET_TABLE_PREFIX,
-            crate::incremental::view::DBSP_CIRCUIT_VERSION,
-            ns.suffix,
-        );
-        let aux_table = schema.get_btree_table(&aux_name).ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "aux table {aux_name} of materialized view {view_name} not found"
-            ))
-        })?;
-        let aux_index = schema
-            .get_indices(&aux_name)
-            .next()
-            .cloned()
-            .ok_or_else(|| {
-                LimboError::InternalError(format!(
-                    "aux table {aux_name} of materialized view {view_name} has no index"
-                ))
-            })?;
-
-        let zero_reg = program.alloc_register();
-        let prev_rowid_scratch = program.alloc_register();
-        let left_rowid_reg = program.alloc_register();
-        let corrupt_label = program.allocate_label();
-        let main_label = program.allocate_label();
-        let end_label = program.allocate_label();
-
-        // Padded-row cursors: the left btree (seeked to the padded left row)
-        // and the right btree on its null row, so a projection reads the left
-        // values with NULLs on the right.
-        let pad_ids: Vec<_> = (0..tables.len())
-            .map(|_| program.table_reference_counter.next())
-            .collect();
-        let mut pad_references = TableReferences::new(
-            tables
-                .iter()
-                .zip(&pad_ids)
-                .map(|((table, ident, using), id)| make_joined_table(table, ident, using, *id))
-                .collect(),
-            vec![],
-        );
-        let pad_cursors: Vec<usize> = tables
-            .iter()
-            .zip(&pad_ids)
-            .map(|((table, _, _), id)| {
-                let cursor_id = program.alloc_cursor_id_keyed(
-                    CursorKey::table(*id),
-                    CursorType::BTreeTable(table.clone()),
-                );
-                program.emit_insn(Insn::OpenRead {
-                    cursor_id,
-                    root_page: table.root_page,
-                    db: 0,
-                });
-                cursor_id
-            })
-            .collect();
-        let pad_where = match where_clause {
-            Some(where_expr) => {
-                let mut bound = where_expr.as_ref().clone();
-                bind_and_rewrite_expr(
-                    &mut bound,
-                    Some(&mut pad_references),
-                    None,
-                    resolver,
-                    BindingBehavior::ResultColumnsNotAllowed,
-                )?;
-                Some(bound)
-            }
-            None => None,
-        };
-
-        let aux = LeftJoinAux::open(
-            program,
-            aux_name,
-            &aux_table,
-            &aux_index,
-            k + n_args,
-            zero_reg,
-            prev_rowid_scratch,
-            corrupt_label,
-        );
-        let content_start = aux.content_start;
-        program.emit_int(0, zero_reg);
-        program.emit_insn(Insn::Goto {
-            target_pc: main_label,
-        });
-
-        // Padded add: project the padded row into the aux payload (persisted
-        // by the aux write) and emit it with +1; padded remove: emit the
-        // stored payload with −1.
-        let mut emit_padded_add = |program: &mut ProgramBuilder,
-                                   _pad_cursors: &[usize],
-                                   pad_references: &mut TableReferences,
-                                   _srid: usize|
-         -> Result<()> {
-            project_group_args(program, pad_references, content_start)?;
-            program.emit_insn(Insn::Copy {
-                src_reg: content_start,
-                dst_reg: eph_rec_start,
-                extra_amount: (k + n_args).saturating_sub(1),
-            });
-            program.emit_int(1, eph_weight_reg);
-            emit_eph_insert(program);
-            Ok(())
-        };
-        let mut emit_padded_remove = |program: &mut ProgramBuilder, _srid: usize| -> Result<()> {
-            program.emit_insn(Insn::Copy {
-                src_reg: content_start,
-                dst_reg: eph_rec_start,
-                extra_amount: (k + n_args).saturating_sub(1),
-            });
-            program.emit_int(-1, eph_weight_reg);
-            emit_eph_insert(program);
-            Ok(())
-        };
-        aux.emit_subroutine(
-            program,
-            resolver,
-            &pad_cursors,
-            &mut pad_references,
-            pad_where.as_ref(),
-            &mut emit_padded_add,
-            &mut emit_padded_remove,
-        )?;
-
-        program.preassign_label_to_next_insn(main_label);
-        aux.emit_presence_pass(program, input, &tables[0].0, view_name);
-        Some(EphOuter {
-            aux,
-            main_label,
-            corrupt_label,
-            end_label,
-            left_rowid_reg,
-        })
-    } else {
-        None
-    };
-
     for (sides, negate) in join_subset_phases(tables.len(), input) {
         emit_join_phase(
             program,
             resolver,
             view_name,
-            &tables,
+            deltas,
+            tables,
+            arrangements,
             &conditions,
             &sides,
             negate,
-            phase_weight_reg,
-            &mut |program, cursors, table_references| {
-                let skip_label = program.allocate_label();
-                if let Some(outer) = &outer {
-                    // Count every ON match against its left row (suppresses
-                    // that row's padded output), then let WHERE gate only
-                    // whether this inner row reaches the aggregate. The count
-                    // gosub may write padded rows and clobber eph_weight_reg,
-                    // so the inner weight is copied from phase_weight_reg
-                    // afterwards.
-                    program.emit_insn(Insn::RowId {
-                        cursor_id: cursors[0],
-                        dest: outer.left_rowid_reg,
-                    });
-                    outer
-                        .aux
-                        .emit_count_match(program, outer.left_rowid_reg, phase_weight_reg);
-                    if let Some(where_expr) = where_clause.as_deref() {
-                        let mut bound = where_expr.clone();
-                        bind_and_rewrite_expr(
-                            &mut bound,
-                            Some(table_references),
-                            None,
-                            resolver,
-                            BindingBehavior::ResultColumnsNotAllowed,
-                        )?;
-                        let pass_label = program.allocate_label();
-                        translate_condition_expr(
-                            program,
-                            table_references,
-                            &bound,
-                            ConditionMetadata {
-                                jump_if_condition_is_true: false,
-                                jump_target_when_true: pass_label,
-                                jump_target_when_false: skip_label,
-                                jump_target_when_null: skip_label,
-                            },
-                            resolver,
-                        )?;
-                        program.preassign_label_to_next_insn(pass_label);
+            eph_weight_reg,
+            &mut |program, cursors, _table_references, _resolver| {
+                for (position, cursor_id) in cursors.iter().enumerate() {
+                    match (&sides[position], &deltas[position]) {
+                        (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
+                            program.emit_insn(Insn::Column {
+                                cursor_id: *cursor_id,
+                                column: 0,
+                                dest: eph_rec_start + position,
+                                default: None,
+                            });
+                            turso_assert!(
+                                channel.identity == DeltaIdentity::OperatorRowid,
+                                "arranged join delta must carry its state rowid"
+                            );
+                        }
+                        _ => program.emit_insn(Insn::RowId {
+                            cursor_id: *cursor_id,
+                            dest: eph_rec_start + position,
+                        }),
                     }
                 }
-                project_group_args(program, table_references, eph_rec_start)?;
-                program.emit_insn(Insn::Copy {
-                    src_reg: phase_weight_reg,
-                    dst_reg: eph_weight_reg,
-                    extra_amount: 0,
-                });
+                let mut destination = eph_value_start;
+                for (position, ((table, _, _, _), cursor_id)) in
+                    tables.iter().zip(cursors).enumerate()
+                {
+                    for column in 0..table.columns().len() {
+                        match (&sides[position], &deltas[position]) {
+                            (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
+                                program.emit_insn(Insn::Column {
+                                    cursor_id: *cursor_id,
+                                    column: channel.value_start + column,
+                                    dest: destination,
+                                    default: None,
+                                });
+                            }
+                            (JoinSide::Btree, _) => program.emit_column_or_rowid(
+                                *cursor_id,
+                                arrangements[position].value_columns()[column],
+                                destination,
+                            ),
+                            (JoinSide::Delta, DeltaSource::BaseTable { .. }) => {
+                                program.emit_column_or_rowid(*cursor_id, column, destination);
+                            }
+                        }
+                        destination += 1;
+                    }
+                }
+                turso_assert!(
+                    destination == eph_value_start + width,
+                    "join stream row does not match its declared schema"
+                );
                 emit_eph_insert(program);
-                program.preassign_label_to_next_insn(skip_label);
                 Ok(())
             },
         )?;
     }
 
-    if let Some(outer) = &outer {
-        program.emit_insn(Insn::Goto {
-            target_pc: outer.end_label,
-        });
-        program.preassign_label_to_next_insn(outer.corrupt_label);
-        program.emit_insn(Insn::Halt {
-            err_code: crate::error::SQLITE_ERROR,
-            description: format!("materialized view {view_name} state is corrupted"),
-            on_error: None,
-            description_reg: None,
-        });
-        program.preassign_label_to_next_insn(outer.end_label);
-        let _ = outer.main_label;
-    }
+    sink.source()
+}
 
-    // Table references over the join tables for the caller's HAVING
-    // translation.
-    let having_references = TableReferences::new(
-        tables
+fn emit_operator_keyed_ephemeral_row(
+    program: &mut ProgramBuilder,
+    output: &EphemeralDelta,
+    kind: i64,
+    source_identity_start: usize,
+    source_identity_width: usize,
+    values_start: usize,
+    weight_reg: usize,
+) {
+    turso_assert!(
+        output.identity == DeltaIdentity::OperatorKey(2)
+            && source_identity_width > 0
+            && output.value_start == 2,
+        "operator-keyed delta rows carry kind, packed source identity, values, and weight"
+    );
+    let record_start = program.alloc_registers(2 + output.width + 1);
+    program.emit_int(kind, record_start);
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: source_identity_start as u16,
+        count: source_identity_width as u16,
+        dest_reg: (record_start + 1) as u16,
+        index_name: None,
+        affinity_str: None,
+    });
+    if output.width > 0 {
+        program.emit_insn(Insn::Copy {
+            src_reg: values_start,
+            dst_reg: record_start + output.value_start,
+            extra_amount: output.width - 1,
+        });
+    }
+    program.emit_insn(Insn::Copy {
+        src_reg: weight_reg,
+        dst_reg: record_start + output.weight_column,
+        extra_amount: 0,
+    });
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: record_start as u16,
+        count: (2 + output.width + 1) as u16,
+        dest_reg: record_reg as u16,
+        index_name: None,
+        affinity_str: None,
+    });
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: output.cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: output.cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        table_name: String::new(),
+    });
+}
+
+fn emit_natural_join_values(
+    program: &mut ProgramBuilder,
+    tables: &[JoinTable],
+    arrangements: &[ArrangementHandle],
+    cursors: &[usize],
+    values_start: usize,
+) -> usize {
+    let mut destination = values_start;
+    for (((table, _, _, _), arrangement), cursor) in tables.iter().zip(arrangements).zip(cursors) {
+        for column in 0..table.columns().len() {
+            program.emit_column_or_rowid(*cursor, arrangement.value_columns()[column], destination);
+            destination += 1;
+        }
+    }
+    destination
+}
+
+/// Emit a two-input LEFT JOIN as one typed z-set stream.
+///
+/// Matched rows use `(0, packed(left identity, right identity))`; padded rows
+/// use `(1, packed(aux rowid))`. The auxiliary table persists the padded
+/// natural row so a departing left row can publish its old image. An explicit
+/// output arrangement then normalizes both key forms to one operator rowid
+/// before any downstream consumer sees them.
+#[allow(clippy::too_many_arguments)]
+fn emit_left_join_deltas_to_ephemeral(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    node_id: dag::NodeId,
+    contract: &JoinContract,
+    output_schema: dag::StreamSchema,
+    input: MaintenanceInput,
+    operator_state: &OperatorStateDef,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<DeltaSource> {
+    let n = contract.tables.len();
+    turso_assert!(n == 2, "DAG validation admits LEFT JOIN for two inputs");
+
+    let sink = open_ephemeral_delta(
+        program,
+        &format!("{view_name}_left_join_delta_{node_id}"),
+        output_schema,
+        DeltaIdentity::OperatorKey(2),
+        true,
+    );
+    let output = sink.ephemeral()?;
+    let natural_width = contract
+        .tables
+        .iter()
+        .map(|(table, _, _, _)| table.columns().len())
+        .sum::<usize>();
+    turso_assert!(
+        output.width == natural_width,
+        "LEFT JOIN output stream must contain its natural row"
+    );
+
+    let aux_name = operator_state.auxiliary_table_name()?.to_string();
+    let aux_table = schema.get_btree_table(&aux_name).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "aux table {aux_name} of materialized view {view_name} not found"
+        ))
+    })?;
+    let aux_index = schema
+        .get_indices(&aux_name)
+        .next()
+        .cloned()
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "aux table {aux_name} of materialized view {view_name} has no index"
+            ))
+        })?;
+
+    let syms = connection.syms.read();
+    let mut resolver = Resolver::new(
+        schema,
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        &syms,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        Arc::new(crate::dialect::SqliteDialect),
+    );
+
+    let zero_reg = program.alloc_register();
+    let one_reg = program.alloc_register();
+    let prev_rowid_scratch = program.alloc_register();
+    let corrupt_label = program.allocate_label();
+    let main_start_label = program.allocate_label();
+    let end_label = program.allocate_label();
+    let pair_identity_start = program.alloc_registers(n);
+    let matched_values_start = program.alloc_registers(natural_width);
+    let matched_weight_reg = program.alloc_register();
+
+    let pad_ids: Vec<_> = (0..n)
+        .map(|_| program.table_reference_counter.next())
+        .collect();
+    let mut pad_references = TableReferences::new(
+        contract
+            .tables
             .iter()
-            .map(|(table, ident, using)| {
-                let id = program.table_reference_counter.next();
-                make_joined_table(table, ident, using, id)
-            })
+            .zip(&pad_ids)
+            .map(|((table, ident, using, _), id)| make_joined_table(table, ident, using, *id))
             .collect(),
         vec![],
     );
+    let pad_cursors: Vec<usize> = contract
+        .arrangements
+        .iter()
+        .zip(&pad_ids)
+        .map(|(arrangement, id)| {
+            let table = arrangement.table();
+            let cursor_id = program.alloc_cursor_id_keyed(
+                CursorKey::table(*id),
+                CursorType::BTreeTable(table.clone()),
+            );
+            program.emit_insn(Insn::OpenRead {
+                cursor_id,
+                root_page: table.root_page,
+                db: 0,
+            });
+            cursor_id
+        })
+        .collect();
+    let outer = LeftJoinAux::open(
+        program,
+        aux_name,
+        &aux_table,
+        &aux_index,
+        natural_width,
+        zero_reg,
+        prev_rowid_scratch,
+        corrupt_label,
+    );
+    let padded_values_start = outer.content_start;
 
-    Ok((
-        eph_cursor_id,
-        JoinAggCtx {
-            k,
-            n_args,
-            arg_positions: arg_positions.clone(),
-        },
-        having_references,
-    ))
+    program.emit_int(0, zero_reg);
+    program.emit_int(1, one_reg);
+    program.emit_insn(Insn::Goto {
+        target_pc: main_start_label,
+    });
+
+    let mut emit_padded_add = |program: &mut ProgramBuilder,
+                               pad_cursors: &[usize],
+                               _pad_references: &mut TableReferences,
+                               srid_reg: usize|
+     -> Result<()> {
+        let end = emit_natural_join_values(
+            program,
+            &contract.tables,
+            &contract.arrangements,
+            pad_cursors,
+            padded_values_start,
+        );
+        turso_assert!(
+            end == padded_values_start + natural_width,
+            "padded LEFT JOIN row does not match its output schema"
+        );
+        emit_operator_keyed_ephemeral_row(
+            program,
+            &output,
+            1,
+            srid_reg,
+            1,
+            padded_values_start,
+            one_reg,
+        );
+        Ok(())
+    };
+    let mut emit_padded_remove = |program: &mut ProgramBuilder, srid_reg: usize| -> Result<()> {
+        let negative_one_reg = program.alloc_register();
+        program.emit_int(-1, negative_one_reg);
+        emit_operator_keyed_ephemeral_row(
+            program,
+            &output,
+            1,
+            srid_reg,
+            1,
+            padded_values_start,
+            negative_one_reg,
+        );
+        Ok(())
+    };
+    outer.emit_subroutine(
+        program,
+        &resolver,
+        &pad_cursors,
+        &mut pad_references,
+        None,
+        &mut emit_padded_add,
+        &mut emit_padded_remove,
+    )?;
+
+    program.preassign_label_to_next_insn(main_start_label);
+    outer.emit_presence_pass(
+        program,
+        input,
+        &contract.deltas[0],
+        &contract.arrangements[0],
+        contract.tables[0].0.columns().len(),
+        view_name,
+    )?;
+
+    let conditions = contract.on.iter().collect::<Vec<_>>();
+    for (sides, negate) in join_subset_phases(n, input) {
+        emit_join_phase(
+            program,
+            &mut resolver,
+            view_name,
+            &contract.deltas,
+            &contract.tables,
+            &contract.arrangements,
+            &conditions,
+            &sides,
+            negate,
+            matched_weight_reg,
+            &mut |program, cursors, _table_references, _resolver| {
+                for (position, cursor) in cursors.iter().enumerate() {
+                    match (&sides[position], &contract.deltas[position]) {
+                        (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
+                            turso_assert!(
+                                channel.identity == DeltaIdentity::OperatorRowid,
+                                "arranged LEFT JOIN delta must carry its arrangement rowid"
+                            );
+                            program.emit_insn(Insn::Column {
+                                cursor_id: *cursor,
+                                column: 0,
+                                dest: pair_identity_start + position,
+                                default: None,
+                            });
+                        }
+                        _ => program.emit_insn(Insn::RowId {
+                            cursor_id: *cursor,
+                            dest: pair_identity_start + position,
+                        }),
+                    }
+                }
+                outer.emit_count_match(program, pair_identity_start, matched_weight_reg);
+                let mut destination = matched_values_start;
+                for (position, ((table, _, _, _), cursor)) in
+                    contract.tables.iter().zip(cursors).enumerate()
+                {
+                    for column in 0..table.columns().len() {
+                        match (&sides[position], &contract.deltas[position]) {
+                            (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
+                                program.emit_insn(Insn::Column {
+                                    cursor_id: *cursor,
+                                    column: channel.value_start + column,
+                                    dest: destination,
+                                    default: None,
+                                });
+                            }
+                            (JoinSide::Btree, _) => program.emit_column_or_rowid(
+                                *cursor,
+                                contract.arrangements[position].value_columns()[column],
+                                destination,
+                            ),
+                            (JoinSide::Delta, DeltaSource::BaseTable { .. }) => {
+                                program.emit_column_or_rowid(*cursor, column, destination);
+                            }
+                        }
+                        destination += 1;
+                    }
+                }
+                turso_assert!(
+                    destination == matched_values_start + natural_width,
+                    "matched LEFT JOIN row does not match its output schema"
+                );
+                emit_operator_keyed_ephemeral_row(
+                    program,
+                    &output,
+                    0,
+                    pair_identity_start,
+                    n,
+                    matched_values_start,
+                    matched_weight_reg,
+                );
+                Ok(())
+            },
+        )?;
+    }
+
+    program.emit_insn(Insn::Goto {
+        target_pc: end_label,
+    });
+    program.preassign_label_to_next_insn(corrupt_label);
+    program.emit_insn(Insn::Halt {
+        err_code: crate::error::SQLITE_ERROR,
+        description: format!("materialized view {view_name} state is corrupted"),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(end_label);
+    drop(syms);
+    sink.source()
 }
 
 /// Consumer hook that materializes one NULL-padded output row: given the
@@ -4891,8 +5868,7 @@ type PaddedAddFn<'a> =
 type PaddedRemoveFn<'a> = dyn FnMut(&mut ProgramBuilder, usize) -> Result<()> + 'a;
 
 /// Per-left-row NULL-padded bookkeeping for a two-table LEFT (or swapped
-/// RIGHT) join, shared by every consumer of the join's output: the standalone
-/// join view, and an aggregate reading the join.
+/// RIGHT) join view.
 ///
 /// A LEFT join's output is the inner matches plus one NULL-padded row for each
 /// left row with no ON-match. The inner rows are a plain function of the
@@ -4938,9 +5914,8 @@ struct LeftJoinAux {
     index_record_reg: usize,
     /// Optional padded-output payload stored in the aux row after `padded`:
     /// its first register and width. A consumer that must retract a padded
-    /// row it cannot reproject (e.g. an aggregate feed, whose left row may be
-    /// gone by removal time) writes the payload here on add and reads it back
-    /// on remove. Zero width for the standalone view, which retracts by rowid.
+    /// row it cannot reproject after the left row is gone writes the payload
+    /// here on add and reads it back on remove.
     content_start: usize,
     content_width: usize,
     // Shared scratch owned by the caller.
@@ -5293,28 +6268,39 @@ impl LeftJoinAux {
         &self,
         program: &mut ProgramBuilder,
         input: MaintenanceInput,
-        left_table: &Arc<BTreeTable>,
+        delta: &DeltaSource,
+        arrangement: &ArrangementHandle,
+        logical_width: usize,
         view_name: &str,
-    ) {
-        let num_left_columns = left_table.columns().len();
+    ) -> Result<()> {
         let input_cursor_id = match input {
-            MaintenanceInput::TransactionDelta => {
-                let cursor_id = program.alloc_cursor_id(CursorType::ViewDelta {
-                    view_name: view_name.to_string(),
-                    table: left_table.clone(),
-                });
-                program.emit_insn(Insn::OpenRead {
-                    cursor_id,
-                    root_page: 0,
-                    db: 0,
-                });
-                cursor_id
-            }
+            MaintenanceInput::TransactionDelta => match delta {
+                DeltaSource::BaseTable {
+                    table: delta_table, ..
+                } => {
+                    turso_assert!(
+                        arrangement.table().root_page == delta_table.root_page,
+                        "outer-join presence delta and arrangement must describe the same relation"
+                    );
+                    let cursor_id = program.alloc_cursor_id(CursorType::ViewDelta {
+                        view_name: view_name.to_string(),
+                        table: delta_table.clone(),
+                    });
+                    program.emit_insn(Insn::OpenRead {
+                        cursor_id,
+                        root_page: 0,
+                        db: 0,
+                    });
+                    cursor_id
+                }
+                DeltaSource::Ephemeral(channel) => channel.cursor_id,
+            },
             MaintenanceInput::BaseTable => {
-                let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(left_table.clone()));
+                let table = arrangement.table();
+                let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
                 program.emit_insn(Insn::OpenRead {
                     cursor_id,
-                    root_page: left_table.root_page,
+                    root_page: table.root_page,
                     db: 0,
                 });
                 cursor_id
@@ -5329,21 +6315,48 @@ impl LeftJoinAux {
         program.preassign_label_to_next_insn(pass_loop);
         match input {
             MaintenanceInput::TransactionDelta => {
+                let weight_column = match delta {
+                    DeltaSource::BaseTable { .. } => logical_width,
+                    DeltaSource::Ephemeral(channel) => channel.weight_column,
+                };
                 program.emit_insn(Insn::Column {
                     cursor_id: input_cursor_id,
-                    column: num_left_columns,
+                    column: weight_column,
                     dest: self.dp_reg,
                     default: None,
                 });
             }
             MaintenanceInput::BaseTable => {
-                program.emit_int(1, self.dp_reg);
+                if let Some(column) = arrangement.count_column() {
+                    program.emit_insn(Insn::Column {
+                        cursor_id: input_cursor_id,
+                        column,
+                        dest: self.dp_reg,
+                        default: None,
+                    });
+                } else {
+                    program.emit_int(1, self.dp_reg);
+                }
             }
         }
-        program.emit_insn(Insn::RowId {
-            cursor_id: input_cursor_id,
-            dest: self.akey_start,
-        });
+        match (input, delta) {
+            (MaintenanceInput::TransactionDelta, DeltaSource::Ephemeral(channel)) => {
+                turso_assert!(
+                    channel.identity == DeltaIdentity::OperatorRowid,
+                    "arranged LEFT JOIN input must carry its arrangement rowid"
+                );
+                program.emit_insn(Insn::Column {
+                    cursor_id: input_cursor_id,
+                    column: 0,
+                    dest: self.akey_start,
+                    default: None,
+                });
+            }
+            _ => program.emit_insn(Insn::RowId {
+                cursor_id: input_cursor_id,
+                dest: self.akey_start,
+            }),
+        }
         program.emit_int(0, self.dm_reg);
         program.emit_insn(Insn::Gosub {
             target_pc: self.merge_label,
@@ -5354,6 +6367,7 @@ impl LeftJoinAux {
             pc_if_next: pass_loop,
         });
         program.preassign_label_to_next_insn(pass_done);
+        Ok(())
     }
 
     /// Emit a match-count delta for the left row at `left_rowid_reg`, weighted
@@ -5382,1039 +6396,6 @@ impl LeftJoinAux {
             return_reg: self.return_reg,
         });
     }
-}
-
-/// A content-keyed z-set **arrangement**: a hidden `(c0..c{w-1}, count)` table
-/// holding a pipeline-breaker operator's current output — one row per distinct
-/// output tuple, with a signed occurrence count. It lets a downstream operator
-/// consume that output the same way it consumes a base table: as current
-/// contents it can probe (rows with a positive count, multiplicity = count)
-/// plus a stream of `(row, weight)` deltas. That single interface is what
-/// composes outer joins and joins of joins — the padded rows an outer join
-/// produces are not a function of the base tables, so a consumer that must
-/// retract one reads its old image from here rather than reconstructing it.
-///
-/// [`Self::emit_apply_subroutine`] applies one `(row, weight)` delta: it folds
-/// the weight into the stored count — mirroring the join state z-set, counts
-/// may dip negative within a transaction and a row is present only while its
-/// count is positive — inserting a row that crosses from zero and deleting one
-/// that crosses to zero, and appends the same `(row, weight)` to an
-/// output-delta ephemeral the consumer reads. Introduced ahead of its
-/// consumers (LEFT-over-3+-tables and FULL joins); unreferenced until then.
-#[allow(dead_code)]
-struct Arrangement {
-    table_name: String,
-    index_name: String,
-    /// The arrangement table (current contents) and its content-key index.
-    cursor_id: usize,
-    index_cursor_id: usize,
-    /// The per-transaction output-delta ephemeral: rows `[c0..c{w-1}, weight]`.
-    delta_cursor_id: usize,
-    /// Number of content columns.
-    width: usize,
-    /// Caller fills `key_start..key_start + width` with the delta row's content
-    /// and `weight_reg` with its signed weight, then `Gosub(apply_label)`.
-    /// `key_start + width` doubles as the row's arrangement rowid slot (so
-    /// `key_start` is the `[content.., rowid]` index record).
-    key_start: usize,
-    weight_reg: usize,
-    apply_label: BranchOffset,
-    return_reg: usize,
-    // Working registers, private to the subroutine.
-    srid_reg: usize,
-    count_reg: usize,
-    new_count_reg: usize,
-    rec_start: usize,
-    table_record_reg: usize,
-    index_record_reg: usize,
-    delta_rec_start: usize,
-    delta_rowid_reg: usize,
-    delta_record_reg: usize,
-    // Shared scratch owned by the caller.
-    zero_reg: usize,
-    prev_rowid_scratch: usize,
-    corrupt_label: BranchOffset,
-}
-
-#[allow(dead_code)]
-impl Arrangement {
-    /// Open the arrangement table, its content-key index, and a fresh
-    /// output-delta ephemeral, and allocate the subroutine's registers.
-    #[allow(clippy::too_many_arguments)]
-    fn open(
-        program: &mut ProgramBuilder,
-        table_name: String,
-        table: &Arc<BTreeTable>,
-        index: &Arc<crate::schema::Index>,
-        width: usize,
-        zero_reg: usize,
-        prev_rowid_scratch: usize,
-        corrupt_label: BranchOffset,
-    ) -> Self {
-        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id,
-            root_page: RegisterOrLiteral::Literal(table.root_page),
-            db: 0,
-        });
-        let index_cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: index_cursor_id,
-            root_page: RegisterOrLiteral::Literal(index.root_page),
-            db: 0,
-        });
-        let delta_table = Arc::new(synthesized_view_table(
-            &format!("{table_name}_delta"),
-            0,
-            width,
-        ));
-        let delta_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(delta_table));
-        program.emit_insn(Insn::OpenEphemeral {
-            cursor_id: delta_cursor_id,
-            is_table: true,
-        });
-
-        // [content.., rowid], contiguous for Found/IdxInsert/IdxDelete.
-        let key_start = program.alloc_registers(width + 1);
-        let srid_reg = key_start + width;
-        // [content.., count], the table row image.
-        let rec_start = program.alloc_registers(width + 1);
-        let count_reg = rec_start + width;
-        // [content.., weight], the delta ephemeral row image.
-        let delta_rec_start = program.alloc_registers(width + 1);
-
-        Self {
-            table_name,
-            index_name: index.name.clone(),
-            cursor_id,
-            index_cursor_id,
-            delta_cursor_id,
-            width,
-            key_start,
-            weight_reg: program.alloc_register(),
-            apply_label: program.allocate_label(),
-            return_reg: program.alloc_register(),
-            srid_reg,
-            count_reg,
-            new_count_reg: program.alloc_register(),
-            rec_start,
-            table_record_reg: program.alloc_register(),
-            index_record_reg: program.alloc_register(),
-            delta_rec_start,
-            delta_rowid_reg: program.alloc_register(),
-            delta_record_reg: program.alloc_register(),
-            zero_reg,
-            prev_rowid_scratch,
-            corrupt_label,
-        }
-    }
-
-    /// Emit the apply-delta subroutine, reached by `Gosub(self.apply_label)`.
-    fn emit_apply_subroutine(&self, program: &mut ProgramBuilder) {
-        program.preassign_label_to_next_insn(self.apply_label);
-        let m_found = program.allocate_label();
-        let m_update = program.allocate_label();
-        let m_delta = program.allocate_label();
-
-        program.emit_insn(Insn::Found {
-            cursor_id: self.index_cursor_id,
-            target_pc: m_found,
-            record_reg: self.key_start,
-            num_regs: self.width,
-        });
-        // Unknown tuple: record its weight as the initial count, whatever the
-        // sign (a retraction can arrive before the matching insertion).
-        program.emit_insn(Insn::NewRowid {
-            cursor: self.cursor_id,
-            rowid_reg: self.srid_reg,
-            prev_largest_reg: self.prev_rowid_scratch,
-        });
-        program.emit_insn(Insn::Copy {
-            src_reg: self.key_start,
-            dst_reg: self.rec_start,
-            extra_amount: self.width.saturating_sub(1),
-        });
-        program.emit_insn(Insn::Copy {
-            src_reg: self.weight_reg,
-            dst_reg: self.count_reg,
-            extra_amount: 0,
-        });
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: self.rec_start as u16,
-            count: (self.width + 1) as u16,
-            dest_reg: self.table_record_reg as u16,
-            index_name: None,
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::Insert {
-            cursor: self.cursor_id,
-            key_reg: self.srid_reg,
-            record_reg: self.table_record_reg,
-            flag: InsertFlags(
-                InsertFlags::REQUIRE_SEEK
-                    | InsertFlags::SKIP_LAST_ROWID
-                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-            ),
-            table_name: self.table_name.clone(),
-        });
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: self.key_start as u16,
-            count: (self.width + 1) as u16,
-            dest_reg: self.index_record_reg as u16,
-            index_name: Some(self.index_name.clone()),
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::IdxInsert {
-            cursor_id: self.index_cursor_id,
-            record_reg: self.index_record_reg,
-            unpacked_start: Some(self.key_start),
-            unpacked_count: Some((self.width + 1) as u16),
-            flags: IdxInsertFlags::new(),
-        });
-        program.emit_insn(Insn::Goto {
-            target_pc: m_delta,
-        });
-
-        program.preassign_label_to_next_insn(m_found);
-        program.emit_insn(Insn::IdxRowId {
-            cursor_id: self.index_cursor_id,
-            dest: self.srid_reg,
-        });
-        program.emit_insn(Insn::SeekRowid {
-            cursor_id: self.cursor_id,
-            src_reg: self.srid_reg,
-            target_pc: self.corrupt_label,
-        });
-        program.emit_insn(Insn::Column {
-            cursor_id: self.cursor_id,
-            column: self.width,
-            dest: self.count_reg,
-            default: None,
-        });
-        program.emit_insn(Insn::Add {
-            lhs: self.weight_reg,
-            rhs: self.count_reg,
-            dest: self.new_count_reg,
-        });
-        program.emit_insn(Insn::Ne {
-            lhs: self.new_count_reg,
-            rhs: self.zero_reg,
-            target_pc: m_update,
-            flags: CmpInsFlags::default(),
-            collation: None,
-        });
-        // Count reached zero: the tuple is gone.
-        program.emit_insn(Insn::IdxDelete {
-            start_reg: self.key_start,
-            num_regs: self.width + 1,
-            cursor_id: self.index_cursor_id,
-            raise_error_if_no_matching_entry: true,
-        });
-        program.emit_insn(Insn::Delete {
-            cursor_id: self.cursor_id,
-            table_name: self.table_name.clone(),
-            is_part_of_update: true,
-        });
-        program.emit_insn(Insn::Goto {
-            target_pc: m_delta,
-        });
-
-        // Count changed but is nonzero: rewrite the row in place (the content
-        // key, hence the index, is unchanged).
-        program.preassign_label_to_next_insn(m_update);
-        program.emit_insn(Insn::Copy {
-            src_reg: self.key_start,
-            dst_reg: self.rec_start,
-            extra_amount: self.width.saturating_sub(1),
-        });
-        program.emit_insn(Insn::Copy {
-            src_reg: self.new_count_reg,
-            dst_reg: self.count_reg,
-            extra_amount: 0,
-        });
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: self.rec_start as u16,
-            count: (self.width + 1) as u16,
-            dest_reg: self.table_record_reg as u16,
-            index_name: None,
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::Insert {
-            cursor: self.cursor_id,
-            key_reg: self.srid_reg,
-            record_reg: self.table_record_reg,
-            flag: InsertFlags(
-                InsertFlags::REQUIRE_SEEK
-                    | InsertFlags::SKIP_LAST_ROWID
-                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-            ),
-            table_name: self.table_name.clone(),
-        });
-
-        // Emit the (row, weight) delta to the consumer, whatever the count
-        // transition: multiplicity-sensitive consumers need the signed change
-        // even when the tuple stays present.
-        program.preassign_label_to_next_insn(m_delta);
-        program.emit_insn(Insn::Copy {
-            src_reg: self.key_start,
-            dst_reg: self.delta_rec_start,
-            extra_amount: self.width.saturating_sub(1),
-        });
-        program.emit_insn(Insn::Copy {
-            src_reg: self.weight_reg,
-            dst_reg: self.delta_rec_start + self.width,
-            extra_amount: 0,
-        });
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: self.delta_rec_start as u16,
-            count: (self.width + 1) as u16,
-            dest_reg: self.delta_record_reg as u16,
-            index_name: None,
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::NewRowid {
-            cursor: self.delta_cursor_id,
-            rowid_reg: self.delta_rowid_reg,
-            prev_largest_reg: 0,
-        });
-        program.emit_insn(Insn::Insert {
-            cursor: self.delta_cursor_id,
-            key_reg: self.delta_rowid_reg,
-            record_reg: self.delta_record_reg,
-            flag: InsertFlags::new().is_ephemeral_table_insert(),
-            table_name: String::new(),
-        });
-        program.emit_insn(Insn::Return {
-            return_reg: self.return_reg,
-            can_fallthrough: false,
-        });
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_join(
-    program: &mut ProgramBuilder,
-    view_name: &str,
-    columns: &[ast::ResultColumn],
-    tables: &[JoinTable],
-    on_conditions: &[ast::Expr],
-    where_clause: Option<&ast::Expr>,
-    left_outer: bool,
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
-    ns: &BranchNamespace,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<()> {
-    let n = tables.len();
-    turso_assert!(
-        !left_outer || n == 2,
-        "classify_view admits LEFT JOIN for exactly two tables"
-    );
-    // For an inner join ON and WHERE gate matches identically, so they merge
-    // into one innermost predicate list. For LEFT JOIN they differ: ON
-    // decides whether a pair is a match (which suppresses the NULL-padded
-    // row), while WHERE only decides whether the matched row reaches the
-    // view — a pair passing ON but failing WHERE still counts as a match
-    // and produces nothing.
-    let conditions: Vec<&ast::Expr> = if left_outer {
-        on_conditions.iter().collect()
-    } else {
-        on_conditions.iter().chain(where_clause).collect()
-    };
-
-    let state_table_name = format!(
-        "{}{}_{view_name}{}",
-        crate::schema::DBSP_TABLE_PREFIX,
-        crate::incremental::view::DBSP_CIRCUIT_VERSION,
-        ns.suffix,
-    );
-    let state_table = schema.get_btree_table(&state_table_name).ok_or_else(|| {
-        LimboError::InternalError(format!(
-            "state table {state_table_name} of materialized view {view_name} not found"
-        ))
-    })?;
-    let state_index = schema
-        .get_indices(&state_table_name)
-        .next()
-        .cloned()
-        .ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "state table {state_table_name} of materialized view {view_name} has no index"
-            ))
-        })?;
-    // LEFT JOIN: per-left-row (present, matches, padded) bookkeeping in the
-    // auxiliary table.
-    let aux = if left_outer {
-        let name = format!(
-            "{}{}_{view_name}{}",
-            crate::schema::DBSP_MULTISET_TABLE_PREFIX,
-            crate::incremental::view::DBSP_CIRCUIT_VERSION,
-            ns.suffix,
-        );
-        let table = schema.get_btree_table(&name).ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "aux table {name} of materialized view {view_name} not found"
-            ))
-        })?;
-        let index = schema.get_indices(&name).next().cloned().ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "aux table {name} of materialized view {view_name} has no index"
-            ))
-        })?;
-        Some((name, table, index))
-    } else {
-        None
-    };
-
-    let syms = connection.syms.read();
-    let resolver = Resolver::new(
-        schema,
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        &syms,
-        connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
-    );
-
-    let state_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(state_table.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: state_cursor_id,
-        root_page: RegisterOrLiteral::Literal(state_table.root_page),
-        db: 0,
-    });
-    let state_index_cursor_id =
-        program.alloc_cursor_id(CursorType::BTreeIndex(state_index.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: state_index_cursor_id,
-        root_page: RegisterOrLiteral::Literal(state_index.root_page),
-        db: 0,
-    });
-    let view_btree = Arc::new(synthesized_view_table(
-        view_name,
-        view_root_page,
-        num_view_columns,
-    ));
-    let view_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(view_btree));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: view_cursor_id,
-        root_page: RegisterOrLiteral::Literal(view_root_page),
-        db: 0,
-    });
-
-    // Register layout, shared by all phases: the merge subroutine reads the
-    // rowid tuple, the projected outputs, and the contribution weight.
-    let zero_reg = program.alloc_register();
-    let gosub_return_reg = program.alloc_register();
-    let prev_rowid_scratch = program.alloc_register();
-    // [rowids.., state_rowid], contiguous for Found/IdxInsert/IdxDelete.
-    let pair_start = program.alloc_registers(n + 1);
-    let srid_reg = pair_start + n;
-    // [outputs.., weight], contiguous for MakeRecord.
-    let out_start = program.alloc_registers(num_view_columns + 1);
-    let out_weight_reg = out_start + num_view_columns;
-    // [rowids.., multiplicity], the state row image.
-    let state_rec_start = program.alloc_registers(n + 1);
-    let state_mult_reg = state_rec_start + n;
-    let w_reg = program.alloc_register();
-    let cur_w_reg = program.alloc_register();
-    let new_w_reg = program.alloc_register();
-    let state_record_reg = program.alloc_register();
-    let index_record_reg = program.alloc_register();
-    let view_record_reg = program.alloc_register();
-    // LEFT JOIN registers: view rowids split across the two state tables
-    // (2*rowid for inner rows, 2*rowid + 1 for padded rows).
-    let view_rowid_reg = program.alloc_register();
-    let two_reg = program.alloc_register();
-    let one_reg = program.alloc_register();
-
-    let merge_label = program.allocate_label();
-    let main_start_label = program.allocate_label();
-    let corrupt_label = program.allocate_label();
-    let end_label = program.allocate_label();
-
-    // LEFT JOIN: dedicated left and right btree read cursors (with their own
-    // table references) for the NULL-padded row — the right cursor is put on
-    // its null row so every column read yields NULL — plus the per-left-row
-    // aux bookkeeping subroutine.
-    let outer = if let Some((aux_name, aux_table, aux_index)) = &aux {
-        let pad_ids: Vec<_> = (0..n)
-            .map(|_| program.table_reference_counter.next())
-            .collect();
-        let mut pad_references = TableReferences::new(
-            tables
-                .iter()
-                .zip(&pad_ids)
-                .map(|((table, ident, using), id)| make_joined_table(table, ident, using, *id))
-                .collect(),
-            vec![],
-        );
-        let pad_cursors: Vec<usize> = tables
-            .iter()
-            .zip(&pad_ids)
-            .map(|((table, _, _), id)| {
-                let cursor_id = program.alloc_cursor_id_keyed(
-                    CursorKey::table(*id),
-                    CursorType::BTreeTable(table.clone()),
-                );
-                program.emit_insn(Insn::OpenRead {
-                    cursor_id,
-                    root_page: table.root_page,
-                    db: 0,
-                });
-                cursor_id
-            })
-            .collect();
-        // Bind the WHERE clause against the padded-row references once; the
-        // aux-merge subroutine evaluates it over (left row, NULL right).
-        let pad_where = match where_clause {
-            Some(where_expr) => {
-                let mut bound = where_expr.clone();
-                bind_and_rewrite_expr(
-                    &mut bound,
-                    Some(&mut pad_references),
-                    None,
-                    &resolver,
-                    BindingBehavior::ResultColumnsNotAllowed,
-                )?;
-                Some(bound)
-            }
-            None => None,
-        };
-        let aux = LeftJoinAux::open(
-            program,
-            aux_name.clone(),
-            aux_table,
-            aux_index,
-            // The standalone view retracts a padded row by its split rowid, so
-            // it stores no payload.
-            0,
-            zero_reg,
-            prev_rowid_scratch,
-            corrupt_label,
-        );
-        Some((pad_references, pad_cursors, pad_where, aux))
-    } else {
-        None
-    };
-
-    program.emit_int(0, zero_reg);
-    program.emit_int(2, two_reg);
-    program.emit_int(1, one_reg);
-
-    program.emit_insn(Insn::Goto {
-        target_pc: main_start_label,
-    });
-
-    // Weight-merge subroutine: apply (pair, outputs, w) to the state and
-    // view btrees. The state row carries the pair's signed multiplicity: the
-    // delta phase decomposition can retract a pair before the matching
-    // insertion arrives (a pair that exists only across the transaction's
-    // old/new generations), so multiplicities dip below zero transiently and
-    // must be recorded rather than dropped — otherwise the later positive
-    // contribution materializes a phantom row. The view row exists only
-    // while the multiplicity is positive; after a full application every
-    // pair converges to 0 (gone) or 1.
-    program.preassign_label_to_next_insn(merge_label);
-    let m_found_label = program.allocate_label();
-    let m_update_label = program.allocate_label();
-    let m_visible_label = program.allocate_label();
-    let m_write_label = program.allocate_label();
-    let m_ret_label = program.allocate_label();
-    program.emit_insn(Insn::Found {
-        cursor_id: state_index_cursor_id,
-        target_pc: m_found_label,
-        record_reg: pair_start,
-        num_regs: n,
-    });
-    // Unknown tuple: record its multiplicity, whatever the sign.
-    program.emit_insn(Insn::NewRowid {
-        cursor: state_cursor_id,
-        rowid_reg: srid_reg,
-        prev_largest_reg: prev_rowid_scratch,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: pair_start,
-        dst_reg: state_rec_start,
-        extra_amount: n - 1,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: w_reg,
-        dst_reg: state_mult_reg,
-        extra_amount: 0,
-    });
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: state_rec_start as u16,
-        count: (n + 1) as u16,
-        dest_reg: state_record_reg as u16,
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: state_cursor_id,
-        key_reg: srid_reg,
-        record_reg: state_record_reg,
-        flag: InsertFlags(
-            InsertFlags::REQUIRE_SEEK
-                | InsertFlags::SKIP_LAST_ROWID
-                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-        ),
-        table_name: state_table_name.clone(),
-    });
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: pair_start as u16,
-        count: (n + 1) as u16,
-        dest_reg: index_record_reg as u16,
-        index_name: Some(state_index.name.clone()),
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::IdxInsert {
-        cursor_id: state_index_cursor_id,
-        record_reg: index_record_reg,
-        unpacked_start: Some(pair_start),
-        unpacked_count: Some((n + 1) as u16),
-        flags: IdxInsertFlags::new(),
-    });
-    program.emit_insn(Insn::Lt {
-        lhs: w_reg,
-        rhs: zero_reg,
-        target_pc: m_ret_label,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: w_reg,
-        dst_reg: out_weight_reg,
-        extra_amount: 0,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: m_write_label,
-    });
-
-    program.preassign_label_to_next_insn(m_found_label);
-    program.emit_insn(Insn::IdxRowId {
-        cursor_id: state_index_cursor_id,
-        dest: srid_reg,
-    });
-    program.emit_insn(Insn::SeekRowid {
-        cursor_id: state_cursor_id,
-        src_reg: srid_reg,
-        target_pc: corrupt_label,
-    });
-    program.emit_insn(Insn::Column {
-        cursor_id: state_cursor_id,
-        column: n,
-        dest: cur_w_reg,
-        default: None,
-    });
-    program.emit_insn(Insn::Add {
-        lhs: w_reg,
-        rhs: cur_w_reg,
-        dest: new_w_reg,
-    });
-    program.emit_insn(Insn::Ne {
-        lhs: new_w_reg,
-        rhs: zero_reg,
-        target_pc: m_update_label,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-    // Multiplicity reached zero: the tuple is gone. Its view row exists only
-    // if the tuple was visible (positive) before this contribution.
-    program.emit_insn(Insn::IdxDelete {
-        start_reg: pair_start,
-        num_regs: n + 1,
-        cursor_id: state_index_cursor_id,
-        raise_error_if_no_matching_entry: true,
-    });
-    program.emit_insn(Insn::Delete {
-        cursor_id: state_cursor_id,
-        table_name: state_table_name.clone(),
-        is_part_of_update: true,
-    });
-    program.emit_insn(Insn::Lt {
-        lhs: cur_w_reg,
-        rhs: zero_reg,
-        target_pc: m_ret_label,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-    emit_split_view_rowid(
-        program,
-        left_outer,
-        srid_reg,
-        two_reg,
-        one_reg,
-        view_rowid_reg,
-        false,
-        ns,
-    );
-    program.emit_insn(Insn::SeekRowid {
-        cursor_id: view_cursor_id,
-        src_reg: view_rowid_reg,
-        target_pc: corrupt_label,
-    });
-    program.emit_insn(Insn::Delete {
-        cursor_id: view_cursor_id,
-        table_name: view_name.to_string(),
-        is_part_of_update: true,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: m_ret_label,
-    });
-
-    // Multiplicity changed but is nonzero: rewrite the state row, and write
-    // or remove the view row per the new sign. Unit contributions cannot
-    // jump from positive to negative (they pass through zero above), so a
-    // nonpositive new multiplicity means the pair was not visible before.
-    program.preassign_label_to_next_insn(m_update_label);
-    program.emit_insn(Insn::Copy {
-        src_reg: pair_start,
-        dst_reg: state_rec_start,
-        extra_amount: n - 1,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: new_w_reg,
-        dst_reg: state_mult_reg,
-        extra_amount: 0,
-    });
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: state_rec_start as u16,
-        count: (n + 1) as u16,
-        dest_reg: state_record_reg as u16,
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: state_cursor_id,
-        key_reg: srid_reg,
-        record_reg: state_record_reg,
-        flag: InsertFlags(
-            InsertFlags::REQUIRE_SEEK
-                | InsertFlags::SKIP_LAST_ROWID
-                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-        ),
-        table_name: state_table_name,
-    });
-    program.emit_insn(Insn::Gt {
-        lhs: new_w_reg,
-        rhs: zero_reg,
-        target_pc: m_visible_label,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: m_ret_label,
-    });
-
-    program.preassign_label_to_next_insn(m_visible_label);
-    program.emit_insn(Insn::Copy {
-        src_reg: new_w_reg,
-        dst_reg: out_weight_reg,
-        extra_amount: 0,
-    });
-    program.preassign_label_to_next_insn(m_write_label);
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: out_start as u16,
-        count: (num_view_columns + 1) as u16,
-        dest_reg: view_record_reg as u16,
-        index_name: None,
-        affinity_str: None,
-    });
-    emit_split_view_rowid(
-        program,
-        left_outer,
-        srid_reg,
-        two_reg,
-        one_reg,
-        view_rowid_reg,
-        false,
-        ns,
-    );
-    program.emit_insn(Insn::Insert {
-        cursor: view_cursor_id,
-        key_reg: view_rowid_reg,
-        record_reg: view_record_reg,
-        flag: InsertFlags(
-            InsertFlags::REQUIRE_SEEK
-                | InsertFlags::SKIP_LAST_ROWID
-                | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-        ),
-        table_name: view_name.to_string(),
-    });
-    program.preassign_label_to_next_insn(m_ret_label);
-    program.emit_insn(Insn::Return {
-        return_reg: gosub_return_reg,
-        can_fallthrough: false,
-    });
-
-    // LEFT JOIN aux-merge subroutine (in [`LeftJoinAux::emit_subroutine`]):
-    // the standalone view materializes each NULL-padded row into the view
-    // btree at its split rowid (2*aux_rowid + 1) and retracts it by that
-    // rowid, so it never needs the departing row's old image.
-    let outer = if let Some((mut pad_references, pad_cursors, pad_where, aux)) = outer {
-        let mut emit_padded_add = |program: &mut ProgramBuilder,
-                                   pad_cursors: &[usize],
-                                   pad_references: &mut TableReferences,
-                                   srid_reg: usize|
-         -> Result<()> {
-            emit_join_projection(
-                program,
-                &resolver,
-                columns,
-                tables,
-                pad_cursors,
-                pad_references,
-                out_start,
-                num_view_columns,
-            )?;
-            program.emit_int(1, out_weight_reg);
-            program.emit_insn(Insn::MakeRecord {
-                start_reg: out_start as u16,
-                count: (num_view_columns + 1) as u16,
-                dest_reg: view_record_reg as u16,
-                index_name: None,
-                affinity_str: None,
-            });
-            emit_split_view_rowid(
-                program,
-                true,
-                srid_reg,
-                two_reg,
-                one_reg,
-                view_rowid_reg,
-                true,
-                ns,
-            );
-            program.emit_insn(Insn::Insert {
-                cursor: view_cursor_id,
-                key_reg: view_rowid_reg,
-                record_reg: view_record_reg,
-                flag: InsertFlags(
-                    InsertFlags::REQUIRE_SEEK
-                        | InsertFlags::SKIP_LAST_ROWID
-                        | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-                ),
-                table_name: view_name.to_string(),
-            });
-            Ok(())
-        };
-        let mut emit_padded_remove =
-            |program: &mut ProgramBuilder, srid_reg: usize| -> Result<()> {
-                emit_split_view_rowid(
-                    program,
-                    true,
-                    srid_reg,
-                    two_reg,
-                    one_reg,
-                    view_rowid_reg,
-                    true,
-                    ns,
-                );
-                program.emit_insn(Insn::SeekRowid {
-                    cursor_id: view_cursor_id,
-                    src_reg: view_rowid_reg,
-                    target_pc: corrupt_label,
-                });
-                program.emit_insn(Insn::Delete {
-                    cursor_id: view_cursor_id,
-                    table_name: view_name.to_string(),
-                    is_part_of_update: true,
-                });
-                Ok(())
-            };
-        aux.emit_subroutine(
-            program,
-            &resolver,
-            &pad_cursors,
-            &mut pad_references,
-            pad_where.as_ref(),
-            &mut emit_padded_add,
-            &mut emit_padded_remove,
-        )?;
-        Some(aux)
-    } else {
-        None
-    };
-
-    program.preassign_label_to_next_insn(main_start_label);
-
-    // LEFT JOIN: the left-input pass updates each touched left row's
-    // presence (a new unmatched left row reaches no join phase). During
-    // population the input is the full left btree, so every left row gets
-    // its bookkeeping row before the join phase counts its matches.
-    if let Some(aux) = &outer {
-        aux.emit_presence_pass(program, input, &tables[0].0, view_name);
-    }
-
-    for (sides, negate) in join_subset_phases(n, input) {
-        emit_join_phase(
-            program,
-            &resolver,
-            view_name,
-            tables,
-            &conditions,
-            &sides,
-            negate,
-            w_reg,
-            &mut |program, cursors, table_references| {
-                // Row identity: the source-rowid tuple, in table order.
-                for (pos, cursor_id) in cursors.iter().enumerate() {
-                    program.emit_insn(Insn::RowId {
-                        cursor_id: *cursor_id,
-                        dest: pair_start + pos,
-                    });
-                }
-
-                let skip_label = program.allocate_label();
-                if let Some(aux) = &outer {
-                    // Every ON match adjusts the left row's match count,
-                    // whether or not WHERE lets the inner row through.
-                    aux.emit_count_match(program, pair_start, w_reg);
-                    // WHERE gates only the inner view row (the match was
-                    // already counted above).
-                    if let Some(where_expr) = where_clause {
-                        let mut bound = where_expr.clone();
-                        bind_and_rewrite_expr(
-                            &mut bound,
-                            Some(table_references),
-                            None,
-                            &resolver,
-                            BindingBehavior::ResultColumnsNotAllowed,
-                        )?;
-                        let pass_label = program.allocate_label();
-                        translate_condition_expr(
-                            program,
-                            table_references,
-                            &bound,
-                            ConditionMetadata {
-                                jump_if_condition_is_true: false,
-                                jump_target_when_true: pass_label,
-                                jump_target_when_false: skip_label,
-                                jump_target_when_null: skip_label,
-                            },
-                            &resolver,
-                        )?;
-                        program.preassign_label_to_next_insn(pass_label);
-                    }
-                }
-
-                emit_join_projection(
-                    program,
-                    &resolver,
-                    columns,
-                    tables,
-                    cursors,
-                    table_references,
-                    out_start,
-                    num_view_columns,
-                )?;
-
-                program.emit_insn(Insn::Gosub {
-                    target_pc: merge_label,
-                    return_reg: gosub_return_reg,
-                });
-                program.preassign_label_to_next_insn(skip_label);
-                Ok(())
-            },
-        )?;
-    }
-
-    program.emit_insn(Insn::Goto {
-        target_pc: end_label,
-    });
-    program.preassign_label_to_next_insn(corrupt_label);
-    program.emit_insn(Insn::Halt {
-        err_code: crate::error::SQLITE_ERROR,
-        description: format!("materialized view {view_name} state is corrupted"),
-        on_error: None,
-        description_reg: None,
-    });
-    program.preassign_label_to_next_insn(end_label);
-
-    drop(syms);
-    Ok(())
-}
-
-/// Emit the projection of a join view's result columns into
-/// `out_start..out_start + num_view_columns`, with every joined cursor
-/// positioned (`cursors` maps table positions to cursor ids). Shared by the
-/// inner-row sink and the LEFT JOIN padded-row writer, whose right cursor
-/// sits on its null row so every read yields NULL.
-#[allow(clippy::too_many_arguments)]
-fn emit_join_projection(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    columns: &[ast::ResultColumn],
-    tables: &[JoinTable],
-    cursors: &[usize],
-    table_references: &mut TableReferences,
-    out_start: usize,
-    num_view_columns: usize,
-) -> Result<()> {
-    let mut out_reg = out_start;
-    for column in columns {
-        match column {
-            ast::ResultColumn::Expr(expr, _) => {
-                let mut bound = expr.as_ref().clone();
-                bind_and_rewrite_expr(
-                    &mut bound,
-                    Some(table_references),
-                    None,
-                    resolver,
-                    BindingBehavior::ResultColumnsNotAllowed,
-                )?;
-                translate_expr_no_constant_opt(
-                    program,
-                    Some(table_references),
-                    &bound,
-                    out_reg,
-                    resolver,
-                    NoConstantOptReason::RegisterReuse,
-                )?;
-                out_reg += 1;
-            }
-            ast::ResultColumn::Star => {
-                // A USING (or NATURAL) join merges its columns: the right
-                // table's copy is not part of the star expansion.
-                for ((table, _, using), cursor_id) in tables.iter().zip(cursors) {
-                    for (i, col) in table.columns().iter().enumerate() {
-                        if using.iter().any(|u| {
-                            col.name
-                                .as_deref()
-                                .is_some_and(|n| n.eq_ignore_ascii_case(u))
-                        }) {
-                            continue;
-                        }
-                        program.emit_column_or_rowid(*cursor_id, i, out_reg);
-                        out_reg += 1;
-                    }
-                }
-            }
-            ast::ResultColumn::TableStar(name) => {
-                let target = crate::util::normalize_ident(name.as_str());
-                let Some(pos) = tables
-                    .iter()
-                    .position(|(_, ident, _)| crate::util::normalize_ident(ident) == target)
-                else {
-                    return Err(LimboError::ParseError(format!("no such table: {target}")));
-                };
-                for (i, _col) in tables[pos].0.columns().iter().enumerate() {
-                    program.emit_column_or_rowid(cursors[pos], i, out_reg);
-                    out_reg += 1;
-                }
-            }
-        }
-    }
-    let num_projected = out_reg - out_start;
-    turso_assert!(
-        num_projected == num_view_columns,
-        "projection produced {num_projected} columns, view declares {num_view_columns}"
-    );
-    Ok(())
 }
 
 /// Emit `dst = 1` if the count in `src` is positive, else `0`. Counts are
@@ -6484,7 +6465,6 @@ fn emit_visibility_fold(
 /// from two independent tables, so they map to disjoint view rowids:
 /// 2*rowid for content rows, 2*rowid + 1 for append rows. With a single
 /// state table the state rowid is the view rowid, as everywhere else.
-#[allow(clippy::too_many_arguments)]
 fn emit_split_view_rowid(
     program: &mut ProgramBuilder,
     both_tables: bool,
@@ -6493,7 +6473,6 @@ fn emit_split_view_rowid(
     one_reg: usize,
     dst: usize,
     append: bool,
-    ns: &BranchNamespace,
 ) {
     if both_tables {
         program.emit_insn(Insn::Multiply {
@@ -6515,53 +6494,78 @@ fn emit_split_view_rowid(
             extra_amount: 0,
         });
     }
-    // Namespace into this branch's slice of the shared compound btree. The
-    // both-tables split and a branch namespace never co-occur (LEFT joins
-    // and dedup compounds are never compound branches).
-    ns.apply_in_place(program, dst);
 }
 
-/// Compile the maintenance (or population) program for a compound SELECT
-/// view (UNION, UNION ALL, INTERSECT, EXCEPT) over filter/project branches.
-///
-/// Each branch is an independent single-table delta stream (or scan during
-/// population). Branches in the dedup prefix funnel through a per-branch
-/// weight-merge subroutine keyed by the row's output content: the state row
-/// keeps one signed count per prefix branch, and the view row exists while
-/// the visibility fold over those counts is true. Branches in the trailing
-/// UNION ALL suffix keep (branch, source rowid) identity — duplicates are
-/// distinct view rows — through one append-merge subroutine, in the state
-/// table when the whole chain is UNION ALL and in the auxiliary multiset
-/// table when a dedup prefix owns the state table.
-#[allow(clippy::too_many_arguments)]
-/// One filter/project branch of a compound view: the base table it scans,
-/// the identifier its columns bind under, its projected result columns, and
-/// its WHERE. Extracted from either the branch `OneSelect` or its DAG
-/// sub-tree so the compound maintenance body is agnostic to its source.
-struct BranchContent {
-    base_table: Arc<BTreeTable>,
-    identifier: String,
-    columns: Vec<ast::ResultColumn>,
-    where_clause: Option<ast::Expr>,
+fn emit_ephemeral_row_with_identity(
+    program: &mut ProgramBuilder,
+    output: &EphemeralDelta,
+    identity_reg: usize,
+    values_start: usize,
+    weight_reg: usize,
+) {
+    turso_assert!(
+        output.identity == DeltaIdentity::OperatorRowid && output.value_start == 1,
+        "arranged operator output streams carry one stable state rowid"
+    );
+    let record_start = program.alloc_registers(1 + output.width + 1);
+    program.emit_insn(Insn::Copy {
+        src_reg: identity_reg,
+        dst_reg: record_start,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: values_start,
+        dst_reg: record_start + 1,
+        extra_amount: output.width.saturating_sub(1),
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: weight_reg,
+        dst_reg: record_start + 1 + output.width,
+        extra_amount: 0,
+    });
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: record_start as u16,
+        count: (1 + output.width + 1) as u16,
+        dest_reg: record_reg as u16,
+        index_name: None,
+        affinity_str: None,
+    });
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: output.cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: output.cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        table_name: String::new(),
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_compound_program(
+fn emit_deduplicating_set_op(
+    program: &mut ProgramBuilder,
     view_name: &str,
-    branches: &[BranchContent],
+    branch_streams: &[EphemeralDelta],
     operators: &[ast::CompoundOperator],
     prefix_len: usize,
     key_collations: &[CollationSeq],
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
+    output: &EphemeralDelta,
+    operator_state: &OperatorStateDef,
     schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<Program> {
-    let n_branches = branches.len();
-    let has_prefix = prefix_len > 0;
+) -> Result<()> {
+    let n_branches = branch_streams.len();
+    let num_view_columns = output.width;
+    turso_assert!(
+        prefix_len > 0,
+        "pure UNION ALL uses stateless branch composition"
+    );
     let has_append = prefix_len < n_branches;
-    let both_tables = has_prefix && has_append;
+    let materializes_append = has_append;
     // Width of the content key: every output column.
     let k = num_view_columns;
     // With a collated dedup key, values that compare equal can differ in
@@ -6572,11 +6576,7 @@ fn emit_compound_program(
         .iter()
         .any(|c| !matches!(c, CollationSeq::Binary | CollationSeq::Unset));
 
-    let state_table_name = format!(
-        "{}{}_{view_name}",
-        crate::schema::DBSP_TABLE_PREFIX,
-        crate::incremental::view::DBSP_CIRCUIT_VERSION
-    );
+    let state_table_name = operator_state.state_table_name()?.to_string();
     let state_table = schema.get_btree_table(&state_table_name).ok_or_else(|| {
         LimboError::InternalError(format!(
             "state table {state_table_name} of materialized view {view_name} not found"
@@ -6591,14 +6591,9 @@ fn emit_compound_program(
                 "state table {state_table_name} of materialized view {view_name} has no index"
             ))
         })?;
-    // The append rows' home: the state table for a pure UNION ALL chain,
-    // the auxiliary multiset table when a dedup prefix owns the state table.
-    let (append_table_name, append_table, append_index) = if both_tables {
-        let name = format!(
-            "{}{}_{view_name}",
-            crate::schema::DBSP_MULTISET_TABLE_PREFIX,
-            crate::incremental::view::DBSP_CIRCUIT_VERSION
-        );
+    // Trailing UNION ALL rows preserve source identity in the auxiliary table.
+    let (append_table_name, append_table, append_index) = if materializes_append {
+        let name = operator_state.auxiliary_table_name()?.to_string();
         let table = schema.get_btree_table(&name).ok_or_else(|| {
             LimboError::InternalError(format!(
                 "append table {name} of materialized view {view_name} not found"
@@ -6618,47 +6613,20 @@ fn emit_compound_program(
         )
     };
 
-    let mut program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts {
-            num_cursors: 6 + branches.len(),
-            approx_num_insns: 128 + 48 * num_view_columns * branches.len(),
-            approx_num_labels: 24 + 8 * branches.len(),
-        },
-    );
-    program.prologue();
-
-    let syms = connection.syms.read();
-    let resolver = Resolver::new(
-        schema,
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        &syms,
-        connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
-    );
-
-    let content_cursors = if has_prefix {
-        let table_cursor = program.alloc_cursor_id(CursorType::BTreeTable(state_table.clone()));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: table_cursor,
-            root_page: RegisterOrLiteral::Literal(state_table.root_page),
-            db: 0,
-        });
-        let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(state_index.clone()));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: index_cursor,
-            root_page: RegisterOrLiteral::Literal(state_index.root_page),
-            db: 0,
-        });
-        Some((table_cursor, index_cursor))
-    } else {
-        None
-    };
-    let append_cursors = if has_append {
+    let state_cursor = program.alloc_cursor_id(CursorType::BTreeTable(state_table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: state_cursor,
+        root_page: RegisterOrLiteral::Literal(state_table.root_page),
+        db: 0,
+    });
+    let state_index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(state_index.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: state_index_cursor,
+        root_page: RegisterOrLiteral::Literal(state_index.root_page),
+        db: 0,
+    });
+    let content_cursors = (state_cursor, state_index_cursor);
+    let append_cursors = if materializes_append {
         let table_cursor = program.alloc_cursor_id(CursorType::BTreeTable(append_table.clone()));
         program.emit_insn(Insn::OpenWrite {
             cursor_id: table_cursor,
@@ -6675,18 +6643,6 @@ fn emit_compound_program(
     } else {
         None
     };
-    let view_btree = Arc::new(synthesized_view_table(
-        view_name,
-        view_root_page,
-        num_view_columns,
-    ));
-    let view_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(view_btree));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: view_cursor_id,
-        root_page: RegisterOrLiteral::Literal(view_root_page),
-        db: 0,
-    });
-
     // Register layout, shared by all branches.
     let zero_reg = program.alloc_register();
     let two_reg = program.alloc_register();
@@ -6696,7 +6652,6 @@ fn emit_compound_program(
     let out_start = program.alloc_registers(num_view_columns + 1);
     let out_weight_reg = out_start + num_view_columns;
     let w_reg = program.alloc_register();
-    let view_record_reg = program.alloc_register();
     let view_rowid_reg = program.alloc_register();
     // Content-merge registers: [key.., state_rowid] contiguous for
     // Found/IdxInsert/IdxDelete, and [key.., counts..] as the state row
@@ -6742,8 +6697,7 @@ fn emit_compound_program(
     // own, and a negative count reads as "absent" in the fold.
     let mut content_merge_labels = Vec::with_capacity(prefix_len);
     for b in 0..prefix_len {
-        let (state_cursor_id, state_index_cursor_id) =
-            content_cursors.expect("prefix branches imply the content state table");
+        let (state_cursor_id, state_index_cursor_id) = content_cursors;
         let cm_label = program.allocate_label();
         program.preassign_label_to_next_insn(cm_label);
         content_merge_labels.push(cm_label);
@@ -6850,7 +6804,7 @@ fn emit_compound_program(
             });
         }
         emit_visibility_fold(
-            &mut program,
+            program,
             operators,
             prefix_len,
             cnt_start,
@@ -6914,7 +6868,7 @@ fn emit_compound_program(
 
         program.preassign_label_to_next_insn(vnew_label);
         emit_visibility_fold(
-            &mut program,
+            program,
             operators,
             prefix_len,
             cnt_start,
@@ -6922,9 +6876,8 @@ fn emit_compound_program(
             p_scratch_reg,
             v_new_reg,
         );
-        // The view row changes only on visibility transitions: a row that
-        // stays visible keeps its stored first-seen content, so there is
-        // nothing to rewrite.
+        // Publish only visibility transitions. A row that stays visible keeps
+        // its stored first-seen content, so there is nothing to emit.
         program.emit_insn(Insn::Eq {
             lhs: v_old_reg,
             rhs: v_new_reg,
@@ -6937,61 +6890,46 @@ fn emit_compound_program(
             target_pc: insert_label,
             jump_if_null: false,
         });
-        // Visible before, not now: remove the view row.
+        // Visible before, not now: publish one retraction.
+        program.emit_int(-1, out_weight_reg);
         emit_split_view_rowid(
-            &mut program,
-            both_tables,
+            program,
+            has_append,
             c_srid_reg,
             two_reg,
             one_reg,
             view_rowid_reg,
             false,
-            &BranchNamespace::none(),
         );
-        program.emit_insn(Insn::SeekRowid {
-            cursor_id: view_cursor_id,
-            src_reg: view_rowid_reg,
-            target_pc: corrupt_label,
-        });
-        program.emit_insn(Insn::Delete {
-            cursor_id: view_cursor_id,
-            table_name: view_name.to_string(),
-            is_part_of_update: true,
-        });
+        emit_ephemeral_row_with_identity(
+            program,
+            output,
+            view_rowid_reg,
+            out_start,
+            out_weight_reg,
+        );
         program.emit_insn(Insn::Goto {
             target_pc: ret_label,
         });
 
         program.preassign_label_to_next_insn(insert_label);
         program.emit_int(1, out_weight_reg);
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: out_start as u16,
-            count: (num_view_columns + 1) as u16,
-            dest_reg: view_record_reg as u16,
-            index_name: None,
-            affinity_str: None,
-        });
         emit_split_view_rowid(
-            &mut program,
-            both_tables,
+            program,
+            has_append,
             c_srid_reg,
             two_reg,
             one_reg,
             view_rowid_reg,
             false,
-            &BranchNamespace::none(),
         );
-        program.emit_insn(Insn::Insert {
-            cursor: view_cursor_id,
-            key_reg: view_rowid_reg,
-            record_reg: view_record_reg,
-            flag: InsertFlags(
-                InsertFlags::REQUIRE_SEEK
-                    | InsertFlags::SKIP_LAST_ROWID
-                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-            ),
-            table_name: view_name.to_string(),
-        });
+        emit_ephemeral_row_with_identity(
+            program,
+            output,
+            view_rowid_reg,
+            out_start,
+            out_weight_reg,
+        );
         program.preassign_label_to_next_insn(ret_label);
         program.emit_insn(Insn::Return {
             return_reg: c_return_reg,
@@ -7011,6 +6949,9 @@ fn emit_compound_program(
         let m_found_label = program.allocate_label();
         let m_update_label = program.allocate_label();
         let m_visible_label = program.allocate_label();
+        let m_visible_delta_label = program.allocate_label();
+        let m_hidden_label = program.allocate_label();
+        let m_retract_label = program.allocate_label();
         let m_write_label = program.allocate_label();
         let m_ret_label = program.allocate_label();
         program.emit_insn(Insn::Found {
@@ -7066,20 +7007,20 @@ fn emit_compound_program(
             unpacked_count: Some(3),
             flags: IdxInsertFlags::new(),
         });
-        program.emit_insn(Insn::Lt {
-            lhs: w_reg,
-            rhs: zero_reg,
-            target_pc: m_ret_label,
-            flags: CmpInsFlags::default(),
-            collation: None,
-        });
         program.emit_insn(Insn::Copy {
             src_reg: w_reg,
             dst_reg: out_weight_reg,
             extra_amount: 0,
         });
-        program.emit_insn(Insn::Goto {
+        program.emit_insn(Insn::Gt {
+            lhs: w_reg,
+            rhs: zero_reg,
             target_pc: m_write_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: m_ret_label,
         });
 
         program.preassign_label_to_next_insn(m_found_label);
@@ -7123,35 +7064,8 @@ fn emit_compound_program(
             table_name: append_table_name.clone(),
             is_part_of_update: true,
         });
-        program.emit_insn(Insn::Lt {
-            lhs: cur_w_reg,
-            rhs: zero_reg,
-            target_pc: m_ret_label,
-            flags: CmpInsFlags::default(),
-            collation: None,
-        });
-        emit_split_view_rowid(
-            &mut program,
-            both_tables,
-            a_srid_reg,
-            two_reg,
-            one_reg,
-            view_rowid_reg,
-            true,
-            &BranchNamespace::none(),
-        );
-        program.emit_insn(Insn::SeekRowid {
-            cursor_id: view_cursor_id,
-            src_reg: view_rowid_reg,
-            target_pc: corrupt_label,
-        });
-        program.emit_insn(Insn::Delete {
-            cursor_id: view_cursor_id,
-            table_name: view_name.to_string(),
-            is_part_of_update: true,
-        });
         program.emit_insn(Insn::Goto {
-            target_pc: m_ret_label,
+            target_pc: m_hidden_label,
         });
 
         program.preassign_label_to_next_insn(m_update_label);
@@ -7191,44 +7105,104 @@ fn emit_compound_program(
             collation: None,
         });
         program.emit_insn(Insn::Goto {
-            target_pc: m_ret_label,
+            target_pc: m_hidden_label,
         });
 
         program.preassign_label_to_next_insn(m_visible_label);
+        // If the row was already visible, only its multiplicity delta is new
+        // downstream state. If it crosses from non-positive to positive,
+        // publish the complete newly-visible multiplicity; previously
+        // suppressed negative deltas must not escape.
+        program.emit_insn(Insn::Gt {
+            lhs: cur_w_reg,
+            rhs: zero_reg,
+            target_pc: m_visible_delta_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
         program.emit_insn(Insn::Copy {
             src_reg: new_w_reg,
             dst_reg: out_weight_reg,
             extra_amount: 0,
         });
-        program.preassign_label_to_next_insn(m_write_label);
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: out_start as u16,
-            count: (num_view_columns + 1) as u16,
-            dest_reg: view_record_reg as u16,
-            index_name: None,
-            affinity_str: None,
+        program.emit_insn(Insn::Goto {
+            target_pc: m_write_label,
         });
+        program.preassign_label_to_next_insn(m_visible_delta_label);
+        program.emit_insn(Insn::Copy {
+            src_reg: w_reg,
+            dst_reg: out_weight_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: m_write_label,
+        });
+
+        // A non-positive new multiplicity is invisible. Retract exactly the
+        // previously visible multiplicity, if any; retain negative state so a
+        // later positive contribution can converge without leaking a
+        // retraction for a row the downstream consumer has never seen.
+        program.preassign_label_to_next_insn(m_hidden_label);
+        program.emit_insn(Insn::Gt {
+            lhs: cur_w_reg,
+            rhs: zero_reg,
+            target_pc: m_retract_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: m_ret_label,
+        });
+        program.preassign_label_to_next_insn(m_retract_label);
         emit_split_view_rowid(
-            &mut program,
-            both_tables,
+            program,
+            has_append,
             a_srid_reg,
             two_reg,
             one_reg,
             view_rowid_reg,
             true,
-            &BranchNamespace::none(),
         );
-        program.emit_insn(Insn::Insert {
-            cursor: view_cursor_id,
-            key_reg: view_rowid_reg,
-            record_reg: view_record_reg,
-            flag: InsertFlags(
-                InsertFlags::REQUIRE_SEEK
-                    | InsertFlags::SKIP_LAST_ROWID
-                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
-            ),
-            table_name: view_name.to_string(),
+        program.emit_insn(Insn::Subtract {
+            lhs: zero_reg,
+            rhs: cur_w_reg,
+            dest: out_weight_reg,
         });
+        emit_ephemeral_row_with_identity(
+            program,
+            output,
+            view_rowid_reg,
+            out_start,
+            out_weight_reg,
+        );
+        program.emit_insn(Insn::Goto {
+            target_pc: m_ret_label,
+        });
+
+        program.preassign_label_to_next_insn(m_write_label);
+        // Fresh positive rows arrive here with `w_reg`; updated rows have
+        // already selected either their delta or their newly-visible weight.
+        program.emit_insn(Insn::IfNot {
+            reg: out_weight_reg,
+            target_pc: m_ret_label,
+            jump_if_null: true,
+        });
+        emit_split_view_rowid(
+            program,
+            has_append,
+            a_srid_reg,
+            two_reg,
+            one_reg,
+            view_rowid_reg,
+            true,
+        );
+        emit_ephemeral_row_with_identity(
+            program,
+            output,
+            view_rowid_reg,
+            out_start,
+            out_weight_reg,
+        );
         program.preassign_label_to_next_insn(m_ret_label);
         program.emit_insn(Insn::Return {
             return_reg: a_return_reg,
@@ -7239,149 +7213,34 @@ fn emit_compound_program(
 
     program.preassign_label_to_next_insn(main_start_label);
 
-    for (branch_idx, branch) in branches.iter().enumerate() {
-        let base_table = &branch.base_table;
-        let columns = &branch.columns;
-        let where_clause = branch.where_clause.as_ref();
-        let num_base_columns = base_table.columns().len();
-
-        let table_ref_id = program.table_reference_counter.next();
-        let mut table_references = TableReferences::new(
-            vec![JoinedTable {
-                op: Operation::Scan(Scan::BTreeTable {
-                    iter_dir: IterationDirection::Forwards,
-                    index: None,
-                }),
-                table: crate::schema::Table::BTree(base_table.clone()),
-                identifier: branch.identifier.clone(),
-                internal_id: table_ref_id,
-                join_info: None,
-                col_used_mask: ColumnUsedMask::default(),
-                column_use_counts: Vec::new(),
-                expression_index_usages: Vec::new(),
-                database_id: 0,
-                indexed: None,
-            }],
-            vec![],
-        );
-
-        let input_cursor_id = match input {
-            MaintenanceInput::TransactionDelta => {
-                let cursor_id = program.alloc_cursor_id_keyed(
-                    CursorKey::table(table_ref_id),
-                    CursorType::ViewDelta {
-                        view_name: view_name.to_string(),
-                        table: base_table.clone(),
-                    },
-                );
-                program.emit_insn(Insn::OpenRead {
-                    cursor_id,
-                    root_page: 0,
-                    db: 0,
-                });
-                cursor_id
-            }
-            MaintenanceInput::BaseTable => {
-                let cursor_id = program.alloc_cursor_id_keyed(
-                    CursorKey::table(table_ref_id),
-                    CursorType::BTreeTable(base_table.clone()),
-                );
-                program.emit_insn(Insn::OpenRead {
-                    cursor_id,
-                    root_page: base_table.root_page,
-                    db: 0,
-                });
-                cursor_id
-            }
-        };
-
+    for (branch_idx, stream) in branch_streams.iter().enumerate() {
         let branch_done_label = program.allocate_label();
         let loop_label = program.allocate_label();
         let next_label = program.allocate_label();
 
         program.emit_insn(Insn::Rewind {
-            cursor_id: input_cursor_id,
+            cursor_id: stream.cursor_id,
             pc_if_empty: branch_done_label,
         });
         program.preassign_label_to_next_insn(loop_label);
 
-        match input {
-            MaintenanceInput::TransactionDelta => {
-                program.emit_insn(Insn::Column {
-                    cursor_id: input_cursor_id,
-                    column: num_base_columns,
-                    dest: w_reg,
-                    default: None,
-                });
-            }
-            MaintenanceInput::BaseTable => {
-                program.emit_int(1, w_reg);
-            }
+        for column in 0..num_view_columns {
+            program.emit_insn(Insn::Column {
+                cursor_id: stream.cursor_id,
+                column: stream.value_start + column,
+                dest: out_start + column,
+                default: None,
+            });
         }
-
-        if let Some(where_expr) = where_clause {
-            let mut bound = where_expr.clone();
-            bind_and_rewrite_expr(
-                &mut bound,
-                Some(&mut table_references),
-                None,
-                &resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            )?;
-            let pred_true = program.allocate_label();
-            translate_condition_expr(
-                &mut program,
-                &table_references,
-                &bound,
-                ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_true: pred_true,
-                    jump_target_when_false: next_label,
-                    jump_target_when_null: next_label,
-                },
-                &resolver,
-            )?;
-            program.preassign_label_to_next_insn(pred_true);
-        }
-
-        let mut out_reg = out_start;
-        for column in columns {
-            match column {
-                ast::ResultColumn::Expr(expr, _) => {
-                    let mut bound = expr.as_ref().clone();
-                    bind_and_rewrite_expr(
-                        &mut bound,
-                        Some(&mut table_references),
-                        None,
-                        &resolver,
-                        BindingBehavior::ResultColumnsNotAllowed,
-                    )?;
-                    translate_expr_no_constant_opt(
-                        &mut program,
-                        Some(&table_references),
-                        &bound,
-                        out_reg,
-                        &resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
-                    out_reg += 1;
-                }
-                ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => {
-                    for (i, _col) in base_table.columns().iter().enumerate() {
-                        program.emit_column_or_rowid(input_cursor_id, i, out_reg);
-                        out_reg += 1;
-                    }
-                }
-            }
-        }
-        let num_projected = out_reg - out_start;
-        turso_assert!(
-            num_projected == num_view_columns,
-            "projection produced {num_projected} columns, view declares {num_view_columns}"
-        );
+        program.emit_insn(Insn::Column {
+            cursor_id: stream.cursor_id,
+            column: stream.weight_column,
+            dest: w_reg,
+            default: None,
+        });
 
         // Row identity: output content for dedup-prefix branches,
-        // (branch, rowid) for the trailing UNION ALL branches.
+        // (branch, source identity record) for trailing UNION ALL branches.
         if branch_idx < prefix_len {
             program.emit_insn(Insn::Copy {
                 src_reg: out_start,
@@ -7393,21 +7252,37 @@ fn emit_compound_program(
                 return_reg: c_return_reg,
             });
         } else {
+            turso_assert!(
+                stream.identity_width() > 0,
+                "UNION ALL suffix requires a stable source identity"
+            );
             program.emit_int(branch_idx as i64, akey_start);
-            program.emit_insn(Insn::RowId {
-                cursor_id: input_cursor_id,
-                dest: akey_start + 1,
+            let identity_start = program.alloc_registers(stream.identity_width());
+            for column in 0..stream.identity_width() {
+                program.emit_insn(Insn::Column {
+                    cursor_id: stream.cursor_id,
+                    column,
+                    dest: identity_start + column,
+                    default: None,
+                });
+            }
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: identity_start as u16,
+                count: stream.identity_width() as u16,
+                dest_reg: (akey_start + 1) as u16,
+                index_name: None,
+                affinity_str: None,
             });
             program.emit_insn(Insn::Gosub {
                 target_pc: append_merge_label
-                    .expect("append branches imply the append-merge subroutine"),
+                    .expect("UNION ALL suffix implies the append-merge subroutine"),
                 return_reg: a_return_reg,
             });
         }
 
         program.preassign_label_to_next_insn(next_label);
         program.emit_insn(Insn::Next {
-            cursor_id: input_cursor_id,
+            cursor_id: stream.cursor_id,
             pc_if_next: loop_label,
         });
         program.preassign_label_to_next_insn(branch_done_label);
@@ -7424,14 +7299,7 @@ fn emit_compound_program(
         description_reg: None,
     });
     program.preassign_label_to_next_insn(end_label);
-
-    program.epilogue(schema);
-    drop(syms);
-    program.build(
-        connection.clone(),
-        false,
-        "materialized view compound maintenance",
-    )
+    Ok(())
 }
 
 /// A minimal BTreeTable describing the view's on-disk layout (output columns

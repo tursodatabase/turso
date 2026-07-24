@@ -1225,13 +1225,11 @@ pub fn op_open_read(
         CursorType::ViewDelta { view_name, table } => {
             // In-memory cursor over the transaction's captured delta for one
             // base table of a materialized view. Opened by maintenance
-            // programs at commit time; the snapshot is taken here.
-            let delta_cursor = match program.connection.view_transaction_states.get(view_name) {
+            // programs when a pending batch is applied; the snapshot is taken
+            // here.
+            let delta_cursor = match program.connection.transaction_changes.get(view_name) {
                 Some(tx_state) => {
-                    let delta = tx_state
-                        .get_table_deltas()
-                        .remove(table.name.as_str())
-                        .unwrap_or_default();
+                    let delta = tx_state.table_delta(table);
                     crate::incremental::vdbe_maintenance::DeltaCursor::new(
                         delta,
                         table.columns().len(),
@@ -1246,7 +1244,7 @@ pub fn op_open_read(
                 .expect("cursor_id should be valid")
                 .replace(Cursor::new_delta(delta_cursor));
         }
-        CursorType::MaterializedView(_, view_mutex) => {
+        CursorType::MaterializedView(_, _) => {
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
 
@@ -1257,20 +1255,12 @@ pub fn op_open_read(
             ));
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
 
-            // Get the view name and look up or create its transaction state
-            let view_name = view_mutex.lock().name().to_string();
-            let tx_state = program
-                .connection
-                .view_transaction_states
-                .get_or_create(&view_name);
-
-            // Create materialized view cursor with this view's transaction state
+            // The cursor observes the transaction-wide change-log generation
+            // for read-your-own-writes.
             let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
                 cursor,
-                view_mutex.clone(),
                 pager,
                 program.connection.clone(),
-                tx_state,
             )?;
 
             cursors
@@ -1728,7 +1718,7 @@ pub fn op_rewind(
                 return_if_io!(mv_cursor.rewind());
                 !mv_cursor.is_valid()?
             }
-            Cursor::Delta(delta_cursor) => !delta_cursor.rewind(),
+            Cursor::Delta(delta_cursor) => !return_if_io!(delta_cursor.rewind()),
             _ => panic!("Rewind on non-btree/materialized-view cursor"),
         }
     };
@@ -3061,7 +3051,7 @@ pub fn op_next(
                 let has_more = return_if_io!(mv_cursor.next());
                 !has_more
             }
-            Cursor::Delta(delta_cursor) => !delta_cursor.next(),
+            Cursor::Delta(delta_cursor) => !return_if_io!(delta_cursor.next()),
             Cursor::IndexMethod(_) => {
                 let cursor = cursor.as_index_method_mut();
                 let has_more = return_if_io!(cursor.query_next());
@@ -3274,6 +3264,18 @@ pub fn halt(
 
     if program.is_trigger_subprogram() {
         return Ok(InsnFunctionStepResult::Done);
+    }
+
+    // Maintain materialized views before releasing this write statement's
+    // savepoint. The maintenance program is the sole evaluator for committed
+    // and same-transaction state, and its writes roll back atomically with the
+    // base-table statement on error. Internal helper statements leave the
+    // enclosing root statement in control of this batch.
+    if state.is_active_write && !program.connection.is_nested_stmt() {
+        match program.apply_pending_view_deltas(state, false, pager)? {
+            IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+            IOResult::Done(()) => {}
+        }
     }
 
     if auto_commit {
@@ -4509,6 +4511,7 @@ pub fn op_savepoint(
 
     match *op {
         SavepointOp::Begin => {
+            let change_log_mark = conn.transaction_changes.change_log_mark();
             conn.with_savepoint_schema_snapshot(
                 |main_schema_snapshot, temp_schema_snapshot, staged_schema_snapshot| {
                     let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
@@ -4560,6 +4563,7 @@ pub fn op_savepoint(
                         name: name.clone(),
                         starts_transaction,
                         deferred_fk_violations,
+                        change_log_mark,
                         main_schema_snapshot,
                         temp_schema_snapshot,
                         staged_schema_snapshot,
@@ -4686,6 +4690,8 @@ pub fn op_savepoint(
             // consistent across tables / indexes / sequences without any
             // I/O.
             if let Some(info) = frame_info {
+                conn.transaction_changes
+                    .rewind_to_mark(info.change_log_mark)?;
                 *conn.schema.write() = info.main_schema_snapshot;
                 if let Some(temp_db) = conn.temp.database.read().as_ref() {
                     match info.temp_schema_snapshot {
@@ -10658,6 +10664,46 @@ pub struct OpInsertState {
     pub is_noop_update: bool,
 }
 
+struct ChangeLogRoute {
+    table: Arc<crate::schema::BTreeTable>,
+    dependent_views: Vec<String>,
+    is_materialized_view: bool,
+}
+
+/// Resolve change-log routing from the btree being written, never from the
+/// SQL spelling carried in the opcode for tracing/update hooks.
+fn change_log_route(program: &Program, cursor_id: usize) -> Result<Option<ChangeLogRoute>> {
+    let cursor_table = match program.cursor_ref.get(cursor_id) {
+        Some((_, CursorType::BTreeTable(table)))
+        | Some((_, CursorType::MaterializedView(table, _))) => table.clone(),
+        _ => return Ok(None),
+    };
+    let schema = program.connection.schema.read();
+    // Maintenance write cursors intentionally use a synthetic physical
+    // descriptor that includes the trailing weight column. Resolve the bound
+    // cursor back to the schema-owned descriptor so change capture always
+    // deals in the relation's logical row shape.
+    let Some(table) = schema.get_btree_table(&cursor_table.name) else {
+        return Ok(None);
+    };
+    // A zero root belongs to a cursor whose btree is assigned at runtime
+    // (CREATE) or to an ephemeral relation. Otherwise the root is part of the
+    // bound relation identity and must still match the current schema.
+    if cursor_table.root_page != 0 && cursor_table.root_page != table.root_page {
+        return Err(LimboError::InternalError(format!(
+            "changed btree {} has root {}, but the current schema binds it to root {}",
+            cursor_table.name, cursor_table.root_page, table.root_page
+        )));
+    }
+    let dependent_views = schema.get_dependent_materialized_views(&table.name);
+    let is_materialized_view = schema.is_materialized_view(&table.name);
+    Ok(Some(ChangeLogRoute {
+        table,
+        dependent_views,
+        is_materialized_view,
+    }))
+}
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum OpInsertSubState {
     /// If this insert overwrites a record, capture the old record for incremental view maintenance.
@@ -10686,6 +10732,89 @@ pub enum OpInsertSubState {
     ApplyViewChange,
 }
 
+fn materialized_view_record_change(
+    table_name: &str,
+    table: &crate::schema::BTreeTable,
+    mut physical_values: crate::alloc::Vec<Value>,
+    direction: isize,
+) -> Result<(crate::alloc::Vec<Value>, isize)> {
+    let logical_width = table.columns().len();
+    if physical_values.len() != logical_width + 1 {
+        return Err(LimboError::Corrupt(format!(
+            "materialized view {table_name} record has {} fields, expected {} logical fields and one weight",
+            physical_values.len(),
+            logical_width
+        )));
+    }
+    let stored_weight = match physical_values.pop() {
+        Some(Value::Numeric(Numeric::Integer(weight))) => weight,
+        _ => {
+            return Err(LimboError::Corrupt(format!(
+                "materialized view {table_name} record has a non-integer weight"
+            )));
+        }
+    };
+    if stored_weight <= 0 {
+        return Err(LimboError::Corrupt(format!(
+            "materialized view {table_name} record has non-positive weight {stored_weight}"
+        )));
+    }
+    let stored_weight = isize::try_from(stored_weight).map_err(|_| {
+        LimboError::Corrupt(format!(
+            "materialized view {table_name} weight does not fit the maintenance weight type"
+        ))
+    })?;
+    let weight = stored_weight.checked_mul(direction).ok_or_else(|| {
+        LimboError::Corrupt(format!(
+            "materialized view {table_name} maintenance weight overflow"
+        ))
+    })?;
+    Ok((physical_values, weight))
+}
+
+fn normalize_table_change_record(
+    table: &crate::schema::BTreeTable,
+    rowid: i64,
+    mut values: crate::alloc::Vec<Value>,
+) -> Result<crate::alloc::Vec<Value>> {
+    if values.len() > table.columns().len() {
+        return Err(LimboError::Corrupt(format!(
+            "table {} record has {} fields, but the schema has {} columns",
+            table.name,
+            values.len(),
+            table.columns().len()
+        )));
+    }
+
+    values.try_reserve(table.columns().len() - values.len())?;
+    for column in table.columns().iter().skip(values.len()) {
+        let mut value = if column.is_rowid_alias() {
+            Value::from_i64(rowid)
+        } else if let Some(default) = column.default.as_deref() {
+            crate::translate::alter::eval_constant_default_value(default)?
+        } else {
+            Value::Null
+        };
+        if let Some(converted) = column.affinity().convert(&value) {
+            value = match converted {
+                Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
+                Either::Left(_) => {
+                    unreachable!("affinity conversion returned an unexpected borrowed value")
+                }
+                Either::Right(value) => value,
+            };
+        }
+        values.push(value);
+    }
+
+    for (index, column) in table.columns().iter().enumerate() {
+        if column.is_rowid_alias() {
+            values[index] = Value::from_i64(rowid);
+        }
+    }
+    Ok(values)
+}
+
 pub fn op_insert(
     program: &Program,
     state: &mut ProgramState,
@@ -10706,18 +10835,14 @@ pub fn op_insert(
     loop {
         match state.active_op_state.insert().sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
-                let has_dependent_views = {
-                    let schema = program.connection.schema.read();
-                    !schema
-                        .get_dependent_materialized_views(table_name)
-                        .is_empty()
-                };
+                let has_change_log_subscribers = change_log_route(program, *cursor_id)?
+                    .is_some_and(|route| !route.dependent_views.is_empty());
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because
                 // op_delete already captured the deletion for IVM, and this insert only needs to
                 // record the new row (which ApplyViewChange handles without old_record).
                 let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                    has_change_log_subscribers && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
 
                 if flag.has(InsertFlags::REQUIRE_SEEK) {
                     state.active_op_state.insert().sub_state = OpInsertSubState::Seek;
@@ -10753,14 +10878,10 @@ pub fn op_insert(
                 )? {
                     return Ok(InsnFunctionStepResult::IO(io));
                 }
-                let has_dependent_views = {
-                    let schema = program.connection.schema.read();
-                    !schema
-                        .get_dependent_materialized_views(table_name)
-                        .is_empty()
-                };
+                let has_change_log_subscribers = change_log_route(program, *cursor_id)?
+                    .is_some_and(|route| !route.dependent_views.is_empty());
                 let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                    has_change_log_subscribers && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
                 if needs_capture {
                     state.active_op_state.insert().sub_state = OpInsertSubState::CaptureRecord;
                 } else {
@@ -10790,15 +10911,18 @@ pub fn op_insert(
                     if key == insert_key {
                         let maybe_record = return_if_io!(cursor.record());
                         if let Some(record) = maybe_record {
-                            let mut values = record.get_values_owned()?;
-                            let schema = program.connection.schema.read();
-                            if let Some(table) = schema.get_table(table_name) {
-                                for (i, col) in table.columns().iter().enumerate() {
-                                    if col.is_rowid_alias() && i < values.len() {
-                                        values[i] = Value::from_i64(key);
-                                    }
-                                }
-                            }
+                            let values = record.get_values_owned()?;
+                            let route =
+                                change_log_route(program, *cursor_id)?.ok_or_else(|| {
+                                    LimboError::InternalError(format!(
+                                        "changed btree for {table_name} missing from schema"
+                                    ))
+                                })?;
+                            let values = if route.is_materialized_view {
+                                values
+                            } else {
+                                normalize_table_change_record(&route.table, key, values)?
+                            };
                             Some((key, values))
                         } else {
                             None
@@ -10945,9 +11069,9 @@ pub fn op_insert(
                 } else {
                     state.record_statement_change();
                 }
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if !dependent_views.is_empty() {
+                let has_change_log_subscribers = change_log_route(program, *cursor_id)?
+                    .is_some_and(|route| !route.dependent_views.is_empty());
+                if has_change_log_subscribers {
                     if !has_rowid {
                         return Err(LimboError::ParseError(
                             "WITHOUT ROWID tables with dependent materialized views are not supported"
@@ -10960,9 +11084,16 @@ pub fn op_insert(
                 break;
             }
             OpInsertSubState::ApplyViewChange => {
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                assert!(!dependent_views.is_empty());
+                if state.active_op_state.insert().is_noop_update {
+                    state.active_op_state.insert().old_record = None;
+                    break;
+                }
+                let route = change_log_route(program, *cursor_id)?.ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "changed btree for {table_name} missing from schema"
+                    ))
+                })?;
+                assert!(!route.dependent_views.is_empty());
 
                 let (key, values) = {
                     let key = match &state.registers[*key_reg].get_value() {
@@ -10983,37 +11114,65 @@ pub fn op_insert(
                     };
 
                     // Add insertion of new row to view deltas
-                    let mut new_values = record.get_values_owned()?;
-
-                    // Fix rowid alias columns: replace Null with actual rowid value
-                    let schema = program.connection.schema.read();
-                    if let Some(table) = schema.get_table(table_name) {
-                        for (i, col) in table.columns().iter().enumerate() {
-                            if col.is_rowid_alias() && i < new_values.len() {
-                                new_values[i] = Value::from_i64(key);
-                            }
-                        }
-                    }
+                    let new_values = record.get_values_owned()?;
+                    let new_values = if route.is_materialized_view {
+                        new_values
+                    } else {
+                        normalize_table_change_record(&route.table, key, new_values)?
+                    };
 
                     (key, new_values)
                 };
 
                 if let Some((key, values)) = state.active_op_state.insert().old_record.take() {
-                    for view_name in dependent_views.iter() {
-                        let tx_state = program
-                            .connection
-                            .view_transaction_states
-                            .get_or_create(view_name);
-                        tx_state.delete(table_name, key, values.to_vec());
+                    if route.is_materialized_view {
+                        let (values, weight) = materialized_view_record_change(
+                            &route.table.name,
+                            &route.table,
+                            values,
+                            -1,
+                        )?;
+                        return_if_io!(program.connection.transaction_changes.change(
+                            &route.table,
+                            &route.dependent_views,
+                            key,
+                            values,
+                            weight,
+                            program.connection.get_temp_store(),
+                        ));
+                    } else {
+                        return_if_io!(program.connection.transaction_changes.delete(
+                            &route.table,
+                            &route.dependent_views,
+                            key,
+                            values,
+                            program.connection.get_temp_store(),
+                        ));
                     }
                 }
-                for view_name in dependent_views.iter() {
-                    let tx_state = program
-                        .connection
-                        .view_transaction_states
-                        .get_or_create(view_name);
-
-                    tx_state.insert(table_name, key, values.to_vec());
+                if route.is_materialized_view {
+                    let (values, weight) = materialized_view_record_change(
+                        &route.table.name,
+                        &route.table,
+                        values,
+                        1,
+                    )?;
+                    return_if_io!(program.connection.transaction_changes.change(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        weight,
+                        program.connection.get_temp_store(),
+                    ));
+                } else {
+                    return_if_io!(program.connection.transaction_changes.insert(
+                        &route.table,
+                        &route.dependent_views,
+                        key,
+                        values,
+                        program.connection.get_temp_store(),
+                    ));
                 }
 
                 break;
@@ -11079,9 +11238,11 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if dependent_views.is_empty() {
+                let Some(route) = change_log_route(program, *cursor_id)? else {
+                    state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
+                    continue;
+                };
+                if route.dependent_views.is_empty() {
                     state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                     continue;
                 }
@@ -11097,16 +11258,12 @@ pub fn op_delete(
                     // Get the current record before deletion and extract values
                     let maybe_record = return_if_io!(cursor.record());
                     if let Some(record) = maybe_record {
-                        let mut values = record.get_values_owned()?;
-
-                        // Fix rowid alias columns: replace Null with actual rowid value
-                        if let Some(table) = schema.get_table(table_name) {
-                            for (i, col) in table.columns().iter().enumerate() {
-                                if col.is_rowid_alias() && i < values.len() {
-                                    values[i] = Value::from_i64(key);
-                                }
-                            }
-                        }
+                        let values = record.get_values_owned()?;
+                        let values = if route.is_materialized_view {
+                            values
+                        } else {
+                            normalize_table_change_record(&route.table, key, values)?
+                        };
                         Some((key, values))
                     } else {
                         None
@@ -11124,26 +11281,46 @@ pub fn op_delete(
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.record_rows_written(1);
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if dependent_views.is_empty() {
+                let has_change_log_subscribers = change_log_route(program, *cursor_id)?
+                    .is_some_and(|route| !route.dependent_views.is_empty());
+                if !has_change_log_subscribers {
                     break;
                 }
                 state.active_op_state.delete().sub_state = OpDeleteSubState::ApplyViewChange;
                 continue;
             }
             OpDeleteSubState::ApplyViewChange => {
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
-                assert!(!dependent_views.is_empty());
+                let route = change_log_route(program, *cursor_id)?.ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "changed btree for {table_name} missing from schema"
+                    ))
+                })?;
+                assert!(!route.dependent_views.is_empty());
                 let maybe_deleted_record = state.active_op_state.delete().deleted_record.take();
                 if let Some((key, values)) = maybe_deleted_record {
-                    for view_name in dependent_views {
-                        let tx_state = program
-                            .connection
-                            .view_transaction_states
-                            .get_or_create(&view_name);
-                        tx_state.delete(table_name, key, values.to_vec());
+                    if route.is_materialized_view {
+                        let (values, weight) = materialized_view_record_change(
+                            &route.table.name,
+                            &route.table,
+                            values,
+                            -1,
+                        )?;
+                        return_if_io!(program.connection.transaction_changes.change(
+                            &route.table,
+                            &route.dependent_views,
+                            key,
+                            values,
+                            weight,
+                            program.connection.get_temp_store(),
+                        ));
+                    } else {
+                        return_if_io!(program.connection.transaction_changes.delete(
+                            &route.table,
+                            &route.dependent_views,
+                            key,
+                            values,
+                            program.connection.get_temp_store(),
+                        ));
                     }
                 }
                 break;
@@ -13869,7 +14046,6 @@ pub fn op_populate_materialized_views(
                     root_page,
                     num_view_columns,
                     crate::incremental::vdbe_maintenance::MaintenanceInput::BaseTable,
-                    crate::incremental::vdbe_maintenance::MaintenanceOutput::ViewBtree,
                     &schema,
                     &conn,
                 )?;

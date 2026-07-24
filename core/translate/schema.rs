@@ -1793,6 +1793,15 @@ fn validate_drop_table(
             "Cannot DROP TABLE on materialized view {tbl_name}. Use DROP VIEW instead.",
         );
     }
+    let dependent_views = resolver.with_schema(database_id, |schema| {
+        schema.get_dependent_materialized_views(tbl_name)
+    });
+    if !dependent_views.is_empty() {
+        bail_parse_error!(
+            "cannot drop table \"{tbl_name}\": it has dependent materialized view(s): {}",
+            dependent_views.join(", ")
+        );
+    }
     Ok(())
 }
 

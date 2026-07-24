@@ -1828,6 +1828,135 @@ fn test_matview_row_loss_during_btree_split(tmp_db: TempDatabase) -> anyhow::Res
     Ok(())
 }
 
+/// Node-owned hidden state and its automatic indexes must be rediscovered
+/// from sqlite_schema after opening a new Database object.
+#[turso_macros::test(views)]
+fn test_matview_node_state_survives_reopen(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE node_a(k INTEGER)")?;
+    conn.execute("CREATE TABLE node_b(k INTEGER)")?;
+    conn.execute("INSERT INTO node_a VALUES (1)")?;
+    conn.execute("INSERT INTO node_b VALUES (1)")?;
+    conn.execute(
+        "CREATE MATERIALIZED VIEW node_catalog AS
+         SELECT COUNT(*) FROM node_a
+         UNION ALL
+         SELECT node_a.k FROM node_a JOIN node_b ON node_a.k = node_b.k",
+    )?;
+    drop(conn);
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, tmp_db.db_opts);
+    let conn = reopened.connect_limbo();
+    conn.execute("INSERT INTO node_a VALUES (2)")?;
+    conn.execute("INSERT INTO node_b VALUES (2)")?;
+
+    let rows = limbo_exec_rows(&conn, "SELECT * FROM node_catalog ORDER BY 1");
+    assert_eq!(
+        rows,
+        vec![
+            vec![RValue::Integer(1)],
+            vec![RValue::Integer(2)],
+            vec![RValue::Integer(2)],
+        ]
+    );
+    let integrity = limbo_exec_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(integrity, vec![vec![RValue::Text("ok".into())]]);
+    Ok(())
+}
+
+/// Base-table subscriptions for a derived relational plan must be rebuilt
+/// recursively from sqlite_schema after reopen. Otherwise the DAG still
+/// compiles, but mutations to the UNION ALL leaves never trigger it.
+#[turso_macros::test(views)]
+fn test_matview_derived_union_aggregate_survives_reopen(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    {
+        let conn = tmp_db.connect_limbo();
+        conn.execute("CREATE TABLE derived_a(id INTEGER PRIMARY KEY, value INTEGER)")?;
+        conn.execute("CREATE TABLE derived_b(id INTEGER PRIMARY KEY, value INTEGER)")?;
+        conn.execute("INSERT INTO derived_a VALUES (1, 10), (2, 20)")?;
+        conn.execute("INSERT INTO derived_b VALUES (1, 10)")?;
+        conn.execute(
+            "CREATE MATERIALIZED VIEW derived_grouped AS
+             SELECT value, COUNT(*) AS count
+             FROM (
+               SELECT value FROM derived_a
+               UNION ALL
+               SELECT value FROM derived_b
+             )
+             GROUP BY value",
+        )?;
+        conn.close()?;
+    }
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, tmp_db.db_opts);
+    let conn = reopened.connect_limbo();
+    conn.execute("INSERT INTO derived_b VALUES (2, 20)")?;
+    conn.execute("UPDATE derived_a SET value = 30 WHERE id = 1")?;
+    conn.execute("DELETE FROM derived_b WHERE id = 1")?;
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT value, count FROM derived_grouped ORDER BY value",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![RValue::Integer(20), RValue::Integer(2)],
+            vec![RValue::Integer(30), RValue::Integer(1)],
+        ]
+    );
+    let integrity = limbo_exec_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(integrity, vec![vec![RValue::Text("ok".into())]]);
+    Ok(())
+}
+
+/// Schema reload must reconstruct materialized views in dependency order, and
+/// commit maintenance must preserve that order after reopening the database.
+#[turso_macros::test(views)]
+fn test_matview_dependency_chain_survives_reopen(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    {
+        let conn = tmp_db.connect_limbo();
+        conn.execute("CREATE TABLE chain_base(id INTEGER PRIMARY KEY, value INTEGER)")?;
+        conn.execute("INSERT INTO chain_base VALUES (1, 10), (2, 10), (3, 20)")?;
+        conn.execute(
+            "CREATE MATERIALIZED VIEW chain_rows AS
+             SELECT value FROM chain_base WHERE value > 0",
+        )?;
+        conn.execute(
+            "CREATE MATERIALIZED VIEW chain_counts AS
+             SELECT value, COUNT(*) AS count FROM chain_rows GROUP BY value",
+        )?;
+        conn.execute(
+            "CREATE MATERIALIZED VIEW chain_scores AS
+             SELECT value, count * 10 AS score FROM chain_counts",
+        )?;
+        conn.close()?;
+    }
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, tmp_db.db_opts);
+    let conn = reopened.connect_limbo();
+    conn.execute("INSERT INTO chain_base VALUES (4, 10), (5, 30)")?;
+    conn.execute("UPDATE chain_base SET value = 30 WHERE id = 3")?;
+    conn.execute("DELETE FROM chain_base WHERE id = 1")?;
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT value, score FROM chain_scores ORDER BY value",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![RValue::Integer(10), RValue::Integer(20)],
+            vec![RValue::Integer(30), RValue::Integer(20)],
+        ]
+    );
+    let integrity = limbo_exec_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(integrity, vec![vec![RValue::Text("ok".into())]]);
+    Ok(())
+}
+
 /// View deltas are captured in op_insert/op_delete as rows are written, so an
 /// aborted statement must rewind its captures: the statement's btree writes
 /// roll back, and any delta left behind would be applied to the view at the

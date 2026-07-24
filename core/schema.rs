@@ -178,6 +178,9 @@ pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 /// Hidden per-view value-multiset table backing MIN/MAX and DISTINCT
 /// aggregates.
 pub const DBSP_MULTISET_TABLE_PREFIX: &str = "__turso_internal_dbsp_multiset_v";
+/// Hidden z-set integral for an operator output consumed as a join
+/// arrangement.
+pub const DBSP_ARRANGEMENT_TABLE_PREFIX: &str = "__turso_internal_dbsp_arrangement_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
 // Prefix for the hidden sequence *name* owned by an AUTOINCREMENT table.
@@ -768,7 +771,7 @@ pub struct Schema {
     pub materialized_view_names: HashSet<String>,
     /// Store original SQL for materialized views (for .schema command)
     pub materialized_view_sql: HashMap<String, String>,
-    /// The incremental view objects (DBSP circuits)
+    /// Materialized-view definitions consumed by compiled IVM programs.
     pub incremental_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
 
     pub views: ViewsMap,
@@ -788,6 +791,10 @@ pub struct Schema {
 
     /// Track views that exist but have incompatible versions
     pub incompatible_views: HashSet<String>,
+    /// Main btree roots for incompatible materialized views. Their logical
+    /// descriptors cannot be loaded, but DROP VIEW must still destroy their
+    /// storage so the documented recreate path remains possible.
+    pub incompatible_materialized_view_roots: HashMap<String, i64>,
 
     /// View rows in sqlite_schema whose stored SQL failed to parse (e.g.
     /// older versions wrote view column lists without identifier quoting).
@@ -924,6 +931,7 @@ impl Schema {
         let triggers = HashMap::default();
         let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::default();
         let incompatible_views = HashSet::default();
+        let incompatible_materialized_view_roots = HashMap::default();
         let mut type_registry = HashMap::default();
         if enable_custom_types {
             bootstrap_builtin_types(&mut type_registry)?;
@@ -943,6 +951,7 @@ impl Schema {
             analyze_stats: AnalyzeStats::default(),
             table_to_materialized_views,
             incompatible_views,
+            incompatible_materialized_view_roots,
             broken_views: HashSet::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
@@ -1150,7 +1159,7 @@ impl Schema {
         self.materialized_view_names.insert(name.clone());
         self.materialized_view_sql.insert(name.clone(), sql);
 
-        // Store the incremental view (DBSP circuit)
+        // Store the definition used to compile maintenance programs.
         self.incremental_views
             .insert(name, Arc::new(Mutex::new(view)));
     }
@@ -1177,14 +1186,12 @@ impl Schema {
             table_name
                 .strip_prefix(DBSP_TABLE_PREFIX)
                 .or_else(|| table_name.strip_prefix(DBSP_MULTISET_TABLE_PREFIX))
+                .or_else(|| table_name.strip_prefix(DBSP_ARRANGEMENT_TABLE_PREFIX))
                 .and_then(|suffix| suffix.split_once('_'))
                 .is_some_and(|(version_str, name)| {
-                    // The base state table (`<view>`) or a compound-all
-                    // branch table (`<view>__b<idx>`).
-                    (name == view_name
-                        || name
-                            .strip_prefix(view_name.as_str())
-                            .is_some_and(|rest| rest.starts_with("__b")))
+                    // A legacy base/branch state table or a node-owned table
+                    // (`<view>__n<node_id>`).
+                    crate::incremental::view::state_key_belongs_to_view(name, &view_name)
                         && version_str
                             .parse::<u32>()
                             .is_ok_and(|v| v != DBSP_CIRCUIT_VERSION)
@@ -1195,6 +1202,16 @@ impl Schema {
     pub fn is_materialized_view(&self, name: &str) -> bool {
         let name = normalize_ident(name);
         self.materialized_view_names.contains(&name)
+    }
+
+    pub fn incompatible_materialized_view_root(&self, name: &str) -> Option<i64> {
+        self.incompatible_materialized_view_roots
+            .get(&normalize_ident(name))
+            .copied()
+    }
+
+    pub fn materialized_view_exists(&self, name: &str) -> bool {
+        self.is_materialized_view(name) || self.incompatible_materialized_view_root(name).is_some()
     }
 
     /// Apply a function to a table's incompatible dependent materialized views
@@ -1220,28 +1237,29 @@ impl Schema {
         if self.views.contains_key(&name) {
             self.views.remove(&name);
             Ok(())
-        } else if self.materialized_view_names.contains(&name) {
+        } else if self.materialized_view_names.contains(&name)
+            || self
+                .incompatible_materialized_view_roots
+                .contains_key(&name)
+        {
             // Remove from tables
             self.remove_table(&name);
 
             // Remove every hidden state/multiset table of this view and its
-            // indexes. A compound-all view has one set per branch, named
-            // `..._<view>__b<idx>`, so match the whole family by the
-            // `<version>_<view>` name part rather than an exact name.
-            let hidden_prefixes = [
-                format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}"),
-                format!("{DBSP_MULTISET_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}"),
-            ];
+            // indexes. Node-owned tables are named
+            // `..._<view>__n<node_id>`; legacy compound branches used
+            // `..._<view>__b<idx>`.
             let hidden_tables: Vec<String> = self
                 .tables
                 .keys()
                 .filter(|t| {
-                    hidden_prefixes.iter().any(|prefix| {
-                        // Exact base table, or a `__b<idx>` branch table.
-                        *t == prefix
-                            || t.strip_prefix(prefix.as_str())
-                                .is_some_and(|rest| rest.starts_with("__b"))
-                    })
+                    t.strip_prefix(DBSP_TABLE_PREFIX)
+                        .or_else(|| t.strip_prefix(DBSP_MULTISET_TABLE_PREFIX))
+                        .or_else(|| t.strip_prefix(DBSP_ARRANGEMENT_TABLE_PREFIX))
+                        .and_then(|suffix| suffix.split_once('_'))
+                        .is_some_and(|(_, stored_name)| {
+                            crate::incremental::view::state_key_belongs_to_view(stored_name, &name)
+                        })
                 })
                 .cloned()
                 .collect();
@@ -1254,11 +1272,14 @@ impl Schema {
             self.materialized_view_names.remove(&name);
             self.materialized_view_sql.remove(&name);
             self.incremental_views.remove(&name);
+            self.incompatible_views.remove(&name);
+            self.incompatible_materialized_view_roots.remove(&name);
 
             // Remove from table_to_materialized_views dependencies
             for views in self.table_to_materialized_views.values_mut() {
                 views.retain(|v| v != &name);
             }
+            self.table_to_materialized_views.remove(&name);
 
             Ok(())
         } else {
@@ -1273,10 +1294,14 @@ impl Schema {
         let table_name = normalize_ident(table_name);
         let view_name = normalize_ident(view_name);
 
-        self.table_to_materialized_views
+        let views = self
+            .table_to_materialized_views
             .entry(table_name)
-            .or_insert_with(|| vec![])
-            .push(view_name);
+            .or_default();
+        if !views.contains(&view_name) {
+            views.push(view_name);
+            views.sort();
+        }
     }
 
     /// Get all materialized views that depend on a given table
@@ -1289,6 +1314,78 @@ impl Schema {
             .get(&table_name)
             .cloned()
             .unwrap_or_else(|| vec![])
+    }
+
+    /// Return every materialized view transitively affected by the initially
+    /// touched views, with dependencies before their consumers.
+    ///
+    /// The transaction change log creates downstream subscriptions while an
+    /// upstream maintenance program writes its view btree. Computing the
+    /// reachable schedule up front ensures those newly captured deltas are
+    /// consumed later in the same commit instead of being omitted from a
+    /// snapshot of the initially touched state map.
+    pub fn materialized_view_maintenance_order(
+        &self,
+        initially_touched: Vec<String>,
+    ) -> Result<Vec<String>> {
+        let mut reachable = HashSet::default();
+        let mut pending = initially_touched
+            .into_iter()
+            .map(|name| normalize_ident(&name))
+            .collect::<Vec<_>>();
+        while let Some(view_name) = pending.pop() {
+            if !self.is_materialized_view(&view_name) || !reachable.insert(view_name.clone()) {
+                continue;
+            }
+            if let Some(dependents) = self.table_to_materialized_views.get(&view_name) {
+                pending.extend(dependents.iter().cloned());
+            }
+        }
+
+        let mut indegree = reachable
+            .iter()
+            .map(|name| (name.clone(), 0usize))
+            .collect::<HashMap<_, _>>();
+        for source in &reachable {
+            if let Some(dependents) = self.table_to_materialized_views.get(source) {
+                for dependent in dependents {
+                    let dependent = normalize_ident(dependent);
+                    if let Some(degree) = indegree.get_mut(&dependent) {
+                        *degree += 1;
+                    }
+                }
+            }
+        }
+
+        let mut ready = indegree
+            .iter()
+            .filter_map(|(name, degree)| (*degree == 0).then_some(name.clone()))
+            .collect::<Vec<_>>();
+        ready.sort_by(|left, right| right.cmp(left));
+        let mut ordered = Vec::with_capacity(reachable.len());
+        while let Some(view_name) = ready.pop() {
+            ordered.push(view_name.clone());
+            if let Some(dependents) = self.table_to_materialized_views.get(&view_name) {
+                for dependent in dependents {
+                    let dependent = normalize_ident(dependent);
+                    let Some(degree) = indegree.get_mut(&dependent) else {
+                        continue;
+                    };
+                    *degree -= 1;
+                    if *degree == 0 {
+                        ready.push(dependent);
+                        ready.sort_by(|left, right| right.cmp(left));
+                    }
+                }
+            }
+        }
+
+        if ordered.len() != reachable.len() {
+            return Err(LimboError::ParseError(
+                "circular materialized-view dependency".to_string(),
+            ));
+        }
+        Ok(ordered)
     }
 
     /// Add a regular (non-materialized) view
@@ -1951,6 +2048,91 @@ impl Schema {
         Ok(())
     }
 
+    fn order_persisted_materialized_views(
+        view_info: HashMap<String, (String, i64)>,
+    ) -> Result<Vec<(String, (String, i64))>> {
+        let mut view_info = view_info
+            .into_iter()
+            .map(|(name, info)| (normalize_ident(&name), info))
+            .collect::<HashMap<_, _>>();
+        let names = view_info.keys().cloned().collect::<HashSet<_>>();
+        let mut indegree = names
+            .iter()
+            .map(|name| (name.clone(), 0usize))
+            .collect::<HashMap<_, _>>();
+        let mut dependents: HashMap<String, Vec<String>> = HashMap::default();
+
+        for (view_name, (sql, _)) in &view_info {
+            let cmd = Parser::new(sql.as_bytes()).next_cmd()?.ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "materialized view {view_name} has an empty schema definition"
+                ))
+            })?;
+            let Cmd::Stmt(Stmt::CreateMaterializedView { select, .. }) = cmd else {
+                return Err(LimboError::Corrupt(format!(
+                    "materialized view {view_name} has a non-view schema definition"
+                )));
+            };
+            let view_name = normalize_ident(view_name);
+            for dependency in IncrementalView::referenced_table_names(&select) {
+                if names.contains(&dependency) {
+                    *indegree.get_mut(&view_name).ok_or_else(|| {
+                        LimboError::Corrupt(format!(
+                            "materialized view {view_name} disappeared while ordering schema"
+                        ))
+                    })? += 1;
+                    dependents
+                        .entry(dependency)
+                        .or_default()
+                        .push(view_name.clone());
+                }
+            }
+        }
+
+        let mut ready = indegree
+            .iter()
+            .filter_map(|(name, degree)| (*degree == 0).then_some(name.clone()))
+            .collect::<Vec<_>>();
+        ready.sort_by(|left, right| right.cmp(left));
+        let mut order = Vec::with_capacity(names.len());
+        while let Some(view_name) = ready.pop() {
+            order.push(view_name.clone());
+            if let Some(children) = dependents.get(&view_name) {
+                for child in children {
+                    let degree = indegree.get_mut(child).ok_or_else(|| {
+                        LimboError::Corrupt(format!(
+                            "materialized view {child} disappeared while ordering schema"
+                        ))
+                    })?;
+                    *degree -= 1;
+                    if *degree == 0 {
+                        ready.push(child.clone());
+                        ready.sort_by(|left, right| right.cmp(left));
+                    }
+                }
+            }
+        }
+        if order.len() != names.len() {
+            return Err(LimboError::Corrupt(
+                "circular materialized-view dependency in schema".to_string(),
+            ));
+        }
+
+        order
+            .into_iter()
+            .map(|name| {
+                view_info
+                    .remove(&name)
+                    .map(|info| (name.clone(), info))
+                    .ok_or_else(|| {
+                        LimboError::Corrupt(format!(
+                            "materialized view {name} disappeared while ordering schema"
+                        ))
+                    })
+            })
+            .collect()
+    }
+
     /// Populate materialized views parsed from the schema.
     pub fn populate_materialized_views(
         &mut self,
@@ -1958,7 +2140,9 @@ impl Schema {
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
     ) -> Result<()> {
-        for (view_name, (sql, main_root)) in materialized_view_info {
+        for (view_name, (sql, main_root)) in
+            Self::order_persisted_materialized_views(materialized_view_info)?
+        {
             // A state table left behind by a different storage version makes
             // the view unusable until it is recreated. Filter/project views
             // legitimately have no state table.
@@ -1970,24 +2154,13 @@ impl Schema {
                 );
                 self.incompatible_views.insert(view_name.clone());
             }
-            let dbsp_state_root = dbsp_state_roots.get(&view_name).copied().unwrap_or(0);
-
-            // Look up the DBSP state index root (may not exist for older schemas)
-            let dbsp_state_index_root =
-                dbsp_state_index_roots.get(&view_name).copied().unwrap_or(0);
-
             // Register each DBSP state table's primary-key index so lookups
             // and integrity check can use it; its columns (and collations)
-            // come from the state table's PRIMARY KEY. A compound-all view
-            // has one state table per branch, keyed `<view>__b<idx>`, so
-            // reconstruct the index for the base view and every branch.
+            // come from the state table's PRIMARY KEY. Reconstruct the index
+            // for every node-owned state table.
             let state_keys: Vec<String> = dbsp_state_index_roots
                 .keys()
-                .filter(|k| {
-                    **k == view_name
-                        || k.strip_prefix(view_name.as_str())
-                            .is_some_and(|rest| rest.starts_with("__b"))
-                })
+                .filter(|k| crate::incremental::view::state_key_belongs_to_view(k, &view_name))
                 .cloned()
                 .collect();
             for key in state_keys {
@@ -2008,15 +2181,46 @@ impl Schema {
                 }
             }
 
+            let cmd = Parser::new(sql.as_bytes()).next_cmd()?.ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "materialized view {view_name} has an empty schema definition"
+                ))
+            })?;
+            let Cmd::Stmt(Stmt::CreateMaterializedView { select, .. }) = cmd else {
+                return Err(LimboError::Corrupt(format!(
+                    "materialized view {view_name} has a non-view schema definition"
+                )));
+            };
+            let referenced_tables = IncrementalView::referenced_table_names(&select);
+            let incompatible_dependency = referenced_tables
+                .iter()
+                .find(|table_name| self.incompatible_views.contains(*table_name))
+                .cloned();
+            if let Some(dependency) = incompatible_dependency {
+                tracing::warn!(
+                    "Materialized view '{}' depends on incompatible materialized view '{}'; \
+                     DROP and recreate both views",
+                    view_name,
+                    dependency
+                );
+                self.incompatible_views.insert(view_name.clone());
+            }
+
+            // An incompatible view has no live table descriptor, but its
+            // dependency metadata must remain so DML is rejected with the
+            // actionable DROP-and-recreate error rather than silently losing
+            // maintenance.
+            if self.incompatible_views.contains(&view_name) {
+                self.incompatible_materialized_view_roots
+                    .insert(view_name.clone(), main_root);
+                for table_name in referenced_tables {
+                    self.add_materialized_view_dependency(&table_name, &view_name);
+                }
+                continue;
+            }
+
             // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(
-                &sql,
-                self,
-                main_root,
-                dbsp_state_root,
-                dbsp_state_index_root,
-            )?;
-            let referenced_tables = incremental_view.get_referenced_table_names();
+            let incremental_view = IncrementalView::from_sql(&sql, self, main_root)?;
 
             // Create a BTreeTable for the materialized view
             let cols = incremental_view.column_schema.flat_columns();
@@ -2039,10 +2243,7 @@ impl Schema {
                 column_dependencies: Default::default(),
             })));
 
-            // Only add to schema if compatible
-            if !self.incompatible_views.contains(&view_name) {
-                self.add_materialized_view(incremental_view, table, sql);
-            }
+            self.add_materialized_view(incremental_view, table, sql);
 
             // Register dependencies regardless of compatibility
             for table_name in referenced_tables {
@@ -2671,6 +2872,13 @@ impl Schema {
             return Some(SchemaObjectType::View);
         }
 
+        if self
+            .incompatible_materialized_view_roots
+            .contains_key(&normalized_name)
+        {
+            return Some(SchemaObjectType::View);
+        }
+
         for index_list in self.indexes.values() {
             if index_list.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
                 return Some(SchemaObjectType::Index);
@@ -2871,6 +3079,8 @@ impl TryClone for Schema {
             })
             .try_collect::<Result<_, TryReserveError>>()??;
         let incompatible_views = self.incompatible_views.try_clone()?;
+        let incompatible_materialized_view_roots =
+            self.incompatible_materialized_view_roots.try_clone()?;
         Ok(Self {
             tables,
             #[cfg(feature = "conn_raw_api")]
@@ -2886,6 +3096,7 @@ impl TryClone for Schema {
             analyze_stats: self.analyze_stats.clone(),
             table_to_materialized_views: self.table_to_materialized_views.try_clone()?,
             incompatible_views,
+            incompatible_materialized_view_roots,
             broken_views: self.broken_views.try_clone()?,
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
@@ -6013,6 +6224,86 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_materialized_views_are_loaded_in_dependency_order() {
+        let mut views = HashMap::default();
+        views.insert(
+            "third".to_string(),
+            (
+                "CREATE MATERIALIZED VIEW third AS SELECT * FROM second".to_string(),
+                5,
+            ),
+        );
+        views.insert(
+            "first".to_string(),
+            (
+                "CREATE MATERIALIZED VIEW first AS SELECT * FROM base".to_string(),
+                3,
+            ),
+        );
+        views.insert(
+            "second".to_string(),
+            (
+                "CREATE MATERIALIZED VIEW second AS SELECT * FROM first".to_string(),
+                4,
+            ),
+        );
+
+        let ordered = Schema::order_persisted_materialized_views(views).unwrap();
+        assert_eq!(
+            ordered
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn persisted_materialized_view_cycle_is_corrupt() {
+        let mut views = HashMap::default();
+        views.insert(
+            "left_view".to_string(),
+            (
+                "CREATE MATERIALIZED VIEW left_view AS SELECT * FROM right_view".to_string(),
+                3,
+            ),
+        );
+        views.insert(
+            "right_view".to_string(),
+            (
+                "CREATE MATERIALIZED VIEW right_view AS SELECT * FROM left_view".to_string(),
+                4,
+            ),
+        );
+
+        let error = Schema::order_persisted_materialized_views(views).unwrap_err();
+        assert!(matches!(error, LimboError::Corrupt(_)));
+    }
+
+    #[test]
+    fn incompatible_materialized_view_can_be_removed() {
+        let mut schema = Schema::new();
+        schema.incompatible_views.insert("old_view".to_string());
+        schema
+            .incompatible_materialized_view_roots
+            .insert("old_view".to_string(), 42);
+        schema
+            .table_to_materialized_views
+            .insert("base".to_string(), vec!["old_view".to_string()]);
+
+        assert!(schema.materialized_view_exists("old_view"));
+        assert_eq!(
+            schema.incompatible_materialized_view_root("old_view"),
+            Some(42)
+        );
+        schema.remove_view("old_view").unwrap();
+        assert!(!schema.materialized_view_exists("old_view"));
+        assert!(!schema.incompatible_views.contains("old_view"));
+        assert!(schema.get_dependent_materialized_views("base").is_empty());
+    }
+
     use crate::alloc::vec;
 
     #[test]
