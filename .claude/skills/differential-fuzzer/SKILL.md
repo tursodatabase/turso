@@ -96,7 +96,13 @@ Always follow these steps
    - `simulator-output/schema.json` - Check table structure at failure time
 
 4. **Create a minimal reproducer**
-   - Create reproducer in `.sqltest` or in `.rs` always load [Debugging skill for reference](../debugging/)
+   - Minimize the failure until the triggering SQL behavior is understood.
+   - Every successfully minimized differential-fuzzer failure **must** become
+     a permanent `*.sqltest` regression case before its fix is complete.
+     Preserve only the schema, data, statements, and assertions required to
+     expose the bug. The seed and minimized fuzzer artifact are debugging
+     aids, not substitutes for this regression.
+   - Always load [Debugging skill for reference](../debugging/).
 
 5. **Compare behavior manually**:
    If needed try to compare the behaviour and produce a report in the end.

@@ -42,6 +42,13 @@ Default: add coverage to the narrowest existing test harness that can express th
 - `testing/simulator/` and `testing/concurrent-simulator/` - deterministic concurrency, scheduling, and failure-injection coverage for state-machine and I/O correctness.
 - `testing/differential-oracle/` and `testing/stress/` - differential and long-running stress tooling. Use these for deeper investigation or specialized validation, not as the first stop for a focused regression test.
 
+### Differential-Fuzzer Regression Rule
+
+Every differential-fuzzer failure that is successfully minimized must become a
+permanent `*.sqltest` regression case before its fix is considered complete.
+The seed and minimized fuzzer artifact are debugging aids, not substitutes for
+the focused SQL regression.
+
 ## Structure
 
 ```
