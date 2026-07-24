@@ -1,0 +1,75 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@skip-file-if sqlite "materialized views are a turso-specific feature"
+@requires-file materialized_views "requires materialized view support"
+
+# The next two cases insert rows before creating the view, so they exercise the
+# from-scratch populate path (a distinct code path from the incremental
+# maintenance below). Kept alongside the incremental cases for full coverage.
+test ivm-null-where-neq-string {
+    CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT);
+    INSERT INTO items VALUES ('a', 'Alice');
+    INSERT INTO items VALUES ('b', 'Bob');
+    INSERT INTO items VALUES ('c', NULL);
+    INSERT INTO items VALUES ('d', NULL);
+    INSERT INTO items VALUES ('e', '');
+
+    CREATE MATERIALIZED VIEW named AS SELECT id, name FROM items WHERE name != '';
+
+    SELECT id, name FROM named ORDER BY id;
+}
+expect {
+    a|Alice
+    b|Bob
+}
+
+test ivm-null-where-lt-string {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'apple');
+    INSERT INTO t VALUES (2, NULL);
+    INSERT INTO t VALUES (3, 'banana');
+    INSERT INTO t VALUES (4, NULL);
+    INSERT INTO t VALUES (5, 'cherry');
+
+    CREATE MATERIALIZED VIEW mv_lt AS SELECT id, val FROM t WHERE val < 'cherry';
+
+    SELECT id, val FROM mv_lt ORDER BY id;
+}
+expect {
+    1|apple
+    3|banana
+}
+
+test ivm-null-where-neq-incremental {
+    CREATE TABLE data (id INTEGER PRIMARY KEY, status TEXT);
+
+    CREATE MATERIALIZED VIEW active AS SELECT id, status FROM data WHERE status != 'deleted';
+
+    INSERT INTO data VALUES (1, 'active');
+    INSERT INTO data VALUES (2, NULL);
+    INSERT INTO data VALUES (3, 'pending');
+    INSERT INTO data VALUES (4, NULL);
+
+    SELECT id, status FROM active ORDER BY id;
+}
+expect {
+    1|active
+    3|pending
+}
+
+test ivm-null-where-neq-after-update {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT);
+
+    CREATE MATERIALIZED VIEW mv2 AS SELECT id, val FROM t2 WHERE val != '';
+
+    INSERT INTO t2 VALUES (1, 'hello');
+    INSERT INTO t2 VALUES (2, NULL);
+    INSERT INTO t2 VALUES (3, 'world');
+
+    UPDATE t2 SET val = NULL WHERE id = 1;
+
+    SELECT id, val FROM mv2 ORDER BY id;
+}
+expect {
+    3|world
+}

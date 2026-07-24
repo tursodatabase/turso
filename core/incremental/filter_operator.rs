@@ -79,27 +79,29 @@ impl FilterOperator {
             FilterPredicate::None => true,
             FilterPredicate::Equals { column_idx, value } => {
                 let v = &values[*column_idx];
-                v == value
+                // SQL: NULL = X → NULL → false in WHERE
+                !matches!(v, Value::Null) && v == value
             }
             FilterPredicate::NotEquals { column_idx, value } => {
                 let v = &values[*column_idx];
-                v != value
+                // SQL: NULL != X → NULL → false in WHERE
+                !matches!(v, Value::Null) && v != value
             }
             FilterPredicate::GreaterThan { column_idx, value } => {
                 let v = &values[*column_idx];
-                v.cmp(value) == Ordering::Greater
+                !matches!(v, Value::Null) && v.cmp(value) == Ordering::Greater
             }
             FilterPredicate::GreaterThanOrEqual { column_idx, value } => {
                 let v = &values[*column_idx];
-                v.cmp(value) != Ordering::Less
+                !matches!(v, Value::Null) && v.cmp(value) != Ordering::Less
             }
             FilterPredicate::LessThan { column_idx, value } => {
                 let v = &values[*column_idx];
-                v.cmp(value) == Ordering::Less
+                !matches!(v, Value::Null) && v.cmp(value) == Ordering::Less
             }
             FilterPredicate::LessThanOrEqual { column_idx, value } => {
                 let v = &values[*column_idx];
-                v.cmp(value) != Ordering::Greater
+                !matches!(v, Value::Null) && v.cmp(value) != Ordering::Greater
             }
             FilterPredicate::And(left, right) => {
                 // Temporarily create sub-filters to evaluate
@@ -119,7 +121,7 @@ impl FilterOperator {
             } => {
                 let left = &values[*left_idx];
                 let right = &values[*right_idx];
-                left == right
+                !matches!(left, Value::Null) && !matches!(right, Value::Null) && left == right
             }
             FilterPredicate::ColumnNotEquals {
                 left_idx,
@@ -127,7 +129,7 @@ impl FilterOperator {
             } => {
                 let left = &values[*left_idx];
                 let right = &values[*right_idx];
-                left != right
+                !matches!(left, Value::Null) && !matches!(right, Value::Null) && left != right
             }
             FilterPredicate::ColumnGreaterThan {
                 left_idx,
@@ -135,7 +137,9 @@ impl FilterOperator {
             } => {
                 let left = &values[*left_idx];
                 let right = &values[*right_idx];
-                left.cmp(right) == Ordering::Greater
+                !matches!(left, Value::Null)
+                    && !matches!(right, Value::Null)
+                    && left.cmp(right) == Ordering::Greater
             }
             FilterPredicate::ColumnGreaterThanOrEqual {
                 left_idx,
@@ -143,7 +147,9 @@ impl FilterOperator {
             } => {
                 let left = &values[*left_idx];
                 let right = &values[*right_idx];
-                left.cmp(right) != Ordering::Less
+                !matches!(left, Value::Null)
+                    && !matches!(right, Value::Null)
+                    && left.cmp(right) != Ordering::Less
             }
             FilterPredicate::ColumnLessThan {
                 left_idx,
@@ -151,7 +157,9 @@ impl FilterOperator {
             } => {
                 let left = &values[*left_idx];
                 let right = &values[*right_idx];
-                left.cmp(right) == Ordering::Less
+                !matches!(left, Value::Null)
+                    && !matches!(right, Value::Null)
+                    && left.cmp(right) == Ordering::Less
             }
             FilterPredicate::ColumnLessThanOrEqual {
                 left_idx,
@@ -159,7 +167,9 @@ impl FilterOperator {
             } => {
                 let left = &values[*left_idx];
                 let right = &values[*right_idx];
-                left.cmp(right) != Ordering::Greater
+                !matches!(left, Value::Null)
+                    && !matches!(right, Value::Null)
+                    && left.cmp(right) != Ordering::Greater
             }
             FilterPredicate::IsNull { column_idx } => {
                 matches!(values[*column_idx], Value::Null)
