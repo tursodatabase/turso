@@ -2561,6 +2561,221 @@ fn test_checkpoint_snapshot_ts_clamps_below_inflight_preparing() {
     assert_eq!(store.checkpoint_snapshot_ts(), 1000);
 }
 
+/// A passive checkpoint must not publish a physical root while its snapshot is
+/// clamped below a newer durable commit whose log record still uses that
+/// table's temporary ID.
+#[test]
+fn test_passive_checkpoint_waits_for_snapshot_to_cover_temporary_id_commit() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+
+    {
+        let setup = db.connect();
+        setup
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        setup
+            .execute("CREATE TABLE anchor(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        setup
+            .execute("INSERT INTO anchor VALUES (1, 'base')")
+            .unwrap();
+        setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        setup
+            .execute("CREATE TABLE pending(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+
+        let pending_root = get_rows(
+            &setup,
+            "SELECT rootpage FROM sqlite_schema WHERE name = 'pending'",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        assert!(pending_root < 0);
+
+        // Park an older commit in Preparing before it takes the logical-log
+        // commit lock. A disjoint newer commit can then finish out of timestamp
+        // order, which forces checkpoint_snapshot_ts below the newer commit.
+        let lower = db.connect();
+        lower.execute("BEGIN CONCURRENT").unwrap();
+        lower
+            .execute("INSERT INTO anchor VALUES (2, 'lower')")
+            .unwrap();
+        let lower_tx_id = lower.get_mv_tx_id().unwrap();
+        let lower_parked = FixedYieldInjector::new([CommitYieldPoint::BuildLogRecordStart.point()]);
+        lower.set_yield_injector(Some(lower_parked.clone()));
+        let mut lower_commit = lower.prepare("COMMIT").unwrap();
+        let lower_io = lower.pager.load().io.clone();
+        let mut reached_park = false;
+        for _ in 0..10_000 {
+            match lower_commit.step().unwrap() {
+                StepResult::Yield if lower_parked.is_empty() => {
+                    reached_park = true;
+                    break;
+                }
+                StepResult::IO => lower_io.step().unwrap(),
+                StepResult::Yield => {}
+                StepResult::Done => panic!("lower commit completed before the injected yield"),
+                other => panic!("unexpected lower COMMIT result: {other:?}"),
+            }
+        }
+        assert!(
+            reached_park,
+            "lower commit never reached BuildLogRecordStart"
+        );
+
+        let store = db.get_mvcc_store();
+        let lower_end_ts = match store.txs.get(&lower_tx_id).unwrap().value().state.load() {
+            TransactionState::Preparing(end_ts) => end_ts,
+            state => panic!("lower transaction must be Preparing, got {state:?}"),
+        };
+
+        let higher = db.connect();
+        higher.execute("BEGIN CONCURRENT").unwrap();
+        higher
+            .execute("INSERT INTO pending VALUES (1, 'durable')")
+            .unwrap();
+        higher.execute("COMMIT").unwrap();
+        let temporary_id_commit_ts = store.last_temporary_id_commit_ts.load(Ordering::Acquire);
+        assert!(
+            temporary_id_commit_ts > lower_end_ts,
+            "newer temporary-ID commit must finish above the parked transaction"
+        );
+
+        let checkpoint = db.connect();
+        checkpoint
+            .execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap();
+        let root_after_deferred_checkpoint = get_rows(
+            &setup,
+            "SELECT rootpage FROM sqlite_schema WHERE name = 'pending'",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        assert!(
+            root_after_deferred_checkpoint < 0,
+            "checkpoint must not publish roots below the temporary-ID watermark"
+        );
+
+        // Dropping the parked commit rolls it back and removes the snapshot
+        // clamp. The next checkpoint can safely include the newer frame and
+        // publish the root mapping.
+        drop(lower_commit);
+        lower.set_yield_injector(None);
+        checkpoint
+            .execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap();
+        let published_root = get_rows(
+            &setup,
+            "SELECT rootpage FROM sqlite_schema WHERE name = 'pending'",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        assert!(published_root > 0);
+
+        checkpoint.close().unwrap();
+        higher.close().unwrap();
+        lower.close().unwrap();
+        setup.close().unwrap();
+    }
+
+    db.restart();
+    let recovered = db.connect();
+    let rows = get_rows(&recovered, "SELECT id, v FROM pending");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "durable");
+    assert_eq!(
+        get_rows(&recovered, "PRAGMA integrity_check")[0][0].to_string(),
+        "ok"
+    );
+}
+
+/// Dropping a COMMIT after its temporary-ID log frame became durable must
+/// publish the commit watermark before releasing the checkpoint fence.
+#[test]
+fn test_abandoned_temporary_id_commit_publishes_checkpoint_watermark() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE pending(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("INSERT INTO pending VALUES (1, 'durable')")
+            .unwrap();
+
+        let tx_id = conn.get_mv_tx_id().unwrap();
+        let before_metadata =
+            FixedYieldInjector::new([CommitYieldPoint::BeforeGlobalHeaderUpdate.point()]);
+        conn.set_yield_injector(Some(before_metadata.clone()));
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        let commit_io = conn.pager.load().io.clone();
+        let mut reached_park = false;
+        for _ in 0..10_000 {
+            match commit.step().unwrap() {
+                StepResult::Yield if before_metadata.is_empty() => {
+                    reached_park = true;
+                    break;
+                }
+                StepResult::IO => commit_io.step().unwrap(),
+                StepResult::Yield => {}
+                StepResult::Done => panic!("commit completed before the injected yield"),
+                other => panic!("unexpected COMMIT result: {other:?}"),
+            }
+        }
+        assert!(
+            reached_park,
+            "commit never reached BeforeGlobalHeaderUpdate"
+        );
+
+        let store = db.get_mvcc_store();
+        let end_ts = match store.txs.get(&tx_id).unwrap().value().state.load() {
+            TransactionState::Committed(end_ts) => end_ts,
+            state => panic!("transaction must already be Committed, got {state:?}"),
+        };
+        assert_eq!(
+            store.last_temporary_id_commit_ts.load(Ordering::Acquire),
+            end_ts
+        );
+        assert!(
+            store.last_committed_tx_ts.load(Ordering::Acquire) < end_ts,
+            "injected yield must precede normal committed-watermark publication"
+        );
+
+        drop(commit);
+        conn.set_yield_injector(None);
+
+        assert!(!store.txs.contains_key(&tx_id));
+        assert!(
+            store.last_committed_tx_ts.load(Ordering::Acquire) >= end_ts,
+            "drop cleanup must publish the durable commit before releasing its fence"
+        );
+
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        let published_root = get_rows(
+            &conn,
+            "SELECT rootpage FROM sqlite_schema WHERE name = 'pending'",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        assert!(published_root > 0);
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    let recovered = db.connect();
+    let rows = get_rows(&recovered, "SELECT id, v FROM pending");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "durable");
+    assert_eq!(
+        get_rows(&recovered, "PRAGMA integrity_check")[0][0].to_string(),
+        "ok"
+    );
+}
+
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
@@ -3932,6 +4147,11 @@ fn test_checkpoint_gc_anchor_loss_update_then_delete_strands_stale_row() {
     conn_v
         .execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, u NUMERIC UNIQUE)")
         .unwrap();
+    // Publish the table and index roots before building the row-version chain.
+    // The later parked checkpoint must allow its synchronous concurrent writer
+    // to commit; commits against temporary roots intentionally wait for that
+    // checkpoint to finish.
+    conn_v.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     conn_v.execute("INSERT INTO t VALUES (1, 724)").unwrap();
 
     let conn_c = db.connect();
@@ -4475,81 +4695,462 @@ fn test_conflict_abort_of_indexed_update_keeps_btree_resident_index_entry() {
 
 #[test]
 fn test_passive_checkpoint_tolerates_concurrent_create_after_snapshot() {
-    let db = MvccTestDbNoConn::new_with_random_db_passive();
-    let conn = db.connect();
-    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    conn.execute("INSERT INTO t1 VALUES (0, 'seed')").unwrap();
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-    // Force an auto-checkpoint on the next commit.
-    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
-        .unwrap();
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    let checkpointed_index_root;
+    let would_be_deferred_id;
+    let deferred_table_root;
 
-    // Drive the auto-checkpoint via this INSERT's commit and park it at
-    // BeforeAcquireLock (snapshot_ts captured in PrepareCheckpoint; blocking lock
-    // not yet held, so a concurrent writer can still commit).
-    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforeAcquireLock.point()]);
-    conn.set_yield_injector(Some(injector.clone()));
-    let mut insert_stmt = conn.prepare("INSERT INTO t1 VALUES (1, 'a')").unwrap();
-    let mut parked = false;
-    for _ in 0..10_000 {
-        match insert_stmt.step().unwrap() {
-            StepResult::IO | StepResult::Yield if injector.is_empty() => {
-                parked = true;
-                break;
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE anchor(
+                 id INTEGER PRIMARY KEY,
+                 pad BLOB
+             )",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO anchor
+             SELECT value, zeroblob(1000)
+             FROM generate_series(1, 8)",
+        )
+        .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        assert_eq!(
+            get_rows(&conn, "PRAGMA page_count")[0][0].as_int().unwrap(),
+            5,
+            "fixture must preserve the allocator/root layout used by the alias assertion"
+        );
+
+        conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX a_v ON a(v)").unwrap();
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        // Force an auto-checkpoint and park it after collection, before it
+        // allocates physical roots for a and a_v.
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforeAcquireLock.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        let mut trigger = conn
+            .prepare("INSERT INTO anchor VALUES (9, zeroblob(1000))")
+            .unwrap();
+        let checkpoint_io = conn.pager.load().io.clone();
+        let mut parked = false;
+        for _ in 0..100_000 {
+            match trigger.step().unwrap() {
+                StepResult::Yield if injector.is_empty() => {
+                    parked = true;
+                    break;
+                }
+                StepResult::IO => checkpoint_io.step().unwrap(),
+                StepResult::Yield => {}
+                StepResult::Done => {
+                    panic!("trigger completed before the checkpoint yield fired")
+                }
+                other => panic!("unexpected trigger result before yield: {other:?}"),
             }
-            StepResult::IO | StepResult::Yield => {}
-            StepResult::Done => {
-                panic!("INSERT completed before the checkpoint acquire-lock yield fired")
-            }
-            other => panic!("unexpected INSERT step result before yield: {other:?}"),
         }
-    }
-    assert!(
-        parked,
-        "auto-checkpoint should yield before acquiring the checkpoint lock"
-    );
-    conn.set_yield_injector(None);
+        assert!(parked, "checkpoint never reached the post-collection yield");
+        conn.set_yield_injector(None);
 
-    // Concurrent connection creates a table that commits AFTER the checkpoint's
-    // snapshot. It lands in the shared schema with a negative root page but is NOT
-    // part of this checkpoint's write set; the in-progress gate stops its own commit
-    // from checkpointing it.
-    let other = db.connect();
-    other
-        .execute("CREATE TABLE t2(id INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
+        // The threshold is store-global. Keep the deferred CREATE in the
+        // logical log after its commit so cold recovery exercises its temp ID.
+        let config = db.connect();
+        config
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
 
-    // Resume the parked checkpoint to completion. Before the fix this panics at the
-    // has_pending_root_publication assert in TruncateWal.
-    let mut done = false;
-    for _ in 0..100_000 {
-        match insert_stmt.step().unwrap() {
-            StepResult::Done => {
-                done = true;
-                break;
+        // A CREATE that starts after the checkpoint snapshot must not allocate
+        // the next temporary ID while this checkpoint is about to publish the
+        // matching positive root.
+        let store = db.get_mvcc_store();
+        would_be_deferred_id = store.next_table_id.load(Ordering::SeqCst);
+        assert!(would_be_deferred_id < 0);
+        let other = db.connect();
+        other.execute("BEGIN").unwrap();
+        let mut create = other
+            .prepare("CREATE TABLE b(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        let create_io = other.pager.load().io.clone();
+        let mut other_tx_id = None;
+        for _ in 0..100_000 {
+            match create.step().unwrap() {
+                StepResult::IO => {
+                    assert_eq!(
+                        store.next_table_id.load(Ordering::SeqCst),
+                        would_be_deferred_id,
+                        "the parked CREATE must not consume the colliding temporary ID"
+                    );
+                    create_io.step().unwrap();
+                }
+                StepResult::Yield => {
+                    assert_eq!(
+                        store.next_table_id.load(Ordering::SeqCst),
+                        would_be_deferred_id,
+                        "the parked CREATE must not consume the colliding temporary ID"
+                    );
+                    other_tx_id = other.get_mv_tx_id();
+                    break;
+                }
+                StepResult::Done => {
+                    panic!(
+                        "post-snapshot CREATE allocated a temporary ID through the checkpoint gate"
+                    )
+                }
+                other => panic!("unexpected deferred CREATE result: {other:?}"),
             }
-            StepResult::IO | StepResult::Yield => {}
-            other => panic!("unexpected resume step result: {other:?}"),
         }
-    }
-    assert!(
-        done,
-        "checkpoint must complete despite a CREATE that committed after its snapshot"
-    );
-    drop(insert_stmt);
+        let other_tx_id =
+            other_tx_id.expect("CREATE did not reach the temporary-ID checkpoint gate");
+        assert!(
+            !store
+                .txs
+                .get(&other_tx_id)
+                .unwrap()
+                .value()
+                .holds_blocking_checkpoint_read
+                .load(Ordering::Acquire),
+            "the parked CREATE must not install a lifetime guard before allocation"
+        );
 
-    // Both tables survive; t2 is usable; integrity holds.
-    let tables = get_rows(
-        &conn,
-        "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('t1','t2') ORDER BY name",
+        let mut checkpoint_done = false;
+        for _ in 0..200_000 {
+            match trigger.step().unwrap() {
+                StepResult::Done => {
+                    checkpoint_done = true;
+                    break;
+                }
+                StepResult::IO => checkpoint_io.step().unwrap(),
+                StepResult::Yield => {}
+                other => panic!("unexpected checkpoint resume result: {other:?}"),
+            }
+        }
+        assert!(checkpoint_done, "checkpoint did not finish");
+        drop(trigger);
+
+        let mut create_done = false;
+        for _ in 0..100_000 {
+            match create.step().unwrap() {
+                StepResult::Done => {
+                    create_done = true;
+                    break;
+                }
+                StepResult::IO => create_io.step().unwrap(),
+                StepResult::Yield => {}
+                other => panic!("unexpected CREATE resume result: {other:?}"),
+            }
+        }
+        assert!(create_done, "CREATE did not resume after root publication");
+        drop(create);
+        other.execute("COMMIT").unwrap();
+
+        checkpointed_index_root = get_rows(
+            &conn,
+            "SELECT rootpage FROM sqlite_schema WHERE name = 'a_v'",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        deferred_table_root = get_rows(
+            &other,
+            "SELECT rootpage FROM sqlite_schema WHERE name = 'b'",
+        )[0][0]
+            .as_int()
+            .unwrap();
+        assert_eq!(
+            checkpointed_index_root, -would_be_deferred_id,
+            "fixture must materialize a_v at the root the old allocator would reuse"
+        );
+        assert!(deferred_table_root < 0);
+        assert_ne!(
+            deferred_table_root, would_be_deferred_id,
+            "the resumed CREATE must allocate again after root publication"
+        );
+        for row in get_rows(
+            &conn,
+            "SELECT name, rootpage
+               FROM sqlite_schema
+              WHERE name IN ('a', 'a_v', 'dummy')
+              ORDER BY name",
+        ) {
+            let published_name = row[0].to_string();
+            let published_root = row[1].as_int().unwrap();
+            assert!(published_root > 0);
+            assert_ne!(
+                published_root, -deferred_table_root,
+                "b's deferred temporary ID must not alias published root {published_name}"
+            );
+        }
+
+        other
+            .execute("INSERT INTO b VALUES (1, 'survives')")
+            .unwrap();
+        assert_eq!(
+            get_rows(&conn, "PRAGMA integrity_check")[0][0].to_string(),
+            "ok"
+        );
+
+        other.close().unwrap();
+        config.close().unwrap();
+        conn.close().unwrap();
+    }
+
+    // Reopen before checkpointing b. Recovery derives a_v's table ID from its
+    // physical root and replays b's negative temporary ID from the logical log.
+    db.restart();
+    let recovered = db.connect();
+    assert_eq!(
+        get_rows(
+            &recovered,
+            "SELECT rootpage FROM sqlite_schema WHERE name = 'a_v'",
+        )[0][0]
+            .as_int()
+            .unwrap(),
+        checkpointed_index_root
     );
-    assert_eq!(tables.len(), 2, "t1 and t2 must both exist: {tables:?}");
-    other.execute("INSERT INTO t2 VALUES (1, 'x')").unwrap();
-    let rows = get_rows(&other, "SELECT id, v FROM t2");
+    assert_eq!(
+        get_rows(
+            &recovered,
+            "SELECT rootpage FROM sqlite_schema WHERE name = 'b'",
+        )[0][0]
+            .as_int()
+            .unwrap(),
+        deferred_table_root
+    );
+    let rows = get_rows(&recovered, "SELECT id, v FROM b");
     assert_eq!(rows.len(), 1);
-    let integrity = get_rows(&conn, "PRAGMA integrity_check");
-    assert_eq!(&integrity[0][0].to_string(), "ok");
+    assert_eq!(rows[0][1].to_string(), "survives");
+    assert_eq!(
+        get_rows(&recovered, "PRAGMA integrity_check")[0][0].to_string(),
+        "ok"
+    );
+}
+
+/// A schema-only commit that started after a checkpoint snapshot can still
+/// carry the table's temporary root in its sqlite_schema payload. It must wait
+/// for root publication and then serialize the positive physical root.
+#[test]
+fn test_schema_commit_canonicalizes_root_after_concurrent_passive_checkpoint() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+
+    let published_root = {
+        let setup = db.connect();
+        setup
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        setup
+            .execute("CREATE TABLE anchor(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        setup
+            .execute("INSERT INTO anchor VALUES (1, 'base')")
+            .unwrap();
+        setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        setup
+            .execute("CREATE TABLE pending(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        setup
+            .execute("INSERT INTO pending VALUES (1, 'kept')")
+            .unwrap();
+        let pending_schema = get_rows(
+            &setup,
+            "SELECT rowid, rootpage FROM sqlite_schema WHERE name = 'pending'",
+        );
+        let pending_schema_rowid = pending_schema[0][0].as_int().unwrap();
+        let temporary_root = pending_schema[0][1].as_int().unwrap();
+        assert!(temporary_root < 0);
+
+        let checkpoint_conn = db.connect();
+        checkpoint_conn
+            .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        let checkpoint_parked =
+            FixedYieldInjector::new([CheckpointYieldPoint::BeforeAcquireLock.point()]);
+        checkpoint_conn.set_yield_injector(Some(checkpoint_parked.clone()));
+        let mut checkpoint = checkpoint_conn
+            .prepare("INSERT INTO anchor VALUES (2, 'trigger')")
+            .unwrap();
+        let checkpoint_io = checkpoint_conn.pager.load().io.clone();
+        let mut reached_checkpoint_park = false;
+        for _ in 0..100_000 {
+            match checkpoint.step().unwrap() {
+                StepResult::Yield if checkpoint_parked.is_empty() => {
+                    reached_checkpoint_park = true;
+                    break;
+                }
+                StepResult::IO => checkpoint_io.step().unwrap(),
+                StepResult::Yield => {}
+                StepResult::Done => {
+                    panic!("checkpoint completed before the injected yield")
+                }
+                other => panic!("unexpected checkpoint step result: {other:?}"),
+            }
+        }
+        assert!(
+            reached_checkpoint_park,
+            "checkpoint never reached BeforeAcquireLock"
+        );
+        // The threshold is store-global. Disable it again before the ALTER
+        // resumes so its commit remains in the WAL for the cold-replay check.
+        setup
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+
+        let alter = db.connect();
+        alter.execute("BEGIN").unwrap();
+        alter
+            .execute("ALTER TABLE pending RENAME COLUMN v TO value")
+            .unwrap();
+        let mut alter_commit = alter.prepare("COMMIT").unwrap();
+        let alter_io = alter.pager.load().io.clone();
+        let mut alter_parked = false;
+        for _ in 0..100_000 {
+            match alter_commit.step().unwrap() {
+                StepResult::Yield => {
+                    alter_parked = true;
+                    break;
+                }
+                StepResult::IO => alter_io.step().unwrap(),
+                StepResult::Done => {
+                    panic!("schema commit bypassed the temporary-root checkpoint gate")
+                }
+                other => panic!("unexpected ALTER commit result: {other:?}"),
+            }
+        }
+        assert!(
+            alter_parked,
+            "ALTER commit never reached the checkpoint gate"
+        );
+
+        checkpoint_conn.set_yield_injector(None);
+        let mut checkpoint_done = false;
+        for _ in 0..100_000 {
+            match checkpoint.step().unwrap() {
+                StepResult::Done => {
+                    checkpoint_done = true;
+                    break;
+                }
+                StepResult::IO => checkpoint_io.step().unwrap(),
+                StepResult::Yield => {}
+                other => panic!("unexpected checkpoint resume result: {other:?}"),
+            }
+        }
+        assert!(checkpoint_done, "checkpoint did not finish");
+        drop(checkpoint);
+
+        let mut alter_done = false;
+        for _ in 0..100_000 {
+            match alter_commit.step().unwrap() {
+                StepResult::Done => {
+                    alter_done = true;
+                    break;
+                }
+                StepResult::IO => alter_io.step().unwrap(),
+                StepResult::Yield => {}
+                other => panic!("unexpected ALTER commit resume result: {other:?}"),
+            }
+        }
+        assert!(
+            alter_done,
+            "schema commit did not resume after root publication"
+        );
+        drop(alter_commit);
+
+        let store = db.get_mvcc_store();
+        let published_root = store
+            .published_root_page(&MVTableId::from(temporary_root))
+            .expect("checkpoint must publish pending's physical root before ALTER resumes");
+
+        let schema_key = RowID::new(
+            SQLITE_SCHEMA_MVCC_TABLE_ID,
+            RowKey::Int(pending_schema_rowid),
+        );
+        let schema_row = store
+            .rows
+            .get(&schema_key)
+            .expect("pending sqlite_schema row must remain in the version store");
+        let schema_versions = schema_row.value().read();
+        assert_eq!(
+            schema_versions
+                .iter()
+                .filter(|version| version.end().is_none())
+                .count(),
+            1,
+            "checkpoint root publication must not resurrect the pre-ALTER schema version"
+        );
+        drop(schema_versions);
+        drop(schema_row);
+
+        assert_eq!(
+            get_rows(
+                &alter,
+                "SELECT rootpage FROM sqlite_schema WHERE name = 'pending'",
+            )[0][0]
+                .as_int()
+                .unwrap(),
+            published_root as i64,
+            "the committing connection must adopt the published physical root"
+        );
+        let live_rows = get_rows(&alter, "SELECT id, value FROM pending");
+        assert_eq!(live_rows.len(), 1);
+        assert_eq!(live_rows[0][1].to_string(), "kept");
+        assert_eq!(
+            get_rows(&alter, "PRAGMA integrity_check")[0][0].to_string(),
+            "ok"
+        );
+
+        alter.close().unwrap();
+        checkpoint_conn.close().unwrap();
+        setup.close().unwrap();
+        published_root
+    };
+
+    // Reopen before another checkpoint so recovery must replay the ALTER frame.
+    // A stale negative root in that frame would collide with the published mapping.
+    db.restart();
+    let recovered = db.connect();
+    let rows = get_rows(&recovered, "SELECT id, value FROM pending");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "kept");
+    assert_eq!(
+        get_rows(
+            &recovered,
+            "SELECT rootpage FROM sqlite_schema WHERE name = 'pending'",
+        )[0][0]
+            .as_int()
+            .unwrap(),
+        published_root as i64,
+        "cold replay must retain the published physical root"
+    );
+    assert_eq!(
+        get_rows(&recovered, "PRAGMA integrity_check")[0][0].to_string(),
+        "ok"
+    );
+
+    // A later checkpoint must treat the ALTER as metadata for the existing
+    // B-tree, not as another CREATE with a fresh root.
+    recovered.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    assert_eq!(
+        get_rows(
+            &recovered,
+            "SELECT rootpage FROM sqlite_schema WHERE name = 'pending'",
+        )[0][0]
+            .as_int()
+            .unwrap(),
+        published_root as i64,
+        "checkpointing the ALTER must keep the original physical root"
+    );
+    let rows = get_rows(&recovered, "SELECT id, value FROM pending");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1].to_string(), "kept");
+    assert_eq!(
+        get_rows(&recovered, "PRAGMA integrity_check")[0][0].to_string(),
+        "ok"
+    );
 }
 
 /// What this test checks: if one checkpoint makes a unique-index delete durable in the B-tree
@@ -18065,6 +18666,65 @@ fn abandoned_commit_in_committed_state_should_not_block_subsequent_checkpoint() 
     let _ = conn_a.prepare("COMMIT").unwrap().step();
 
     conn_b.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+}
+
+#[test]
+fn cleanup_dropped_committed_tx_notifies_dependents_and_releases_temp_id_guard() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let owner = db.connect();
+    let dependent = db.connect();
+    let store = db.get_mvcc_store();
+
+    owner.execute("BEGIN CONCURRENT").unwrap();
+    let owner_tx_id = owner.get_mv_tx_id().unwrap();
+    assert!(
+        store.try_get_next_table_id(owner_tx_id).unwrap().is_some(),
+        "temporary-ID allocation must acquire the transaction-lifetime checkpoint guard"
+    );
+
+    dependent.execute("BEGIN CONCURRENT").unwrap();
+    let dependent_tx_id = dependent.get_mv_tx_id().unwrap();
+
+    let owner_tx = store.txs.get(&owner_tx_id).unwrap();
+    owner_tx
+        .value()
+        .state
+        .store(TransactionState::Committed(100));
+    owner_tx
+        .value()
+        .commit_dep_set
+        .lock()
+        .insert(dependent_tx_id);
+    store
+        .txs
+        .get(&dependent_tx_id)
+        .unwrap()
+        .value()
+        .commit_dep_counter
+        .fetch_add(1, Ordering::AcqRel);
+    drop(owner_tx);
+
+    store.cleanup_dropped_commit(owner_tx_id, &owner, crate::MAIN_DB_ID);
+
+    assert!(store.txs.get(&owner_tx_id).is_none());
+    assert_eq!(
+        store
+            .txs
+            .get(&dependent_tx_id)
+            .unwrap()
+            .value()
+            .commit_dep_counter
+            .load(Ordering::Acquire),
+        0,
+        "abandoned committed owner must notify its waiting dependent"
+    );
+    assert!(
+        store.blocking_checkpoint_lock.write(),
+        "abandoned committed owner must release its temporary-ID checkpoint guard"
+    );
+    store.blocking_checkpoint_lock.unlock();
+
+    dependent.execute("ROLLBACK").unwrap();
 }
 
 /// A concurrent explicit rowid insert must raise the allocator watermark before

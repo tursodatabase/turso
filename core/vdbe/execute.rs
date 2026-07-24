@@ -11807,7 +11807,14 @@ pub fn op_create_btree(
     let mv_store = program.connection.mv_store_for_db(*db);
 
     if let Some(mv_store) = mv_store.as_ref() {
-        let root_page = mv_store.get_next_table_id();
+        let tx_id = program.connection.get_mv_tx_id_for_db(*db).ok_or_else(|| {
+            LimboError::InternalError("MVCC CreateBtree requires an active transaction".to_string())
+        })?;
+        let Some(root_page) = mv_store.try_get_next_table_id(tx_id)? else {
+            return Ok(InsnFunctionStepResult::IO(IOCompletions(
+                Completion::new_yield(),
+            )));
+        };
         state.registers[*root].set_int(root_page);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
