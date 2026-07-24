@@ -69,6 +69,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     )?;
     connection_class.define_method("busy_timeout=", method!(Connection::set_busy_timeout, 1))?;
     connection_class.define_method("query_timeout=", method!(Connection::set_query_timeout, 1))?;
+    connection_class.define_method("query_timeout", method!(Connection::get_query_timeout, 0))?;
     connection_class.define_method("interrupt", method!(Connection::interrupt, 0))?;
     connection_class.define_method("total_changes", method!(Connection::total_changes, 0))?;
     connection_class.define_method("changes", method!(Connection::changes, 0))?;

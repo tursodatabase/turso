@@ -88,6 +88,10 @@ impl Connection {
             .set_query_timeout(std::time::Duration::from_millis(ms as u64));
     }
 
+    pub fn get_query_timeout(&self) -> u64 {
+        self.inner.get_query_timeout().as_millis() as u64
+    }
+
     pub fn interrupt(&self) {
         self.inner.interrupt();
     }
