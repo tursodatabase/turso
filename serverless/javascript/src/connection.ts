@@ -68,6 +68,10 @@ function toResultSet(result: any): any {
  * waits for the previous one to finish — just like the native
  * `@tursodatabase/database` binding.
  *
+ * The exception is `transactionAsync()`: each transaction runs on its own
+ * dedicated stream, so it does not block (and is not blocked by) statements
+ * on the connection itself.
+ *
  * ## Parallel queries
  *
  * For parallelism, create multiple connections. `connect()` is cheap — it just
@@ -121,6 +125,8 @@ export class Connection {
    * request), so it reflects the connection's real transaction state — the
    * same as `sqlite3_get_autocommit()` on the native bindings — including
    * transactions opened with a raw `BEGIN`, not just via `transaction()`.
+   * A `transactionAsync()` transaction runs on its own dedicated session,
+   * so it is not reflected here.
    */
   get inTransaction(): boolean {
     return this.session.inTransaction;
@@ -425,17 +431,17 @@ export class Connection {
   /**
    * Returns a function that executes the given function in a transaction.
    *
-   * The wrapper owns the connection for the whole BEGIN..COMMIT window: it
-   * acquires the connection's execution lock before BEGIN and releases it
-   * only after COMMIT/ROLLBACK, so no concurrent statement or transaction
-   * can interleave its own statements into the transaction's window. The
-   * callback receives a {@link Transaction} handle as its first argument,
-   * followed by the arguments the wrapped function was called with — all
-   * SQL inside the callback must go through that handle. Calls on the
-   * `Connection` itself (or statements prepared from it) queue on the lock
-   * until the transaction finishes, so awaiting them inside the callback
-   * deadlocks the transaction. Callbacks that do not declare the handle
-   * parameter are rejected.
+   * Each invocation runs the whole BEGIN..COMMIT window on its own
+   * dedicated session (a separate server stream), so it does not lock the
+   * connection: concurrent statements on the `Connection` proceed normally
+   * while the transaction is open. The callback receives a
+   * {@link Transaction} handle as its first argument, followed by the
+   * arguments the wrapped function was called with — all SQL of the
+   * transaction must go through that handle. Calls on the `Connection`
+   * itself (or statements prepared from it) execute on the connection's
+   * own stream, outside the transaction, and do not see its uncommitted
+   * changes. Callbacks that do not declare the handle parameter are
+   * rejected.
    *
    * @param fn - The function to wrap in a transaction; receives the
    *   transaction handle followed by the caller's arguments
@@ -470,10 +476,11 @@ export class Connection {
         if (!db.isOpen) {
           throw new TypeError("The database connection is not open");
         }
-        // own the session for the whole transaction: everything else
-        // queues on execLock until COMMIT/ROLLBACK releases it
-        await db.execLock.acquire();
-        const txn = new Transaction(db.session, db.defaultSafeIntegerMode);
+        // The transaction owns a dedicated session (server stream), so the
+        // connection is not locked for its duration: concurrent statements
+        // on the connection run on its own stream, outside the transaction.
+        const session = new Session(db.config);
+        const txn = new Transaction(session, db.defaultSafeIntegerMode);
         try {
           await txn.exec("BEGIN " + mode);
           try {
@@ -481,12 +488,18 @@ export class Connection {
             await txn.exec("COMMIT");
             return result;
           } catch (err) {
-            await txn.exec("ROLLBACK");
+            try {
+              await txn.exec("ROLLBACK");
+            } catch {
+              // The stream is dedicated to this transaction and is closed
+              // below, which discards the open transaction server-side —
+              // a failed ROLLBACK must not mask the original error.
+            }
             throw err;
           }
         } finally {
           txn.finish();
-          db.execLock.release();
+          await session.close();
         }
       };
     };
@@ -534,25 +547,24 @@ export class Connection {
 
 /**
  * A handle to an open transaction, passed as the first argument to the
- * callback of `Connection.transactionAsync()`. All SQL of the transaction
- * must go through this handle: the transaction wrapper holds the
- * connection's execution lock for the whole BEGIN..COMMIT window, so
- * `Connection` calls issued inside the callback wait for the transaction
- * to finish (and deadlock it if awaited), while the handle executes on the
- * already-owned session. Once the transaction commits or rolls back the
- * handle is closed and every method throws.
+ * callback of `Connection.transactionAsync()`. The transaction owns a
+ * dedicated session (server stream) for its whole BEGIN..COMMIT window, so
+ * all SQL of the transaction must go through this handle: `Connection`
+ * calls issued inside the callback execute on the connection's own stream,
+ * outside the transaction, and do not see its uncommitted changes. Once
+ * the transaction commits or rolls back the handle is closed and every
+ * method throws.
  */
 export class Transaction {
   private session: Session;
   private defaultSafeIntegerMode: boolean;
   private active: boolean = true;
-  // Per-transaction execution gate. The wrapper already holds the connection's
-  // execLock for the whole transaction, so this never contends with other
-  // transactions or connection-level calls; it serializes native calls *within*
-  // this transaction — the same invariant the connection's execLock enforces on
-  // the session — so statements issued concurrently in the callback cannot
-  // interleave on the shared session. It also rejects use of a completed
-  // transaction.
+  // Per-transaction execution gate. The transaction owns a dedicated
+  // session, so this never contends with connection-level calls; it
+  // serializes requests *within* this transaction — each request must
+  // carry the baton of the previous response, so statements issued
+  // concurrently in the callback cannot interleave on the transaction's
+  // stream. It also rejects use of a completed transaction.
   private gate: Lock;
 
   constructor(session: Session, defaultSafeIntegerMode: boolean) {

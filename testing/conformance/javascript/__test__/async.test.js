@@ -422,7 +422,7 @@ test.serial("Database.transactionAsync().deferred() [batch]", async (t) => {
   const db = t.context.db;
 
   const insertMany = db.transactionAsync(async (tx) => {
-    t.is(db.inTransaction, true);
+    t.is(db.inTransaction, process.env.PROVIDER !== "serverless");
     return await tx.batch([
       { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Joey", "joey@example.org"] },
       { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Sally", "sally@example.org"] },
@@ -512,11 +512,17 @@ test.serial("Database.inTransaction property", async (t) => {
   t.false(db.inTransaction, "autocommit after a one-shot query");
 
   // 3. The transaction() helper reports in-transaction inside its callback and
-  //    autocommit once it completes.
+  //    autocommit once it completes. The serverless driver runs the
+  //    transaction on its own dedicated session, so the connection itself
+  //    stays in autocommit.
   let insideTxn;
   const txn = db.transactionAsync(async (tx) => { insideTxn = db.inTransaction; });
   await txn();
-  t.true(insideTxn, "in a transaction inside the transactionAsync() callback");
+  if (process.env.PROVIDER === "serverless") {
+    t.false(insideTxn, "serverless transactionAsync() runs on a dedicated session");
+  } else {
+    t.true(insideTxn, "in a transaction inside the transactionAsync() callback");
+  }
   t.false(db.inTransaction, "autocommit after transactionAsync() completes");
 
   // 4. inTransaction must reflect the real transaction state, so it also tracks
@@ -573,10 +579,13 @@ test.serial("Database.transactionAsync()", async (t) => {
   const db = t.context.db;
 
   const insertMany = db.transactionAsync(async (tx, users) => {
-    t.is(db.inTransaction, true);
-    // statements of the transaction must be prepared from its handle: the
-    // wrapper owns the connection lock for the whole transaction, so
-    // database-level statements would wait for it instead of joining it
+    // the serverless driver runs the transaction on a dedicated session,
+    // so the connection itself stays in autocommit inside the callback
+    t.is(db.inTransaction, process.env.PROVIDER !== "serverless");
+    // statements of the transaction must be prepared from its handle:
+    // database-level statements never join the transaction — on the native
+    // driver they wait on the connection lock, on the serverless driver
+    // they run in autocommit on the connection's own stream
     const insert = await tx.prepare(
       "INSERT INTO users(name, email) VALUES (:name, :email)"
     );
@@ -626,7 +635,7 @@ test.serial("Database.transaction() [deprecated]", async (t) => {
 test.serial("Database.transactionAsync().immediate()", async (t) => {
   const db = t.context.db;
   const insertMany = db.transactionAsync(async (tx, users) => {
-    t.is(db.inTransaction, true);
+    t.is(db.inTransaction, process.env.PROVIDER !== "serverless");
     const insert = await tx.prepare(
       "INSERT INTO users(name, email) VALUES (:name, :email)"
     );
