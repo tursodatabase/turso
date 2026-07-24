@@ -325,7 +325,8 @@ fn append_postgres_filters(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
 ) {
-    let context = PlanContext(&[table_references]);
+    let context_tables = [table_references];
+    let context = PlanContext(&context_tables);
     let filters = where_clause
         .iter()
         .filter(|term| !term.consumed)
@@ -376,7 +377,8 @@ fn append_postgres_select(
     let leaf_depth = depth + wrappers.len();
 
     if !select.order_by.is_empty() {
-        let context = PlanContext(&[&select.table_references]);
+        let context_tables = [&select.table_references];
+        let context = PlanContext(&context_tables);
         let sort_depth = depth
             + wrappers
                 .iter()
@@ -401,7 +403,8 @@ fn append_postgres_select(
     }
 
     if let Some(group_by) = &select.group_by {
-        let context = PlanContext(&[&select.table_references]);
+        let context_tables = [&select.table_references];
+        let context = PlanContext(&context_tables);
         let aggregate_depth = depth
             + wrappers
                 .iter()
@@ -497,7 +500,8 @@ fn append_postgres_hash_join_condition(
     let Operation::HashJoin(hash_join) = &table.op else {
         return;
     };
-    let context = PlanContext(&[table_references]);
+    let context_tables = [table_references];
+    let context = PlanContext(&context_tables);
     let conditions = hash_join
         .join_keys
         .iter()
