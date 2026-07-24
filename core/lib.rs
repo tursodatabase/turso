@@ -184,7 +184,8 @@ pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
-    FromValueRow, PrepareContext, PreparedProgram, Program, Register,
+    explain::POSTGRES_EXPLAIN_COLUMNS, FromValueRow, PrepareContext, PreparedProgram, Program,
+    Register,
 };
 pub use vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable};
 

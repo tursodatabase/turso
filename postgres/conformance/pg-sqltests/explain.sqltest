@@ -1,0 +1,239 @@
+# PostgreSQL-shaped bare EXPLAIN through the real pgwire server.
+#
+# These assertions match complete Turso plan trees. Numeric estimates remain
+# flexible because this frontend does not promise PostgreSQL-compatible costs.
+
+@database :memory:
+
+setup items {
+    CREATE TABLE items (id int primary key, category int, value int);
+    CREATE TABLE categories (id int primary key, label text);
+    CREATE INDEX items_category ON items(category);
+    INSERT INTO items VALUES (1, 10, 100), (2, 20, 200);
+    INSERT INTO categories VALUES (10, 'one'), (20, 'two');
+}
+
+setup dml-items {
+    CREATE TABLE items (id int primary key, value int);
+    CREATE TABLE replacements (id int primary key, value int);
+    INSERT INTO items VALUES (1, 10);
+    INSERT INTO replacements VALUES (1, 99);
+}
+
+setup hash-join {
+    CREATE TABLE left_rows (key int, value int);
+    CREATE TABLE right_rows (key int, value int);
+    INSERT INTO left_rows VALUES (1, 10), (2, 20);
+    INSERT INTO right_rows VALUES (1, 100), (3, 300);
+}
+
+test explain-result {
+    EXPLAIN SELECT 1;
+}
+expect pattern {
+\AResult\z
+}
+
+@setup items
+test explain-sequential-filter {
+    EXPLAIN SELECT * FROM items WHERE value = 100;
+}
+expect pattern {
+(?m)\ASeq Scan on items  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+  Filter: \(items\.value = 100\)\z
+}
+
+@setup items
+test explain-index-scan {
+    EXPLAIN SELECT * FROM items WHERE category = 10;
+}
+expect pattern {
+(?m)\AIndex Scan using items_category on items  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+  Index Cond: \(category=\?\)\z
+}
+
+@setup items
+test explain-sort-limit {
+    EXPLAIN SELECT * FROM items ORDER BY value LIMIT 1;
+}
+expect pattern {
+(?m)\ALimit  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+  -> Sort
+    Sort Key: items\.value ASC
+    -> Seq Scan on items  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)\z
+}
+
+@setup items
+test explain-aggregate-details {
+    EXPLAIN SELECT category, count(*) FROM items GROUP BY category HAVING count(*) > 0;
+}
+expect pattern {
+(?m)\AAggregate  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+  Group Key: items\.category
+  Filter: \(count \(\*\) > 0\)
+  -> Index Only Scan using items_category on items  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)\z
+}
+
+@setup items
+test explain-nested-loop {
+    EXPLAIN SELECT items.value, categories.label FROM items JOIN categories ON items.category = categories.id;
+}
+expect pattern {
+(?m)\ANested Loop  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+  -> Seq Scan on items  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+  -> Index Scan using PRIMARY KEY on categories  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)\z
+}
+
+@setup hash-join
+test explain-hash-condition {
+    EXPLAIN SELECT left_rows.value, right_rows.value FROM left_rows JOIN right_rows ON left_rows.key = right_rows.key;
+}
+expect pattern {
+(?m)\AHash Join  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+  Hash Cond: \(left_rows\.key = right_rows\.key\)\z
+}
+
+@setup items
+test explain-union-all {
+    EXPLAIN SELECT value FROM items UNION ALL SELECT value FROM items;
+}
+expect pattern {
+(?m)\AAppend
+  -> Seq Scan on items
+  -> Seq Scan on items\z
+}
+
+@setup items
+test explain-union {
+    EXPLAIN SELECT value FROM items UNION SELECT value FROM items;
+}
+expect pattern {
+(?m)\AUnique
+  -> Append
+    -> Seq Scan on items
+    -> Seq Scan on items\z
+}
+
+@setup items
+test explain-intersect {
+    EXPLAIN SELECT value FROM items INTERSECT SELECT value FROM items;
+}
+expect pattern {
+(?m)\ASetOp Intersect
+  -> Seq Scan on items
+  -> Seq Scan on items\z
+}
+
+@setup items
+test explain-except {
+    EXPLAIN SELECT value FROM items EXCEPT SELECT value FROM items;
+}
+expect pattern {
+(?m)\ASetOp Except
+  -> Seq Scan on items
+  -> Seq Scan on items\z
+}
+
+@setup dml-items
+test explain-insert-values-does-not-execute {
+    EXPLAIN INSERT INTO items VALUES (2, 20);
+    SELECT id, value FROM items;
+}
+expect pattern {
+(?m)\AInsert on items
+  -> Result
+1\|10\z
+}
+
+@setup dml-items
+test explain-insert-select-does-not-execute {
+    EXPLAIN INSERT INTO items SELECT id + 10, value FROM items WHERE id = 1;
+    SELECT id, value FROM items;
+}
+expect pattern {
+(?m)\AInsert on items  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+  -> Index Scan using PRIMARY KEY on items  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+1\|10\z
+}
+
+@setup dml-items
+test explain-update-does-not-execute {
+    EXPLAIN UPDATE items SET value = 99 WHERE id = 1;
+    SELECT id, value FROM items;
+}
+expect pattern {
+(?m)\AUpdate on items  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+  -> Index Scan using PRIMARY KEY on items  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+1\|10\z
+}
+
+@setup dml-items
+test explain-update-from-does-not-execute {
+    EXPLAIN UPDATE items SET value = replacements.value FROM replacements WHERE items.id = replacements.id;
+    SELECT id, value FROM items;
+}
+expect pattern {
+(?m)\AUpdate on items  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+  -> Nested Loop  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+    -> Seq Scan on replacements  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+    -> Index Scan using PRIMARY KEY on items  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+1\|10\z
+}
+
+@setup dml-items
+test explain-delete-index-does-not-execute {
+    EXPLAIN DELETE FROM items WHERE id = 1;
+    SELECT id, value FROM items;
+}
+expect pattern {
+(?m)\ADelete on items  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+  -> Index Scan using PRIMARY KEY on items  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+1\|10\z
+}
+
+@setup dml-items
+test explain-delete-filter-does-not-execute {
+    EXPLAIN DELETE FROM items WHERE value = 10;
+    SELECT id, value FROM items;
+}
+expect pattern {
+(?m)\ADelete on items  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+  -> Seq Scan on items  \(cost=0\.00\.\.[0-9]+\.[0-9]{2} rows=[0-9]+\)
+    Filter: \(items\.value = 10\)
+1\|10\z
+}
+
+test explain-rejects-analyze {
+    EXPLAIN ANALYZE SELECT 1;
+}
+expect error {
+EXPLAIN options are not supported
+}
+
+test explain-rejects-verbose {
+    EXPLAIN VERBOSE SELECT 1;
+}
+expect error {
+EXPLAIN options are not supported
+}
+
+test explain-rejects-costs-off {
+    EXPLAIN (COSTS OFF) SELECT 1;
+}
+expect error {
+EXPLAIN options are not supported
+}
+
+test explain-rejects-buffers {
+    EXPLAIN (BUFFERS) SELECT 1;
+}
+expect error {
+EXPLAIN options are not supported
+}
+
+test explain-rejects-json-format {
+    EXPLAIN (FORMAT JSON) SELECT 1;
+}
+expect error {
+EXPLAIN options are not supported
+}

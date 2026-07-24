@@ -260,6 +260,7 @@ pub struct ProgramBuilder {
     next_free_cursor_id: usize,
     next_hash_table_id: usize,
     pub table_references: TableReferences,
+    postgres_explain: Option<Vec<String>>,
     /// Current parsing nesting level
     nested_level: usize,
     init_label: BranchOffset,
@@ -542,12 +543,14 @@ pub enum QueryMode {
     Normal,
     Explain,
     ExplainQueryPlan,
+    ExplainPostgres,
 }
 
 impl QueryMode {
     pub const fn new(cmd: &ast::Cmd) -> Self {
         match cmd {
             ast::Cmd::ExplainQueryPlan(_) => QueryMode::ExplainQueryPlan,
+            ast::Cmd::ExplainPostgres(_) => QueryMode::ExplainPostgres,
             ast::Cmd::Explain(_) => QueryMode::Explain,
             ast::Cmd::Stmt(_) => QueryMode::Normal,
         }
@@ -666,6 +669,7 @@ impl ProgramBuilder {
             parameters: Parameters::new(),
             result_columns: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
+            postgres_explain: None,
             collation: None,
             nested_level: 0,
             // These labels will be filled when `prologue()` is called
@@ -1117,6 +1121,36 @@ impl ProgramBuilder {
 
     pub const fn get_query_mode(&self) -> QueryMode {
         self.query_mode
+    }
+
+    pub fn set_postgres_explain(&mut self, lines: Vec<String>) {
+        turso_assert!(self.query_mode == QueryMode::ExplainPostgres);
+        self.postgres_explain = Some(lines);
+    }
+
+    /// Add an INSERT root above an already-rendered PostgreSQL EXPLAIN source.
+    ///
+    /// This changes presentation only; it does not add a node to the optimizer
+    /// plan or VDBE program. The root estimate is currently reused from the
+    /// rendered source text rather than retained as structured plan data.
+    pub fn wrap_postgres_explain_insert(&mut self, root: String) {
+        turso_assert!(self.query_mode == QueryMode::ExplainPostgres);
+        let mut source = self
+            .postgres_explain
+            .take()
+            .unwrap_or_else(|| vec!["Result".to_string()]);
+        let estimate = source
+            .first()
+            .and_then(|line| line.find("  (cost=").map(|start| line[start..].to_string()));
+        let first = source
+            .first_mut()
+            .expect("PostgreSQL EXPLAIN source plans must contain a root node");
+        *first = format!("  -> {first}");
+        for line in &mut source[1..] {
+            line.insert_str(0, "  ");
+        }
+        source.insert(0, format!("{root}{}", estimate.unwrap_or_default()));
+        self.postgres_explain = Some(source);
     }
 
     /// use emit_explain macro instead, because we don't want to allocate
@@ -1998,6 +2032,7 @@ impl ProgramBuilder {
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,
             table_references: self.table_references,
+            postgres_explain: self.postgres_explain,
             sql: sql.to_string(),
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
                 needs_stmt_subtransactions,

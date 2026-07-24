@@ -86,7 +86,7 @@ DML against pg_catalog is rejected. `version()`, `pg_typeof`, and
 | Custom background workers | ❌ Not supported | |
 | Disk based FSM | ❌ Not supported | |
 | Dynamic Background Workers | ❌ Not supported | |
-| EXPLAIN (BUFFERS) support | ❌ Not supported | EXPLAIN is not supported at all |
+| EXPLAIN (BUFFERS) support | ❌ Not supported | Bare EXPLAIN returns Turso's query-plan summary; PostgreSQL options are unsupported |
 | EXPLAIN (MEMORY) | ❌ Not supported | |
 | EXPLAIN (SERIALIZE) support | ❌ Not supported | |
 | EXPLAIN (WAL) support | ❌ Not supported | |
