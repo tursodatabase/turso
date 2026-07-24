@@ -85,7 +85,15 @@ macro_rules! assert_send_sync {
 
 pub(crate) use assert_send_sync;
 
+/// Errors returned by the embedded driver.
+///
+/// The enum is non-exhaustive: the serverless `turso_serverless::Error`
+/// shares a common subset of variants and each driver keeps
+/// backend-specific ones (this driver's local [`IoError`](Error::IoError),
+/// serverless's HTTP transport error), so matches must have a wildcard arm
+/// and stay compatible with either driver.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("SQL conversion failure: `{0}`")]
     ToSqlConversionFailure(BoxError),
