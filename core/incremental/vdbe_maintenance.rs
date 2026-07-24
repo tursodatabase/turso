@@ -149,6 +149,18 @@ impl DeltaSource {
         }
     }
 
+    fn binding_rowids(&self) -> Arc<[bool]> {
+        match self {
+            Self::BaseTable { table, .. } => vec![table.has_rowid].into(),
+            Self::Ephemeral(channel) => channel
+                .binding_rowid_columns
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>()
+                .into(),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn materialize(
         &self,
@@ -174,6 +186,7 @@ impl DeltaSource {
             &format!("{view_name}_scan_delta_{source_node}"),
             source_contract.schema.as_ref().clone(),
             source_contract.emitted_identity,
+            source_contract.binding_rowids.clone(),
             false,
         );
         let channel = sink.ephemeral()?;
@@ -213,6 +226,10 @@ struct JoinContract {
 struct EphemeralDelta {
     cursor_id: usize,
     identity: DeltaIdentity,
+    /// Physical metadata column carrying each logical binding's SQL rowid.
+    /// `None` means this node intentionally does not expose rowid provenance
+    /// for that namespace.
+    binding_rowid_columns: Arc<[Option<usize>]>,
     value_start: usize,
     width: usize,
     weight_column: usize,
@@ -243,6 +260,10 @@ impl EphemeralDelta {
     fn identity_width(&self) -> usize {
         self.identity.width()
     }
+
+    fn record_width(&self) -> usize {
+        self.weight_column + 1
+    }
 }
 
 impl DeltaIdentity {
@@ -252,6 +273,21 @@ impl DeltaIdentity {
             Self::OperatorRowid => 1,
             Self::OperatorKey(width) => width,
         }
+    }
+}
+
+fn binding_rowid_metadata_width(identity: DeltaIdentity, binding_rowids: &[bool]) -> usize {
+    if let DeltaIdentity::BindingRowids(width) = identity {
+        turso_assert!(
+            width == binding_rowids.len() && binding_rowids.iter().all(|available| *available),
+            "binding-rowid transport identity must cover every logical binding"
+        );
+        0
+    } else {
+        binding_rowids
+            .iter()
+            .filter(|available| **available)
+            .count()
     }
 }
 
@@ -265,6 +301,9 @@ struct ArrangementHandle {
     table: Arc<BTreeTable>,
     identity: DeltaIdentity,
     identity_columns: Arc<[ArrangementIdentityColumn]>,
+    /// Physical arrangement locations for the SQL rowid of each logical
+    /// binding, independent of the arrangement's transport identity.
+    binding_rowid_columns: Arc<[Option<ArrangementIdentityColumn>]>,
     /// Physical table columns corresponding to the operator's logical output
     /// schema. Base arrangements are identity-mapped; aggregate state skips
     /// accumulator payload columns and explicit output arrangements skip
@@ -297,6 +336,10 @@ impl ArrangementHandle {
         &self.identity_columns
     }
 
+    fn binding_rowid_columns(&self) -> &[Option<ArrangementIdentityColumn>] {
+        &self.binding_rowid_columns
+    }
+
     fn count_column(&self) -> Option<usize> {
         self.count_column
     }
@@ -306,6 +349,7 @@ fn btree_arrangement(
     table: Arc<BTreeTable>,
     identity: DeltaIdentity,
     identity_columns: Vec<ArrangementIdentityColumn>,
+    binding_rowid_columns: Vec<Option<ArrangementIdentityColumn>>,
     value_columns: Vec<usize>,
     count_column: Option<usize>,
 ) -> ArrangementHandle {
@@ -317,6 +361,7 @@ fn btree_arrangement(
         table,
         identity,
         identity_columns: identity_columns.into(),
+        binding_rowid_columns: binding_rowid_columns.into(),
         value_columns: value_columns.into(),
         count_column,
     }
@@ -328,6 +373,7 @@ fn base_arrangement(table: Arc<BTreeTable>, count_column: Option<usize>) -> Arra
         table,
         DeltaIdentity::BindingRowids(1),
         vec![ArrangementIdentityColumn::RowId],
+        vec![Some(ArrangementIdentityColumn::RowId)],
         value_columns,
         count_column,
     )
@@ -367,12 +413,48 @@ fn open_ephemeral_delta(
     name: &str,
     schema: dag::StreamSchema,
     identity: DeltaIdentity,
+    binding_rowids: Arc<[bool]>,
     requires_positive_first: bool,
 ) -> DeltaSink {
     let schema = Arc::new(schema);
     let width = schema.len();
     let identity_width = identity.width();
-    let table = Arc::new(synthesized_view_table(name, 0, identity_width + width));
+    turso_assert!(
+        binding_rowids.len() == schema.bindings.len(),
+        "delta rowid provenance must be parallel to its logical bindings"
+    );
+    let binding_rowid_metadata_width =
+        binding_rowid_metadata_width(identity, binding_rowids.as_ref());
+    let mut next_metadata_column = identity_width;
+    let binding_rowid_columns: Arc<[Option<usize>]> = if binding_rowid_metadata_width == 0
+        && matches!(identity, DeltaIdentity::BindingRowids(_))
+    {
+        (0..binding_rowids.len())
+            .map(Some)
+            .collect::<Vec<_>>()
+            .into()
+    } else {
+        binding_rowids
+            .iter()
+            .map(|available| {
+                available.then(|| {
+                    let column = next_metadata_column;
+                    next_metadata_column += 1;
+                    column
+                })
+            })
+            .collect::<Vec<_>>()
+            .into()
+    };
+    turso_assert!(
+        next_metadata_column == identity_width + binding_rowid_metadata_width,
+        "ephemeral rowid metadata layout must match its planned width"
+    );
+    let table = Arc::new(synthesized_view_table(
+        name,
+        0,
+        next_metadata_column + width,
+    ));
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id,
@@ -381,9 +463,10 @@ fn open_ephemeral_delta(
     let channel = EphemeralDelta {
         cursor_id,
         identity,
-        value_start: identity_width,
+        binding_rowid_columns,
+        value_start: next_metadata_column,
         width,
-        weight_column: identity_width + width,
+        weight_column: next_metadata_column + width,
         schema,
         requires_positive_first,
     };
@@ -462,31 +545,26 @@ fn seed_ephemeral_stream_cache<'a>(
         let bound = remap_bound_expr(expr, remap)?;
         resolver.cache_expr_reg(std::borrow::Cow::Owned(bound), value_reg, false, None);
     }
-    let DeltaIdentity::BindingRowids(identity_width) = channel.identity else {
-        return Ok(());
-    };
     turso_assert!(
-        identity_width == channel.schema.bindings.len(),
-        "binding-rowid identity must have one rowid per binding",
+        channel.binding_rowid_columns.len() == channel.schema.bindings.len(),
+        "rowid provenance must have one entry per stream binding",
         {
-            "identity_width": identity_width,
+            "provenance_count": channel.binding_rowid_columns.len(),
             "binding_count": channel.schema.bindings.len()
         }
     );
-    for (identity_column, binding) in channel
-        .schema
-        .bindings
+    for (binding_rowid_column, binding) in channel
+        .binding_rowid_columns
         .iter()
-        .take(identity_width)
-        .enumerate()
+        .zip(channel.schema.bindings.iter())
     {
-        if !binding.table.has_rowid {
+        let Some(binding_rowid_column) = binding_rowid_column else {
             continue;
-        }
+        };
         let value_reg = program.alloc_register();
         program.emit_insn(Insn::Column {
             cursor_id: channel.cursor_id,
-            column: identity_column,
+            column: *binding_rowid_column,
             dest: value_reg,
             default: None,
         });
@@ -1216,7 +1294,7 @@ fn build_select_plan_dag(
             .as_ref()
             .and_then(|group_by| group_by.having.as_ref())
         {
-            let normalized = having.iter().cloned().collect::<Vec<_>>();
+            let normalized = having.to_vec();
             if let Some(predicate) = combine_predicates(normalized) {
                 node = builder.push(dag::OpNode::Filter {
                     input: node,
@@ -1318,6 +1396,9 @@ pub struct HiddenTableDef {
 #[derive(Debug, Clone)]
 struct NodeOutputContract {
     schema: Arc<dag::StreamSchema>,
+    /// Whether each logical binding's SQL rowid remains available after this
+    /// operator. Transport identity is planned separately below.
+    binding_rowids: Arc<[bool]>,
     /// Identity emitted by the relational operator before an optional output
     /// arrangement.
     emitted_identity: DeltaIdentity,
@@ -1913,6 +1994,75 @@ fn declared_emitted_identity(
     Ok(identity)
 }
 
+fn declared_binding_rowids(
+    node: &dag::OpNode,
+    prior_states: &[OperatorStateDef],
+) -> Result<Arc<[bool]>> {
+    let provenance = match node {
+        dag::OpNode::Scan { table, .. } => vec![table.has_rowid],
+        dag::OpNode::Filter { input, .. } | dag::OpNode::Project { input, .. } => prior_states
+            .get(*input)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "maintenance DAG input node {input} has no rowid provenance contract"
+                ))
+            })?
+            .output
+            .binding_rowids
+            .to_vec(),
+        // A derived-table alias introduces one new SQL namespace. The source
+        // transport key still distinguishes rows, but it is not the alias's
+        // SQL rowid.
+        dag::OpNode::Alias { .. } => vec![false],
+        dag::OpNode::Join { inputs, .. } => {
+            let mut provenance = Vec::new();
+            for input in inputs {
+                provenance.extend_from_slice(
+                    &prior_states
+                        .get(*input)
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "maintenance DAG input node {input} has no rowid provenance contract"
+                            ))
+                        })?
+                        .output
+                        .binding_rowids,
+                );
+            }
+            provenance
+        }
+        // These operators may retain source expressions as output values, but
+        // they do not preserve a one-to-one source-row namespace.
+        dag::OpNode::Aggregate { input, .. } => vec![
+            false;
+            prior_states
+                .get(*input)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "maintenance DAG input node {input} has no rowid provenance contract"
+                    ))
+                })?
+                .output
+                .binding_rowids
+                .len()
+        ],
+        dag::OpNode::SetOp { inputs, .. } => vec![
+            false;
+            prior_states
+                .get(inputs[0])
+                .ok_or_else(|| {
+                    LimboError::InternalError(
+                        "set-op input has no rowid provenance contract".to_string(),
+                    )
+                })?
+                .output
+                .binding_rowids
+                .len()
+        ],
+    };
+    Ok(provenance.into())
+}
+
 /// A derived-table alias replaces all of its input bindings with one new SQL
 /// namespace. The physical source key remains stable, but its slots can no
 /// longer be interpreted as one rowid per output binding.
@@ -2008,6 +2158,12 @@ fn plan_operator_states(
     let mut hidden_names = FxHashSet::default();
     for (node_id, node) in dag.nodes.iter().enumerate() {
         let emitted_identity = declared_emitted_identity(node, &catalog.nodes)?;
+        let binding_rowids = declared_binding_rowids(node, &catalog.nodes)?;
+        if binding_rowids.len() != dag.output_schema(node_id).bindings.len() {
+            return Err(LimboError::InternalError(format!(
+                "maintenance DAG node {node_id} rowid provenance does not match its output bindings"
+            )));
+        }
         let needs_state = node_requires_primary_state(dag, node_id);
         let state_table = if needs_state {
             let table_name = format!(
@@ -2030,7 +2186,21 @@ fn plan_operator_states(
                 create_sql: multiset_table_sql(
                     &table_name,
                     node,
-                    dag.output_schema(node_id).len(),
+                    dag.output_schema(node_id).len()
+                        + if matches!(
+                            node,
+                            dag::OpNode::Join {
+                                kind: dag::JoinKind::LeftOuter,
+                                ..
+                            }
+                        ) {
+                            binding_rowids
+                                .iter()
+                                .filter(|available| **available)
+                                .count()
+                        } else {
+                            0
+                        },
                 )?,
                 table_name,
             })
@@ -2049,6 +2219,7 @@ fn plan_operator_states(
                     &table_name,
                     identity_width,
                     dag.output_schema(node_id).len(),
+                    binding_rowid_metadata_width(emitted_identity, &binding_rowids),
                 )?,
                 table_name,
             })
@@ -2066,6 +2237,7 @@ fn plan_operator_states(
             node_id,
             output: NodeOutputContract {
                 schema: Arc::new(dag.output_schema(node_id).clone()),
+                binding_rowids,
                 emitted_identity,
                 published_identity,
             },
@@ -2097,6 +2269,7 @@ fn arrangement_table_sql(
     table_name: &str,
     identity_width: usize,
     value_width: usize,
+    binding_rowid_width: usize,
 ) -> Result<String> {
     if identity_width == 0 {
         return Err(LimboError::InternalError(
@@ -2108,8 +2281,9 @@ fn arrangement_table_sql(
         .map(|i| format!("i{i}"))
         .collect::<Vec<_>>();
     columns.extend((0..value_width).map(|i| format!("c{i}")));
-    columns.push("mult".to_string());
     let key = columns[..identity_width + value_width].to_vec();
+    columns.extend((0..binding_rowid_width).map(|i| format!("r{i}")));
+    columns.push("mult".to_string());
     Ok(format!(
         "CREATE TABLE {table_ident} ({}, PRIMARY KEY ({}))",
         columns.join(", "),
@@ -2237,7 +2411,7 @@ fn node_needs_auxiliary_state(node: &dag::OpNode) -> bool {
 fn multiset_table_sql(
     multiset_table_name: &str,
     node: &dag::OpNode,
-    output_width: usize,
+    payload_width: usize,
 ) -> Result<String> {
     let multiset_table_ident = crate::util::quote_identifier(multiset_table_name);
     match node {
@@ -2270,10 +2444,11 @@ fn multiset_table_sql(
         )),
         // A LEFT JOIN view's per-left-row bookkeeping: signed presence,
         // count of ON-matches, and whether its NULL-padded row is currently
-        // published. The payload preserves that image so downstream
-        // operators can consume its retraction after the left row departs.
+        // published. The payload preserves that image and its binding-rowid
+        // provenance so downstream operators can consume its retraction after
+        // the left row departs.
         dag::OpNode::Join { .. } => {
-            let payload = (0..output_width)
+            let payload = (0..payload_width)
                 .map(|i| format!(", c{i}"))
                 .collect::<String>();
             Ok(format!(
@@ -2440,6 +2615,11 @@ fn join_contract_from_inputs(
                 "join arrangement does not match its logical input width".to_string(),
             ));
         }
+        if arrangement.binding_rowid_columns().len() != input_schema.bindings.len() {
+            return Err(LimboError::InternalError(
+                "join arrangement does not match its logical binding provenance".to_string(),
+            ));
+        }
         if arrangement.identity() != input.delta.identity() {
             return Err(LimboError::InternalError(
                 "join delta and arrangement expose different identities".to_string(),
@@ -2477,11 +2657,18 @@ fn emit_output_arrangement(
             "an arranged delta must carry a stable source identity".to_string(),
         ));
     }
+    let extra_binding_rowid_width = input.value_start - identity_width;
     turso_assert!(
         (output.identity == input.identity || output.identity == DeltaIdentity::OperatorRowid)
-            && output.value_start == output.identity_width()
             && output.width == input.width
-            && output.weight_column == output.identity_width() + input.width,
+            && output.binding_rowid_columns.len() == input.binding_rowid_columns.len()
+            && output
+                .binding_rowid_columns
+                .iter()
+                .map(Option::is_some)
+                .eq(input.binding_rowid_columns.iter().map(Option::is_some))
+            && input.weight_column == input.value_start + input.width
+            && output.weight_column == output.value_start + output.width,
         "output arrangement must publish its planned identity, values, and weight"
     );
 
@@ -2501,7 +2688,7 @@ fn emit_output_arrangement(
                 "output arrangement {arrangement_table_name} of materialized view {view_name} has no index"
             ))
         })?;
-    let expected_columns = identity_width + input.width + 1;
+    let expected_columns = identity_width + input.width + extra_binding_rowid_width + 1;
     if table.columns().len() != expected_columns {
         return Err(LimboError::InternalError(format!(
             "output arrangement {arrangement_table_name} has {} columns, expected {expected_columns}",
@@ -2536,15 +2723,16 @@ fn emit_output_arrangement(
     let one_reg = program.alloc_register();
     let is_new_reg = program.alloc_register();
     let previous_rowid_reg = program.alloc_register();
-    // [source identity..., persisted values..., multiplicity].
+    // [source identity..., persisted values..., binding rowids..., multiplicity].
     let state_record_start = program.alloc_registers(expected_columns);
-    let state_mult_reg = state_record_start + key_width;
+    let state_binding_rowids_start = state_record_start + key_width;
+    let state_mult_reg = state_binding_rowids_start + extra_binding_rowid_width;
     let state_record_reg = program.alloc_register();
     let index_record_reg = program.alloc_register();
-    // [published identity..., delta values..., delta weight].
-    let output_record_start = program.alloc_registers(output.identity_width() + input.width + 1);
-    let output_values_start = output_record_start + output.identity_width();
-    let output_weight_reg = output_values_start + input.width;
+    // [published identity..., binding rowids..., delta values..., delta weight].
+    let output_record_start = program.alloc_registers(output.record_width());
+    let output_values_start = output_record_start + output.value_start;
+    let output_weight_reg = output_record_start + output.weight_column;
     let output_record_reg = program.alloc_register();
     let output_rowid_reg = program.alloc_register();
 
@@ -2577,6 +2765,14 @@ fn emit_output_arrangement(
             cursor_id: input.cursor_id,
             column: input.value_start + column,
             dest: input_values_start + column,
+            default: None,
+        });
+    }
+    for column in identity_width..input.value_start {
+        program.emit_insn(Insn::Column {
+            cursor_id: input.cursor_id,
+            column,
+            dest: state_binding_rowids_start + column - identity_width,
             default: None,
         });
     }
@@ -2641,7 +2837,7 @@ fn emit_output_arrangement(
     });
     program.emit_insn(Insn::Column {
         cursor_id: table_cursor,
-        column: key_width,
+        column: key_width + extra_binding_rowid_width,
         dest: current_mult_reg,
         default: None,
     });
@@ -2748,6 +2944,39 @@ fn emit_output_arrangement(
             extra_amount: input.width - 1,
         });
     }
+    for (input_column, output_column) in input
+        .binding_rowid_columns
+        .iter()
+        .zip(output.binding_rowid_columns.iter())
+    {
+        match (input_column, output_column) {
+            (None, None) => {}
+            (Some(input_column), Some(output_column))
+                if *output_column < output.identity_width() =>
+            {
+                turso_assert!(
+                    output.identity == input.identity && input_column == output_column,
+                    "published binding-rowid identity must preserve its source slot"
+                );
+            }
+            (Some(input_column), Some(output_column)) => {
+                let source_reg = if *input_column < identity_width {
+                    lookup_start + *input_column
+                } else {
+                    state_binding_rowids_start + *input_column - identity_width
+                };
+                program.emit_insn(Insn::Copy {
+                    src_reg: source_reg,
+                    dst_reg: output_record_start + *output_column,
+                    extra_amount: 0,
+                });
+            }
+            _ => turso_assert!(
+                false,
+                "output arrangement must preserve binding-rowid availability"
+            ),
+        }
+    }
     program.emit_insn(Insn::Copy {
         src_reg: contribution_reg,
         dst_reg: output_weight_reg,
@@ -2755,7 +2984,7 @@ fn emit_output_arrangement(
     });
     program.emit_insn(Insn::MakeRecord {
         start_reg: output_record_start as u16,
-        count: (output.identity_width() + input.width + 1) as u16,
+        count: output.record_width() as u16,
         dest_reg: output_record_reg as u16,
         index_name: None,
         affinity_str: None,
@@ -2791,6 +3020,19 @@ fn emit_output_arrangement(
     program.preassign_label_to_next_insn(end_label);
 
     let value_columns = (identity_width..identity_width + input.width).collect();
+    let binding_rowid_columns = input
+        .binding_rowid_columns
+        .iter()
+        .map(|column| {
+            column.map(|column| {
+                ArrangementIdentityColumn::Column(if column < identity_width {
+                    column
+                } else {
+                    key_width + column - identity_width
+                })
+            })
+        })
+        .collect();
     let (arrangement_identity, identity_columns) = if output.identity == input.identity {
         (
             input.identity,
@@ -2808,8 +3050,9 @@ fn emit_output_arrangement(
         table,
         arrangement_identity,
         identity_columns,
+        binding_rowid_columns,
         value_columns,
-        Some(identity_width + input.width),
+        Some(key_width + extra_binding_rowid_width),
     ))
 }
 
@@ -2845,6 +3088,7 @@ fn materialize_declared_output_arrangement(
         &format!("{view_name}_arranged_delta_{node_id}"),
         operator_state.output.schema.as_ref().clone(),
         operator_state.output.published_identity,
+        operator_state.output.binding_rowids.clone(),
         input.requires_positive_first,
     );
     let arranged_output = arranged_sink.ephemeral()?;
@@ -2852,7 +3096,7 @@ fn materialize_declared_output_arrangement(
         program,
         view_name,
         &input,
-        &arranged_output,
+        arranged_output,
         &arrangement_def.table_name,
         schema,
     )?;
@@ -2878,6 +3122,7 @@ fn emit_ephemeral_filter(
         &format!("{view_name}_filter_delta_{node_id}"),
         output_contract.schema.as_ref().clone(),
         output_contract.emitted_identity,
+        output_contract.binding_rowids.clone(),
         input.requires_positive_first,
     );
     let output = sink.ephemeral()?;
@@ -2899,7 +3144,14 @@ fn emit_ephemeral_filter(
     let loop_label = program.allocate_label();
     let next_label = program.allocate_label();
     let pass_label = program.allocate_label();
-    let record_start = program.alloc_registers(input.identity_width() + input.width + 1);
+    turso_assert!(
+        output.identity == input.identity
+            && output.binding_rowid_columns == input.binding_rowid_columns
+            && output.value_start == input.value_start
+            && output.weight_column == input.weight_column,
+        "filter output must preserve its complete input stream contract"
+    );
+    let record_start = program.alloc_registers(output.record_width());
     let record_reg = program.alloc_register();
     let rowid_reg = program.alloc_register();
 
@@ -2924,7 +3176,7 @@ fn emit_ephemeral_filter(
     )?;
     program.preassign_label_to_next_insn(pass_label);
 
-    for column in 0..input.identity_width() {
+    for column in 0..input.weight_column {
         program.emit_insn(Insn::Column {
             cursor_id: input.cursor_id,
             column,
@@ -2932,23 +3184,15 @@ fn emit_ephemeral_filter(
             default: None,
         });
     }
-    for column in 0..input.width {
-        program.emit_insn(Insn::Column {
-            cursor_id: input.cursor_id,
-            column: input.value_start + column,
-            dest: record_start + input.identity_width() + column,
-            default: None,
-        });
-    }
     program.emit_insn(Insn::Column {
         cursor_id: input.cursor_id,
         column: input.weight_column,
-        dest: record_start + input.identity_width() + input.width,
+        dest: record_start + output.weight_column,
         default: None,
     });
     program.emit_insn(Insn::MakeRecord {
         start_reg: record_start as u16,
-        count: (input.identity_width() + input.width + 1) as u16,
+        count: output.record_width() as u16,
         dest_reg: record_reg as u16,
         index_name: None,
         affinity_str: None,
@@ -2983,6 +3227,7 @@ fn append_alias_values(
     if input.width != output.width
         || output.identity_width() != input.identity_width()
         || output.value_start != output.identity_width()
+        || output.binding_rowid_columns.iter().any(Option::is_some)
     {
         return Err(LimboError::InternalError(
             "alias stream copy has incompatible input/output layouts".to_string(),
@@ -2991,7 +3236,7 @@ fn append_alias_values(
 
     let end_label = program.allocate_label();
     let loop_label = program.allocate_label();
-    let record_start = program.alloc_registers(output.identity_width() + output.width + 1);
+    let record_start = program.alloc_registers(output.record_width());
     let record_reg = program.alloc_register();
     let rowid_reg = program.alloc_register();
 
@@ -3024,7 +3269,7 @@ fn append_alias_values(
     });
     program.emit_insn(Insn::MakeRecord {
         start_reg: record_start as u16,
-        count: (output.identity_width() + output.width + 1) as u16,
+        count: output.record_width() as u16,
         dest_reg: record_reg as u16,
         index_name: None,
         affinity_str: None,
@@ -3061,10 +3306,11 @@ fn emit_ephemeral_alias(
         &format!("{view_name}_alias_delta_{node_id}"),
         output_contract.schema.as_ref().clone(),
         output_contract.emitted_identity,
+        output_contract.binding_rowids.clone(),
         input.requires_positive_first,
     );
     let output = sink.ephemeral()?;
-    append_alias_values(program, input, &output)?;
+    append_alias_values(program, input, output)?;
     sink.source()
 }
 
@@ -3081,11 +3327,12 @@ fn emit_union_all_to_ephemeral(
         &format!("{view_name}_union_all_delta_{node_id}"),
         output_contract.schema.as_ref().clone(),
         output_contract.emitted_identity,
+        output_contract.binding_rowids.clone(),
         requires_positive_first,
     );
     let output = sink.ephemeral()?;
     for (branch, input) in inputs.iter().enumerate() {
-        append_union_all_branch(program, branch, input, &output)?;
+        append_union_all_branch(program, branch, input, output)?;
     }
     sink.source()
 }
@@ -3102,6 +3349,7 @@ fn append_union_all_branch(
         || input.identity_width() == 0
         || output.identity != DeltaIdentity::OperatorKey(2)
         || output.value_start != 2
+        || output.binding_rowid_columns.iter().any(Option::is_some)
     {
         return Err(LimboError::InternalError(
             "UNION ALL branch has an incompatible delta identity".to_string(),
@@ -3110,7 +3358,7 @@ fn append_union_all_branch(
 
     let end_label = program.allocate_label();
     let loop_label = program.allocate_label();
-    let record_start = program.alloc_registers(2 + output.width + 1);
+    let record_start = program.alloc_registers(output.record_width());
     let source_identity_start = program.alloc_registers(input.identity_width());
     let record_reg = program.alloc_register();
     let rowid_reg = program.alloc_register();
@@ -3152,7 +3400,7 @@ fn append_union_all_branch(
     });
     program.emit_insn(Insn::MakeRecord {
         start_reg: record_start as u16,
-        count: (2 + output.width + 1) as u16,
+        count: output.record_width() as u16,
         dest_reg: record_reg as u16,
         index_name: None,
         affinity_str: None,
@@ -3263,6 +3511,7 @@ fn emit_declared_delta_nodes_to(
                     &format!("{view_name}_project_delta_{node_id}"),
                     output_contract.schema.as_ref().clone(),
                     output_contract.emitted_identity,
+                    output_contract.binding_rowids.clone(),
                     upstream.requires_positive_first,
                 );
                 let output = sink.ephemeral()?;
@@ -3270,7 +3519,7 @@ fn emit_declared_delta_nodes_to(
                     program,
                     &upstream,
                     projections,
-                    &output,
+                    output,
                     schema,
                     connection,
                 )?;
@@ -3419,6 +3668,7 @@ fn emit_declared_delta_nodes_to(
                         &format!("{view_name}_set_op_delta_{node_id}"),
                         output_contract.schema.as_ref().clone(),
                         output_contract.emitted_identity,
+                        output_contract.binding_rowids.clone(),
                         requires_positive_first,
                     );
                     let output = sink.ephemeral()?;
@@ -3429,7 +3679,7 @@ fn emit_declared_delta_nodes_to(
                         operators,
                         *prefix_len,
                         key_collations,
-                        &output,
+                        output,
                         operator_states.for_node(node_id)?,
                         schema,
                     )?;
@@ -3465,6 +3715,7 @@ fn emit_declared_delta_nodes_to(
                     &format!("{view_name}_aggregate_delta_{node_id}"),
                     output_contract.schema.as_ref().clone(),
                     output_contract.emitted_identity,
+                    output_contract.binding_rowids.clone(),
                     false,
                 );
                 let output = sink.ephemeral()?;
@@ -3477,7 +3728,7 @@ fn emit_declared_delta_nodes_to(
                     group_collations,
                     aggregates,
                     *scalar,
-                    &output,
+                    output,
                     input,
                     operator_state,
                     schema,
@@ -3496,6 +3747,7 @@ fn emit_declared_delta_nodes_to(
                         state_table,
                         DeltaIdentity::OperatorRowid,
                         vec![ArrangementIdentityColumn::RowId],
+                        vec![None; output_contract.schema.bindings.len()],
                         value_columns,
                         None,
                     )),
@@ -3508,6 +3760,11 @@ fn emit_declared_delta_nodes_to(
                 "maintenance DAG node {node_id} emitted {:?}, but its declared identity is {:?}",
                 output.delta.identity(),
                 operator_state.output.emitted_identity
+            )));
+        }
+        if output.delta.binding_rowids().as_ref() != operator_state.output.binding_rowids.as_ref() {
+            return Err(LimboError::InternalError(format!(
+                "maintenance DAG node {node_id} emitted the wrong binding-rowid provenance"
             )));
         }
         let output = materialize_declared_output_arrangement(
@@ -3525,6 +3782,25 @@ fn emit_declared_delta_nodes_to(
                 output.delta.identity(),
                 operator_state.output.published_identity
             )));
+        }
+        if output.delta.binding_rowids().as_ref() != operator_state.output.binding_rowids.as_ref() {
+            return Err(LimboError::InternalError(format!(
+                "maintenance DAG node {node_id} published the wrong binding-rowid provenance"
+            )));
+        }
+        if let Some(arrangement) = &output.arrangement {
+            let arrangement_binding_rowids = arrangement
+                .binding_rowid_columns()
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>();
+            if arrangement_binding_rowids.as_slice()
+                != operator_state.output.binding_rowids.as_ref()
+            {
+                return Err(LimboError::InternalError(format!(
+                    "maintenance DAG node {node_id} arrangement exposes the wrong binding-rowid provenance"
+                )));
+            }
         }
         outputs[node_id] = Some(output);
     }
@@ -3620,6 +3896,7 @@ fn emit_base_scan_delta(
 ) -> Result<()> {
     turso_assert!(
         output.identity == DeltaIdentity::BindingRowids(1)
+            && output.binding_rowid_columns.as_ref() == [Some(0)]
             && output.value_start == 1
             && output.width == base_table.columns().len()
             && output.weight_column == output.width + 1,
@@ -3657,7 +3934,7 @@ fn emit_base_scan_delta(
     });
     program.preassign_label_to_next_insn(loop_label);
 
-    let record_start = program.alloc_registers(output.identity_width() + output.width + 1);
+    let record_start = program.alloc_registers(output.record_width());
     let weight_reg = record_start + output.weight_column;
     program.emit_insn(Insn::RowId {
         cursor_id: input_cursor_id,
@@ -3696,7 +3973,7 @@ fn emit_base_scan_delta(
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: record_start as u16,
-        count: (output.identity_width() + output.width + 1) as u16,
+        count: output.record_width() as u16,
         dest_reg: record_reg as u16,
         index_name: None,
         affinity_str: None,
@@ -3758,12 +4035,19 @@ fn emit_ephemeral_project(
     program.preassign_label_to_next_insn(loop_label);
     seed_ephemeral_stream_cache(program, input, &binding_remap, &mut resolver)?;
 
-    let identity_start = program.alloc_registers(input.identity_width());
-    for column in 0..input.identity_width() {
+    turso_assert!(
+        output.identity == input.identity
+            && output.binding_rowid_columns == input.binding_rowid_columns
+            && output.value_start == input.value_start
+            && output.weight_column == output.value_start + num_output_columns,
+        "linear projection sink must preserve its input metadata contract"
+    );
+    let metadata_start = program.alloc_registers(output.value_start);
+    for column in 0..input.value_start {
         program.emit_insn(Insn::Column {
             cursor_id: input.cursor_id,
             column,
-            dest: identity_start + column,
+            dest: metadata_start + column,
             default: None,
         });
     }
@@ -3788,13 +4072,7 @@ fn emit_ephemeral_project(
         default: None,
     });
 
-    turso_assert!(
-        output.identity == input.identity
-            && output.value_start == input.identity_width()
-            && output.weight_column == input.identity_width() + num_output_columns,
-        "linear projection sink must preserve its input identity"
-    );
-    debug_assert_eq!(identity_start + input.identity_width(), out_start);
+    debug_assert_eq!(metadata_start + output.value_start, out_start);
     program.emit_insn(Insn::Copy {
         src_reg: weight_reg,
         dst_reg: new_weight_reg,
@@ -3802,8 +4080,8 @@ fn emit_ephemeral_project(
     });
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: identity_start as u16,
-        count: (input.identity_width() + num_output_columns + 1) as u16,
+        start_reg: metadata_start as u16,
+        count: output.record_width() as u16,
         dest_reg: record_reg as u16,
         index_name: None,
         affinity_str: None,
@@ -3844,7 +4122,7 @@ fn emit_terminal_delta(
         matches!(
             input.identity,
             DeltaIdentity::BindingRowids(1) | DeltaIdentity::OperatorRowid
-        ) && input.value_start == 1,
+        ) && input.weight_column == input.value_start + input.width,
         "terminal delta streams require one stable operator identity"
     );
     let num_output_columns = match sink {
@@ -5155,14 +5433,13 @@ fn make_joined_table(
 /// and the per-input physical cursor ids.
 type JoinPhaseSink<'a> = dyn FnMut(&mut ProgramBuilder, &[usize]) -> Result<()> + 'a;
 
-fn emit_arrangement_identity_value(
+fn emit_arrangement_column_value(
     program: &mut ProgramBuilder,
-    arrangement: &ArrangementHandle,
+    column: ArrangementIdentityColumn,
     cursor_id: usize,
-    identity_column: usize,
     dest: usize,
 ) {
-    match arrangement.identity_columns()[identity_column] {
+    match column {
         ArrangementIdentityColumn::RowId => {
             program.emit_insn(Insn::RowId { cursor_id, dest });
         }
@@ -5173,6 +5450,74 @@ fn emit_arrangement_identity_value(
                 dest,
                 default: None,
             });
+        }
+    }
+}
+
+fn emit_arrangement_identity_value(
+    program: &mut ProgramBuilder,
+    arrangement: &ArrangementHandle,
+    cursor_id: usize,
+    identity_column: usize,
+    dest: usize,
+) {
+    emit_arrangement_column_value(
+        program,
+        arrangement.identity_columns()[identity_column],
+        cursor_id,
+        dest,
+    );
+}
+
+fn emit_join_input_binding_rowid(
+    program: &mut ProgramBuilder,
+    side: JoinSide,
+    delta: &DeltaSource,
+    arrangement: &ArrangementHandle,
+    cursor_id: usize,
+    binding: usize,
+    dest: usize,
+) -> bool {
+    match (side, delta) {
+        (JoinSide::Delta, DeltaSource::BaseTable { table, .. }) => {
+            turso_assert!(
+                binding == 0,
+                "a base-table delta exposes exactly one logical binding"
+            );
+            if !table.has_rowid {
+                return false;
+            }
+            program.emit_insn(Insn::RowId { cursor_id, dest });
+            true
+        }
+        (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
+            let Some(column) = channel
+                .binding_rowid_columns
+                .get(binding)
+                .copied()
+                .flatten()
+            else {
+                return false;
+            };
+            program.emit_insn(Insn::Column {
+                cursor_id,
+                column,
+                dest,
+                default: None,
+            });
+            true
+        }
+        (JoinSide::Btree, _) => {
+            let Some(column) = arrangement
+                .binding_rowid_columns()
+                .get(binding)
+                .copied()
+                .flatten()
+            else {
+                return false;
+            };
+            emit_arrangement_column_value(program, column, cursor_id, dest);
+            true
         }
     }
 }
@@ -5409,48 +5754,18 @@ fn emit_join_phase(
             let bound = remap_bound_expr(expr, &binding_remap)?;
             resolver.cache_expr_reg(std::borrow::Cow::Owned(bound), value_reg, false, None);
         }
-        let input_identity = match sides[pos] {
-            JoinSide::Delta => deltas[pos].identity(),
-            JoinSide::Btree => arrangements[pos].identity(),
-        };
-        let DeltaIdentity::BindingRowids(identity_width) = input_identity else {
-            continue;
-        };
-        turso_assert!(
-            identity_width == schemas[pos].bindings.len(),
-            "binding-rowid join input must have one rowid per binding"
-        );
-        for (identity_column, binding) in schemas[pos].bindings.iter().enumerate() {
-            if !binding.table.has_rowid {
-                continue;
-            }
+        for (binding_index, binding) in schemas[pos].bindings.iter().enumerate() {
             let rowid_reg = program.alloc_register();
-            match (&sides[pos], &deltas[pos]) {
-                (JoinSide::Delta, DeltaSource::BaseTable { .. }) => {
-                    turso_assert!(
-                        identity_width == 1,
-                        "a base-table join input has one binding rowid"
-                    );
-                    program.emit_insn(Insn::RowId {
-                        cursor_id: cursor_ids[pos],
-                        dest: rowid_reg,
-                    });
-                }
-                (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
-                    program.emit_insn(Insn::Column {
-                        cursor_id: channel.cursor_id,
-                        column: identity_column,
-                        dest: rowid_reg,
-                        default: None,
-                    });
-                }
-                (JoinSide::Btree, _) => emit_arrangement_identity_value(
-                    program,
-                    &arrangements[pos],
-                    cursor_ids[pos],
-                    identity_column,
-                    rowid_reg,
-                ),
+            if !emit_join_input_binding_rowid(
+                program,
+                sides[pos],
+                &deltas[pos],
+                &arrangements[pos],
+                cursor_ids[pos],
+                binding_index,
+                rowid_reg,
+            ) {
+                continue;
             }
             let phase_id = *binding_remap.get(&binding.logical_id).ok_or_else(|| {
                 LimboError::InternalError(
@@ -5553,22 +5868,23 @@ fn emit_join_deltas_to_ephemeral(
         &format!("{view_name}_joined_delta"),
         output_contract.schema.as_ref().clone(),
         output_contract.emitted_identity,
+        output_contract.binding_rowids.clone(),
         true,
     );
     let channel = sink.ephemeral()?;
     let eph_cursor_id = channel.cursor_id;
 
-    // [input rowids.., natural join row.., weight].
-    let eph_rec_start = program.alloc_registers(channel.identity_width() + width + 1);
-    let eph_value_start = eph_rec_start + channel.identity_width();
-    let eph_weight_reg = eph_value_start + width;
+    // [transport identity..., binding rowids..., natural join row..., weight].
+    let eph_rec_start = program.alloc_registers(channel.record_width());
+    let eph_value_start = eph_rec_start + channel.value_start;
+    let eph_weight_reg = eph_rec_start + channel.weight_column;
     let eph_rowid_reg = program.alloc_register();
     let eph_record_reg = program.alloc_register();
 
     let emit_eph_insert = |program: &mut ProgramBuilder| {
         program.emit_insn(Insn::MakeRecord {
             start_reg: eph_rec_start as u16,
-            count: (channel.identity_width() + width + 1) as u16,
+            count: channel.record_width() as u16,
             dest_reg: eph_record_reg as u16,
             index_name: None,
             affinity_str: None,
@@ -5656,6 +5972,41 @@ fn emit_join_deltas_to_ephemeral(
                         ));
                     }
                 }
+                let mut output_binding = 0;
+                for position in 0..schemas.len() {
+                    for input_binding in 0..schemas[position].bindings.len() {
+                        if let Some(output_column) = channel.binding_rowid_columns[output_binding] {
+                            if output_column < channel.identity_width() {
+                                turso_assert!(
+                                    channel.identity
+                                        == DeltaIdentity::BindingRowids(
+                                            channel.schema.bindings.len()
+                                        )
+                                        && output_column == output_binding,
+                                    "binding-rowid transport slots must follow binding order"
+                                );
+                            } else {
+                                turso_assert!(
+                                    emit_join_input_binding_rowid(
+                                        program,
+                                        sides[position],
+                                        &deltas[position],
+                                        &arrangements[position],
+                                        cursors[position],
+                                        input_binding,
+                                        eph_rec_start + output_column,
+                                    ),
+                                    "planned join rowid provenance is unavailable from its input"
+                                );
+                            }
+                        }
+                        output_binding += 1;
+                    }
+                }
+                turso_assert!(
+                    output_binding == channel.schema.bindings.len(),
+                    "join input bindings must match its output provenance contract"
+                );
                 let mut destination = eph_value_start;
                 for (position, (input_schema, cursor_id)) in schemas.iter().zip(cursors).enumerate()
                 {
@@ -5694,22 +6045,25 @@ fn emit_join_deltas_to_ephemeral(
     sink.source()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_operator_keyed_ephemeral_row(
     program: &mut ProgramBuilder,
     output: &EphemeralDelta,
     kind: i64,
     source_identity_start: usize,
     source_identity_width: usize,
+    binding_rowid_regs: &[Option<usize>],
     values_start: usize,
     weight_reg: usize,
 ) {
     turso_assert!(
         output.identity == DeltaIdentity::OperatorKey(2)
             && source_identity_width > 0
-            && output.value_start == 2,
+            && binding_rowid_regs.len() == output.binding_rowid_columns.len()
+            && output.weight_column == output.value_start + output.width,
         "operator-keyed delta rows carry kind, packed source identity, values, and weight"
     );
-    let record_start = program.alloc_registers(2 + output.width + 1);
+    let record_start = program.alloc_registers(output.record_width());
     program.emit_int(kind, record_start);
     program.emit_insn(Insn::MakeRecord {
         start_reg: source_identity_start as u16,
@@ -5718,6 +6072,20 @@ fn emit_operator_keyed_ephemeral_row(
         index_name: None,
         affinity_str: None,
     });
+    for (column, source_reg) in output.binding_rowid_columns.iter().zip(binding_rowid_regs) {
+        match (column, source_reg) {
+            (Some(column), Some(source_reg)) => program.emit_insn(Insn::Copy {
+                src_reg: *source_reg,
+                dst_reg: record_start + *column,
+                extra_amount: 0,
+            }),
+            (None, None) => {}
+            _ => turso_assert!(
+                false,
+                "operator-keyed delta row does not satisfy its provenance contract"
+            ),
+        }
+    }
     if output.width > 0 {
         program.emit_insn(Insn::Copy {
             src_reg: values_start,
@@ -5733,7 +6101,7 @@ fn emit_operator_keyed_ephemeral_row(
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: record_start as u16,
-        count: (2 + output.width + 1) as u16,
+        count: output.record_width() as u16,
         dest_reg: record_reg as u16,
         index_name: None,
         affinity_str: None,
@@ -5797,6 +6165,7 @@ fn emit_left_join_deltas_to_ephemeral(
         &format!("{view_name}_left_join_delta_{node_id}"),
         output_contract.schema.as_ref().clone(),
         output_contract.emitted_identity,
+        output_contract.binding_rowids.clone(),
         true,
     );
     let output = sink.ephemeral()?;
@@ -5847,6 +6216,27 @@ fn emit_left_join_deltas_to_ephemeral(
     let pair_identity_start = program.alloc_registers(n);
     let matched_values_start = program.alloc_registers(natural_width);
     let matched_weight_reg = program.alloc_register();
+    let binding_rowid_width = output
+        .binding_rowid_columns
+        .iter()
+        .filter(|column| column.is_some())
+        .count();
+    let binding_rowid_registers = |start| {
+        let mut next = start;
+        output
+            .binding_rowid_columns
+            .iter()
+            .map(|column| {
+                column.map(|_| {
+                    let register = next;
+                    next += 1;
+                    register
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let matched_binding_rowids_start = program.alloc_registers(binding_rowid_width);
+    let matched_binding_rowid_regs = binding_rowid_registers(matched_binding_rowids_start);
 
     let pad_cursors: Vec<usize> = contract
         .arrangements
@@ -5867,12 +6257,14 @@ fn emit_left_join_deltas_to_ephemeral(
         aux_name,
         &aux_table,
         &aux_index,
-        natural_width,
+        natural_width + binding_rowid_width,
         zero_reg,
         prev_rowid_scratch,
         corrupt_label,
     );
     let padded_values_start = outer.content_start;
+    let padded_binding_rowids_start = padded_values_start + natural_width;
+    let padded_binding_rowid_regs = binding_rowid_registers(padded_binding_rowids_start);
 
     program.emit_int(0, zero_reg);
     program.emit_int(1, one_reg);
@@ -5893,12 +6285,44 @@ fn emit_left_join_deltas_to_ephemeral(
                 end == padded_values_start + natural_width,
                 "padded LEFT JOIN row does not match its output schema"
             );
+            let mut output_binding = 0;
+            for (position, input_schema) in contract.schemas.iter().enumerate() {
+                for input_binding in 0..input_schema.bindings.len() {
+                    if let Some(dest) = padded_binding_rowid_regs[output_binding] {
+                        if position == 0 {
+                            turso_assert!(
+                                emit_join_input_binding_rowid(
+                                    program,
+                                    JoinSide::Btree,
+                                    &contract.deltas[position],
+                                    &contract.arrangements[position],
+                                    pad_cursors[position],
+                                    input_binding,
+                                    dest,
+                                ),
+                                "LEFT JOIN padded row requires its left rowid provenance"
+                            );
+                        } else {
+                            program.emit_insn(Insn::Null {
+                                dest,
+                                dest_end: None,
+                            });
+                        }
+                    }
+                    output_binding += 1;
+                }
+            }
+            turso_assert!(
+                output_binding == output.schema.bindings.len(),
+                "LEFT JOIN padded row provenance must match its output bindings"
+            );
             emit_operator_keyed_ephemeral_row(
                 program,
-                &output,
+                output,
                 1,
                 srid_reg,
                 1,
+                &padded_binding_rowid_regs,
                 padded_values_start,
                 one_reg,
             );
@@ -5909,10 +6333,11 @@ fn emit_left_join_deltas_to_ephemeral(
         program.emit_int(-1, negative_one_reg);
         emit_operator_keyed_ephemeral_row(
             program,
-            &output,
+            output,
             1,
             srid_reg,
             1,
+            &padded_binding_rowid_regs,
             padded_values_start,
             negative_one_reg,
         );
@@ -6000,12 +6425,37 @@ fn emit_left_join_deltas_to_ephemeral(
                     destination == matched_values_start + natural_width,
                     "matched LEFT JOIN row does not match its output schema"
                 );
+                let mut output_binding = 0;
+                for (position, input_schema) in contract.schemas.iter().enumerate() {
+                    for input_binding in 0..input_schema.bindings.len() {
+                        if let Some(dest) = matched_binding_rowid_regs[output_binding] {
+                            turso_assert!(
+                                emit_join_input_binding_rowid(
+                                    program,
+                                    sides[position],
+                                    &contract.deltas[position],
+                                    &contract.arrangements[position],
+                                    cursors[position],
+                                    input_binding,
+                                    dest,
+                                ),
+                                "matched LEFT JOIN row requires its planned rowid provenance"
+                            );
+                        }
+                        output_binding += 1;
+                    }
+                }
+                turso_assert!(
+                    output_binding == output.schema.bindings.len(),
+                    "matched LEFT JOIN provenance must match its output bindings"
+                );
                 emit_operator_keyed_ephemeral_row(
                     program,
-                    &output,
+                    output,
                     0,
                     pair_identity_start,
                     n,
+                    &matched_binding_rowid_regs,
                     matched_values_start,
                     matched_weight_reg,
                 );
@@ -6650,10 +7100,12 @@ fn emit_ephemeral_row_with_identity(
     weight_reg: usize,
 ) {
     turso_assert!(
-        output.identity == DeltaIdentity::OperatorRowid && output.value_start == 1,
+        output.identity == DeltaIdentity::OperatorRowid
+            && output.value_start == 1
+            && output.binding_rowid_columns.iter().all(Option::is_none),
         "arranged operator output streams carry one stable state rowid"
     );
-    let record_start = program.alloc_registers(1 + output.width + 1);
+    let record_start = program.alloc_registers(output.record_width());
     program.emit_insn(Insn::Copy {
         src_reg: identity_reg,
         dst_reg: record_start,
@@ -6672,7 +7124,7 @@ fn emit_ephemeral_row_with_identity(
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: record_start as u16,
-        count: (1 + output.width + 1) as u16,
+        count: output.record_width() as u16,
         dest_reg: record_reg as u16,
         index_name: None,
         affinity_str: None,
