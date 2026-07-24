@@ -972,7 +972,7 @@ fn reject_outer_query_refs_in_group_by_expr(
                     crate::bail_parse_error!(
                         "no such column: {}.{}",
                         outer_ref.identifier,
-                        column_name
+                        normalize_ident(column_name)
                     );
                 }
             }
@@ -1045,7 +1045,11 @@ fn reject_outer_scope_refs_inside_select_plan(
                 .get(col_idx)
                 .and_then(|col| col.name.as_deref())
                 .expect("bound outer-scope Expr::Column must point to a named column in schema");
-            crate::bail_parse_error!("no such column: {}.{}", outer_ref.identifier, column_name);
+            crate::bail_parse_error!(
+                "no such column: {}.{}",
+                outer_ref.identifier,
+                normalize_ident(column_name)
+            );
         }
         if outer_ref.rowid_referenced {
             crate::bail_parse_error!("no such column: {}.rowid", outer_ref.identifier);
