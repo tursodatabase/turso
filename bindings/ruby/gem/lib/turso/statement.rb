@@ -5,7 +5,7 @@ module Turso
     def initialize(native_statement, native_database)
       @native = native_statement
       @database = native_database
-      @owner = Thread.current
+      @owner = owner_token
     end
 
     def bind(*args)
@@ -79,9 +79,13 @@ module Turso
 
     private
 
+    def owner_token
+      [Thread.current.object_id, Fiber.current.object_id]
+    end
+
     def check_owner!
-      unless Thread.current.equal?(@owner)
-        raise Turso::Exception, "statement is already in use by another thread"
+      unless owner_token == @owner
+        raise Turso::Exception, "statement is already in use by another thread or fiber"
       end
     end
 
