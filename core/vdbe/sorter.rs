@@ -1067,22 +1067,7 @@ impl BoxedSortableRecord {
                     _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
                 }
             };
-            if cmp != Ordering::Equal {
-                let involves_null =
-                    matches!(self_val, ValueRef::Null) || matches!(other_val, ValueRef::Null);
-                if involves_null {
-                    if let Some(nulls_order) = key_info.nulls_order {
-                        return match nulls_order {
-                            turso_parser::ast::NullsOrder::First => cmp,
-                            turso_parser::ast::NullsOrder::Last => cmp.reverse(),
-                        };
-                    }
-                }
-                return match key_info.sort_order {
-                    SortOrder::Asc => cmp,
-                    SortOrder::Desc => cmp.reverse(),
-                };
-            }
+            cmp_with_sort(cmp, &self_val, &other_val, key_info);
         }
         Ordering::Equal
     }
