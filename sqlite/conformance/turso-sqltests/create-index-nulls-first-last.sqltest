@@ -577,3 +577,68 @@ test upsert-explicit-nulls-target-still-rejected {
 expect error {
     NULLS
 }
+
+@setup single_data
+test eqp-min-fast-path-on-nulls-last-index {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    EXPLAIN QUERY PLAN SELECT min(a) FROM t;
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX idx
+}
+
+@setup single_data
+test eqp-max-fast-path-on-desc-nulls-first-index {
+    CREATE INDEX idx ON t(a DESC NULLS FIRST);
+    EXPLAIN QUERY PLAN SELECT max(a) FROM t;
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX idx
+}
+
+test min-max-all-null-with-nulls-last-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT);
+    INSERT INTO t VALUES (1, NULL), (2, NULL);
+    CREATE INDEX idx ON t(a NULLS LAST);
+    SELECT min(a), max(a), count(*) FROM t;
+}
+expect {
+    ||2
+}
+
+test min-max-all-null-with-desc-nulls-first-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT);
+    INSERT INTO t VALUES (1, NULL), (2, NULL);
+    CREATE INDEX idx ON t(a DESC NULLS FIRST);
+    SELECT min(a), max(a), count(*) FROM t;
+}
+expect {
+    ||2
+}
+
+test min-max-empty-table-with-nulls-last-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT);
+    CREATE INDEX idx ON t(a NULLS LAST);
+    SELECT min(a), max(a) FROM t;
+}
+expect {
+    |
+}
+
+@setup single_data
+test min-with-range-on-nulls-last-index {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    SELECT min(a) FROM t WHERE a > 1;
+}
+expect {
+    2
+}
+
+@setup single_data
+test max-with-range-on-desc-nulls-first-index {
+    CREATE INDEX idx ON t(a DESC NULLS FIRST);
+    SELECT max(a) FROM t WHERE a < 3;
+}
+expect {
+    2
+}
