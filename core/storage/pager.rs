@@ -5332,6 +5332,17 @@ impl Pager {
                     }
 
                     let first_freelist_trunk_page_id = header.freelist_trunk_page.get();
+                    let freelist_count = header.freelist_pages.get();
+                    if first_freelist_trunk_page_id != 0 && freelist_count == 0 {
+                        // Both fields live in the page-1 buffer and every
+                        // free/allocate operation updates them together, so a
+                        // set trunk pointer with a zero count cannot arise from
+                        // correct bookkeeping. Continuing would underflow the
+                        // count on the reuse path.
+                        return Err(LimboError::Corrupt(format!(
+                            "freelist_trunk_page={first_freelist_trunk_page_id} but freelist_pages=0"
+                        )));
+                    }
                     if first_freelist_trunk_page_id == 0 {
                         *state = AllocatePageState::AllocateNewPage {
                             current_db_size: new_db_size,
