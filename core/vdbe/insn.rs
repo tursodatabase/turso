@@ -1522,6 +1522,21 @@ pub enum Insn {
         /// The full CREATE TYPE SQL string
         sql: String,
     },
+    /// Add a user-defined function to the in-memory schema by parsing its
+    /// CREATE FUNCTION SQL
+    AddFunction {
+        /// The database within which this function needs to be added
+        db: usize,
+        /// The full CREATE FUNCTION SQL string
+        sql: String,
+    },
+    /// Drop a user-defined function from the in-memory schema
+    DropFunction {
+        /// The database within which this function needs to be dropped
+        db: usize,
+        /// The name of the function being dropped
+        func_name: String,
+    },
 
     /// Close a cursor.
     Close {
@@ -2146,6 +2161,8 @@ impl InsnVariants {
             InsnVariants::SequenceBeginInnerTx => execute::op_sequence_begin_inner_tx,
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
+            InsnVariants::AddFunction => execute::op_add_function,
+            InsnVariants::DropFunction => execute::op_drop_function,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -2266,6 +2283,8 @@ impl Insn {
             | Self::SequenceBeginInnerTx { .. }
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
+            | Self::AddFunction { .. }
+            | Self::DropFunction { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }

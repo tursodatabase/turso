@@ -657,6 +657,10 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("CREATE INDEX")
     } else if upper.starts_with("CREATE SCHEMA") {
         Tag::new("CREATE SCHEMA")
+    } else if upper.starts_with("CREATE FUNCTION")
+        || upper.starts_with("CREATE OR REPLACE FUNCTION")
+    {
+        Tag::new("CREATE FUNCTION")
     } else if upper.starts_with("CREATE") {
         Tag::new("CREATE TABLE")
     } else if upper.starts_with("DROP VIEW") {
@@ -665,6 +669,8 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("DROP INDEX")
     } else if upper.starts_with("DROP SCHEMA") {
         Tag::new("DROP SCHEMA")
+    } else if upper.starts_with("DROP FUNCTION") {
+        Tag::new("DROP FUNCTION")
     } else if upper.starts_with("DROP") {
         Tag::new("DROP TABLE")
     } else if upper.starts_with("ALTER") {

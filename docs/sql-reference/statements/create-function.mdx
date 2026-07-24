@@ -1,0 +1,97 @@
+---
+title: CREATE FUNCTION
+description: Define a user-defined scalar function with a Starlark body compiled to bytecode
+sidebarTitle: CREATE FUNCTION
+---
+
+# CREATE FUNCTION
+
+<Info>
+**Turso Extension**: CREATE FUNCTION is a Turso-specific statement not available in standard SQLite. It is experimental and requires the `--experimental-udfs` flag.
+</Info>
+
+The CREATE FUNCTION statement defines a user-defined scalar function (UDF) whose body is written in a subset of [Starlark](https://github.com/bazelbuild/starlark), a dialect of Python. The syntax follows PostgreSQL's `CREATE FUNCTION`. Function definitions are persisted in the database and survive restarts.
+
+There is no interpreter at query time: the function body is compiled into the calling statement's bytecode inline at every call site, so calling a UDF executes the same way built-in expressions do.
+
+## Syntax
+
+```sql
+CREATE [OR REPLACE] FUNCTION function-name ( [param [type] [, ...]] )
+    [RETURNS type]
+    LANGUAGE starlark
+    AS 'body' | $$body$$ | $tag$body$tag$;
+```
+
+## Description
+
+The body is the function body itself, in the style of PL/Python: the declared parameters are in scope as variables, `return` produces the function's result, and falling off the end returns `NULL`. The body may be a single-quoted string literal or a PostgreSQL-style dollar-quoted string (`$$ ... $$`, or `$tag$ ... $tag$` when the body itself contains `$$`).
+
+```sql
+CREATE FUNCTION fact(n INTEGER)
+RETURNS INTEGER
+LANGUAGE starlark
+AS $$
+acc = 1
+for i in range(1, n + 1):
+    acc = acc * i
+return acc
+$$;
+
+SELECT fact(5);
+-- 120
+```
+
+### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `OR REPLACE` | Replace an existing function with the same name instead of raising an error. |
+| `function-name` | The name of the function. Names that collide with built-in functions are rejected. |
+| `param [type]` | Parameter name with an optional declared type. Parameter names must be unique. |
+| `RETURNS type` | Optional declared result type. The result is cast to this type's affinity (SQLite `CAST` semantics) on return. |
+| `LANGUAGE starlark` | Required. `starlark` is the only supported language. |
+| `AS body` | Required. The Starlark function body. |
+
+## Supported Starlark subset
+
+Statements:
+
+- Assignments and augmented assignments: `x = expr`, `x += expr`, `-=`, `*=`, `/=`, `//=`, `%=`
+- `if` / `elif` / `else`
+- `while` loops
+- `for <var> in range(stop)` / `range(start, stop)` / `range(start, stop, step)` — `step` must be a non-zero integer literal
+- `break`, `continue`, `pass`
+- `return [expr]`
+
+Expressions:
+
+- Integer, float, string, `True`/`False`, and `None` literals
+- Arithmetic, comparison, bitwise, and boolean operators (`+ - * / // % & | << >> ~ == != < <= > >= and or not`)
+- Conditional expressions: `a if cond else b`
+- Function calls: any built-in SQL scalar function (e.g. `upper()`, `concat()`, `abs()`) and other user-defined functions are callable from a body. The Starlark built-ins `len()`, `str()`, `int()`, and `float()` map to their SQL equivalents.
+
+Function calls between UDFs are compiled inline; recursion (direct or mutual) is rejected at translation time.
+
+## Semantics
+
+Because bodies compile to bytecode operating on SQL values, runtime semantics are **SQL semantics**, not Starlark's evaluator semantics:
+
+- `None` is SQL `NULL` and propagates through arithmetic and comparisons (`a + b` is `NULL` when either side is).
+- Conditions use SQL truthiness: `NULL` and non-numeric text are false in `if`/`while`.
+- `/` and `//` both perform SQLite division (integer division truncates toward zero); `%` follows SQLite `%`.
+- Integers are 64-bit (no big integers); `+` does not concatenate strings — use `concat()` or `||` via built-ins.
+- `and` / `or` use SQL three-valued logic and do not short-circuit.
+
+Unsupported Starlark constructs (`def`, `lambda`, lists, dicts, methods, keyword arguments, chained comparisons, `**`) are rejected with an error when the function is created.
+
+## Errors
+
+- Creating a function whose name matches a built-in function is an error.
+- Creating a function that already exists without `OR REPLACE` is an error.
+- The body is parsed and validated at creation time; syntax errors are reported by `CREATE FUNCTION`, not at first call.
+- Calling a function with the wrong number of arguments is an error.
+
+## See Also
+
+- [DROP FUNCTION](/sql-reference/statements/drop-function)

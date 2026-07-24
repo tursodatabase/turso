@@ -897,6 +897,49 @@ impl ToTokens for Stmt {
                 s.append(TK_ID, Some(domain_name))?;
                 Ok(())
             }
+            Self::CreateFunction {
+                or_replace,
+                func_name,
+                params,
+                returns,
+                language,
+                body,
+            } => {
+                s.append(TK_CREATE, None)?;
+                if *or_replace {
+                    s.append(TK_OR, None)?;
+                    s.append(TK_ID, Some("REPLACE"))?;
+                }
+                s.append(TK_ID, Some("FUNCTION"))?;
+                func_name.to_tokens(s, context)?;
+                s.append(TK_LP, None)?;
+                comma(params, s, context)?;
+                s.append(TK_RP, None)?;
+                if let Some(returns) = returns {
+                    s.append(TK_ID, Some("RETURNS"))?;
+                    returns.to_tokens(s, context)?;
+                }
+                s.append(TK_ID, Some("LANGUAGE"))?;
+                language.to_tokens(s, context)?;
+                s.append(TK_AS, None)?;
+                // Render the body as a single-quoted literal so the canonical
+                // SQL re-parses without dollar-quote support.
+                s.append(TK_STRING, Some(&format!("'{}'", body.replace('\'', "''"))))?;
+                Ok(())
+            }
+            Self::DropFunction {
+                if_exists,
+                func_name,
+            } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("FUNCTION"))?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                func_name.to_tokens(s, context)?;
+                Ok(())
+            }
         }
     }
 }
@@ -2442,6 +2485,21 @@ impl ToTokens for Type {
         for _ in 0..self.array_dimensions {
             s.append(TK_LBRACKET, None)?;
             s.append(TK_RBRACKET, None)?;
+        }
+        Ok(())
+    }
+}
+
+impl_display_for_to_tokens!(FunctionParam);
+impl ToTokens for FunctionParam {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        self.name.to_tokens(s, context)?;
+        if let Some(ref ty) = self.ty {
+            ty.to_tokens(s, context)?;
         }
         Ok(())
     }

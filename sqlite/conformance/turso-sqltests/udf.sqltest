@@ -1,0 +1,372 @@
+@database :memory:
+@requires-file udfs "uses user-defined functions (CREATE FUNCTION)"
+
+# --- Basic scalar functions ---
+
+test udf-basic-arithmetic {
+    CREATE FUNCTION myadd(a INTEGER, b INTEGER)
+    RETURNS INTEGER
+    LANGUAGE starlark
+    AS $$
+    return a + b
+    $$;
+    SELECT myadd(2, 3), myadd(-1, 1), myadd(10, 20) + 100;
+}
+expect {
+    5|0|130
+}
+
+test udf-single-quoted-body {
+    CREATE FUNCTION triple(x INTEGER) LANGUAGE starlark AS 'return x * 3';
+    SELECT triple(7);
+}
+expect {
+    21
+}
+
+test udf-no-params {
+    CREATE FUNCTION answer() RETURNS INTEGER LANGUAGE starlark AS 'return 42';
+    SELECT answer();
+}
+expect {
+    42
+}
+
+test udf-null-propagation {
+    CREATE FUNCTION nadd(a INTEGER, b INTEGER) LANGUAGE starlark AS 'return a + b';
+    SELECT nadd(NULL, 1) IS NULL, nadd(1, NULL) IS NULL;
+}
+expect {
+    1|1
+}
+
+test udf-implicit-return-null {
+    CREATE FUNCTION noret(x INTEGER) LANGUAGE starlark AS $$
+    y = x + 1
+    $$;
+    SELECT noret(5) IS NULL;
+}
+expect {
+    1
+}
+
+# --- Control flow ---
+
+test udf-if-elif-else {
+    CREATE FUNCTION classify(x INTEGER) RETURNS TEXT LANGUAGE starlark AS $$
+    if x > 0:
+        return 'pos'
+    elif x < 0:
+        return 'neg'
+    else:
+        return 'zero'
+    $$;
+    SELECT classify(5), classify(-5), classify(0);
+}
+expect {
+    pos|neg|zero
+}
+
+test udf-while-loop {
+    CREATE FUNCTION sumto(n INTEGER) RETURNS INTEGER LANGUAGE starlark AS $$
+    total = 0
+    i = 1
+    while i <= n:
+        total += i
+        i += 1
+    return total
+    $$;
+    SELECT sumto(10), sumto(0), sumto(1);
+}
+expect {
+    55|0|1
+}
+
+test udf-for-range-loop {
+    CREATE FUNCTION fact(n INTEGER) RETURNS INTEGER LANGUAGE starlark AS $$
+    acc = 1
+    for i in range(1, n + 1):
+        acc = acc * i
+    return acc
+    $$;
+    SELECT fact(0), fact(1), fact(5), fact(10);
+}
+expect {
+    1|1|120|3628800
+}
+
+test udf-for-range-step-and-break-continue {
+    CREATE FUNCTION oddsum(n INTEGER) RETURNS INTEGER LANGUAGE starlark AS $$
+    total = 0
+    for i in range(0, 100, 1):
+        if i > n:
+            break
+        if i % 2 == 0:
+            continue
+        total += i
+    return total
+    $$;
+    SELECT oddsum(10);
+}
+expect {
+    25
+}
+
+test udf-for-range-negative-step {
+    CREATE FUNCTION countdown(n INTEGER) RETURNS TEXT LANGUAGE starlark AS $$
+    out = ''
+    for i in range(n, 0, -1):
+        out = concat(out, i)
+    return out
+    $$;
+    SELECT countdown(5);
+}
+expect {
+    54321
+}
+
+test udf-ternary {
+    CREATE FUNCTION mymax(a INTEGER, b INTEGER) LANGUAGE starlark AS 'return a if a > b else b';
+    SELECT mymax(3, 7), mymax(9, 2);
+}
+expect {
+    7|9
+}
+
+# --- Calling other functions ---
+
+test udf-calls-builtin-functions {
+    CREATE FUNCTION shout(s TEXT) RETURNS TEXT LANGUAGE starlark AS $$
+    return concat(upper(s), '!')
+    $$;
+    SELECT shout('hello');
+}
+expect {
+    HELLO!
+}
+
+test udf-len-str-int-float {
+    CREATE FUNCTION conv(s TEXT) LANGUAGE starlark AS $$
+    return len(s) + int('10') + float('0.5')
+    $$;
+    SELECT conv('abc');
+}
+expect {
+    13.5
+}
+
+test udf-calls-other-udf {
+    CREATE FUNCTION inc(x INTEGER) LANGUAGE starlark AS 'return x + 1';
+    CREATE FUNCTION inc2(x INTEGER) LANGUAGE starlark AS 'return inc(inc(x))';
+    SELECT inc2(40), inc(inc(inc(0)));
+}
+expect {
+    42|3
+}
+
+# --- Use in queries ---
+
+test udf-per-row-and-where {
+    CREATE FUNCTION double(x INTEGER) LANGUAGE starlark AS 'return x * 2';
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT x, double(x) FROM t WHERE double(x) > 4 ORDER BY x;
+}
+expect {
+    3|6
+    4|8
+}
+
+test udf-loop-state-resets-per-row {
+    CREATE FUNCTION acc(n INTEGER) RETURNS INTEGER LANGUAGE starlark AS $$
+    total = 0
+    for i in range(1, n + 1):
+        total += i
+    return total
+    $$;
+    CREATE TABLE nums(n INTEGER);
+    INSERT INTO nums VALUES (3), (3), (3);
+    SELECT acc(n) FROM nums;
+}
+expect {
+    6
+    6
+    6
+}
+
+test udf-in-group-by-query {
+    CREATE FUNCTION parity(x INTEGER) RETURNS TEXT LANGUAGE starlark AS $$
+    return 'even' if x % 2 == 0 else 'odd'
+    $$;
+    CREATE TABLE g(x INTEGER);
+    INSERT INTO g VALUES (1), (2), (3), (4), (5);
+    SELECT parity(x) AS p, count(*) FROM g GROUP BY p ORDER BY p;
+}
+expect {
+    even|2
+    odd|3
+}
+
+# --- RETURNS type cast ---
+
+test udf-returns-cast {
+    CREATE FUNCTION toint(x TEXT) RETURNS INTEGER LANGUAGE starlark AS 'return x';
+    SELECT toint('42'), typeof(toint('42'));
+}
+expect {
+    42|integer
+}
+
+# --- OR REPLACE and DROP ---
+
+test udf-or-replace {
+    CREATE FUNCTION v() RETURNS INTEGER LANGUAGE starlark AS 'return 1';
+    CREATE OR REPLACE FUNCTION v() RETURNS INTEGER LANGUAGE starlark AS 'return 2';
+    SELECT v();
+}
+expect {
+    2
+}
+
+test udf-drop-function {
+    CREATE FUNCTION gone(x INTEGER) LANGUAGE starlark AS 'return x';
+    DROP FUNCTION gone;
+    SELECT gone(1);
+}
+expect error {
+    no such function: gone
+}
+
+test udf-drop-if-exists-missing {
+    DROP FUNCTION IF EXISTS never_existed;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test udf-drop-missing-errors {
+    DROP FUNCTION never_existed;
+}
+expect error {
+    no such function: never_existed
+}
+
+# --- Error cases ---
+
+test udf-duplicate-create-errors {
+    CREATE FUNCTION dup(x INTEGER) LANGUAGE starlark AS 'return x';
+    CREATE FUNCTION dup(y INTEGER) LANGUAGE starlark AS 'return y';
+}
+expect error {
+    function dup already exists
+}
+
+test udf-builtin-name-collision {
+    CREATE FUNCTION abs(x INTEGER) LANGUAGE starlark AS 'return x';
+}
+expect error {
+    a built-in function with the same name exists
+}
+
+test udf-unsupported-language {
+    CREATE FUNCTION nope(x INTEGER) LANGUAGE plpgsql AS 'return x';
+}
+expect error {
+    unsupported function language: plpgsql
+}
+
+test udf-wrong-arg-count {
+    CREATE FUNCTION two(a INTEGER, b INTEGER) LANGUAGE starlark AS 'return a + b';
+    SELECT two(1);
+}
+expect error {
+    wrong number of arguments to function two
+}
+
+test udf-body-syntax-error-at-create {
+    CREATE FUNCTION bad(x INTEGER) LANGUAGE starlark AS $$
+    if x > 0
+        return 1
+    $$;
+}
+expect error {
+    starlark \(line 2\)
+}
+
+test udf-def-not-supported {
+    CREATE FUNCTION nodef(x INTEGER) LANGUAGE starlark AS 'def helper(): pass';
+}
+expect error {
+    'def' is not supported in function bodies
+}
+
+test udf-undefined-variable {
+    CREATE FUNCTION undef(x INTEGER) LANGUAGE starlark AS 'return y';
+    SELECT undef(1);
+}
+expect error {
+    undefined variable y in function undef
+}
+
+test udf-recursion-rejected {
+    CREATE FUNCTION selfref(x INTEGER) LANGUAGE starlark AS 'return selfref(x)';
+    SELECT selfref(1);
+}
+expect error {
+    recursive use of user-defined function selfref is not allowed
+}
+
+test udf-mutual-recursion-rejected {
+    CREATE FUNCTION ping(x INTEGER) LANGUAGE starlark AS 'return pong(x)';
+    CREATE FUNCTION pong(x INTEGER) LANGUAGE starlark AS 'return ping(x)';
+    SELECT ping(1);
+}
+expect error {
+    recursive use of user-defined function ping is not allowed
+}
+
+test udf-duplicate-param-names {
+    CREATE FUNCTION dupp(a INTEGER, a INTEGER) LANGUAGE starlark AS 'return a';
+}
+expect error {
+    duplicate parameter name a in function dupp
+}
+
+test udf-break-outside-loop {
+    CREATE FUNCTION brk(x INTEGER) LANGUAGE starlark AS 'break';
+}
+expect error {
+    'break' outside of a loop
+}
+
+test udf-range-zero-iterations-on-null {
+    CREATE FUNCTION nullrange(n INTEGER) RETURNS INTEGER LANGUAGE starlark AS $$
+    total = 0
+    for i in range(n):
+        total += 1
+    return total
+    $$;
+    SELECT nullrange(NULL), nullrange(3);
+}
+expect {
+    0|3
+}
+
+# --- Persistence metadata ---
+
+test udf-stored-in-internal-table {
+    CREATE FUNCTION stored(x INTEGER) LANGUAGE starlark AS 'return x';
+    SELECT name FROM __turso_internal_functions;
+}
+expect {
+    stored
+}
+
+test udf-schema-table-stays-clean {
+    CREATE FUNCTION clean(x INTEGER) LANGUAGE starlark AS 'return x';
+    SELECT count(*) FROM sqlite_schema WHERE type NOT IN ('table', 'index', 'view', 'trigger');
+}
+expect {
+    0
+}

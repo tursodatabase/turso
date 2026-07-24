@@ -123,6 +123,7 @@ pub struct Builder {
     enable_generated_columns: bool,
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
+    enable_udfs: bool,
 }
 
 impl Builder {
@@ -147,6 +148,7 @@ impl Builder {
             enable_generated_columns: false,
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
+            enable_udfs: false,
         }
     }
 
@@ -210,6 +212,11 @@ impl Builder {
     /// [`crate::Builder::experimental_without_rowid`].
     pub fn experimental_without_rowid(mut self, enable: bool) -> Self {
         self.enable_without_rowid = enable;
+        self
+    }
+
+    pub fn experimental_udfs(mut self, enable: bool) -> Self {
+        self.enable_udfs = enable;
         self
     }
 
@@ -331,6 +338,9 @@ impl Builder {
         }
         if self.enable_without_rowid {
             features.push("without_rowid");
+        }
+        if self.enable_udfs {
+            features.push("udfs");
         }
         if features.is_empty() {
             None

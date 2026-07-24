@@ -144,6 +144,7 @@ impl PostgreSQLTranslator {
                 ))
             }
             NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?,
+            NodeRef::CreateFunctionStmt(func) => self.translate_create_function(func)?,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "{} is not supported",
@@ -895,6 +896,21 @@ impl PostgreSQLTranslator {
             Some(Node::String(s)) => {
                 ast::QualifiedName::single(ast::Name::from_string(s.sval.clone()))
             }
+            Some(Node::ObjectWithArgs(owa)) => {
+                // DROP FUNCTION objects carry the name inside ObjectWithArgs.
+                let name = owa
+                    .objname
+                    .iter()
+                    .filter_map(|n| match &n.node {
+                        Some(Node::String(s)) => Some(s.sval.clone()),
+                        _ => None,
+                    })
+                    .next_back()
+                    .ok_or_else(|| {
+                        ParseError::ParseError("DROP FUNCTION: empty function name".into())
+                    })?;
+                ast::QualifiedName::single(ast::Name::from_string(name))
+            }
             Some(Node::TypeName(tn)) => {
                 // DROP TYPE uses TypeName nodes; extract the last name component
                 let type_name = tn
@@ -939,6 +955,10 @@ impl PostgreSQLTranslator {
             ObjectType::ObjectSequence => Ok(ast::Stmt::DropSequence {
                 if_exists: drop.missing_ok,
                 seq_name: qualified_name,
+            }),
+            ObjectType::ObjectFunction => Ok(ast::Stmt::DropFunction {
+                if_exists: drop.missing_ok,
+                func_name: qualified_name,
             }),
             _ => Err(ParseError::ParseError(format!(
                 "DROP {} is not supported",
@@ -3705,6 +3725,136 @@ impl PostgreSQLTranslator {
             constraints,
         })
     }
+
+    fn translate_create_function(
+        &self,
+        func: &pg_query::protobuf::CreateFunctionStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        use pg_query::protobuf::node::Node;
+        use pg_query::protobuf::FunctionParameterMode;
+
+        if func.is_procedure {
+            return Err(ParseError::ParseError(
+                "CREATE PROCEDURE is not supported".into(),
+            ));
+        }
+        if func.sql_body.is_some() {
+            return Err(ParseError::ParseError(
+                "CREATE FUNCTION ... BEGIN ATOMIC is not supported; use LANGUAGE starlark AS $$...$$".into(),
+            ));
+        }
+
+        // Function name: the last String component is the unqualified name.
+        let name = func
+            .funcname
+            .iter()
+            .filter_map(|n| match &n.node {
+                Some(Node::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .next_back()
+            .ok_or_else(|| {
+                ParseError::ParseError("CREATE FUNCTION missing function name".into())
+            })?;
+
+        let mut params = Vec::new();
+        for param_node in &func.parameters {
+            let Some(Node::FunctionParameter(param)) = &param_node.node else {
+                continue;
+            };
+            let mode = FunctionParameterMode::try_from(param.mode)
+                .unwrap_or(FunctionParameterMode::Undefined);
+            if !matches!(
+                mode,
+                FunctionParameterMode::Undefined
+                    | FunctionParameterMode::FuncParamIn
+                    | FunctionParameterMode::FuncParamDefault
+            ) {
+                return Err(ParseError::ParseError(
+                    "only IN parameters are supported in CREATE FUNCTION".into(),
+                ));
+            }
+            if param.defexpr.is_some() {
+                return Err(ParseError::ParseError(
+                    "parameter DEFAULT values are not supported in CREATE FUNCTION".into(),
+                ));
+            }
+            if param.name.is_empty() {
+                return Err(ParseError::ParseError(
+                    "CREATE FUNCTION parameters must be named".into(),
+                ));
+            }
+            let ty = match &param.arg_type {
+                Some(type_name) => Some(pg_type_to_ast_type(type_name)?),
+                None => None,
+            };
+            params.push(ast::FunctionParam {
+                name: ast::Name::exact(param.name.clone()),
+                ty,
+            });
+        }
+
+        let returns = match &func.return_type {
+            Some(type_name) => Some(pg_type_to_ast_type(type_name)?),
+            None => None,
+        };
+
+        // LANGUAGE and AS arrive as DefElem options; volatility and similar
+        // attributes are accepted and ignored.
+        let mut language: Option<String> = None;
+        let mut body: Option<String> = None;
+        for opt_node in &func.options {
+            let Some(Node::DefElem(def)) = &opt_node.node else {
+                continue;
+            };
+            match def.defname.as_str() {
+                "language" => language = def_elem_string_val(def),
+                "as" => {
+                    // The arg is a List of String nodes (one element for
+                    // non-C functions).
+                    if let Some(Node::List(list)) =
+                        def.arg.as_deref().and_then(|arg| arg.node.as_ref())
+                    {
+                        for item in &list.items {
+                            if let Some(Node::String(s)) = &item.node {
+                                body = Some(s.sval.clone());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let language = language.ok_or_else(|| {
+            ParseError::ParseError("CREATE FUNCTION requires a LANGUAGE clause".into())
+        })?;
+        let body = body
+            .ok_or_else(|| ParseError::ParseError("CREATE FUNCTION requires an AS body".into()))?;
+
+        Ok(ast::Stmt::CreateFunction {
+            or_replace: func.replace,
+            func_name: ast::QualifiedName::single(ast::Name::exact(name)),
+            params,
+            returns,
+            language: ast::Name::exact(language),
+            body,
+        })
+    }
+}
+
+/// Map a pg_query TypeName to a turso AST type, applying the PG-to-Turso
+/// type-name mapping.
+fn pg_type_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Result<ast::Type, ParseError> {
+    let pg_type = extract_type_name_from_typename(type_name)?;
+    let mapped = match map_pg_type(&pg_type, &[]) {
+        Some(mapping) => mapping.type_name,
+        None => pg_type,
+    };
+    Ok(ast::Type {
+        name: mapped,
+        size: None,
+        array_dimensions: 0,
+    })
 }
 
 /// Extract a string value from a DefElem's arg.

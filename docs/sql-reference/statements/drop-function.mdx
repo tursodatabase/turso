@@ -1,0 +1,43 @@
+---
+title: DROP FUNCTION
+description: Remove a user-defined function from the database
+sidebarTitle: DROP FUNCTION
+---
+
+# DROP FUNCTION
+
+<Info>
+**Turso Extension**: DROP FUNCTION is a Turso-specific statement not available in standard SQLite. It is experimental and requires the `--experimental-udfs` flag.
+</Info>
+
+The DROP FUNCTION statement removes a user-defined function created with [CREATE FUNCTION](/sql-reference/statements/create-function).
+
+## Syntax
+
+```sql
+DROP FUNCTION [IF EXISTS] function-name;
+```
+
+## Description
+
+DROP FUNCTION removes the named function from the database schema and its persisted definition. The function must exist unless the `IF EXISTS` clause is specified.
+
+### Clauses
+
+| Clause | Description |
+|--------|-------------|
+| `IF EXISTS` | Suppresses the error that would occur if the function does not exist. The statement is a no-op when the function is not found. |
+
+## Examples
+
+```sql
+CREATE FUNCTION double(x INTEGER) RETURNS INTEGER LANGUAGE starlark AS 'return x * 2';
+
+DROP FUNCTION double;
+
+DROP FUNCTION IF EXISTS does_not_exist; -- no-op
+```
+
+## See Also
+
+- [CREATE FUNCTION](/sql-reference/statements/create-function)

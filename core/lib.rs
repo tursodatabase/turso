@@ -79,6 +79,7 @@ mod stats;
 #[cfg(feature = "time")]
 mod time;
 mod translate;
+mod udf;
 mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
@@ -235,6 +236,7 @@ pub struct DatabaseOpts {
     pub enable_generated_columns: bool,
     pub enable_multiprocess_wal: bool,
     pub enable_without_rowid: bool,
+    pub enable_udfs: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
     enable_load_extension: bool,
@@ -303,6 +305,11 @@ impl DatabaseOpts {
 
     pub fn with_without_rowid(mut self, enable: bool) -> Self {
         self.enable_without_rowid = enable;
+        self
+    }
+
+    pub fn with_udfs(mut self, enable: bool) -> Self {
+        self.enable_udfs = enable;
         self
     }
 
@@ -1656,6 +1663,31 @@ impl Database {
                         })();
                         if let Err(e) = load_result {
                             tracing::warn!("Failed to load custom types during open: {}", e);
+                        }
+                    }
+
+                    // Same for user-defined functions stored in
+                    // __turso_internal_functions.
+                    if conn.experimental_udfs_enabled() {
+                        conn.maybe_update_schema();
+                        let load_result: Result<()> = (|| {
+                            let function_sqls = conn.query_stored_function_definitions()?;
+                            if !function_sqls.is_empty() {
+                                let db = state
+                                    .db
+                                    .as_ref()
+                                    .expect("db must be initialized in Init phase");
+                                db.with_schema_mut(|schema| {
+                                    schema.load_function_definitions(&function_sqls)
+                                })?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(e) = load_result {
+                            tracing::warn!(
+                                "Failed to load user-defined functions during open: {}",
+                                e
+                            );
                         }
                     }
 
@@ -3086,6 +3118,10 @@ impl Database {
 
     pub fn experimental_without_rowid_enabled(&self) -> bool {
         self.opts.enable_without_rowid
+    }
+
+    pub fn experimental_udfs_enabled(&self) -> bool {
+        self.opts.enable_udfs
     }
 
     /// check if database is currently in MVCC mode

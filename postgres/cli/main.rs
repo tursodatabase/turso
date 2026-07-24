@@ -106,7 +106,8 @@ fn open_database(
         .with_index_method(true)
         .with_autovacuum(true)
         .with_attach(true)
-        .with_generated_columns(true);
+        .with_generated_columns(true)
+        .with_udfs(true);
 
     let flags = if readonly {
         OpenFlags::default().union(OpenFlags::ReadOnly)

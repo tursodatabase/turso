@@ -40,6 +40,7 @@ pub(crate) mod subquery;
 pub(crate) mod transaction;
 pub(crate) mod trigger;
 pub(crate) mod trigger_exec;
+pub(crate) mod udf;
 pub(crate) mod update;
 pub(crate) mod upsert;
 pub(crate) mod vacuum;
@@ -177,6 +178,8 @@ pub fn translate_inner(
             | ast::Stmt::Insert { .. }
             | ast::Stmt::CreateSequence { .. }
             | ast::Stmt::DropSequence { .. }
+            | ast::Stmt::CreateFunction { .. }
+            | ast::Stmt::DropFunction { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -343,6 +346,37 @@ pub fn translate_inner(
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
             schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
+        }
+        ast::Stmt::CreateFunction {
+            or_replace,
+            func_name,
+            params,
+            returns,
+            language,
+            body,
+        } => {
+            if !connection.experimental_udfs_enabled() {
+                bail_parse_error!("CREATE FUNCTION requires --experimental-udfs flag");
+            }
+            udf::translate_create_function(
+                or_replace,
+                &func_name,
+                &params,
+                returns.as_ref(),
+                &language,
+                &body,
+                resolver,
+                program,
+            )?
+        }
+        ast::Stmt::DropFunction {
+            if_exists,
+            func_name,
+        } => {
+            if !connection.experimental_udfs_enabled() {
+                bail_parse_error!("DROP FUNCTION requires --experimental-udfs flag");
+            }
+            udf::translate_drop_function(if_exists, &func_name, resolver, program)?
         }
         ast::Stmt::CreateDomain {
             if_not_exists,
@@ -512,6 +546,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::Optimize { .. } => "optimize",
         ast::Stmt::CreateSequence { .. } => "create_sequence",
         ast::Stmt::DropSequence { .. } => "drop_sequence",
+        ast::Stmt::CreateFunction { .. } => "create_function",
+        ast::Stmt::DropFunction { .. } => "drop_function",
     }
 }
 

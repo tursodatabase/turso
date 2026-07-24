@@ -515,8 +515,12 @@ impl Parser {
                 self.advance();
                 Ok(ast::Capability::CustomTypes)
             }
+            Some(Token::Udfs) => {
+                self.advance();
+                Ok(ast::Capability::Udfs)
+            }
             Some(token) => Err(self.error(format!(
-                "expected capability (trigger, strict, materialized_views, custom_types), got {token}"
+                "expected capability (trigger, strict, materialized_views, custom_types, udfs), got {token}"
             ))),
             None => Err(self.error("expected capability, got EOF".to_string())),
         }

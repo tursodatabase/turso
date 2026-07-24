@@ -176,6 +176,7 @@ pub const TEMP_SCHEMA_TABLE_NAME: &str = "sqlite_temp_schema";
 pub const TEMP_SCHEMA_TABLE_NAME_ALT: &str = "sqlite_temp_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
+pub const TURSO_FUNCTIONS_TABLE_NAME: &str = "__turso_internal_functions";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
@@ -296,6 +297,65 @@ impl ResolvedType {
     /// doesn't declare its own.
     pub fn default_expr(&self) -> Option<&ast::Expr> {
         self.chain.iter().find_map(|td| td.default_expr())
+    }
+}
+
+/// A user-defined scalar function created with `CREATE FUNCTION ... LANGUAGE
+/// starlark`. The parsed body is compiled into the caller's bytecode at each
+/// call site; see `translate::udf`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionDef {
+    /// Normalized function name.
+    pub name: String,
+    /// Normalized parameter names, in declaration order.
+    pub params: std::vec::Vec<String>,
+    /// Declared `RETURNS` type name, if any. The result is cast to this
+    /// type's affinity on return.
+    pub returns: Option<String>,
+    /// Parsed Starlark body.
+    pub body: crate::udf::StarlarkBody,
+    /// Canonical `CREATE FUNCTION` SQL for round-trip persistence.
+    pub sql: String,
+}
+
+impl FunctionDef {
+    /// Build a `FunctionDef` from a parsed `CREATE FUNCTION` statement. This
+    /// is the single validation point shared by DDL translation and schema
+    /// loading: the language must be `starlark`, parameter names must be
+    /// unique, and the body must parse.
+    pub fn from_create_function(
+        func_name: &ast::QualifiedName,
+        params: &[ast::FunctionParam],
+        returns: Option<&ast::Type>,
+        language: &ast::Name,
+        body: &str,
+        sql: String,
+    ) -> crate::Result<Self> {
+        if !normalize_ident(language.as_str()).eq_ignore_ascii_case("starlark") {
+            return Err(crate::LimboError::ParseError(format!(
+                "unsupported function language: {}; only 'starlark' is supported",
+                language.as_str()
+            )));
+        }
+        let name = normalize_ident(func_name.name.as_str());
+        let mut param_names = std::vec::Vec::with_capacity(params.len());
+        for param in params {
+            let param_name = normalize_ident(param.name.as_str());
+            if param_names.contains(&param_name) {
+                return Err(crate::LimboError::ParseError(format!(
+                    "duplicate parameter name {param_name} in function {name}"
+                )));
+            }
+            param_names.push(param_name);
+        }
+        let parsed_body = crate::udf::parse_body(body)?;
+        Ok(Self {
+            name,
+            params: param_names,
+            returns: returns.map(|ty| ty.name.clone()),
+            body: parsed_body,
+            sql,
+        })
     }
 }
 
@@ -805,6 +865,9 @@ pub struct Schema {
     pub generated_columns_enabled: bool,
     /// Named sequences (CREATE SEQUENCE)
     pub sequences: HashMap<String, Arc<Sequence>>,
+    /// User-defined functions (CREATE FUNCTION), loaded from
+    /// __turso_internal_functions and keyed by normalized name.
+    pub functions: HashMap<String, Arc<FunctionDef>>,
 }
 
 impl Default for Schema {
@@ -947,6 +1010,7 @@ impl Schema {
             type_registry,
             generated_columns_enabled: false,
             sequences: HashMap::default(),
+            functions: HashMap::default(),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -2590,6 +2654,56 @@ impl Schema {
         self.sequences.get(&normalize_ident(name))
     }
 
+    /// Parse a CREATE FUNCTION SQL string and add the function to the
+    /// in-memory registry.
+    pub fn add_function_from_sql(&mut self, sql: &str) -> crate::Result<()> {
+        use turso_parser::ast::{Cmd, Stmt};
+        use turso_parser::parser::Parser;
+
+        let mut parser = Parser::new(sql.as_bytes());
+        match parser.next_cmd() {
+            Ok(Some(Cmd::Stmt(Stmt::CreateFunction {
+                func_name,
+                params,
+                returns,
+                language,
+                body,
+                ..
+            }))) => {
+                let def = FunctionDef::from_create_function(
+                    &func_name,
+                    &params,
+                    returns.as_ref(),
+                    &language,
+                    &body,
+                    sql.to_string(),
+                )?;
+                self.functions.insert(def.name.clone(), Arc::new(def));
+                Ok(())
+            }
+            _ => Err(crate::LimboError::ParseError(format!(
+                "invalid function sql: {sql}"
+            ))),
+        }
+    }
+
+    /// Load function definitions from CREATE FUNCTION SQL strings. Shared by
+    /// initial database open and schema reparse.
+    pub fn load_function_definitions(&mut self, function_sqls: &[String]) -> crate::Result<()> {
+        for sql in function_sqls {
+            self.add_function_from_sql(sql)?;
+        }
+        Ok(())
+    }
+
+    pub fn get_function(&self, name: &str) -> Option<Arc<FunctionDef>> {
+        self.functions.get(&normalize_ident(name)).cloned()
+    }
+
+    pub fn remove_function(&mut self, name: &str) {
+        self.functions.remove(&normalize_ident(name));
+    }
+
     /// Remove a sequence and its backing table from the in-memory schema.
     pub fn remove_sequence(&mut self, name: &str) {
         let normalized = normalize_ident(name);
@@ -2831,6 +2945,7 @@ impl TryClone for Schema {
             type_registry: self.type_registry.try_clone()?,
             generated_columns_enabled: self.generated_columns_enabled,
             sequences: self.sequences.try_clone()?,
+            functions: self.functions.try_clone()?,
         })
     }
 }
