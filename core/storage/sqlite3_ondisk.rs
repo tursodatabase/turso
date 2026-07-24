@@ -62,7 +62,7 @@ use crate::io::{Buffer, Completion, FileSyncType, ReadComplete};
 use crate::numeric::Numeric;
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
-use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
+use crate::storage::database::{DatabaseStorage, PageCodecLocation, PageTransform};
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
 use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -101,6 +101,7 @@ impl PageSize {
     pub const MIN: u32 = 512;
     pub const MAX: u32 = 65536;
     pub const DEFAULT: u16 = 4096;
+    pub const MIN_USABLE_SPACE: u32 = 480;
 
     /// Interpret a user-provided u32 as either a valid page size or None.
     pub const fn new(size: u32) -> Option<Self> {
@@ -141,6 +142,10 @@ impl PageSize {
             1 => Self::MAX,
             v => v as u32,
         }
+    }
+
+    pub const fn has_valid_reserved_space(self, reserved_space: u8) -> bool {
+        self.get().saturating_sub(reserved_space as u32) >= Self::MIN_USABLE_SPACE
     }
 
     /// Get the raw u16 value stored internally
@@ -1965,8 +1970,8 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
     let buf = buffer_pool.get_page();
     let buf = Arc::new(buf);
 
-    match io_ctx.encryption_or_checksum() {
-        EncryptionOrChecksum::Encryption(ctx) => {
+    match io_ctx.page_transform() {
+        PageTransform::Encryption(ctx) => {
             let encryption_ctx = ctx.clone();
             let original_complete = complete;
 
@@ -1976,10 +1981,14 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
                         return original_complete(res);
                     };
                     turso_assert_greater_than!(
-                        bytes_read, 0,
+                        bytes_read,
+                        0,
                         "expected to read data for encrypted page",
                         { "page_idx": page_idx }
                     );
+                    if bytes_read as usize != encrypted_buf.len() {
+                        return original_complete(Ok((encrypted_buf, bytes_read)));
+                    }
                     match encryption_ctx.decrypt_page(encrypted_buf.as_slice(), page_idx) {
                         Ok(decrypted_data) => {
                             encrypted_buf
@@ -2001,7 +2010,47 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let new_completion = Completion::new_read(buf, decrypt_complete);
             io.pread(offset, new_completion)
         }
-        EncryptionOrChecksum::Checksum(ctx) => {
+        PageTransform::PageCodec(ctx) => {
+            let page_codec = ctx.clone();
+            let original_complete = complete;
+            let decoded_buf = Arc::new(buffer_pool.get_page());
+
+            let decode_complete =
+                Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                    let Ok((encoded_buf, bytes_read)) = res else {
+                        return original_complete(res);
+                    };
+                    turso_assert_greater_than!(
+                        bytes_read,
+                        0,
+                        "expected to read data for page codec page",
+                        { "page_idx": page_idx }
+                    );
+                    if bytes_read as usize != encoded_buf.len() {
+                        return original_complete(Ok((encoded_buf, bytes_read)));
+                    }
+                    match page_codec.decode_page(
+                        encoded_buf.as_slice(),
+                        decoded_buf.as_mut_slice(),
+                        page_idx,
+                        PageCodecLocation::Wal,
+                    ) {
+                        Ok(()) => original_complete(Ok((decoded_buf.clone(), bytes_read))),
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to decode WAL frame data for page_idx={page_idx}: {e}"
+                            );
+                            let err = CompletionError::PageCodecError { page_idx };
+                            original_complete(Err(err));
+                            Some(err)
+                        }
+                    }
+                });
+
+            let new_completion = Completion::new_read(buf, decode_complete);
+            io.pread(offset, new_completion)
+        }
+        PageTransform::Checksum(ctx) => {
             let checksum_ctx = ctx.clone();
             let original_c = complete;
             let verify_complete =
@@ -2029,7 +2078,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let c = Completion::new_read(buf, verify_complete);
             io.pread(offset, c)
         }
-        EncryptionOrChecksum::None => {
+        PageTransform::None => {
             let c = Completion::new_read(buf, complete);
             io.pread(offset, c)
         }
@@ -2059,37 +2108,60 @@ pub fn prepare_wal_frame(
     buffer_pool: &Arc<BufferPool>,
     wal_header: &WalHeader,
     prev_checksums: (u32, u32),
-    page_size: u32,
+    _page_size: u32,
     page_number: u32,
     db_size: u32,
     page: &[u8],
 ) -> ((u32, u32), Arc<Buffer>) {
     tracing::trace!(page_number);
 
-    let buffer = buffer_pool.get_wal_frame();
+    let buffer = prepare_wal_frame_header(buffer_pool, wal_header, page_number, db_size);
     let frame = buffer.as_mut_slice();
     frame[WAL_FRAME_HEADER_SIZE..].copy_from_slice(page);
 
+    let final_checksum = recompute_wal_frame_checksum(frame, wal_header, prev_checksums);
+
+    (final_checksum, buffer)
+}
+
+/// Prepares a WAL frame header while leaving the page body for a transform to fill.
+///
+/// The caller must write every byte after [`WAL_FRAME_HEADER_SIZE`] before computing
+/// the frame checksum or submitting the frame to storage.
+pub fn prepare_wal_frame_header(
+    buffer_pool: &Arc<BufferPool>,
+    wal_header: &WalHeader,
+    page_number: u32,
+    db_size: u32,
+) -> Arc<Buffer> {
+    let buffer = Arc::new(buffer_pool.get_wal_frame());
+    let frame = buffer.as_mut_slice();
     frame[0..4].copy_from_slice(&page_number.to_be_bytes());
     frame[4..8].copy_from_slice(&db_size.to_be_bytes());
     frame[8..12].copy_from_slice(&wal_header.salt_1.to_be_bytes());
     frame[12..16].copy_from_slice(&wal_header.salt_2.to_be_bytes());
+    buffer
+}
 
+/// Recompute a frame checksum after transforming its page body in place.
+pub fn recompute_wal_frame_checksum(
+    frame: &mut [u8],
+    wal_header: &WalHeader,
+    prev_checksums: (u32, u32),
+) -> (u32, u32) {
     let expects_be = wal_header.magic & 1;
     let use_native_endian = cfg!(target_endian = "big") as u32 == expects_be;
     let header_checksum = checksum_wal(&frame[0..8], wal_header, prev_checksums, use_native_endian);
     let final_checksum = checksum_wal(
-        &frame[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + page_size as usize],
+        &frame[WAL_FRAME_HEADER_SIZE..],
         wal_header,
         header_checksum,
         use_native_endian,
     );
     frame[16..20].copy_from_slice(&final_checksum.0.to_be_bytes());
     frame[20..24].copy_from_slice(&final_checksum.1.to_be_bytes());
-
-    (final_checksum, Arc::new(buffer))
+    final_checksum
 }
-
 pub fn begin_write_wal_header<F: File + ?Sized>(io: &F, header: &WalHeader) -> Result<Completion> {
     tracing::trace!("begin_write_wal_header");
     let buffer = {

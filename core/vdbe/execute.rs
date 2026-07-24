@@ -16676,6 +16676,11 @@ fn op_journal_mode_inner(
                             .to_string(),
                     ));
                 }
+                if matches!(new_mode, journal_mode::JournalMode::Mvcc) && pager.has_page_codec() {
+                    return Err(LimboError::InvalidArgument(
+                        "external page codecs are not supported with MVCC databases".to_string(),
+                    ));
+                }
 
                 state.active_op_state.journal_mode().new_mode = Some(new_mode);
                 state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::Checkpoint;
@@ -17198,15 +17203,31 @@ fn op_vacuum_into_inner(
                 // Always use PlatformIO for the output file, even if source
                 // is in-memory. This ensures VACUUM INTO writes to disk.
                 let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
-                let output_db = crate::Database::open_file_with_flags(
-                    io,
-                    dest_path,
-                    OpenFlags::Create,
-                    output_opts,
-                    None,
-                    source_db.dialect(),
-                )?;
-                let output_conn = output_db.connect()?;
+                let page_codec = source_pager.page_codec();
+                let output_db = match &page_codec {
+                    Some(codec) => crate::Database::open_file_with_flags_and_page_codec(
+                        io,
+                        dest_path,
+                        OpenFlags::Create,
+                        output_opts,
+                        None,
+                        None,
+                        codec.clone(),
+                        source_db.dialect(),
+                    )?,
+                    None => crate::Database::open_file_with_flags(
+                        io,
+                        dest_path,
+                        OpenFlags::Create,
+                        output_opts,
+                        None,
+                        source_db.dialect(),
+                    )?,
+                };
+                let output_conn = match page_codec {
+                    Some(codec) => output_db.connect_with_page_codec(codec)?,
+                    None => output_db.connect()?,
+                };
                 output_conn.reset_page_size(page_size)?;
                 // set reserved_space on output to match source
                 // this is important for databases using encryption or checksums

@@ -1,6 +1,6 @@
-use memmap2::{MmapMut, MmapOptions};
 use rand::{Rng, RngCore};
 use rand_chacha::ChaCha8Rng;
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File as StdFile, OpenOptions};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,6 +59,30 @@ impl SimulatorIO {
         self.file_sizes.clone()
     }
 
+    /// Number of submitted I/O operations whose completion callbacks have not run.
+    pub fn pending_completion_count(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+
+    /// Abort queued completion notifications after a simulated process crash.
+    ///
+    /// `SimulatorFile` applies submitted bytes before queuing the completion, so
+    /// this models losing process state after storage accepted an I/O request but
+    /// before the issuing state machine observed completion. Completing the
+    /// callbacks as aborted releases their process-local waiters before the
+    /// test drops the simulated process.
+    pub fn abort_pending_completions(&self) -> usize {
+        let pending = {
+            let mut pending = self.pending.lock().unwrap();
+            std::mem::take(&mut *pending)
+        };
+        let discarded = pending.len();
+        for completion in pending {
+            completion.completion.abort();
+        }
+        discarded
+    }
+
     /// Dump all database files to the specified output directory.
     /// Only copies the actual file content, not the full mmap size.
     pub fn dump_files(&self, out_dir: &std::path::Path) -> anyhow::Result<()> {
@@ -77,8 +101,8 @@ impl SimulatorIO {
                     .unwrap_or_else(|| path.clone());
 
                 let dest_path = out_dir.join(&filename);
-                let mmap = file.mmap.lock().unwrap();
-                std::fs::write(&dest_path, &mmap[..actual_size])?;
+                let contents = file.read_to_vec(0, actual_size);
+                std::fs::write(&dest_path, &contents)?;
                 println!(
                     "Dumped {} ({} bytes) to {}",
                     path,
@@ -202,12 +226,22 @@ impl IO for SimulatorIO {
                         let byte_offset = rng.random_range(0..file_size);
                         let bit_idx = rng.random_range(0..8);
 
-                        let mut mmap = file.mmap.lock().unwrap();
-                        let old_byte = mmap[byte_offset];
-                        mmap[byte_offset] ^= 1 << bit_idx;
+                        let mut byte = [0];
+                        let result = file.read_at(byte_offset, &mut byte);
+                        assert_eq!(
+                            result, 1,
+                            "cosmic ray offset is selected from a valid simulator file size"
+                        );
+                        let old_byte = byte[0];
+                        byte[0] ^= 1 << bit_idx;
+                        let result = file.write_at(byte_offset, &byte);
+                        assert_eq!(
+                            result, 1,
+                            "cosmic ray offset is selected from a valid simulator file size"
+                        );
                         println!(
                             "Cosmic ray! File: {} - Flipped bit {} at offset {} (0x{:02x} -> 0x{:02x})",
-                            path, bit_idx, byte_offset, old_byte, mmap[byte_offset]
+                            path, bit_idx, byte_offset, old_byte, byte[0]
                         );
                     }
                 }
@@ -235,9 +269,11 @@ type PendingQueue = Arc<Mutex<Vec<PendingCompletion>>>;
 
 const MAX_FILE_SIZE: usize = 1 << 33; // 8 GiB
 pub(crate) const FILE_SIZE_SOFT_LIMIT: u64 = 6 * (1 << 30); // 6 GiB (75% of MAX_FILE_SIZE)
+const SIMULATOR_FILE_BLOCK_SIZE: usize = 4096;
+type SimulatorFileBlock = Box<[u8; SIMULATOR_FILE_BLOCK_SIZE]>;
 
 struct SimulatorFile {
-    mmap: Mutex<MmapMut>,
+    blocks: Mutex<BTreeMap<usize, SimulatorFileBlock>>,
     size: Mutex<usize>,
     file_sizes: Arc<Mutex<HashMap<String, u64>>>,
     path: String,
@@ -259,29 +295,87 @@ impl SimulatorFile {
             .open(file_path)
             .unwrap_or_else(|e| panic!("Failed to create file {file_path}: {e}"));
 
-        file.set_len(MAX_FILE_SIZE as u64)
-            .unwrap_or_else(|e| panic!("Failed to truncate file {file_path}: {e}"));
-
-        let mmap = unsafe {
-            MmapOptions::new()
-                .len(MAX_FILE_SIZE)
-                .map_mut(&file)
-                .unwrap_or_else(|e| panic!("mmap failed for file {file_path}: {e}"))
-        };
-
         {
             let mut sizes = file_sizes.lock().unwrap();
             sizes.insert(file_path.to_string(), 0);
         }
 
         Self {
-            mmap: Mutex::new(mmap),
+            blocks: Mutex::new(BTreeMap::new()),
             size: Mutex::new(0),
             file_sizes,
             path: file_path.to_string(),
             _file: file,
             pending,
         }
+    }
+
+    fn read_at(&self, pos: usize, dest: &mut [u8]) -> i32 {
+        let Some(end) = pos.checked_add(dest.len()) else {
+            return 0;
+        };
+        if end > MAX_FILE_SIZE {
+            return 0;
+        }
+
+        dest.fill(0);
+        let blocks = self.blocks.lock().unwrap();
+        let mut copied = 0;
+        while copied < dest.len() {
+            let absolute = pos + copied;
+            let block_idx = absolute / SIMULATOR_FILE_BLOCK_SIZE;
+            let block_offset = absolute % SIMULATOR_FILE_BLOCK_SIZE;
+            let chunk_len = (SIMULATOR_FILE_BLOCK_SIZE - block_offset).min(dest.len() - copied);
+            if let Some(block) = blocks.get(&block_idx) {
+                dest[copied..copied + chunk_len]
+                    .copy_from_slice(&block[block_offset..block_offset + chunk_len]);
+            }
+            copied += chunk_len;
+        }
+        dest.len() as i32
+    }
+
+    fn read_to_vec(&self, pos: usize, len: usize) -> Vec<u8> {
+        let mut contents = vec![0; len];
+        let result = self.read_at(pos, &mut contents);
+        assert_eq!(
+            result as usize, len,
+            "dumped simulator files must stay within MAX_FILE_SIZE"
+        );
+        contents
+    }
+
+    fn write_at(&self, pos: usize, src: &[u8]) -> i32 {
+        let Some(end) = pos.checked_add(src.len()) else {
+            return 0;
+        };
+        if end > MAX_FILE_SIZE {
+            return 0;
+        }
+
+        let mut blocks = self.blocks.lock().unwrap();
+        let mut written = 0;
+        while written < src.len() {
+            let absolute = pos + written;
+            let block_idx = absolute / SIMULATOR_FILE_BLOCK_SIZE;
+            let block_offset = absolute % SIMULATOR_FILE_BLOCK_SIZE;
+            let chunk_len = (SIMULATOR_FILE_BLOCK_SIZE - block_offset).min(src.len() - written);
+            let block = blocks
+                .entry(block_idx)
+                .or_insert_with(|| Box::new([0; SIMULATOR_FILE_BLOCK_SIZE]));
+            block[block_offset..block_offset + chunk_len]
+                .copy_from_slice(&src[written..written + chunk_len]);
+            written += chunk_len;
+        }
+        drop(blocks);
+
+        let mut size = self.size.lock().unwrap();
+        if end > *size {
+            *size = end;
+            let mut sizes = self.file_sizes.lock().unwrap();
+            sizes.insert(self.path.clone(), *size as u64);
+        }
+        src.len() as i32
     }
 }
 
@@ -297,15 +391,8 @@ impl File for SimulatorFile {
         let pos = pos as usize;
         let read_completion = c.as_read();
         let buffer = read_completion.buf_arc();
-        let len = buffer.len();
 
-        let result = if pos + len <= MAX_FILE_SIZE {
-            let mmap = self.mmap.lock().unwrap();
-            buffer.as_mut_slice().copy_from_slice(&mmap[pos..pos + len]);
-            len as i32
-        } else {
-            0
-        };
+        let result = self.read_at(pos, buffer.as_mut_slice());
         self.pending.lock().unwrap().push(PendingCompletion {
             completion: c.clone(),
             result,
@@ -320,23 +407,7 @@ impl File for SimulatorFile {
         c: Completion,
     ) -> Result<Completion> {
         let pos = pos as usize;
-        let len = buffer.len();
-
-        let result = if pos + len <= MAX_FILE_SIZE {
-            let mut mmap = self.mmap.lock().unwrap();
-            mmap[pos..pos + len].copy_from_slice(buffer.as_slice());
-            let mut size = self.size.lock().unwrap();
-            if pos + len > *size {
-                *size = pos + len;
-                {
-                    let mut sizes = self.file_sizes.lock().unwrap();
-                    sizes.insert(self.path.clone(), *size as u64);
-                }
-            }
-            len as i32
-        } else {
-            0
-        };
+        let result = self.write_at(pos, buffer.as_slice());
         self.pending.lock().unwrap().push(PendingCompletion {
             completion: c.clone(),
             result,
@@ -353,31 +424,14 @@ impl File for SimulatorFile {
         let mut offset = pos as usize;
         let mut total_written = 0;
 
-        {
-            let mut mmap = self.mmap.lock().unwrap();
-            for buffer in buffers {
-                let len = buffer.len();
-                if offset + len <= MAX_FILE_SIZE {
-                    mmap[offset..offset + len].copy_from_slice(buffer.as_slice());
-                    offset += len;
-                    total_written += len;
-                } else {
-                    break;
-                }
+        for buffer in buffers {
+            let len = buffer.len();
+            let result = self.write_at(offset, buffer.as_slice());
+            if result != len as i32 {
+                break;
             }
-        }
-
-        // Update the file size if we wrote beyond the current size
-        if total_written > 0 {
-            let mut size = self.size.lock().unwrap();
-            let end_pos = (pos as usize) + total_written;
-            if end_pos > *size {
-                *size = end_pos;
-                {
-                    let mut sizes = self.file_sizes.lock().unwrap();
-                    sizes.insert(self.path.clone(), *size as u64);
-                }
-            }
+            offset += len;
+            total_written += len;
         }
 
         self.pending.lock().unwrap().push(PendingCompletion {
@@ -420,5 +474,44 @@ impl File for SimulatorFile {
 
     fn size(&self) -> Result<u64> {
         Ok(*self.size.lock().unwrap() as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempFile {
+        path: String,
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn simulator_file_does_not_preallocate_max_size() {
+        let path =
+            std::env::temp_dir().join(format!("turso-whopper-blocks-{}.db", std::process::id()));
+        let path = path.to_string_lossy().into_owned();
+        let _cleanup = TempFile { path: path.clone() };
+        let file = SimulatorFile::new(
+            &path,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+
+        assert_eq!(file._file.metadata().unwrap().len(), 0);
+
+        let pos = MAX_FILE_SIZE - 2;
+        assert_eq!(file.write_at(pos, &[1, 2]), 2);
+        assert_eq!(file._file.metadata().unwrap().len(), 0);
+        assert_eq!(file.size().unwrap(), MAX_FILE_SIZE as u64);
+
+        let mut read = [0; 3];
+        assert_eq!(file.read_at(pos - 1, &mut read), 3);
+        assert_eq!(read, [0, 1, 2]);
     }
 }
