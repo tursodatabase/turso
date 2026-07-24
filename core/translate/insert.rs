@@ -22,8 +22,8 @@ use crate::{
         },
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
-            emit_guarded_fk_decrement, index_probe, open_read_index, open_read_table,
-            ForeignKeyActions,
+            emit_guarded_fk_decrement, emit_skip_if_any_null, index_probe, index_scan_match_any,
+            open_read_index, open_read_table, ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -4219,8 +4219,19 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         if !force_immediate && !pref.fk.deferred && !is_self_ref {
             continue;
         }
+        // Nothing to do if the parent counter is 0
+        let skip_fk = program.allocate_label();
+        program.emit_insn(Insn::FkIfZero {
+            deferred: pref.fk.deferred,
+            target_pc: skip_fk,
+        });
+
         let (new_pk_start, n_cols) =
             build_parent_key_image_for_insert(program, parent_table, &pref, insertion)?;
+
+        // Nothing to do if the key contains NULLs, because a NULL parent key
+        // never matches any child row (SQL NULL semantics)
+        emit_skip_if_any_null(program, new_pk_start, n_cols, skip_fk);
 
         let child_tbl = &pref.child_table;
         let child_cols = &pref.fk.child_columns;
@@ -4255,24 +4266,13 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 });
             }
 
-            let found = program.allocate_label();
-            program.emit_insn(Insn::Found {
-                cursor_id: icur,
-                target_pc: found,
-                record_reg: probe_start,
-                num_regs: n_cols,
-            });
-
-            // Not found, nothing to decrement
-            program.emit_insn(Insn::Close { cursor_id: icur });
-            let skip = program.allocate_label();
-            program.emit_insn(Insn::Goto { target_pc: skip });
-
-            // Found: guarded counter decrement
-            program.preassign_label_to_next_insn(found);
-            program.emit_insn(Insn::Close { cursor_id: icur });
-            emit_guarded_fk_decrement(program, skip, pref.fk.deferred);
-            program.preassign_label_to_next_insn(skip);
+            // Decrement once per matching child row
+            index_scan_match_any(program, icur, probe_start, n_cols, None, |p| {
+                let next = p.allocate_label();
+                emit_guarded_fk_decrement(p, next, pref.fk.deferred);
+                p.preassign_label_to_next_insn(next);
+                Ok(())
+            })?;
         } else {
             // fallback scan :(
             let ccur = open_read_table(program, child_tbl, database_id);
@@ -4325,6 +4325,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             program.preassign_label_to_next_insn(done);
             program.emit_insn(Insn::Close { cursor_id: ccur });
         }
+        program.preassign_label_to_next_insn(skip_fk);
     }
     Ok(())
 }
