@@ -9840,6 +9840,17 @@ fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: usize) -> Re
         page.write_fragmented_bytes_count(0);
     }
     page.write_cell_count(page.cell_count() as u16 - 1);
+
+    // Adjust overflow cell indices after deletion.
+    // Overflow cells track their intended position via `index`. When a regular cell
+    // is deleted, any overflow cells that were positioned after it need their
+    // indices decremented to maintain correct positioning during balance operations.
+    for overflow_cell in page.overflow_cells.iter_mut() {
+        if overflow_cell.index > cell_idx {
+            overflow_cell.index -= 1;
+        }
+    }
+
     debug_validate_cells!(page, usable_space);
     Ok(())
 }
