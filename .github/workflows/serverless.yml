@@ -7,22 +7,12 @@ on:
     paths:
       - "serverless/rust/**"
       - "serverless/conformance/differential/**"
-      - "bindings/rust/**"
-      - "core/types.rs"
-      - "core/error.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
       - ".github/workflows/serverless.yml"
   pull_request:
     branches: [main]
     paths:
       - "serverless/rust/**"
       - "serverless/conformance/differential/**"
-      - "bindings/rust/**"
-      - "core/types.rs"
-      - "core/error.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
       - ".github/workflows/serverless.yml"
 
 permissions:
