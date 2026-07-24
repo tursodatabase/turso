@@ -15,7 +15,6 @@ use turso_core::{
     vector::{self, vector_types::VectorType},
     Numeric, Register, Result, Value, MAIN_DB_ID,
 };
-use turso_parser::ast::SortOrder;
 
 use crate::common::{limbo_exec_rows, TempDatabase};
 
@@ -60,14 +59,7 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn {
-                name: "embedding".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 1,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: vec![IndexColumn::new("embedding", 1)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -103,14 +95,7 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn {
-                name: "embedding".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 1,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: vec![IndexColumn::new("embedding", 1)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -193,14 +178,7 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn {
-                name: "embedding".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 1,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: vec![IndexColumn::new("embedding", 1)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -411,24 +389,7 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "fts_docs".to_string(),
-            columns: vec![
-                IndexColumn {
-                    name: "title".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: "body".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 2,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-            ],
+            columns: vec![IndexColumn::new("title", 1), IndexColumn::new("body", 2)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -470,24 +431,7 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "fts_docs".to_string(),
-            columns: vec![
-                IndexColumn {
-                    name: "title".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: "body".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 2,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-            ],
+            columns: vec![IndexColumn::new("title", 1), IndexColumn::new("body", 2)],
             parameters: HashMap::default(),
         })
         .unwrap();

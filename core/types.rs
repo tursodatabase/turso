@@ -25,6 +25,7 @@ use crate::vtab::VirtualTableCursor;
 use crate::{Completion, CompletionError, Result, IO};
 use std::borrow::{Borrow, Cow};
 use std::cell::Cell;
+use std::cmp::Ordering;
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::iter::{FusedIterator, Peekable};
@@ -439,26 +440,26 @@ impl Debug for ValueRef<'_> {
 }
 
 pub trait AsValueRef {
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a>;
+    fn as_value_ref(&'_ self) -> ValueRef<'_>;
 }
 
 impl<'b> AsValueRef for ValueRef<'b> {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         *self
     }
 }
 
 impl AsValueRef for Value {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         self.as_ref()
     }
 }
 
 impl AsValueRef for &mut Value {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         self.as_ref()
     }
 }
@@ -469,7 +470,7 @@ where
     V2: AsValueRef,
 {
     #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         match self {
             Either::Left(left) => left.as_value_ref(),
             Either::Right(right) => right.as_value_ref(),
@@ -478,7 +479,7 @@ where
 }
 
 impl<V: AsValueRef> AsValueRef for &V {
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+    fn as_value_ref(&'_ self) -> ValueRef<'_> {
         (*self).as_value_ref()
     }
 }
@@ -495,7 +496,7 @@ impl Value {
         Self::Numeric(Numeric::Integer(i))
     }
 
-    pub fn as_ref<'a>(&'a self) -> ValueRef<'a> {
+    pub fn as_ref(&'_ self) -> ValueRef<'_> {
         match self {
             Value::Null => ValueRef::Null,
             Value::Numeric(n) => ValueRef::Numeric(*n),
@@ -2483,6 +2484,7 @@ where
     Ok(std::cmp::Ordering::Equal)
 }
 
+/// Treats `NULL` as equal to itself and smaller than other values.
 pub fn compare_immutable_single<V1, V2>(l: V1, r: V2, collation: CollationSeq) -> std::cmp::Ordering
 where
     V1: AsValueRef,
@@ -2494,6 +2496,33 @@ where
         (ValueRef::Text(left), ValueRef::Text(right)) => collation.compare_strings(&left, &right),
         _ => l.cmp(&r),
     }
+}
+
+pub fn cmp_in_column(a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
+    cmp_with_sort(compare_immutable_single(a, b, key.collation), a, b, key)
+}
+
+/// Outputs a modified [Ordering] that takes into account the sort order and the NULLS order.
+pub fn cmp_with_sort(cmp: Ordering, a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
+    if cmp != Ordering::Equal {
+        let involves_null = matches!(a, ValueRef::Null) || matches!(b, ValueRef::Null);
+        if involves_null {
+            if let Some(nulls_order) = key.nulls_order {
+                // ValueRef ordering: NULL < non-NULL.
+                // NULLS FIRST: keep that natural order regardless of ASC/DESC.
+                // NULLS LAST: reverse it regardless of ASC/DESC.
+                return match nulls_order {
+                    turso_parser::ast::NullsOrder::First => cmp,
+                    turso_parser::ast::NullsOrder::Last => cmp.reverse(),
+                };
+            }
+        }
+        return match key.sort_order {
+            SortOrder::Asc => cmp,
+            SortOrder::Desc => cmp.reverse(),
+        };
+    }
+    Ordering::Equal
 }
 
 #[derive(Debug, Clone, Copy)]

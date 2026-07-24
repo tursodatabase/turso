@@ -2022,7 +2022,7 @@ fn generate_join_bitmasks(table_number_max_exclusive: usize, how_many: usize) ->
 mod tests {
     use std::{collections::VecDeque, sync::Arc};
 
-    use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
+    use turso_parser::ast::{self, Expr, Operator, TableInternalId};
 
     use super::*;
     use crate::alloc::TursoSliceExt;
@@ -2307,14 +2307,7 @@ mod tests {
             name: "sqlite_autoindex_test_table_1".to_string(),
             table_name: "test_table".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn {
-                name: "id".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 0,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: crate::alloc::vec![IndexColumn::new("id", 0)],
             unique: true,
             ephemeral: false,
             root_page: 1,
@@ -2404,14 +2397,7 @@ mod tests {
             name: "index1".to_string(),
             table_name: "table1".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn {
-                name: "id".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 0,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: crate::alloc::vec![IndexColumn::new("id", 0)],
             unique: true,
             ephemeral: false,
             root_page: 1,
@@ -2546,14 +2532,7 @@ mod tests {
                     name: index_name,
                     where_clause: None,
                     table_name: table_name.to_string(),
-                    columns: crate::alloc::vec![IndexColumn {
-                        name: "id".to_string(),
-                        order: SortOrder::Asc,
-                        pos_in_table: 0,
-                        collation: None,
-                        default: None,
-                        expr: None,
-                    }],
+                    columns: crate::alloc::vec![IndexColumn::new("id", 0)],
                     unique: true,
                     ephemeral: false,
                     root_page: 1,
@@ -2571,14 +2550,7 @@ mod tests {
             name: "orders_customer_id_idx".to_string(),
             table_name: "orders".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn {
-                name: "customer_id".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 1,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: crate::alloc::vec![IndexColumn::new("customer_id", 1)],
             unique: false,
             ephemeral: false,
             root_page: 1,
@@ -2590,14 +2562,7 @@ mod tests {
             name: "order_items_order_id_idx".to_string(),
             table_name: "order_items".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn {
-                name: "order_id".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 1,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: crate::alloc::vec![IndexColumn::new("order_id", 1)],
             unique: false,
             ephemeral: false,
             root_page: 1,
@@ -3080,24 +3045,7 @@ mod tests {
             name: "idx_xy".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![
-                IndexColumn {
-                    name: "x".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 0,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: "y".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-            ],
+            columns: crate::alloc::vec![IndexColumn::new("x", 0), IndexColumn::new("y", 1),],
             unique: false,
             root_page: 2,
             ephemeral: false,
@@ -3193,30 +3141,9 @@ mod tests {
             table_name: "t1".to_string(),
             where_clause: None,
             columns: crate::alloc::vec![
-                IndexColumn {
-                    name: "c1".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 0,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: "c2".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: "c3".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 2,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
+                IndexColumn::new("c1", 0),
+                IndexColumn::new("c2", 1),
+                IndexColumn::new("c3", 2),
             ],
             unique: false,
             root_page: 2,
@@ -3330,32 +3257,7 @@ mod tests {
             name: "idx1".to_string(),
             table_name: "t1".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![
-                IndexColumn {
-                    name: "c1".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 0,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: "c2".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 1,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn {
-                    name: "c3".to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: 2,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                },
-            ],
+            columns: IndexColumn::new_many(vec!["c1", "c2", "c3"]),
             root_page: 2,
             ephemeral: false,
             has_rowid: true,
@@ -3537,14 +3439,7 @@ mod tests {
             where_clause: None,
             columns: columns
                 .iter()
-                .map(|(name, pos_in_table)| IndexColumn {
-                    name: (*name).to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: *pos_in_table,
-                    collation: None,
-                    default: None,
-                    expr: None,
-                })
+                .map(|(name, pos_in_table)| IndexColumn::new((*name).to_string(), *pos_in_table))
                 .try_collect()
                 .unwrap(),
             unique,
@@ -3687,14 +3582,7 @@ mod tests {
             name: "idx_t2_a".to_string(),
             table_name: "t2".to_string(),
             where_clause: None,
-            columns: crate::alloc::vec![IndexColumn {
-                name: "a".to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 0,
-                collation: None,
-                default: None,
-                expr: None,
-            }],
+            columns: crate::alloc::vec![IndexColumn::new("a", 0)],
             unique: false, // Non-unique index
             ephemeral: false,
             root_page: 2,

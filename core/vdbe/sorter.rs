@@ -12,7 +12,7 @@ use std::rc::Rc;
 use crate::alloc::vec;
 use crate::alloc::*;
 use crate::io::TempFile;
-use crate::types::{IOCompletions, ValueIterator};
+use crate::types::{cmp_in_column, cmp_with_sort, IOCompletions, ValueIterator};
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, CompletionGroup, File, IO},
@@ -944,35 +944,17 @@ impl ArenaSortableRecord {
             .enumerate()
         {
             let cmp = if let Some(Some(comparator)) = comparators.get(i) {
-                comparator(&self_val, &other_val).expect("Memory allocation failed here")
+                let base =
+                    comparator(&self_val, &other_val).expect("Memory allocation failed here");
+                cmp_with_sort(base, &self_val, &other_val, key_info)
             } else {
-                match (self_val, other_val) {
-                    (ValueRef::Text(left), ValueRef::Text(right)) => {
-                        key_info.collation.compare_strings(&left, &right)
-                    }
-                    _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
-                }
+                cmp_in_column(&self_val, &other_val, key_info)
             };
             if cmp != Ordering::Equal {
-                let involves_null =
-                    matches!(self_val, ValueRef::Null) || matches!(other_val, ValueRef::Null);
-                if involves_null {
-                    if let Some(nulls_order) = key_info.nulls_order {
-                        // ValueRef ordering: NULL < non-NULL.
-                        // NULLS FIRST: keep that natural order regardless of ASC/DESC.
-                        // NULLS LAST: reverse it regardless of ASC/DESC.
-                        return match nulls_order {
-                            turso_parser::ast::NullsOrder::First => cmp,
-                            turso_parser::ast::NullsOrder::Last => cmp.reverse(),
-                        };
-                    }
-                }
-                return match key_info.sort_order {
-                    SortOrder::Asc => cmp,
-                    SortOrder::Desc => cmp.reverse(),
-                };
+                return cmp;
             }
         }
+
         Ordering::Equal
     }
 }
@@ -1085,22 +1067,7 @@ impl BoxedSortableRecord {
                     _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
                 }
             };
-            if cmp != Ordering::Equal {
-                let involves_null =
-                    matches!(self_val, ValueRef::Null) || matches!(other_val, ValueRef::Null);
-                if involves_null {
-                    if let Some(nulls_order) = key_info.nulls_order {
-                        return match nulls_order {
-                            turso_parser::ast::NullsOrder::First => cmp,
-                            turso_parser::ast::NullsOrder::Last => cmp.reverse(),
-                        };
-                    }
-                }
-                return match key_info.sort_order {
-                    SortOrder::Asc => cmp,
-                    SortOrder::Desc => cmp.reverse(),
-                };
-            }
+            cmp_with_sort(cmp, &self_val, &other_val, key_info);
         }
         Ordering::Equal
     }
@@ -1168,33 +1135,6 @@ mod tests {
                     .expect("Failed to parse SEED environment variable as u64")
             },
         ) as u64
-    }
-
-    /// Reference single-column comparison replicating the full comparator's
-    /// rules (SQL type ordering, ASC/DESC, NULLS FIRST/LAST, binary collation).
-    fn reference_single_key_cmp(a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
-        let cmp = match (a, b) {
-            (ValueRef::Text(left), ValueRef::Text(right)) => {
-                key.collation.compare_strings(left, right)
-            }
-            _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-        };
-        if cmp != Ordering::Equal {
-            let involves_null = matches!(a, ValueRef::Null) || matches!(b, ValueRef::Null);
-            if involves_null {
-                if let Some(nulls_order) = key.nulls_order {
-                    return match nulls_order {
-                        turso_parser::ast::NullsOrder::First => cmp,
-                        turso_parser::ast::NullsOrder::Last => cmp.reverse(),
-                    };
-                }
-            }
-            return match key.sort_order {
-                SortOrder::Asc => cmp,
-                SortOrder::Desc => cmp.reverse(),
-            };
-        }
-        Ordering::Equal
     }
 
     #[test]
@@ -1274,7 +1214,10 @@ mod tests {
             let (norm_b, dec_b) =
                 normalized_first_key(&rb[..ncols], &keys[..ncols], &comparators[..ncols]);
             // The normalized key only ever reflects the first column.
-            let reference = reference_single_key_cmp(&ra[0], &rb[0], &keys[0]);
+            let a = &ra[0];
+            let b = &rb[0];
+            let key = &keys[0];
+            let reference = cmp_in_column(a, b, key);
 
             if ncols > 1 {
                 assert!(
@@ -1404,5 +1347,94 @@ mod tests {
             values.push(value);
         }
         values
+    }
+
+    fn assert_secondary_key_sort(
+        second_order: SortOrder,
+        second_nulls: Option<turso_parser::ast::NullsOrder>,
+        seconds: &[Value],
+        expected: &[ValueRef],
+    ) {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc, second_order],
+            try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![None, second_nulls].unwrap(),
+            try_vec![None, None].unwrap(),
+            1 << 20,
+            64,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+
+        for second in seconds {
+            let values = try_vec![Value::from_i64(1), second.clone()].unwrap();
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            io.block(|| sorter.insert(&record))
+                .expect("Failed to insert the record");
+        }
+
+        io.block(|| sorter.sort())
+            .expect("Failed to sort the records");
+        assert!(sorter.chunks.is_empty());
+
+        let mut idx = 0;
+        while sorter.has_more() {
+            {
+                let record = sorter.record().unwrap();
+                let vals = record.get_values().unwrap();
+                assert_eq!(vals[0], ValueRef::from_i64(1));
+                assert_eq!(vals[1], expected[idx]);
+            }
+            idx += 1;
+            io.block(|| sorter.next())
+                .expect("Failed to get the next record");
+        }
+        assert_eq!(idx, expected.len());
+    }
+
+    #[test]
+    fn in_memory_sort_applies_desc_on_secondary_key() {
+        let seconds = try_vec![
+            Value::from_i64(10),
+            Value::from_i64(40),
+            Value::from_i64(20),
+            Value::from_i64(30)
+        ]
+        .unwrap();
+        assert_secondary_key_sort(
+            SortOrder::Desc,
+            None,
+            &seconds,
+            &[
+                ValueRef::from_i64(40),
+                ValueRef::from_i64(30),
+                ValueRef::from_i64(20),
+                ValueRef::from_i64(10),
+            ],
+        );
+    }
+
+    #[test]
+    fn in_memory_sort_places_nulls_last_on_desc_secondary_key() {
+        let seconds = try_vec![
+            Value::Null,
+            Value::from_i64(10),
+            Value::Null,
+            Value::from_i64(20)
+        ]
+        .unwrap();
+        assert_secondary_key_sort(
+            SortOrder::Desc,
+            Some(turso_parser::ast::NullsOrder::Last),
+            &seconds,
+            &[
+                ValueRef::from_i64(20),
+                ValueRef::from_i64(10),
+                ValueRef::Null,
+                ValueRef::Null,
+            ],
+        );
     }
 }
