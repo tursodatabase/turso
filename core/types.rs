@@ -734,12 +734,14 @@ impl FromValue for Value {
 impl Sealed for crate::Value {}
 
 macro_rules! impl_int_from_value {
-    ($ty:ty, $cast:expr) => {
+    ($ty:ty) => {
         impl FromValue for $ty {
             fn from_sql(val: Value) -> Result<Self> {
                 match val {
                     Value::Null => Err(LimboError::NullValue),
-                    Value::Numeric(Numeric::Integer(i)) => Ok($cast(i)),
+                    Value::Numeric(Numeric::Integer(i)) => {
+                        <$ty>::try_from(i).map_err(|_| LimboError::IntegerOverflow)
+                    }
                     _ => Err(LimboError::InvalidColumnType),
                 }
             }
@@ -749,16 +751,17 @@ macro_rules! impl_int_from_value {
     };
 }
 
-impl_int_from_value!(i32, |i| i as i32);
-impl_int_from_value!(u32, |i| i as u32);
-impl_int_from_value!(i64, |i| i);
-impl_int_from_value!(u64, |i| i as u64);
+impl_int_from_value!(i32);
+impl_int_from_value!(u32);
+impl_int_from_value!(i64);
+impl_int_from_value!(u64);
 
 impl FromValue for f64 {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
             Value::Numeric(Numeric::Float(f)) => Ok(f64::from(f)),
+            Value::Numeric(Numeric::Integer(i)) => Ok(i as f64),
             _ => Err(LimboError::InvalidColumnType),
         }
     }
@@ -3579,6 +3582,65 @@ mod tests {
     use super::*;
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
+
+    fn assert_integer_conversions<T>(in_range: &[(i64, T)], out_of_range: &[i64])
+    where
+        T: Copy + std::fmt::Debug + PartialEq + FromValue,
+    {
+        for &(input, expected) in in_range {
+            assert_eq!(T::from_sql(Value::from_i64(input)).unwrap(), expected);
+        }
+        for &input in out_of_range {
+            assert!(
+                matches!(
+                    T::from_sql(Value::from_i64(input)),
+                    Err(LimboError::IntegerOverflow)
+                ),
+                "{input} should overflow {}",
+                std::any::type_name::<T>()
+            );
+        }
+    }
+
+    #[test]
+    fn from_value_checks_integer_ranges() {
+        assert_integer_conversions::<i32>(
+            &[
+                (i32::MIN as i64, i32::MIN),
+                (-1, -1),
+                (0, 0),
+                (1, 1),
+                (i32::MAX as i64, i32::MAX),
+            ],
+            &[i32::MIN as i64 - 1, i32::MAX as i64 + 1],
+        );
+        assert_integer_conversions::<u32>(
+            &[(0, 0), (1, 1), (u32::MAX as i64, u32::MAX)],
+            &[-2, -1, u32::MAX as i64 + 1],
+        );
+        assert_integer_conversions::<i64>(
+            &[
+                (i64::MIN, i64::MIN),
+                (-1, -1),
+                (0, 0),
+                (1, 1),
+                (i64::MAX, i64::MAX),
+            ],
+            &[],
+        );
+        assert_integer_conversions::<u64>(
+            &[(0, 0), (1, 1), (i64::MAX, i64::MAX as u64)],
+            &[-2, -1],
+        );
+    }
+
+    #[test]
+    fn from_value_converts_integers_to_f64() {
+        for input in [i64::MIN, -1, 0, 1, (1_i64 << 53) + 1, i64::MAX] {
+            assert_eq!(f64::from_sql(Value::from_i64(input)).unwrap(), input as f64);
+        }
+        assert_eq!(f64::from_sql(Value::from_f64(1.5)).unwrap(), 1.5);
+    }
 
     #[cfg(nightly)]
     #[test]
