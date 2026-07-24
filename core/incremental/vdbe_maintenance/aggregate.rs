@@ -12,7 +12,10 @@ use crate::schema::Schema;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
+use crate::translate::expr::{
+    translate_condition_expr, translate_expr_no_constant_opt, ConditionMetadata,
+    NoConstantOptReason,
+};
 use crate::translate::plan::Aggregate;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -397,13 +400,23 @@ fn emit_group_aggregate_rows(
         dest: persisted_value_start,
         dest_end: Some(persisted_value_start + aggregates.len() - 1),
     });
-    // A fresh group's DISTINCT accumulators may never be stepped in the apply
-    // loop (a NULL argument contributes nothing), but the write path stores
-    // every payload accumulator, so materialize empty contexts now. Stepping
-    // a NULL argument initializes the context without contributing to it.
+    // A fresh group's DISTINCT or filtered accumulators may never be stepped
+    // in the apply loop, but the write path stores every payload accumulator.
+    // Materialize their empty contexts now. A NULL argument contributes
+    // nothing except to COUNT(*), whose initialization step is inverted.
     for (i, agg) in aggregates.iter().enumerate() {
-        if tracks_distinct_values(agg) {
-            program.emit_insn(Insn::AggStep {
+        if !tracks_distinct_values(agg) && agg.filter_expr.is_none() {
+            continue;
+        }
+        program.emit_insn(Insn::AggStep {
+            acc_reg: acc_start + i,
+            col: null_arg_reg,
+            delimiter: 0,
+            func: AccumulatorFunc::Agg(agg.func.clone()),
+            comparator: None,
+        });
+        if matches!(agg.func, AggFunc::Count0) {
+            program.emit_insn(Insn::AggInverse {
                 acc_reg: acc_start + i,
                 col: null_arg_reg,
                 delimiter: 0,
@@ -486,6 +499,24 @@ fn emit_group_aggregate_rows(
     for (i, agg) in aggregates.iter().enumerate() {
         let is_minmax = matches!(agg.func, AggFunc::Min | AggFunc::Max);
         let is_distinct = tracks_distinct_values(agg);
+        let aggregate_done_label = program.allocate_label();
+        if let Some(filter_expr) = &agg.filter_expr {
+            let apply_aggregate_label = program.allocate_label();
+            let bound_filter = remap_bound_expr(filter_expr, &binding_remap)?;
+            translate_condition_expr(
+                program,
+                &table_references,
+                &bound_filter,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_true: apply_aggregate_label,
+                    jump_target_when_false: aggregate_done_label,
+                    jump_target_when_null: aggregate_done_label,
+                },
+                &resolver,
+            )?;
+            program.preassign_label_to_next_insn(apply_aggregate_label);
+        }
         let col_reg = match agg.args.first() {
             Some(arg_expr) => {
                 let bound = remap_bound_expr(arg_expr, &binding_remap)?;
@@ -514,13 +545,12 @@ fn emit_group_aggregate_rows(
             let mm = mm_cursors[i]
                 .as_ref()
                 .expect("DAG validation guarantees one multiset per multiset aggregate");
-            let done_label = program.allocate_label();
             let mm_found_label = program.allocate_label();
             let mm_upsert_label = program.allocate_label();
 
             program.emit_insn(Insn::IsNull {
                 reg: col_reg,
-                target_pc: done_label,
+                target_pc: aggregate_done_label,
             });
             // Key image: [g.., val].
             program.emit_insn(Insn::Copy {
@@ -543,7 +573,7 @@ fn emit_group_aggregate_rows(
             program.emit_insn(Insn::Lt {
                 lhs: weight_reg,
                 rhs: zero_reg,
-                target_pc: done_label,
+                target_pc: aggregate_done_label,
                 flags: CmpInsFlags::default(),
                 collation: None,
             });
@@ -629,7 +659,7 @@ fn emit_group_aggregate_rows(
                 is_part_of_update: true,
             });
             program.emit_insn(Insn::Goto {
-                target_pc: done_label,
+                target_pc: aggregate_done_label,
             });
 
             // Write (g.., val, mult) at the row's rowid; a fresh value also
@@ -681,7 +711,7 @@ fn emit_group_aggregate_rows(
                 flags: IdxInsertFlags::new(),
             });
             program.preassign_label_to_next_insn(mm_skip_idx_label);
-            program.preassign_label_to_next_insn(done_label);
+            program.preassign_label_to_next_insn(aggregate_done_label);
             continue;
         }
 
@@ -713,6 +743,7 @@ fn emit_group_aggregate_rows(
             comparator: None,
         });
         program.preassign_label_to_next_insn(after_label);
+        program.preassign_label_to_next_insn(aggregate_done_label);
     }
 
     // Group liveness: the hidden COUNT(*) is zero when every row of the
