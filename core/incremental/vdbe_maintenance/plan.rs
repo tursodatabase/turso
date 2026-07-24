@@ -1,6 +1,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use turso_parser::ast::{self, TableInternalId};
 
+use super::output::NodeOutputContract;
 use super::stream::{binding_rowid_metadata_width, DeltaIdentity};
 use crate::function::{AggFunc, Func};
 use crate::incremental::dag;
@@ -540,26 +541,6 @@ pub struct HiddenTableDef {
     pub create_sql: String,
 }
 
-/// The complete physical output contract of one DAG node.
-///
-/// Planning derives this once from the logical node and its already-planned
-/// inputs. Bytecode emission consumes it verbatim; emitters must not infer an
-/// identity from an operator shape or reconstruct a schema from physical
-/// inputs.
-#[derive(Debug, Clone)]
-pub(super) struct NodeOutputContract {
-    pub(super) schema: Arc<dag::StreamSchema>,
-    /// Whether each logical binding's SQL rowid remains available after this
-    /// operator. Transport identity is planned separately below.
-    pub(super) binding_rowids: Arc<[bool]>,
-    /// Identity emitted by the relational operator before an optional output
-    /// arrangement.
-    pub(super) emitted_identity: DeltaIdentity,
-    /// Identity published on the node's DAG edge. An explicit arrangement
-    /// replaces the producer identity with its own stable rowid.
-    pub(super) published_identity: DeltaIdentity,
-}
-
 /// Persistent storage and output contract assigned to one DAG node.
 ///
 /// `state_table` is the operator's primary integral. `auxiliary_table` is the
@@ -630,10 +611,6 @@ impl OperatorStateCatalog {
             )));
         }
         Ok(state)
-    }
-
-    pub(super) fn output_for_node(&self, node_id: dag::NodeId) -> Result<&NodeOutputContract> {
-        Ok(&self.for_node(node_id)?.output)
     }
 
     pub fn hidden_tables(&self) -> impl Iterator<Item = &HiddenTableDef> {

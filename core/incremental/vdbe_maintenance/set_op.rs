@@ -1,8 +1,8 @@
-use super::plan::{NodeOutputContract, OperatorStateDef};
+use super::output::{DeltaSource, NodeOutputContract};
+use super::plan::OperatorStateDef;
 use super::stream::{
     emit_operator_rowid_delta, open_ephemeral_delta, DeltaIdentity, EphemeralDelta,
 };
-use super::DeltaSource;
 use crate::incremental::dag;
 use crate::schema::Schema;
 use crate::translate::collate::CollationSeq;
