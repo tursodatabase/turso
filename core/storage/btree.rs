@@ -9840,6 +9840,17 @@ fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: usize) -> Re
         page.write_fragmented_bytes_count(0);
     }
     page.write_cell_count(page.cell_count() as u16 - 1);
+
+    // Adjust overflow cell indices after deletion.
+    // Overflow cells track their intended position via `index`. When a regular cell
+    // is deleted, any overflow cells that were positioned after it need their
+    // indices decremented to maintain correct positioning during balance operations.
+    for overflow_cell in page.overflow_cells.iter_mut() {
+        if overflow_cell.index > cell_idx {
+            overflow_cell.index -= 1;
+        }
+    }
+
     debug_validate_cells!(page, usable_space);
     Ok(())
 }
@@ -13130,6 +13141,111 @@ mod tests {
 
     fn run_until_done<T>(action: impl FnMut() -> Result<IOResult<T>>, pager: &Pager) -> Result<T> {
         pager.io.block(action)
+    }
+
+    /// Test that drop_cell correctly adjusts overflow cell indices.
+    ///
+    /// This test verifies the fix for a bug where balance_non_root would panic
+    /// when a sibling page had overflow cells with indices beyond cell_count.
+    ///
+    /// The bug occurred in IVM scenarios where:
+    /// 1. A page has an overflow cell created during an insert
+    /// 2. Before balance completes, another operation deletes a cell from the same page
+    /// 3. Without the fix, the overflow cell index would exceed cell_count
+    /// 4. balance_non_root would panic when collecting cells
+    ///
+    /// The fix: drop_cell now adjusts overflow cell indices when cells are deleted,
+    /// similar to how shift_pointers_left adjusts regular cell pointers.
+    #[test]
+    pub fn test_drop_cell_adjusts_overflow_cell_indices() {
+        let (pager, _, _, _) = empty_btree();
+        let usable_space = pager.usable_space();
+
+        // Create a test page
+        let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
+        btree_init_page(&page, PageType::TableLeaf, 0, usable_space);
+
+        let page_contents = page.get_contents();
+
+        // Insert several small cells to fill the page partially
+        for i in 0..10 {
+            let regs = &[Register::Value(Value::from_i64(i))];
+            let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
+            let mut payload = crate::alloc::vec![];
+            let mut fill_state = FillCellPayloadState::Start;
+            run_until_done(
+                || {
+                    fill_cell_payload(
+                        &PinGuard::new(page.clone()),
+                        Some(i),
+                        &mut payload,
+                        i as usize,
+                        &record,
+                        usable_space,
+                        pager.clone(),
+                        &mut fill_state,
+                    )
+                },
+                &pager,
+            )
+            .unwrap();
+            insert_into_cell(page_contents, &payload, i as usize, usable_space).unwrap();
+        }
+
+        assert_eq!(page_contents.cell_count(), 10);
+
+        // Now manually add overflow cells at indices 10 and 11
+        // (simulating what happens when inserts overflow during balance)
+        page_contents.overflow_cells.push(OverflowCell {
+            index: 10,
+            payload: std::pin::Pin::new(crate::alloc::vec![1, 2, 3, 4]), // Dummy payload
+        });
+        page_contents.overflow_cells.push(OverflowCell {
+            index: 11,
+            payload: std::pin::Pin::new(crate::alloc::vec![5, 6, 7, 8]), // Dummy payload
+        });
+
+        assert_eq!(page_contents.overflow_cells.len(), 2);
+        assert_eq!(page_contents.overflow_cells[0].index, 10);
+        assert_eq!(page_contents.overflow_cells[1].index, 11);
+
+        // Delete cell at index 5 - this should adjust overflow indices
+        drop_cell(page_contents, 5, usable_space).unwrap();
+
+        // Verify: cell_count decreased by 1
+        assert_eq!(page_contents.cell_count(), 9);
+
+        // Verify: overflow cell indices were adjusted (decremented by 1)
+        // because they were both > 5
+        assert_eq!(page_contents.overflow_cells[0].index, 9);
+        assert_eq!(page_contents.overflow_cells[1].index, 10);
+
+        // Delete cell at index 0 - this should also adjust overflow indices
+        drop_cell(page_contents, 0, usable_space).unwrap();
+
+        assert_eq!(page_contents.cell_count(), 8);
+        assert_eq!(page_contents.overflow_cells[0].index, 8);
+        assert_eq!(page_contents.overflow_cells[1].index, 9);
+
+        // Delete cell at index 8 (now the last regular cell)
+        // This should NOT affect overflow indices since they point past the deleted cell
+        drop_cell(page_contents, 7, usable_space).unwrap();
+
+        assert_eq!(page_contents.cell_count(), 7);
+        // Overflow indices should still be valid (pointing past the regular cells)
+        assert_eq!(page_contents.overflow_cells[0].index, 7);
+        assert_eq!(page_contents.overflow_cells[1].index, 8);
+
+        // Key invariant: overflow cell indices should always be <= cell_count + overflow_cells.len()
+        // With cell_count=7 and 2 overflow cells, valid indices are 0..=9
+        assert!(
+            page_contents.overflow_cells[0].index
+                <= page_contents.cell_count() + page_contents.overflow_cells.len()
+        );
+        assert!(
+            page_contents.overflow_cells[1].index
+                <= page_contents.cell_count() + page_contents.overflow_cells.len()
+        );
     }
 
     #[test]
