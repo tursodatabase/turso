@@ -1,12 +1,11 @@
+use super::binding::{remap_bound_expr, seed_ephemeral_stream_cache, stream_table_references};
 use super::output::{DeltaSource, EmittedNodeOutput, NodeOutputContract};
 use super::plan::{tracks_distinct_values, uses_multiset, OperatorStateDef};
 use super::stream::{
     btree_arrangement, emit_operator_rowid_delta, open_ephemeral_delta, ArrangementIdentityColumn,
     DeltaIdentity, EphemeralDelta,
 };
-use super::{
-    remap_bound_expr, seed_ephemeral_stream_cache, stream_table_references, MaintenanceInput,
-};
+use super::MaintenanceInput;
 use crate::function::AggFunc;
 use crate::incremental::dag;
 use crate::schema::Schema;
