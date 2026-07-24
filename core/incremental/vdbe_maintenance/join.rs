@@ -375,7 +375,7 @@ fn emit_join_phase(
     for pos in 0..JOIN_ARITY {
         let input = &contract.inputs[pos];
         for (logical_column, column) in input.schema.columns.iter().enumerate() {
-            let Some(expr) = &column.expr else {
+            let Some(expr) = column else {
                 continue;
             };
             let physical_column = match (&sides[pos], &input.delta) {

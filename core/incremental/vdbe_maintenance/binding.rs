@@ -98,8 +98,8 @@ pub(super) fn seed_ephemeral_stream_cache<'a>(
     resolver: &mut Resolver<'a>,
 ) -> Result<()> {
     resolver.enable_expr_to_reg_cache();
-    for (column, stream_column) in channel.schema.columns.iter().enumerate() {
-        let Some(expr) = &stream_column.expr else {
+    for (column, stream_expr) in channel.schema.columns.iter().enumerate() {
+        let Some(expr) = stream_expr else {
             continue;
         };
         let value_reg = program.alloc_register();
