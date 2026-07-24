@@ -18,6 +18,7 @@ pub struct DatabaseReplayGenerator {
     pub opts: DatabaseReplaySessionOpts,
 }
 
+#[derive(Debug)]
 pub struct ReplayInfo {
     pub change_type: DatabaseChangeType,
     pub query: String,
@@ -89,6 +90,7 @@ impl DatabaseReplayGenerator {
     ) -> HashMap<String, turso_core::Value> {
         let mut row = HashMap::with_capacity(info.column_names.len());
         for (i, value) in values.iter().enumerate() {
+            tracing::trace!("info: {:?}, value: {:?}", info, value);
             row.insert(info.column_names[i].clone(), value.clone());
         }
         row
