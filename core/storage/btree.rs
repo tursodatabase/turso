@@ -10502,6 +10502,73 @@ mod tests {
         }
     }
 
+    /// Contract test: `drop_cell` must never be handed a page whose pending
+    /// overflow cell sits *after* the cell being dropped.
+    ///
+    /// A page only carries pending `overflow_cells` while a balance is in progress.
+    /// The sole sanctioned caller that drops cells from such a page —
+    /// `balance_non_root` dropping divider cells — always consumes the overflow
+    /// divider at or before the dropped index, so `overflow_cell.index <= cell_idx`
+    /// holds there. A pending overflow cell positioned strictly *after* the dropped
+    /// cell is therefore an ILLEGAL state: it can only arise if some operation
+    /// reached a page mid-balance, which no transaction, statement, or connection
+    /// can do through any sanctioned path (the engine enforces this at four layers;
+    /// the one way it was observed — IVM's WriteRow abandoning its own in-flight
+    /// balance by advancing state past a yielded cursor op — is fixed by the
+    /// re-poll-contract change in the companion PR).
+    ///
+    /// This test manufactures that illegal state on purpose and asserts drop_cell's
+    /// `turso_assert` fires, rather than silently renumbering the stray cell — which
+    /// would legitimize the mid-balance access instead of surfacing the bug.
+    #[test]
+    #[should_panic(expected = "pending overflow cell positioned after dropped cell")]
+    fn test_drop_cell_rejects_overflow_cell_after_dropped_cell() {
+        let (pager, _, _, _) = empty_btree();
+        let usable_space = pager.usable_space();
+
+        let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
+        btree_init_page(&page, PageType::TableLeaf, 0, usable_space);
+        let page_contents = page.get_contents();
+
+        // Populate the leaf with a handful of regular cells.
+        for i in 0..10 {
+            let regs = &[Register::Value(Value::from_i64(i))];
+            let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
+            let mut payload = crate::alloc::vec![];
+            let mut fill_state = FillCellPayloadState::Start;
+            run_until_done(
+                || {
+                    fill_cell_payload(
+                        &PinGuard::new(page.clone()),
+                        Some(i),
+                        &mut payload,
+                        i as usize,
+                        &record,
+                        usable_space,
+                        pager.clone(),
+                        &mut fill_state,
+                    )
+                },
+                &pager,
+            )
+            .unwrap();
+            insert_into_cell(page_contents, &payload, i as usize, usable_space).unwrap();
+        }
+        assert_eq!(page_contents.cell_count(), 10);
+
+        // ILLEGAL STATE, constructed only to exercise the contract: a pending
+        // overflow cell whose intended position (index 8) is *after* the cell we
+        // are about to drop (index 5). No sanctioned path can produce this.
+        page_contents.overflow_cells.push(OverflowCell {
+            index: 8,
+            payload: std::pin::Pin::new(crate::alloc::vec![1, 2, 3, 4]),
+        });
+
+        // Dropping a cell before that pending overflow cell must trip the contract
+        // assertion, not silently renumber it.
+        let _ = drop_cell(page_contents, 5, usable_space);
+    }
+
     fn validate_btree(pager: Arc<Pager>, page_idx: i64) -> (usize, bool) {
         let num_columns = 5;
         let cursor = BTreeCursor::new_table(pager.clone(), page_idx, num_columns);
