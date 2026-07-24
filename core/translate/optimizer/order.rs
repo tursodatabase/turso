@@ -1,4 +1,4 @@
-use crate::schema::{IndexColumn, Table};
+use crate::schema::{impl_effective_nulls_order, IndexColumn, Table};
 use crate::turso_assert_greater_than_or_equal;
 use crate::{
     schema::{FromClauseSubquery, Index, Schema},
@@ -15,7 +15,7 @@ use crate::{
     },
     util::exprs_are_equivalent,
 };
-use turso_parser::ast::{self, NullsOrder, SortOrder, TableInternalId};
+use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use super::{
     access_method::AccessMethod,
@@ -43,19 +43,7 @@ pub struct ColumnOrder {
     pub nulls_order: Option<ast::NullsOrder>,
 }
 
-impl ColumnOrder {
-    pub fn effective_nulls_order_when_iterated(&self, iter_dir: IterationDirection) -> NullsOrder {
-        match iter_dir {
-            IterationDirection::Forwards => self.effective_nulls_order(),
-            IterationDirection::Backwards => self.effective_nulls_order().reverse(),
-        }
-    }
-
-    fn effective_nulls_order(&self) -> NullsOrder {
-        self.nulls_order
-            .unwrap_or_else(|| NullsOrder::default_for(self.order))
-    }
-}
+impl_effective_nulls_order!(ColumnOrder);
 
 #[derive(Debug, PartialEq, Clone)]
 /// If an [OrderTarget] is satisfied, then [EliminatesSort] describes which part
@@ -755,7 +743,7 @@ fn expr_to_column_order(
 
 fn target_matches_index_column(
     target_col: &ColumnOrder,
-    idx_col: &crate::schema::IndexColumn,
+    idx_col: &IndexColumn,
     table_ref: &JoinedTable,
 ) -> bool {
     if target_col.table_id != table_ref.internal_id {

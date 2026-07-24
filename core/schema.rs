@@ -149,7 +149,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{BitSet, ColumnMask, IterationDirection, Plan, TableReferences};
+use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
 };
@@ -5636,6 +5636,35 @@ pub struct IndexColumn {
     pub expr: Option<Box<Expr>>,
 }
 
+macro_rules! impl_effective_nulls_order {
+    ($ty:ty) => {
+        impl $ty {
+            pub fn effective_nulls_order_when_iterated(
+                &self,
+                iter_dir: $crate::translate::plan::IterationDirection,
+            ) -> turso_parser::ast::NullsOrder {
+                match iter_dir {
+                    $crate::translate::plan::IterationDirection::Forwards => {
+                        self.effective_nulls_order()
+                    }
+                    $crate::translate::plan::IterationDirection::Backwards => {
+                        self.effective_nulls_order().reverse()
+                    }
+                }
+            }
+
+            fn effective_nulls_order(&self) -> turso_parser::ast::NullsOrder {
+                self.nulls_order
+                    .unwrap_or_else(|| turso_parser::ast::NullsOrder::default_for(self.order))
+            }
+        }
+    };
+}
+
+pub(crate) use impl_effective_nulls_order;
+
+impl_effective_nulls_order!(IndexColumn);
+
 impl IndexColumn {
     /// Returns a default column with the given name and position.
     pub fn new(name: impl ToString, pos_in_table: usize) -> Self {
@@ -5672,18 +5701,6 @@ impl IndexColumn {
             .for_each(|col| cols.push(col));
 
         cols
-    }
-
-    pub fn effective_nulls_order_when_iterated(&self, iter_dir: IterationDirection) -> NullsOrder {
-        match iter_dir {
-            IterationDirection::Forwards => self.effective_nulls_order(),
-            IterationDirection::Backwards => self.effective_nulls_order().reverse(),
-        }
-    }
-
-    fn effective_nulls_order(&self) -> NullsOrder {
-        self.nulls_order
-            .unwrap_or_else(|| NullsOrder::default_for(self.order))
     }
 
     pub fn has_default_nulls_placement(&self) -> bool {
