@@ -1,9 +1,14 @@
-use super::plan::{tracks_distinct_values, uses_multiset, OperatorStateDef};
-use super::stream::{emit_operator_rowid_delta, EphemeralDelta};
+use super::plan::{tracks_distinct_values, uses_multiset, NodeOutputContract, OperatorStateDef};
+use super::stream::{
+    btree_arrangement, emit_operator_rowid_delta, open_ephemeral_delta, ArrangementIdentityColumn,
+    DeltaIdentity, EphemeralDelta,
+};
 use super::{
-    remap_bound_expr, seed_ephemeral_stream_cache, stream_table_references, MaintenanceInput,
+    remap_bound_expr, seed_ephemeral_stream_cache, stream_table_references, DeltaSource,
+    MaintenanceInput, NodeOutput,
 };
 use crate::function::AggFunc;
+use crate::incremental::dag;
 use crate::schema::Schema;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
@@ -18,6 +23,65 @@ use turso_parser::ast;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_group_aggregate(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    node_id: dag::NodeId,
+    channel: &EphemeralDelta,
+    group_exprs: &[ast::Expr],
+    group_collations: &[CollationSeq],
+    aggregates: &[Aggregate],
+    scalar: bool,
+    input: MaintenanceInput,
+    output_contract: &NodeOutputContract,
+    operator_state: &OperatorStateDef,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<NodeOutput> {
+    let output = open_ephemeral_delta(
+        program,
+        &format!("{view_name}_aggregate_delta_{node_id}"),
+        output_contract.schema.as_ref().clone(),
+        output_contract.emitted_identity,
+        output_contract.binding_rowids.clone(),
+        false,
+    );
+    emit_group_aggregate_rows(
+        program,
+        view_name,
+        channel,
+        group_exprs,
+        group_collations,
+        aggregates,
+        scalar,
+        &output,
+        input,
+        operator_state,
+        schema,
+        connection,
+    )?;
+
+    let state_table_name = operator_state.state_table_name()?;
+    let state_table = schema.get_btree_table(state_table_name).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "aggregate arrangement table {state_table_name} not found"
+        ))
+    })?;
+    let value_columns = (0..group_exprs.len() + aggregates.len()).collect();
+    Ok(NodeOutput {
+        delta: DeltaSource::Ephemeral(output),
+        arrangement: Some(btree_arrangement(
+            state_table,
+            DeltaIdentity::OperatorRowid,
+            vec![ArrangementIdentityColumn::RowId],
+            vec![None; output_contract.schema.bindings.len()],
+            value_columns,
+            None,
+        )),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_group_aggregate_rows(
     program: &mut ProgramBuilder,
     view_name: &str,
     channel: &EphemeralDelta,
