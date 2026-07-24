@@ -922,6 +922,9 @@ pub fn constraints_from_where_clause(
                     if !index.columns[position_in_index].has_default_nulls_placement()
                         && constraint.operator != ast::Operator::Equals.into()
                     {
+                        // TODO (Mikaël) for this initial pass, we don't use Gt or Lt constraints on
+                        //  ASC NULLS LAST or DESC NULLS FIRST columns. This will require adapting
+                        //  code in seek.rs.
                         continue;
                     }
                     if let Some(table_col_pos) = constraint.table_col_pos {
