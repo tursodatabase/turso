@@ -1,0 +1,99 @@
+name: Serverless
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "serverless/rust/**"
+      - "serverless/conformance/differential/**"
+      - "bindings/rust/**"
+      - "core/types.rs"
+      - "core/error.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/serverless.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "serverless/rust/**"
+      - "serverless/conformance/differential/**"
+      - "bindings/rust/**"
+      - "core/types.rs"
+      - "core/error.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/serverless.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  conformance:
+    name: Rust conformance and differential tests
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    env:
+      TURSO_DATABASE_NAME: serverless-rust-ci-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-serverless-rust"
+          cache-on-failure: true
+
+      - name: Install Turso CLI
+        run: |
+          curl -sSfL https://get.tur.so/install.sh | bash
+          echo "$HOME/.turso" >> "$GITHUB_PATH"
+
+      - name: Create scratch database
+        id: provision
+        env:
+          TURSO_API_TOKEN: ${{ secrets.TURSO_API_TOKEN }}
+        run: |
+          if [ -z "$TURSO_API_TOKEN" ]; then
+            echo "::error::TURSO_API_TOKEN is not configured"
+            exit 1
+          fi
+
+          turso db create "$TURSO_DATABASE_NAME" --wait
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+          database_url="$(turso db show "$TURSO_DATABASE_NAME" --url)"
+          database_token="$(turso db tokens create "$TURSO_DATABASE_NAME" --expiration 1h)"
+          echo "::add-mask::$database_token"
+          echo "TURSO_DATABASE_URL=$database_url" >> "$GITHUB_ENV"
+          echo "TURSO_AUTH_TOKEN=$database_token" >> "$GITHUB_ENV"
+
+      - name: Run Rust serverless conformance tests
+        run: cargo test --locked -p turso_serverless_conformance
+
+      - name: Run Rust serverless differential tests
+        run: cargo test --locked -p turso_serverless_differential
+
+      - name: Destroy scratch database
+        if: always() && steps.provision.outputs.created == 'true'
+        env:
+          TURSO_API_TOKEN: ${{ secrets.TURSO_API_TOKEN }}
+        run: turso db destroy "$TURSO_DATABASE_NAME" --yes
