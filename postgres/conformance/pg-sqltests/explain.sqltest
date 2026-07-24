@@ -134,6 +134,53 @@ expect pattern {
   -> Seq Scan on items\z
 }
 
+test explain-three-way-union-all {
+    EXPLAIN SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3;
+}
+expect pattern {
+(?m)\AAppend
+  -> Append
+    -> Result
+    -> Result
+  -> Result\z
+}
+
+test explain-mixed-compound {
+    EXPLAIN SELECT 1 UNION ALL SELECT 2 UNION SELECT 3;
+}
+expect pattern {
+(?m)\AUnique
+  -> Append
+    -> Append
+      -> Result
+      -> Result
+    -> Result\z
+}
+
+@setup items
+test explain-compound-order-by-limit {
+    EXPLAIN SELECT value FROM items UNION ALL SELECT value FROM items ORDER BY value DESC LIMIT 1;
+}
+expect pattern {
+(?m)\ALimit
+  -> Sort
+    Sort Key: value DESC
+    -> Append
+      -> Seq Scan on items
+      -> Seq Scan on items\z
+}
+
+@setup items
+test explain-compound-offset {
+    EXPLAIN SELECT value FROM items UNION ALL SELECT value FROM items OFFSET 1;
+}
+expect pattern {
+(?m)\ALimit
+  -> Append
+    -> Seq Scan on items
+    -> Seq Scan on items\z
+}
+
 @setup dml-items
 test explain-insert-values-does-not-execute {
     EXPLAIN INSERT INTO items VALUES (2, 20);

@@ -1818,8 +1818,6 @@ impl Program {
             return Ok(StepResult::Interrupt);
         }
 
-        // DML rendering is intentionally deferred from the SELECT-focused MVP.
-        // Keep EXPLAIN side-effect free and report no plan rows for those commands.
         let Some(lines) = self.prepared.postgres_explain.as_ref() else {
             return Ok(StepResult::Done);
         };

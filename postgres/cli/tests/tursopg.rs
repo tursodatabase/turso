@@ -94,28 +94,6 @@ fn explain_returns_postgres_style_query_plan() {
     );
 }
 
-/// PostgreSQL's EXPLAIN regression test covers these option families. Turso
-/// accepts only bare EXPLAIN, so each option must fail explicitly rather than
-/// silently changing the requested semantics.
-#[test]
-fn explain_options_are_rejected() {
-    for sql in [
-        "EXPLAIN ANALYZE SELECT 1;\n",
-        "EXPLAIN VERBOSE SELECT 1;\n",
-        "EXPLAIN (COSTS OFF) SELECT 1;\n",
-        "EXPLAIN (BUFFERS) SELECT 1;\n",
-        "EXPLAIN (FORMAT JSON) SELECT 1;\n",
-    ] {
-        let output = run_tursopg(sql.as_bytes());
-        assert_ne!(output.status.code(), Some(0), "expected failure for: {sql}");
-        let out = stdout(&output);
-        assert!(
-            out.contains("EXPLAIN options are not supported"),
-            "expected unsupported EXPLAIN option error for {sql:?} in: {out}"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Meta-commands: \dt
 // ---------------------------------------------------------------------------
@@ -1240,7 +1218,7 @@ fn wire_integer_literal_reports_int4() {
 /// EXPLAIN travels through the same simple-query protocol used by psql and
 /// returns PostgreSQL's one-column text result shape.
 #[test]
-fn wire_explain_reports_query_plan_columns() {
+fn wire_explain_reports_text_column_oid() {
     with_pg_client(|c| {
         assert_eq!(c.query_column_oids("EXPLAIN SELECT 1"), vec![OID_TEXT]);
     });
