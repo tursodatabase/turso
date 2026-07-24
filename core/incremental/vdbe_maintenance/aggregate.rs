@@ -20,6 +20,13 @@ use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, Register
 use crate::{Connection, LimboError, Result};
 use turso_parser::ast;
 
+struct AggregateMultisetCursors {
+    table_name: String,
+    table_cursor_id: usize,
+    index_cursor_id: usize,
+    index_name: String,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_group_aggregate(
     program: &mut ProgramBuilder,
@@ -134,8 +141,6 @@ fn emit_group_aggregate_rows(
             }))
         })
         .collect();
-    let has_multiset = aggregates.iter().any(uses_multiset);
-
     // The state table and its primary-key index are real schema objects
     // created by CREATE MATERIALIZED VIEW and assigned to this DAG node.
     let state_table_name = operator_state.state_table_name()?.to_string();
@@ -153,38 +158,6 @@ fn emit_group_aggregate_rows(
                 "state table {state_table_name} of materialized view {view_name} has no index"
             ))
         })?;
-
-    // The value multiset table, when the view has MIN/MAX or DISTINCT
-    // aggregates.
-    let multiset_table_name = operator_state
-        .auxiliary_table
-        .as_ref()
-        .map(|table| table.table_name.clone());
-    let mm_schema = if has_multiset {
-        let multiset_table_name = multiset_table_name.as_ref().ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "aggregate DAG node {} requires a multiset table",
-                operator_state.node_id
-            ))
-        })?;
-        let table = schema.get_btree_table(multiset_table_name).ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "multiset table {multiset_table_name} of materialized view {view_name} not found"
-            ))
-        })?;
-        let index = schema
-            .get_indices(multiset_table_name)
-            .next()
-            .cloned()
-            .ok_or_else(|| {
-                LimboError::InternalError(format!(
-                    "multiset table {multiset_table_name} of materialized view {view_name} has no index"
-                ))
-            })?;
-        Some((table, index))
-    } else {
-        None
-    };
 
     let syms = connection.syms.read();
     let mut resolver = Resolver::new(
@@ -219,9 +192,29 @@ fn emit_group_aggregate_rows(
         root_page: RegisterOrLiteral::Literal(state_index.root_page),
         db: 0,
     });
-    let mut mm_cursors = None;
-    let mut mm_index_name = String::new();
-    if let Some((mm_table, mm_index)) = &mm_schema {
+    let mut mm_cursors = Vec::with_capacity(aggregates.len());
+    for (aggregate_index, aggregate) in aggregates.iter().enumerate() {
+        if !uses_multiset(aggregate) {
+            mm_cursors.push(None);
+            continue;
+        }
+        let table_name = operator_state
+            .aggregate_multiset_table_name(aggregate_index)?
+            .to_string();
+        let mm_table = schema.get_btree_table(&table_name).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "aggregate multiset table {table_name} of materialized view {view_name} not found"
+            ))
+        })?;
+        let mm_index = schema
+            .get_indices(&table_name)
+            .next()
+            .cloned()
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "aggregate multiset table {table_name} of materialized view {view_name} has no index"
+                ))
+            })?;
         let mm_table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(mm_table.clone()));
         program.emit_insn(Insn::OpenWrite {
             cursor_id: mm_table_cursor_id,
@@ -234,8 +227,12 @@ fn emit_group_aggregate_rows(
             root_page: RegisterOrLiteral::Literal(mm_index.root_page),
             db: 0,
         });
-        mm_cursors = Some((mm_table_cursor_id, mm_index_cursor_id));
-        mm_index_name.clone_from(&mm_index.name);
+        mm_cursors.push(Some(AggregateMultisetCursors {
+            table_name,
+            table_cursor_id: mm_table_cursor_id,
+            index_cursor_id: mm_index_cursor_id,
+            index_name: mm_index.name.clone(),
+        }));
     }
 
     // Register layout.
@@ -270,10 +267,10 @@ fn emit_group_aggregate_rows(
     let old_out_weight_reg = old_out_start + k + aggregates.len();
     let state_record_reg = program.alloc_register();
     let index_record_reg = program.alloc_register();
-    // Multiset record image: [agg_id, g.., val, mult-or-rowid], contiguous.
-    let mm_rec_start = program.alloc_registers(1 + k + 2);
-    let mm_val_reg = mm_rec_start + 1 + k;
-    let mm_last_reg = mm_rec_start + 1 + k + 1;
+    // Per-aggregate multiset record image: [g.., val, mult-or-rowid].
+    let mm_rec_start = program.alloc_registers(k + 2);
+    let mm_val_reg = mm_rec_start + k;
+    let mm_last_reg = mm_rec_start + k + 1;
     let mm_rowid_reg = program.alloc_register();
     let mm_mult_reg = program.alloc_register();
     let mm_record_reg = program.alloc_register();
@@ -507,15 +504,16 @@ fn emit_group_aggregate_rows(
 
         if is_minmax || is_distinct {
             // Weight-merge the value into the aggregate's multiset:
-            // (agg_id, group.., value) -> multiplicity. NULLs are ignored,
-            // matching aggregate NULL semantics. For a DISTINCT aggregate the
+            // (group.., value) -> multiplicity. NULLs are ignored, matching
+            // aggregate NULL semantics. For a DISTINCT aggregate the
             // accumulator steps only when a value's multiplicity transitions
             // 0 -> positive and inverts only on positive -> 0, so it sees
             // each distinct value exactly once. Transition detection relies
             // on delta rows carrying unit weights (each captured DML op is
             // one row of weight +1 or -1, and population scans weigh +1).
-            let (mm_table_cursor_id, mm_index_cursor_id) = mm_cursors
-                .expect("DAG validation guarantees a multiset table for multiset aggregates");
+            let mm = mm_cursors[i]
+                .as_ref()
+                .expect("DAG validation guarantees one multiset per multiset aggregate");
             let done_label = program.allocate_label();
             let mm_found_label = program.allocate_label();
             let mm_upsert_label = program.allocate_label();
@@ -524,11 +522,10 @@ fn emit_group_aggregate_rows(
                 reg: col_reg,
                 target_pc: done_label,
             });
-            // Key image: [agg_id, g.., val].
-            program.emit_int(i as i64, mm_rec_start);
+            // Key image: [g.., val].
             program.emit_insn(Insn::Copy {
                 src_reg: group_start,
-                dst_reg: mm_rec_start + 1,
+                dst_reg: mm_rec_start,
                 extra_amount: k.saturating_sub(1),
             });
             program.emit_insn(Insn::Copy {
@@ -537,10 +534,10 @@ fn emit_group_aggregate_rows(
                 extra_amount: 0,
             });
             program.emit_insn(Insn::Found {
-                cursor_id: mm_index_cursor_id,
+                cursor_id: mm.index_cursor_id,
                 target_pc: mm_found_label,
                 record_reg: mm_rec_start,
-                num_regs: 1 + k + 1,
+                num_regs: k + 1,
             });
             // Not found: retraction of an unknown value is a no-op.
             program.emit_insn(Insn::Lt {
@@ -552,7 +549,7 @@ fn emit_group_aggregate_rows(
             });
             program.emit_int(0, mm_found_reg);
             program.emit_insn(Insn::NewRowid {
-                cursor: mm_table_cursor_id,
+                cursor: mm.table_cursor_id,
                 rowid_reg: mm_rowid_reg,
                 prev_largest_reg: prev_rowid_scratch,
             });
@@ -578,17 +575,17 @@ fn emit_group_aggregate_rows(
             program.preassign_label_to_next_insn(mm_found_label);
             program.emit_int(1, mm_found_reg);
             program.emit_insn(Insn::IdxRowId {
-                cursor_id: mm_index_cursor_id,
+                cursor_id: mm.index_cursor_id,
                 dest: mm_rowid_reg,
             });
             program.emit_insn(Insn::SeekRowid {
-                cursor_id: mm_table_cursor_id,
+                cursor_id: mm.table_cursor_id,
                 src_reg: mm_rowid_reg,
                 target_pc: corrupt_label,
             });
             program.emit_insn(Insn::Column {
-                cursor_id: mm_table_cursor_id,
-                column: 1 + k + 1,
+                cursor_id: mm.table_cursor_id,
+                column: k + 1,
                 dest: mm_mult_reg,
                 default: None,
             });
@@ -622,34 +619,31 @@ fn emit_group_aggregate_rows(
             });
             program.emit_insn(Insn::IdxDelete {
                 start_reg: mm_rec_start,
-                num_regs: 1 + k + 2,
-                cursor_id: mm_index_cursor_id,
+                num_regs: k + 2,
+                cursor_id: mm.index_cursor_id,
                 raise_error_if_no_matching_entry: true,
             });
             program.emit_insn(Insn::Delete {
-                cursor_id: mm_table_cursor_id,
-                table_name: multiset_table_name
-                    .as_ref()
-                    .expect("multiset users require an auxiliary table")
-                    .clone(),
+                cursor_id: mm.table_cursor_id,
+                table_name: mm.table_name.clone(),
                 is_part_of_update: true,
             });
             program.emit_insn(Insn::Goto {
                 target_pc: done_label,
             });
 
-            // Write (agg_id, g.., val, mult) at the row's rowid; a fresh
-            // value also gets an index entry (agg_id, g.., val, rowid).
+            // Write (g.., val, mult) at the row's rowid; a fresh value also
+            // gets an index entry (g.., val, rowid).
             program.preassign_label_to_next_insn(mm_upsert_label);
             program.emit_insn(Insn::MakeRecord {
                 start_reg: mm_rec_start as u16,
-                count: (1 + k + 2) as u16,
+                count: (k + 2) as u16,
                 dest_reg: mm_record_reg as u16,
                 index_name: None,
                 affinity_str: None,
             });
             program.emit_insn(Insn::Insert {
-                cursor: mm_table_cursor_id,
+                cursor: mm.table_cursor_id,
                 key_reg: mm_rowid_reg,
                 record_reg: mm_record_reg,
                 flag: InsertFlags(
@@ -657,10 +651,7 @@ fn emit_group_aggregate_rows(
                         | InsertFlags::SKIP_LAST_ROWID
                         | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
                 ),
-                table_name: multiset_table_name
-                    .as_ref()
-                    .expect("multiset users require an auxiliary table")
-                    .clone(),
+                table_name: mm.table_name.clone(),
             });
             // Only a freshly-inserted value needs an index entry; an
             // existing value's entry is already present.
@@ -677,16 +668,16 @@ fn emit_group_aggregate_rows(
             });
             program.emit_insn(Insn::MakeRecord {
                 start_reg: mm_rec_start as u16,
-                count: (1 + k + 2) as u16,
+                count: (k + 2) as u16,
                 dest_reg: mm_record_reg as u16,
-                index_name: Some(mm_index_name.clone()),
+                index_name: Some(mm.index_name.clone()),
                 affinity_str: None,
             });
             program.emit_insn(Insn::IdxInsert {
-                cursor_id: mm_index_cursor_id,
+                cursor_id: mm.index_cursor_id,
                 record_reg: mm_record_reg,
                 unpacked_start: Some(mm_rec_start),
-                unpacked_count: Some((1 + k + 2) as u16),
+                unpacked_count: Some((k + 2) as u16),
                 flags: IdxInsertFlags::new(),
             });
             program.preassign_label_to_next_insn(mm_skip_idx_label);
@@ -844,57 +835,57 @@ fn emit_group_aggregate_rows(
             let value_reg = agg_value_start + i;
             if matches!(agg.func, AggFunc::Min | AggFunc::Max) {
                 // The group's extreme is the first (MIN) or last (MAX)
-                // multiset entry with the (agg_id, group..) prefix.
-                let (_, mm_index_cursor_id) =
-                    mm_cursors.expect("MIN/MAX aggregates imply the multiset table");
+                // entry in this aggregate's multiset with the group prefix.
+                let mm = mm_cursors[i]
+                    .as_ref()
+                    .expect("MIN/MAX aggregates own a multiset table");
                 let empty_label = program.allocate_label();
                 let have_label = program.allocate_label();
-                program.emit_int(i as i64, mm_rec_start);
                 program.emit_insn(Insn::Copy {
                     src_reg: group_start,
-                    dst_reg: mm_rec_start + 1,
+                    dst_reg: mm_rec_start,
                     extra_amount: k.saturating_sub(1),
                 });
                 match agg.func {
                     AggFunc::Min => {
                         program.emit_insn(Insn::SeekGE {
                             is_index: true,
-                            cursor_id: mm_index_cursor_id,
+                            cursor_id: mm.index_cursor_id,
                             start_reg: mm_rec_start,
-                            num_regs: 1 + k,
+                            num_regs: k,
                             target_pc: empty_label,
                             eq_only: false,
                         });
                         // Positioned past the group: no values.
                         program.emit_insn(Insn::IdxGT {
-                            cursor_id: mm_index_cursor_id,
+                            cursor_id: mm.index_cursor_id,
                             start_reg: mm_rec_start,
-                            num_regs: 1 + k,
+                            num_regs: k,
                             target_pc: empty_label,
                         });
                     }
                     AggFunc::Max => {
                         program.emit_insn(Insn::SeekLE {
                             is_index: true,
-                            cursor_id: mm_index_cursor_id,
+                            cursor_id: mm.index_cursor_id,
                             start_reg: mm_rec_start,
-                            num_regs: 1 + k,
+                            num_regs: k,
                             target_pc: empty_label,
                             eq_only: false,
                         });
                         // Positioned before the group: no values.
                         program.emit_insn(Insn::IdxLT {
-                            cursor_id: mm_index_cursor_id,
+                            cursor_id: mm.index_cursor_id,
                             start_reg: mm_rec_start,
-                            num_regs: 1 + k,
+                            num_regs: k,
                             target_pc: empty_label,
                         });
                     }
                     _ => unreachable!(),
                 }
                 program.emit_insn(Insn::Column {
-                    cursor_id: mm_index_cursor_id,
-                    column: 1 + k,
+                    cursor_id: mm.index_cursor_id,
+                    column: k,
                     dest: value_reg,
                     default: None,
                 });

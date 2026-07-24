@@ -835,7 +835,7 @@ pub(super) fn emit_left_join(
         "LEFT JOIN output stream must contain its natural row"
     );
 
-    let aux_name = operator_state.auxiliary_table_name()?.to_string();
+    let aux_name = operator_state.left_join_matches_table_name()?.to_string();
     let aux_table = schema.get_btree_table(&aux_name).ok_or_else(|| {
         LimboError::InternalError(format!(
             "aux table {aux_name} of materialized view {view_name} not found"
