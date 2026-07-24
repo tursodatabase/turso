@@ -1,5 +1,9 @@
 use super::*;
 
+/// Whether an aggregate's accumulator must see each distinct argument value
+/// exactly once, tracked through the value multiset table. MIN/MAX see each
+/// value once by definition, so DISTINCT changes nothing for them — their
+/// multiset participation is about extremes, not distinctness.
 pub(super) fn tracks_distinct_values(agg: &Aggregate) -> bool {
     agg.distinctness.is_distinct() && !matches!(agg.func, AggFunc::Min | AggFunc::Max)
 }
