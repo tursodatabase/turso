@@ -206,17 +206,17 @@ impl OpNode {
 #[derive(Debug, Clone)]
 pub struct MaintenanceDag {
     pub nodes: Vec<OpNode>,
-    output_schemas: Vec<StreamSchema>,
+    output_schemas: Vec<Arc<StreamSchema>>,
     pub root: NodeId,
 }
 
 impl MaintenanceDag {
-    pub fn output_schema(&self, node: NodeId) -> &StreamSchema {
+    pub fn output_schema(&self, node: NodeId) -> &Arc<StreamSchema> {
         &self.output_schemas[node]
     }
 
     pub fn root_schema(&self) -> &StreamSchema {
-        self.output_schema(self.root)
+        self.output_schema(self.root).as_ref()
     }
 }
 
@@ -225,7 +225,7 @@ impl MaintenanceDag {
 #[derive(Default)]
 pub struct DagBuilder {
     nodes: Vec<OpNode>,
-    output_schemas: Vec<StreamSchema>,
+    output_schemas: Vec<Arc<StreamSchema>>,
 }
 
 impl DagBuilder {
@@ -242,7 +242,7 @@ impl DagBuilder {
         }
         let output_schema = self.derive_output_schema(&node)?;
         self.nodes.push(node);
-        self.output_schemas.push(output_schema);
+        self.output_schemas.push(Arc::new(output_schema));
         Ok(self.nodes.len() - 1)
     }
 
