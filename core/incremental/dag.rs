@@ -261,6 +261,19 @@ impl DagBuilder {
                 "maintenance DAG root must be the last node".to_string(),
             ));
         }
+        let mut reachable = vec![false; self.nodes.len()];
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if std::mem::replace(&mut reachable[node], true) {
+                continue;
+            }
+            pending.extend_from_slice(self.nodes[node].inputs());
+        }
+        if reachable.iter().any(|reachable| !reachable) {
+            return Err(LimboError::InternalError(
+                "every maintenance DAG node must contribute to the root".to_string(),
+            ));
+        }
         Ok(MaintenanceDag {
             nodes: self.nodes,
             output_schemas: self.output_schemas,
@@ -393,5 +406,41 @@ impl DagBuilder {
             }
         };
         Ok(StreamSchema { columns, bindings })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::BTreeCharacteristics;
+
+    fn scan(name: &str, id: usize) -> OpNode {
+        OpNode::Scan {
+            table: Arc::new(BTreeTable::new(
+                id as i64 + 1,
+                name.to_string(),
+                Vec::new(),
+                Vec::new(),
+                BTreeCharacteristics::HAS_ROWID,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )),
+            identifier: name.to_string(),
+            logical_id: TableInternalId::from(id),
+        }
+    }
+
+    #[test]
+    fn finish_rejects_nodes_disconnected_from_root() {
+        let mut builder = DagBuilder::new();
+        builder.push(scan("orphan", 0)).unwrap();
+        let root = builder.push(scan("root", 1)).unwrap();
+
+        let error = builder.finish(root).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("every maintenance DAG node must contribute to the root"));
     }
 }

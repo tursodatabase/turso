@@ -72,7 +72,7 @@ mod set_op;
 use set_op::emit_set_op;
 
 mod plan;
-pub use plan::{plan_view, MaintenancePlan, OperatorStateCatalog};
+pub(crate) use plan::{plan_view, MaintenancePlan};
 
 mod delta_cursor;
 pub use delta_cursor::DeltaCursor;
@@ -85,7 +85,7 @@ use arrangement::publish_node_output;
 
 /// What the maintenance program reads as its input relation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MaintenanceInput {
+pub(crate) enum MaintenanceInput {
     /// The transaction's captured delta for the view's base table:
     /// rows are (rowid, base column values..., weight).
     TransactionDelta,
@@ -135,8 +135,7 @@ impl MaintenanceProgramCache {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn compile_maintenance_program(
+pub(crate) fn compile_maintenance_program(
     view_name: &str,
     select: &ast::Select,
     view_root_page: i64,
@@ -155,12 +154,13 @@ pub fn compile_maintenance_program(
     if let Some(prepared) = connection.maintenance_program_cache.get(&key, connection) {
         return Ok(prepared.bind(connection.clone()));
     }
-    let program = compile_maintenance_program_uncached(
+    let plan = build_plan_for_connection(view_name, select, schema, connection)?;
+    let program = compile_maintenance_plan(
         view_name,
-        select,
         view_root_page,
         num_view_columns,
         input,
+        &plan,
         schema,
         connection,
     )?;
@@ -170,29 +170,6 @@ pub fn compile_maintenance_program(
     Ok(program)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compile_maintenance_program_uncached(
-    view_name: &str,
-    select: &ast::Select,
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<Program> {
-    let plan = build_plan_for_connection(view_name, select, schema, connection)?;
-    compile_maintenance_plan(
-        view_name,
-        view_root_page,
-        num_view_columns,
-        input,
-        &plan,
-        schema,
-        connection,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 fn compile_maintenance_plan(
     view_name: &str,
     view_root_page: i64,
@@ -202,16 +179,33 @@ fn compile_maintenance_plan(
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<Program> {
-    compile_generic_dag_program(
+    let mut program = ProgramBuilder::new_for_subprogram(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts {
+            num_cursors: 13,
+            approx_num_insns: 128 + 64 * num_view_columns,
+            approx_num_labels: 48,
+        },
+    );
+    program.prologue();
+    emit_plan_to_sink(
+        &mut program,
         view_name,
-        &plan.dag,
-        plan.dag.root,
-        view_root_page,
-        num_view_columns,
+        plan,
         input,
-        &plan.operator_states,
+        &ViewSink {
+            root_page: view_root_page,
+            num_columns: num_view_columns,
+        },
         schema,
         connection,
+    )?;
+    program.epilogue(schema);
+    program.build(
+        connection.clone(),
+        false,
+        "materialized view DAG maintenance",
     )
 }
 
@@ -236,36 +230,23 @@ fn build_plan_for_connection(
     plan_view(view_name, select, &resolver, connection)
 }
 
-/// Emit every ancestor needed by `target` once, in DAG topological order.
+/// Emit every node once in DAG topological order.
 ///
 /// The output table is keyed by [`dag::NodeId`], making fan-out explicit:
 /// downstream nodes consume the already-compiled [`NodeOutput`] of each
 /// declared input rather than recursively re-emitting its subtree.
-#[allow(clippy::too_many_arguments)]
-fn emit_declared_delta_nodes_to(
+fn emit_plan_nodes(
     program: &mut ProgramBuilder,
     view_name: &str,
-    dag: &dag::MaintenanceDag,
-    target: dag::NodeId,
+    plan: &MaintenancePlan,
     input: MaintenanceInput,
-    operator_states: &OperatorStateCatalog,
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<NodeOutput> {
-    let mut required = vec![false; dag.nodes.len()];
-    let mut pending = vec![target];
-    while let Some(node_id) = pending.pop() {
-        if std::mem::replace(&mut required[node_id], true) {
-            continue;
-        }
-        pending.extend_from_slice(dag.nodes[node_id].inputs());
-    }
-
+    let dag = plan.dag();
+    let operator_states = plan.operator_states();
     let mut outputs: Vec<Option<NodeOutput>> = vec![None; dag.nodes.len()];
-    for node_id in 0..=target {
-        if !required[node_id] {
-            continue;
-        }
+    for node_id in 0..dag.nodes.len() {
         let operator_state = operator_states.for_node(node_id)?;
         let output_contract = &operator_state.output;
         let output = match &dag.nodes[node_id] {
@@ -454,79 +435,25 @@ fn emit_declared_delta_nodes_to(
         outputs[node_id] = Some(output);
     }
 
-    outputs[target].take().ok_or_else(|| {
+    outputs[dag.root].take().ok_or_else(|| {
         LimboError::InternalError(format!(
-            "maintenance DAG target node {target} was not compiled"
+            "maintenance DAG root node {} was not compiled",
+            dag.root
         ))
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_generic_dag_to_sink(
+fn emit_plan_to_sink(
     program: &mut ProgramBuilder,
     view_name: &str,
-    dag: &dag::MaintenanceDag,
-    root: dag::NodeId,
+    plan: &MaintenancePlan,
     input: MaintenanceInput,
     sink: &ViewSink,
-    operator_states: &OperatorStateCatalog,
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let node_output = emit_declared_delta_nodes_to(
-        program,
-        view_name,
-        dag,
-        root,
-        input,
-        operator_states,
-        schema,
-        connection,
-    )?;
+    let node_output = emit_plan_nodes(program, view_name, plan, input, schema, connection)?;
+    let root = plan.dag().root;
     let stream = materialize_node_output(program, view_name, root, &node_output, input)?;
     emit_terminal_delta(program, view_name, &stream, sink)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compile_generic_dag_program(
-    view_name: &str,
-    dag: &dag::MaintenanceDag,
-    root: dag::NodeId,
-    view_root_page: i64,
-    num_view_columns: usize,
-    input: MaintenanceInput,
-    operator_states: &OperatorStateCatalog,
-    schema: &Schema,
-    connection: &Arc<Connection>,
-) -> Result<Program> {
-    let mut program = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        None,
-        ProgramBuilderOpts {
-            num_cursors: 13,
-            approx_num_insns: 128 + 64 * num_view_columns,
-            approx_num_labels: 48,
-        },
-    );
-    program.prologue();
-    emit_generic_dag_to_sink(
-        &mut program,
-        view_name,
-        dag,
-        root,
-        input,
-        &ViewSink {
-            root_page: view_root_page,
-            num_columns: num_view_columns,
-        },
-        operator_states,
-        schema,
-        connection,
-    )?;
-    program.epilogue(schema);
-    program.build(
-        connection.clone(),
-        false,
-        "materialized view generic DAG maintenance",
-    )
 }

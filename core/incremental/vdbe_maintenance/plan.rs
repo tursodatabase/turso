@@ -528,10 +528,10 @@ fn plan_expr_collation(
 /// A hidden state/multiset table a view needs, fully named with its CREATE
 /// SQL. The single source of truth for the DDL the CREATE program emits.
 #[derive(Debug, Clone)]
-pub struct HiddenTableDef {
-    pub table_name: String,
-    pub create_sql: String,
-    pub primary_key_index: bool,
+pub(crate) struct HiddenTableDef {
+    pub(crate) table_name: String,
+    pub(crate) create_sql: String,
+    pub(crate) primary_key_index: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -619,7 +619,7 @@ impl OperatorStateDef {
 /// The vector has exactly one entry per DAG node, so codegen cannot recover
 /// storage by reclassifying a branch or reconstructing a name.
 #[derive(Debug, Clone)]
-pub struct OperatorStateCatalog {
+pub(super) struct OperatorStateCatalog {
     nodes: Vec<OperatorStateDef>,
 }
 
@@ -650,21 +650,33 @@ impl OperatorStateCatalog {
 /// codegen consumes the same representation. Keeping these together prevents
 /// the accepted-query set, hidden schema, and bytecode dispatcher from
 /// evolving as three independent shape classifiers.
-pub struct MaintenancePlan {
-    pub dag: dag::MaintenanceDag,
-    pub operator_states: OperatorStateCatalog,
-    pub output_arity: usize,
+pub(crate) struct MaintenancePlan {
+    dag: dag::MaintenanceDag,
+    operator_states: OperatorStateCatalog,
+    output_arity: usize,
     version_marker: HiddenTableDef,
 }
 
 impl MaintenancePlan {
-    pub fn hidden_tables(&self) -> impl Iterator<Item = &HiddenTableDef> {
+    pub(super) fn dag(&self) -> &dag::MaintenanceDag {
+        &self.dag
+    }
+
+    pub(super) fn operator_states(&self) -> &OperatorStateCatalog {
+        &self.operator_states
+    }
+
+    pub(crate) fn output_arity(&self) -> usize {
+        self.output_arity
+    }
+
+    pub(crate) fn hidden_tables(&self) -> impl Iterator<Item = &HiddenTableDef> {
         std::iter::once(&self.version_marker).chain(self.operator_states.hidden_tables())
     }
 }
 
 /// Validate a view and build its executable maintenance plan.
-pub fn plan_view(
+pub(crate) fn plan_view(
     view_name: &str,
     select: &ast::Select,
     resolver: &Resolver,
