@@ -224,6 +224,9 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     mvcc_meta_table: Option<(MVTableId, usize)>,
     /// File-backed databases must persist replay boundary durably.
     durable_mvcc_metadata: bool,
+    /// True after the durable-storage checkpoint start hook is invoked and
+    /// until its matching end hook has run.
+    storage_checkpoint_started: bool,
     /// Header staged into pager page 1 before commit; published to global_header on success.
     staged_checkpoint_header: Option<DatabaseHeader>,
     /// Guard to avoid restaging page 1 across CommitPagerTxn async retries.
@@ -817,6 +820,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             mode,
             mvcc_meta_table,
             durable_mvcc_metadata,
+            storage_checkpoint_started: false,
             staged_checkpoint_header: None,
             header_staged_for_commit: false,
             pager_commit_done: false,
@@ -857,8 +861,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     /// of `step()`. This mirrors `step()` error handling and also resets pager/WAL
     /// checkpoint bookkeeping.
     pub fn cleanup_after_external_io_error(&mut self, err: LimboError) -> Result<()> {
-        // run storage cleanup within proper checkpoint context (e.g. pager has pending read/write txn)
-        let result = self.mvstore.storage.on_checkpoint_end(Err(err));
+        // Run storage cleanup only for a checkpoint whose start hook was invoked.
+        // Early passive no-op paths finish before on_checkpoint_start.
+        let result = if std::mem::take(&mut self.storage_checkpoint_started) {
+            self.mvstore.storage.on_checkpoint_end(Err(err))
+        } else {
+            Ok(())
+        };
 
         // Drop this checkpoint's staged (not-yet-applied) root-map mutations. They were never
         // written to the shared map (deferred to the post-commit publish window), so a failed
@@ -1142,7 +1151,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
             let row_versions = entry.value().read();
 
-            for version in self.maybe_get_checkpointable_versions(&row_versions, key.table_id) {
+            for mut version in self.maybe_get_checkpointable_versions(&row_versions, key.table_id) {
+                // Old or externally recovered state can retain a negative
+                // sqlite_schema root after its physical mapping is already
+                // published. Normalize the checkpoint clone before deciding
+                // whether this is CREATE/DROP work, preventing duplicate root
+                // allocation or a skipped physical destroy.
+                self.mvstore
+                    .canonicalize_schema_root_if_published(&mut version)?;
                 let is_delete = version.end().is_some();
 
                 let mut special_write = None;
@@ -1940,27 +1956,42 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     .connection
                     .experimental_mvcc_passive_checkpoint_enabled();
                 if passive {
-                    // The passive checkpoint acquires the blocking lock only after
-                    // collection, so it needs an explicit single-orchestrator gate. The
-                    // blocking (flag-off) path takes the lock up front and gets that
-                    // invariant — plus Busy-on-contention — from the lock itself, so it
-                    // must NOT use this gate, which would turn a contended explicit
-                    // TRUNCATE into a silent no-op.
+                    if !self.checkpoint_lock.write() {
+                        return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
+                    }
+                    // Freeze the snapshot while temporary-ID commits are drained.
+                    // A lower-ts Preparing transaction can clamp the snapshot
+                    // below a later committed frame, so do not publish roots
+                    // until every durable temporary-ID frame is covered.
+                    let snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
+                    let temporary_id_commit_ts = self
+                        .mvstore
+                        .last_temporary_id_commit_ts
+                        .load(Ordering::Acquire);
+                    if snapshot_ts < temporary_id_commit_ts {
+                        self.checkpoint_lock.unlock();
+                        self.state = CheckpointState::Finalize;
+                        return Ok(TransitionResult::Done(CheckpointResult::default()));
+                    }
+                    // Publish the single-orchestrator gate before releasing the
+                    // fence so no new temporary-ID commit can miss this snapshot.
                     if self
                         .mvstore
                         .checkpoint_in_progress
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                         .is_err()
                     {
+                        self.checkpoint_lock.unlock();
                         // Another checkpoint is already running: no-op (no work, no resources).
                         self.state = CheckpointState::Finalize;
                         return Ok(TransitionResult::Done(CheckpointResult::default()));
                     }
                     self.owns_checkpoint_in_progress = true;
+                    self.snapshot_ts = snapshot_ts;
+                    self.checkpoint_lock.unlock();
                 }
 
                 if passive {
-                    self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
                     // Checkpoint state machines can be created before they are run.
                     // Resample after serializing so already-durable index deletes are not replayed.
                     self.refresh_checkpoint_bounds();
@@ -2099,6 +2130,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 self.durable_txid_max_new = durable_old.max(self.snapshot_ts);
                 self.maybe_stage_mvcc_metadata_write()?;
 
+                self.storage_checkpoint_started = true;
                 self.mvstore.storage.on_checkpoint_start()?;
 
                 if self.write_set.is_empty() && self.index_write_set.is_empty() {
@@ -2995,7 +3027,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
                 res
             }
             Ok(TransitionResult::Done(ref result)) => {
-                self.mvstore.storage.on_checkpoint_end(Ok(result))?;
+                if std::mem::take(&mut self.storage_checkpoint_started) {
+                    self.mvstore.storage.on_checkpoint_end(Ok(result))?;
+                }
                 res
             }
             Ok(result) => Ok(result),

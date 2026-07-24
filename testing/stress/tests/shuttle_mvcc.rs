@@ -2,6 +2,7 @@
 
 use shuttle::scheduler::{PctScheduler, RandomScheduler};
 use shuttle::sync::Barrier;
+use std::future::Future;
 use turso::Builder;
 use turso_stress::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use turso_stress::sync::Arc;
@@ -736,4 +737,372 @@ async fn begin_publish_window_gc_scenario(num_readers: usize, rounds: i64) {
         !row_disappeared.load(Ordering::Acquire),
         "Observed a row, and then no row. This violates Snapshot Isolation"
     );
+}
+
+async fn passive_checkpoint_stale_table_id_aliases_index_root_scenario() {
+    const WRITES: i64 = 4;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("passive-checkpoint-table-index-alias.db");
+    let db_path = db_path.to_str().unwrap();
+
+    let db = Builder::new_local(db_path)
+        .experimental_mvcc_passive_checkpoint(true)
+        .build()
+        .await
+        .unwrap();
+
+    let setup = db.connect().unwrap();
+
+    {
+        let mut rows = setup
+            .query("PRAGMA journal_mode = 'experimental_mvcc'", ())
+            .await
+            .unwrap();
+
+        while rows.next().await.unwrap().is_some() {}
+    }
+
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1", ())
+        .await
+        .unwrap();
+
+    setup
+        .execute_batch(
+            "CREATE TABLE anchor(
+                 id  INTEGER PRIMARY KEY,
+                 pad BLOB
+             );
+
+             INSERT INTO anchor
+             SELECT value, zeroblob(1000)
+             FROM generate_series(1, 8);",
+        )
+        .await
+        .unwrap();
+
+    async fn passive_checkpoint(conn: &turso::Connection) {
+        let mut rows = conn
+            .query("PRAGMA wal_checkpoint(PASSIVE)", ())
+            .await
+            .unwrap();
+
+        while rows.next().await.unwrap().is_some() {}
+    }
+
+    passive_checkpoint(&setup).await;
+    turso_stress::note_progress();
+
+    assert_eq!(query_i64(&setup, "PRAGMA page_count").await, 5);
+
+    setup
+        .execute_batch(
+            "CREATE TABLE a(
+                 id INTEGER PRIMARY KEY,
+                 v  TEXT
+             );
+
+             CREATE INDEX a_v ON a(v);
+
+             CREATE TABLE dummy(
+                 id INTEGER PRIMARY KEY
+             );
+
+             CREATE TABLE b(
+                 id INTEGER PRIMARY KEY,
+                 v  TEXT
+             );
+
+             INSERT INTO anchor
+             SELECT value + 100, zeroblob(1)
+             FROM generate_series(1, 1025);",
+        )
+        .await
+        .unwrap();
+    turso_stress::note_progress();
+
+    assert!(
+        query_i64(
+            &setup,
+            "SELECT rootpage
+               FROM sqlite_schema
+              WHERE name = 'a_v'",
+        )
+        .await
+            < 0
+    );
+
+    let b_temporary_root = query_i64(
+        &setup,
+        "SELECT rootpage
+           FROM sqlite_schema
+          WHERE name = 'b'",
+    )
+    .await;
+
+    assert!(b_temporary_root < 0);
+
+    let writer_conn = db.connect().unwrap();
+    writer_conn.execute("BEGIN CONCURRENT", ()).await.unwrap();
+    writer_conn
+        .execute("INSERT INTO b VALUES(100000, 'ack-100000')", ())
+        .await
+        .unwrap();
+    turso_stress::note_progress();
+    let mut writer_commit_stmt = writer_conn.prepare("COMMIT").await.unwrap();
+
+    // The trigger's commit is visible before its retained auto-checkpoint
+    // future first parks. At that point PrepareCheckpoint has frozen its
+    // snapshot and raised the temporary-ID commit gate.
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0", ())
+        .await
+        .unwrap();
+    let checkpoint_parked = Arc::new(AtomicBool::new(false));
+    let checkpoint_completed = Arc::new(AtomicBool::new(false));
+    let writer_commit_polled = Arc::new(AtomicBool::new(false));
+
+    let trigger_conn = db.connect().unwrap();
+    let observer = db.connect().unwrap();
+    let checkpoint_config = db.connect().unwrap();
+    let mut trigger_stmt = trigger_conn
+        .prepare("INSERT INTO anchor VALUES(9, zeroblob(1000))")
+        .await
+        .unwrap();
+    let checkpoint_parked_task = checkpoint_parked.clone();
+    let checkpoint_completed_task = checkpoint_completed.clone();
+    let writer_commit_polled_task = writer_commit_polled.clone();
+
+    let checkpoint = turso_stress::future::spawn(async move {
+        let mut trigger_future = std::pin::pin!(trigger_stmt.execute(()));
+        let observer_future = async move {
+            loop {
+                let mut rows = observer
+                    .query("SELECT count(*) FROM anchor WHERE id = 9", ())
+                    .await
+                    .unwrap();
+                let mut count = None;
+                while let Some(row) = rows.next().await.unwrap() {
+                    count = Some(row.get::<i64>(0).unwrap());
+                }
+                if count == Some(1) {
+                    return;
+                }
+                shuttle::future::yield_now().await;
+            }
+        };
+        let mut observer_future = std::pin::pin!(observer_future);
+        let mut parked_after_commit = false;
+
+        for _ in 0..1_000 {
+            let trigger_poll = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(match trigger_future.as_mut().poll(cx) {
+                    std::task::Poll::Pending => None,
+                    std::task::Poll::Ready(result) => Some(result),
+                })
+            })
+            .await;
+
+            if let Some(result) = trigger_poll {
+                result.unwrap();
+                panic!("auto-checkpoint completed before it could be parked");
+            }
+
+            let observer_done = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(matches!(
+                    observer_future.as_mut().poll(cx),
+                    std::task::Poll::Ready(())
+                ))
+            })
+            .await;
+            if observer_done {
+                parked_after_commit = true;
+                break;
+            }
+
+            shuttle::future::yield_now().await;
+        }
+
+        assert!(
+            parked_after_commit,
+            "trigger commit never reached its retained auto-checkpoint"
+        );
+        turso_stress::note_progress();
+
+        checkpoint_parked_task.store(true, Ordering::SeqCst);
+
+        let mut writer_was_polled = false;
+        for _ in 0..1_000 {
+            if writer_commit_polled_task.load(Ordering::SeqCst) {
+                writer_was_polled = true;
+                break;
+            }
+            shuttle::future::yield_now().await;
+        }
+        assert!(
+            writer_was_polled,
+            "writer never polled COMMIT after the checkpoint parked"
+        );
+
+        trigger_future.await.unwrap();
+        turso_stress::note_progress();
+
+        // The threshold is store-global. The writer waits for this post-
+        // checkpoint handoff before resuming COMMIT, so its durable frame stays
+        // in the logical log for cold recovery.
+        checkpoint_config
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1", ())
+            .await
+            .unwrap();
+        checkpoint_completed_task.store(true, Ordering::SeqCst);
+        turso_stress::note_progress();
+    });
+
+    let writer_checkpoint_parked = checkpoint_parked.clone();
+    let writer_checkpoint_completed = checkpoint_completed.clone();
+    let writer_commit_polled_task = writer_commit_polled.clone();
+
+    let writer = turso_stress::future::spawn(async move {
+        let mut saw_parked_checkpoint = false;
+        for _ in 0..1_000 {
+            if writer_checkpoint_parked.load(Ordering::SeqCst) {
+                saw_parked_checkpoint = true;
+                break;
+            }
+            shuttle::future::yield_now().await;
+        }
+        assert!(
+            saw_parked_checkpoint,
+            "writer never observed the parked checkpoint"
+        );
+
+        // Preparation and the row write happened before the checkpoint. The
+        // only remaining work is COMMIT, so Pending here is the temporary-ID
+        // checkpoint fence rather than statement preparation or pager IO.
+        let mut writer_commit = std::pin::pin!(writer_commit_stmt.execute(()));
+        let first_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(match writer_commit.as_mut().poll(cx) {
+                std::task::Poll::Pending => None,
+                std::task::Poll::Ready(result) => Some(result),
+            })
+        })
+        .await;
+        assert!(
+            first_poll.is_none(),
+            "prepared writer COMMIT bypassed the active checkpoint fence"
+        );
+        writer_commit_polled_task.store(true, Ordering::SeqCst);
+
+        let mut saw_completed_checkpoint = false;
+        for _ in 0..1_000 {
+            if writer_checkpoint_completed.load(Ordering::SeqCst) {
+                saw_completed_checkpoint = true;
+                break;
+            }
+            shuttle::future::yield_now().await;
+        }
+        assert!(
+            saw_completed_checkpoint,
+            "writer never observed checkpoint completion"
+        );
+
+        writer_commit.await.unwrap();
+        turso_stress::note_progress();
+
+        let mut acknowledged = 1;
+        for id in 100_001..100_000 + WRITES {
+            match writer_conn
+                .execute(format!("INSERT INTO b VALUES({id}, 'ack-{id}')"), ())
+                .await
+            {
+                Ok(_) => {
+                    acknowledged += 1;
+                }
+
+                Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {}
+
+                Err(error) => {
+                    panic!("unexpected INSERT error: {error:?}");
+                }
+            }
+
+            shuttle::future::yield_now().await;
+        }
+
+        acknowledged
+    });
+
+    checkpoint.await.unwrap();
+    let acknowledged = writer.await.unwrap();
+    turso_stress::note_progress();
+
+    assert!(acknowledged > 0);
+    assert!(
+        writer_commit_polled.load(Ordering::SeqCst),
+        "the prepared writer commit must be polled while the checkpoint is parked"
+    );
+
+    drop(setup);
+    drop(db);
+
+    let cold_db = Builder::new_local(db_path)
+        .experimental_mvcc_passive_checkpoint(true)
+        .build()
+        .await
+        .unwrap();
+
+    let cold = cold_db.connect().unwrap();
+
+    cold.execute("PRAGMA mvcc_checkpoint_threshold = -1", ())
+        .await
+        .unwrap();
+
+    let cold_index_root = query_i64(
+        &cold,
+        "SELECT rootpage
+           FROM sqlite_schema
+          WHERE name = 'a_v'",
+    )
+    .await;
+
+    assert_eq!(
+        cold_index_root, -b_temporary_root,
+        "fixture must preserve the stale-table-ID/index-root alias"
+    );
+
+    let recovered = query_i64(&cold, "SELECT count(*) FROM b WHERE id >= 100000").await;
+
+    assert_eq!(
+        recovered, acknowledged,
+        "cold recovery lost acknowledged writes to b"
+    );
+
+    assert_eq!(query_string(&cold, "PRAGMA integrity_check").await, "ok");
+    turso_stress::note_progress();
+
+    passive_checkpoint(&cold).await;
+
+    let recovered_after_checkpoint =
+        query_i64(&cold, "SELECT count(*) FROM b WHERE id >= 100000").await;
+
+    assert_eq!(
+        recovered_after_checkpoint, acknowledged,
+        "post-recovery checkpoint lost acknowledged writes to b"
+    );
+
+    assert_eq!(query_string(&cold, "PRAGMA integrity_check").await, "ok");
+}
+
+#[test]
+fn shuttle_test_passive_checkpoint_stale_table_id_aliases_index_root() {
+    // The explicit checkpoint/commit handshake above fixes the relevant
+    // ordering, so one deterministic execution covers the regression.
+    let scheduler = PctScheduler::new_from_seed(0xa903_398d_4995_8e14, 5, 1);
+
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+
+    runner.run(|| {
+        shuttle::future::block_on(passive_checkpoint_stale_table_id_aliases_index_root_scenario())
+    });
 }
