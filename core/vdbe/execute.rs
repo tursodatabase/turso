@@ -6256,10 +6256,11 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
 /// - **ArrayAgg/Mode/PercentileCont/PercentileDisc**: buffer every input value by growing the
 ///   payload `Vec` (one push per row); the leading slots hold a running count and, for the
 ///   ordered-set aggregates, the collation / percentile fraction to use at finalize time.
+#[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::AggAccumulate)]
 fn update_agg_payload(
     func: &AggFunc,
-    arg: &Value,               // first argument
-    maybe_arg2: Option<Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
+    arg: &Value,                // first argument
+    maybe_arg2: Option<&Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut crate::alloc::Vec<Value>,
     collation: CollationSeq,
     comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
@@ -6434,7 +6435,7 @@ fn update_agg_payload(
                 return Ok(());
             }
             if matches!(payload[0], Value::Null) {
-                payload[0] = arg.clone();
+                payload[0].try_clone_from(arg)?;
                 return Ok(());
             }
             use std::cmp::Ordering;
@@ -6453,22 +6454,25 @@ fn update_agg_payload(
                 _ => false,
             };
             if should_update {
-                payload[0] = arg.clone();
+                payload[0].try_clone_from(arg)?;
             }
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             if matches!(arg, Value::Null) {
                 return Ok(());
             }
-            let delimiter = maybe_arg2.unwrap_or_else(|| Value::build_text(","));
             let acc = &mut payload[0];
             if matches!(acc, Value::Null) {
-                // First non-null value: convert to Text
-                *acc = Value::build_text(arg.to_string());
+                // Start an empty Text accumulator; append below without an
+                // intermediate String for Text inputs.
+                *acc = Value::build_text(String::new());
             } else {
-                acc.exec_group_concat(&delimiter);
-                acc.exec_group_concat(arg);
+                match maybe_arg2 {
+                    Some(delimiter) => acc.exec_group_concat(delimiter)?,
+                    None => acc.exec_group_concat(&Value::build_text(","))?,
+                }
             }
+            acc.exec_group_concat(arg)?;
         }
         AggFunc::External(_) => {
             mark_unlikely();
@@ -6486,13 +6490,14 @@ fn update_agg_payload(
                 ));
             };
             let mut key_vec = convert_dbtype_to_raw_jsonb(arg, Conv::ToString)?;
-            let mut val_vec = convert_dbtype_to_raw_jsonb(&value, Conv::NotStrict)?;
+            let mut val_vec = convert_dbtype_to_raw_jsonb(value, Conv::NotStrict)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
                     "JsonGroupObject: payload[0] is not a blob".to_string(),
                 ));
             };
+            vec.try_reserve(usize::from(vec.is_empty()) + key_vec.len() + val_vec.len())?;
             if vec.is_empty() {
                 // bits for obj header
                 vec.push(12);
@@ -6507,7 +6512,7 @@ fn update_agg_payload(
                 LimboError::InternalError("array_agg count slot must be an integer".into())
             })? as usize;
             payload[0] = Value::from_i64((count + 1) as i64);
-            payload.push(arg.clone());
+            payload.try_push(arg.try_clone()?)?;
         }
         AggFunc::Mode => {
             // Record the value's collation (constant per group) for finalize-time sorting, then
@@ -6516,19 +6521,19 @@ fn update_agg_payload(
             if !matches!(arg, Value::Null) {
                 let count = payload[1].as_int().unwrap_or(0) as usize;
                 payload[1] = Value::from_i64((count + 1) as i64);
-                payload.push(arg.clone());
+                payload.try_push(arg.try_clone()?)?;
             }
         }
         AggFunc::PercentileCont | AggFunc::PercentileDisc => {
             payload[0] = Value::from_i64(collation.to_bits() as i64);
             // The fraction is a per-group constant; record it on every step.
             if let Some(fraction) = maybe_arg2 {
-                payload[2] = fraction;
+                payload[2].try_clone_from(fraction)?;
             }
             if !matches!(arg, Value::Null) {
                 let count = payload[1].as_int().unwrap_or(0) as usize;
                 payload[1] = Value::from_i64((count + 1) as i64);
-                payload.push(arg.clone());
+                payload.try_push(arg.try_clone()?)?;
             }
         }
         #[cfg(feature = "json")]
@@ -6541,6 +6546,7 @@ fn update_agg_payload(
                     "JsonGroupArray: payload[0] is not a blob".to_string(),
                 ));
             };
+            vec.try_reserve(usize::from(vec.is_empty()) + data.len())?;
             if vec.is_empty() {
                 vec.push(11); // bits for array header
             }
@@ -6905,13 +6911,18 @@ fn op_window_step(
                 *captured != 0
             };
             if !already_captured {
-                let arg_value = state.registers[arg_reg].get_value().clone();
-                let Register::Aggregate(AggContext::Builtin(payload)) =
-                    &mut state.registers[acc_reg]
-                else {
+                let [arg_slot, acc_slot] = state
+                    .registers
+                    .get_disjoint_mut([arg_reg, acc_reg])
+                    .map_err(|_| {
+                        LimboError::InternalError(format!(
+                            "first_value: argument register {arg_reg} and accumulator register {acc_reg} must be distinct"
+                        ))
+                    })?;
+                let Register::Aggregate(AggContext::Builtin(payload)) = acc_slot else {
                     unreachable!("first_value accumulator must be a Builtin payload");
                 };
-                payload[0] = arg_value;
+                payload[0].try_clone_from(arg_slot.get_value())?;
                 let Value::Numeric(Numeric::Integer(captured)) = &mut payload[1] else {
                     unreachable!("first_value capture flag must be Integer");
                 };
@@ -6928,12 +6939,18 @@ fn op_window_step(
                 state.registers[acc_reg] =
                     Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![Value::Null]?));
             }
-            let arg_value = state.registers[arg_reg].get_value().clone();
-            let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
-            else {
+            let [arg_slot, acc_slot] = state
+                .registers
+                .get_disjoint_mut([arg_reg, acc_reg])
+                .map_err(|_| {
+                    LimboError::InternalError(format!(
+                        "last_value: argument register {arg_reg} and accumulator register {acc_reg} must be distinct"
+                    ))
+                })?;
+            let Register::Aggregate(AggContext::Builtin(payload)) = acc_slot else {
                 unreachable!("last_value accumulator must be a Builtin payload");
             };
-            payload[0] = arg_value;
+            payload[0].try_clone_from(arg_slot.get_value())?;
         }
         other => {
             return Err(LimboError::InternalError(format!(
@@ -7155,17 +7172,16 @@ pub fn op_agg_step(
             }
         }
         _ => {
-            // Second argument (delimiter for group_concat/json, fraction for percentiles),
             let maybe_arg2 = match func {
                 AggFunc::GroupConcat | AggFunc::StringAgg => {
-                    Some(state.registers[*delimiter].get_value().clone())
+                    Some(state.registers[*delimiter].get_value().try_clone()?)
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-                    Some(state.registers[*delimiter].get_value().clone())
+                    Some(state.registers[*delimiter].get_value().try_clone()?)
                 }
                 AggFunc::PercentileCont | AggFunc::PercentileDisc => {
-                    Some(state.registers[*delimiter].get_value().clone())
+                    Some(state.registers[*delimiter].get_value().try_clone()?)
                 }
                 _ => None,
             };
@@ -7191,7 +7207,7 @@ pub fn op_agg_step(
             update_agg_payload(
                 func,
                 arg,
-                maybe_arg2,
+                maybe_arg2.as_ref(),
                 payload,
                 current_collation,
                 comparator_factory,
@@ -8041,15 +8057,14 @@ pub fn op_function(
             ScalarFunc::Cast => {
                 assert_eq!(arg_count, 2);
                 assert!(*start_reg + 1 < state.registers.len());
-                let reg_value_argument = state.registers[*start_reg].clone();
-                let Value::Text(reg_value_type) =
-                    state.registers[*start_reg + 1].get_value().clone()
-                else {
-                    unreachable!("Cast with non-text type");
+                let result = {
+                    let Value::Text(cast_type) = state.registers[*start_reg + 1].get_value() else {
+                        unreachable!("Cast with non-text type");
+                    };
+                    state.registers[*start_reg]
+                        .get_value()
+                        .exec_cast(cast_type.as_str())?
                 };
-                let result = reg_value_argument
-                    .get_value()
-                    .exec_cast(reg_value_type.as_str())?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Changes => {
