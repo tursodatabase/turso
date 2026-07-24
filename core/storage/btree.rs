@@ -1354,7 +1354,7 @@ impl BTreeCursor {
                             io_yield_one!(c);
                         }
                     }
-                    IOResult::IO(IOCompletions::Single(spill_c)) => {
+                    IOResult::IO(IOCompletions(spill_c)) => {
                         self.iteration_pending_descent =
                             Some(IterationPendingDescent::Backwards(left_child_page as i64));
                         io_yield_one!(spill_c);
@@ -1595,7 +1595,7 @@ impl BTreeCursor {
                                     }
                                     continue;
                                 }
-                                IOResult::IO(IOCompletions::Single(spill_c)) => {
+                                IOResult::IO(IOCompletions(spill_c)) => {
                                     self.iteration_pending_descent =
                                         Some(IterationPendingDescent::Forwards(
                                             right_most_pointer as i64,
@@ -1645,7 +1645,7 @@ impl BTreeCursor {
                             io_yield_one!(c);
                         }
                     }
-                    IOResult::IO(IOCompletions::Single(spill_c)) => {
+                    IOResult::IO(IOCompletions(spill_c)) => {
                         self.iteration_pending_descent =
                             Some(IterationPendingDescent::Forwards(left_child_page as i64));
                         io_yield_one!(spill_c);
@@ -1893,14 +1893,12 @@ impl BTreeCursor {
                             eq_seen: state.eq_seen,
                         };
                         if let Some(c) = c {
-                            return Ok(ControlFlow::Break(IOResult::IO(IOCompletions::Single(c))));
+                            return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
                         }
                         return Ok(ControlFlow::Continue(()));
                     }
-                    IOResult::IO(IOCompletions::Single(spill_c)) => {
-                        return Ok(ControlFlow::Break(IOResult::IO(IOCompletions::Single(
-                            spill_c,
-                        ))));
+                    IOResult::IO(IOCompletions(spill_c)) => {
+                        return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(spill_c))));
                     }
                 }
             }
@@ -1918,14 +1916,12 @@ impl BTreeCursor {
                             eq_seen: state.eq_seen,
                         };
                         if let Some(c) = c {
-                            return Ok(ControlFlow::Break(IOResult::IO(IOCompletions::Single(c))));
+                            return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
                         }
                         return Ok(ControlFlow::Continue(()));
                     }
-                    IOResult::IO(IOCompletions::Single(spill_c)) => {
-                        return Ok(ControlFlow::Break(IOResult::IO(IOCompletions::Single(
-                            spill_c,
-                        ))));
+                    IOResult::IO(IOCompletions(spill_c)) => {
+                        return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(spill_c))));
                     }
                 },
                 None => {
@@ -2012,7 +2008,7 @@ impl BTreeCursor {
 
         if matches!(self.seek_state, CursorSeekState::Start) {
             if let Some(c) = return_if_io!(self.move_to_root_nonblock()) {
-                return Ok(IOResult::IO(IOCompletions::Single(c)));
+                return Ok(IOResult::IO(IOCompletions(c)));
             }
         }
 
@@ -2148,16 +2144,14 @@ impl BTreeCursor {
                                     eq_seen: state.eq_seen,
                                 };
                                 if let Some(c) = c {
-                                    return Ok(ControlFlow::Break(IOResult::IO(
-                                        IOCompletions::Single(c),
-                                    )));
+                                    return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
                                 }
                                 return Ok(ControlFlow::Continue(()));
                             }
-                            IOResult::IO(IOCompletions::Single(spill_c)) => {
-                                return Ok(ControlFlow::Break(IOResult::IO(
-                                    IOCompletions::Single(spill_c),
-                                )));
+                            IOResult::IO(IOCompletions(spill_c)) => {
+                                return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(
+                                    spill_c,
+                                ))));
                             }
                         }
                     }
@@ -2209,13 +2203,11 @@ impl BTreeCursor {
                         eq_seen: state.eq_seen,
                     };
                     if let Some(c) = c {
-                        return Ok(ControlFlow::Break(IOResult::IO(IOCompletions::Single(c))));
+                        return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
                     }
                 }
-                IOResult::IO(IOCompletions::Single(spill_c)) => {
-                    return Ok(ControlFlow::Break(IOResult::IO(IOCompletions::Single(
-                        spill_c,
-                    ))));
+                IOResult::IO(IOCompletions(spill_c)) => {
+                    return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(spill_c))));
                 }
             }
             return Ok(ControlFlow::Continue(()));
@@ -2544,7 +2536,7 @@ impl BTreeCursor {
         ) {
             if matches!(self.seek_state, CursorSeekState::Start) {
                 if let Some(c) = return_if_io!(self.move_to_root_nonblock()) {
-                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    return Ok(IOResult::IO(IOCompletions(c)));
                 }
             }
             return_if_io!(self.indexbtree_move_to_internal(seek_op, record_comparer, key_values));
@@ -3434,7 +3426,7 @@ impl BTreeCursor {
                                     pending_sibling_load_completions.push(c);
                                 }
                             }
-                            Ok(IOResult::IO(IOCompletions::Single(spill_c))) => {
+                            Ok(IOResult::IO(IOCompletions(spill_c))) => {
                                 // Spill yield. The loop is fully re-entrant:
                                 // on re-entry we re-execute from the top of
                                 // `NonRootPickSiblings`, the pager's
@@ -5305,7 +5297,7 @@ impl BTreeCursor {
                                                 io_yield_one!(c);
                                             }
                                         }
-                                        IOResult::IO(IOCompletions::Single(spill_c)) => {
+                                        IOResult::IO(IOCompletions(spill_c)) => {
                                             let destroy_info =
                                                 self.state.mut_destroy_info().expect(
                                                     "unable to get a mut reference to destroy state in cursor",
@@ -5381,7 +5373,7 @@ impl BTreeCursor {
                                             io_yield_one!(c);
                                         }
                                     }
-                                    IOResult::IO(IOCompletions::Single(spill_c)) => {
+                                    IOResult::IO(IOCompletions(spill_c)) => {
                                         let destroy_info =
                                             self.state.mut_destroy_info().expect(
                                                 "unable to get a mut reference to destroy state in cursor",
@@ -5420,7 +5412,7 @@ impl BTreeCursor {
                                         io_yield_one!(c);
                                     }
                                 }
-                                IOResult::IO(IOCompletions::Single(spill_c)) => {
+                                IOResult::IO(IOCompletions(spill_c)) => {
                                     let destroy_info = self.state.mut_destroy_info().expect(
                                         "unable to get a mut reference to destroy state in cursor",
                                     );
@@ -7058,7 +7050,7 @@ impl CursorTrait for BTreeCursor {
                                     io_yield_one!(c);
                                 }
                             }
-                            IOResult::IO(IOCompletions::Single(spill_c)) => {
+                            IOResult::IO(IOCompletions(spill_c)) => {
                                 self.count_state = CountState::Descend {
                                     target: right_most_pointer as i64,
                                 };
@@ -7088,7 +7080,7 @@ impl CursorTrait for BTreeCursor {
                                             io_yield_one!(c);
                                         }
                                     }
-                                    IOResult::IO(IOCompletions::Single(spill_c)) => {
+                                    IOResult::IO(IOCompletions(spill_c)) => {
                                         self.count_state = CountState::Descend {
                                             target: left_child_page as i64,
                                         };

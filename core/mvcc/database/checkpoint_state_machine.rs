@@ -1276,7 +1276,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
             processed += 1;
             if processed >= COLLECT_PREEMPTION_THRESHOLD {
-                return Ok(Some(IOCompletions::Single(Completion::new_yield())));
+                return Ok(Some(IOCompletions(Completion::new_yield())));
             }
         }
         // Writing in ascending order of rowid gives us a better chance of using balance-quick algorithm
@@ -1345,7 +1345,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
                 processed += 1;
                 if processed >= COLLECT_PREEMPTION_THRESHOLD {
-                    return Ok(Some(IOCompletions::Single(Completion::new_yield())));
+                    return Ok(Some(IOCompletions(Completion::new_yield())));
                 }
             }
             self.collect_index_tableid_cursor = Some(index_id);
@@ -1769,7 +1769,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             };
             *next_index = index;
 
-            Some(IOCompletions::Single(Completion::new_yield()))
+            Some(IOCompletions(Completion::new_yield()))
         } else {
             None
         }
@@ -1836,7 +1836,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 unreachable!("gc_checkpointed_index_versions runs only in GcIndexRows");
             };
             *next_index = index;
-            Some(IOCompletions::Single(Completion::new_yield()))
+            Some(IOCompletions(Completion::new_yield()))
         } else {
             None
         }
@@ -2720,9 +2720,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             tracing::debug!(
                                 "passive checkpoint publish contended; yielding for retry"
                             );
-                            return Ok(TransitionResult::Io(IOCompletions::Single(
-                                Completion::new_yield(),
-                            )));
+                            return Ok(TransitionResult::Io(
+                                IOCompletions(Completion::new_yield()),
+                            ));
                         }
                         return Err(crate::LimboError::Busy);
                     }
@@ -2771,7 +2771,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     }
                     Ok(TransitionResult::Continue)
                 } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    Ok(TransitionResult::Io(IOCompletions(c)))
                 }
             }
 
@@ -2789,7 +2789,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    Ok(TransitionResult::Io(IOCompletions(c)))
                 }
             }
 
@@ -2838,7 +2838,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     .db_file
                     .sync(Completion::new_sync(|_| {}), self.pager.get_sync_type())?;
                 checkpoint_result.db_sync_sent = true;
-                Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                Ok(TransitionResult::Io(IOCompletions(c)))
             }
 
             CheckpointState::TruncateWal => {

@@ -3318,9 +3318,7 @@ impl Cursor {
 
 #[derive(Debug)]
 #[must_use]
-pub enum IOCompletions {
-    Single(Completion),
-}
+pub struct IOCompletions(pub Completion);
 
 pub struct IOCompletionAsync<'a, I: ?Sized + IO> {
     io: &'a I,
@@ -3348,51 +3346,41 @@ impl<'a, I: ?Sized + IO> Future for IOCompletionAsync<'a, I> {
 impl IOCompletions {
     /// Wais for the Completions to complete
     pub fn wait<I: ?Sized + IO>(self, io: &I) -> Result<()> {
-        match self {
-            IOCompletions::Single(c) => io.wait_for_completion(c),
-        }
+        io.wait_for_completion(self.0)
     }
 
     /// Waits for Completion to complete and `steps` IO. Ideally the user should do the stepping,
     /// but we do not have yet a good api for this
     pub async fn wait_async<I: ?Sized + IO>(self, io: &I) -> Result<()> {
-        match self {
-            IOCompletions::Single(c) => IOCompletionAsync { io, completion: c }.await,
+        IOCompletionAsync {
+            io,
+            completion: self.0,
         }
+        .await
     }
 
     pub fn finished(&self) -> bool {
-        match self {
-            IOCompletions::Single(c) => c.finished(),
-        }
+        self.0.finished()
     }
 
     /// Returns true if this is an explicit yield — a signal to return control
     /// to the cooperative scheduler so other fibers can make progress.
     pub fn is_explicit_yield(&self) -> bool {
-        match self {
-            IOCompletions::Single(c) => c.is_explicit_yield(),
-        }
+        self.0.is_explicit_yield()
     }
 
     /// Send abort signal to completions
     pub fn abort(&self) {
-        match self {
-            IOCompletions::Single(c) => c.abort(),
-        }
+        self.0.abort()
     }
 
     pub fn get_error(&self) -> Option<CompletionError> {
-        match self {
-            IOCompletions::Single(c) => c.get_error(),
-        }
+        self.0.get_error()
     }
 
     pub fn set_waker(&self, waker: Option<&Waker>) {
         if let Some(waker) = waker {
-            match self {
-                IOCompletions::Single(c) => c.set_waker(waker),
-            }
+            self.0.set_waker(waker)
         }
     }
 }

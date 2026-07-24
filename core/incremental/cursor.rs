@@ -1803,7 +1803,7 @@ mod tests {
                 if count == 0 {
                     // First call returns IO (pending)
                     let completion = Completion::new_yield();
-                    Ok(IOResult::IO(IOCompletions::Single(completion)))
+                    Ok(IOResult::IO(IOCompletions(completion)))
                 } else {
                     // Subsequent calls return Done
                     Ok(IOResult::Done(()))
@@ -1815,7 +1815,7 @@ mod tests {
                 if count == 0 {
                     // First call returns IO (pending)
                     let completion = Completion::new_yield();
-                    Ok(IOResult::IO(IOCompletions::Single(completion)))
+                    Ok(IOResult::IO(IOCompletions(completion)))
                 } else {
                     // Subsequent calls return Done
                     Ok(IOResult::Done(()))

@@ -2383,9 +2383,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         }
         if ctx.cursor < write_set_len {
             // More work remains in the current pass: yield and resume.
-            return Ok(TransitionResult::Io(IOCompletions::Single(
-                Completion::new_yield(),
-            )));
+            return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
         }
 
         if ctx.schema_process {
@@ -2691,9 +2689,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             iterations += 1;
         }
         if ctx.cursor < write_set_len {
-            return Ok(TransitionResult::Io(IOCompletions::Single(
-                Completion::new_yield(),
-            )));
+            return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
         }
         self.state = CommitState::FinalizeCommit { end_ts };
         Ok(TransitionResult::Continue)
@@ -2991,9 +2987,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // counter is zero." Deadlock impossible: edges always go from higher
                 // end_ts to lower end_ts, so the wait graph is acyclic.
                 if tx.commit_dep_counter.load(Ordering::Acquire) > 0 {
-                    return Ok(TransitionResult::Io(IOCompletions::Single(
-                        Completion::new_yield(),
-                    )));
+                    return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
                 }
 
                 // Check abort_now AFTER counter reaches 0. Memory ordering:
@@ -3060,9 +3054,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                     let locked = self.commit_coordinator.pager_commit_lock.write();
                     if !locked {
-                        return Ok(TransitionResult::Io(IOCompletions::Single(
-                            Completion::new_yield(),
-                        )));
+                        return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
                     }
                     tx.value()
                         .pager_commit_lock_held
@@ -3085,7 +3077,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             CommitState::UpgradeLogicalLogHeader { end_ts, log_record } => {
                 if let Some(c) = mvcc_store.storage.upgrade_header_for_log_tx(log_record)? {
                     if !c.succeeded() {
-                        return Ok(TransitionResult::Io(IOCompletions::Single(c)));
+                        return Ok(TransitionResult::Io(IOCompletions(c)));
                     }
                 }
                 let end_ts = *end_ts;
@@ -3117,7 +3109,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    Ok(TransitionResult::Io(IOCompletions(c)))
                 }
             }
 
@@ -3127,7 +3119,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    Ok(TransitionResult::Io(IOCompletions(c)))
                 }
             }
 
@@ -3145,7 +3137,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    Ok(TransitionResult::Io(IOCompletions(c)))
                 }
             }
             CommitState::EndCommitLogicalLog { end_ts } => {

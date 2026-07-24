@@ -739,7 +739,7 @@ impl Statement {
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     let io = self.take_io_completions().unwrap_or_else(|| {
-                        crate::types::IOCompletions::Single(crate::io::Completion::new_yield())
+                        crate::types::IOCompletions(crate::io::Completion::new_yield())
                     });
                     return Ok(crate::IOResult::IO(io));
                 }
@@ -772,7 +772,7 @@ impl Statement {
                 }
                 vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     let io = self.take_io_completions().unwrap_or_else(|| {
-                        crate::types::IOCompletions::Single(crate::io::Completion::new_yield())
+                        crate::types::IOCompletions(crate::io::Completion::new_yield())
                     });
                     return Ok(crate::IOResult::IO(io));
                 }

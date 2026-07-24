@@ -467,7 +467,7 @@ impl Sorter {
             if !completion.succeeded() {
                 // IO not complete - put it back and yield
                 self.pending_completion = Some((completion.clone(), chunk_idx));
-                return Ok(IOResult::IO(IOCompletions::Single(completion)));
+                return Ok(IOResult::IO(IOCompletions(completion)));
             }
             // IO completed - push result to heap and retry
             if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {

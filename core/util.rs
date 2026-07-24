@@ -23,7 +23,7 @@ use turso_parser::parser::Parser;
 #[macro_export]
 macro_rules! io_yield_one {
     ($c:expr) => {
-        return Ok(IOResult::IO(IOCompletions::Single($c)));
+        return Ok(IOResult::IO(IOCompletions($c)));
     };
 }
 

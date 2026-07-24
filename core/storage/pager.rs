@@ -3322,7 +3322,7 @@ impl Pager {
                 self.pending_reads.write().remove(&page_idx);
                 Ok(IOResult::Done((page, c_disk)))
             }
-            IOResult::IO(IOCompletions::Single(spill_c)) => {
+            IOResult::IO(IOCompletions(spill_c)) => {
                 // Leave the pending entry in place; the next call to
                 // `read_page_nonblock(page_idx)` will recover it and retry
                 // `cache_insert` without re-issuing the disk read.
@@ -3542,7 +3542,7 @@ impl Pager {
                     dirty_ids,
                     completion: completion.clone(),
                 },
-                IOCompletions::Single(completion),
+                IOCompletions(completion),
             )),
             None => {
                 // No async prep needed, go straight to finish
@@ -3552,7 +3552,7 @@ impl Pager {
                         dirty_ids,
                         completion: completion.clone(),
                     },
-                    IOCompletions::Single(completion),
+                    IOCompletions(completion),
                 ))
             }
         }
@@ -3572,7 +3572,7 @@ impl Pager {
                     dirty_ids,
                     completion: completion.clone(),
                 },
-                IOCompletions::Single(completion),
+                IOCompletions(completion),
             ));
         }
 
@@ -3582,7 +3582,7 @@ impl Pager {
                 dirty_ids,
                 completion: finish_completion.clone(),
             },
-            IOCompletions::Single(finish_completion),
+            IOCompletions(finish_completion),
         ))
     }
 
@@ -3599,7 +3599,7 @@ impl Pager {
                     dirty_ids,
                     completion: completion.clone(),
                 },
-                IOCompletions::Single(completion),
+                IOCompletions(completion),
             ));
         }
 
@@ -3649,7 +3649,7 @@ impl Pager {
                                 page,
                                 completion: completion.clone(),
                             },
-                            IOCompletions::Single(completion),
+                            IOCompletions(completion),
                         ));
                     }
 
@@ -3689,7 +3689,7 @@ impl Pager {
                     page,
                     completion: completion.clone(),
                 },
-                IOCompletions::Single(completion),
+                IOCompletions(completion),
             ));
         }
         trace!(
