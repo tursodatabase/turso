@@ -187,9 +187,7 @@ pub(crate) fn seek_constraint_annotation(
 }
 
 /// Render an optimized plan in the textual shape used by PostgreSQL's default
-/// `EXPLAIN` output. This is deliberately a small, presentation-only
-/// projection of the optimizer plan: it does not participate in execution and
-/// is built only for PostgreSQL EXPLAIN statements.
+/// `EXPLAIN` output.
 pub(crate) fn render_postgres_explain(
     plan: &Plan,
     explain: Option<&PostgresExplain>,
@@ -197,8 +195,19 @@ pub(crate) fn render_postgres_explain(
     match plan {
         Plan::Select(select) => render_postgres_select(select, explain),
         Plan::CompoundSelect {
-            left, right_most, ..
-        } => render_postgres_compound(left, right_most),
+            left,
+            right_most,
+            limit,
+            offset,
+            order_by,
+            ..
+        } => render_postgres_compound(
+            left,
+            right_most,
+            limit.as_deref(),
+            offset.as_deref(),
+            order_by.as_deref(),
+        ),
         Plan::Delete(delete) => render_postgres_delete(delete, explain),
         Plan::Update(update) => render_postgres_update(update, explain),
     }
@@ -207,12 +216,52 @@ pub(crate) fn render_postgres_explain(
 fn render_postgres_compound(
     left: &[(SelectPlan, ast::CompoundOperator)],
     right_most: &SelectPlan,
+    limit: Option<&ast::Expr>,
+    offset: Option<&ast::Expr>,
+    order_by: Option<&[super::plan::CompoundOrderByKey]>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
-    append_postgres_compound(&mut lines, left, right_most, 0);
+    let mut depth = 0;
+    if limit.is_some() || offset.is_some() {
+        push_plan_line(&mut lines, depth, "Limit", None);
+        depth += 1;
+    }
+    if let Some(order_by) = order_by {
+        push_plan_line(&mut lines, depth, "Sort", None);
+        for (column_idx, direction, nulls, _) in order_by {
+            let column = right_most
+                .result_columns
+                .get(*column_idx)
+                .expect("compound ORDER BY columns must reference a result column");
+            let direction = match direction {
+                SortOrder::Asc => "ASC",
+                SortOrder::Desc => "DESC",
+            };
+            let nulls = match nulls {
+                Some(ast::NullsOrder::First) => " NULLS FIRST",
+                Some(ast::NullsOrder::Last) => " NULLS LAST",
+                None => "",
+            };
+            push_detail_line(
+                &mut lines,
+                depth,
+                &format!(
+                    "Sort Key: {} {direction}{nulls}",
+                    column.name_or_expr(&right_most.table_references)
+                ),
+            );
+        }
+        depth += 1;
+    }
+    append_postgres_compound(&mut lines, left, right_most, depth);
     lines
 }
 
+/// Render a compound SELECT from its left operands and right-most SELECT.
+///
+/// For `A UNION B UNION C`, `left` contains `(A, UNION)` and `(B, UNION)`,
+/// while `right_most` is `C`. The last operator is the root, so this renders
+/// `(A UNION B)` recursively before adding `C` as the other child.
 fn append_postgres_compound(
     lines: &mut Vec<String>,
     left: &[(SelectPlan, ast::CompoundOperator)],
@@ -529,9 +578,8 @@ fn append_table_access(
     let table_name = if table.table.get_name() == table.identifier {
         table.identifier.as_str()
     } else {
-        // PostgreSQL prints the base table name in the node and the alias in a
-        // separate field. The MVP keeps both pieces of user-visible context.
-        // This is more useful than silently dropping the alias.
+        // Use the binding name so scan nodes match expression qualifiers.
+        // PostgreSQL's base-name-plus-alias form needs both names here.
         &table.identifier
     };
 
