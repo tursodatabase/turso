@@ -1169,14 +1169,71 @@ expect {
     2|200|2000
 }
 
-test matview-vdbe-left-join-three-way-rejected {
+test matview-vdbe-left-join-three-way {
     CREATE TABLE tl(a INTEGER);
-    CREATE TABLE tr1(a INTEGER);
-    CREATE TABLE tr2(a INTEGER);
-    CREATE MATERIALIZED VIEW badt AS SELECT tl.a FROM tl LEFT JOIN tr1 ON tl.a = tr1.a LEFT JOIN tr2 ON tr1.a = tr2.a;
+    CREATE TABLE tr1(a INTEGER, b TEXT);
+    CREATE TABLE tr2(b TEXT, c INTEGER);
+    INSERT INTO tl VALUES (1), (2), (3);
+    INSERT INTO tr1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO tr2 VALUES ('x', 10);
+    CREATE MATERIALIZED VIEW three_left AS
+      SELECT tl.a, tr1.b, tr2.c
+      FROM tl
+      LEFT JOIN tr1 ON tl.a = tr1.a
+      LEFT JOIN tr2 ON tr1.b = tr2.b;
+    SELECT 'init', * FROM three_left ORDER BY a;
+    BEGIN;
+    INSERT INTO tr1 VALUES (3, 'z');
+    INSERT INTO tr2 VALUES ('z', 30);
+    DELETE FROM tr2 WHERE b = 'x';
+    COMMIT;
+    SELECT 'after', * FROM three_left ORDER BY a;
+    DELETE FROM tr1 WHERE a = 2;
+    SELECT 'pad', * FROM three_left ORDER BY a;
 }
-expect error {
-    materialized views with LEFT JOIN over more than two tables are not yet supported
+expect {
+    init|1|x|10
+    init|2|y|
+    init|3||
+    after|1|x|
+    after|2|y|
+    after|3|z|30
+    pad|1|x|
+    pad|2||
+    pad|3|z|30
+}
+
+# Mixed join trees keep each outer boundary at its own binary node. The final
+# inner join removes the first LEFT JOIN's padded rows, while later right-side
+# changes can make them enter or leave the result.
+test matview-vdbe-left-then-inner-join {
+    CREATE TABLE mix_l(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE mix_m(k INTEGER, tag TEXT);
+    CREATE TABLE mix_r(tag TEXT, value INTEGER);
+    INSERT INTO mix_l VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO mix_m VALUES (10, 'a'), (20, 'b');
+    INSERT INTO mix_r VALUES ('a', 100);
+    CREATE MATERIALIZED VIEW mixed_join_tree AS
+      SELECT mix_l.id, mix_m.tag, mix_r.value
+      FROM mix_l
+      LEFT JOIN mix_m ON mix_l.k = mix_m.k
+      JOIN mix_r ON mix_m.tag = mix_r.tag;
+    SELECT 'init', * FROM mixed_join_tree ORDER BY id;
+    BEGIN;
+    INSERT INTO mix_r VALUES ('b', 200);
+    INSERT INTO mix_m VALUES (30, 'c');
+    INSERT INTO mix_r VALUES ('c', 300);
+    DELETE FROM mix_r WHERE tag = 'a';
+    COMMIT;
+    SELECT 'after', * FROM mixed_join_tree ORDER BY id;
+    DELETE FROM mix_m WHERE k = 20;
+    SELECT 'gone', * FROM mixed_join_tree ORDER BY id;
+}
+expect {
+    init|1|a|100
+    after|2|b|200
+    after|3|c|300
+    gone|3|c|300
 }
 
 # USING desugars to equality predicates against the left-most table with
@@ -1247,8 +1304,7 @@ expect {
     wc2|p|20
 }
 
-# USING requires the column on both sides; NATURAL or USING between tables
-# with the same identifier cannot qualify the desugared predicates.
+# USING requires the column on both sides.
 test matview-vdbe-join-using-missing-column-rejected {
     CREATE TABLE ml(a INTEGER, b TEXT);
     CREATE TABLE mr(a INTEGER, c TEXT);
@@ -1258,12 +1314,20 @@ expect error {
     cannot join using column b - column not present in both tables
 }
 
-test matview-vdbe-join-using-self-rejected {
+test matview-vdbe-join-using-self {
     CREATE TABLE sl(a INTEGER);
-    CREATE MATERIALIZED VIEW bads AS SELECT * FROM sl JOIN sl USING (a);
+    INSERT INTO sl VALUES (1), (1), (2);
+    CREATE MATERIALIZED VIEW self_using AS SELECT * FROM sl JOIN sl USING (a);
+    SELECT 'init', a, COUNT(*) FROM self_using GROUP BY a ORDER BY a;
+    INSERT INTO sl VALUES (2);
+    DELETE FROM sl WHERE rowid = (SELECT MIN(rowid) FROM sl WHERE a = 1);
+    SELECT 'after', a, COUNT(*) FROM self_using GROUP BY a ORDER BY a;
 }
-expect error {
-    NATURAL or USING joins between tables with the same name
+expect {
+    init|1|4
+    init|2|1
+    after|1|1
+    after|2|4
 }
 
 # DISTINCT over a join is GROUP BY every output column over the join: one
@@ -2118,8 +2182,8 @@ expect {
     after|5
 }
 
-# Three-way joins: maintenance runs one delta phase per non-empty subset of
-# the joined tables (seven for three tables), keyed by the rowid triple.
+# Three-way joins compose two binary nodes. Each node emits the same three
+# bilinear phases and the interior arrangement preserves the rowid tuple.
 test matview-vdbe-three-way-join {
     CREATE TABLE w1(id INTEGER PRIMARY KEY, v TEXT);
     CREATE TABLE w2(id INTEGER PRIMARY KEY, w1_id INTEGER, v TEXT);
@@ -2173,7 +2237,8 @@ expect {
     ok
 }
 
-# Four tables is the cap (fifteen delta phases).
+# A left-deep tree emits three delta phases per binary join node, independent
+# of the total number of joined tables.
 test matview-vdbe-four-way-join {
     CREATE TABLE f1(a INTEGER);
     CREATE TABLE f2(a INTEGER);
@@ -2193,15 +2258,44 @@ expect {
     2
 }
 
-test matview-vdbe-five-way-join-rejected {
+test matview-vdbe-five-way-join {
     CREATE TABLE g1(a INTEGER);
     CREATE TABLE g2(a INTEGER);
     CREATE TABLE g3(a INTEGER);
     CREATE TABLE g4(a INTEGER);
-    CREATE MATERIALIZED VIEW bad5 AS SELECT g1.a FROM g1 JOIN g2 ON g1.a = g2.a JOIN g3 ON g2.a = g3.a JOIN g4 ON g3.a = g4.a JOIN g1 AS g5 ON g4.a = g5.a;
+    CREATE TABLE g5(a INTEGER);
+    INSERT INTO g1 VALUES (1), (2);
+    INSERT INTO g2 VALUES (1), (2);
+    INSERT INTO g3 VALUES (1), (2);
+    INSERT INTO g4 VALUES (1), (2);
+    INSERT INTO g5 VALUES (1), (2);
+    CREATE MATERIALIZED VIEW v5w AS
+      SELECT g1.rowid AS left_rid, g5.rowid AS right_rid, g1.a
+      FROM g1
+      JOIN g2 ON g1.a = g2.a
+      JOIN g3 ON g2.a = g3.a
+      JOIN g4 ON g3.a = g4.a
+      JOIN g5 ON g4.a = g5.a;
+    SELECT 'init', * FROM v5w ORDER BY 2;
+    BEGIN;
+    INSERT INTO g1 VALUES (3);
+    INSERT INTO g2 VALUES (3);
+    INSERT INTO g3 VALUES (3);
+    INSERT INTO g4 VALUES (3);
+    INSERT INTO g5 VALUES (3);
+    COMMIT;
+    SELECT 'after', * FROM v5w ORDER BY 2;
+    DELETE FROM g3 WHERE a = 1;
+    SELECT 'gone', * FROM v5w ORDER BY 2;
 }
-expect error {
-    materialized views with joins over more than 4 tables are not yet supported
+expect {
+    init|1|1|1
+    init|2|2|2
+    after|1|1|1
+    after|2|2|2
+    after|3|3|3
+    gone|2|2|2
+    gone|3|3|3
 }
 
 test matview-vdbe-materialized-view-dependency-chain {
@@ -2355,11 +2449,11 @@ test matview-vdbe-filtered-derived-input-arrangement {
     SELECT * FROM arranged_join ORDER BY 1;
     SELECT COUNT(*)
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_arrangement_v9_arranged_join__n%';
+     WHERE name LIKE '__turso_internal_dbsp_arrangement_v10_arranged_join__n%';
     DROP VIEW arranged_join;
     SELECT COUNT(*)
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_arrangement_v9_arranged_join__n%';
+     WHERE name LIKE '__turso_internal_dbsp_arrangement_v10_arranged_join__n%';
 }
 expect {
     1|ten
@@ -2719,17 +2813,17 @@ test matview-vdbe-node-owned-hidden-state {
       SELECT node_a.k FROM node_a JOIN node_b ON node_a.k = node_b.k;
     SELECT name
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_state_v9_node_catalog__n%'
-        OR name LIKE '__turso_internal_dbsp_arrangement_v9_node_catalog__n%'
+     WHERE name LIKE '__turso_internal_dbsp_state_v10_node_catalog__n%'
+        OR name LIKE '__turso_internal_dbsp_arrangement_v10_node_catalog__n%'
      ORDER BY name;
     DROP VIEW node_catalog;
     SELECT COUNT(*)
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_state_v9_node_catalog__n%';
+     WHERE name LIKE '__turso_internal_dbsp_state_v10_node_catalog__n%';
 }
 expect {
-    __turso_internal_dbsp_arrangement_v9_node_catalog__n7
-    __turso_internal_dbsp_state_v9_node_catalog__n1
+    __turso_internal_dbsp_arrangement_v10_node_catalog__n8
+    __turso_internal_dbsp_state_v10_node_catalog__n1
     0
 }
 

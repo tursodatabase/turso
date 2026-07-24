@@ -43,7 +43,7 @@ use turso_parser::{
 /// v8: a non-native operator output consumed by a join owns an explicit
 /// `(source identity, values, multiplicity)` arrangement. Its rowid is the
 /// stable identity published to the downstream join.
-pub const DBSP_CIRCUIT_VERSION: u32 = 9;
+pub const DBSP_CIRCUIT_VERSION: u32 = 10;
 
 /// Whether a version-stripped hidden-state key belongs to `view_name`.
 ///
