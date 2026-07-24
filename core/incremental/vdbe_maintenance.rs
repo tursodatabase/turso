@@ -57,19 +57,19 @@ mod sink;
 use sink::{emit_terminal_delta, ViewSink};
 
 mod output;
-use output::{EmittedNodeOutput, NodeOutput};
+use output::NodeOutput;
 
 mod source;
 use source::{materialize_node_output, scan_node_output};
 
 mod join;
-use join::{emit_join_deltas_to_ephemeral, emit_left_join_deltas_to_ephemeral, JoinContract};
+use join::{emit_inner_join, emit_left_join, JoinContract};
 
 mod aggregate;
 use aggregate::emit_group_aggregate;
 
 mod set_op;
-use set_op::emit_set_op_to_ephemeral;
+use set_op::emit_set_op;
 
 mod plan;
 pub use plan::{plan_view, MaintenancePlan, OperatorStateCatalog};
@@ -78,7 +78,7 @@ mod delta_cursor;
 pub use delta_cursor::DeltaCursor;
 
 mod linear;
-use linear::{emit_ephemeral_alias, emit_ephemeral_filter, emit_ephemeral_project};
+use linear::{emit_alias, emit_filter, emit_project};
 
 mod arrangement;
 use arrangement::publish_node_output;
@@ -282,20 +282,15 @@ fn emit_declared_delta_nodes_to(
                 })?;
                 let upstream =
                     materialize_node_output(program, view_name, upstream_id, upstream, input)?;
-                EmittedNodeOutput::new(
+                emit_filter(
+                    program,
+                    view_name,
                     node_id,
-                    emit_ephemeral_filter(
-                        program,
-                        view_name,
-                        node_id,
-                        &upstream,
-                        output_contract,
-                        predicate,
-                        schema,
-                        connection,
-                    )?,
-                    None,
+                    &upstream,
                     output_contract,
+                    predicate,
+                    schema,
+                    connection,
                 )?
             }
             dag::OpNode::Project {
@@ -315,20 +310,15 @@ fn emit_declared_delta_nodes_to(
                     upstream_output,
                     input,
                 )?;
-                EmittedNodeOutput::new(
+                emit_project(
+                    program,
+                    view_name,
                     node_id,
-                    emit_ephemeral_project(
-                        program,
-                        view_name,
-                        node_id,
-                        &upstream,
-                        projections,
-                        output_contract,
-                        schema,
-                        connection,
-                    )?,
-                    None,
+                    &upstream,
+                    projections,
                     output_contract,
+                    schema,
+                    connection,
                 )?
             }
             dag::OpNode::Alias {
@@ -347,12 +337,7 @@ fn emit_declared_delta_nodes_to(
                     upstream_output,
                     input,
                 )?;
-                EmittedNodeOutput::new(
-                    node_id,
-                    emit_ephemeral_alias(program, view_name, node_id, &upstream, output_contract)?,
-                    None,
-                    output_contract,
-                )?
+                emit_alias(program, view_name, node_id, &upstream, output_contract)?
             }
             dag::OpNode::Join { inputs, on, kind } => {
                 let declared_input = |input_id: dag::NodeId| {
@@ -365,46 +350,27 @@ fn emit_declared_delta_nodes_to(
                 let declared_inputs = [declared_input(inputs[0])?, declared_input(inputs[1])?];
                 let contract = JoinContract::from_outputs(declared_inputs, on)?;
                 if *kind == dag::JoinKind::LeftOuter {
-                    EmittedNodeOutput::new(
+                    emit_left_join(
+                        program,
+                        view_name,
                         node_id,
-                        emit_left_join_deltas_to_ephemeral(
-                            program,
-                            view_name,
-                            node_id,
-                            &contract,
-                            output_contract,
-                            input,
-                            operator_states.for_node(node_id)?,
-                            schema,
-                            connection,
-                        )?,
-                        None,
+                        &contract,
                         output_contract,
+                        input,
+                        operator_state,
+                        schema,
+                        connection,
                     )?
                 } else {
-                    let syms = connection.syms.read();
-                    let mut resolver = Resolver::new(
-                        schema,
-                        connection.database_schemas(),
-                        &connection.temp.database,
-                        connection.attached_databases(),
-                        &syms,
-                        connection.experimental_custom_types_enabled(),
-                        connection.get_dqs_dml().into(),
-                        Arc::new(crate::dialect::SqliteDialect),
-                    );
-                    EmittedNodeOutput::new(
+                    emit_inner_join(
+                        program,
+                        view_name,
                         node_id,
-                        emit_join_deltas_to_ephemeral(
-                            program,
-                            &mut resolver,
-                            view_name,
-                            output_contract,
-                            &contract,
-                            input,
-                        )?,
-                        None,
                         output_contract,
+                        &contract,
+                        input,
+                        schema,
+                        connection,
                     )?
                 }
             }
@@ -430,22 +396,17 @@ fn emit_declared_delta_nodes_to(
                         input,
                     )?);
                 }
-                EmittedNodeOutput::new(
+                emit_set_op(
+                    program,
+                    view_name,
                     node_id,
-                    emit_set_op_to_ephemeral(
-                        program,
-                        view_name,
-                        node_id,
-                        &channels,
-                        operators,
-                        *prefix_len,
-                        key_collations,
-                        output_contract,
-                        operator_states.for_node(node_id)?,
-                        schema,
-                    )?,
-                    None,
+                    &channels,
+                    operators,
+                    *prefix_len,
+                    key_collations,
                     output_contract,
+                    operator_state,
+                    schema,
                 )?
             }
             dag::OpNode::Aggregate {
@@ -475,7 +436,7 @@ fn emit_declared_delta_nodes_to(
                     *scalar,
                     input,
                     output_contract,
-                    operator_states.for_node(node_id)?,
+                    operator_state,
                     schema,
                     connection,
                 )?

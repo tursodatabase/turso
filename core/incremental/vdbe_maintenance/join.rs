@@ -1,5 +1,5 @@
 use super::binding::{make_joined_table, remap_bound_expr, BindingRemap};
-use super::output::{DeltaSource, NodeOutput, NodeOutputContract};
+use super::output::{DeltaSource, EmittedNodeOutput, NodeOutput, NodeOutputContract};
 use super::plan::OperatorStateDef;
 use super::stream::{
     open_ephemeral_delta, ArrangementHandle, ArrangementIdentityColumn, DeltaIdentity,
@@ -486,18 +486,19 @@ fn emit_join_phase(
 /// aggregate arguments, filters, and projections are evaluated by their own
 /// operators from this stream.
 ///
-/// Returns the ephemeral cursor and its row layout. The cursor's
-/// [`dag::StreamSchema`] owns the logical binding namespace used by the
-/// aggregate consumer.
+/// The returned emitted output is validated against the node's planned
+/// identity and binding namespace before the dispatcher can publish it.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn emit_join_deltas_to_ephemeral(
+pub(super) fn emit_inner_join(
     program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
     view_name: &str,
+    node_id: dag::NodeId,
     output_contract: &NodeOutputContract,
     contract: &JoinContract,
     input: MaintenanceInput,
-) -> Result<DeltaSource> {
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<EmittedNodeOutput> {
     let width = output_contract.schema.len();
     let natural_width = contract
         .inputs
@@ -511,7 +512,7 @@ pub(super) fn emit_join_deltas_to_ephemeral(
 
     let channel = open_ephemeral_delta(
         program,
-        &format!("{view_name}_joined_delta"),
+        &format!("{view_name}_join_delta_{node_id}"),
         output_contract.schema.as_ref().clone(),
         output_contract.emitted_identity,
         output_contract.binding_rowids.clone(),
@@ -525,6 +526,18 @@ pub(super) fn emit_join_deltas_to_ephemeral(
     let eph_weight_reg = eph_rec_start + channel.weight_column;
     let eph_rowid_reg = program.alloc_register();
     let eph_record_reg = program.alloc_register();
+
+    let syms = connection.syms.read();
+    let mut resolver = Resolver::new(
+        schema,
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        &syms,
+        connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
+        Arc::new(crate::dialect::SqliteDialect),
+    );
 
     let emit_eph_insert = |program: &mut ProgramBuilder| {
         program.emit_insn(Insn::MakeRecord {
@@ -551,7 +564,7 @@ pub(super) fn emit_join_deltas_to_ephemeral(
     for &(sides, negate) in binary_join_phases(input) {
         emit_join_phase(
             program,
-            resolver,
+            &mut resolver,
             view_name,
             contract,
             &sides,
@@ -685,7 +698,8 @@ pub(super) fn emit_join_deltas_to_ephemeral(
         )?;
     }
 
-    Ok(DeltaSource::Ephemeral(channel))
+    drop(syms);
+    EmittedNodeOutput::from_ephemeral(node_id, channel, output_contract)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -792,7 +806,7 @@ fn emit_natural_join_values(
 /// output arrangement then normalizes both key forms to one operator rowid
 /// before any downstream consumer sees them.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn emit_left_join_deltas_to_ephemeral(
+pub(super) fn emit_left_join(
     program: &mut ProgramBuilder,
     view_name: &str,
     node_id: dag::NodeId,
@@ -802,7 +816,7 @@ pub(super) fn emit_left_join_deltas_to_ephemeral(
     operator_state: &OperatorStateDef,
     schema: &Schema,
     connection: &Arc<Connection>,
-) -> Result<DeltaSource> {
+) -> Result<EmittedNodeOutput> {
     let output = open_ephemeral_delta(
         program,
         &format!("{view_name}_left_join_delta_{node_id}"),
@@ -1105,7 +1119,7 @@ pub(super) fn emit_left_join_deltas_to_ephemeral(
     });
     program.preassign_label_to_next_insn(end_label);
     drop(syms);
-    Ok(DeltaSource::Ephemeral(output))
+    EmittedNodeOutput::from_ephemeral(node_id, output, output_contract)
 }
 
 /// Consumer hook that materializes one NULL-padded output row: given the
