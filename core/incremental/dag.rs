@@ -158,7 +158,8 @@ pub enum OpNode {
         /// scalar aggregate (`scalar`).
         group_exprs: Vec<ast::Expr>,
         group_collations: Vec<CollationSeq>,
-        /// `aggregates[0]` is the hidden liveness `COUNT(*)`.
+        /// `aggregates[0]` is the hidden liveness `COUNT(*)`. Its physical
+        /// output column is not published as a SQL expression.
         aggregates: Vec<Aggregate>,
         /// Value-key collation for each aggregate-owned multiset. Entries are
         /// aligned with `aggregates`; `None` means the aggregate has no
@@ -358,12 +359,10 @@ impl DagBuilder {
                 group_exprs
                     .iter()
                     .cloned()
-                    .chain(
-                        aggregates
-                            .iter()
-                            .map(|aggregate| aggregate.original_expr.clone()),
-                    )
                     .map(Some)
+                    .chain(aggregates.iter().enumerate().map(|(index, aggregate)| {
+                        (index != 0).then(|| aggregate.original_expr.clone())
+                    }))
                     .collect(),
                 self.output_schemas[*input].bindings.clone(),
             ),
@@ -393,7 +392,9 @@ impl DagBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::function::AggFunc;
     use crate::schema::BTreeCharacteristics;
+    use crate::translate::plan::Distinctness;
 
     fn scan(name: &str, id: usize) -> OpNode {
         OpNode::Scan {
@@ -423,5 +424,43 @@ mod tests {
         assert!(error
             .to_string()
             .contains("every maintenance DAG node must contribute to the root"));
+    }
+
+    #[test]
+    fn aggregate_schema_does_not_publish_hidden_liveness_count() {
+        let count = ast::Expr::FunctionCallStar {
+            name: ast::Name::exact("count".to_string()),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        let aggregate = || {
+            Aggregate::new(
+                AggFunc::Count0,
+                &[],
+                &count,
+                Distinctness::NonDistinct,
+                None,
+            )
+        };
+        let mut builder = DagBuilder::new();
+        let input = builder.push(scan("t", 0)).unwrap();
+        let root = builder
+            .push(OpNode::Aggregate {
+                input,
+                group_exprs: vec![count.clone()],
+                group_collations: vec![CollationSeq::Binary],
+                aggregates: vec![aggregate(), aggregate()],
+                multiset_collations: vec![None, None],
+                scalar: false,
+            })
+            .unwrap();
+        let dag = builder.finish(root).unwrap();
+
+        assert_eq!(
+            dag.root_schema().columns,
+            vec![Some(count.clone()), None, Some(count)]
+        );
     }
 }

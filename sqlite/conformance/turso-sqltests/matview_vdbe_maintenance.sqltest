@@ -1569,13 +1569,56 @@ expect {
     1|z|p
 }
 
-test matview-vdbe-join-distinct-aggregate-rejected {
+# DISTINCT composes after an aggregate over a join. As grouped counts collide
+# and diverge, the downstream dedup node tracks result-row multiplicity.
+test matview-vdbe-join-distinct-aggregate {
     CREATE TABLE jl8(x INTEGER);
     CREATE TABLE jr8(y INTEGER);
-    CREATE MATERIALIZED VIEW bad8 AS SELECT DISTINCT COUNT(*) FROM jl8 JOIN jr8 ON x = y;
+    INSERT INTO jl8 VALUES (1), (1), (2);
+    INSERT INTO jr8 VALUES (1), (1), (2);
+    CREATE VIEW regular_vda8 AS
+      SELECT DISTINCT COUNT(*) AS c
+      FROM jl8 JOIN jr8 ON x = y
+      GROUP BY x;
+    CREATE MATERIALIZED VIEW vda8 AS
+      SELECT DISTINCT COUNT(*) AS c
+      FROM jl8 JOIN jr8 ON x = y
+      GROUP BY x;
+    CREATE VIEW vda8_parity AS
+      WITH
+        missing AS (SELECT * FROM regular_vda8 EXCEPT SELECT * FROM vda8),
+        extra AS (SELECT * FROM vda8 EXCEPT SELECT * FROM regular_vda8)
+      SELECT
+        (SELECT COUNT(*) FROM missing) + (SELECT COUNT(*) FROM extra)
+          AS mismatches;
+    SELECT * FROM vda8 ORDER BY c;
+    SELECT 'parity', * FROM vda8_parity;
+    DELETE FROM jl8 WHERE rowid = 1;
+    SELECT * FROM vda8 ORDER BY c;
+    SELECT 'parity', * FROM vda8_parity;
+    INSERT INTO jr8 VALUES (2);
+    SELECT * FROM vda8 ORDER BY c;
+    SELECT 'parity', * FROM vda8_parity;
+    DELETE FROM jl8 WHERE x = 1;
+    SELECT * FROM vda8 ORDER BY c;
+    SELECT 'parity', * FROM vda8_parity;
+    DELETE FROM jr8 WHERE y = 2;
+    SELECT COUNT(*) FROM vda8;
+    SELECT 'parity', * FROM vda8_parity;
 }
-expect error {
-    materialized views with DISTINCT over aggregates are not yet supported
+expect {
+    1
+    4
+    parity|0
+    1
+    2
+    parity|0
+    2
+    parity|0
+    2
+    parity|0
+    0
+    parity|0
 }
 
 # SELECT DISTINCT is maintained as GROUP BY over every result column: one
@@ -1744,12 +1787,62 @@ expect {
     0
 }
 
-test matview-vdbe-distinct-over-aggregates-rejected {
-    CREATE TABLE t35(g TEXT, x INTEGER);
-    CREATE MATERIALIZED VIEW bad35 AS SELECT DISTINCT COUNT(*) FROM t35 GROUP BY g;
+# Projection and DISTINCT are independent downstream operators. Equivalent
+# aggregate results therefore share one output row until the last producing
+# group changes or disappears.
+test matview-vdbe-distinct-over-aggregates {
+    CREATE TABLE t35(id INTEGER PRIMARY KEY, g TEXT, x INTEGER);
+    INSERT INTO t35 VALUES
+      (1, 'a', 10),
+      (2, 'b', 20),
+      (3, 'c', 30),
+      (4, 'c', 40);
+    CREATE VIEW regular_v35 AS
+      SELECT DISTINCT COUNT(*) AS c FROM t35 GROUP BY g;
+    CREATE MATERIALIZED VIEW v35 AS
+      SELECT DISTINCT COUNT(*) AS c FROM t35 GROUP BY g;
+    CREATE VIEW v35_parity AS
+      WITH
+        missing AS (SELECT * FROM regular_v35 EXCEPT SELECT * FROM v35),
+        extra AS (SELECT * FROM v35 EXCEPT SELECT * FROM regular_v35)
+      SELECT
+        (SELECT COUNT(*) FROM missing) + (SELECT COUNT(*) FROM extra)
+          AS mismatches;
+    SELECT * FROM v35 ORDER BY c;
+    SELECT 'parity', * FROM v35_parity;
+    INSERT INTO t35 VALUES (5, 'a', 50);
+    SELECT * FROM v35 ORDER BY c;
+    SELECT 'parity', * FROM v35_parity;
+    INSERT INTO t35 VALUES (6, 'b', 60);
+    SELECT * FROM v35 ORDER BY c;
+    SELECT 'parity', * FROM v35_parity;
+    DELETE FROM t35 WHERE id = 4;
+    SELECT * FROM v35 ORDER BY c;
+    SELECT 'parity', * FROM v35_parity;
+    DELETE FROM t35 WHERE id IN (1, 5);
+    SELECT * FROM v35 ORDER BY c;
+    SELECT 'parity', * FROM v35_parity;
+    DELETE FROM t35 WHERE id = 3;
+    SELECT * FROM v35 ORDER BY c;
+    SELECT 'parity', * FROM v35_parity;
 }
-expect error {
-    materialized views with DISTINCT over aggregates are not yet supported
+expect {
+    1
+    2
+    parity|0
+    1
+    2
+    parity|0
+    2
+    parity|0
+    1
+    2
+    parity|0
+    1
+    2
+    parity|0
+    2
+    parity|0
 }
 
 # A pair can be retracted by the delta phases before its insertion arrives
