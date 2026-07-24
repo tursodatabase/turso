@@ -8,6 +8,7 @@ impl Cmd {
         match self {
             Self::Explain(stmt) => stmt,
             Self::ExplainQueryPlan(stmt) => stmt,
+            Self::ExplainPostgres(stmt) => stmt,
             Self::Stmt(stmt) => stmt,
         }
     }
@@ -16,12 +17,16 @@ impl Cmd {
         match self {
             Self::Explain(_) => ColumnCount::Fixed(8),
             Self::ExplainQueryPlan(_) => ColumnCount::Fixed(4),
+            Self::ExplainPostgres(_) => ColumnCount::Fixed(1),
             Self::Stmt(stmt) => stmt.column_count(),
         }
     }
     /// Like `sqlite3_stmt_isexplain`
     pub fn is_explain(&self) -> bool {
-        matches!(self, Self::Explain(_) | Self::ExplainQueryPlan(_))
+        matches!(
+            self,
+            Self::Explain(_) | Self::ExplainQueryPlan(_) | Self::ExplainPostgres(_)
+        )
     }
     /// Like `sqlite3_stmt_readonly`
     pub fn readonly(&self) -> bool {

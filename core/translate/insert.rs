@@ -9,6 +9,7 @@ use crate::{
     },
     sync::Arc,
     translate::{
+        display::render_postgres_insert,
         emitter::{
             delete::emit_fk_child_decrement_on_delete, emit_cdc_autocommit_commit,
             emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, emit_check_constraints,
@@ -47,7 +48,9 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         affinity::Affinity,
-        builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts},
+        builder::{
+            CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts, QueryMode,
+        },
         insn::{to_u16, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset,
     },
@@ -291,6 +294,9 @@ pub fn translate_insert(
             resolver,
             connection,
         )?;
+        if program.get_query_mode() == QueryMode::ExplainPostgres {
+            program.wrap_postgres_explain_insert(render_postgres_insert(table.get_name()));
+        }
         return Ok(());
     }
 
@@ -1204,6 +1210,9 @@ pub fn translate_insert(
 
     program.result_columns = result_columns;
     program.table_references.extend(table_references);
+    if program.get_query_mode() == QueryMode::ExplainPostgres {
+        program.wrap_postgres_explain_insert(render_postgres_insert(table.get_name()));
+    }
     Ok(())
 }
 

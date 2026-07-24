@@ -164,7 +164,7 @@ fn prepare_statement(conn: &Arc<Connection>, sql: &str) -> Result<Statement> {
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
-    reject_catalog_dml(&translated.stmt)?;
+    reject_catalog_dml(translated.cmd.stmt())?;
 
     for prereq in translated.prereqs {
         let input = prereq.to_string();
@@ -172,7 +172,7 @@ fn prepare_statement(conn: &Arc<Connection>, sql: &str) -> Result<Statement> {
         stmt.run_ignore_rows()?;
     }
 
-    conn.prepare_translated_stmt(translated.stmt, sql)
+    conn.prepare_translated_cmd(translated.cmd, sql)
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {

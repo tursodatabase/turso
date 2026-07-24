@@ -7,12 +7,13 @@ use crate::schema::Table;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
+use crate::translate::display::render_postgres_explain;
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
     bind_and_rewrite_expr, expr_vector_size, walk_expr, BindingBehavior, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
-use crate::translate::optimizer::optimize_plan;
+use crate::translate::optimizer::{optimize_plan, optimize_plan_for_postgres_explain};
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
 use crate::translate::planner::{
     append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries, parse_from,
@@ -24,7 +25,10 @@ use crate::translate::window::plan_windows;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
-use crate::{vdbe::builder::ProgramBuilder, Result};
+use crate::{
+    vdbe::builder::{ProgramBuilder, QueryMode},
+    Result,
+};
 use std::borrow::Cow;
 use turso_parser::ast::ResultColumn;
 use turso_parser::ast::SortOrder;
@@ -66,7 +70,12 @@ pub fn emit_select_plan(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    optimize_plan(program, &mut plan, resolver)?;
+    if program.get_query_mode() == QueryMode::ExplainPostgres {
+        let postgres_explain = optimize_plan_for_postgres_explain(program, &mut plan, resolver)?;
+        program.set_postgres_explain(render_postgres_explain(&plan, postgres_explain.as_ref()));
+    } else {
+        optimize_plan(program, &mut plan, resolver)?;
+    }
     let num_result_cols;
     let opts = match &plan {
         Plan::Select(select) => {
