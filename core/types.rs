@@ -3352,6 +3352,15 @@ impl IOCompletions {
         io.wait_for_completion(self.0)
     }
 
+    /// Drive the IO backend until these completions finish without observing
+    /// their result. The operation that owns the completions remains
+    /// responsible for error handling and cleanup on re-entry.
+    pub fn wait_for_finish<I: ?Sized + IO>(&self, io: &I) -> Result<()> {
+        match self {
+            IOCompletions::Single(c) => io.drain_completions(std::slice::from_ref(c)),
+        }
+    }
+
     /// Waits for Completion to complete and `steps` IO. Ideally the user should do the stepping,
     /// but we do not have yet a good api for this
     pub async fn wait_async<I: ?Sized + IO>(self, io: &I) -> Result<()> {

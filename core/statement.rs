@@ -467,6 +467,17 @@ impl Statement {
         self.state.io_completions.take()
     }
 
+    /// Wait for the statement's pending I/O without taking it from VDBE state.
+    ///
+    /// The next statement step still observes completion errors and performs
+    /// the required cleanup.
+    pub fn wait_for_io(&self) -> Result<()> {
+        if let Some(io) = &self.state.io_completions {
+            io.wait_for_finish(self.pager.io.as_ref())?;
+        }
+        Ok(())
+    }
+
     fn arm_query_timeout_if_needed(&mut self) {
         if !matches!(self.state.execution_state, ProgramExecutionState::Init)
             || self.state.query_deadline.is_some()
@@ -678,7 +689,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.wait_for_io()?,
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
                     return Err(LimboError::Busy)
@@ -692,7 +703,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.wait_for_io()?,
                 vdbe::StepResult::Row => {
                     values.push(self.row().unwrap().get_values().cloned().collect());
                     continue;
@@ -712,7 +723,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => break,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.wait_for_io()?,
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
                 }
@@ -794,7 +805,7 @@ impl Statement {
                 vdbe::StepResult::Done => break None,
                 vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     pre_io_func()?;
-                    self.pager.io.step()?;
+                    self.wait_for_io()?;
                     post_io_func()?;
                 }
                 vdbe::StepResult::Row => break Some(self.row().expect("row should be present")),
@@ -1384,8 +1395,8 @@ impl Statement {
                             halt_completed = true;
                             break;
                         }
-                        Ok(vdbe::execute::InsnFunctionStepResult::IO(_)) => {
-                            if let Err(e) = self.pager.io.step() {
+                        Ok(vdbe::execute::InsnFunctionStepResult::IO(io)) => {
+                            if let Err(e) = io.wait_for_finish(self.pager.io.as_ref()) {
                                 capture_reset_error(
                                     &mut reset_error,
                                     e,

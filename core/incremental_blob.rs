@@ -47,12 +47,12 @@ enum StepOutcome {
 
 /// Advance `stmt` to its next stop, pumping IO and mapping Interrupt/Busy to
 /// [`LimboError::Busy`]. The single step loop behind read/write/close/open.
-fn pump_step(stmt: &mut Statement, pager: &Pager) -> Result<StepOutcome> {
+fn pump_step(stmt: &mut Statement, _pager: &Pager) -> Result<StepOutcome> {
     loop {
         match stmt.step()? {
             StepResult::Row => return Ok(StepOutcome::Row),
             StepResult::Done => return Ok(StepOutcome::Done),
-            StepResult::IO | StepResult::Yield => pager.io.step()?,
+            StepResult::IO | StepResult::Yield => stmt.wait_for_io()?,
             StepResult::Interrupt | StepResult::Busy => return Err(LimboError::Busy),
         }
     }

@@ -217,6 +217,39 @@ pub async fn test_execute_batch() {
     }
 }
 
+#[cfg(target_os = "windows")]
+#[tokio::test]
+async fn test_iocp_multiprocess_wal_execute_batch_create_table_completes() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("repro.sqlite");
+    let db = Builder::new_local(path.to_str().unwrap())
+        .with_io("experimental_win_iocp")
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+
+    let mut rows = conn.query("PRAGMA user_version", ()).await.unwrap();
+    rows.next().await.unwrap().unwrap();
+    drop(rows);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        conn.execute_batch("CREATE TABLE repro (value INTEGER);"),
+    )
+    .await
+    .expect("CREATE TABLE should not hang with IOCP and multiprocess WAL")
+    .unwrap();
+
+    conn.execute("INSERT INTO repro VALUES (42)", ())
+        .await
+        .unwrap();
+    let mut rows = conn.query("SELECT value FROM repro", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get_value(0).unwrap(), Value::Integer(42));
+}
+
 #[tokio::test]
 async fn test_query_row_returns_first_row() {
     let db = Builder::new_local(":memory:").build().await.unwrap();

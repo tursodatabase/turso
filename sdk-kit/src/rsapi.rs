@@ -1279,7 +1279,7 @@ fn step_inner(
                 if async_io {
                     Ok(TursoStatusCode::Io)
                 } else {
-                    stmt._io().step()?;
+                    stmt.wait_for_io()?;
                     continue;
                 }
             }
@@ -1449,6 +1449,7 @@ impl TursoStatement {
         stmt._io().step()?;
         Ok(())
     }
+
     /// get row value as an owned Value
     #[inline]
     pub fn row_value(&self, index: usize) -> Result<turso_core::Value, TursoError> {
@@ -1597,6 +1598,32 @@ mod tests {
             io: None,
             db_file: None,
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn synchronous_iocp_statement_waits_for_poller() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("iocp.db");
+        let database = TursoDatabase::new(TursoDatabaseConfig {
+            path: path.to_string_lossy().into_owned(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: IoBackend::IOCP,
+            io: None,
+            db_file: None,
+        });
+        assert!(!database.open().unwrap().is_io());
+        let connection = database.connect().unwrap();
+        let mut statement = connection
+            .prepare_single("CREATE TABLE sync_iocp (value INTEGER)")
+            .unwrap();
+
+        assert_eq!(
+            statement.execute(None).unwrap().status,
+            TursoStatusCode::Done
+        );
     }
 
     #[test]

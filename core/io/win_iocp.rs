@@ -62,6 +62,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     FORMAT_MESSAGE_IGNORE_INSERTS,
 };
 
+use std::sync::{Condvar, Mutex as StdMutex};
 use std::{io, mem, ptr};
 use tracing::{debug, instrument, trace, warn, Level};
 
@@ -94,6 +95,7 @@ use windows_sys::Win32::System::IO::{
 // Constants
 
 const CACHING_CAPACITY: usize = 128;
+const IOCP_POLLER_TIMEOUT_MS: u32 = 10;
 //TODO: enable this or remove when direct IO stabilized
 const ENABLE_DIRECT_IO: bool = false;
 const ENABLE_LOCK_ON_OPEN: bool = true;
@@ -270,9 +272,9 @@ impl WindowsIOCP {
         if iocp_queue_handle == INVALID_HANDLE_VALUE {
             return Err(LimboError::NullValue);
         }
-        Ok(Self {
-            instance: InnerWindowsIOCP::new(iocp_queue_handle),
-        })
+        let instance = InnerWindowsIOCP::new(iocp_queue_handle);
+        InnerWindowsIOCP::spawn_poller(&instance)?;
+        Ok(Self { instance })
     }
 }
 
@@ -415,17 +417,20 @@ impl IO for WindowsIOCP {
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn step(&self) -> Result<()> {
-        trace!("I/O Step..");
+        // The poller is the sole GetQueuedCompletionStatus consumer.
+        self.instance.poller_error()
+    }
 
-        match self.instance.process_packet_from_iocp() {
-            Err(GetIOCPPacketError::SystemError(code)) => {
-                Err(get_generic_limboerror_from_os_err(code))
-            }
-            Err(GetIOCPPacketError::Aborted)
-            | Err(GetIOCPPacketError::Empty)
-            | Err(GetIOCPPacketError::InvalidIO)
-            | Ok(()) => Ok(()),
+    fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
+        self.instance.wait_for_completions(completions)
+    }
+
+    fn wait_for_completion(&self, c: Completion) -> Result<()> {
+        self.drain_completions(std::slice::from_ref(&c))?;
+        if let Some(err) = c.get_error() {
+            return Err(err.into());
         }
+        Ok(())
     }
 }
 
@@ -445,6 +450,14 @@ pub struct InnerWindowsIOCP {
     iocp_queue_handle: HANDLE,
     free_io_packets: Mutex<VecDeque<IoPacket>>,
     tracked_io_packets: Mutex<HashMap<CompletionKey, IoContext>>,
+    poller_state: StdMutex<PollerState>,
+    poller_ready: Condvar,
+}
+
+#[derive(Default)]
+struct PollerState {
+    generation: u64,
+    error: Option<LimboError>,
 }
 
 unsafe impl Send for InnerWindowsIOCP {}
@@ -467,7 +480,106 @@ impl InnerWindowsIOCP {
             iocp_queue_handle: iocp_handle,
             free_io_packets: Mutex::new(free_packets),
             tracked_io_packets: Mutex::new(HashMap::with_capacity(CACHING_CAPACITY)),
+            poller_state: StdMutex::new(PollerState::default()),
+            poller_ready: Condvar::new(),
         })
+    }
+
+    fn spawn_poller(instance: &Arc<Self>) -> Result<()> {
+        let instance = Arc::downgrade(instance);
+        std::thread::Builder::new()
+            .name("turso-iocp-poller".to_string())
+            .spawn(move || loop {
+                let Some(instance) = instance.upgrade() else {
+                    return;
+                };
+
+                match instance.process_packet_from_iocp(IOCP_POLLER_TIMEOUT_MS) {
+                    Ok(()) => instance.signal_poller_progress(),
+                    Err(GetIOCPPacketError::Empty)
+                    | Err(GetIOCPPacketError::Aborted)
+                    | Err(GetIOCPPacketError::InvalidIO) => {}
+                    Err(GetIOCPPacketError::SystemError(code)) => {
+                        let error = get_generic_limboerror_from_os_err(code);
+                        let io_error = i32::try_from(code)
+                            .map(std::io::Error::from_raw_os_error)
+                            .map(|error| error.kind())
+                            .unwrap_or(std::io::ErrorKind::Other);
+                        instance.fail_tracked_completions(CompletionError::IOError(
+                            io_error,
+                            "iocp-poller",
+                        ));
+                        instance.signal_poller_error(error);
+                        return;
+                    }
+                }
+            })
+            .map(|_| ())
+            .map_err(|error| LimboError::InternalError(format!("failed to spawn IOCP poller: {error}")))
+    }
+
+    fn signal_poller_progress(&self) {
+        let mut state = self
+            .poller_state
+            .lock()
+            .expect("IOCP poller state mutex poisoned");
+        state.generation = state.generation.wrapping_add(1);
+        self.poller_ready.notify_all();
+    }
+
+    fn signal_poller_error(&self, error: LimboError) {
+        let mut state = self
+            .poller_state
+            .lock()
+            .expect("IOCP poller state mutex poisoned");
+        state.error = Some(error);
+        state.generation = state.generation.wrapping_add(1);
+        self.poller_ready.notify_all();
+    }
+
+    fn poller_error(&self) -> Result<()> {
+        let state = self
+            .poller_state
+            .lock()
+            .expect("IOCP poller state mutex poisoned");
+        if let Some(error) = &state.error {
+            return Err(error.clone());
+        }
+        Ok(())
+    }
+
+    fn wait_for_completions(&self, completions: &[Completion]) -> Result<()> {
+        let mut state = self
+            .poller_state
+            .lock()
+            .expect("IOCP poller state mutex poisoned");
+        while completions.iter().any(|completion| !completion.finished()) {
+            if let Some(error) = &state.error {
+                return Err(error.clone());
+            }
+            let generation = state.generation;
+            state = self
+                .poller_ready
+                .wait_while(state, |state| {
+                    state.generation == generation
+                        && state.error.is_none()
+                        && completions.iter().any(|completion| !completion.finished())
+                })
+                .expect("IOCP poller state mutex poisoned");
+        }
+        Ok(())
+    }
+
+    fn fail_tracked_completions(&self, error: CompletionError) {
+        let completions = self
+            .tracked_io_packets
+            .lock()
+            .values()
+            .filter_map(|context| context.io_packet.completion.clone())
+            .collect::<Vec<_>>();
+        for completion in completions {
+            completion.error(error);
+        }
     }
 
     fn recycle_or_create_io_packet(&self) -> IoPacket {
@@ -571,7 +683,7 @@ impl InnerWindowsIOCP {
         None
     }
 
-    fn process_packet_from_iocp(&self) -> Result<(), GetIOCPPacketError> {
+    fn process_packet_from_iocp(&self, timeout_ms: u32) -> Result<(), GetIOCPPacketError> {
         let mut overlapped_ptr = ptr::null_mut();
         let mut bytes_received = 0;
         let mut iocp_key = 0;
@@ -582,7 +694,7 @@ impl InnerWindowsIOCP {
                 &raw mut bytes_received,
                 &raw mut iocp_key,
                 &raw mut overlapped_ptr,
-                0,
+                timeout_ms,
             )
         };
 
@@ -654,7 +766,7 @@ impl InnerWindowsIOCP {
 
     fn drain(&self) -> Result<()> {
         loop {
-            match self.process_packet_from_iocp() {
+            match self.process_packet_from_iocp(0) {
                 Err(GetIOCPPacketError::Empty | GetIOCPPacketError::Aborted) => {
                     break;
                 }
@@ -1169,7 +1281,15 @@ impl Drop for WindowsFile {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        task::{Wake, Waker},
+        thread,
+        time::{Duration, Instant},
+    };
 
     use crate::{
         io::{common, win_iocp::get_generic_limboerror_from_os_err, OpenFlags, TempFile},
@@ -1177,6 +1297,39 @@ mod tests {
     };
 
     use super::WindowsIOCP;
+
+    #[derive(Default)]
+    struct CompletionWaker(AtomicBool);
+
+    impl Wake for CompletionWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_poller_completes_and_wakes_without_step() {
+        let iocp: Arc<dyn IO> = Arc::new(WindowsIOCP::new().unwrap());
+        let file = TempFile::new(&iocp).unwrap();
+        let completion = Completion::new_write(|result| assert_eq!(result, Ok(4)));
+        let buffer = Arc::new(Buffer::new_temporary(4));
+        buffer.as_mut_slice().copy_from_slice(b"wake");
+        let completion = file.pwrite(0, buffer, completion).unwrap();
+
+        let wake = Arc::new(CompletionWaker::default());
+        completion.set_waker(&Waker::from(wake.clone()));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !wake.0.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(
+            wake.0.load(Ordering::SeqCst),
+            "IOCP poller did not wake completion"
+        );
+        assert!(completion.succeeded());
+    }
 
     #[test]
     fn test_file_read_write() {

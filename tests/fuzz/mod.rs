@@ -4249,13 +4249,35 @@ mod fuzz_tests {
                     .push_str(")")
                     .build(),
             )
+            // Avoid nested expressions for atan2 because tiny libm differences near
+            // (0, 0) can cross the branch cut and produce different quadrants.
+            .option(
+                g.create()
+                    .concat("")
+                    .push_str("atan2(")
+                    .push(
+                        g.create()
+                            .choice()
+                            .options_str(["-2.0", "-1.0", "0.5", "1.0", "2.0"])
+                            .build(),
+                    )
+                    .push_str(", ")
+                    .push(
+                        g.create()
+                            .choice()
+                            .options_str(["-2.0", "-1.0", "0.5", "1.0", "2.0"])
+                            .build(),
+                    )
+                    .push_str(")")
+                    .build(),
+            )
             .option(
                 g.create()
                     .concat("")
                     .push(
                         g.create()
                             .choice()
-                            .options_str(["atan2", "log", "mod", "pow", "power"])
+                            .options_str(["log", "mod", "pow", "power"])
                             .build(),
                     )
                     .push_str("(")

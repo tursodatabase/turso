@@ -929,9 +929,9 @@ mod tests {
     use reqwest::Client;
     use serde_json::json;
     use std::{
-        env,
+        env, fs,
+        net::TcpListener,
         process::{Child, Command, Stdio},
-        thread::sleep,
         time::Duration,
     };
     use tempfile::TempDir;
@@ -1020,6 +1020,7 @@ mod tests {
         db_url: String,
         host: String,
         server: Option<Child>,
+        _temp_dir: Option<TempDir>,
         client: Client,
     }
 
@@ -1060,32 +1061,64 @@ mod tests {
                     db_url: format!("{}://{}--{}--{}.{}", tokens[0], name, name, name, tokens[1]),
                     host: format!("{name}--{name}--{name}.localhost"),
                     server: None,
+                    _temp_dir: None,
                     client,
                 })
             } else {
-                let port: u16 = rand::rng().random_range(10_000..=65_535);
+                let listener = TcpListener::bind("0.0.0.0:0")
+                    .context("failed to reserve a local sync server port")?;
+                let port = listener
+                    .local_addr()
+                    .context("failed to read local sync server port")?
+                    .port();
+                drop(listener);
                 let server_bin = env::var("LOCAL_SYNC_SERVER").unwrap();
+                let temp_dir =
+                    TempDir::new().context("failed to create local sync server db dir")?;
+                let db_path = temp_dir.path().join("remote.db");
+                let db_path_arg = db_path.to_string_lossy().into_owned();
+                let stderr_path = temp_dir.path().join("sync-server.stderr");
+                let stderr = fs::File::create(&stderr_path)
+                    .context("failed to create local sync server log")?;
+                let address = format!("0.0.0.0:{port}");
 
                 // IMPORTANT: do not use Stdio::piped() here. Nothing reads from
                 // those pipes, so once the kernel pipe buffer (~64 KiB on Linux)
                 // fills, the child blocks forever inside write() and stops
                 // servicing HTTP requests, deadlocking sync operations in
                 // long-running tests like test_sync_parallel_writes_with_sync_ops.
-                let child = Command::new(server_bin)
-                    .args(["--sync-server", &format!("0.0.0.0:{port}")])
+                let mut child = Command::new(server_bin)
+                    .arg(&db_path_arg)
+                    .args(["--sync-server", &address])
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
+                    .stderr(stderr)
                     .spawn()
                     .context("failed to spawn local sync server")?;
 
                 let user_url = format!("http://localhost:{port}");
 
                 // wait for server readiness
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
                 loop {
+                    if let Some(status) = child
+                        .try_wait()
+                        .context("failed to inspect local sync server")?
+                    {
+                        let stderr = fs::read_to_string(&stderr_path)
+                            .context("failed to read local sync server log")?;
+                        return Err(anyhow!(
+                            "local sync server exited before becoming ready: {status}\n{stderr}"
+                        ));
+                    }
                     if client.get(&user_url).send().await.is_ok() {
                         break;
                     }
-                    sleep(Duration::from_millis(100));
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(anyhow!(
+                            "local sync server did not become ready within 30 seconds"
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
 
                 Ok(Self {
@@ -1093,6 +1126,7 @@ mod tests {
                     db_url: user_url,
                     host: String::new(),
                     server: Some(child),
+                    _temp_dir: Some(temp_dir),
                     client,
                 })
             }

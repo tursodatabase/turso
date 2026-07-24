@@ -427,10 +427,7 @@ impl Statement {
 
     /// Execute this prepared statement.
     pub async fn execute(&mut self, params: impl IntoParams) -> Result<u64> {
-        {
-            // Reset the statement before executing
-            self.inner.lock().unwrap().reset()?;
-        }
+        self.reset()?;
         let params = params.into_params()?;
         match params {
             params::Params::None => (),

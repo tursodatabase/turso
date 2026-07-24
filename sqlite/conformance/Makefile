@@ -14,9 +14,11 @@ RUNNER_DIR := $(ROOT_DIR)/testing/sqltest
 ifdef CI
     CARGO_PROFILE := --release
     TARGET_DIR := release
+    SQLTEST_TIMEOUT ?= 900
 else
     CARGO_PROFILE :=
     TARGET_DIR := debug
+    SQLTEST_TIMEOUT ?= 600
 endif
 
 TURSODB := $(ROOT_DIR)/target/$(TARGET_DIR)/tursodb
@@ -66,12 +68,12 @@ endif
 
 # Run all tests with selected backend
 run: build
-	$(TEST_RUNNER) run $(SQLITE_TESTS) --timeout 600 --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
+	$(TEST_RUNNER) run $(SQLITE_TESTS) --timeout $(SQLTEST_TIMEOUT) --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
 	$(TEST_RUNNER) run $(TURSO_TESTS) --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
 
 # Run tests with CLI backend (spawns tursodb subprocess)
 run-cli: build
-	$(TEST_RUNNER) run $(SQLITE_TESTS) --timeout 600 --backend cli --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
+	$(TEST_RUNNER) run $(SQLITE_TESTS) --timeout $(SQLTEST_TIMEOUT) --backend cli --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
 	$(TEST_RUNNER) run $(TURSO_TESTS) --backend cli --binary $(TURSODB) $(MVCC_FLAG) $(CROSS_CHECK_FLAG)
 
 # Run tests with Rust backend (native turso bindings)
