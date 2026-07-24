@@ -4,7 +4,7 @@ use magnus::{
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::TursoConnection;
 
-use crate::error::from_turso_error;
+use crate::blocking_op::run_blocking;
 use crate::statement::Statement;
 use crate::ERROR_CLASSES;
 
@@ -33,41 +33,34 @@ impl Connection {
 
     pub fn prepare_single(&self, sql: String) -> Result<magnus::typed_data::Obj<Statement>, Error> {
         let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
-        let stmt = self
-            .inner
-            .prepare_single(&sql)
-            .map_err(|e| from_turso_error(e, classes))?;
+        let inner = self.inner.clone();
+        let stmt = run_blocking(classes, move || inner.prepare_single(&sql))?;
         let ruby = unsafe { Ruby::get_unchecked() };
         Ok(ruby.obj_wrap(Statement::new(stmt)))
     }
 
     pub fn execute_batch(&self, sql: String) -> Result<RArray, Error> {
         let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
+        let inner = self.inner.clone();
+        let results: Vec<(i64, i64)> = run_blocking(classes, move || {
+            let mut results = Vec::new();
+            let mut offset: usize = 0;
+            while let Some((mut stmt, consumed)) = inner.prepare_first(&sql[offset..])? {
+                let info = stmt.execute(None)?;
+                results.push((info.rows_changed as i64, inner.last_insert_rowid()));
+                offset += consumed;
+            }
+            Ok(results)
+        })?;
         let ruby = unsafe { Ruby::get_unchecked() };
-        let results = ruby.ary_new();
-        let mut offset: usize = 0;
-        while let Some((mut stmt, consumed)) = self
-            .inner
-            .prepare_first(&sql[offset..])
-            .map_err(|e| from_turso_error(e, classes))?
-        {
-            let info = stmt
-                .execute(None)
-                .map_err(|e| from_turso_error(e, classes))?;
-            let ruby = unsafe { Ruby::get_unchecked() };
+        let ary = ruby.ary_new();
+        for (changes, rowid) in results {
             let hash = ruby.hash_new();
-            hash.aset(
-                ruby.intern("changes"),
-                ruby.integer_from_i64(info.rows_changed as i64),
-            )?;
-            hash.aset(
-                ruby.intern("last_insert_rowid"),
-                ruby.integer_from_i64(self.inner.last_insert_rowid()),
-            )?;
-            results.push(hash)?;
-            offset += consumed;
+            hash.aset(ruby.intern("changes"), ruby.integer_from_i64(changes))?;
+            hash.aset(ruby.intern("last_insert_rowid"), ruby.integer_from_i64(rowid))?;
+            ary.push(hash)?;
         }
-        Ok(results)
+        Ok(ary)
     }
 
     pub fn get_auto_commit(&self) -> bool {
@@ -106,9 +99,7 @@ impl Connection {
 
     pub fn close(&self) -> Result<(), Error> {
         let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
-        self.inner
-            .close()
-            .map_err(|e| from_turso_error(e, classes))?;
-        Ok(())
+        let inner = self.inner.clone();
+        run_blocking(classes, move || inner.close())
     }
 }

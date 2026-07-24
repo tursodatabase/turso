@@ -6,7 +6,6 @@ use std::ptr;
 use crate::error::{from_turso_error, ErrorClasses};
 use turso_sdk_kit::rsapi::TursoError;
 
-#[allow(dead_code)]
 trait Callable {
     fn call(self: Box<Self>) -> Result<Box<dyn Any + Send + 'static>, TursoError>;
 }

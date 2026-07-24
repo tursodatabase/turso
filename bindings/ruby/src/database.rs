@@ -6,6 +6,7 @@ use std::sync::Arc;
 use turso_sdk_kit::rsapi::{TursoConnection, TursoDatabase, TursoDatabaseConfig};
 use turso_sdk_kit::IoBackend;
 
+use crate::blocking_op::run_blocking;
 use crate::error::from_turso_error;
 use crate::ERROR_CLASSES;
 
@@ -116,10 +117,8 @@ impl Database {
 
     pub fn close(&self) -> Result<(), Error> {
         let classes = ERROR_CLASSES.get().expect("ERROR_CLASSES not initialized");
-        self.inner
-            .conn
-            .close()
-            .map_err(|e| from_turso_error(e, classes))?;
+        let conn = self.inner.conn.clone();
+        run_blocking(classes, move || conn.close())?;
         self.inner
             .closed
             .store(true, std::sync::atomic::Ordering::Release);
