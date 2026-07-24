@@ -444,3 +444,136 @@ test expression-index-nulls-last-range-excludes-nulls {
 expect {
     2
 }
+
+@setup single_data
+test eqp-range-seek-on-nulls-last-index {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE a > 1;
+}
+expect {
+    1|0|0|SEARCH t USING INDEX idx (a>?)
+}
+
+@setup single_data
+test eqp-upper-range-seek-on-nulls-last-index {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE a < 3;
+}
+expect {
+    1|0|0|SEARCH t USING INDEX idx (a<?)
+}
+
+@setup single_data
+test range-seek-rows-ordered-nulls-last {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    SELECT id, a FROM t WHERE a > 1 ORDER BY a NULLS LAST;
+}
+expect {
+    5|2
+    2|3
+}
+
+@setup single_data
+test range-seek-upper-bound-rows-nulls-last {
+    CREATE INDEX idx ON t(a NULLS LAST);
+    SELECT id, a FROM t WHERE a < 3 ORDER BY a NULLS LAST;
+}
+expect {
+    3|1
+    5|2
+}
+
+@setup single_data
+test range-seek-desc-nulls-first {
+    CREATE INDEX idx ON t(a DESC NULLS FIRST);
+    SELECT id, a FROM t WHERE a > 1 ORDER BY a DESC NULLS FIRST;
+}
+expect {
+    2|3
+    5|2
+}
+
+@setup single_data
+test range-seek-backward-on-desc-nulls-first {
+    CREATE INDEX idx ON t(a DESC NULLS FIRST);
+    SELECT id, a FROM t WHERE a < 3 ORDER BY a ASC NULLS LAST;
+}
+expect {
+    3|1
+    5|2
+}
+
+@setup comp_data
+test composite-range-after-eq-excludes-trailing-null-block {
+    CREATE INDEX idx ON t(a, b NULLS LAST);
+    SELECT id, a, b FROM t WHERE a = 2 AND b > 0;
+}
+expect {
+    6|2|5
+}
+
+@setup comp_data
+test composite-upper-range-after-eq-nulls-last {
+    CREATE INDEX idx ON t(a, b NULLS LAST);
+    SELECT id, a, b FROM t WHERE a = 1 AND b < 40;
+}
+expect {
+    4|1|30
+}
+
+@setup comp_data
+test composite-backward-range-skips-trailing-null-block {
+    CREATE INDEX idx ON t(a, b NULLS LAST);
+    SELECT id, a, b FROM t WHERE a = 1 AND b > 0 ORDER BY b DESC NULLS FIRST;
+}
+expect {
+    4|1|30
+}
+
+@setup comp_data
+test composite-range-after-eq-desc-nulls-first {
+    CREATE INDEX idx ON t(a, b DESC NULLS FIRST);
+    SELECT id, a, b FROM t WHERE a = 1 AND b > 0;
+}
+expect {
+    4|1|30
+}
+
+@setup comp_data
+test composite-upper-range-desc-nulls-first-ordered {
+    CREATE INDEX idx ON t(a, b DESC NULLS FIRST);
+    SELECT id, a, b FROM t WHERE a = 1 AND b < 40 ORDER BY b DESC NULLS FIRST;
+}
+expect {
+    4|1|30
+}
+
+@setup comp_data
+test composite-both-bounds-nulls-last {
+    CREATE INDEX idx ON t(a, b NULLS LAST);
+    SELECT id, a, b FROM t WHERE a = 2 AND b >= 5 AND b <= 6;
+}
+expect {
+    6|2|5
+}
+
+test upsert-plain-target-matches-nulls-last-unique-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE UNIQUE INDEX idx ON t(a NULLS LAST);
+    INSERT INTO t VALUES (1, 5, 0);
+    INSERT INTO t(id, a, b) VALUES (2, 5, 1) ON CONFLICT(a) DO UPDATE SET b = excluded.b;
+    SELECT id, a, b FROM t;
+}
+expect {
+    1|5|1
+}
+
+test upsert-explicit-nulls-target-still-rejected {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT);
+    CREATE UNIQUE INDEX idx ON t(a NULLS LAST);
+    INSERT INTO t VALUES (1, 5);
+    INSERT INTO t(id, a) VALUES (2, 5) ON CONFLICT(a NULLS LAST) DO NOTHING;
+}
+expect error {
+    NULLS
+}

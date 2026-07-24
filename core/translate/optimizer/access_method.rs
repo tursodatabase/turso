@@ -1579,6 +1579,7 @@ fn find_best_access_method_for_subquery(
                 constraint_vec_pos: *orig_idx,
                 index_col_pos,
                 sort_order: SortOrder::Asc,
+                nulls_order: ast::NullsOrder::First,
             }
         })
         .collect();

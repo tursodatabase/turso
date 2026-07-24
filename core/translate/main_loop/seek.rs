@@ -1,4 +1,5 @@
 use super::*;
+use turso_parser::ast::NullsOrder;
 
 fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
     // Apply the constraint's resolved comparison affinity to the seek key,
@@ -122,10 +123,9 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         {
             match self.seek_def.iter_dir {
                 IterationDirection::Forwards => {
-                    if self
-                        .seek_index
-                        .is_some_and(|index| index.columns[0].order == SortOrder::Asc)
-                    {
+                    if self.seek_index.is_some_and(|index| {
+                        index.columns[0].effective_nulls_order() == NullsOrder::First
+                    }) {
                         self.program.emit_null(self.start_reg, None);
                         self.program.emit_insn(Insn::SeekGT {
                             is_index: self.is_index,
@@ -142,10 +142,9 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     }
                 }
                 IterationDirection::Backwards => {
-                    if self
-                        .seek_index
-                        .is_some_and(|index| index.columns[0].order == SortOrder::Desc)
-                    {
+                    if self.seek_index.is_some_and(|index| {
+                        index.columns[0].effective_nulls_order() == NullsOrder::Last
+                    }) {
                         self.program.emit_null(self.start_reg, None);
                         self.program.emit_insn(Insn::SeekLT {
                             is_index: self.is_index,
@@ -268,10 +267,9 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             self.program.preassign_label_to_next_insn(loop_start);
             match self.seek_def.iter_dir {
                 IterationDirection::Forwards => {
-                    if self
-                        .seek_index
-                        .is_some_and(|index| index.columns[0].order == SortOrder::Desc)
-                    {
+                    if self.seek_index.is_some_and(|index| {
+                        index.columns[0].effective_nulls_order() == NullsOrder::Last
+                    }) {
                         self.program.emit_null(self.start_reg, None);
                         self.program.emit_insn(Insn::IdxGE {
                             cursor_id: self.seek_cursor_id,
@@ -282,10 +280,9 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     }
                 }
                 IterationDirection::Backwards => {
-                    if self
-                        .seek_index
-                        .is_some_and(|index| index.columns[0].order == SortOrder::Asc)
-                    {
+                    if self.seek_index.is_some_and(|index| {
+                        index.columns[0].effective_nulls_order() == NullsOrder::First
+                    }) {
                         self.program.emit_null(self.start_reg, None);
                         self.program.emit_insn(Insn::IdxLE {
                             cursor_id: self.seek_cursor_id,

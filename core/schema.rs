@@ -5653,7 +5653,7 @@ macro_rules! impl_effective_nulls_order {
                 }
             }
 
-            fn effective_nulls_order(&self) -> turso_parser::ast::NullsOrder {
+            pub fn effective_nulls_order(&self) -> turso_parser::ast::NullsOrder {
                 self.nulls_order
                     .unwrap_or_else(|| turso_parser::ast::NullsOrder::default_for(self.order))
             }
@@ -5701,10 +5701,6 @@ impl IndexColumn {
             .for_each(|col| cols.push(col));
 
         cols
-    }
-
-    pub fn has_default_nulls_placement(&self) -> bool {
-        self.effective_nulls_order() == NullsOrder::default_for(self.order)
     }
 }
 
