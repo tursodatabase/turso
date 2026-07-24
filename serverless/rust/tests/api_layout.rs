@@ -87,7 +87,20 @@ async fn transaction_api_surface(
         Ok(())
     })
     .await?;
+
+    let _stmt = conn.prepare_cached("SELECT 1").await?;
     Ok(())
+}
+
+/// Pins the trait implementations shared with the embedded driver.
+#[test]
+fn shared_trait_impls() {
+    fn assert_clone<T: Clone>() {}
+    fn assert_debug<T: std::fmt::Debug>() {}
+    assert_clone::<turso_serverless::Row>();
+    assert_clone::<turso_serverless::Column>();
+    assert_debug::<turso_serverless::Column>();
+    assert_debug::<turso_serverless::Transaction<'static>>();
 }
 
 #[test]

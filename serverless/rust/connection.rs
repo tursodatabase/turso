@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -29,6 +30,9 @@ pub struct Connection {
     /// means there is nothing to do. Shared across clones because clones
     /// share the stream that carries the transaction.
     dangling_tx: Arc<AtomicU8>,
+    /// Column metadata cached by [`prepare_cached`](Connection::prepare_cached),
+    /// keyed by SQL text.
+    cached_statements: Arc<std::sync::Mutex<HashMap<String, Vec<Column>>>>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -70,6 +74,7 @@ impl Connection {
             shared,
             transaction_behavior: TransactionBehavior::Deferred,
             dangling_tx: Arc::new(AtomicU8::new(DropBehavior::Ignore.into())),
+            cached_statements: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -170,6 +175,28 @@ impl Connection {
                 "missing describe result in pipeline response".to_string(),
             )),
         }
+    }
+
+    /// Prepare a SQL statement, reusing column metadata cached on the
+    /// connection.
+    ///
+    /// The remote protocol cannot retain a server-side prepared statement,
+    /// so this caches the client-side description (the column metadata
+    /// fetched by [`prepare`](Connection::prepare)) keyed by SQL text and
+    /// skips the describe round trip on a cache hit. Execution always
+    /// sends the SQL text, exactly as with a freshly prepared statement.
+    pub async fn prepare_cached(&self, sql: impl AsRef<str>) -> Result<Statement> {
+        let sql = sql.as_ref();
+        let cached = self.cached_statements.lock().unwrap().get(sql).cloned();
+        if let Some(columns) = cached {
+            return Ok(Statement::new(self.clone(), sql.to_string(), columns));
+        }
+        let stmt = self.prepare(sql).await?;
+        self.cached_statements
+            .lock()
+            .unwrap()
+            .insert(sql.to_string(), stmt.columns());
+        Ok(stmt)
     }
 
     /// Begin a new transaction with the connection's default behavior

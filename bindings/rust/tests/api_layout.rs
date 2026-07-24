@@ -31,6 +31,17 @@ fn root_exports_match_module_definitions() {
     let _ = takes_connection;
 }
 
+/// Pins the trait implementations shared with the serverless driver.
+#[test]
+fn shared_trait_impls() {
+    fn assert_clone<T: Clone>() {}
+    fn assert_debug<T: std::fmt::Debug>() {}
+    assert_clone::<turso::Row>();
+    assert_clone::<turso::Column>();
+    assert_debug::<turso::Column>();
+    assert_debug::<turso::Transaction<'static>>();
+}
+
 /// Pins the value API surface shared with the serverless driver: borrowed
 /// access through ValueRef, type inspection through ValueType, and the
 /// blob conversions.

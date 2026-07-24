@@ -560,6 +560,7 @@ impl Statement {
 }
 
 /// Column information.
+#[derive(Clone, Debug)]
 pub struct Column {
     name: String,
     decl_type: Option<String>,

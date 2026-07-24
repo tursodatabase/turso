@@ -208,6 +208,36 @@ async fn prepared_statement_metadata_and_execution() {
 }
 
 #[tokio::test]
+async fn prepare_cached_reuses_column_metadata() {
+    let config = config_or_skip!();
+    let conn = connect(&config.url, &config.auth_token).await;
+    let table = unique_name("t_pc");
+
+    conn.execute(
+        format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, name TEXT)"),
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute(format!("INSERT INTO {table} (name) VALUES ('a')"), ())
+        .await
+        .unwrap();
+
+    let sql = format!("SELECT id, name FROM {table} WHERE name = ?");
+    // The first call describes the statement; the second is served from
+    // the connection's cache. Both must behave identically.
+    for _ in 0..2 {
+        let mut stmt = conn.prepare_cached(&sql).await.unwrap();
+        assert_eq!(stmt.column_count(), 2);
+        assert_eq!(stmt.column_name(1).unwrap(), "name");
+        let row = stmt.query_row(("a",)).await.unwrap();
+        assert_eq!(row.get::<String>(1).unwrap(), "a");
+    }
+
+    drop_table(&conn, &table).await;
+}
+
+#[tokio::test]
 async fn prepare_invalid_sql_fails() {
     let config = config_or_skip!();
     let conn = connect(&config.url, &config.auth_token).await;
