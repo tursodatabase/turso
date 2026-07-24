@@ -455,7 +455,8 @@ impl From<&ast::Literal> for SimValue {
             ast::Literal::Numeric(number) => Numeric::from(number).into(),
             ast::Literal::String(string) => types::Value::build_text(unescape_singlequotes(string)),
             ast::Literal::Blob(blob) => types::Value::Blob(
-                blob.as_bytes()
+                ast::blob_literal_hex(blob)
+                    .as_bytes()
                     .chunks_exact(2)
                     .map(|pair| {
                         // We assume that sqlite3-parser has already validated that
@@ -491,7 +492,7 @@ impl From<&SimValue> for ast::Literal {
             types::Value::Numeric(Numeric::Integer(i)) => Self::Numeric(i.to_string()),
             types::Value::Numeric(Numeric::Float(f)) => Self::Numeric(f.to_string()),
             text @ types::Value::Text(..) => Self::String(escape_singlequotes(&text.to_string())),
-            types::Value::Blob(blob) => Self::Blob(hex::encode(blob)),
+            types::Value::Blob(blob) => Self::Blob(format!("X'{}'", hex::encode(blob))),
         }
     }
 }
