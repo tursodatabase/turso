@@ -43,7 +43,17 @@ use turso_parser::{
 /// v8: a non-native operator output consumed by a join owns an explicit
 /// `(source identity, values, multiplicity)` arrangement. Its rowid is the
 /// stable identity published to the downstream join.
-pub const DBSP_CIRCUIT_VERSION: u32 = 10;
+///
+/// v9: all maintenance paths consume the same compiled DAG and transaction
+/// change log, with node-owned state and arrangement contracts.
+///
+/// v10: joins lower to binary nodes with fixed differential phases. Composite
+/// identities and LEFT-join state therefore follow the binary tree layout.
+///
+/// v11: SQL binding-rowid provenance is stored independently from operator
+/// transport identity in ephemeral streams, arrangements, and LEFT-join
+/// padded-row state.
+pub const DBSP_CIRCUIT_VERSION: u32 = 11;
 
 /// Whether a version-stripped hidden-state key belongs to `view_name`.
 ///

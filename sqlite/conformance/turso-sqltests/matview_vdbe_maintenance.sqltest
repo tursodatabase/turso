@@ -1236,6 +1236,42 @@ expect {
     gone|3|c|300
 }
 
+# A downstream operator must be able to bind every source rowid even when an
+# outer-join arrangement replaces the delta's transport key with its own
+# state rowid.
+test matview-vdbe-left-then-inner-source-rowids {
+    CREATE TABLE rowid_l(k INTEGER);
+    CREATE TABLE rowid_m(k INTEGER, tag TEXT);
+    CREATE TABLE rowid_r(k INTEGER);
+    INSERT INTO rowid_l VALUES (10), (20);
+    INSERT INTO rowid_m VALUES (10, 'a');
+    INSERT INTO rowid_r VALUES (10), (20);
+    CREATE MATERIALIZED VIEW mixed_rowids AS
+      SELECT rowid_l.rowid, rowid_m.rowid, rowid_r.rowid
+      FROM rowid_l
+      LEFT JOIN rowid_m ON rowid_l.k = rowid_m.k
+      JOIN rowid_r ON rowid_l.k = rowid_r.k;
+    SELECT 'init', * FROM mixed_rowids ORDER BY 2;
+    DELETE FROM rowid_l WHERE rowid = 2;
+    SELECT 'removed', * FROM mixed_rowids ORDER BY 2;
+    INSERT INTO rowid_l VALUES (20);
+    SELECT 'readded', * FROM mixed_rowids ORDER BY 2;
+    INSERT INTO rowid_m VALUES (20, 'b');
+    SELECT 'after', * FROM mixed_rowids ORDER BY 2;
+    DELETE FROM rowid_r WHERE rowid = 1;
+    SELECT 'gone', * FROM mixed_rowids ORDER BY 2;
+}
+expect {
+    init|1|1|1
+    init|2||2
+    removed|1|1|1
+    readded|1|1|1
+    readded|2||2
+    after|1|1|1
+    after|2|2|2
+    gone|2|2|2
+}
+
 # USING desugars to equality predicates against the left-most table with
 # each merged column; the star expansion shows the merged column once, and
 # unqualified references to it resolve without ambiguity.
@@ -2449,11 +2485,11 @@ test matview-vdbe-filtered-derived-input-arrangement {
     SELECT * FROM arranged_join ORDER BY 1;
     SELECT COUNT(*)
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_arrangement_v10_arranged_join__n%';
+     WHERE name LIKE '__turso_internal_dbsp_arrangement_v11_arranged_join__n%';
     DROP VIEW arranged_join;
     SELECT COUNT(*)
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_arrangement_v10_arranged_join__n%';
+     WHERE name LIKE '__turso_internal_dbsp_arrangement_v11_arranged_join__n%';
 }
 expect {
     1|ten
@@ -2813,17 +2849,17 @@ test matview-vdbe-node-owned-hidden-state {
       SELECT node_a.k FROM node_a JOIN node_b ON node_a.k = node_b.k;
     SELECT name
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_state_v10_node_catalog__n%'
-        OR name LIKE '__turso_internal_dbsp_arrangement_v10_node_catalog__n%'
+     WHERE name LIKE '__turso_internal_dbsp_state_v11_node_catalog__n%'
+        OR name LIKE '__turso_internal_dbsp_arrangement_v11_node_catalog__n%'
      ORDER BY name;
     DROP VIEW node_catalog;
     SELECT COUNT(*)
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_state_v10_node_catalog__n%';
+     WHERE name LIKE '__turso_internal_dbsp_state_v11_node_catalog__n%';
 }
 expect {
-    __turso_internal_dbsp_arrangement_v10_node_catalog__n8
-    __turso_internal_dbsp_state_v10_node_catalog__n1
+    __turso_internal_dbsp_arrangement_v11_node_catalog__n8
+    __turso_internal_dbsp_state_v11_node_catalog__n1
     0
 }
 
