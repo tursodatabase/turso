@@ -30,3 +30,20 @@ fn root_exports_match_module_definitions() {
     fn takes_connection(_: turso::connection::Connection) {}
     let _ = takes_connection;
 }
+
+/// Pins the pragma_query callback signature: fallible with the crate's own
+/// public Error, so callbacks can use `?` and stop iteration early, and the
+/// same callback works against the serverless driver.
+#[allow(dead_code)]
+async fn pragma_query_surface(conn: &turso::Connection) -> turso::Result<()> {
+    conn.pragma_query("journal_mode", |row| {
+        let _ = row.get_value(0)?;
+        Ok(())
+    })
+    .await
+}
+
+#[test]
+fn pragma_query_surface_compiles() {
+    let _ = pragma_query_surface;
+}

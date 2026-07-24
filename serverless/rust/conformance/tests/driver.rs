@@ -470,7 +470,10 @@ async fn set_transaction_behavior_applies_to_new_transactions() {
 
     conn.set_transaction_behavior(TransactionBehavior::Immediate);
     let tx = conn.transaction().await.unwrap();
-    let mut stmt = tx.prepare(&format!("INSERT INTO {table} VALUES (?)")).await.unwrap();
+    let mut stmt = tx
+        .prepare(&format!("INSERT INTO {table} VALUES (?)"))
+        .await
+        .unwrap();
     stmt.execute((1,)).await.unwrap();
     tx.commit().await.unwrap();
 
@@ -482,6 +485,30 @@ async fn set_transaction_behavior_applies_to_new_transactions() {
     assert_eq!(row.get::<i64>(0).unwrap(), 1);
 
     drop_table(&conn, &table).await;
+}
+
+#[tokio::test]
+async fn pragma_query_callback_error_stops_iteration() {
+    let config = config_or_skip!();
+    let conn = connect(&config.url, &config.auth_token).await;
+
+    let mut seen = 0;
+    conn.pragma_query("journal_mode", |row| {
+        seen += 1;
+        row.get_value(0).map(|_| ())
+    })
+    .await
+    .unwrap();
+    assert_eq!(seen, 1);
+
+    // An error returned by the callback stops iteration and propagates.
+    let err = conn
+        .pragma_query("journal_mode", |_| {
+            Err(Error::Misuse("stop iteration".to_string()))
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Misuse(msg) if msg == "stop iteration"));
 }
 
 #[tokio::test]

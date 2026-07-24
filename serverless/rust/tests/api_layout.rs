@@ -55,6 +55,14 @@ async fn transaction_api_surface(
     tx.commit().await?;
     let tx = Transaction::new_unchecked(&*conn, TransactionBehavior::Deferred).await?;
     tx.rollback().await?;
+
+    // The pragma_query callback is fallible with the crate's own Error, so
+    // it can use `?` and stop iteration early, as in the embedded driver.
+    conn.pragma_query("journal_mode", |row| {
+        let _ = row.get_value(0)?;
+        Ok(())
+    })
+    .await?;
     Ok(())
 }
 

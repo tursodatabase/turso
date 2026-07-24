@@ -212,13 +212,16 @@ impl Connection {
     }
 
     /// Execute a PRAGMA query and call a closure for each result row.
+    ///
+    /// An error returned by the closure stops the iteration and propagates
+    /// to the caller.
     pub async fn pragma_query<F>(&self, pragma_name: &str, mut f: F) -> Result<()>
     where
-        F: FnMut(&Row),
+        F: FnMut(&Row) -> Result<()>,
     {
         let mut rows = self.query(format!("PRAGMA {pragma_name}"), ()).await?;
         while let Some(row) = rows.next().await? {
-            f(&row);
+            f(&row)?;
         }
         Ok(())
     }
