@@ -11,56 +11,11 @@ use turso_parser::{
     parser::Parser,
 };
 
-/// Version of the materialized-view state storage format, embedded in the
-/// internal state table name (`__turso_internal_dbsp_state_v<N>_<view>`).
-/// Views created under a different version are unusable and must be
-/// recreated.
-///
-/// v2: maintenance compiled to VDBE programs. Filter/project views have no
-/// state table at all; GROUP BY views use a typed state table (group keys,
-/// view rowid, aggregate payloads) instead of v1's generic blob layout.
-///
-/// v3: pure UNION ALL is stateless branch composition. Its view-row identity
-/// is derived directly from `(branch, source rowid)` rather than a hidden
-/// state-table rowid.
-///
-/// v4: hidden state is owned and named by DAG node (`__n<node_id>`), rather
-/// than inferred from a root shape or UNION ALL branch. This permits multiple
-/// stateful operators in one maintenance circuit without name collisions.
-///
-/// v5: trailing UNION ALL identity keys store the complete source-identity
-/// tuple, not a single rowid.
-///
-/// v6: aggregate state rows also persist each finalized aggregate value. The
-/// state table is therefore the aggregate node's output arrangement and can
-/// publish `-old/+new` typed deltas to downstream operators.
-///
-/// v7: mixed deduplicating/UNION ALL set operators always keep their trailing
-/// source-identity map, including when their output feeds another operator.
-/// This makes the set-op's stable identity part of its typed delta contract
-/// rather than a terminal-view-only implementation detail.
-///
-/// v8: a non-native operator output consumed by a join owns an explicit
-/// `(source identity, values, multiplicity)` arrangement. Its rowid is the
-/// stable identity published to the downstream join.
-///
-/// v9: all maintenance paths consume the same compiled DAG and transaction
-/// change log, with node-owned state and arrangement contracts.
-///
-/// v10: joins lower to binary nodes with fixed differential phases. Composite
-/// identities and LEFT-join state therefore follow the binary tree layout.
-///
-/// v11: SQL binding-rowid provenance is stored independently from operator
-/// transport identity in ephemeral streams, arrangements, and LEFT-join
-/// padded-row state.
-///
-/// v12: every materialized view owns an explicit version marker, including
-/// stateless views with no operator state. Absence of the current marker is
-/// incompatible rather than being treated as an implicitly current layout.
-///
-/// v13: aggregate value multisets are stored per aggregate, so each index
-/// carries the collation of that aggregate's argument.
-pub const DBSP_CIRCUIT_VERSION: u32 = 13;
+/// Version of the materialized-view storage format embedded in every hidden
+/// table name. Version 1 is the interpreter layout released on `main`;
+/// version 2 is the VDBE-maintained operator-DAG layout developed on this
+/// branch. Bump this only after a layout has shipped or been shared.
+pub const DBSP_CIRCUIT_VERSION: u32 = 2;
 
 pub(crate) fn dbsp_version_marker_table_name(view_name: &str) -> String {
     format!(
