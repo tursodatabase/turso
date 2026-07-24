@@ -1,5 +1,5 @@
 use super::binding::{remap_bound_expr, seed_ephemeral_stream_cache, stream_table_references};
-use super::output::{DeltaSource, NodeOutputContract};
+use super::output::{EmittedNodeOutput, NodeOutputContract};
 use super::stream::{open_ephemeral_delta, EphemeralDelta};
 use crate::incremental::dag;
 use crate::schema::Schema;
@@ -16,7 +16,7 @@ use crate::{Connection, LimboError, Result};
 use turso_parser::ast;
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn emit_ephemeral_filter(
+pub(super) fn emit_filter(
     program: &mut ProgramBuilder,
     view_name: &str,
     node_id: dag::NodeId,
@@ -25,7 +25,7 @@ pub(super) fn emit_ephemeral_filter(
     predicate: &ast::Expr,
     schema: &Schema,
     connection: &Arc<Connection>,
-) -> Result<DeltaSource> {
+) -> Result<EmittedNodeOutput> {
     let output = open_ephemeral_delta(
         program,
         &format!("{view_name}_filter_delta_{node_id}"),
@@ -124,7 +124,7 @@ pub(super) fn emit_ephemeral_filter(
     });
     program.preassign_label_to_next_insn(end_label);
     drop(syms);
-    Ok(DeltaSource::Ephemeral(output))
+    EmittedNodeOutput::from_ephemeral(node_id, output, output_contract)
 }
 
 fn append_alias_values(
@@ -202,13 +202,13 @@ fn append_alias_values(
     Ok(())
 }
 
-pub(super) fn emit_ephemeral_alias(
+pub(super) fn emit_alias(
     program: &mut ProgramBuilder,
     view_name: &str,
     node_id: dag::NodeId,
     input: &EphemeralDelta,
     output_contract: &NodeOutputContract,
-) -> Result<DeltaSource> {
+) -> Result<EmittedNodeOutput> {
     let output = open_ephemeral_delta(
         program,
         &format!("{view_name}_alias_delta_{node_id}"),
@@ -218,11 +218,11 @@ pub(super) fn emit_ephemeral_alias(
         input.requires_positive_first,
     );
     append_alias_values(program, input, &output)?;
-    Ok(DeltaSource::Ephemeral(output))
+    EmittedNodeOutput::from_ephemeral(node_id, output, output_contract)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn emit_ephemeral_project(
+pub(super) fn emit_project(
     program: &mut ProgramBuilder,
     view_name: &str,
     node_id: dag::NodeId,
@@ -231,7 +231,7 @@ pub(super) fn emit_ephemeral_project(
     output_contract: &NodeOutputContract,
     schema: &Schema,
     connection: &Arc<Connection>,
-) -> Result<DeltaSource> {
+) -> Result<EmittedNodeOutput> {
     let output = open_ephemeral_delta(
         program,
         &format!("{view_name}_project_delta_{node_id}"),
@@ -241,7 +241,7 @@ pub(super) fn emit_ephemeral_project(
         input.requires_positive_first,
     );
     emit_project_rows(program, input, projections, &output, schema, connection)?;
-    Ok(DeltaSource::Ephemeral(output))
+    EmittedNodeOutput::from_ephemeral(node_id, output, output_contract)
 }
 
 #[allow(clippy::too_many_arguments)]

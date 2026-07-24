@@ -1,4 +1,4 @@
-use super::output::{DeltaSource, NodeOutputContract};
+use super::output::{EmittedNodeOutput, NodeOutputContract};
 use super::plan::OperatorStateDef;
 use super::stream::{
     emit_operator_rowid_delta, open_ephemeral_delta, DeltaIdentity, EphemeralDelta,
@@ -17,7 +17,7 @@ use turso_parser::ast;
 /// Pure UNION ALL is a stateless identity-namespacing map. Any deduplicating
 /// prefix owns the content and append integrals declared for this node.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn emit_set_op_to_ephemeral(
+pub(super) fn emit_set_op(
     program: &mut ProgramBuilder,
     view_name: &str,
     node_id: dag::NodeId,
@@ -28,8 +28,8 @@ pub(super) fn emit_set_op_to_ephemeral(
     output_contract: &NodeOutputContract,
     operator_state: &OperatorStateDef,
     schema: &Schema,
-) -> Result<DeltaSource> {
-    if prefix_len == 0 {
+) -> Result<EmittedNodeOutput> {
+    let output = if prefix_len == 0 {
         if operators
             .iter()
             .any(|operator| *operator != ast::CompoundOperator::UnionAll)
@@ -38,39 +38,40 @@ pub(super) fn emit_set_op_to_ephemeral(
                 "stateless set-op has a deduplicating operator".to_string(),
             ));
         }
-        return emit_union_all_to_ephemeral(program, view_name, node_id, inputs, output_contract);
-    }
-
-    let requires_positive_first = inputs.iter().any(|channel| channel.requires_positive_first);
-    let output = open_ephemeral_delta(
-        program,
-        &format!("{view_name}_set_op_delta_{node_id}"),
-        output_contract.schema.as_ref().clone(),
-        output_contract.emitted_identity,
-        output_contract.binding_rowids.clone(),
-        requires_positive_first,
-    );
-    emit_deduplicating_set_op(
-        program,
-        view_name,
-        inputs,
-        operators,
-        prefix_len,
-        key_collations,
-        &output,
-        operator_state,
-        schema,
-    )?;
-    Ok(DeltaSource::Ephemeral(output))
+        emit_union_all_delta(program, view_name, node_id, inputs, output_contract)?
+    } else {
+        let requires_positive_first = inputs.iter().any(|channel| channel.requires_positive_first);
+        let output = open_ephemeral_delta(
+            program,
+            &format!("{view_name}_set_op_delta_{node_id}"),
+            output_contract.schema.as_ref().clone(),
+            output_contract.emitted_identity,
+            output_contract.binding_rowids.clone(),
+            requires_positive_first,
+        );
+        emit_deduplicating_set_op(
+            program,
+            view_name,
+            inputs,
+            operators,
+            prefix_len,
+            key_collations,
+            &output,
+            operator_state,
+            schema,
+        )?;
+        output
+    };
+    EmittedNodeOutput::from_ephemeral(node_id, output, output_contract)
 }
 
-fn emit_union_all_to_ephemeral(
+fn emit_union_all_delta(
     program: &mut ProgramBuilder,
     view_name: &str,
     node_id: dag::NodeId,
     inputs: &[EphemeralDelta],
     output_contract: &NodeOutputContract,
-) -> Result<DeltaSource> {
+) -> Result<EphemeralDelta> {
     let requires_positive_first = inputs.iter().any(|input| input.requires_positive_first);
     let output = open_ephemeral_delta(
         program,
@@ -83,7 +84,7 @@ fn emit_union_all_to_ephemeral(
     for (branch, input) in inputs.iter().enumerate() {
         append_union_all_branch(program, branch, input, &output)?;
     }
-    Ok(DeltaSource::Ephemeral(output))
+    Ok(output)
 }
 
 /// Append one UNION ALL branch while namespacing its complete source identity

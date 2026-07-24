@@ -75,6 +75,14 @@ pub(super) struct EmittedNodeOutput {
 }
 
 impl EmittedNodeOutput {
+    pub(super) fn from_ephemeral(
+        node_id: dag::NodeId,
+        delta: EphemeralDelta,
+        contract: &NodeOutputContract,
+    ) -> Result<Self> {
+        Self::new(node_id, DeltaSource::Ephemeral(delta), None, contract)
+    }
+
     pub(super) fn new(
         node_id: dag::NodeId,
         delta: DeltaSource,
