@@ -1,6 +1,6 @@
+use super::binding::{remap_bound_expr, seed_ephemeral_stream_cache, stream_table_references};
 use super::output::{DeltaSource, NodeOutputContract};
 use super::stream::{open_ephemeral_delta, EphemeralDelta};
-use super::{remap_bound_expr, seed_ephemeral_stream_cache, stream_table_references};
 use crate::incremental::dag;
 use crate::schema::Schema;
 use crate::sync::Arc;

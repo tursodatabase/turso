@@ -1,10 +1,11 @@
+use super::binding::{make_joined_table, remap_bound_expr, BindingRemap};
 use super::output::{DeltaSource, NodeOutput, NodeOutputContract};
 use super::plan::OperatorStateDef;
 use super::stream::{
     open_ephemeral_delta, ArrangementHandle, ArrangementIdentityColumn, DeltaIdentity,
     EphemeralDelta,
 };
-use super::{make_joined_table, remap_bound_expr, BindingRemap, MaintenanceInput};
+use super::MaintenanceInput;
 use crate::incremental::dag;
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::Arc;
