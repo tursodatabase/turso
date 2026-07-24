@@ -927,6 +927,24 @@ test('transform', async ({ server }) => {
     expect(rows2).toEqual([{ key: '1', value: 2 }]);
 })
 
+test('simple-transform', async ({ server }) => {
+    const transform = (m: DatabaseRowMutation) => ({
+        operation: 'rewrite',
+        stmt: {
+            sql: `UPDATE counter SET value = value + ? WHERE key = ?`,
+            values: [m.after!.value - (m.before?.value ?? 0), m.after!.key]
+        }
+    } as DatabaseRowTransformResult);
+    const db = await connect({
+        path: ':memory:',
+        url: server.dbUrl(),
+        transform: transform,
+    });
+    await db.exec("CREATE TABLE IF NOT EXISTS counter (key TEXT PRIMARY KEY, value INTEGER)");
+    await db.exec("INSERT INTO counter VALUES ('clicks', 0)");
+    await db.push(); // <- aborts the process here
+})
+
 test('transform-many', async ({ server }) => {
     {
         const db = await connect({
