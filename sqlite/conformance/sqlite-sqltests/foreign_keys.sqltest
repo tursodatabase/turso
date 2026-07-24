@@ -4158,3 +4158,179 @@ test fk-alter-table-add-column-rejects-missing {
 }
 expect error {
 }
+
+# --- Parent-INSERT repayment of deferred FK violations (SQLite parity) ---
+# SQLite decrements the deferred counter once PER matching child row when the
+# parent key is inserted, so child-insert-then-parent-insert
+# must commit regardless of statement order or how many children came first.
+
+# Two children inserted before the parent, no index on the child FK column.
+@cross-check-integrity
+test fk-deferred-two-children-then-parent-noindex {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES(1, 99);
+    INSERT INTO c VALUES(2, 99);
+    INSERT INTO p VALUES(99);
+    COMMIT;
+    SELECT * FROM c ORDER BY 1;
+}
+expect {
+    1|99
+    2|99
+}
+
+# Same but with an index on the child FK column (exercises the index-probe path).
+@cross-check-integrity
+test fk-deferred-two-children-then-parent-indexed {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE INDEX c_pid ON c(pid);
+    BEGIN;
+    INSERT INTO c VALUES(1, 99);
+    INSERT INTO c VALUES(2, 99);
+    INSERT INTO p VALUES(99);
+    COMMIT;
+    SELECT * FROM c ORDER BY 1;
+}
+expect {
+    1|99
+    2|99
+}
+
+# Parent row arrives via INSERT ... SELECT.
+@cross-check-integrity
+test fk-deferred-parent-via-insert-select {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES(1, 77);
+    INSERT INTO p SELECT 77;
+    COMMIT;
+    SELECT * FROM c ORDER BY 1;
+}
+expect {
+    1|77
+}
+
+# Multi-column FK: children first, composite parent later.
+@cross-check-integrity
+test fk-deferred-multicol-children-then-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INTEGER PRIMARY KEY, ca INT, cb INT,
+        FOREIGN KEY(ca,cb) REFERENCES p(a,b) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES(1, 4, 5);
+    INSERT INTO c VALUES(2, 4, 5);
+    INSERT INTO p VALUES(4, 5);
+    COMMIT;
+    SELECT * FROM c ORDER BY 1;
+}
+expect {
+    1|4|5
+    2|4|5
+}
+
+# Multi-column FK with an index on the child FK columns.
+@cross-check-integrity
+test fk-deferred-multicol-children-then-parent-indexed {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INTEGER PRIMARY KEY, ca INT, cb INT,
+        FOREIGN KEY(ca,cb) REFERENCES p(a,b) DEFERRABLE INITIALLY DEFERRED);
+    CREATE INDEX c_cab ON c(ca,cb);
+    BEGIN;
+    INSERT INTO c VALUES(1, 4, 5);
+    INSERT INTO c VALUES(2, 4, 5);
+    INSERT INTO p VALUES(4, 5);
+    COMMIT;
+    SELECT * FROM c ORDER BY 1;
+}
+expect {
+    1|4|5
+    2|4|5
+}
+
+# A parent INSERT that does NOT satisfy the outstanding violation must still fail at COMMIT.
+@cross-check-integrity
+test fk-deferred-wrong-parent-key-still-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES(1, 99);
+    INSERT INTO p VALUES(1);
+    COMMIT;
+}
+expect error {
+}
+
+# Two violations, only one repaid by the parent insert: still fails.
+@cross-check-integrity
+test fk-deferred-partial-repair-still-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES(1, 99);
+    INSERT INTO c VALUES(2, 88);
+    INSERT INTO p VALUES(99);
+    COMMIT;
+}
+expect error {
+}
+
+# TEXT keys (Holon-shaped: TEXT ids, child rows created before their parent).
+@cross-check-integrity
+test fk-deferred-text-keys-children-then-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id TEXT PRIMARY KEY);
+    CREATE TABLE c(id TEXT PRIMARY KEY, pid TEXT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES('c1', 'root');
+    INSERT INTO c VALUES('c2', 'root');
+    INSERT INTO p VALUES('root');
+    COMMIT;
+    SELECT * FROM c ORDER BY 1;
+}
+expect {
+    c1|root
+    c2|root
+}
+
+# Multi-row VALUES parent insert repaying several distinct keys.
+@cross-check-integrity
+test fk-deferred-multirow-parent-insert {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES(1, 10);
+    INSERT INTO c VALUES(2, 20);
+    INSERT INTO p VALUES(10),(20);
+    COMMIT;
+    SELECT * FROM c ORDER BY 1;
+}
+expect {
+    1|10
+    2|20
+}
+
+# NULL parent key never repays a violation (FK on a UNIQUE parent column).
+@cross-check-integrity
+test fk-deferred-null-parent-key-does-not-repay {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, u INT UNIQUE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pu INT REFERENCES p(u) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES(1, 99);
+    INSERT INTO p(u) VALUES(NULL);
+    COMMIT;
+}
+expect error {
+}
