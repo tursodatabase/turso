@@ -443,6 +443,13 @@ export class Connection {
    * changes. Callbacks that do not declare the handle parameter are
    * rejected.
    *
+   * Because the session is fresh, session-scoped side effects applied to
+   * the connection earlier — `PRAGMA` settings such as `foreign_keys`,
+   * attached databases, temp tables, and other per-connection state — are
+   * NOT present inside the transaction. Anything the transaction's SQL
+   * depends on must either be committed database state or be re-applied
+   * through the transaction handle inside the callback.
+   *
    * @param fn - The function to wrap in a transaction; receives the
    *   transaction handle followed by the caller's arguments
    * @returns A function that will execute fn within a transaction
@@ -548,12 +555,14 @@ export class Connection {
 /**
  * A handle to an open transaction, passed as the first argument to the
  * callback of `Connection.transactionAsync()`. The transaction owns a
- * dedicated session (server stream) for its whole BEGIN..COMMIT window, so
- * all SQL of the transaction must go through this handle: `Connection`
- * calls issued inside the callback execute on the connection's own stream,
- * outside the transaction, and do not see its uncommitted changes. Once
- * the transaction commits or rolls back the handle is closed and every
- * method throws.
+ * dedicated, freshly created session (server stream) for its whole
+ * BEGIN..COMMIT window, so all SQL of the transaction must go through this
+ * handle: `Connection` calls issued inside the callback execute on the
+ * connection's own stream, outside the transaction, and do not see its
+ * uncommitted changes. Session-scoped state set up on the connection
+ * (`PRAGMA` settings, attached databases, temp tables) does not carry over
+ * to the fresh session. Once the transaction commits or rolls back the
+ * handle is closed and every method throws.
  */
 export class Transaction {
   private session: Session;
