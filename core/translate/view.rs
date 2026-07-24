@@ -99,11 +99,11 @@ pub fn translate_create_materialized_view(
             &connection,
         )
     })?;
-    if maintenance_plan.output_arity != view_columns.len() {
+    if maintenance_plan.output_arity() != view_columns.len() {
         return Err(crate::LimboError::InternalError(format!(
             "materialized view result schema has {} columns but its maintenance DAG emits {}",
             view_columns.len(),
-            maintenance_plan.output_arity,
+            maintenance_plan.output_arity(),
         )));
     }
     let hidden_tables = maintenance_plan
