@@ -163,3 +163,91 @@ test.serial('transactionAsync.concurrent uses BEGIN CONCURRENT', async t => {
     await localClient.close();
   }
 });
+
+const withTimeout = (promise, timeoutMs, label) => {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+};
+
+// Each transactionAsync runs on its own dedicated stream, so all callbacks
+// can be open at the same time. The barrier resolves only once every
+// callback has been entered — if transactions were serialized on the
+// connection (the pre-dedicated-session behavior), the first callback
+// would wait on the barrier forever and the test would time out.
+test.serial('transactionAsync transactions run in parallel', async t => {
+  const N = 3;
+  let entered = 0;
+  let releaseBarrier;
+  const allEntered = new Promise(resolve => { releaseBarrier = resolve; });
+
+  const txn = client.transactionAsync(async (tx, i) => {
+    if (++entered === N) releaseBarrier();
+    await withTimeout(allEntered, 5000, 'all transaction callbacks open at once');
+    const row = await tx.get('SELECT ? AS i', [i]);
+    return row.i;
+  });
+
+  const results = await Promise.all(Array.from({ length: N }, (_, i) => txn(i)));
+  t.deepEqual(results.sort(), [0, 1, 2]);
+});
+
+// Statements on the connection are not blocked by an open transactionAsync
+// window; they run on the connection's own stream, outside the transaction,
+// so they must not observe its uncommitted writes. Under a connection-level
+// lock this await would deadlock the transaction.
+test.serial('connection statements proceed while transactionAsync is open', async t => {
+  await client.exec('DROP TABLE IF EXISTS txn_parallel');
+  await client.exec('CREATE TABLE txn_parallel (id INTEGER PRIMARY KEY, v TEXT)');
+
+  let uncommittedCount;
+  await withTimeout(client.transactionAsync(async tx => {
+    await tx.run('INSERT INTO txn_parallel (v) VALUES (?)', ['inside']);
+    const rows = await client.all('SELECT COUNT(*) AS n FROM txn_parallel');
+    uncommittedCount = rows[0].n;
+  })(), 5000, 'connection statement inside transactionAsync callback');
+
+  t.is(uncommittedCount, 0);
+  const rows = await client.all('SELECT COUNT(*) AS n FROM txn_parallel');
+  t.is(rows[0].n, 1);
+});
+
+// Two transactions with overlapping open windows commit and roll back
+// independently. The write sections are kept disjoint on purpose — the
+// overlap under test is the callback windows, not the server's write lock.
+test.serial('rollback of a parallel transactionAsync leaves the other intact', async t => {
+  await client.exec('DROP TABLE IF EXISTS txn_writers');
+  await client.exec('CREATE TABLE txn_writers (v TEXT)');
+
+  let entered = 0;
+  let releaseBarrier;
+  const bothOpen = new Promise(resolve => { releaseBarrier = resolve; });
+  let releaseOkDone;
+  const okDone = new Promise(resolve => { releaseOkDone = resolve; });
+
+  const ok = client.transactionAsync(async tx => {
+    if (++entered === 2) releaseBarrier();
+    await withTimeout(bothOpen, 5000, 'both transaction callbacks open');
+    await tx.run("INSERT INTO txn_writers (v) VALUES ('kept')");
+  });
+  const failing = client.transactionAsync(async tx => {
+    if (++entered === 2) releaseBarrier();
+    await withTimeout(bothOpen, 5000, 'both transaction callbacks open');
+    await withTimeout(okDone, 5000, 'parallel transaction commits first');
+    await tx.run("INSERT INTO txn_writers (v) VALUES ('discarded')");
+    throw new Error('boom');
+  });
+
+  const [, err] = await Promise.all([
+    ok().then(releaseOkDone),
+    failing().then(() => null, e => e),
+  ]);
+  t.is(err.message, 'boom');
+
+  const rows = await client.all('SELECT v FROM txn_writers ORDER BY v');
+  t.deepEqual(rows.map(r => r.v), ['kept']);
+});
