@@ -1,8 +1,9 @@
 use crate::schema::{BTreeTable, Table};
 use crate::sync::Arc;
+use crate::translate::display::render_postgres_explain;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
-use crate::translate::optimizer::optimize_plan;
+use crate::translate::optimizer::{optimize_plan, optimize_plan_for_postgres_explain};
 use crate::translate::plan::{
     DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember, Operation, Plan,
     QueryDestination, ResultSetColumn, Scan, SelectPlan,
@@ -14,7 +15,7 @@ use crate::translate::subquery::{
 };
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::util::normalize_ident;
-use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
+use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::Result;
 use smallvec::SmallVec;
 use turso_parser::ast::{Expr, Limit, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
@@ -126,7 +127,12 @@ pub fn translate_delete(
         }
     }
 
-    optimize_plan(program, &mut delete_plan, resolver)?;
+    let postgres_explain = if program.get_query_mode() == QueryMode::ExplainPostgres {
+        optimize_plan_for_postgres_explain(program, &mut delete_plan, resolver)?
+    } else {
+        optimize_plan(program, &mut delete_plan, resolver)?;
+        None
+    };
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Re-check after optimization: chosen access paths can make "delete while scanning"
         // unsafe, so we may need to collect rowids first.
@@ -163,6 +169,12 @@ pub fn translate_delete(
     let Plan::Delete(ref delete) = delete_plan else {
         panic!("delete_plan is not a DeletePlan");
     };
+    if program.get_query_mode() == QueryMode::ExplainPostgres {
+        program.set_postgres_explain(render_postgres_explain(
+            &delete_plan,
+            postgres_explain.as_ref(),
+        ));
+    }
     super::stmt_journal::set_delete_stmt_journal_flags(
         program,
         delete,

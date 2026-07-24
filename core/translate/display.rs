@@ -11,13 +11,14 @@ use turso_parser::{
 
 use crate::{
     schema::Table,
+    translate::optimizer::{ExplainEstimate, PostgresExplain},
     translate::plan::{SeekKeyComponent, TableReferences},
     types::SeekOp,
 };
 
 use super::plan::{
     Aggregate, DeletePlan, JoinedTable, Operation, Plan, ResultSetColumn, Scan, Search, SeekDef,
-    SelectPlan, SetOperation, UpdatePlan,
+    SelectPlan, SetOperation, UpdatePlan, WhereTerm,
 };
 
 fn fmt_order_by_item(
@@ -183,6 +184,464 @@ pub(crate) fn seek_constraint_annotation(
     } else {
         format!(" ({})", parts.join(" AND "))
     }
+}
+
+/// Render an optimized plan in the textual shape used by PostgreSQL's default
+/// `EXPLAIN` output. This is deliberately a small, presentation-only
+/// projection of the optimizer plan: it does not participate in execution and
+/// is built only for PostgreSQL EXPLAIN statements.
+pub(crate) fn render_postgres_explain(
+    plan: &Plan,
+    explain: Option<&PostgresExplain>,
+) -> Vec<String> {
+    match plan {
+        Plan::Select(select) => render_postgres_select(select, explain),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => render_postgres_compound(left, right_most),
+        Plan::Delete(delete) => render_postgres_delete(delete, explain),
+        Plan::Update(update) => render_postgres_update(update, explain),
+    }
+}
+
+fn render_postgres_compound(
+    left: &[(SelectPlan, ast::CompoundOperator)],
+    right_most: &SelectPlan,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    append_postgres_compound(&mut lines, left, right_most, 0);
+    lines
+}
+
+fn append_postgres_compound(
+    lines: &mut Vec<String>,
+    left: &[(SelectPlan, ast::CompoundOperator)],
+    right_most: &SelectPlan,
+    depth: usize,
+) {
+    let (last_left, operator) = left
+        .last()
+        .expect("compound SELECT plans must contain a left operand");
+    let child_depth = match operator {
+        ast::CompoundOperator::UnionAll => {
+            push_plan_line(lines, depth, "Append", None);
+            depth + 1
+        }
+        ast::CompoundOperator::Union => {
+            push_plan_line(lines, depth, "Unique", None);
+            push_plan_line(lines, depth + 1, "Append", None);
+            depth + 2
+        }
+        ast::CompoundOperator::Intersect => {
+            push_plan_line(lines, depth, "SetOp Intersect", None);
+            depth + 1
+        }
+        ast::CompoundOperator::Except => {
+            push_plan_line(lines, depth, "SetOp Except", None);
+            depth + 1
+        }
+    };
+
+    if left.len() == 1 {
+        append_postgres_select(lines, last_left, child_depth, None);
+    } else {
+        append_postgres_compound(lines, &left[..left.len() - 1], last_left, child_depth);
+    }
+    append_postgres_select(lines, right_most, child_depth, None);
+}
+
+pub(crate) fn render_postgres_insert(table_name: &str) -> String {
+    format!("Insert on {table_name}")
+}
+
+fn render_postgres_delete(delete: &DeletePlan, explain: Option<&PostgresExplain>) -> Vec<String> {
+    let Some(target) = delete.table_references.joined_tables().first() else {
+        unreachable!("DELETE plans must have a target table");
+    };
+
+    let mut lines = Vec::new();
+    push_plan_line(
+        &mut lines,
+        0,
+        &format!("Delete on {}", target.table.get_name()),
+        explain.map(|explain| explain.total),
+    );
+    if let Some(rowset) = &delete.rowset_plan {
+        append_postgres_select(&mut lines, rowset, 1, explain);
+    } else {
+        append_table_access(&mut lines, 1, target, access_estimate(explain, target));
+        append_postgres_filters(
+            &mut lines,
+            1,
+            &delete.where_clause,
+            &delete.table_references,
+        );
+    }
+    lines
+}
+
+fn render_postgres_update(update: &UpdatePlan, explain: Option<&PostgresExplain>) -> Vec<String> {
+    let mut lines = Vec::new();
+    push_plan_line(
+        &mut lines,
+        0,
+        &format!("Update on {}", update.target_table.table.get_name()),
+        explain.map(|explain| explain.total),
+    );
+    if let Some(write_set) = &update.write_set_plan {
+        append_postgres_select(&mut lines, &write_set.select, 1, explain);
+    } else if update.from_tables.joined_tables().is_empty() {
+        append_table_access(
+            &mut lines,
+            1,
+            &update.target_table,
+            access_estimate(explain, &update.target_table),
+        );
+        let read_scope_tables = update.build_read_scope_tables();
+        append_postgres_filters(&mut lines, 1, &update.where_clause, &read_scope_tables);
+    } else {
+        push_plan_line(
+            &mut lines,
+            1,
+            "Nested Loop",
+            explain.map(|explain| explain.total),
+        );
+        append_table_access(
+            &mut lines,
+            2,
+            &update.target_table,
+            access_estimate(explain, &update.target_table),
+        );
+        for table in update.from_tables.joined_tables() {
+            append_table_access(&mut lines, 2, table, access_estimate(explain, table));
+        }
+    }
+    lines
+}
+
+fn append_postgres_filters(
+    lines: &mut Vec<String>,
+    depth: usize,
+    where_clause: &[WhereTerm],
+    table_references: &TableReferences,
+) {
+    let context = PlanContext(&[table_references]);
+    let filters = where_clause
+        .iter()
+        .filter(|term| !term.consumed)
+        .map(|term| term.expr.displayer(&context).to_string())
+        .collect::<Vec<_>>();
+    if !filters.is_empty() {
+        push_detail_line(
+            lines,
+            depth,
+            &format!("Filter: ({})", filters.join(" AND ")),
+        );
+    }
+}
+
+fn render_postgres_select(select: &SelectPlan, explain: Option<&PostgresExplain>) -> Vec<String> {
+    let mut lines = Vec::new();
+    append_postgres_select(&mut lines, select, 0, explain);
+    lines
+}
+
+fn append_postgres_select(
+    lines: &mut Vec<String>,
+    select: &SelectPlan,
+    depth: usize,
+    explain: Option<&PostgresExplain>,
+) {
+    let mut wrappers = Vec::new();
+    if select.limit.is_some() {
+        wrappers.push("Limit".to_string());
+    }
+    if !select.order_by.is_empty() {
+        wrappers.push("Sort".to_string());
+    }
+    if !select.aggregates.is_empty() || select.group_by.is_some() {
+        wrappers.push("Aggregate".to_string());
+    }
+
+    for (offset, wrapper) in wrappers.iter().enumerate() {
+        push_plan_line(
+            lines,
+            depth + offset,
+            wrapper,
+            (offset == 0)
+                .then_some(explain.map(|explain| explain.total))
+                .flatten(),
+        );
+    }
+    let leaf_depth = depth + wrappers.len();
+
+    if !select.order_by.is_empty() {
+        let context = PlanContext(&[&select.table_references]);
+        let sort_depth = depth
+            + wrappers
+                .iter()
+                .position(|wrapper| wrapper == "Sort")
+                .unwrap_or(0);
+        for (expr, direction, nulls) in &select.order_by {
+            let direction = match direction {
+                SortOrder::Asc => "ASC",
+                SortOrder::Desc => "DESC",
+            };
+            let nulls = match nulls {
+                Some(ast::NullsOrder::First) => " NULLS FIRST",
+                Some(ast::NullsOrder::Last) => " NULLS LAST",
+                None => "",
+            };
+            push_detail_line(
+                lines,
+                sort_depth,
+                &format!("Sort Key: {} {direction}{nulls}", expr.displayer(&context)),
+            );
+        }
+    }
+
+    if let Some(group_by) = &select.group_by {
+        let context = PlanContext(&[&select.table_references]);
+        let aggregate_depth = depth
+            + wrappers
+                .iter()
+                .position(|wrapper| wrapper == "Aggregate")
+                .expect("GROUP BY plans must have an Aggregate wrapper");
+        let keys = group_by
+            .exprs
+            .iter()
+            .map(|expr| expr.displayer(&context).to_string())
+            .collect::<Vec<_>>();
+        push_detail_line(
+            lines,
+            aggregate_depth,
+            &format!("Group Key: {}", keys.join(", ")),
+        );
+        if let Some(having) = &group_by.having {
+            let conditions = having
+                .iter()
+                .map(|expr| expr.displayer(&context).to_string())
+                .collect::<Vec<_>>();
+            push_detail_line(
+                lines,
+                aggregate_depth,
+                &format!("Filter: ({})", conditions.join(" AND ")),
+            );
+        }
+    }
+
+    if select.join_order.is_empty() {
+        push_plan_line(
+            lines,
+            leaf_depth,
+            "Result",
+            explain.map(|explain| explain.total),
+        );
+    } else if select.join_order.len() == 1 {
+        if let Some(table) = select
+            .table_references
+            .find_joined_table_by_internal_id(select.join_order[0].table_id)
+        {
+            append_table_access(lines, leaf_depth, table, access_estimate(explain, table));
+            append_postgres_hash_join_condition(
+                lines,
+                leaf_depth,
+                table,
+                &select.where_clause,
+                &select.table_references,
+            );
+            append_postgres_filters(
+                lines,
+                leaf_depth,
+                &select.where_clause,
+                &select.table_references,
+            );
+        }
+    } else {
+        push_plan_line(
+            lines,
+            leaf_depth,
+            "Nested Loop",
+            explain.map(|explain| explain.total),
+        );
+        for member in &select.join_order {
+            if let Some(table) = select
+                .table_references
+                .find_joined_table_by_internal_id(member.table_id)
+            {
+                append_table_access(
+                    lines,
+                    leaf_depth + 1,
+                    table,
+                    access_estimate(explain, table),
+                );
+                append_postgres_hash_join_condition(
+                    lines,
+                    leaf_depth + 1,
+                    table,
+                    &select.where_clause,
+                    &select.table_references,
+                );
+            }
+        }
+    }
+}
+
+fn append_postgres_hash_join_condition(
+    lines: &mut Vec<String>,
+    depth: usize,
+    table: &JoinedTable,
+    where_clause: &[WhereTerm],
+    table_references: &TableReferences,
+) {
+    let Operation::HashJoin(hash_join) = &table.op else {
+        return;
+    };
+    let context = PlanContext(&[table_references]);
+    let conditions = hash_join
+        .join_keys
+        .iter()
+        .map(|key| {
+            format!(
+                "{} = {}",
+                key.get_build_expr(where_clause).displayer(&context),
+                key.get_probe_expr(where_clause).displayer(&context),
+            )
+        })
+        .collect::<Vec<_>>();
+    push_detail_line(
+        lines,
+        depth,
+        &format!("Hash Cond: ({})", conditions.join(" AND ")),
+    );
+}
+
+fn append_table_access(
+    lines: &mut Vec<String>,
+    depth: usize,
+    table: &JoinedTable,
+    estimate: Option<ExplainEstimate>,
+) {
+    let table_name = if table.table.get_name() == table.identifier {
+        table.identifier.as_str()
+    } else {
+        // PostgreSQL prints the base table name in the node and the alias in a
+        // separate field. The MVP keeps both pieces of user-visible context.
+        // This is more useful than silently dropping the alias.
+        &table.identifier
+    };
+
+    match &table.op {
+        Operation::Scan(Scan::BTreeTable {
+            index: Some(index), ..
+        }) => {
+            let kind = if table.utilizes_covering_index() {
+                "Index Only Scan"
+            } else {
+                "Index Scan"
+            };
+            push_plan_line(
+                lines,
+                depth,
+                &format!("{kind} using {} on {table_name}", index.name),
+                estimate,
+            );
+        }
+        Operation::Scan(_) => {
+            push_plan_line(lines, depth, &format!("Seq Scan on {table_name}"), estimate)
+        }
+        Operation::Search(Search::RowidEq { .. })
+        | Operation::Search(Search::Seek { index: None, .. })
+        | Operation::Search(Search::InSeek { index: None, .. }) => {
+            push_plan_line(
+                lines,
+                depth,
+                &format!("Index Scan using PRIMARY KEY on {table_name}"),
+                estimate,
+            );
+        }
+        Operation::Search(Search::Seek {
+            index: Some(index),
+            seek_def,
+        }) => {
+            let kind = if table.utilizes_covering_index() {
+                "Index Only Scan"
+            } else {
+                "Index Scan"
+            };
+            push_plan_line(
+                lines,
+                depth,
+                &format!("{kind} using {} on {table_name}", index.name),
+                estimate,
+            );
+            let constraint = seek_constraint_annotation(index, seek_def);
+            if !constraint.is_empty() {
+                push_detail_line(lines, depth, &format!("Index Cond:{constraint}"));
+            }
+        }
+        Operation::Search(Search::InSeek {
+            index: Some(index), ..
+        }) => {
+            let kind = if table.utilizes_covering_index() {
+                "Index Only Scan"
+            } else {
+                "Index Scan"
+            };
+            push_plan_line(
+                lines,
+                depth,
+                &format!("{kind} using {} on {table_name}", index.name),
+                estimate,
+            );
+        }
+        Operation::MultiIndexScan(_) => push_plan_line(lines, depth, "Bitmap Heap Scan", estimate),
+        Operation::HashJoin(_) => push_plan_line(lines, depth, "Hash Join", estimate),
+        Operation::IndexMethodQuery(index) => push_plan_line(
+            lines,
+            depth,
+            &format!("Index Scan using {} on {table_name}", index.index.name),
+            estimate,
+        ),
+    }
+}
+
+fn access_estimate(
+    explain: Option<&PostgresExplain>,
+    table: &JoinedTable,
+) -> Option<ExplainEstimate> {
+    explain.and_then(|explain| {
+        explain
+            .accesses
+            .iter()
+            .find_map(|(table_id, estimate)| (*table_id == table.internal_id).then_some(*estimate))
+    })
+}
+
+fn push_plan_line(
+    lines: &mut Vec<String>,
+    depth: usize,
+    node: &str,
+    estimate: Option<ExplainEstimate>,
+) {
+    let prefix = if depth == 0 { "" } else { "  -> " };
+    let estimate = estimate.map_or_else(String::new, |estimate| {
+        format!(
+            "  (cost=0.00..{:.2} rows={:.0})",
+            estimate.cost, estimate.rows
+        )
+    });
+    lines.push(format!(
+        "{}{}{}{}",
+        "  ".repeat(depth.saturating_sub(1)),
+        prefix,
+        node,
+        estimate,
+    ));
+}
+
+fn push_detail_line(lines: &mut Vec<String>, depth: usize, detail: &str) {
+    lines.push(format!("{}{}", "  ".repeat(depth + 1), detail));
 }
 
 impl Display for Aggregate {

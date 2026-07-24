@@ -23,6 +23,8 @@ pub enum Cmd {
     Explain(Stmt),
     /// `EXPLAIN QUERY PLAN` statement
     ExplainQueryPlan(Stmt),
+    /// PostgreSQL-compatible `EXPLAIN` statement
+    ExplainPostgres(Stmt),
     /// statement
     Stmt(Stmt),
 }

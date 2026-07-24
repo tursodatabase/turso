@@ -92,7 +92,9 @@ use turso_parser::ast::ResolveType;
 use crate::io::TempFile;
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
-use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
+use explain::{
+    insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS, POSTGRES_EXPLAIN_COLUMNS,
+};
 use std::{
     collections::HashMap,
     num::NonZero,
@@ -1504,6 +1506,7 @@ pub struct PreparedProgram {
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
+    pub postgres_explain: Option<Vec<String>>,
     pub sql: String,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.
@@ -1638,6 +1641,7 @@ impl Program {
             QueryMode::Normal => self.normal_step(state, pager, waker),
             QueryMode::Explain => self.explain_step(state, pager),
             QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, pager),
+            QueryMode::ExplainPostgres => self.explain_postgres_step(state, pager),
         };
         match &result {
             Ok(StepResult::Done) => {
@@ -1795,6 +1799,41 @@ impl Program {
             state.pc += 1;
             return Ok(StepResult::Row);
         }
+    }
+
+    fn explain_postgres_step(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Result<StepResult> {
+        turso_debug_assert!(state.column_count() == POSTGRES_EXPLAIN_COLUMNS.len());
+        if self.connection.is_closed() {
+            let tx_state = self.connection.get_tx_state();
+            if let TransactionState::Write { .. } = tx_state {
+                pager.rollback_tx(&self.connection);
+            }
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+        if self.maybe_request_interrupt(state, pager.io.as_ref()) {
+            return Ok(StepResult::Interrupt);
+        }
+
+        // DML rendering is intentionally deferred from the SELECT-focused MVP.
+        // Keep EXPLAIN side-effect free and report no plan rows for those commands.
+        let Some(lines) = self.prepared.postgres_explain.as_ref() else {
+            return Ok(StepResult::Done);
+        };
+        let Some(line) = lines.get(state.pc as usize) else {
+            return Ok(StepResult::Done);
+        };
+        state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+        state.registers[0].set_value(Value::from_text(line.clone()));
+        state.result_row = Some(Row {
+            values: &state.registers[0] as *const Register,
+            count: POSTGRES_EXPLAIN_COLUMNS.len(),
+        });
+        state.pc += 1;
+        Ok(StepResult::Row)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

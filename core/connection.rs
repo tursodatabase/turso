@@ -901,7 +901,10 @@ impl Connection {
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
-        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let (Cmd::Stmt(stmt)
+        | Cmd::Explain(stmt)
+        | Cmd::ExplainQueryPlan(stmt)
+        | Cmd::ExplainPostgres(stmt)) = cmd;
         let schema = self.schema.read().clone();
         match translate::translate(
             &schema,
@@ -931,7 +934,10 @@ impl Connection {
                 let syms = self.syms.read();
                 let pager = self.pager.load().clone();
                 let mode = QueryMode::new(&cmd);
-                let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+                let (Cmd::Stmt(stmt)
+                | Cmd::Explain(stmt)
+                | Cmd::ExplainQueryPlan(stmt)
+                | Cmd::ExplainPostgres(stmt)) = cmd;
                 let schema = self.schema.read().clone();
                 translate::translate(
                     &schema,
@@ -1034,13 +1040,35 @@ impl Connection {
         stmt: ast::Stmt,
         input: &str,
     ) -> Result<Statement> {
-        self.prepare_stmt_with_input_and_origin(stmt, input, StatementOrigin::Root)
+        self.prepare_translated_cmd(ast::Cmd::Stmt(stmt), input)
+    }
+
+    /// Prepare an already-translated command while keeping the original SQL text.
+    ///
+    /// Unlike [`Connection::prepare_translated_stmt`], this preserves command-level
+    /// execution modes such as `EXPLAIN`.
+    pub fn prepare_translated_cmd(
+        self: &Arc<Connection>,
+        cmd: ast::Cmd,
+        input: &str,
+    ) -> Result<Statement> {
+        self.prepare_cmd_with_input_and_origin(cmd, input, StatementOrigin::Root)
     }
 
     #[turso_macros::trace_stack]
     fn prepare_stmt_with_input_and_origin(
         self: &Arc<Connection>,
         stmt: ast::Stmt,
+        input: &str,
+        origin: StatementOrigin,
+    ) -> Result<Statement> {
+        self.prepare_cmd_with_input_and_origin(ast::Cmd::Stmt(stmt), input, origin)
+    }
+
+    #[turso_macros::trace_stack]
+    fn prepare_cmd_with_input_and_origin(
+        self: &Arc<Connection>,
+        cmd: ast::Cmd,
         input: &str,
         origin: StatementOrigin,
     ) -> Result<Statement> {
@@ -1052,7 +1080,7 @@ impl Connection {
             self.start_nested();
         }
         let result = (|| {
-            let (program, pager, mode) = self.compile_cmd(Cmd::Stmt(stmt), input, origin)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
             Ok(Statement::new_with_origin(
                 program,
                 pager,

@@ -3,6 +3,7 @@ mod copy;
 mod dialect;
 mod domain;
 mod functions;
+mod explain;
 mod parse_edge_cases;
 mod sequence;
 mod table;

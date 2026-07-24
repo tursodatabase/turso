@@ -10,15 +10,17 @@ use crate::translate::planner::{parse_limit, ROWID_STRS};
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
+    turso_assert,
     util::normalize_ident,
-    vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
+    vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode},
     CaptureDataChangesExt, Connection,
 };
 use turso_parser::ast::{self, Expr};
 
+use super::display::render_postgres_explain;
 use super::emitter::emit_program;
 use super::expr::process_returning_clause;
-use super::optimizer::optimize_plan;
+use super::optimizer::{optimize_plan, optimize_plan_for_postgres_explain};
 use super::plan::{
     ColumnUsedMask, DmlSafety, JoinedTable, Plan, TableReferences, UpdatePlan, UpdateSetClause,
 };
@@ -62,7 +64,15 @@ pub fn translate_update(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
-    let plan = prepare_and_optimize_update_plan(program, resolver, body, connection, false, None)?;
+    let plan = if program.get_query_mode() == QueryMode::ExplainPostgres {
+        let (plan, postgres_explain) = prepare_and_optimize_update_plan_for_postgres_explain(
+            program, resolver, body, connection, false, None,
+        )?;
+        program.set_postgres_explain(render_postgres_explain(&plan, postgres_explain.as_ref()));
+        plan
+    } else {
+        prepare_and_optimize_update_plan(program, resolver, body, connection, false, None)?
+    };
     let Plan::Update(ref update_plan) = plan else {
         unreachable!("prepare_and_optimize_update_plan must return Plan::Update");
     };
@@ -166,6 +176,47 @@ fn prepare_and_optimize_update_plan(
     is_internal_schema_change: bool,
     ddl_query_for_cdc_update: Option<&str>,
 ) -> crate::Result<Plan> {
+    prepare_and_optimize_update_plan_impl(
+        program,
+        resolver,
+        body,
+        connection,
+        is_internal_schema_change,
+        ddl_query_for_cdc_update,
+        false,
+    )
+    .map(|(plan, _)| plan)
+}
+
+fn prepare_and_optimize_update_plan_for_postgres_explain(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    body: ast::Update,
+    connection: &Arc<crate::Connection>,
+    is_internal_schema_change: bool,
+    ddl_query_for_cdc_update: Option<&str>,
+) -> crate::Result<(Plan, Option<super::optimizer::PostgresExplain>)> {
+    turso_assert!(program.get_query_mode() == QueryMode::ExplainPostgres);
+    prepare_and_optimize_update_plan_impl(
+        program,
+        resolver,
+        body,
+        connection,
+        is_internal_schema_change,
+        ddl_query_for_cdc_update,
+        true,
+    )
+}
+
+fn prepare_and_optimize_update_plan_impl(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    body: ast::Update,
+    connection: &Arc<crate::Connection>,
+    is_internal_schema_change: bool,
+    ddl_query_for_cdc_update: Option<&str>,
+    collect_postgres_explain: bool,
+) -> crate::Result<(Plan, Option<super::optimizer::PostgresExplain>)> {
     let mut update_plan = prepare_update_plan(
         program,
         resolver,
@@ -196,8 +247,13 @@ fn prepare_and_optimize_update_plan(
     update_plan.from_tables = read_scope_tables;
 
     let mut plan = Plan::Update(Box::new(update_plan));
-    optimize_plan(program, &mut plan, resolver)?;
-    Ok(plan)
+    let postgres_explain = if collect_postgres_explain {
+        optimize_plan_for_postgres_explain(program, &mut plan, resolver)?
+    } else {
+        optimize_plan(program, &mut plan, resolver)?;
+        None
+    };
+    Ok((plan, postgres_explain))
 }
 
 fn validate_update(

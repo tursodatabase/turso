@@ -11,6 +11,8 @@ pub const EXPLAIN_COLUMNS_TYPE: [&str; 8] = [
 ];
 pub const EXPLAIN_QUERY_PLAN_COLUMNS: [&str; 4] = ["id", "parent", "notused", "detail"];
 pub const EXPLAIN_QUERY_PLAN_COLUMNS_TYPE: [&str; 4] = ["INTEGER", "INTEGER", "INTEGER", "TEXT"];
+pub const POSTGRES_EXPLAIN_COLUMNS: [&str; 1] = ["QUERY PLAN"];
+pub const POSTGRES_EXPLAIN_COLUMNS_TYPE: [&str; 1] = ["TEXT"];
 
 pub fn insn_to_row(
     program: &PreparedProgram,
