@@ -291,6 +291,7 @@ pub(super) fn choose_best_btree_candidate(
                     &order_target.columns,
                     schema,
                     EqualityPrefixScope::AnyEquality,
+                    order_target.is_extremum(),
                 ) == order_target.columns.len();
                 let all_opposite_direction = btree_access_order_consumed(
                     rhs_table,
@@ -300,6 +301,7 @@ pub(super) fn choose_best_btree_candidate(
                     &order_target.columns,
                     schema,
                     EqualityPrefixScope::AnyEquality,
+                    order_target.is_extremum(),
                 ) == order_target.columns.len();
 
                 let satisfies_order = all_same_direction || all_opposite_direction;
@@ -1781,6 +1783,7 @@ fn materialized_subquery_order_properties(
         &order_target.columns,
         schema,
         EqualityPrefixScope::AnyEquality,
+        order_target.is_extremum(),
     ) == order_target.columns.len();
     let all_opposite_direction = btree_access_order_consumed(
         rhs_table,
@@ -1790,6 +1793,7 @@ fn materialized_subquery_order_properties(
         &order_target.columns,
         schema,
         EqualityPrefixScope::AnyEquality,
+        order_target.is_extremum(),
     ) == order_target.columns.len();
 
     if !(all_same_direction || all_opposite_direction) {

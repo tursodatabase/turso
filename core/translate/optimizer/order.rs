@@ -288,6 +288,7 @@ pub fn plan_satisfies_order_target(
                 &order_target.columns[target_col_idx..],
                 schema,
                 EqualityPrefixScope::ConstantEquality,
+                order_target.is_extremum(),
             ),
             AccessMethodParams::MaterializedSubquery {
                 index,
@@ -301,6 +302,7 @@ pub fn plan_satisfies_order_target(
                 &order_target.columns[target_col_idx..],
                 schema,
                 EqualityPrefixScope::ConstantEquality,
+                order_target.is_extremum(),
             ),
             AccessMethodParams::Subquery { iter_dir } => {
                 let Table::FromClauseSubquery(from_clause_subquery) = &table_ref.table else {
@@ -652,6 +654,7 @@ fn finalized_scan_subquery_order_consumed(
             &mapped_target,
             schema,
             EqualityPrefixScope::ConstantEquality,
+            false,
         ),
         Operation::Scan(Scan::Subquery { .. }) => {
             let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table else {
@@ -777,6 +780,7 @@ fn target_matches_index_column(
 /// [`EqualityPrefixScope`] because candidate scoring may skip any equality
 /// prefix in the chosen seek key, while final global ordering proof may only
 /// skip prefixes that are constant across all output rows.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn btree_access_order_consumed(
     table_ref: &JoinedTable,
     iter_dir: IterationDirection,
@@ -785,6 +789,7 @@ pub(super) fn btree_access_order_consumed(
     order_target: &[ColumnOrder],
     schema: &Schema,
     equality_prefix_scope: EqualityPrefixScope,
+    target_is_extremum: bool,
 ) -> usize {
     let Some(first_target_col) = order_target.first() else {
         return 0;
@@ -886,10 +891,12 @@ pub(super) fn btree_access_order_consumed(
                     break;
                 }
 
-                let requested_nulls = target_col.effective_nulls_order();
-                let effective_nulls = idx_col.effective_nulls_order_when_iterated(iter_dir);
-                if requested_nulls != effective_nulls {
-                    break;
+                if !target_is_extremum {
+                    let requested_nulls = target_col.effective_nulls_order();
+                    let effective_nulls = idx_col.effective_nulls_order_when_iterated(iter_dir);
+                    if requested_nulls != effective_nulls {
+                        break;
+                    }
                 }
 
                 col_idx += 1;
