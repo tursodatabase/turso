@@ -55,15 +55,15 @@ use crate::translate::expr::{
     WalkControl,
 };
 use crate::translate::plan::{
-    Aggregate, ColumnUsedMask, IterationDirection, JoinInfo, JoinedTable, Operation, Plan,
-    QueryDestination, Scan, SelectPlan, TableReferences,
+    Aggregate, ColumnUsedMask, IterationDirection, JoinedTable, Operation, Plan, QueryDestination,
+    Scan, SelectPlan, TableReferences,
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::select::prepare_select_plan;
 use crate::turso_assert;
 use crate::types::ImmutableRecord;
 use crate::util::walk_expr_with_subqueries;
-use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder, ProgramBuilderOpts};
+use crate::vdbe::builder::{CursorType, ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::vdbe::{BranchOffset, PreparedProgram, Program};
 use crate::{
@@ -132,8 +132,6 @@ impl MaintenanceProgramCache {
 enum DeltaSource {
     BaseTable {
         table: Arc<BTreeTable>,
-        identifier: String,
-        logical_id: TableInternalId,
         /// Physical multiplicity column when this scan reads another
         /// materialized view. Transaction-delta cursors always expose their
         /// signed weight immediately after the logical columns.
@@ -151,37 +149,13 @@ impl DeltaSource {
         }
     }
 
-    fn sole_binding(&self) -> Result<(Arc<BTreeTable>, String, TableInternalId)> {
-        match self {
-            Self::BaseTable {
-                table,
-                identifier,
-                logical_id,
-                ..
-            } => Ok((table.clone(), identifier.clone(), *logical_id)),
-            Self::Ephemeral(channel) => {
-                if channel.schema.bindings.len() != 1 {
-                    return Err(LimboError::InternalError(
-                        "arranged input must expose exactly one logical binding".to_string(),
-                    ));
-                }
-                let binding = &channel.schema.bindings[0];
-                Ok((
-                    binding.table.clone(),
-                    binding.identifier.clone(),
-                    binding.logical_id,
-                ))
-            }
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn materialize(
         &self,
         program: &mut ProgramBuilder,
         view_name: &str,
         source_node: dag::NodeId,
-        source_schema: &dag::StreamSchema,
+        source_contract: &NodeOutputContract,
         input: MaintenanceInput,
     ) -> Result<EphemeralDelta> {
         let Self::BaseTable {
@@ -198,8 +172,8 @@ impl DeltaSource {
         let sink = open_ephemeral_delta(
             program,
             &format!("{view_name}_scan_delta_{source_node}"),
-            source_schema.clone(),
-            DeltaIdentity::BindingRowids(1),
+            source_contract.schema.as_ref().clone(),
+            source_contract.emitted_identity,
             false,
         );
         let channel = sink.ephemeral()?;
@@ -230,7 +204,7 @@ struct NodeOutput {
 /// Physical inputs declared by one Join DAG node.
 struct JoinContract {
     deltas: Vec<DeltaSource>,
-    tables: Vec<JoinTable>,
+    schemas: Vec<Arc<dag::StreamSchema>>,
     arrangements: Vec<ArrangementHandle>,
     on: Vec<ast::Expr>,
 }
@@ -289,6 +263,8 @@ impl DeltaIdentity {
 #[derive(Debug, Clone)]
 struct ArrangementHandle {
     table: Arc<BTreeTable>,
+    identity: DeltaIdentity,
+    identity_columns: Arc<[ArrangementIdentityColumn]>,
     /// Physical table columns corresponding to the operator's logical output
     /// schema. Base arrangements are identity-mapped; aggregate state skips
     /// accumulator payload columns and explicit output arrangements skip
@@ -296,6 +272,12 @@ struct ArrangementHandle {
     value_columns: Arc<[usize]>,
     /// `None` when each physical row has multiplicity one.
     count_column: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArrangementIdentityColumn {
+    RowId,
+    Column(usize),
 }
 
 impl ArrangementHandle {
@@ -307,6 +289,14 @@ impl ArrangementHandle {
         &self.value_columns
     }
 
+    fn identity(&self) -> DeltaIdentity {
+        self.identity
+    }
+
+    fn identity_columns(&self) -> &[ArrangementIdentityColumn] {
+        &self.identity_columns
+    }
+
     fn count_column(&self) -> Option<usize> {
         self.count_column
     }
@@ -314,11 +304,19 @@ impl ArrangementHandle {
 
 fn btree_arrangement(
     table: Arc<BTreeTable>,
+    identity: DeltaIdentity,
+    identity_columns: Vec<ArrangementIdentityColumn>,
     value_columns: Vec<usize>,
     count_column: Option<usize>,
 ) -> ArrangementHandle {
+    turso_assert!(
+        identity.width() == identity_columns.len(),
+        "arrangement identity layout must match its identity contract"
+    );
     ArrangementHandle {
         table,
+        identity,
+        identity_columns: identity_columns.into(),
         value_columns: value_columns.into(),
         count_column,
     }
@@ -326,7 +324,13 @@ fn btree_arrangement(
 
 fn base_arrangement(table: Arc<BTreeTable>, count_column: Option<usize>) -> ArrangementHandle {
     let value_columns = (0..table.columns().len()).collect();
-    btree_arrangement(table, value_columns, count_column)
+    btree_arrangement(
+        table,
+        DeltaIdentity::BindingRowids(1),
+        vec![ArrangementIdentityColumn::RowId],
+        value_columns,
+        count_column,
+    )
 }
 
 /// The terminal consumer of an operator's output delta.
@@ -403,7 +407,7 @@ fn stream_table_references(
                 previous.is_none(),
                 "a stream schema must expose each logical binding exactly once"
             );
-            make_joined_table(&binding.table, &binding.identifier, &[], phase_id)
+            make_joined_table(&binding.table, &binding.identifier, phase_id)
         })
         .collect();
     (TableReferences::new(tables, vec![]), remap)
@@ -789,10 +793,6 @@ fn tracks_distinct_values(agg: &Aggregate) -> bool {
     agg.distinctness.is_distinct() && !matches!(agg.func, AggFunc::Min | AggFunc::Max)
 }
 
-/// Maximum number of tables in a join view: maintenance runs one delta phase
-/// per non-empty subset of the joined tables, so programs grow as 2^N - 1.
-pub const MAX_JOIN_TABLES: usize = 4;
-
 fn unsupported<T>(what: &str) -> Result<T> {
     Err(LimboError::ParseError(format!(
         "materialized views with {what} are not yet supported",
@@ -1039,7 +1039,6 @@ fn build_select_plan_dag(
     }
 
     let mut inputs = Vec::with_capacity(joined_tables.len());
-    let mut using = Vec::with_capacity(joined_tables.len());
     for joined in joined_tables {
         let input = match &joined.table {
             crate::schema::Table::BTree(table) => builder.push(dag::OpNode::Scan {
@@ -1063,59 +1062,67 @@ fn build_select_plan_dag(
             crate::schema::Table::Virtual(_) => return unsupported("virtual-table FROM sources"),
         };
         inputs.push(input);
-        using.push(
-            joined
-                .join_info
-                .as_ref()
-                .map(|join| {
-                    join.using
-                        .iter()
-                        .map(|name| name.as_str().to_string())
-                        .collect()
-                })
-                .unwrap_or_default(),
-        );
     }
 
-    let kind = if joined_tables.iter().any(|table| {
-        table
-            .join_info
-            .as_ref()
-            .is_some_and(|join| join.join_type == crate::translate::plan::JoinType::LeftOuter)
-    }) {
-        if inputs.len() != 2 {
-            return unsupported("LEFT JOIN over more than two tables");
-        }
-        dag::JoinKind::LeftOuter
-    } else {
-        dag::JoinKind::Inner
-    };
-    let mut on = Vec::new();
-    let mut filters = Vec::new();
+    let binding_positions = joined_tables
+        .iter()
+        .enumerate()
+        .map(|(position, table)| (table.internal_id, position))
+        .collect::<FxHashMap<_, _>>();
+    let mut on_by_step = vec![Vec::new(); inputs.len()];
+    let mut filters_by_step = vec![Vec::new(); inputs.len()];
     for term in &plan.where_clause {
-        let expr = term.expr.clone();
-        if inputs.len() > 1 && (kind == dag::JoinKind::Inner || term.from_outer_join.is_some()) {
-            on.push(expr);
+        if let Some(right_binding) = term.from_outer_join {
+            let step = *binding_positions.get(&right_binding).ok_or_else(|| {
+                LimboError::InternalError(
+                    "outer-join predicate references a table outside the FROM clause".to_string(),
+                )
+            })?;
+            if step == 0
+                || !joined_tables[step].join_info.as_ref().is_some_and(|join| {
+                    join.join_type == crate::translate::plan::JoinType::LeftOuter
+                })
+            {
+                return Err(LimboError::InternalError(
+                    "outer-join predicate is not owned by a LEFT JOIN step".to_string(),
+                ));
+            }
+            on_by_step[step].push(term.expr.clone());
         } else {
-            filters.push(expr);
+            let step = max_referenced_binding_position(&term.expr, &binding_positions)?;
+            filters_by_step[step].push(term.expr.clone());
         }
     }
 
-    let mut node = if inputs.len() == 1 {
-        inputs[0]
-    } else {
-        builder.push(dag::OpNode::Join {
-            inputs,
-            using,
-            on,
-            kind,
-        })?
-    };
-    if let Some(predicate) = combine_predicates(filters) {
+    let mut node = inputs[0];
+    if let Some(predicate) = combine_predicates(std::mem::take(&mut filters_by_step[0])) {
         node = builder.push(dag::OpNode::Filter {
             input: node,
             predicate,
         })?;
+    }
+    for step in 1..inputs.len() {
+        let kind = match joined_tables[step]
+            .join_info
+            .as_ref()
+            .map(|join| join.join_type)
+            .unwrap_or(crate::translate::plan::JoinType::Inner)
+        {
+            crate::translate::plan::JoinType::Inner => dag::JoinKind::Inner,
+            crate::translate::plan::JoinType::LeftOuter => dag::JoinKind::LeftOuter,
+            _ => unreachable!("unsupported join kinds were rejected before DAG lowering"),
+        };
+        node = builder.push(dag::OpNode::Join {
+            inputs: [node, inputs[step]],
+            on: std::mem::take(&mut on_by_step[step]),
+            kind,
+        })?;
+        if let Some(predicate) = combine_predicates(std::mem::take(&mut filters_by_step[step])) {
+            node = builder.push(dag::OpNode::Filter {
+                input: node,
+                predicate,
+            })?;
+        }
     }
 
     let is_distinct = plan.distinctness.is_distinct();
@@ -1237,6 +1244,35 @@ fn combine_predicates(mut predicates: Vec<ast::Expr>) -> Option<ast::Expr> {
     }))
 }
 
+fn max_referenced_binding_position(
+    expr: &ast::Expr,
+    binding_positions: &FxHashMap<TableInternalId, usize>,
+) -> Result<usize> {
+    let mut max_position = 0;
+    walk_expr_with_subqueries(expr, &mut |node| {
+        let binding = match node {
+            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => Some(*table),
+            ast::Expr::Id(_) | ast::Expr::Qualified(_, _) | ast::Expr::DoublyQualified(_, _, _) => {
+                return Err(LimboError::InternalError(
+                    "maintenance predicate contains an unresolved identifier".to_string(),
+                ));
+            }
+            _ => None,
+        };
+        if let Some(binding) = binding {
+            let position = binding_positions.get(&binding).ok_or_else(|| {
+                LimboError::InternalError(
+                    "maintenance predicate references a binding outside its FROM clause"
+                        .to_string(),
+                )
+            })?;
+            max_position = max_position.max(*position);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(max_position)
+}
+
 fn hidden_count_aggregate(resolver: &Resolver) -> Result<Vec<Aggregate>> {
     let count_star = ast::Expr::FunctionCallStar {
         name: ast::Name::exact("count".to_string()),
@@ -1273,7 +1309,24 @@ pub struct HiddenTableDef {
     pub create_sql: String,
 }
 
-/// Persistent storage assigned to one DAG node.
+/// The complete physical output contract of one DAG node.
+///
+/// Planning derives this once from the logical node and its already-planned
+/// inputs. Bytecode emission consumes it verbatim; emitters must not infer an
+/// identity from an operator shape or reconstruct a schema from physical
+/// inputs.
+#[derive(Debug, Clone)]
+struct NodeOutputContract {
+    schema: Arc<dag::StreamSchema>,
+    /// Identity emitted by the relational operator before an optional output
+    /// arrangement.
+    emitted_identity: DeltaIdentity,
+    /// Identity published on the node's DAG edge. An explicit arrangement
+    /// replaces the producer identity with its own stable rowid.
+    published_identity: DeltaIdentity,
+}
+
+/// Persistent storage and output contract assigned to one DAG node.
 ///
 /// `state_table` is the operator's primary integral. `auxiliary_table` is the
 /// aggregate value multiset, the LEFT-join unmatched-row bookkeeping, or the
@@ -1284,12 +1337,7 @@ pub struct HiddenTableDef {
 #[derive(Debug, Clone)]
 struct OperatorStateDef {
     node_id: dag::NodeId,
-    /// Identity emitted by the relational operator before an optional output
-    /// arrangement.
-    emitted_identity: DeltaIdentity,
-    /// Identity published on the node's DAG edge. An explicit arrangement
-    /// replaces the producer identity with its own stable rowid.
-    output_identity: DeltaIdentity,
+    output: NodeOutputContract,
     state_table: Option<HiddenTableDef>,
     auxiliary_table: Option<HiddenTableDef>,
     arrangement_table: Option<HiddenTableDef>,
@@ -1348,6 +1396,10 @@ impl OperatorStateCatalog {
             )));
         }
         Ok(state)
+    }
+
+    fn output_for_node(&self, node_id: dag::NodeId) -> Result<&NodeOutputContract> {
+        Ok(&self.for_node(node_id)?.output)
     }
 
     pub fn hidden_tables(&self) -> impl Iterator<Item = &HiddenTableDef> {
@@ -1469,7 +1521,7 @@ fn validate_terminal_delta_identity(
     operator_states: &OperatorStateCatalog,
     node_id: dag::NodeId,
 ) -> Result<()> {
-    match operator_states.for_node(node_id)?.output_identity {
+    match operator_states.for_node(node_id)?.output.published_identity {
         DeltaIdentity::BindingRowids(1) | DeltaIdentity::OperatorRowid => Ok(()),
         DeltaIdentity::BindingRowids(_) | DeltaIdentity::OperatorKey(_) => unsupported(
             "a root delta with composite identity without an explicit materialized sink",
@@ -1694,13 +1746,8 @@ fn validate_composable_delta_node(
             Ok(())
         }
         dag::OpNode::Alias { .. } => Ok(()),
-        dag::OpNode::Join {
-            inputs,
-            using,
-            on,
-            kind,
-        } => {
-            validate_join_node(dag, inputs, using, on, *kind, operator_states)?;
+        dag::OpNode::Join { inputs, on, .. } => {
+            validate_join_node(dag, inputs, on, operator_states)?;
             Ok(())
         }
         dag::OpNode::SetOp {
@@ -1772,21 +1819,10 @@ fn validate_composable_delta_node(
 
 fn validate_join_node(
     dag: &dag::MaintenanceDag,
-    inputs: &[dag::NodeId],
-    using: &[Vec<String>],
+    inputs: &[dag::NodeId; 2],
     predicates: &[ast::Expr],
-    kind: dag::JoinKind,
     operator_states: &OperatorStateCatalog,
 ) -> Result<()> {
-    if inputs.len() > MAX_JOIN_TABLES {
-        return unsupported(&format!("joins over more than {MAX_JOIN_TABLES} tables"));
-    }
-    if kind == dag::JoinKind::LeftOuter && inputs.len() != 2 {
-        return Err(LimboError::InternalError(
-            "a LEFT JOIN maintenance node must be binary".to_string(),
-        ));
-    }
-    let mut identifiers = Vec::with_capacity(inputs.len());
     for &input in inputs {
         if !operator_states
             .for_node(input)?
@@ -1795,17 +1831,6 @@ fn validate_join_node(
             return Err(LimboError::InternalError(format!(
                 "join input DAG node {input} has no declared arrangement"
             )));
-        }
-        let bindings = &dag.output_schema(input).bindings;
-        if bindings.len() != 1 {
-            return unsupported("join inputs with multiple logical namespaces");
-        }
-        identifiers.push(crate::util::normalize_ident(&bindings[0].identifier));
-    }
-    if using.iter().any(|columns| !columns.is_empty()) {
-        identifiers.sort();
-        if identifiers.windows(2).any(|pair| pair[0] == pair[1]) {
-            return unsupported("NATURAL or USING joins between tables with the same name");
         }
     }
     for predicate in predicates {
@@ -1828,7 +1853,8 @@ fn declared_emitted_identity(
                         "maintenance DAG input node {input} has no identity contract"
                     ))
                 })?
-                .output_identity
+                .output
+                .published_identity
         }
         dag::OpNode::Alias { input, .. } => {
             let upstream = prior_states
@@ -1838,14 +1864,42 @@ fn declared_emitted_identity(
                         "maintenance DAG input node {input} has no identity contract"
                     ))
                 })?
-                .output_identity;
+                .output
+                .published_identity;
             alias_identity(upstream)
         }
         dag::OpNode::Join {
             inputs,
             kind: dag::JoinKind::Inner,
             ..
-        } => DeltaIdentity::BindingRowids(inputs.len()),
+        } => {
+            let input_identities = inputs
+                .iter()
+                .map(|input| {
+                    prior_states
+                        .get(*input)
+                        .map(|state| state.output.published_identity)
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "maintenance DAG input node {input} has no identity contract"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if input_identities
+                .iter()
+                .all(|identity| matches!(identity, DeltaIdentity::BindingRowids(_)))
+            {
+                DeltaIdentity::BindingRowids(
+                    input_identities
+                        .iter()
+                        .map(|identity| identity.width())
+                        .sum(),
+                )
+            } else {
+                DeltaIdentity::OperatorKey(2)
+            }
+        }
         // Matched and NULL-padded rows share `(kind, packed source identity)`.
         dag::OpNode::Join {
             kind: dag::JoinKind::LeftOuter,
@@ -1881,6 +1935,19 @@ fn node_is_join_input(dag: &dag::MaintenanceDag, node_id: dag::NodeId) -> bool {
         matches!(
             node,
             dag::OpNode::Join { inputs, .. } if inputs.contains(&node_id)
+        )
+    })
+}
+
+fn node_is_left_join_input(dag: &dag::MaintenanceDag, node_id: dag::NodeId) -> bool {
+    dag.nodes.iter().any(|node| {
+        matches!(
+            node,
+            dag::OpNode::Join {
+                inputs,
+                kind: dag::JoinKind::LeftOuter,
+                ..
+            } if inputs.contains(&node_id)
         )
     })
 }
@@ -1988,15 +2055,20 @@ fn plan_operator_states(
         } else {
             None
         };
-        let output_identity = if arrangement_table.is_some() {
+        let published_identity = if arrangement_table.is_some()
+            && (node_id == dag.root || node_is_left_join_input(dag, node_id))
+        {
             DeltaIdentity::OperatorRowid
         } else {
             emitted_identity
         };
         let state = OperatorStateDef {
             node_id,
-            emitted_identity,
-            output_identity,
+            output: NodeOutputContract {
+                schema: Arc::new(dag.output_schema(node_id).clone()),
+                emitted_identity,
+                published_identity,
+            },
             state_table,
             auxiliary_table,
             arrangement_table,
@@ -2192,7 +2264,7 @@ fn multiset_table_sql(
         // (branch, packed source identity), each row's rowid doubling as its
         // view rowid (disambiguated from content-row rowids by the caller).
         // Packing makes the contract independent of whether a branch carries
-        // one scan rowid or an N-way join identity tuple.
+        // one scan rowid or a composed join identity tuple.
         dag::OpNode::SetOp { .. } => Ok(format!(
             "CREATE TABLE {multiset_table_ident} (branch, source_identity, mult, PRIMARY KEY (branch, source_identity))"
         )),
@@ -2331,12 +2403,7 @@ fn scan_node_output(
     node_id: dag::NodeId,
     schema: &Schema,
 ) -> Result<NodeOutput> {
-    let dag::OpNode::Scan {
-        table,
-        identifier,
-        logical_id,
-    } = &dag.nodes[node_id]
-    else {
+    let dag::OpNode::Scan { table, .. } = &dag.nodes[node_id] else {
         return Err(LimboError::InternalError(format!(
             "maintenance DAG node {node_id} is not a scan"
         )));
@@ -2347,8 +2414,6 @@ fn scan_node_output(
     Ok(NodeOutput {
         delta: DeltaSource::BaseTable {
             table: table.clone(),
-            identifier: identifier.clone(),
-            logical_id: *logical_id,
             stored_weight_column,
         },
         arrangement: Some(base_arrangement(table.clone(), stored_weight_column)),
@@ -2357,46 +2422,46 @@ fn scan_node_output(
 
 fn join_contract_from_inputs(
     inputs: &[NodeOutput],
-    using: &[Vec<String>],
+    input_schemas: &[Arc<dag::StreamSchema>],
     on: &[ast::Expr],
 ) -> Result<JoinContract> {
     turso_assert!(
-        inputs.len() == using.len(),
-        "join USING metadata must be parallel to its inputs"
+        inputs.len() == 2 && input_schemas.len() == 2,
+        "a binary join must declare exactly two physical inputs"
     );
     let mut deltas = Vec::with_capacity(inputs.len());
-    let mut tables = Vec::with_capacity(inputs.len());
     let mut arrangements = Vec::with_capacity(inputs.len());
-    for (position, input) in inputs.iter().enumerate() {
-        let (table, identifier, logical_id) = input.delta.sole_binding()?;
+    for (input, input_schema) in inputs.iter().zip(input_schemas) {
         let arrangement = input.arrangement.clone().ok_or_else(|| {
             LimboError::InternalError("join input has no materialized arrangement".to_string())
         })?;
-        if arrangement.value_columns().len() != table.columns().len() {
+        if arrangement.value_columns().len() != input_schema.len() {
             return Err(LimboError::InternalError(
                 "join arrangement does not match its logical input width".to_string(),
             ));
         }
+        if arrangement.identity() != input.delta.identity() {
+            return Err(LimboError::InternalError(
+                "join delta and arrangement expose different identities".to_string(),
+            ));
+        }
         deltas.push(input.delta.clone());
-        tables.push((table, identifier, using[position].clone(), logical_id));
         arrangements.push(arrangement);
     }
     Ok(JoinContract {
         deltas,
-        tables,
+        schemas: input_schemas.to_vec(),
         arrangements,
         on: on.to_vec(),
     })
 }
 
-/// Integrate one node's declared delta into its persistent output
-/// arrangement and republish the same `(values, weight)` changes with the
-/// arrangement rowid as their stable identity.
+/// Integrate one node's declared delta into its persistent output arrangement.
 ///
-/// The source identity is only the key used to find the arrangement row. The
-/// downstream identity is always the arrangement's own rowid, so consumers do
-/// not need to know whether the producer was a scan, join, aggregate, or
-/// another arranged operator.
+/// Interior arrangements preserve the producer identity so later binary joins
+/// can compose binding-rowid tuples without losing provenance. A terminal
+/// arrangement publishes its own rowid to satisfy the materialized-view sink's
+/// one-rowid contract.
 #[allow(clippy::too_many_arguments)]
 fn emit_output_arrangement(
     program: &mut ProgramBuilder,
@@ -2413,11 +2478,11 @@ fn emit_output_arrangement(
         ));
     }
     turso_assert!(
-        output.identity == DeltaIdentity::OperatorRowid
-            && output.value_start == 1
+        (output.identity == input.identity || output.identity == DeltaIdentity::OperatorRowid)
+            && output.value_start == output.identity_width()
             && output.width == input.width
-            && output.weight_column == input.width + 1,
-        "output arrangement must publish rowid, values, and weight"
+            && output.weight_column == output.identity_width() + input.width,
+        "output arrangement must publish its planned identity, values, and weight"
     );
 
     let table = schema
@@ -2476,9 +2541,9 @@ fn emit_output_arrangement(
     let state_mult_reg = state_record_start + key_width;
     let state_record_reg = program.alloc_register();
     let index_record_reg = program.alloc_register();
-    // [arrangement rowid, delta values..., delta weight].
-    let output_record_start = program.alloc_registers(1 + input.width + 1);
-    let output_values_start = output_record_start + 1;
+    // [published identity..., delta values..., delta weight].
+    let output_record_start = program.alloc_registers(output.identity_width() + input.width + 1);
+    let output_values_start = output_record_start + output.identity_width();
     let output_weight_reg = output_values_start + input.width;
     let output_record_reg = program.alloc_register();
     let output_rowid_reg = program.alloc_register();
@@ -2663,11 +2728,19 @@ fn emit_output_arrangement(
     });
 
     program.preassign_label_to_next_insn(emit_label);
-    program.emit_insn(Insn::Copy {
-        src_reg: arrangement_rowid_reg,
-        dst_reg: output_record_start,
-        extra_amount: 0,
-    });
+    if output.identity == input.identity {
+        program.emit_insn(Insn::Copy {
+            src_reg: lookup_start,
+            dst_reg: output_record_start,
+            extra_amount: identity_width - 1,
+        });
+    } else {
+        program.emit_insn(Insn::Copy {
+            src_reg: arrangement_rowid_reg,
+            dst_reg: output_record_start,
+            extra_amount: 0,
+        });
+    }
     if input.width > 0 {
         program.emit_insn(Insn::Copy {
             src_reg: input_values_start,
@@ -2682,7 +2755,7 @@ fn emit_output_arrangement(
     });
     program.emit_insn(Insn::MakeRecord {
         start_reg: output_record_start as u16,
-        count: (1 + input.width + 1) as u16,
+        count: (output.identity_width() + input.width + 1) as u16,
         dest_reg: output_record_reg as u16,
         index_name: None,
         affinity_str: None,
@@ -2718,8 +2791,23 @@ fn emit_output_arrangement(
     program.preassign_label_to_next_insn(end_label);
 
     let value_columns = (identity_width..identity_width + input.width).collect();
+    let (arrangement_identity, identity_columns) = if output.identity == input.identity {
+        (
+            input.identity,
+            (0..identity_width)
+                .map(ArrangementIdentityColumn::Column)
+                .collect(),
+        )
+    } else {
+        (
+            DeltaIdentity::OperatorRowid,
+            vec![ArrangementIdentityColumn::RowId],
+        )
+    };
     Ok(btree_arrangement(
         table,
+        arrangement_identity,
+        identity_columns,
         value_columns,
         Some(identity_width + input.width),
     ))
@@ -2729,7 +2817,6 @@ fn emit_output_arrangement(
 fn materialize_declared_output_arrangement(
     program: &mut ProgramBuilder,
     view_name: &str,
-    dag: &dag::MaintenanceDag,
     node_id: dag::NodeId,
     output: NodeOutput,
     maintenance_input: MaintenanceInput,
@@ -2743,10 +2830,10 @@ fn materialize_declared_output_arrangement(
         program,
         view_name,
         node_id,
-        dag.output_schema(node_id),
+        &operator_state.output,
         maintenance_input,
     )?;
-    let expected_identity = operator_state.emitted_identity;
+    let expected_identity = operator_state.output.emitted_identity;
     if input.identity != expected_identity {
         return Err(LimboError::InternalError(format!(
             "maintenance DAG node {node_id} emits {:?}, expected {:?}",
@@ -2756,8 +2843,8 @@ fn materialize_declared_output_arrangement(
     let arranged_sink = open_ephemeral_delta(
         program,
         &format!("{view_name}_arranged_delta_{node_id}"),
-        dag.output_schema(node_id).clone(),
-        DeltaIdentity::OperatorRowid,
+        operator_state.output.schema.as_ref().clone(),
+        operator_state.output.published_identity,
         input.requires_positive_first,
     );
     let arranged_output = arranged_sink.ephemeral()?;
@@ -2781,6 +2868,7 @@ fn emit_ephemeral_filter(
     view_name: &str,
     node_id: dag::NodeId,
     input: &EphemeralDelta,
+    output_contract: &NodeOutputContract,
     predicate: &ast::Expr,
     schema: &Schema,
     connection: &Arc<Connection>,
@@ -2788,8 +2876,8 @@ fn emit_ephemeral_filter(
     let sink = open_ephemeral_delta(
         program,
         &format!("{view_name}_filter_delta_{node_id}"),
-        input.schema.as_ref().clone(),
-        input.identity,
+        output_contract.schema.as_ref().clone(),
+        output_contract.emitted_identity,
         input.requires_positive_first,
     );
     let output = sink.ephemeral()?;
@@ -2893,7 +2981,6 @@ fn append_alias_values(
     output: &EphemeralDelta,
 ) -> Result<()> {
     if input.width != output.width
-        || output.identity != alias_identity(input.identity)
         || output.identity_width() != input.identity_width()
         || output.value_start != output.identity_width()
     {
@@ -2967,13 +3054,13 @@ fn emit_ephemeral_alias(
     view_name: &str,
     node_id: dag::NodeId,
     input: &EphemeralDelta,
-    output_schema: dag::StreamSchema,
+    output_contract: &NodeOutputContract,
 ) -> Result<DeltaSource> {
     let sink = open_ephemeral_delta(
         program,
         &format!("{view_name}_alias_delta_{node_id}"),
-        output_schema,
-        alias_identity(input.identity),
+        output_contract.schema.as_ref().clone(),
+        output_contract.emitted_identity,
         input.requires_positive_first,
     );
     let output = sink.ephemeral()?;
@@ -2986,14 +3073,14 @@ fn emit_union_all_to_ephemeral(
     view_name: &str,
     node_id: dag::NodeId,
     inputs: &[EphemeralDelta],
-    output_schema: dag::StreamSchema,
+    output_contract: &NodeOutputContract,
 ) -> Result<DeltaSource> {
     let requires_positive_first = inputs.iter().any(|input| input.requires_positive_first);
     let sink = open_ephemeral_delta(
         program,
         &format!("{view_name}_union_all_delta_{node_id}"),
-        output_schema,
-        DeltaIdentity::OperatorKey(2),
+        output_contract.schema.as_ref().clone(),
+        output_contract.emitted_identity,
         requires_positive_first,
     );
     let output = sink.ephemeral()?;
@@ -3120,6 +3207,7 @@ fn emit_declared_delta_nodes_to(
         if !required[node_id] {
             continue;
         }
+        let output_contract = operator_states.output_for_node(node_id)?;
         let output = match &dag.nodes[node_id] {
             dag::OpNode::Scan { .. } => scan_node_output(dag, node_id, schema)?,
             dag::OpNode::Filter {
@@ -3136,12 +3224,19 @@ fn emit_declared_delta_nodes_to(
                     program,
                     view_name,
                     upstream_id,
-                    dag.output_schema(upstream_id),
+                    operator_states.output_for_node(upstream_id)?,
                     input,
                 )?;
                 NodeOutput {
                     delta: emit_ephemeral_filter(
-                        program, view_name, node_id, &upstream, predicate, schema, connection,
+                        program,
+                        view_name,
+                        node_id,
+                        &upstream,
+                        output_contract,
+                        predicate,
+                        schema,
+                        connection,
                     )?,
                     arrangement: None,
                 }
@@ -3160,14 +3255,14 @@ fn emit_declared_delta_nodes_to(
                     program,
                     view_name,
                     upstream_id,
-                    dag.output_schema(upstream_id),
+                    operator_states.output_for_node(upstream_id)?,
                     input,
                 )?;
                 let sink = open_ephemeral_delta(
                     program,
                     &format!("{view_name}_project_delta_{node_id}"),
-                    dag.output_schema(node_id).clone(),
-                    upstream.identity,
+                    output_contract.schema.as_ref().clone(),
+                    output_contract.emitted_identity,
                     upstream.requires_positive_first,
                 );
                 let output = sink.ephemeral()?;
@@ -3197,7 +3292,7 @@ fn emit_declared_delta_nodes_to(
                     program,
                     view_name,
                     upstream_id,
-                    dag.output_schema(upstream_id),
+                    operator_states.output_for_node(upstream_id)?,
                     input,
                 )?;
                 NodeOutput {
@@ -3206,17 +3301,12 @@ fn emit_declared_delta_nodes_to(
                         view_name,
                         node_id,
                         &upstream,
-                        dag.output_schema(node_id).clone(),
+                        output_contract,
                     )?,
                     arrangement: None,
                 }
             }
-            dag::OpNode::Join {
-                inputs,
-                using,
-                on,
-                kind,
-            } => {
+            dag::OpNode::Join { inputs, on, kind } => {
                 let declared_inputs = inputs
                     .iter()
                     .map(|input| {
@@ -3227,7 +3317,15 @@ fn emit_declared_delta_nodes_to(
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let contract = join_contract_from_inputs(&declared_inputs, using, on)?;
+                let input_schemas = inputs
+                    .iter()
+                    .map(|input| {
+                        operator_states
+                            .output_for_node(*input)
+                            .map(|plan| plan.schema.clone())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let contract = join_contract_from_inputs(&declared_inputs, &input_schemas, on)?;
                 if *kind == dag::JoinKind::LeftOuter {
                     NodeOutput {
                         delta: emit_left_join_deltas_to_ephemeral(
@@ -3235,7 +3333,7 @@ fn emit_declared_delta_nodes_to(
                             view_name,
                             node_id,
                             &contract,
-                            dag.output_schema(node_id).clone(),
+                            output_contract,
                             input,
                             operator_states.for_node(node_id)?,
                             schema,
@@ -3260,8 +3358,9 @@ fn emit_declared_delta_nodes_to(
                             program,
                             &mut resolver,
                             view_name,
+                            output_contract,
                             &contract.deltas,
-                            &contract.tables,
+                            &contract.schemas,
                             &contract.arrangements,
                             &contract.on,
                             input,
@@ -3288,7 +3387,7 @@ fn emit_declared_delta_nodes_to(
                         program,
                         view_name,
                         *upstream_id,
-                        dag.output_schema(*upstream_id),
+                        operator_states.output_for_node(*upstream_id)?,
                         input,
                     )?);
                 }
@@ -3307,7 +3406,7 @@ fn emit_declared_delta_nodes_to(
                             view_name,
                             node_id,
                             &channels,
-                            dag.output_schema(node_id).clone(),
+                            output_contract,
                         )?,
                         arrangement: None,
                     }
@@ -3318,8 +3417,8 @@ fn emit_declared_delta_nodes_to(
                     let sink = open_ephemeral_delta(
                         program,
                         &format!("{view_name}_set_op_delta_{node_id}"),
-                        dag.output_schema(node_id).clone(),
-                        DeltaIdentity::OperatorRowid,
+                        output_contract.schema.as_ref().clone(),
+                        output_contract.emitted_identity,
                         requires_positive_first,
                     );
                     let output = sink.ephemeral()?;
@@ -3358,14 +3457,14 @@ fn emit_declared_delta_nodes_to(
                     program,
                     view_name,
                     upstream_id,
-                    dag.output_schema(upstream_id),
+                    operator_states.output_for_node(upstream_id)?,
                     input,
                 )?;
                 let sink = open_ephemeral_delta(
                     program,
                     &format!("{view_name}_aggregate_delta_{node_id}"),
-                    dag.output_schema(node_id).clone(),
-                    DeltaIdentity::OperatorRowid,
+                    output_contract.schema.as_ref().clone(),
+                    output_contract.emitted_identity,
                     false,
                 );
                 let output = sink.ephemeral()?;
@@ -3393,33 +3492,38 @@ fn emit_declared_delta_nodes_to(
                 let value_columns = (0..group_exprs.len() + aggregates.len()).collect();
                 NodeOutput {
                     delta: sink.source()?,
-                    arrangement: Some(btree_arrangement(state_table, value_columns, None)),
+                    arrangement: Some(btree_arrangement(
+                        state_table,
+                        DeltaIdentity::OperatorRowid,
+                        vec![ArrangementIdentityColumn::RowId],
+                        value_columns,
+                        None,
+                    )),
                 }
             }
         };
         let operator_state = operator_states.for_node(node_id)?;
-        if output.delta.identity() != operator_state.emitted_identity {
+        if output.delta.identity() != operator_state.output.emitted_identity {
             return Err(LimboError::InternalError(format!(
                 "maintenance DAG node {node_id} emitted {:?}, but its declared identity is {:?}",
                 output.delta.identity(),
-                operator_state.emitted_identity
+                operator_state.output.emitted_identity
             )));
         }
         let output = materialize_declared_output_arrangement(
             program,
             view_name,
-            dag,
             node_id,
             output,
             input,
             operator_state,
             schema,
         )?;
-        if output.delta.identity() != operator_state.output_identity {
+        if output.delta.identity() != operator_state.output.published_identity {
             return Err(LimboError::InternalError(format!(
                 "maintenance DAG node {node_id} published {:?}, but its edge contract is {:?}",
                 output.delta.identity(),
-                operator_state.output_identity
+                operator_state.output.published_identity
             )));
         }
         outputs[node_id] = Some(output);
@@ -3454,10 +3558,13 @@ fn emit_generic_dag_to_sink(
         schema,
         connection,
     )?;
-    let stream =
-        node_output
-            .delta
-            .materialize(program, view_name, root, dag.output_schema(root), input)?;
+    let stream = node_output.delta.materialize(
+        program,
+        view_name,
+        root,
+        operator_states.output_for_node(root)?,
+        input,
+    )?;
     emit_terminal_delta(program, view_name, &stream, sink)
 }
 
@@ -5001,41 +5108,30 @@ enum JoinSide {
     Btree,
 }
 
-/// The delta phases of an N-way inner join. With the base btrees holding
-/// post-change state when the batch is applied, the view delta is the
-/// inclusion–exclusion sum over every non-empty subset S of the joined
-/// tables: join the deltas of the tables in S against the post-state btrees
-/// of the rest, signed (-1)^(|S|+1). The two-table case is the familiar
-/// `d(L ⋈ R) = dL ⋈ R_new + L_new ⋈ dR − dL ⋈ dR`. Population is a single
-/// all-btree phase with weight +1.
-fn join_subset_phases(n_tables: usize, input: MaintenanceInput) -> Vec<(Vec<JoinSide>, bool)> {
+/// The bilinear delta decomposition for one binary join:
+/// `d(L ⋈ R) = dL ⋈ R_new + L_new ⋈ dR − dL ⋈ dR`.
+///
+/// Population is one all-arrangement phase with weight +1. Unlike the deleted
+/// n-ary subset expansion, this has constant code size per join node.
+fn binary_join_phases(input: MaintenanceInput) -> Vec<([JoinSide; 2], bool)> {
     match input {
-        MaintenanceInput::BaseTable => vec![(vec![JoinSide::Btree; n_tables], false)],
-        MaintenanceInput::TransactionDelta => (1u32..(1 << n_tables))
-            .map(|mask| {
-                let sides = (0..n_tables)
-                    .map(|i| {
-                        if mask & (1 << i) != 0 {
-                            JoinSide::Delta
-                        } else {
-                            JoinSide::Btree
-                        }
-                    })
-                    .collect();
-                (sides, mask.count_ones() % 2 == 0)
-            })
-            .collect(),
+        MaintenanceInput::BaseTable => {
+            vec![([JoinSide::Btree, JoinSide::Btree], false)]
+        }
+        MaintenanceInput::TransactionDelta => vec![
+            ([JoinSide::Delta, JoinSide::Btree], false),
+            ([JoinSide::Btree, JoinSide::Delta], false),
+            ([JoinSide::Delta, JoinSide::Delta], true),
+        ],
     }
 }
 
-/// A [`JoinedTable`] scan entry for synthesized maintenance-program table
-/// references. `using` carries the table's merged USING/NATURAL column
-/// names so unqualified references to them bind without ambiguity, exactly
-/// as in the defining query.
+/// A [`JoinedTable`] scan entry for synthesized maintenance-program bindings.
+/// Expressions are already planner-bound, so no SQL name resolution or
+/// USING/NATURAL metadata is reconstructed here.
 fn make_joined_table(
     table: &Arc<BTreeTable>,
     identifier: &str,
-    using: &[String],
     id: TableInternalId,
 ) -> JoinedTable {
     JoinedTable {
@@ -5046,11 +5142,7 @@ fn make_joined_table(
         table: crate::schema::Table::BTree(table.clone()),
         identifier: identifier.to_string(),
         internal_id: id,
-        join_info: (!using.is_empty()).then(|| JoinInfo {
-            join_type: crate::translate::plan::JoinType::Inner,
-            using: using.iter().map(|n| ast::Name::exact(n.clone())).collect(),
-            no_reorder: false,
-        }),
+        join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
@@ -5059,14 +5151,76 @@ fn make_joined_table(
     }
 }
 
-/// A joined table with the identifier its columns bind under and the column
-/// names its USING (or NATURAL) join constraint merges.
-type JoinTable = (Arc<BTreeTable>, String, Vec<String>, TableInternalId);
-
 /// Per-match emission hook for [`emit_join_phase`]: receives the program,
-/// the per-table-position cursor ids, and the phase's table references.
-type JoinPhaseSink<'a> =
-    dyn FnMut(&mut ProgramBuilder, &[usize], &mut TableReferences, &Resolver) -> Result<()> + 'a;
+/// and the per-input physical cursor ids.
+type JoinPhaseSink<'a> = dyn FnMut(&mut ProgramBuilder, &[usize]) -> Result<()> + 'a;
+
+fn emit_arrangement_identity_value(
+    program: &mut ProgramBuilder,
+    arrangement: &ArrangementHandle,
+    cursor_id: usize,
+    identity_column: usize,
+    dest: usize,
+) {
+    match arrangement.identity_columns()[identity_column] {
+        ArrangementIdentityColumn::RowId => {
+            program.emit_insn(Insn::RowId { cursor_id, dest });
+        }
+        ArrangementIdentityColumn::Column(column) => {
+            program.emit_insn(Insn::Column {
+                cursor_id,
+                column,
+                dest,
+                default: None,
+            });
+        }
+    }
+}
+
+fn emit_join_input_identity(
+    program: &mut ProgramBuilder,
+    side: JoinSide,
+    delta: &DeltaSource,
+    arrangement: &ArrangementHandle,
+    cursor_id: usize,
+    dest: usize,
+) -> usize {
+    let identity = match side {
+        JoinSide::Delta => delta.identity(),
+        JoinSide::Btree => arrangement.identity(),
+    };
+    match (side, delta) {
+        (JoinSide::Delta, DeltaSource::BaseTable { .. }) => {
+            turso_assert!(
+                identity == DeltaIdentity::BindingRowids(1),
+                "base-table delta identity must be its rowid"
+            );
+            program.emit_insn(Insn::RowId { cursor_id, dest });
+        }
+        (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
+            for column in 0..identity.width() {
+                program.emit_insn(Insn::Column {
+                    cursor_id: channel.cursor_id,
+                    column,
+                    dest: dest + column,
+                    default: None,
+                });
+            }
+        }
+        (JoinSide::Btree, _) => {
+            for column in 0..identity.width() {
+                emit_arrangement_identity_value(
+                    program,
+                    arrangement,
+                    cursor_id,
+                    column,
+                    dest + column,
+                );
+            }
+        }
+    }
+    identity.width()
+}
 
 /// Emit one join delta phase: nested loops over every joined table — reading
 /// the transaction delta for tables in the phase's subset and the post-state
@@ -5081,7 +5235,7 @@ fn emit_join_phase(
     resolver: &mut Resolver,
     view_name: &str,
     deltas: &[DeltaSource],
-    tables: &[JoinTable],
+    schemas: &[Arc<dag::StreamSchema>],
     arrangements: &[ArrangementHandle],
     conditions: &[&ast::Expr],
     sides: &[JoinSide],
@@ -5089,40 +5243,45 @@ fn emit_join_phase(
     w_reg: usize,
     sink: &mut JoinPhaseSink<'_>,
 ) -> Result<()> {
-    let n = tables.len();
+    let n = schemas.len();
     turso_assert!(
-        deltas.len() == n && arrangements.len() == n,
-        "every join input must expose a delta and an arrangement"
+        n == 2 && deltas.len() == n && arrangements.len() == n && sides.len() == n,
+        "a binary join phase must expose two deltas and arrangements"
     );
 
-    // Fresh table references per phase: the same logical table reads from a
-    // different relation (delta vs btree) in each phase, and cursors are
-    // keyed by the internal id expressions bind against.
-    let ids: Vec<_> = (0..n)
-        .map(|_| program.table_reference_counter.next())
-        .collect();
-    let binding_remap = tables
-        .iter()
-        .zip(&ids)
-        .map(|((_, _, _, logical_id), phase_id)| (*logical_id, *phase_id))
-        .collect::<BindingRemap>();
-    let mut table_references = TableReferences::new(
-        tables
+    // A physical input may carry several SQL bindings after a previous binary
+    // join. Bound expressions are retargeted to fresh phase ids and every
+    // column is seeded from the one physical cursor declared by that edge.
+    let mut binding_remap = BindingRemap::default();
+    let mut phase_bindings = Vec::new();
+    for schema in schemas {
+        for binding in &schema.bindings {
+            let phase_id = program.table_reference_counter.next();
+            let previous = binding_remap.insert(binding.logical_id, phase_id);
+            turso_assert!(
+                previous.is_none(),
+                "a join phase must expose each logical binding exactly once"
+            );
+            phase_bindings.push((binding, phase_id));
+        }
+    }
+    let table_references = TableReferences::new(
+        phase_bindings
             .iter()
-            .zip(&ids)
-            .map(|((table, ident, using, _), id)| make_joined_table(table, ident, using, *id))
+            .map(|(binding, phase_id)| {
+                make_joined_table(&binding.table, &binding.identifier, *phase_id)
+            })
             .collect(),
         vec![],
     );
 
-    let cursor_ids: Vec<usize> = tables
+    let cursor_ids: Vec<usize> = schemas
         .iter()
         .zip(deltas)
         .zip(arrangements)
-        .zip(&ids)
         .zip(sides)
         .map(
-            |(((((table, _, _, _), delta), arrangement), id), side)| -> Result<usize> {
+            |(((input_schema, delta), arrangement), side)| -> Result<usize> {
                 let storage = arrangement.table();
                 match side {
                     JoinSide::Delta => match delta {
@@ -5130,17 +5289,15 @@ fn emit_join_phase(
                             table: delta_table, ..
                         } => {
                             turso_assert!(
-                                Arc::ptr_eq(table, delta_table)
-                                    || table.root_page == delta_table.root_page,
+                                input_schema.len() == delta_table.columns().len()
+                                    && (Arc::ptr_eq(storage, delta_table)
+                                        || storage.root_page == delta_table.root_page),
                                 "join delta and arrangement must describe the same relation"
                             );
-                            let cursor_id = program.alloc_cursor_id_keyed(
-                                CursorKey::table(*id),
-                                CursorType::ViewDelta {
-                                    view_name: view_name.to_string(),
-                                    table: delta_table.clone(),
-                                },
-                            );
+                            let cursor_id = program.alloc_cursor_id(CursorType::ViewDelta {
+                                view_name: view_name.to_string(),
+                                table: delta_table.clone(),
+                            });
                             program.emit_insn(Insn::OpenRead {
                                 cursor_id,
                                 root_page: 0,
@@ -5151,10 +5308,8 @@ fn emit_join_phase(
                         DeltaSource::Ephemeral(channel) => Ok(channel.cursor_id),
                     },
                     JoinSide::Btree => {
-                        let cursor_id = program.alloc_cursor_id_keyed(
-                            CursorKey::table(*id),
-                            CursorType::BTreeTable(storage.clone()),
-                        );
+                        let cursor_id =
+                            program.alloc_cursor_id(CursorType::BTreeTable(storage.clone()));
                         program.emit_insn(Insn::OpenRead {
                             cursor_id,
                             root_page: storage.root_page,
@@ -5199,7 +5354,7 @@ fn emit_join_phase(
         program.preassign_label_to_next_insn(loop_labels[depth]);
         if let Some(w) = delta_w_regs[pos] {
             let weight_column = match &deltas[pos] {
-                DeltaSource::BaseTable { .. } => tables[pos].0.columns().len(),
+                DeltaSource::BaseTable { .. } => schemas[pos].len(),
                 DeltaSource::Ephemeral(channel) => channel.weight_column,
             };
             program.emit_insn(Insn::Column {
@@ -5228,12 +5383,10 @@ fn emit_join_phase(
     // while ephemeral deltas carry identity before their values).
     resolver.enable_expr_to_reg_cache();
     for pos in 0..n {
-        let (table, _, _, _) = &tables[pos];
-        let phase_id = ids[pos];
-        for (logical_column, column) in table.columns().iter().enumerate() {
-            if column.name.is_none() {
+        for (logical_column, column) in schemas[pos].columns.iter().enumerate() {
+            let Some(expr) = &column.expr else {
                 continue;
-            }
+            };
             let physical_column = match (&sides[pos], &deltas[pos]) {
                 (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
                     channel.value_start + logical_column
@@ -5253,26 +5406,57 @@ fn emit_join_phase(
                 }
                 _ => program.emit_column_or_rowid(cursor_ids[pos], physical_column, value_reg),
             }
-            let expr = ast::Expr::Column {
-                database: None,
-                table: phase_id,
-                column: logical_column,
-                is_rowid_alias: column.is_rowid_alias(),
-            };
-            resolver.cache_expr_reg(std::borrow::Cow::Owned(expr), value_reg, false, None);
+            let bound = remap_bound_expr(expr, &binding_remap)?;
+            resolver.cache_expr_reg(std::borrow::Cow::Owned(bound), value_reg, false, None);
         }
-        if let (JoinSide::Delta, DeltaSource::Ephemeral(channel)) = (&sides[pos], &deltas[pos]) {
-            turso_assert!(
-                channel.identity_width() == 1,
-                "arranged join inputs must publish one stable rowid"
-            );
+        let input_identity = match sides[pos] {
+            JoinSide::Delta => deltas[pos].identity(),
+            JoinSide::Btree => arrangements[pos].identity(),
+        };
+        let DeltaIdentity::BindingRowids(identity_width) = input_identity else {
+            continue;
+        };
+        turso_assert!(
+            identity_width == schemas[pos].bindings.len(),
+            "binding-rowid join input must have one rowid per binding"
+        );
+        for (identity_column, binding) in schemas[pos].bindings.iter().enumerate() {
+            if !binding.table.has_rowid {
+                continue;
+            }
             let rowid_reg = program.alloc_register();
-            program.emit_insn(Insn::Column {
-                cursor_id: cursor_ids[pos],
-                column: 0,
-                dest: rowid_reg,
-                default: None,
-            });
+            match (&sides[pos], &deltas[pos]) {
+                (JoinSide::Delta, DeltaSource::BaseTable { .. }) => {
+                    turso_assert!(
+                        identity_width == 1,
+                        "a base-table join input has one binding rowid"
+                    );
+                    program.emit_insn(Insn::RowId {
+                        cursor_id: cursor_ids[pos],
+                        dest: rowid_reg,
+                    });
+                }
+                (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
+                    program.emit_insn(Insn::Column {
+                        cursor_id: channel.cursor_id,
+                        column: identity_column,
+                        dest: rowid_reg,
+                        default: None,
+                    });
+                }
+                (JoinSide::Btree, _) => emit_arrangement_identity_value(
+                    program,
+                    &arrangements[pos],
+                    cursor_ids[pos],
+                    identity_column,
+                    rowid_reg,
+                ),
+            }
+            let phase_id = *binding_remap.get(&binding.logical_id).ok_or_else(|| {
+                LimboError::InternalError(
+                    "join binding rowid has no phase-local binding".to_string(),
+                )
+            })?;
             resolver.cache_expr_reg(
                 std::borrow::Cow::Owned(ast::Expr::RowId {
                     database: None,
@@ -5323,7 +5507,7 @@ fn emit_join_phase(
         });
     }
 
-    sink(program, &cursor_ids, &mut table_references, resolver)?;
+    sink(program, &cursor_ids)?;
 
     for depth in (0..n).rev() {
         program.preassign_label_to_next_insn(next_labels[depth]);
@@ -5349,52 +5533,26 @@ fn emit_join_deltas_to_ephemeral(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     view_name: &str,
+    output_contract: &NodeOutputContract,
     deltas: &[DeltaSource],
-    tables: &[JoinTable],
+    schemas: &[Arc<dag::StreamSchema>],
     arrangements: &[ArrangementHandle],
     on_conditions: &[ast::Expr],
     input: MaintenanceInput,
 ) -> Result<DeltaSource> {
     let conditions: Vec<&ast::Expr> = on_conditions.iter().collect();
-
-    // The relational value schema excludes source identity; rowids travel in
-    // the channel's identity prefix.
-    let mut stream_columns = Vec::new();
-    for (table, _, _, logical_id) in tables {
-        for (logical_column, column) in table.columns().iter().enumerate() {
-            let name = column.name.clone().ok_or_else(|| {
-                LimboError::InternalError(
-                    "join stream contains an unaddressable column".to_string(),
-                )
-            })?;
-            stream_columns.push(dag::StreamColumn {
-                expr: Some(ast::Expr::Column {
-                    database: None,
-                    table: *logical_id,
-                    column: logical_column,
-                    is_rowid_alias: column.is_rowid_alias(),
-                }),
-                name: Some(name),
-            });
-        }
-    }
-    let width = stream_columns.len();
+    let width = output_contract.schema.len();
+    let natural_width = schemas.iter().map(|schema| schema.len()).sum::<usize>();
+    turso_assert!(
+        width == natural_width,
+        "join physical inputs must match the planned output schema"
+    );
 
     let sink = open_ephemeral_delta(
         program,
         &format!("{view_name}_joined_delta"),
-        dag::StreamSchema {
-            columns: stream_columns,
-            bindings: tables
-                .iter()
-                .map(|(table, identifier, _, logical_id)| dag::StreamBinding {
-                    table: table.clone(),
-                    identifier: identifier.clone(),
-                    logical_id: *logical_id,
-                })
-                .collect(),
-        },
-        DeltaIdentity::BindingRowids(tables.len()),
+        output_contract.schema.as_ref().clone(),
+        output_contract.emitted_identity,
         true,
     );
     let channel = sink.ephemeral()?;
@@ -5429,44 +5587,79 @@ fn emit_join_deltas_to_ephemeral(
         });
     };
 
-    for (sides, negate) in join_subset_phases(tables.len(), input) {
+    for (sides, negate) in binary_join_phases(input) {
         emit_join_phase(
             program,
             resolver,
             view_name,
             deltas,
-            tables,
+            schemas,
             arrangements,
             &conditions,
             &sides,
             negate,
             eph_weight_reg,
-            &mut |program, cursors, _table_references, _resolver| {
-                for (position, cursor_id) in cursors.iter().enumerate() {
-                    match (&sides[position], &deltas[position]) {
-                        (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
-                            program.emit_insn(Insn::Column {
-                                cursor_id: *cursor_id,
-                                column: 0,
-                                dest: eph_rec_start + position,
-                                default: None,
-                            });
+            &mut |program, cursors| {
+                match channel.identity {
+                    DeltaIdentity::BindingRowids(expected_width) => {
+                        let mut destination = eph_rec_start;
+                        for position in 0..schemas.len() {
+                            let source_identity = match sides[position] {
+                                JoinSide::Delta => deltas[position].identity(),
+                                JoinSide::Btree => arrangements[position].identity(),
+                            };
                             turso_assert!(
-                                channel.identity == DeltaIdentity::OperatorRowid,
-                                "arranged join delta must carry its state rowid"
+                                matches!(source_identity, DeltaIdentity::BindingRowids(_)),
+                                "binding-rowid join output requires binding-rowid inputs"
+                            );
+                            destination += emit_join_input_identity(
+                                program,
+                                sides[position],
+                                &deltas[position],
+                                &arrangements[position],
+                                cursors[position],
+                                destination,
                             );
                         }
-                        _ => program.emit_insn(Insn::RowId {
-                            cursor_id: *cursor_id,
-                            dest: eph_rec_start + position,
-                        }),
+                        turso_assert!(
+                            destination == eph_rec_start + expected_width,
+                            "join binding-rowid output width must equal its input identities"
+                        );
+                    }
+                    DeltaIdentity::OperatorKey(2) => {
+                        for position in 0..schemas.len() {
+                            let source_identity = match sides[position] {
+                                JoinSide::Delta => deltas[position].identity(),
+                                JoinSide::Btree => arrangements[position].identity(),
+                            };
+                            let source_start = program.alloc_registers(source_identity.width());
+                            let width = emit_join_input_identity(
+                                program,
+                                sides[position],
+                                &deltas[position],
+                                &arrangements[position],
+                                cursors[position],
+                                source_start,
+                            );
+                            program.emit_insn(Insn::MakeRecord {
+                                start_reg: source_start as u16,
+                                count: width as u16,
+                                dest_reg: (eph_rec_start + position) as u16,
+                                index_name: None,
+                                affinity_str: None,
+                            });
+                        }
+                    }
+                    DeltaIdentity::OperatorRowid | DeltaIdentity::OperatorKey(_) => {
+                        return Err(LimboError::InternalError(
+                            "binary inner join has an invalid planned identity".to_string(),
+                        ));
                     }
                 }
                 let mut destination = eph_value_start;
-                for (position, ((table, _, _, _), cursor_id)) in
-                    tables.iter().zip(cursors).enumerate()
+                for (position, (input_schema, cursor_id)) in schemas.iter().zip(cursors).enumerate()
                 {
-                    for column in 0..table.columns().len() {
+                    for column in 0..input_schema.len() {
                         match (&sides[position], &deltas[position]) {
                             (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
                                 program.emit_insn(Insn::Column {
@@ -5562,14 +5755,14 @@ fn emit_operator_keyed_ephemeral_row(
 
 fn emit_natural_join_values(
     program: &mut ProgramBuilder,
-    tables: &[JoinTable],
+    schemas: &[Arc<dag::StreamSchema>],
     arrangements: &[ArrangementHandle],
     cursors: &[usize],
     values_start: usize,
 ) -> usize {
     let mut destination = values_start;
-    for (((table, _, _, _), arrangement), cursor) in tables.iter().zip(arrangements).zip(cursors) {
-        for column in 0..table.columns().len() {
+    for ((schema, arrangement), cursor) in schemas.iter().zip(arrangements).zip(cursors) {
+        for column in 0..schema.len() {
             program.emit_column_or_rowid(*cursor, arrangement.value_columns()[column], destination);
             destination += 1;
         }
@@ -5590,27 +5783,27 @@ fn emit_left_join_deltas_to_ephemeral(
     view_name: &str,
     node_id: dag::NodeId,
     contract: &JoinContract,
-    output_schema: dag::StreamSchema,
+    output_contract: &NodeOutputContract,
     input: MaintenanceInput,
     operator_state: &OperatorStateDef,
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<DeltaSource> {
-    let n = contract.tables.len();
+    let n = contract.schemas.len();
     turso_assert!(n == 2, "DAG validation admits LEFT JOIN for two inputs");
 
     let sink = open_ephemeral_delta(
         program,
         &format!("{view_name}_left_join_delta_{node_id}"),
-        output_schema,
-        DeltaIdentity::OperatorKey(2),
+        output_contract.schema.as_ref().clone(),
+        output_contract.emitted_identity,
         true,
     );
     let output = sink.ephemeral()?;
     let natural_width = contract
-        .tables
+        .schemas
         .iter()
-        .map(|(table, _, _, _)| table.columns().len())
+        .map(|schema| schema.len())
         .sum::<usize>();
     turso_assert!(
         output.width == natural_width,
@@ -5655,28 +5848,12 @@ fn emit_left_join_deltas_to_ephemeral(
     let matched_values_start = program.alloc_registers(natural_width);
     let matched_weight_reg = program.alloc_register();
 
-    let pad_ids: Vec<_> = (0..n)
-        .map(|_| program.table_reference_counter.next())
-        .collect();
-    let mut pad_references = TableReferences::new(
-        contract
-            .tables
-            .iter()
-            .zip(&pad_ids)
-            .map(|((table, ident, using, _), id)| make_joined_table(table, ident, using, *id))
-            .collect(),
-        vec![],
-    );
     let pad_cursors: Vec<usize> = contract
         .arrangements
         .iter()
-        .zip(&pad_ids)
-        .map(|(arrangement, id)| {
+        .map(|arrangement| {
             let table = arrangement.table();
-            let cursor_id = program.alloc_cursor_id_keyed(
-                CursorKey::table(*id),
-                CursorType::BTreeTable(table.clone()),
-            );
+            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
             program.emit_insn(Insn::OpenRead {
                 cursor_id,
                 root_page: table.root_page,
@@ -5703,33 +5880,30 @@ fn emit_left_join_deltas_to_ephemeral(
         target_pc: main_start_label,
     });
 
-    let mut emit_padded_add = |program: &mut ProgramBuilder,
-                               pad_cursors: &[usize],
-                               _pad_references: &mut TableReferences,
-                               srid_reg: usize|
-     -> Result<()> {
-        let end = emit_natural_join_values(
-            program,
-            &contract.tables,
-            &contract.arrangements,
-            pad_cursors,
-            padded_values_start,
-        );
-        turso_assert!(
-            end == padded_values_start + natural_width,
-            "padded LEFT JOIN row does not match its output schema"
-        );
-        emit_operator_keyed_ephemeral_row(
-            program,
-            &output,
-            1,
-            srid_reg,
-            1,
-            padded_values_start,
-            one_reg,
-        );
-        Ok(())
-    };
+    let mut emit_padded_add =
+        |program: &mut ProgramBuilder, pad_cursors: &[usize], srid_reg: usize| -> Result<()> {
+            let end = emit_natural_join_values(
+                program,
+                &contract.schemas,
+                &contract.arrangements,
+                pad_cursors,
+                padded_values_start,
+            );
+            turso_assert!(
+                end == padded_values_start + natural_width,
+                "padded LEFT JOIN row does not match its output schema"
+            );
+            emit_operator_keyed_ephemeral_row(
+                program,
+                &output,
+                1,
+                srid_reg,
+                1,
+                padded_values_start,
+                one_reg,
+            );
+            Ok(())
+        };
     let mut emit_padded_remove = |program: &mut ProgramBuilder, srid_reg: usize| -> Result<()> {
         let negative_one_reg = program.alloc_register();
         program.emit_int(-1, negative_one_reg);
@@ -5746,10 +5920,7 @@ fn emit_left_join_deltas_to_ephemeral(
     };
     outer.emit_subroutine(
         program,
-        &resolver,
         &pad_cursors,
-        &mut pad_references,
-        None,
         &mut emit_padded_add,
         &mut emit_padded_remove,
     )?;
@@ -5760,24 +5931,24 @@ fn emit_left_join_deltas_to_ephemeral(
         input,
         &contract.deltas[0],
         &contract.arrangements[0],
-        contract.tables[0].0.columns().len(),
+        contract.schemas[0].len(),
         view_name,
     )?;
 
     let conditions = contract.on.iter().collect::<Vec<_>>();
-    for (sides, negate) in join_subset_phases(n, input) {
+    for (sides, negate) in binary_join_phases(input) {
         emit_join_phase(
             program,
             &mut resolver,
             view_name,
             &contract.deltas,
-            &contract.tables,
+            &contract.schemas,
             &contract.arrangements,
             &conditions,
             &sides,
             negate,
             matched_weight_reg,
-            &mut |program, cursors, _table_references, _resolver| {
+            &mut |program, cursors| {
                 for (position, cursor) in cursors.iter().enumerate() {
                     match (&sides[position], &contract.deltas[position]) {
                         (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
@@ -5800,10 +5971,10 @@ fn emit_left_join_deltas_to_ephemeral(
                 }
                 outer.emit_count_match(program, pair_identity_start, matched_weight_reg);
                 let mut destination = matched_values_start;
-                for (position, ((table, _, _, _), cursor)) in
-                    contract.tables.iter().zip(cursors).enumerate()
+                for (position, (input_schema, cursor)) in
+                    contract.schemas.iter().zip(cursors).enumerate()
                 {
-                    for column in 0..table.columns().len() {
+                    for column in 0..input_schema.len() {
                         match (&sides[position], &contract.deltas[position]) {
                             (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
                                 program.emit_insn(Insn::Column {
@@ -5861,8 +6032,7 @@ fn emit_left_join_deltas_to_ephemeral(
 /// Consumer hook that materializes one NULL-padded output row: given the
 /// padded-image cursors (left seeked, right on its null row), their table
 /// references, and the aux row's rowid identifying the padded row.
-type PaddedAddFn<'a> =
-    dyn FnMut(&mut ProgramBuilder, &[usize], &mut TableReferences, usize) -> Result<()> + 'a;
+type PaddedAddFn<'a> = dyn FnMut(&mut ProgramBuilder, &[usize], usize) -> Result<()> + 'a;
 /// Consumer hook that retracts one NULL-padded output row, given the aux
 /// row's rowid.
 type PaddedRemoveFn<'a> = dyn FnMut(&mut ProgramBuilder, usize) -> Result<()> + 'a;
@@ -5876,17 +6046,16 @@ type PaddedRemoveFn<'a> = dyn FnMut(&mut ProgramBuilder, usize) -> Result<()> + 
 /// from the base-table deltas), but a padded row exists only *because* its
 /// left row currently has zero matches — it must appear when the left row
 /// arrives unmatched and disappear the moment a match arrives, the left row
-/// leaves, or (with a WHERE over the padded image) the predicate flips. That
-/// is anti-join maintenance, and it needs state: this auxiliary table keeps,
-/// per left row, its signed presence, its count of ON-matches, and whether its
-/// padded output row is currently live.
+/// leaves. That is anti-join maintenance, and it needs state: this auxiliary
+/// table keeps, per left row, its signed presence, its count of ON-matches,
+/// and whether its padded output row is currently live.
 ///
 /// The subroutine applies a `(l_rid, dPresent, dMatches)` delta to that state
-/// and, on a transition of "present with zero matches and the padded image
-/// passes WHERE", invokes the consumer's `emit_padded_add` / `padded_remove`
-/// to materialize or retract the one padded output row. Presence deltas come
-/// from the left-input pass ([`Self::emit_presence_pass`]); match deltas come
-/// from each inner join phase ([`Self::emit_count_match`]).
+/// and, on a transition to or from "present with zero matches", invokes the
+/// consumer's `emit_padded_add` / `padded_remove` to materialize or retract
+/// the one padded output row. WHERE is a separate DAG filter. Presence deltas
+/// come from the left-input pass ([`Self::emit_presence_pass`]); match deltas
+/// come from each inner join phase ([`Self::emit_count_match`]).
 struct LeftJoinAux {
     aux_name: String,
     aux_index_name: String,
@@ -5991,19 +6160,12 @@ impl LeftJoinAux {
     }
 
     /// Emit the aux-merge subroutine (reached by `Gosub(self.merge_label)`).
-    /// `pad_cursors`/`pad_references`/`pad_where` describe the padded image
-    /// (left cursor plus a NULL-row right cursor) over which WHERE is tested;
-    /// `emit_padded_add`/`emit_padded_remove` materialize and retract the one
-    /// padded output row, with `self.srid_reg` holding its identity and (for
-    /// add) `pad_cursors` positioned on the padded image.
-    #[allow(clippy::too_many_arguments)]
+    /// `pad_cursors` describe the padded image (left cursor plus a NULL-row
+    /// right cursor). The hooks materialize and retract its one output row.
     fn emit_subroutine(
         &self,
         program: &mut ProgramBuilder,
-        resolver: &Resolver,
         pad_cursors: &[usize],
-        pad_references: &mut TableReferences,
-        pad_where: Option<&ast::Expr>,
         emit_padded_add: &mut PaddedAddFn<'_>,
         emit_padded_remove: &mut PaddedRemoveFn<'_>,
     ) -> Result<()> {
@@ -6133,22 +6295,6 @@ impl LeftJoinAux {
         program.emit_insn(Insn::NullRow {
             cursor_id: pad_cursors[1],
         });
-        if let Some(pad_where) = pad_where {
-            let pad_pass = program.allocate_label();
-            translate_condition_expr(
-                program,
-                pad_references,
-                pad_where,
-                ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_true: pad_pass,
-                    jump_target_when_false: af_transition,
-                    jump_target_when_null: af_transition,
-                },
-                resolver,
-            )?;
-            program.preassign_label_to_next_insn(pad_pass);
-        }
         program.emit_int(1, self.padded_new_reg);
         program.preassign_label_to_next_insn(af_transition);
         program.emit_insn(Insn::Eq {
@@ -6173,7 +6319,7 @@ impl LeftJoinAux {
         // sets `padded_new` positioned the pad cursors, so the consumer reads
         // the left row with NULLs on the right.
         program.preassign_label_to_next_insn(af_padwrite);
-        emit_padded_add(program, pad_cursors, pad_references, self.srid_reg)?;
+        emit_padded_add(program, pad_cursors, self.srid_reg)?;
 
         program.preassign_label_to_next_insn(af_store);
         // Persist the padded bit the transitions just enacted.

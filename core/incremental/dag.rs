@@ -137,23 +137,21 @@ pub enum OpNode {
         logical_id: TableInternalId,
     },
 
-    /// Join (⋈), n-ary over its inputs, with arbitrary ON predicates. Pure:
-    /// no projection, no WHERE (those are `Project`/`Filter` above). Output
-    /// schema: the concatenation of the input schemas. The bilinear delta
-    /// decomposition and the source-rowid-tuple pair map live in the codegen.
+    /// Binary join (⋈) with arbitrary ON predicates. Pure: no projection, no
+    /// WHERE (those are `Project`/`Filter` above). Output schema: the
+    /// concatenation of the left and right schemas. Keeping this node binary
+    /// makes SQL's mixed outer-join tree explicit and bounds every delta
+    /// decomposition to the bilinear two-input rule.
     ///
     /// Inputs expose both a delta stream and, where available, an arrangement.
     /// Scans use base-table btrees for free; aggregates expose their persisted
     /// finalized rows. Other interior operators require an explicit output
     /// arrangement before a downstream join can consume them.
     Join {
-        inputs: Vec<NodeId>,
-        /// Merged USING/NATURAL column names per input (parallel to `inputs`).
-        using: Vec<Vec<String>>,
+        inputs: [NodeId; 2],
         /// ON predicates, desugared from USING/NATURAL; bind against the
         /// concatenated input schema.
         on: Vec<ast::Expr>,
-        /// A LEFT join is binary. N-ary nodes are inner joins only.
         kind: JoinKind,
     },
 
@@ -202,7 +200,8 @@ impl OpNode {
             | OpNode::Project { input, .. }
             | OpNode::Alias { input, .. }
             | OpNode::Aggregate { input, .. } => std::slice::from_ref(input),
-            OpNode::Join { inputs, .. } | OpNode::SetOp { inputs, .. } => inputs,
+            OpNode::Join { inputs, .. } => inputs,
+            OpNode::SetOp { inputs, .. } => inputs,
         }
     }
 }
