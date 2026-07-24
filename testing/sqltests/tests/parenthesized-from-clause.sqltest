@@ -1,0 +1,145 @@
+@database :memory:
+
+
+test paren-around-single-table {
+    CREATE TABLE t(x INT);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT x FROM (t) ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+test paren-around-inner-join {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT, ax INT);
+    INSERT INTO a VALUES (1), (2), (3);
+    INSERT INTO b VALUES (10, 1), (20, 2);
+    SELECT a.x, b.y FROM (a INNER JOIN b ON a.x = b.ax) ORDER BY a.x;
+}
+expect {
+    1|10
+    2|20
+}
+
+test paren-around-inner-join-then-outer-join {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT, ax INT);
+    CREATE TABLE c(z INT, by_ INT);
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (10, 1), (20, 2);
+    INSERT INTO c VALUES (100, 10), (200, 20);
+    SELECT a.x, b.y, c.z
+    FROM (a INNER JOIN b ON a.x = b.ax)
+    INNER JOIN c ON c.by_ = b.y
+    ORDER BY a.x;
+}
+expect {
+    1|10|100
+    2|20|200
+}
+
+test paren-around-left-join {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT, ax INT);
+    INSERT INTO a VALUES (1), (2), (3);
+    INSERT INTO b VALUES (10, 1), (20, 2);
+    SELECT a.x, b.y FROM (a LEFT JOIN b ON a.x = b.ax) ORDER BY a.x;
+}
+expect {
+    1|10
+    2|20
+    3|
+}
+
+test double-paren-around-join {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT, ax INT);
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (10, 1), (20, 2);
+    SELECT a.x, b.y FROM ((a INNER JOIN b ON a.x = b.ax)) ORDER BY a.x;
+}
+expect {
+    1|10
+    2|20
+}
+
+test paren-around-from-with-where {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT, ax INT);
+    INSERT INTO a VALUES (1), (2), (3);
+    INSERT INTO b VALUES (10, 1), (20, 2), (30, 3);
+    SELECT a.x, b.y
+    FROM (a INNER JOIN b ON a.x = b.ax)
+    WHERE b.y > 10
+    ORDER BY a.x;
+}
+expect {
+    2|20
+    3|30
+}
+
+test paren-around-three-way-join {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT, ax INT);
+    CREATE TABLE c(z INT, by_ INT);
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (10, 1), (20, 2);
+    INSERT INTO c VALUES (100, 10), (200, 20);
+    SELECT a.x, b.y, c.z
+    FROM (a INNER JOIN b ON a.x = b.ax INNER JOIN c ON c.by_ = b.y)
+    ORDER BY a.x;
+}
+expect {
+    1|10|100
+    2|20|200
+}
+
+# Issue #4585 reproducer 1: Sub appears as the right side of a JOIN.
+# `(b)` is a single table in parens — always safe to flatten regardless of
+# the outer join type.
+test left-join-with-paren-single-table {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT);
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (1);
+    SELECT * FROM a LEFT JOIN (b) ON a.x = b.y ORDER BY a.x;
+}
+expect {
+    1|1
+    2|
+}
+
+# Issue #4585 reproducer 3: Sub as the second table in a comma-join. Comma is
+# not an OUTER join, so the multi-table inner is safe to flatten.
+test cross-join-with-paren-multi-table {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT);
+    CREATE TABLE c(z INT);
+    INSERT INTO a VALUES (1);
+    INSERT INTO b VALUES (1);
+    INSERT INTO c VALUES (1);
+    SELECT * FROM a, (b LEFT JOIN c ON b.y = c.z);
+}
+expect {
+    1|1|1
+}
+
+# Inner LEFT JOIN inside an outer comma-join (still safe — comma is not OUTER).
+test cross-join-with-paren-left-inner-no-match {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT);
+    CREATE TABLE c(z INT);
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (1), (2);
+    INSERT INTO c VALUES (1);
+    SELECT * FROM a, (b LEFT JOIN c ON b.y = c.z) ORDER BY a.x, b.y;
+}
+expect {
+    1|1|1
+    1|2|
+    2|1|1
+    2|2|
+}

@@ -1,5 +1,6 @@
 use crate::sync::Arc;
 use crate::{turso_assert, turso_assert_greater_than_or_equal};
+use std::collections::VecDeque;
 
 use super::plan::NamedWindowBound;
 use super::{
@@ -1519,10 +1520,25 @@ pub fn parse_from(
 
     // Process FROM clause if present
     if let Some(from_owned) = from {
-        let select_owned = from_owned.select;
-        let joins_owned = from_owned.joins;
+        // Flatten top-level unaliased parenthesized FROM expressions. The parens
+        // are syntactic grouping with no enclosing JOIN here, so:
+        //   FROM (a JOIN b ON x)              →  FROM a JOIN b ON x
+        //   FROM (a JOIN b ON x) JOIN c ON y  →  FROM a JOIN b ON x JOIN c ON y
+        // Repeat in case of nested wrapping like `FROM ((a JOIN b ...))`.
+        // Aliased `Sub(.., Some(_))` is not flattened: aliasing a multi-table
+        // grouping is a derived-table construct that would need separate
+        // handling.
+        let mut current_select = *from_owned.select;
+        let mut current_joins = from_owned.joins;
+        while let ast::SelectTable::Sub(inner, None) = current_select {
+            let mut combined = inner.joins;
+            combined.append(&mut current_joins);
+            current_select = *inner.select;
+            current_joins = combined;
+        }
+
         parse_from_clause_table(
-            *select_owned,
+            current_select,
             resolver,
             program,
             table_references,
@@ -1531,17 +1547,62 @@ pub fn parse_from(
             connection,
         )?;
 
-        for join in joins_owned.into_iter() {
-            parse_join(
-                join,
-                resolver,
-                program,
-                &cte_definitions,
-                out_where_clause,
-                vtab_predicates,
-                table_references,
-                connection,
-            )?;
+        // Flatten unaliased `Sub` when it appears as a joined table, with a
+        // safety guard for OUTER joins. Two cases are safe:
+        //   1. Inner FromClause has no joins (just `(t)` — single table). The
+        //      parens are a no-op for any outer JOIN type.
+        //   2. The outer JOIN is not LEFT/RIGHT/FULL/OUTER. Comma/CROSS/INNER
+        //      are associative-with-arbitrary-inner, so flattening preserves
+        //      semantics.
+        // The remaining case — outer is OUTER and inner has joins — is left
+        // to bail downstream because flattening would change row-preservation
+        // semantics (e.g. `LEFT JOIN (b INNER JOIN c ON x) ON y` is not
+        // equivalent to `LEFT JOIN b ON y INNER JOIN c ON x`).
+        let mut work: VecDeque<ast::JoinedSelectTable> = current_joins.into();
+        while let Some(join) = work.pop_front() {
+            let ast::JoinedSelectTable {
+                operator,
+                table,
+                constraint,
+            } = join;
+            let outer_is_outer_join = matches!(
+                &operator,
+                ast::JoinOperator::TypedJoin(Some(jt))
+                    if jt.contains(JoinType::LEFT)
+                        || jt.contains(JoinType::RIGHT)
+                        || jt.contains(JoinType::OUTER)
+            );
+            match *table {
+                ast::SelectTable::Sub(inner, None)
+                    if inner.joins.is_empty() || !outer_is_outer_join =>
+                {
+                    // Inner joins follow the (now-flattened) current join.
+                    for inner_join in inner.joins.into_iter().rev() {
+                        work.push_front(inner_join);
+                    }
+                    work.push_front(ast::JoinedSelectTable {
+                        operator,
+                        table: inner.select,
+                        constraint,
+                    });
+                }
+                other => {
+                    parse_join(
+                        ast::JoinedSelectTable {
+                            operator,
+                            table: Box::new(other),
+                            constraint,
+                        },
+                        resolver,
+                        program,
+                        &cte_definitions,
+                        out_where_clause,
+                        vtab_predicates,
+                        table_references,
+                        connection,
+                    )?;
+                }
+            }
         }
     }
 
