@@ -890,157 +890,99 @@ fn validate_terminal_delta_identity(
     }
 }
 
-fn declared_emitted_identity(
+fn plan_node_output(
+    schema: Arc<dag::StreamSchema>,
     node: &dag::OpNode,
     prior_states: &[OperatorStateDef],
-) -> Result<DeltaIdentity> {
-    let identity = match node {
-        dag::OpNode::Scan { .. } => DeltaIdentity::BindingRowids(1),
-        dag::OpNode::Filter { input, .. } | dag::OpNode::Project { input, .. } => {
-            prior_states
-                .get(*input)
-                .ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "maintenance DAG input node {input} has no identity contract"
-                    ))
-                })?
-                .output
-                .published_identity
-        }
-        dag::OpNode::Alias { input, .. } => {
-            let upstream = prior_states
-                .get(*input)
-                .ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "maintenance DAG input node {input} has no identity contract"
-                    ))
-                })?
-                .output
-                .published_identity;
-            alias_identity(upstream)
-        }
-        dag::OpNode::Join {
-            inputs,
-            kind: dag::JoinKind::Inner,
-            ..
-        } => {
-            let input_identities = inputs
-                .iter()
-                .map(|input| {
-                    prior_states
-                        .get(*input)
-                        .map(|state| state.output.published_identity)
-                        .ok_or_else(|| {
-                            LimboError::InternalError(format!(
-                                "maintenance DAG input node {input} has no identity contract"
-                            ))
-                        })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if input_identities
-                .iter()
-                .all(|identity| matches!(identity, DeltaIdentity::BindingRowids(_)))
-            {
-                DeltaIdentity::BindingRowids(
-                    input_identities
-                        .iter()
-                        .map(|identity| identity.width())
-                        .sum(),
-                )
-            } else {
-                DeltaIdentity::OperatorKey(2)
-            }
-        }
-        // Matched and NULL-padded rows share `(kind, packed source identity)`.
-        dag::OpNode::Join {
-            kind: dag::JoinKind::LeftOuter,
-            ..
-        } => DeltaIdentity::OperatorKey(2),
-        dag::OpNode::Aggregate { .. } => DeltaIdentity::OperatorRowid,
-        dag::OpNode::SetOp { prefix_len, .. } if *prefix_len > 0 => DeltaIdentity::OperatorRowid,
-        // Pure UNION ALL namespaces every branch's packed source identity.
-        dag::OpNode::SetOp { .. } => DeltaIdentity::OperatorKey(2),
-    };
-    Ok(identity)
-}
-
-fn declared_binding_rowids(
-    node: &dag::OpNode,
-    prior_states: &[OperatorStateDef],
-) -> Result<Arc<[bool]>> {
-    let provenance = match node {
-        dag::OpNode::Scan { table, .. } => vec![table.has_rowid],
-        dag::OpNode::Filter { input, .. } | dag::OpNode::Project { input, .. } => prior_states
-            .get(*input)
+) -> Result<NodeOutputContract> {
+    let prior_output = |input: dag::NodeId| {
+        prior_states
+            .get(input)
+            .map(|state| &state.output)
             .ok_or_else(|| {
                 LimboError::InternalError(format!(
-                    "maintenance DAG input node {input} has no rowid provenance contract"
+                    "maintenance DAG input node {input} has no output contract"
                 ))
-            })?
-            .output
-            .binding_rowids
-            .to_vec(),
+            })
+    };
+    let (emitted_identity, binding_rowids): (DeltaIdentity, Arc<[bool]>) = match node {
+        dag::OpNode::Scan { table, .. } => (
+            DeltaIdentity::BindingRowids(1),
+            vec![table.has_rowid].into(),
+        ),
+        dag::OpNode::Filter { input, .. } | dag::OpNode::Project { input, .. } => {
+            let upstream = prior_output(*input)?;
+            (upstream.published_identity, upstream.binding_rowids.clone())
+        }
         // A derived-table alias introduces one new SQL namespace. The source
         // transport key still distinguishes rows, but it is not the alias's
         // SQL rowid.
-        dag::OpNode::Alias { .. } => vec![false],
-        dag::OpNode::Join { inputs, .. } => {
+        dag::OpNode::Alias { input, .. } => {
+            let upstream = prior_output(*input)?;
+            let identity = match upstream.published_identity {
+                DeltaIdentity::BindingRowids(width) => DeltaIdentity::OperatorKey(width),
+                identity => identity,
+            };
+            (identity, vec![false].into())
+        }
+        dag::OpNode::Join { inputs, kind, .. } => {
+            let inputs = [prior_output(inputs[0])?, prior_output(inputs[1])?];
+            let identity = if *kind == dag::JoinKind::Inner
+                && inputs.iter().all(|input| {
+                    matches!(input.published_identity, DeltaIdentity::BindingRowids(_))
+                }) {
+                DeltaIdentity::BindingRowids(
+                    inputs
+                        .iter()
+                        .map(|input| input.published_identity.width())
+                        .sum(),
+                )
+            } else {
+                // Opaque pair for non-binding inputs; LEFT JOIN also
+                // namespaces matched and NULL-padded rows.
+                DeltaIdentity::OperatorKey(2)
+            };
             let mut provenance = Vec::new();
-            for input in inputs {
-                provenance.extend_from_slice(
-                    &prior_states
-                        .get(*input)
-                        .ok_or_else(|| {
-                            LimboError::InternalError(format!(
-                                "maintenance DAG input node {input} has no rowid provenance contract"
-                            ))
-                        })?
-                        .output
-                        .binding_rowids,
-                );
+            for input in &inputs {
+                provenance.extend_from_slice(&input.binding_rowids);
             }
-            provenance
+            (identity, provenance.into())
         }
         // These operators may retain source expressions as output values, but
         // they do not preserve a one-to-one source-row namespace.
-        dag::OpNode::Aggregate { input, .. } => vec![
-            false;
-            prior_states
-                .get(*input)
-                .ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "maintenance DAG input node {input} has no rowid provenance contract"
-                    ))
-                })?
-                .output
-                .binding_rowids
-                .len()
-        ],
-        dag::OpNode::SetOp { inputs, .. } => vec![
-            false;
-            prior_states
-                .get(inputs[0])
-                .ok_or_else(|| {
-                    LimboError::InternalError(
-                        "set-op input has no rowid provenance contract".to_string(),
-                    )
-                })?
-                .output
-                .binding_rowids
-                .len()
-        ],
+        dag::OpNode::Aggregate { input, .. } => (
+            DeltaIdentity::OperatorRowid,
+            vec![false; prior_output(*input)?.binding_rowids.len()].into(),
+        ),
+        dag::OpNode::SetOp {
+            inputs, prefix_len, ..
+        } => {
+            let first = inputs.first().ok_or_else(|| {
+                LimboError::InternalError("set-op DAG must have at least one input".to_string())
+            })?;
+            let identity = if *prefix_len > 0 {
+                DeltaIdentity::OperatorRowid
+            } else {
+                // Pure UNION ALL namespaces every branch's packed identity.
+                DeltaIdentity::OperatorKey(2)
+            };
+            (
+                identity,
+                vec![false; prior_output(*first)?.binding_rowids.len()].into(),
+            )
+        }
     };
-    Ok(provenance.into())
-}
-
-/// A derived-table alias replaces all of its input bindings with one new SQL
-/// namespace. The physical source key remains stable, but its slots can no
-/// longer be interpreted as one rowid per output binding.
-fn alias_identity(upstream: DeltaIdentity) -> DeltaIdentity {
-    match upstream {
-        DeltaIdentity::BindingRowids(width) => DeltaIdentity::OperatorKey(width),
-        identity => identity,
+    if binding_rowids.len() != schema.bindings.len() {
+        return Err(LimboError::InternalError(
+            "maintenance output rowid provenance does not match its bindings".to_string(),
+        ));
     }
+    Ok(NodeOutputContract {
+        schema,
+        binding_rowids,
+        emitted_identity,
+        published_identity: emitted_identity,
+    })
 }
 
 fn node_has_native_arrangement(node: &dag::OpNode) -> bool {
@@ -1127,13 +1069,8 @@ fn plan_operator_states(
     };
     let mut hidden_names = FxHashSet::default();
     for (node_id, node) in dag.nodes.iter().enumerate() {
-        let emitted_identity = declared_emitted_identity(node, &catalog.nodes)?;
-        let binding_rowids = declared_binding_rowids(node, &catalog.nodes)?;
-        if binding_rowids.len() != dag.output_schema(node_id).bindings.len() {
-            return Err(LimboError::InternalError(format!(
-                "maintenance DAG node {node_id} rowid provenance does not match its output bindings"
-            )));
-        }
+        let mut output =
+            plan_node_output(dag.output_schema(node_id).clone(), node, &catalog.nodes)?;
         let needs_state = node_requires_primary_state(dag, node_id);
         let state_table = if needs_state {
             let table_name = format!(
@@ -1153,43 +1090,39 @@ fn plan_operator_states(
             node_id,
             node,
             dag.output_schema(node_id).len(),
-            &binding_rowids,
+            &output.binding_rowids,
         );
-        let arrangement_table = if node_requires_output_arrangement(dag, node_id, emitted_identity)
-        {
-            let identity_width = emitted_identity.width();
-            let table_name = format!(
-                "{}{DBSP_CIRCUIT_VERSION}_{view_name}__n{node_id}",
-                crate::schema::DBSP_ARRANGEMENT_TABLE_PREFIX,
-            );
-            Some(HiddenTableDef {
-                create_sql: arrangement_table_sql(
-                    &table_name,
-                    identity_width,
-                    dag.output_schema(node_id).len(),
-                    binding_rowid_metadata_width(emitted_identity, &binding_rowids),
-                )?,
-                table_name,
-                primary_key_index: true,
-            })
-        } else {
-            None
-        };
-        let published_identity = if arrangement_table.is_some()
+        let arrangement_table =
+            if node_requires_output_arrangement(dag, node_id, output.emitted_identity) {
+                let identity_width = output.emitted_identity.width();
+                let table_name = format!(
+                    "{}{DBSP_CIRCUIT_VERSION}_{view_name}__n{node_id}",
+                    crate::schema::DBSP_ARRANGEMENT_TABLE_PREFIX,
+                );
+                Some(HiddenTableDef {
+                    create_sql: arrangement_table_sql(
+                        &table_name,
+                        identity_width,
+                        dag.output_schema(node_id).len(),
+                        binding_rowid_metadata_width(
+                            output.emitted_identity,
+                            &output.binding_rowids,
+                        ),
+                    )?,
+                    table_name,
+                    primary_key_index: true,
+                })
+            } else {
+                None
+            };
+        if arrangement_table.is_some()
             && (node_id == dag.root || node_is_left_join_input(dag, node_id))
         {
-            DeltaIdentity::OperatorRowid
-        } else {
-            emitted_identity
-        };
+            output.published_identity = DeltaIdentity::OperatorRowid;
+        }
         let state = OperatorStateDef {
             node_id,
-            output: NodeOutputContract {
-                schema: Arc::new(dag.output_schema(node_id).clone()),
-                binding_rowids,
-                emitted_identity,
-                published_identity,
-            },
+            output,
             state_table,
             auxiliary_tables,
             arrangement_table,
@@ -1468,6 +1401,20 @@ fn collate_clause(collation: CollationSeq) -> String {
 mod tests {
     use super::*;
 
+    fn test_table() -> Arc<BTreeTable> {
+        Arc::new(BTreeTable::new(
+            1,
+            "t".to_string(),
+            Vec::new(),
+            Vec::new(),
+            crate::schema::BTreeCharacteristics::HAS_ROWID,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        ))
+    }
+
     fn sum_expr(column: usize) -> ast::Expr {
         ast::Expr::FunctionCall {
             name: ast::Name::exact("sum".to_string()),
@@ -1511,5 +1458,29 @@ mod tests {
         assert!(error
             .to_string()
             .contains("expressions over aggregate results"));
+    }
+
+    #[test]
+    fn node_output_contract_reuses_dag_schema() {
+        let table = test_table();
+        let schema = Arc::new(dag::StreamSchema {
+            columns: Vec::new(),
+            bindings: vec![dag::StreamBinding {
+                table: table.clone(),
+                identifier: "t".to_string(),
+                logical_id: TableInternalId::from(1),
+            }],
+        });
+        let node = dag::OpNode::Scan {
+            table,
+            identifier: "t".to_string(),
+            logical_id: TableInternalId::from(1),
+        };
+
+        let output = plan_node_output(schema.clone(), &node, &[]).unwrap();
+
+        assert!(Arc::ptr_eq(&output.schema, &schema));
+        assert_eq!(output.emitted_identity, DeltaIdentity::BindingRowids(1));
+        assert_eq!(output.binding_rowids.as_ref(), &[true]);
     }
 }
