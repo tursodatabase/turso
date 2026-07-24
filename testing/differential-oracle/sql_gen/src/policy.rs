@@ -67,6 +67,9 @@ pub struct Policy {
     /// Configuration for function call generation.
     pub function_config: FunctionConfig,
 
+    /// Configuration for FTS-specific generation.
+    pub fts_config: FtsConfig,
+
     /// Maximum recursion depth for expressions.
     pub max_expr_depth: usize,
 
@@ -113,6 +116,7 @@ impl Default for Policy {
             drop_index_config: DropIndexConfig::default(),
             trigger_config: TriggerConfig::default(),
             function_config: FunctionConfig::default(),
+            fts_config: FtsConfig::default(),
             max_expr_depth: 6,
             max_subquery_depth: 3,
             max_tables: 3,
@@ -129,6 +133,46 @@ impl Policy {
     /// Create a new policy with default settings.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a policy for broad Turso FTS fuzzing.
+    ///
+    /// This profile deliberately emits Turso-specific FTS syntax and must not be
+    /// used with the SQLite differential runner.
+    pub fn fts() -> Self {
+        Self {
+            stmt_weights: StmtWeights::fts(),
+            select_config: SelectConfig {
+                limit_probability: 1.0,
+                order_by_probability: 0.9,
+                require_order_by_with_limit: true,
+                ..SelectConfig::default()
+            },
+            create_index_config: CreateIndexConfig {
+                unique_probability: 0.0,
+                fts_probability: 1.0,
+                fts_tokenizer_probability: 0.35,
+                fts_weight_probability: 0.5,
+                ..CreateIndexConfig::default()
+            },
+            expr_weights: ExprWeights {
+                fts_match: 30,
+                ..ExprWeights::default()
+            },
+            fts_config: FtsConfig {
+                match_function_weight: 6,
+                tuple_match_weight: 4,
+                query_text_weight: 12,
+                query_field_filter_weight: 5,
+                query_weird_arg_weight: 2,
+                query_column_arg_weight: 3,
+                score_projection_probability: 0.35,
+                score_order_by_probability: 0.45,
+                indexed_text_term_probability: 0.75,
+                join_on_fts_match_probability: 0.25,
+            },
+            ..Self::default()
+        }
     }
 
     // =========================================================================
@@ -240,6 +284,12 @@ impl Policy {
     /// Builder method to set function configuration.
     pub fn with_function_config(mut self, config: FunctionConfig) -> Self {
         self.function_config = config;
+        self
+    }
+
+    /// Builder method to set FTS configuration.
+    pub fn with_fts_config(mut self, config: FtsConfig) -> Self {
+        self.fts_config = config;
         self
     }
 
@@ -373,6 +423,7 @@ pub struct StmtWeights {
     pub alter_table: u32,
     pub create_index: u32,
     pub drop_index: u32,
+    pub optimize_index: u32,
     pub pragma_foreign_key_list: u32,
     pub create_trigger: u32,
     pub drop_trigger: u32,
@@ -381,6 +432,8 @@ pub struct StmtWeights {
     pub begin: u32,
     pub commit: u32,
     pub rollback: u32,
+    pub savepoint: u32,
+    pub release: u32,
 
     // Stubs (not yet implemented, weight 0)
     pub create_view: u32,
@@ -388,8 +441,6 @@ pub struct StmtWeights {
     pub vacuum: u32,
     pub reindex: u32,
     pub analyze: u32,
-    pub savepoint: u32,
-    pub release: u32,
 }
 
 impl Default for StmtWeights {
@@ -406,6 +457,7 @@ impl Default for StmtWeights {
             alter_table: 1,
             create_index: 2,
             drop_index: 1,
+            optimize_index: 0,
             pragma_foreign_key_list: 1,
             create_trigger: 1,
             drop_trigger: 1,
@@ -413,14 +465,14 @@ impl Default for StmtWeights {
             begin: 0,
             commit: 0,
             rollback: 0,
+            savepoint: 0,
+            release: 0,
             // Stubs (not yet implemented)
             create_view: 0,
             drop_view: 0,
             vacuum: 0,
             reindex: 0,
             analyze: 0,
-            savepoint: 0,
-            release: 0,
         }
     }
 }
@@ -445,8 +497,27 @@ impl StmtWeights {
         }
     }
 
+    /// Create weights for broad FTS generation.
+    pub fn fts() -> Self {
+        Self {
+            select: 35,
+            insert: 20,
+            update: 12,
+            delete: 8,
+            create_table: 4,
+            alter_table: 2,
+            create_index: 8,
+            drop_index: 2,
+            optimize_index: 4,
+            begin: 2,
+            commit: 2,
+            rollback: 1,
+            ..Self::all_zero()
+        }
+    }
+
     /// All weights set to zero.
-    fn all_zero() -> Self {
+    pub fn all_zero() -> Self {
         Self {
             select: 0,
             insert: 0,
@@ -457,19 +528,20 @@ impl StmtWeights {
             alter_table: 0,
             create_index: 0,
             drop_index: 0,
+            optimize_index: 0,
             pragma_foreign_key_list: 0,
             create_trigger: 0,
             drop_trigger: 0,
             begin: 0,
             commit: 0,
             rollback: 0,
+            savepoint: 0,
+            release: 0,
             create_view: 0,
             drop_view: 0,
             vacuum: 0,
             reindex: 0,
             analyze: 0,
-            savepoint: 0,
-            release: 0,
         }
     }
 
@@ -485,20 +557,21 @@ impl StmtWeights {
             StmtKind::AlterTable => self.alter_table,
             StmtKind::CreateIndex => self.create_index,
             StmtKind::DropIndex => self.drop_index,
+            StmtKind::OptimizeIndex => self.optimize_index,
             StmtKind::PragmaForeignKeyList => self.pragma_foreign_key_list,
             StmtKind::CreateTrigger => self.create_trigger,
             StmtKind::DropTrigger => self.drop_trigger,
             StmtKind::Begin => self.begin,
             StmtKind::Commit => self.commit,
             StmtKind::Rollback => self.rollback,
+            StmtKind::Savepoint => self.savepoint,
+            StmtKind::Release => self.release,
             // Stubs
             StmtKind::CreateView => self.create_view,
             StmtKind::DropView => self.drop_view,
             StmtKind::Vacuum => self.vacuum,
             StmtKind::Reindex => self.reindex,
             StmtKind::Analyze => self.analyze,
-            StmtKind::Savepoint => self.savepoint,
-            StmtKind::Release => self.release,
         }
     }
 
@@ -514,20 +587,21 @@ impl StmtWeights {
             (StmtKind::AlterTable, self.alter_table),
             (StmtKind::CreateIndex, self.create_index),
             (StmtKind::DropIndex, self.drop_index),
+            (StmtKind::OptimizeIndex, self.optimize_index),
             (StmtKind::PragmaForeignKeyList, self.pragma_foreign_key_list),
             (StmtKind::CreateTrigger, self.create_trigger),
             (StmtKind::DropTrigger, self.drop_trigger),
             (StmtKind::Begin, self.begin),
             (StmtKind::Commit, self.commit),
             (StmtKind::Rollback, self.rollback),
+            (StmtKind::Savepoint, self.savepoint),
+            (StmtKind::Release, self.release),
             // Stubs
             (StmtKind::CreateView, self.create_view),
             (StmtKind::DropView, self.drop_view),
             (StmtKind::Vacuum, self.vacuum),
             (StmtKind::Reindex, self.reindex),
             (StmtKind::Analyze, self.analyze),
-            (StmtKind::Savepoint, self.savepoint),
-            (StmtKind::Release, self.release),
         ]
         .into_iter()
         .filter(|(_, w)| *w > 0)
@@ -554,6 +628,8 @@ pub struct ExprWeights {
     pub in_subquery: u32,
     pub is_null: u32,
     pub exists: u32,
+    // FTS expressions (default 0 — only enabled for FTS fuzzer)
+    pub fts_match: u32,
     // Array expressions (default 0 — only enabled for array fuzzer)
     pub array_literal: u32,
     pub array_subscript: u32,
@@ -579,6 +655,8 @@ impl Default for ExprWeights {
             in_subquery: 5,
             is_null: 1,
             exists: 5,
+            // FTS
+            fts_match: 0,
             // Array
             array_literal: 0,
             array_subscript: 0,
@@ -608,6 +686,7 @@ impl ExprWeights {
             ExprKind::InSubquery => self.in_subquery,
             ExprKind::IsNull => self.is_null,
             ExprKind::Exists => self.exists,
+            ExprKind::FtsMatch => self.fts_match,
             ExprKind::Parenthesized => 0, // Never generated directly
             // Array
             ExprKind::ArrayLiteral => self.array_literal,
@@ -644,6 +723,7 @@ impl ExprWeights {
             in_subquery: 8,
             is_null: 1,
             exists: 8,
+            fts_match: 0,
             array_literal: 0,
             array_subscript: 0,
             window_function: 0,
@@ -653,7 +733,7 @@ impl ExprWeights {
     }
 
     /// All weights set to zero.
-    fn all_zero() -> Self {
+    pub fn all_zero() -> Self {
         Self {
             column_ref: 0,
             literal: 0,
@@ -668,11 +748,71 @@ impl ExprWeights {
             in_subquery: 0,
             is_null: 0,
             exists: 0,
+            fts_match: 0,
             array_literal: 0,
             array_subscript: 0,
             window_function: 0,
             collate: 0,
             raise: 0,
+        }
+    }
+}
+
+// =============================================================================
+// FTS Configuration
+// =============================================================================
+
+/// Configuration for Turso FTS expression generation.
+#[derive(Debug, Clone)]
+pub struct FtsConfig {
+    /// Weight for `fts_match(col, ..., query)`.
+    pub match_function_weight: u32,
+
+    /// Weight for `(col, ...) MATCH query`.
+    pub tuple_match_weight: u32,
+
+    /// Weight for normal string query arguments.
+    pub query_text_weight: u32,
+
+    /// Weight for query strings with Tantivy field filters, e.g. `title:rust`.
+    pub query_field_filter_weight: u32,
+
+    /// Weight for invalid or unusual query argument types.
+    pub query_weird_arg_weight: u32,
+
+    /// Weight for query arguments read from visible TEXT columns.
+    pub query_column_arg_weight: u32,
+
+    /// Probability of adding an `fts_score(...)` projection to generated SELECTs
+    /// when an FTS index is visible in the query scope.
+    pub score_projection_probability: f64,
+
+    /// Probability of adding `fts_score(...)` to ORDER BY when an FTS index is
+    /// visible in the query scope.
+    pub score_order_by_probability: f64,
+
+    /// Probability that INSERT/UPDATE values for FTS-indexed TEXT columns use
+    /// terms from the generated FTS query vocabulary.
+    pub indexed_text_term_probability: f64,
+
+    /// Probability that JOIN ON generation uses an FTS predicate when one is
+    /// visible in the join scope.
+    pub join_on_fts_match_probability: f64,
+}
+
+impl Default for FtsConfig {
+    fn default() -> Self {
+        Self {
+            match_function_weight: 0,
+            tuple_match_weight: 0,
+            query_text_weight: 0,
+            query_field_filter_weight: 0,
+            query_weird_arg_weight: 0,
+            query_column_arg_weight: 0,
+            score_projection_probability: 0.0,
+            score_order_by_probability: 0.0,
+            indexed_text_term_probability: 0.0,
+            join_on_fts_match_probability: 0.0,
         }
     }
 }
@@ -1685,6 +1825,18 @@ pub struct CreateIndexConfig {
     /// Probability of IF NOT EXISTS clause.
     pub if_not_exists_probability: f64,
 
+    /// Probability of emitting `CREATE INDEX ... USING fts`.
+    ///
+    /// Default is zero because this syntax is Turso-specific and not accepted
+    /// by SQLite.
+    pub fts_probability: f64,
+
+    /// Probability of adding an FTS tokenizer option when FTS is selected.
+    pub fts_tokenizer_probability: f64,
+
+    /// Probability of adding FTS field weights when FTS is selected.
+    pub fts_weight_probability: f64,
+
     // Stubs (not yet implemented, probability 0.0)
     /// Probability of WHERE clause on index.
     pub partial_index_probability: f64,
@@ -1699,6 +1851,9 @@ impl Default for CreateIndexConfig {
             max_columns: 3,
             unique_probability: 0.2,
             if_not_exists_probability: 0.5,
+            fts_probability: 0.0,
+            fts_tokenizer_probability: 0.0,
+            fts_weight_probability: 0.0,
             // Stubs
             partial_index_probability: 0.0,
             expression_index_probability: 0.0,
@@ -2229,6 +2384,20 @@ mod tests {
         assert!(weights.insert > 0);
         assert_eq!(weights.create_table, 0);
         assert_eq!(weights.begin, 0);
+    }
+
+    #[test]
+    fn test_fts_policy_is_explicit() {
+        let default_policy = Policy::default();
+        assert_eq!(default_policy.create_index_config.fts_probability, 0.0);
+        assert_eq!(default_policy.stmt_weights.optimize_index, 0);
+
+        let fts_policy = Policy::fts();
+        assert!(fts_policy.create_index_config.fts_probability > 0.0);
+        assert!(fts_policy.stmt_weights.optimize_index > 0);
+        assert_eq!(fts_policy.stmt_weights.savepoint, 0);
+        assert_eq!(fts_policy.stmt_weights.create_view, 0);
+        assert!(fts_policy.select_config.require_order_by_with_limit);
     }
 
     #[test]

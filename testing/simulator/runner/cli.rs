@@ -219,8 +219,34 @@ pub enum SimulatorCommand {
         )]
         filter: String,
     },
+    #[cfg(feature = "fts")]
+    #[clap(about = "run the native FTS sql_gen simulator workload")]
+    Fts(FtsCommand),
     /// Print profile Json Schema
     PrintSchema,
+}
+
+#[cfg(feature = "fts")]
+#[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
+pub struct FtsCommand {
+    #[clap(
+        long,
+        default_value_t = 1,
+        help = "maximum number of consecutive FTS seeds to try"
+    )]
+    pub seeds: usize,
+    #[clap(
+        long,
+        default_value_t = 48,
+        help = "number of random statements in each generated SQL program"
+    )]
+    pub program_steps: usize,
+    #[clap(
+        long,
+        default_value_t = 6,
+        help = "run generic FTS oracles every N generated statements"
+    )]
+    pub verify_interval: usize,
 }
 
 impl SimulatorCLI {

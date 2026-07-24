@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use sql_generation::model::table::SimValue;
 use turso_core::{Connection, Result, StepResult};
 
+#[cfg(feature = "fts")]
+use crate::model::fts::{FtsOracleCheck, FtsSql};
 use crate::{
     generation::Shadow,
     model::{
@@ -22,7 +24,9 @@ use crate::{
         metrics::InteractionStats,
         property::{Property, PropertyDiscriminants},
     },
-    runner::env::{ShadowTablesMut, SimConnection, SimulationType, SimulatorEnv},
+    runner::env::{
+        ShadowTablesMut, SimConnection, SimulationType, SimulatorEnv, simulator_database_opts,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -302,6 +306,8 @@ impl Interactions {
         match &self.interactions {
             InteractionsType::Property(property) => property.check_tables(),
             InteractionsType::Query(query) => query.is_dml(),
+            #[cfg(feature = "fts")]
+            InteractionsType::FtsSql(_) | InteractionsType::FtsOracle(_) => false,
             // REOPEN_DATABASE tears down all connections and re-opens the
             // database, which exercises the on-disk recovery path (WAL replay,
             // header re-read, schema reload). Any committed row must still be
@@ -345,12 +351,18 @@ pub enum InteractionsType {
     Property(Property),
     Query(Query),
     Fault(Fault),
+    #[cfg(feature = "fts")]
+    FtsSql(FtsSql),
+    #[cfg(feature = "fts")]
+    FtsOracle(FtsOracleCheck),
 }
 
 impl InteractionsType {
     pub fn is_transaction(&self) -> bool {
         match self {
             InteractionsType::Query(query) => query.is_transaction(),
+            #[cfg(feature = "fts")]
+            InteractionsType::FtsSql(sql) => sql.is_transaction(),
             _ => false,
         }
     }
@@ -525,6 +537,10 @@ impl Interaction {
             InteractionType::Query(query)
             | InteractionType::FsyncQuery(query)
             | InteractionType::FaultyQuery(query) => query.uses(),
+            #[cfg(feature = "fts")]
+            InteractionType::FtsSql(sql) => sql.uses(),
+            #[cfg(feature = "fts")]
+            InteractionType::FtsOracle(check) => check.uses(),
             InteractionType::Assertion(assert) | InteractionType::Assumption(assert) => {
                 assert.uses()
             }
@@ -539,6 +555,10 @@ pub enum InteractionType {
     Assumption(Assertion),
     Assertion(Assertion),
     Fault(Fault),
+    #[cfg(feature = "fts")]
+    FtsSql(FtsSql),
+    #[cfg(feature = "fts")]
+    FtsOracle(FtsOracleCheck),
     /// Will attempt to run any random query. However, when the connection tries to sync it will
     /// close all connections and reopen the database and assert that no data was lost
     FsyncQuery(Query),
@@ -561,6 +581,10 @@ impl Display for InteractionType {
                 write!(f, "-- ASSERT {};", assertion.name)
             }
             Self::Fault(fault) => write!(f, "-- FAULT '{fault}'"),
+            #[cfg(feature = "fts")]
+            Self::FtsSql(sql) => write!(f, "{sql}"),
+            #[cfg(feature = "fts")]
+            Self::FtsOracle(check) => write!(f, "{check}"),
             Self::FsyncQuery(query) => {
                 writeln!(f, "-- FSYNC QUERY")?;
                 writeln!(f, "{query};")?;
@@ -581,6 +605,8 @@ impl Shadow for InteractionType {
             | Self::Fault(_)
             | Self::FaultyQuery(_)
             | Self::FsyncQuery(_) => Ok(vec![]),
+            #[cfg(feature = "fts")]
+            Self::FtsSql(_) | Self::FtsOracle(_) => Ok(vec![]),
         }
     }
 }
@@ -593,6 +619,8 @@ impl InteractionType {
             InteractionType::Query(query)
             | InteractionType::FsyncQuery(query)
             | InteractionType::FaultyQuery(query) => query.requires_exclusive_tx(),
+            #[cfg(feature = "fts")]
+            InteractionType::FtsSql(_) | InteractionType::FtsOracle(_) => false,
             _ => false,
         }
     }
@@ -926,10 +954,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
                 env.io.clone(),
                 env.get_db_path().to_str().expect("path should be 'to_str'"),
                 turso_core::OpenFlags::default(),
-                turso_core::DatabaseOpts::new()
-                    .with_autovacuum(true)
-                    .with_attach(true)
-                    .with_generated_columns(true),
+                simulator_database_opts(env.opts.enable_fts),
                 None,
                 Arc::new(SqliteDialect),
             ) {

@@ -5,6 +5,7 @@ use crate::capabilities::Capabilities;
 use crate::context::Context;
 use crate::error::GenError;
 use crate::functions::{FunctionCategory, FunctionDef};
+use crate::generate::fts::{generate_fts_match_expr, has_fts_index_in_scope};
 use crate::generate::literal::generate_literal;
 use crate::generate::select::{generate_select, generate_simple_select};
 use crate::schema::DataType;
@@ -91,6 +92,9 @@ fn collect_capability_allowed_exprs<C: Capabilities>() -> Vec<ExprKind> {
     candidates.push(ExprKind::ArrayLiteral);
     candidates.push(ExprKind::ArraySubscript);
 
+    // FTS expressions (default weight 0)
+    candidates.push(ExprKind::FtsMatch);
+
     // Always available (but weight 0)
     candidates.push(ExprKind::Collate);
     candidates.push(ExprKind::Raise);
@@ -130,7 +134,7 @@ fn filter_by_depth_validity<C: Capabilities>(
             max_expr_depth,
             subquery_depth,
             max_subquery_depth,
-        );
+        ) && (kind != ExprKind::FtsMatch || has_fts_index_in_scope(generator, ctx));
         if valid {
             Some((kind, weights.weight_for(kind)))
         } else {
@@ -158,6 +162,7 @@ fn is_expr_valid_for_depth(
         | ExprKind::Between
         | ExprKind::InList
         | ExprKind::FunctionCall
+        | ExprKind::FtsMatch
         | ExprKind::Case
         | ExprKind::Cast => depth < max_expr_depth,
 
@@ -193,6 +198,7 @@ fn dispatch_expr_generation<C: Capabilities>(
         ExprKind::BinaryOp => generate_binary_op(generator, ctx, depth),
         ExprKind::UnaryOp => generate_unary_op(generator, ctx, depth),
         ExprKind::FunctionCall => generate_function_call(generator, ctx, depth),
+        ExprKind::FtsMatch => generate_fts_match_expr(generator, ctx),
         ExprKind::IsNull => generate_is_null(generator, ctx, depth),
         ExprKind::Between => generate_between(generator, ctx, depth),
         ExprKind::InList => generate_in_list(generator, ctx, depth),
@@ -738,7 +744,7 @@ mod tests {
     use super::*;
     use crate::Full;
     use crate::policy::Policy;
-    use crate::schema::{ColumnDef, SchemaBuilder, Table};
+    use crate::schema::{ColumnDef, FtsIndexSpec, Index, SchemaBuilder, Table};
 
     fn test_generator() -> SqlGen<Full> {
         let schema = SchemaBuilder::new()
@@ -773,6 +779,59 @@ mod tests {
 
         let cond = ctx.with_table_scope([(table, None)], |ctx| generate_condition(&generator, ctx));
         assert!(cond.is_ok());
+    }
+
+    #[test]
+    fn test_generate_fts_match_expression_from_schema_index() {
+        use crate::policy::{ExprWeights, FtsConfig};
+
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "docs",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("title", DataType::Text),
+                    ColumnDef::new("body", DataType::Text),
+                ],
+            ))
+            .index(
+                Index::new(
+                    "docs_fts",
+                    "docs",
+                    vec!["title".to_string(), "body".to_string()],
+                )
+                .fts(FtsIndexSpec::new()),
+            )
+            .build();
+
+        let policy = Policy::default()
+            .with_expr_weights(ExprWeights {
+                fts_match: 100,
+                ..ExprWeights::all_zero()
+            })
+            .with_fts_config(FtsConfig {
+                match_function_weight: 1,
+                tuple_match_weight: 1,
+                query_text_weight: 1,
+                query_field_filter_weight: 1,
+                query_weird_arg_weight: 0,
+                query_column_arg_weight: 0,
+                score_projection_probability: 0.0,
+                score_order_by_probability: 0.0,
+                indexed_text_term_probability: 0.0,
+                join_on_fts_match_probability: 0.0,
+            });
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let table = generator.schema().tables[0].clone();
+        let mut ctx = Context::new_with_seed(11);
+
+        let expr = ctx
+            .with_table_scope([(table, None)], |ctx| generate_expr(&generator, ctx, 0))
+            .unwrap();
+        let sql = expr.to_string();
+
+        assert!(sql.contains("fts_match(") || sql.contains(" MATCH "));
+        assert!(sql.contains("title") || sql.contains("body"));
     }
 
     #[test]
@@ -816,6 +875,7 @@ mod tests {
             in_subquery: 0,
             is_null: 0,
             exists: 0,
+            fts_match: 0,
             array_literal: 0,
             array_subscript: 0,
             window_function: 0,
@@ -866,6 +926,7 @@ mod tests {
             in_subquery: 0,
             is_null: 0,
             exists: 0,
+            fts_match: 0,
             array_literal: 0,
             array_subscript: 0,
             window_function: 0,
@@ -927,6 +988,7 @@ mod tests {
             in_subquery: 0,
             is_null: 0,
             exists: 0,
+            fts_match: 0,
             array_literal: 0,
             array_subscript: 0,
             window_function: 0,
@@ -986,6 +1048,7 @@ mod tests {
                 in_subquery: 30,
                 is_null: 0,
                 exists: 30,
+                fts_match: 0,
                 array_literal: 0,
                 array_subscript: 0,
                 window_function: 0,
@@ -1062,6 +1125,7 @@ mod tests {
             in_subquery: 40,
             is_null: 0,
             exists: 40,
+            fts_match: 0,
             array_literal: 0,
             array_subscript: 0,
             window_function: 0,

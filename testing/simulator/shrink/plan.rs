@@ -19,6 +19,51 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+fn interaction_is_transaction(interaction: &InteractionType) -> bool {
+    match interaction {
+        InteractionType::Query(Query::Begin(..))
+        | InteractionType::Query(Query::Commit(..))
+        | InteractionType::Query(Query::Rollback(..))
+        | InteractionType::Query(Query::Savepoint(..))
+        | InteractionType::Query(Query::RollbackToSavepoint(..))
+        | InteractionType::Query(Query::ReleaseSavepoint(..)) => true,
+        #[cfg(feature = "fts")]
+        InteractionType::FtsSql(sql) => sql.is_transaction(),
+        _ => false,
+    }
+}
+
+fn interaction_starts_transaction(interaction: &InteractionType) -> bool {
+    match interaction {
+        InteractionType::Query(Query::Begin(..)) | InteractionType::Query(Query::Savepoint(..)) => {
+            true
+        }
+        #[cfg(feature = "fts")]
+        InteractionType::FtsSql(sql) => sql.starts_transaction(),
+        _ => false,
+    }
+}
+
+fn interaction_ends_transaction(interaction: &InteractionType) -> bool {
+    match interaction {
+        InteractionType::Query(Query::Commit(..))
+        | InteractionType::Query(Query::Rollback(..))
+        | InteractionType::Query(Query::ReleaseSavepoint(..)) => true,
+        #[cfg(feature = "fts")]
+        InteractionType::FtsSql(sql) => sql.ends_transaction(),
+        _ => false,
+    }
+}
+
+fn interaction_is_discardable_read(interaction: &InteractionType) -> bool {
+    match interaction {
+        InteractionType::Query(Query::Select(..)) => true,
+        #[cfg(feature = "fts")]
+        InteractionType::FtsSql(sql) => sql.is_read_only(),
+        _ => false,
+    }
+}
+
 impl InteractionPlan {
     /// Create a smaller interaction plan by deleting a property
     pub(crate) fn shrink_interaction_plan(&self, failing_execution: &Execution) -> InteractionPlan {
@@ -28,6 +73,9 @@ impl InteractionPlan {
         let mut plan = self.clone();
 
         let all_interactions = self.interactions_list();
+        if failing_execution.interaction_index >= all_interactions.len() {
+            return plan;
+        }
         let failing_interaction = &all_interactions[failing_execution.interaction_index];
 
         let range = self.find_interactions_range(failing_interaction.id());
@@ -49,6 +97,10 @@ impl InteractionPlan {
                     InteractionType::Assertion(assert) | InteractionType::Assumption(assert) => {
                         (!assert.tables.is_empty()).then(|| assert.dependencies())
                     }
+                    #[cfg(feature = "fts")]
+                    InteractionType::FtsSql(sql) => Some(IndexSet::from_iter(sql.uses())),
+                    #[cfg(feature = "fts")]
+                    InteractionType::FtsOracle(check) => Some(IndexSet::from_iter(check.uses())),
                     _ => None,
                 }
             })
@@ -73,6 +125,16 @@ impl InteractionPlan {
                             depending_tables.insert(new_name.clone());
                             depending_tables.insert(table_name.clone());
                         }
+                    }
+                }
+                #[cfg(feature = "fts")]
+                InteractionType::FtsSql(sql) => {
+                    if let Some(rename) = sql.table_rename()
+                        && (depending_tables.contains(&rename.old_name)
+                            || depending_tables.contains(&rename.new_name))
+                    {
+                        depending_tables.insert(rename.old_name.clone());
+                        depending_tables.insert(rename.new_name.clone());
                     }
                 }
                 _ => {}
@@ -169,6 +231,7 @@ impl InteractionPlan {
             }
         }
 
+        ret_plan.refresh_fts_oracle_tags();
         ret_plan
     }
 
@@ -222,15 +285,7 @@ impl InteractionPlan {
                         .any(|t| depending_tables.contains(t));
 
                     let is_fault = matches!(&interaction.interaction, InteractionType::Fault(..));
-                    let is_transaction = matches!(
-                        &interaction.interaction,
-                        InteractionType::Query(Query::Begin(..))
-                            | InteractionType::Query(Query::Commit(..))
-                            | InteractionType::Query(Query::Rollback(..))
-                            | InteractionType::Query(Query::Savepoint(..))
-                            | InteractionType::Query(Query::RollbackToSavepoint(..))
-                            | InteractionType::Query(Query::ReleaseSavepoint(..))
-                    );
+                    let is_transaction = interaction_is_transaction(&interaction.interaction);
                     let is_pragma = matches!(
                         &interaction.interaction,
                         InteractionType::Query(Query::Pragma(..))
@@ -246,20 +301,14 @@ impl InteractionPlan {
                                 | PropertyDiscriminants::UnionAllPreservesCardinality
                                 | PropertyDiscriminants::WhereTrueFalseNull
                         ) {
-                            // Theses properties only emit select queries, so they can be discarded entirely
+                            // These properties only emit select queries, so they can be discarded entirely
                             true
                         } else {
                             property_meta.extension
-                                && matches!(
-                                    &interaction.interaction,
-                                    InteractionType::Query(Query::Select(..))
-                                )
+                                && interaction_is_discardable_read(&interaction.interaction)
                         }
                     } else {
-                        matches!(
-                            &interaction.interaction,
-                            InteractionType::Query(Query::Select(..))
-                        )
+                        interaction_is_discardable_read(&interaction.interaction)
                     };
 
                     (is_part_of_property || !skip_interaction)
@@ -282,32 +331,26 @@ impl InteractionPlan {
 
         // Comprises of idxs of Begin interactions
         let mut begin_idx: HashMap<usize, Vec<usize>> = HashMap::new();
-        // Comprises of idxs of Commit and Rollback intereactions
+        // Comprises of idxs of Commit and Rollback interactions
         let mut end_tx_idx: HashMap<usize, Vec<usize>> = HashMap::new();
 
         for (idx, interaction) in self.interactions_list().iter().enumerate() {
-            match &interaction.interaction {
-                InteractionType::Query(Query::Begin(..))
-                | InteractionType::Query(Query::Savepoint(..)) => {
-                    begin_idx
+            if interaction_starts_transaction(&interaction.interaction) {
+                begin_idx
+                    .entry(interaction.connection_index)
+                    .or_default()
+                    .push(idx);
+            } else if interaction_ends_transaction(&interaction.interaction) {
+                let last_begin = begin_idx
+                    .get_mut(&interaction.connection_index)
+                    .and_then(|list| list.pop())
+                    .expect("transaction end must have a matching transaction start");
+                if last_begin + 1 == idx {
+                    end_tx_idx
                         .entry(interaction.connection_index)
-                        .or_insert_with(|| vec![idx]);
+                        .or_default()
+                        .push(idx);
                 }
-                InteractionType::Query(Query::Commit(..))
-                | InteractionType::Query(Query::Rollback(..))
-                | InteractionType::Query(Query::ReleaseSavepoint(..)) => {
-                    let last_begin = begin_idx
-                        .get(&interaction.connection_index)
-                        .and_then(|list| list.last())
-                        .unwrap()
-                        + 1;
-                    if last_begin == idx {
-                        end_tx_idx
-                            .entry(interaction.connection_index)
-                            .or_insert_with(|| vec![idx]);
-                    }
-                }
-                _ => {}
             }
         }
 
@@ -336,5 +379,192 @@ impl InteractionPlan {
             idx += 1;
             retain
         });
+
+        self.refresh_fts_oracle_tags();
+    }
+
+    #[cfg(feature = "fts")]
+    fn refresh_fts_oracle_tags(&mut self) {
+        let mut program_tags = std::collections::BTreeSet::new();
+        self.retain_mut(|interaction| {
+            match &mut interaction.interaction {
+                InteractionType::FtsSql(sql) => {
+                    program_tags.extend(sql.tags.iter().copied());
+                }
+                InteractionType::FtsOracle(check) => {
+                    check.refresh_tags(&program_tags);
+                }
+                _ => {}
+            }
+            true
+        });
+    }
+
+    #[cfg(not(feature = "fts"))]
+    fn refresh_fts_oracle_tags(&mut self) {}
+}
+
+#[cfg(test)]
+mod general_tests {
+    use super::*;
+
+    #[test]
+    fn shrink_empty_plan_returns_empty_plan() {
+        let plan = InteractionPlan::new(false);
+
+        let shrunk = plan.shrink_interaction_plan(&Execution::new(0, 0));
+
+        assert_eq!(shrunk.len(), 0);
+    }
+}
+
+#[cfg(all(test, feature = "fts"))]
+mod tests {
+    use std::{collections::BTreeSet, num::NonZeroUsize};
+
+    use crate::model::{
+        fts::{
+            FtsFeatureTag, FtsOracleCheck, FtsSchemaSnapshot, FtsSql, FtsTableRename,
+            FtsTableSnapshot,
+        },
+        interactions::{InteractionBuilder, InteractionType},
+    };
+
+    use super::*;
+
+    fn fts_sql(
+        sql: &str,
+        tables: &[&str],
+        read_only: bool,
+        table_rename: Option<(&str, &str)>,
+    ) -> InteractionType {
+        fts_sql_with_tags(sql, tables, read_only, table_rename, &[])
+    }
+
+    fn fts_sql_with_tags(
+        sql: &str,
+        tables: &[&str],
+        read_only: bool,
+        table_rename: Option<(&str, &str)>,
+        tags: &[FtsFeatureTag],
+    ) -> InteractionType {
+        let transaction = ["BEGIN", "COMMIT", "ROLLBACK"]
+            .iter()
+            .any(|stmt| sql.eq_ignore_ascii_case(stmt));
+        InteractionType::FtsSql(FtsSql {
+            sql: sql.to_string(),
+            tables: tables.iter().map(|table| table.to_string()).collect(),
+            tags: tags.iter().copied().collect(),
+            ignore_error: false,
+            transaction,
+            read_only,
+            table_rename: table_rename.map(|(old_name, new_name)| FtsTableRename {
+                old_name: old_name.to_string(),
+                new_name: new_name.to_string(),
+            }),
+        })
+    }
+
+    fn fts_oracle(table: &str) -> InteractionType {
+        InteractionType::FtsOracle(FtsOracleCheck {
+            seed: 1,
+            step: 1,
+            verification_sql: "SELECT * FROM new_t".to_string(),
+            tags: BTreeSet::new(),
+            query_tags: BTreeSet::new(),
+            schema: FtsSchemaSnapshot {
+                tables: vec![FtsTableSnapshot {
+                    qualified_name: table.to_string(),
+                    columns: vec!["x".to_string()],
+                    create_sql: format!("CREATE TABLE {table}(x TEXT)"),
+                }],
+                indexes: Vec::new(),
+            },
+            limit_prefix: None,
+            rebuild: true,
+            scalar: false,
+            reopen: false,
+        })
+    }
+
+    fn interaction(
+        id: usize,
+        interaction: InteractionType,
+    ) -> crate::model::interactions::Interaction {
+        let mut builder = InteractionBuilder::with_interaction(interaction);
+        builder
+            .connection_index(0)
+            .id(NonZeroUsize::new(id).unwrap());
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn fts_shrink_uses_oracle_dependencies_and_drops_read_only_sql() {
+        let mut plan = InteractionPlan::new(false);
+        plan.push(interaction(
+            1,
+            fts_sql("CREATE TABLE old_t(x TEXT)", &["old_t"], false, None),
+        ));
+        plan.push(interaction(
+            2,
+            fts_sql_with_tags(
+                "SELECT * FROM old_t",
+                &["old_t"],
+                true,
+                None,
+                &[FtsFeatureTag::FtsScoreProjection],
+            ),
+        ));
+        plan.push(interaction(
+            3,
+            fts_sql(
+                "ALTER TABLE old_t RENAME TO new_t",
+                &["old_t"],
+                false,
+                Some(("old_t", "new_t")),
+            ),
+        ));
+        plan.push(interaction(4, fts_oracle("new_t")));
+
+        let shrunk = plan.shrink_interaction_plan(&Execution::new(0, 3));
+        let sql = shrunk.to_string();
+
+        assert_eq!(shrunk.len(), 3);
+        assert!(sql.contains("CREATE TABLE old_t"));
+        assert!(!sql.contains("SELECT * FROM old_t"));
+        assert!(sql.contains("ALTER TABLE old_t RENAME TO new_t"));
+        assert!(sql.contains("FTS_ORACLE"));
+        let oracle = shrunk
+            .interactions_list()
+            .iter()
+            .find_map(|interaction| match &interaction.interaction {
+                InteractionType::FtsOracle(check) => Some(check),
+                _ => None,
+            })
+            .expect("shrunk plan keeps FTS oracle");
+
+        assert!(oracle.tags.contains(&FtsFeatureTag::RebuildOracle));
+        assert!(!oracle.tags.contains(&FtsFeatureTag::FtsScoreProjection));
+    }
+
+    #[test]
+    fn fts_shrink_drops_empty_transaction_pairs() {
+        let mut plan = InteractionPlan::new(false);
+        plan.push(interaction(
+            1,
+            fts_sql("CREATE TABLE t(x TEXT)", &["t"], false, None),
+        ));
+        plan.push(interaction(2, fts_sql("BEGIN", &[], false, None)));
+        plan.push(interaction(3, fts_sql("COMMIT", &[], false, None)));
+        plan.push(interaction(4, fts_oracle("t")));
+
+        let shrunk = plan.shrink_interaction_plan(&Execution::new(0, 3));
+        let sql = shrunk.to_string();
+
+        assert_eq!(shrunk.len(), 2);
+        assert!(sql.contains("CREATE TABLE t"));
+        assert!(!sql.contains("BEGIN"));
+        assert!(!sql.contains("COMMIT"));
+        assert!(sql.contains("FTS_ORACLE"));
     }
 }
