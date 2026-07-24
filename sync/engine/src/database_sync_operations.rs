@@ -34,11 +34,11 @@ use crate::{
         PullUpdatesStreamKind, Stmt, StmtResult, StreamRequest,
     },
     types::{
-        parse_bin_record, Coro, DatabasePullRevision, DatabaseRowTransformResult,
-        DatabaseSchemaKind, DatabaseSchemaReplay, DatabaseStatementReplay,
-        DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation, DatabaseTapeRowChange,
-        DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus, PartialBootstrapStrategy,
-        PartialSyncOpts, SyncEngineIoResult,
+        parse_bin_record, Coro, DatabasePullRevision, DatabaseRowMutation,
+        DatabaseRowTransformResult, DatabaseSchemaKind, DatabaseSchemaReplay,
+        DatabaseStatementReplay, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
+        DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus,
+        PartialBootstrapStrategy, PartialSyncOpts, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -3078,18 +3078,55 @@ pub async fn apply_transformation<IO: SyncEngineIo, Ctx>(
     changes: &[DatabaseTapeRowChange],
     generator: &DatabaseReplayGenerator,
 ) -> Result<Vec<DatabaseRowTransformResult>> {
+    let mut transformed = Vec::new();
     let mut mutations = Vec::new();
+    // break changes at DDL boundaries and apply transformation callback only of DML operations
+    // e.g. for sequence like that:
+    // 1. INSERT INTO t1
+    // 2. INSERT INTO t2
+    // 3. CREATE TABLE t3
+    // 4. INSERT INTO t3
+    // 5. CREATE TABLE t4
+    // 6. CREATE TABLE t5
+    // We will invoke transform callback for operations [1, 2] and then for operation [4]
+
+    let flush_mutations = async |mutations: &mut Vec<DatabaseRowMutation>,
+                                 transformed: &mut Vec<DatabaseRowTransformResult>|
+           -> Result<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let mutations_cnt = mutations.len();
+        let completion = ctx.io.transform(std::mem::take(mutations))?;
+        let transformed_part = wait_all_results(ctx.coro, &completion, None).await?;
+        if transformed_part.len() != mutations_cnt {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "unexpected result from custom transformation: mismatch in shapes: {} != {}",
+                transformed_part.len(),
+                mutations_cnt,
+            )));
+        }
+        tracing::info!("apply_transformation: got {:?}", transformed_part);
+        transformed.extend(transformed_part);
+        Ok(())
+    };
+
     for change in changes {
         let replay_info = generator.replay_info(ctx.coro, change).await?;
-        mutations.push(generator.create_mutation(&replay_info, change)?);
+        if !replay_info.is_ddl_replay {
+            mutations.push(generator.create_mutation(&replay_info, change)?);
+        } else {
+            flush_mutations(&mut mutations, &mut transformed).await?;
+            transformed.push(DatabaseRowTransformResult::Keep);
+        }
     }
-    let completion = ctx.io.transform(mutations)?;
-    let transformed = wait_all_results(ctx.coro, &completion, None).await?;
+    flush_mutations(&mut mutations, &mut transformed).await?;
+
     if transformed.len() != changes.len() {
         return Err(Error::DatabaseSyncEngineError(format!(
-            "unexpected result from custom transformation: mismatch in shapes: {} != {}",
+            "unexpected result from apply_transformation: mismatch in shapes: {} != {}",
             transformed.len(),
-            changes.len()
+            changes.len(),
         )));
     }
     tracing::info!("apply_transformation: got {:?}", transformed);
