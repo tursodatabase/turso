@@ -45,4 +45,30 @@ class TestTransaction < Turso::TestCase
     rows = db.query("SELECT * FROM users").to_a
     assert_equal 1, rows.length
   end
+
+  def test_savepoint_commit
+    conn = in_memory_db.connection
+    conn.execute("CREATE TABLE users (name TEXT)")
+    conn.execute("BEGIN")
+    conn.execute("INSERT INTO users VALUES ('outer')")
+    conn.savepoint("sp1")
+    conn.execute("INSERT INTO users VALUES ('inner')")
+    conn.release_savepoint("sp1")
+    conn.execute("COMMIT")
+    rows = conn.query("SELECT name FROM users ORDER BY name").to_a
+    assert_equal ["inner", "outer"], rows.map { |r| r["name"] }
+  end
+
+  def test_savepoint_rollback
+    conn = in_memory_db.connection
+    conn.execute("CREATE TABLE users (name TEXT)")
+    conn.execute("BEGIN")
+    conn.execute("INSERT INTO users VALUES ('outer')")
+    conn.savepoint("sp1")
+    conn.execute("INSERT INTO users VALUES ('inner')")
+    conn.rollback_to_savepoint("sp1")
+    conn.execute("COMMIT")
+    rows = conn.query("SELECT name FROM users").to_a
+    assert_equal ["outer"], rows.map { |r| r["name"] }
+  end
 end

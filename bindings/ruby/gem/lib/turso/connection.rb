@@ -94,6 +94,18 @@ module Turso
       @native.last_insert_rowid
     end
 
+    def savepoint(name)
+      execute("SAVEPOINT #{name}")
+    end
+
+    def release_savepoint(name)
+      execute("RELEASE SAVEPOINT #{name}")
+    end
+
+    def rollback_to_savepoint(name)
+      execute("ROLLBACK TO SAVEPOINT #{name}")
+    end
+
     private
 
     def owner_token
