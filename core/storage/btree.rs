@@ -9840,6 +9840,23 @@ fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: usize) -> Re
         page.write_fragmented_bytes_count(0);
     }
     page.write_cell_count(page.cell_count() as u16 - 1);
+
+    // drop_cell removes a single regular cell; it must never be asked to renumber a
+    // pending overflow cell. A page carries pending overflow_cells only mid-balance,
+    // and the one sanctioned caller that drops cells from such a page
+    // (balance_non_root dropping divider cells) always consumes the overflow divider
+    // at or before the dropped index, so overflow_cell.index <= cell_idx there. A
+    // pending overflow cell strictly after cell_idx means an operation reached the
+    // page mid-balance -- a contract violation, surfaced here rather than silently
+    // mis-slotting the payload during the next balance.
+    for overflow_cell in page.overflow_cells.iter() {
+        turso_assert!(
+            overflow_cell.index <= cell_idx,
+            "drop_cell: pending overflow cell positioned after dropped cell",
+            { "overflow_index": overflow_cell.index, "cell_idx": cell_idx }
+        );
+    }
+
     debug_validate_cells!(page, usable_space);
     Ok(())
 }
