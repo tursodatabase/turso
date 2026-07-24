@@ -58,7 +58,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     database_class.define_method("total_changes", method!(Database::total_changes, 0))?;
     database_class.undef_default_alloc_func();
 
-    let connection_class = module.define_class("Connection", ruby.class_object())?;
+    let connection_class = module.define_class("NativeConnection", ruby.class_object())?;
     let _ = RAW_CONNECTION_CLASS.set(val_to_usize(connection_class.as_value()));
     connection_class.define_method("prepare", method!(Connection::prepare_single, 1))?;
     connection_class.define_method("execute_batch", method!(Connection::execute_batch, 1))?;

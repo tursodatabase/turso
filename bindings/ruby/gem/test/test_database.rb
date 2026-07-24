@@ -27,4 +27,12 @@ class TestDatabase < Turso::TestCase
     db.execute("INSERT INTO users (name) VALUES (?)", "Bob")
     assert_equal 1, db.changes
   end
+
+  def test_database_exposes_connection
+    db = in_memory_db
+    conn = db.connection
+    assert_kind_of Turso::Connection, conn
+    assert_respond_to conn, :closed?
+    assert_respond_to conn, :close
+  end
 end

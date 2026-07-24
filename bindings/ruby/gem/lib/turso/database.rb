@@ -28,6 +28,10 @@ module Turso
       @closed = true
     end
 
+    def connection
+      Connection.new(@native.connection)
+    end
+
     def prepare(sql)
       raise Turso::Exception, "database is closed" if closed?
       Statement.new(@native.connection.prepare(sql), @native.connection)
