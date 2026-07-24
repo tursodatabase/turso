@@ -24,20 +24,20 @@
 //! ```
 
 mod column;
-mod connection;
+pub mod connection;
 mod error;
 pub mod params;
 pub mod protocol;
 mod rows;
 mod session;
 mod statement;
-mod transaction;
-mod value;
+pub mod transaction;
+pub mod value;
 
 pub use column::Column;
 pub use connection::Connection;
 pub use error::{BoxError, Error, Result};
-pub use params::{params_from_iter, IntoParams, IntoValue};
+pub use params::{params_from_iter, IntoParams, IntoValue, Params};
 pub use rows::{Row, Rows};
 pub use statement::Statement;
 pub use transaction::{Transaction, TransactionBehavior};

@@ -52,6 +52,9 @@ pub use value::Value;
 
 pub use params::params_from_iter;
 pub use params::IntoParams;
+pub use params::IntoValue;
+pub use params::Params;
+pub use transaction::{Transaction, TransactionBehavior};
 
 use std::fmt::Debug;
 use std::future::Future;
@@ -132,7 +135,7 @@ impl From<turso_sdk_kit::rsapi::TursoError> for Error {
     }
 }
 
-pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type EncryptionOpts = turso_sdk_kit::rsapi::EncryptionOpts;
@@ -565,19 +568,6 @@ impl Column {
         self.decl_type.as_deref()
     }
 }
-
-pub trait IntoValue {
-    fn into_value(self) -> Result<Value>;
-}
-
-#[derive(Debug, Clone)]
-pub enum Params {
-    None,
-    Positional(Vec<Value>),
-    Named(Vec<(String, Value)>),
-}
-
-pub struct Transaction {}
 
 #[cfg(test)]
 mod tests {
