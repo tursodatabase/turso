@@ -1078,7 +1078,10 @@ impl BoxedSortableRecord {
                     _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
                 }
             };
-            cmp_with_sort(cmp, &self_val, &other_val, key_info);
+            let cmp = cmp_with_sort(cmp, &self_val, &other_val, key_info);
+            if cmp != Ordering::Equal {
+                return cmp;
+            }
         }
         Ordering::Equal
     }
@@ -1366,13 +1369,31 @@ mod tests {
         seconds: &[Value],
         expected: &[ValueRef],
     ) {
+        assert_secondary_key_sort_with_buffer(
+            second_order,
+            second_nulls,
+            1 << 20,
+            false,
+            seconds,
+            expected,
+        );
+    }
+
+    fn assert_secondary_key_sort_with_buffer(
+        second_order: SortOrder,
+        second_nulls: Option<turso_parser::ast::NullsOrder>,
+        max_buffer_size_bytes: usize,
+        expect_spill: bool,
+        seconds: &[Value],
+        expected: &[ValueRef],
+    ) {
         let io = Arc::new(PlatformIO::new().unwrap());
         let mut sorter = Sorter::new(
             &[SortOrder::Asc, second_order],
             try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
             try_vec![None, second_nulls].unwrap(),
             try_vec![None, None].unwrap(),
-            1 << 20,
+            max_buffer_size_bytes,
             64,
             io.clone(),
             crate::TempStore::Default,
@@ -1386,9 +1407,15 @@ mod tests {
                 .expect("Failed to insert the record");
         }
 
+        if expect_spill {
+            assert!(!sorter.chunks.is_empty());
+        }
+
         io.block(|| sorter.sort())
             .expect("Failed to sort the records");
-        assert!(sorter.chunks.is_empty());
+        if !expect_spill {
+            assert!(sorter.chunks.is_empty());
+        }
 
         let mut idx = 0;
         while sorter.has_more() {
@@ -1443,6 +1470,54 @@ mod tests {
             &[
                 ValueRef::from_i64(20),
                 ValueRef::from_i64(10),
+                ValueRef::Null,
+                ValueRef::Null,
+            ],
+        );
+    }
+
+    #[test]
+    fn spilled_sort_applies_secondary_key_in_chunk_merge() {
+        let seconds = try_vec![
+            Value::from_i64(10),
+            Value::from_i64(40),
+            Value::from_i64(20),
+            Value::from_i64(30)
+        ]
+        .unwrap();
+        assert_secondary_key_sort_with_buffer(
+            SortOrder::Asc,
+            None,
+            1,
+            true,
+            &seconds,
+            &[
+                ValueRef::from_i64(10),
+                ValueRef::from_i64(20),
+                ValueRef::from_i64(30),
+                ValueRef::from_i64(40),
+            ],
+        );
+    }
+
+    #[test]
+    fn spilled_sort_places_nulls_last_in_chunk_merge() {
+        let seconds = try_vec![
+            Value::Null,
+            Value::from_i64(10),
+            Value::Null,
+            Value::from_i64(20)
+        ]
+        .unwrap();
+        assert_secondary_key_sort_with_buffer(
+            SortOrder::Asc,
+            Some(turso_parser::ast::NullsOrder::Last),
+            1,
+            true,
+            &seconds,
+            &[
+                ValueRef::from_i64(10),
+                ValueRef::from_i64(20),
                 ValueRef::Null,
                 ValueRef::Null,
             ],
