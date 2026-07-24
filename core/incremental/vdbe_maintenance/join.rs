@@ -1,11 +1,10 @@
-use super::plan::{NodeOutputContract, OperatorStateDef};
+use super::output::{DeltaSource, NodeOutput, NodeOutputContract};
+use super::plan::OperatorStateDef;
 use super::stream::{
     open_ephemeral_delta, ArrangementHandle, ArrangementIdentityColumn, DeltaIdentity,
     EphemeralDelta,
 };
-use super::{
-    make_joined_table, remap_bound_expr, BindingRemap, DeltaSource, MaintenanceInput, NodeOutput,
-};
+use super::{make_joined_table, remap_bound_expr, BindingRemap, MaintenanceInput};
 use crate::incremental::dag;
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::Arc;
@@ -41,32 +40,16 @@ pub(super) struct JoinContract {
 impl JoinContract {
     pub(super) fn from_outputs(
         outputs: [&NodeOutput; JOIN_ARITY],
-        schemas: [Arc<dag::StreamSchema>; JOIN_ARITY],
         on: &[ast::Expr],
     ) -> Result<Self> {
         let input = |position: usize| -> Result<JoinInputContract> {
             let output = outputs[position];
-            let schema = schemas[position].clone();
-            let arrangement = output.arrangement.clone().ok_or_else(|| {
+            let schema = output.contract().schema.clone();
+            let arrangement = output.arrangement().cloned().ok_or_else(|| {
                 LimboError::InternalError("join input has no materialized arrangement".to_string())
             })?;
-            if arrangement.value_columns().len() != schema.len() {
-                return Err(LimboError::InternalError(
-                    "join arrangement does not match its logical input width".to_string(),
-                ));
-            }
-            if arrangement.binding_rowid_columns().len() != schema.bindings.len() {
-                return Err(LimboError::InternalError(
-                    "join arrangement does not match its logical binding provenance".to_string(),
-                ));
-            }
-            if arrangement.identity() != output.delta.identity() {
-                return Err(LimboError::InternalError(
-                    "join delta and arrangement expose different identities".to_string(),
-                ));
-            }
             Ok(JoinInputContract {
-                delta: output.delta.clone(),
+                delta: output.delta().clone(),
                 schema,
                 arrangement,
             })

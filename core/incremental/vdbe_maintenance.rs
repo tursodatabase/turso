@@ -57,10 +57,13 @@ use crate::{Connection, LimboError, QueryMode, Result};
 use turso_parser::ast::TableInternalId;
 
 mod stream;
-use stream::{
-    open_ephemeral_delta, synthesized_view_table, ArrangementHandle, DeltaIdentity, EphemeralDelta,
-    ViewSink,
-};
+use stream::{synthesized_view_table, DeltaIdentity, EphemeralDelta, ViewSink};
+
+mod output;
+use output::{EmittedNodeOutput, NodeOutput};
+
+mod source;
+use source::{materialize_node_output, scan_node_output};
 
 mod join;
 use join::{emit_join_deltas_to_ephemeral, emit_left_join_deltas_to_ephemeral, JoinContract};
@@ -72,7 +75,6 @@ mod set_op;
 use set_op::emit_set_op_to_ephemeral;
 
 mod plan;
-use plan::NodeOutputContract;
 pub use plan::{plan_view, MaintenancePlan, OperatorStateCatalog};
 
 mod delta_cursor;
@@ -82,7 +84,7 @@ mod linear;
 use linear::{emit_ephemeral_alias, emit_ephemeral_filter, emit_ephemeral_project};
 
 mod arrangement;
-use arrangement::{materialize_declared_output_arrangement, scan_node_output};
+use arrangement::publish_node_output;
 
 /// What the maintenance program reads as its input relation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -134,96 +136,6 @@ impl MaintenanceProgramCache {
         entries.retain(|existing, _| existing.schema_version == key.schema_version);
         entries.insert(key, program);
     }
-}
-
-/// A delta-producing relation consumed by a maintenance operator.
-///
-/// This is derived exclusively from DAG edges. Emitters must not recover their
-/// input by inspecting the original SELECT: doing so makes the DAG descriptive
-/// rather than executable and reintroduces per-shape composition.
-#[derive(Debug, Clone)]
-enum DeltaSource {
-    BaseTable {
-        table: Arc<BTreeTable>,
-        /// Physical multiplicity column when this scan reads another
-        /// materialized view. Transaction-delta cursors always expose their
-        /// signed weight immediately after the logical columns.
-        stored_weight_column: Option<usize>,
-    },
-    /// A z-set stream emitted by an upstream operator in this program.
-    Ephemeral(EphemeralDelta),
-}
-
-impl DeltaSource {
-    fn identity(&self) -> DeltaIdentity {
-        match self {
-            Self::BaseTable { .. } => DeltaIdentity::BindingRowids(1),
-            Self::Ephemeral(channel) => channel.identity,
-        }
-    }
-
-    fn binding_rowids(&self) -> Arc<[bool]> {
-        match self {
-            Self::BaseTable { table, .. } => vec![table.has_rowid].into(),
-            Self::Ephemeral(channel) => channel
-                .binding_rowid_columns
-                .iter()
-                .map(Option::is_some)
-                .collect::<Vec<_>>()
-                .into(),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn materialize(
-        &self,
-        program: &mut ProgramBuilder,
-        view_name: &str,
-        source_node: dag::NodeId,
-        source_contract: &NodeOutputContract,
-        input: MaintenanceInput,
-    ) -> Result<EphemeralDelta> {
-        let Self::BaseTable {
-            table,
-            stored_weight_column,
-            ..
-        } = self
-        else {
-            let Self::Ephemeral(channel) = self else {
-                unreachable!()
-            };
-            return Ok(channel.clone());
-        };
-        let channel = open_ephemeral_delta(
-            program,
-            &format!("{view_name}_scan_delta_{source_node}"),
-            source_contract.schema.as_ref().clone(),
-            source_contract.emitted_identity,
-            source_contract.binding_rowids.clone(),
-            false,
-        );
-        emit_base_scan_delta(
-            program,
-            view_name,
-            table,
-            *stored_weight_column,
-            input,
-            &channel,
-        )?;
-        Ok(channel)
-    }
-}
-
-/// The physical result of compiling one DAG node.
-///
-/// `delta` is the node's transaction change stream. `arrangement` is the
-/// maintained integral downstream stateful operators may probe. Linear nodes
-/// deliberately have no arrangement: producing one requires an explicit
-/// materialization operator rather than silently reopening an ancestor table.
-#[derive(Debug, Clone)]
-struct NodeOutput {
-    delta: DeltaSource,
-    arrangement: Option<ArrangementHandle>,
 }
 
 /// A [`JoinedTable`] scan entry for synthesized maintenance-program bindings.
@@ -491,9 +403,10 @@ fn emit_declared_delta_nodes_to(
         if !required[node_id] {
             continue;
         }
-        let output_contract = operator_states.output_for_node(node_id)?;
+        let operator_state = operator_states.for_node(node_id)?;
+        let output_contract = &operator_state.output;
         let output = match &dag.nodes[node_id] {
-            dag::OpNode::Scan { .. } => scan_node_output(dag, node_id, schema)?,
+            dag::OpNode::Scan { .. } => scan_node_output(dag, node_id, output_contract, schema)?,
             dag::OpNode::Filter {
                 input: upstream,
                 predicate,
@@ -504,15 +417,11 @@ fn emit_declared_delta_nodes_to(
                         "filter DAG node {node_id} input {upstream} was not compiled"
                     ))
                 })?;
-                let upstream = upstream.delta.materialize(
-                    program,
-                    view_name,
-                    upstream_id,
-                    operator_states.output_for_node(upstream_id)?,
-                    input,
-                )?;
-                NodeOutput {
-                    delta: emit_ephemeral_filter(
+                let upstream =
+                    materialize_node_output(program, view_name, upstream_id, upstream, input)?;
+                EmittedNodeOutput::new(
+                    node_id,
+                    emit_ephemeral_filter(
                         program,
                         view_name,
                         node_id,
@@ -522,8 +431,9 @@ fn emit_declared_delta_nodes_to(
                         schema,
                         connection,
                     )?,
-                    arrangement: None,
-                }
+                    None,
+                    output_contract,
+                )?
             }
             dag::OpNode::Project {
                 input: upstream,
@@ -535,15 +445,16 @@ fn emit_declared_delta_nodes_to(
                         "project DAG node {node_id} input {upstream} was not compiled"
                     ))
                 })?;
-                let upstream = upstream_output.delta.materialize(
+                let upstream = materialize_node_output(
                     program,
                     view_name,
                     upstream_id,
-                    operator_states.output_for_node(upstream_id)?,
+                    upstream_output,
                     input,
                 )?;
-                NodeOutput {
-                    delta: emit_ephemeral_project(
+                EmittedNodeOutput::new(
+                    node_id,
+                    emit_ephemeral_project(
                         program,
                         view_name,
                         node_id,
@@ -553,8 +464,9 @@ fn emit_declared_delta_nodes_to(
                         schema,
                         connection,
                     )?,
-                    arrangement: None,
-                }
+                    None,
+                    output_contract,
+                )?
             }
             dag::OpNode::Alias {
                 input: upstream, ..
@@ -565,23 +477,19 @@ fn emit_declared_delta_nodes_to(
                         "alias DAG node {node_id} input {upstream} was not compiled"
                     ))
                 })?;
-                let upstream = upstream_output.delta.materialize(
+                let upstream = materialize_node_output(
                     program,
                     view_name,
                     upstream_id,
-                    operator_states.output_for_node(upstream_id)?,
+                    upstream_output,
                     input,
                 )?;
-                NodeOutput {
-                    delta: emit_ephemeral_alias(
-                        program,
-                        view_name,
-                        node_id,
-                        &upstream,
-                        output_contract,
-                    )?,
-                    arrangement: None,
-                }
+                EmittedNodeOutput::new(
+                    node_id,
+                    emit_ephemeral_alias(program, view_name, node_id, &upstream, output_contract)?,
+                    None,
+                    output_contract,
+                )?
             }
             dag::OpNode::Join { inputs, on, kind } => {
                 let declared_input = |input_id: dag::NodeId| {
@@ -592,14 +500,11 @@ fn emit_declared_delta_nodes_to(
                     })
                 };
                 let declared_inputs = [declared_input(inputs[0])?, declared_input(inputs[1])?];
-                let input_schemas = [
-                    operator_states.output_for_node(inputs[0])?.schema.clone(),
-                    operator_states.output_for_node(inputs[1])?.schema.clone(),
-                ];
-                let contract = JoinContract::from_outputs(declared_inputs, input_schemas, on)?;
+                let contract = JoinContract::from_outputs(declared_inputs, on)?;
                 if *kind == dag::JoinKind::LeftOuter {
-                    NodeOutput {
-                        delta: emit_left_join_deltas_to_ephemeral(
+                    EmittedNodeOutput::new(
+                        node_id,
+                        emit_left_join_deltas_to_ephemeral(
                             program,
                             view_name,
                             node_id,
@@ -610,8 +515,9 @@ fn emit_declared_delta_nodes_to(
                             schema,
                             connection,
                         )?,
-                        arrangement: None,
-                    }
+                        None,
+                        output_contract,
+                    )?
                 } else {
                     let syms = connection.syms.read();
                     let mut resolver = Resolver::new(
@@ -624,8 +530,9 @@ fn emit_declared_delta_nodes_to(
                         connection.get_dqs_dml().into(),
                         Arc::new(crate::dialect::SqliteDialect),
                     );
-                    NodeOutput {
-                        delta: emit_join_deltas_to_ephemeral(
+                    EmittedNodeOutput::new(
+                        node_id,
+                        emit_join_deltas_to_ephemeral(
                             program,
                             &mut resolver,
                             view_name,
@@ -633,8 +540,9 @@ fn emit_declared_delta_nodes_to(
                             &contract,
                             input,
                         )?,
-                        arrangement: None,
-                    }
+                        None,
+                        output_contract,
+                    )?
                 }
             }
             dag::OpNode::SetOp {
@@ -651,16 +559,17 @@ fn emit_declared_delta_nodes_to(
                             "set-op DAG node {node_id} input {upstream_id} was not compiled"
                         ))
                     })?;
-                    channels.push(upstream.delta.materialize(
+                    channels.push(materialize_node_output(
                         program,
                         view_name,
                         *upstream_id,
-                        operator_states.output_for_node(*upstream_id)?,
+                        upstream,
                         input,
                     )?);
                 }
-                NodeOutput {
-                    delta: emit_set_op_to_ephemeral(
+                EmittedNodeOutput::new(
+                    node_id,
+                    emit_set_op_to_ephemeral(
                         program,
                         view_name,
                         node_id,
@@ -672,8 +581,9 @@ fn emit_declared_delta_nodes_to(
                         operator_states.for_node(node_id)?,
                         schema,
                     )?,
-                    arrangement: None,
-                }
+                    None,
+                    output_contract,
+                )?
             }
             dag::OpNode::Aggregate {
                 input: upstream,
@@ -689,13 +599,8 @@ fn emit_declared_delta_nodes_to(
                         "aggregate DAG node {node_id} input {upstream} was not compiled"
                     ))
                 })?;
-                let upstream = upstream.delta.materialize(
-                    program,
-                    view_name,
-                    upstream_id,
-                    operator_states.output_for_node(upstream_id)?,
-                    input,
-                )?;
+                let upstream =
+                    materialize_node_output(program, view_name, upstream_id, upstream, input)?;
                 emit_group_aggregate(
                     program,
                     view_name,
@@ -713,20 +618,7 @@ fn emit_declared_delta_nodes_to(
                 )?
             }
         };
-        let operator_state = operator_states.for_node(node_id)?;
-        if output.delta.identity() != operator_state.output.emitted_identity {
-            return Err(LimboError::InternalError(format!(
-                "maintenance DAG node {node_id} emitted {:?}, but its declared identity is {:?}",
-                output.delta.identity(),
-                operator_state.output.emitted_identity
-            )));
-        }
-        if output.delta.binding_rowids().as_ref() != operator_state.output.binding_rowids.as_ref() {
-            return Err(LimboError::InternalError(format!(
-                "maintenance DAG node {node_id} emitted the wrong binding-rowid provenance"
-            )));
-        }
-        let output = materialize_declared_output_arrangement(
+        let output = publish_node_output(
             program,
             view_name,
             node_id,
@@ -735,32 +627,6 @@ fn emit_declared_delta_nodes_to(
             operator_state,
             schema,
         )?;
-        if output.delta.identity() != operator_state.output.published_identity {
-            return Err(LimboError::InternalError(format!(
-                "maintenance DAG node {node_id} published {:?}, but its edge contract is {:?}",
-                output.delta.identity(),
-                operator_state.output.published_identity
-            )));
-        }
-        if output.delta.binding_rowids().as_ref() != operator_state.output.binding_rowids.as_ref() {
-            return Err(LimboError::InternalError(format!(
-                "maintenance DAG node {node_id} published the wrong binding-rowid provenance"
-            )));
-        }
-        if let Some(arrangement) = &output.arrangement {
-            let arrangement_binding_rowids = arrangement
-                .binding_rowid_columns()
-                .iter()
-                .map(Option::is_some)
-                .collect::<Vec<_>>();
-            if arrangement_binding_rowids.as_slice()
-                != operator_state.output.binding_rowids.as_ref()
-            {
-                return Err(LimboError::InternalError(format!(
-                    "maintenance DAG node {node_id} arrangement exposes the wrong binding-rowid provenance"
-                )));
-            }
-        }
         outputs[node_id] = Some(output);
     }
 
@@ -793,13 +659,7 @@ fn emit_generic_dag_to_sink(
         schema,
         connection,
     )?;
-    let stream = node_output.delta.materialize(
-        program,
-        view_name,
-        root,
-        operator_states.output_for_node(root)?,
-        input,
-    )?;
+    let stream = materialize_node_output(program, view_name, root, &node_output, input)?;
     emit_terminal_delta(program, view_name, &stream, sink)
 }
 
@@ -847,119 +707,6 @@ fn compile_generic_dag_program(
     )
 }
 
-// Emit a Scan node into its declared ephemeral delta channel.
-fn emit_base_scan_delta(
-    program: &mut ProgramBuilder,
-    view_name: &str,
-    base_table: &Arc<BTreeTable>,
-    stored_weight_column: Option<usize>,
-    input: MaintenanceInput,
-    output: &EphemeralDelta,
-) -> Result<()> {
-    turso_assert!(
-        output.identity == DeltaIdentity::BindingRowids(1)
-            && output.binding_rowid_columns.as_ref() == [Some(0)]
-            && output.value_start == 1
-            && output.width == base_table.columns().len()
-            && output.weight_column == output.width + 1,
-        "scan delta channel must contain rowid, base columns, and weight"
-    );
-    let input_cursor_id = match input {
-        MaintenanceInput::TransactionDelta => {
-            let cursor_id = program.alloc_cursor_id(CursorType::ViewDelta {
-                view_name: view_name.to_string(),
-                table: base_table.clone(),
-            });
-            program.emit_insn(Insn::OpenRead {
-                cursor_id,
-                root_page: 0,
-                db: 0,
-            });
-            cursor_id
-        }
-        MaintenanceInput::BaseTable => {
-            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(base_table.clone()));
-            program.emit_insn(Insn::OpenRead {
-                cursor_id,
-                root_page: base_table.root_page,
-                db: 0,
-            });
-            cursor_id
-        }
-    };
-
-    let end_label = program.allocate_label();
-    let loop_label = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id: input_cursor_id,
-        pc_if_empty: end_label,
-    });
-    program.preassign_label_to_next_insn(loop_label);
-
-    let record_start = program.alloc_registers(output.record_width());
-    let weight_reg = record_start + output.weight_column;
-    program.emit_insn(Insn::RowId {
-        cursor_id: input_cursor_id,
-        dest: record_start,
-    });
-    for column in 0..output.width {
-        program.emit_column_or_rowid(
-            input_cursor_id,
-            column,
-            record_start + output.value_start + column,
-        );
-    }
-    match input {
-        MaintenanceInput::TransactionDelta => {
-            program.emit_insn(Insn::Column {
-                cursor_id: input_cursor_id,
-                column: base_table.columns().len(),
-                dest: weight_reg,
-                default: None,
-            });
-        }
-        MaintenanceInput::BaseTable => {
-            if let Some(column) = stored_weight_column {
-                program.emit_insn(Insn::Column {
-                    cursor_id: input_cursor_id,
-                    column,
-                    dest: weight_reg,
-                    default: None,
-                });
-            } else {
-                program.emit_int(1, weight_reg);
-            }
-        }
-    }
-
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: record_start as u16,
-        count: output.record_width() as u16,
-        dest_reg: record_reg as u16,
-        index_name: None,
-        affinity_str: None,
-    });
-    let output_rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: output.cursor_id,
-        rowid_reg: output_rowid_reg,
-        prev_largest_reg: 0,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: output.cursor_id,
-        key_reg: output_rowid_reg,
-        record_reg,
-        flag: InsertFlags::new().is_ephemeral_table_insert(),
-        table_name: String::new(),
-    });
-    program.emit_insn(Insn::Next {
-        cursor_id: input_cursor_id,
-        pc_if_next: loop_label,
-    });
-    program.preassign_label_to_next_insn(end_label);
-    Ok(())
-}
 /// Consume a fully evaluated one-identity delta stream at the maintenance
 /// program boundary. Operator code owns expression evaluation; this adapter
 /// only binds the root's standard `(identity, values, weight)` contract to a

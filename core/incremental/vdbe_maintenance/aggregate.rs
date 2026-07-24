@@ -1,11 +1,11 @@
-use super::plan::{tracks_distinct_values, uses_multiset, NodeOutputContract, OperatorStateDef};
+use super::output::{DeltaSource, EmittedNodeOutput, NodeOutputContract};
+use super::plan::{tracks_distinct_values, uses_multiset, OperatorStateDef};
 use super::stream::{
     btree_arrangement, emit_operator_rowid_delta, open_ephemeral_delta, ArrangementIdentityColumn,
     DeltaIdentity, EphemeralDelta,
 };
 use super::{
-    remap_bound_expr, seed_ephemeral_stream_cache, stream_table_references, DeltaSource,
-    MaintenanceInput, NodeOutput,
+    remap_bound_expr, seed_ephemeral_stream_cache, stream_table_references, MaintenanceInput,
 };
 use crate::function::AggFunc;
 use crate::incremental::dag;
@@ -36,7 +36,7 @@ pub(super) fn emit_group_aggregate(
     operator_state: &OperatorStateDef,
     schema: &Schema,
     connection: &Arc<Connection>,
-) -> Result<NodeOutput> {
+) -> Result<EmittedNodeOutput> {
     let output = open_ephemeral_delta(
         program,
         &format!("{view_name}_aggregate_delta_{node_id}"),
@@ -67,9 +67,10 @@ pub(super) fn emit_group_aggregate(
         ))
     })?;
     let value_columns = (0..group_exprs.len() + aggregates.len()).collect();
-    Ok(NodeOutput {
-        delta: DeltaSource::Ephemeral(output),
-        arrangement: Some(btree_arrangement(
+    EmittedNodeOutput::new(
+        node_id,
+        DeltaSource::Ephemeral(output),
+        Some(btree_arrangement(
             state_table,
             DeltaIdentity::OperatorRowid,
             vec![ArrangementIdentityColumn::RowId],
@@ -77,7 +78,8 @@ pub(super) fn emit_group_aggregate(
             value_columns,
             None,
         )),
-    })
+        output_contract,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

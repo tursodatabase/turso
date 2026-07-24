@@ -1,37 +1,17 @@
+use super::output::{DeltaSource, EmittedNodeOutput, NodeOutput};
 use super::plan::OperatorStateDef;
+use super::source::materialize_delta_source;
 use super::stream::{
-    base_arrangement, btree_arrangement, open_ephemeral_delta, ArrangementHandle,
-    ArrangementIdentityColumn, DeltaIdentity, EphemeralDelta,
+    btree_arrangement, open_ephemeral_delta, ArrangementHandle, ArrangementIdentityColumn,
+    DeltaIdentity, EphemeralDelta,
 };
-use super::{DeltaSource, MaintenanceInput, NodeOutput};
+use super::MaintenanceInput;
 use crate::incremental::dag;
 use crate::schema::Schema;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{LimboError, Result};
-
-pub(super) fn scan_node_output(
-    dag: &dag::MaintenanceDag,
-    node_id: dag::NodeId,
-    schema: &Schema,
-) -> Result<NodeOutput> {
-    let dag::OpNode::Scan { table, .. } = &dag.nodes[node_id] else {
-        return Err(LimboError::InternalError(format!(
-            "maintenance DAG node {node_id} is not a scan"
-        )));
-    };
-    let stored_weight_column = schema
-        .is_materialized_view(&table.name)
-        .then(|| table.columns().len());
-    Ok(NodeOutput {
-        delta: DeltaSource::BaseTable {
-            table: table.clone(),
-            stored_weight_column,
-        },
-        arrangement: Some(base_arrangement(table.clone(), stored_weight_column)),
-    })
-}
 
 /// Integrate one node's declared delta into its persistent output arrangement.
 ///
@@ -454,22 +434,29 @@ fn emit_output_arrangement(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn materialize_declared_output_arrangement(
+pub(super) fn publish_node_output(
     program: &mut ProgramBuilder,
     view_name: &str,
     node_id: dag::NodeId,
-    output: NodeOutput,
+    output: EmittedNodeOutput,
     maintenance_input: MaintenanceInput,
     operator_state: &OperatorStateDef,
     schema: &Schema,
 ) -> Result<NodeOutput> {
+    let (delta, native_arrangement) = output.into_parts();
     let Some(arrangement_def) = &operator_state.arrangement_table else {
-        return Ok(output);
+        return NodeOutput::new(node_id, delta, native_arrangement, &operator_state.output);
     };
-    let input = output.delta.materialize(
+    if native_arrangement.is_some() {
+        return Err(LimboError::InternalError(format!(
+            "maintenance DAG node {node_id} has both a native and explicit output arrangement"
+        )));
+    }
+    let input = materialize_delta_source(
         program,
         view_name,
         node_id,
+        &delta,
         &operator_state.output,
         maintenance_input,
     )?;
@@ -496,8 +483,10 @@ pub(super) fn materialize_declared_output_arrangement(
         &arrangement_def.table_name,
         schema,
     )?;
-    Ok(NodeOutput {
-        delta: DeltaSource::Ephemeral(arranged_output),
-        arrangement: Some(arrangement),
-    })
+    NodeOutput::new(
+        node_id,
+        DeltaSource::Ephemeral(arranged_output),
+        Some(arrangement),
+        &operator_state.output,
+    )
 }
