@@ -398,29 +398,6 @@ fn build_select_plan_dag(
             )
         };
 
-        let mut multiset_collation = None;
-        for aggregate in plan
-            .aggregates
-            .iter()
-            .filter(|aggregate| uses_multiset(aggregate))
-        {
-            let collation = aggregate
-                .args
-                .first()
-                .map(|argument| {
-                    plan_expr_collation(argument, &plan.table_references, resolver)
-                        .map(|collation| collation.unwrap_or(CollationSeq::Binary))
-                })
-                .transpose()?
-                .unwrap_or(CollationSeq::Binary);
-            if multiset_collation.is_some_and(|existing| existing != collation) {
-                return unsupported(
-                    "different collations across MIN/MAX or DISTINCT aggregate arguments",
-                );
-            }
-            multiset_collation = Some(collation);
-        }
-        let multiset_collation = multiset_collation.unwrap_or(CollationSeq::Binary);
         let mut aggregates = hidden_count_aggregate(resolver)?;
         for aggregate in &plan.aggregates {
             let mut normalized = aggregate.clone();
@@ -434,12 +411,27 @@ fn build_select_plan_dag(
                 aggregates.push(normalized);
             }
         }
+        let mut multiset_collations = Vec::with_capacity(aggregates.len());
+        for aggregate in &aggregates {
+            if !uses_multiset(aggregate) {
+                multiset_collations.push(None);
+                continue;
+            }
+            let collation = aggregate
+                .args
+                .first()
+                .map(|argument| plan_expr_collation(argument, &plan.table_references, resolver))
+                .transpose()?
+                .flatten()
+                .unwrap_or(CollationSeq::Binary);
+            multiset_collations.push(Some(collation));
+        }
         node = builder.push(dag::OpNode::Aggregate {
             input: node,
             group_exprs,
             group_collations,
             aggregates,
-            multiset_collation,
+            multiset_collations,
             scalar,
         })?;
 
@@ -542,20 +534,33 @@ pub struct HiddenTableDef {
     pub primary_key_index: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuxiliaryStatePurpose {
+    AggregateMultiset { aggregate_index: usize },
+    LeftJoinMatches,
+    SetOpIdentity,
+}
+
+#[derive(Debug, Clone)]
+struct AuxiliaryTableDef {
+    purpose: AuxiliaryStatePurpose,
+    table: HiddenTableDef,
+}
+
 /// Persistent storage and output contract assigned to one DAG node.
 ///
-/// `state_table` is the operator's primary integral. `auxiliary_table` is the
-/// aggregate value multiset, the LEFT-join unmatched-row bookkeeping, or the
-/// trailing-UNION-ALL identity multiset associated with that same node.
-/// `arrangement_table` is the node's explicitly materialized output integral
-/// when a downstream join or terminal sink needs a one-rowid identity and the
-/// operator has no native arrangement.
+/// `state_table` is the operator's primary integral. Auxiliary tables have an
+/// explicit operator-local purpose: each aggregate value multiset owns its
+/// own collation-bearing index, while LEFT joins and mixed set operations each
+/// own one bookkeeping table. `arrangement_table` is the node's explicitly
+/// materialized output integral when a downstream join or terminal sink needs
+/// a one-rowid identity and the operator has no native arrangement.
 #[derive(Debug, Clone)]
 pub(super) struct OperatorStateDef {
     pub(super) node_id: dag::NodeId,
     pub(super) output: NodeOutputContract,
     pub(super) state_table: Option<HiddenTableDef>,
-    pub(super) auxiliary_table: Option<HiddenTableDef>,
+    auxiliary_tables: Vec<AuxiliaryTableDef>,
     pub(super) arrangement_table: Option<HiddenTableDef>,
 }
 
@@ -576,16 +581,36 @@ impl OperatorStateDef {
             })
     }
 
-    pub(super) fn auxiliary_table_name(&self) -> Result<&str> {
-        self.auxiliary_table
-            .as_ref()
-            .map(|table| table.table_name.as_str())
+    fn auxiliary_table_name(&self, purpose: AuxiliaryStatePurpose) -> Result<&str> {
+        self.auxiliary_tables
+            .iter()
+            .find(|table| table.purpose == purpose)
+            .map(|table| table.table.table_name.as_str())
             .ok_or_else(|| {
                 LimboError::InternalError(format!(
-                    "maintenance DAG node {} has no auxiliary state table",
+                    "maintenance DAG node {} has no {purpose:?} table",
                     self.node_id
                 ))
             })
+    }
+
+    pub(super) fn aggregate_multiset_table_name(&self, aggregate_index: usize) -> Result<&str> {
+        self.auxiliary_table_name(AuxiliaryStatePurpose::AggregateMultiset { aggregate_index })
+    }
+
+    pub(super) fn left_join_matches_table_name(&self) -> Result<&str> {
+        self.auxiliary_table_name(AuxiliaryStatePurpose::LeftJoinMatches)
+    }
+
+    pub(super) fn set_op_identity_table_name(&self) -> Result<&str> {
+        self.auxiliary_table_name(AuxiliaryStatePurpose::SetOpIdentity)
+    }
+
+    fn hidden_tables(&self) -> impl Iterator<Item = &HiddenTableDef> {
+        self.state_table
+            .iter()
+            .chain(self.auxiliary_tables.iter().map(|table| &table.table))
+            .chain(self.arrangement_table.iter())
     }
 }
 
@@ -615,13 +640,7 @@ impl OperatorStateCatalog {
     }
 
     fn hidden_tables(&self) -> impl Iterator<Item = &HiddenTableDef> {
-        self.nodes.iter().flat_map(|state| {
-            state
-                .state_table
-                .iter()
-                .chain(state.auxiliary_table.iter())
-                .chain(state.arrangement_table.iter())
-        })
+        self.nodes.iter().flat_map(OperatorStateDef::hidden_tables)
     }
 }
 
@@ -1024,18 +1043,26 @@ fn validate_composable_delta_node(
             group_exprs,
             group_collations,
             aggregates,
+            multiset_collations,
             ..
         } => {
-            if group_exprs.len() != group_collations.len() {
+            if group_exprs.len() != group_collations.len()
+                || aggregates.len() != multiset_collations.len()
+                || aggregates
+                    .iter()
+                    .zip(multiset_collations)
+                    .any(|(aggregate, collation)| uses_multiset(aggregate) != collation.is_some())
+            {
                 return Err(LimboError::InternalError(
-                    "aggregate DAG has inconsistent group collation layout".to_string(),
+                    "aggregate DAG has inconsistent collation metadata".to_string(),
                 ));
             }
             if group_collations
                 .iter()
+                .chain(multiset_collations.iter().flatten())
                 .any(|collation| collation.is_custom())
             {
-                return unsupported("custom collations on grouping or dedup keys");
+                return unsupported("custom collations on aggregate state keys");
             }
             for expr in group_exprs {
                 check_scalar_expr(expr)?;
@@ -1328,37 +1355,13 @@ fn plan_operator_states(
         } else {
             None
         };
-        let auxiliary_table = if node_needs_auxiliary_state(node) {
-            let table_name = format!(
-                "{}{DBSP_CIRCUIT_VERSION}_{view_name}__n{node_id}",
-                crate::schema::DBSP_MULTISET_TABLE_PREFIX,
-            );
-            Some(HiddenTableDef {
-                create_sql: multiset_table_sql(
-                    &table_name,
-                    node,
-                    dag.output_schema(node_id).len()
-                        + if matches!(
-                            node,
-                            dag::OpNode::Join {
-                                kind: dag::JoinKind::LeftOuter,
-                                ..
-                            }
-                        ) {
-                            binding_rowids
-                                .iter()
-                                .filter(|available| **available)
-                                .count()
-                        } else {
-                            0
-                        },
-                )?,
-                table_name,
-                primary_key_index: true,
-            })
-        } else {
-            None
-        };
+        let auxiliary_tables = plan_auxiliary_tables(
+            view_name,
+            node_id,
+            node,
+            dag.output_schema(node_id).len(),
+            &binding_rowids,
+        );
         let arrangement_table = if node_requires_output_arrangement(dag, node_id, emitted_identity)
         {
             let identity_width = emitted_identity.width();
@@ -1395,15 +1398,10 @@ fn plan_operator_states(
                 published_identity,
             },
             state_table,
-            auxiliary_table,
+            auxiliary_tables,
             arrangement_table,
         };
-        for table in state
-            .state_table
-            .iter()
-            .chain(state.auxiliary_table.iter())
-            .chain(state.arrangement_table.iter())
-        {
+        for table in state.hidden_tables() {
             if !hidden_names.insert(table.table_name.clone()) {
                 return Err(LimboError::InternalError(format!(
                     "duplicate maintenance state table {}",
@@ -1416,6 +1414,83 @@ fn plan_operator_states(
     }
     validate_terminal_delta_identity(&catalog, dag.root)?;
     Ok(catalog)
+}
+
+fn plan_auxiliary_tables(
+    view_name: &str,
+    node_id: dag::NodeId,
+    node: &dag::OpNode,
+    output_width: usize,
+    binding_rowids: &[bool],
+) -> Vec<AuxiliaryTableDef> {
+    use crate::incremental::view::DBSP_CIRCUIT_VERSION;
+
+    let table_name = |suffix: &str| {
+        format!(
+            "{}{DBSP_CIRCUIT_VERSION}_{view_name}__n{node_id}{suffix}",
+            crate::schema::DBSP_MULTISET_TABLE_PREFIX,
+        )
+    };
+    let table = |purpose, table_name: String, create_sql| AuxiliaryTableDef {
+        purpose,
+        table: HiddenTableDef {
+            table_name,
+            create_sql,
+            primary_key_index: true,
+        },
+    };
+
+    match node {
+        dag::OpNode::Aggregate {
+            group_collations,
+            multiset_collations,
+            ..
+        } => multiset_collations
+            .iter()
+            .enumerate()
+            .filter_map(|(aggregate_index, collation)| {
+                collation.map(|collation| {
+                    let table_name = table_name(&format!("__a{aggregate_index}"));
+                    let create_sql =
+                        aggregate_multiset_table_sql(&table_name, group_collations, collation);
+                    table(
+                        AuxiliaryStatePurpose::AggregateMultiset { aggregate_index },
+                        table_name,
+                        create_sql,
+                    )
+                })
+            })
+            .collect(),
+        dag::OpNode::Join {
+            kind: dag::JoinKind::LeftOuter,
+            ..
+        } => {
+            let table_name = table_name("");
+            let payload_width = output_width
+                + binding_rowids
+                    .iter()
+                    .filter(|available| **available)
+                    .count();
+            vec![table(
+                AuxiliaryStatePurpose::LeftJoinMatches,
+                table_name.clone(),
+                left_join_matches_table_sql(&table_name, payload_width),
+            )]
+        }
+        dag::OpNode::SetOp {
+            operators,
+            prefix_len,
+            ..
+        } if *prefix_len > 0 && *prefix_len < operators.len() + 1 => {
+            let table_name = table_name("");
+            vec![table(
+                AuxiliaryStatePurpose::SetOpIdentity,
+                table_name.clone(),
+                set_op_identity_table_sql(&table_name),
+            )]
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn arrangement_table_sql(
@@ -1463,8 +1538,8 @@ fn node_requires_primary_state(dag: &dag::MaintenanceDag, node_id: dag::NodeId) 
 /// For a compound view with a dedup prefix: one row per distinct content
 /// key, holding one signed count per prefix branch (the visibility fold
 /// reads them). A trailing UNION ALL suffix keeps its
-/// (branch, source-identity, multiplicity) rows in the auxiliary table (see
-/// [`multiset_table_sql`]); pure UNION ALL is stateless branch composition.
+/// (branch, source-identity, multiplicity) rows in its identity table; pure
+/// UNION ALL is stateless branch composition.
 ///
 /// In each case the state row's rowid is the operator output identity.
 ///
@@ -1536,82 +1611,53 @@ pub(super) fn uses_multiset(agg: &Aggregate) -> bool {
     matches!(agg.func, AggFunc::Min | AggFunc::Max) || tracks_distinct_values(agg)
 }
 
-/// Whether this operator needs auxiliary state.
-///
-/// Aggregate value multisets are part of aggregate semantics. A mixed set-op's
-/// trailing UNION ALL identity map is also part of its output contract: the
-/// operator must publish one stable identity whether its consumer is another
-/// operator or the terminal view.
-fn node_needs_auxiliary_state(node: &dag::OpNode) -> bool {
-    match node {
-        dag::OpNode::Aggregate { aggregates, .. } => aggregates.iter().any(uses_multiset),
-        dag::OpNode::SetOp {
-            operators,
-            prefix_len,
-            ..
-        } => *prefix_len > 0 && *prefix_len < operators.len() + 1,
-        dag::OpNode::Join { kind, .. } => *kind == dag::JoinKind::LeftOuter,
-        _ => false,
+/// One aggregate's value multiset: one row per (group, distinct value) with
+/// its multiplicity. A table per aggregate lets the value-key index carry
+/// that argument's own collation. For MIN/MAX the key ordering makes a
+/// group's extreme an index seek; for DISTINCT aggregates the multiplicity
+/// decides when a value enters or leaves the accumulator.
+fn aggregate_multiset_table_sql(
+    multiset_table_name: &str,
+    group_collations: &[CollationSeq],
+    value_collation: CollationSeq,
+) -> String {
+    let multiset_table_ident = crate::util::quote_identifier(multiset_table_name);
+    let mut columns = Vec::with_capacity(group_collations.len() + 2);
+    let mut key = Vec::with_capacity(group_collations.len() + 1);
+    for (i, collation) in group_collations.iter().enumerate() {
+        columns.push(format!("g{i}{}", collate_clause(*collation)));
+        key.push(format!("g{i}"));
     }
+    columns.push(format!("val{}", collate_clause(value_collation)));
+    key.push("val".to_string());
+    columns.push("mult".to_string());
+    format!(
+        "CREATE TABLE {multiset_table_ident} ({}, PRIMARY KEY ({}))",
+        columns.join(", "),
+        key.join(", ")
+    )
 }
 
-/// The CREATE TABLE statement for a GROUP BY view's value multiset: one row
-/// per (aggregate, group, distinct value) with its multiplicity. For MIN/MAX
-/// the PRIMARY KEY ordering makes a group's extreme value an index seek, so
-/// retracting the current extreme never needs a rescan in Rust; for DISTINCT
-/// aggregates the multiplicity decides when a value enters or leaves the
-/// accumulator.
-fn multiset_table_sql(
-    multiset_table_name: &str,
-    node: &dag::OpNode,
-    payload_width: usize,
-) -> Result<String> {
-    let multiset_table_ident = crate::util::quote_identifier(multiset_table_name);
-    match node {
-        dag::OpNode::Aggregate {
-            group_collations,
-            multiset_collation,
-            ..
-        } => {
-            let mut columns = vec!["agg_id".to_string()];
-            let mut key = vec!["agg_id".to_string()];
-            for (i, collation) in group_collations.iter().enumerate() {
-                columns.push(format!("g{i}{}", collate_clause(*collation)));
-                key.push(format!("g{i}"));
-            }
-            columns.push(format!("val{}", collate_clause(*multiset_collation)));
-            key.push("val".to_string());
-            Ok(format!(
-                "CREATE TABLE {multiset_table_ident} ({}, mult, PRIMARY KEY ({}))",
-                columns.join(", "),
-                key.join(", ")
-            ))
-        }
-        // A compound view's trailing UNION ALL branches: a multiset of
-        // (branch, packed source identity), each row's rowid doubling as its
-        // view rowid (disambiguated from content-row rowids by the caller).
-        // Packing makes the contract independent of whether a branch carries
-        // one scan rowid or a composed join identity tuple.
-        dag::OpNode::SetOp { .. } => Ok(format!(
-            "CREATE TABLE {multiset_table_ident} (branch, source_identity, mult, PRIMARY KEY (branch, source_identity))"
-        )),
-        // A LEFT JOIN view's per-left-row bookkeeping: signed presence,
-        // count of ON-matches, and whether its NULL-padded row is currently
-        // published. The payload preserves that image and its binding-rowid
-        // provenance so downstream operators can consume its retraction after
-        // the left row departs.
-        dag::OpNode::Join { .. } => {
-            let payload = (0..payload_width)
-                .map(|i| format!(", c{i}"))
-                .collect::<String>();
-            Ok(format!(
-                "CREATE TABLE {multiset_table_ident} (l_rid, present, matches, padded{payload}, PRIMARY KEY (l_rid))"
-            ))
-        }
-        _ => Err(LimboError::InternalError(
-            "only GROUP BY, compound, and LEFT JOIN views have multiset tables".to_string(),
-        )),
-    }
+/// A compound view's trailing UNION ALL branches: a multiset of
+/// (branch, packed source identity), each row's rowid doubling as its view
+/// rowid. Packing keeps the table independent of each branch's identity width.
+fn set_op_identity_table_sql(table_name: &str) -> String {
+    let table_ident = crate::util::quote_identifier(table_name);
+    format!(
+        "CREATE TABLE {table_ident} (branch, source_identity, mult, PRIMARY KEY (branch, source_identity))"
+    )
+}
+
+/// A LEFT JOIN's per-left-row presence, ON-match count, padded-row publication
+/// flag, and preserved output image.
+fn left_join_matches_table_sql(table_name: &str, payload_width: usize) -> String {
+    let table_ident = crate::util::quote_identifier(table_name);
+    let payload = (0..payload_width)
+        .map(|i| format!(", c{i}"))
+        .collect::<String>();
+    format!(
+        "CREATE TABLE {table_ident} (l_rid, present, matches, padded{payload}, PRIMARY KEY (l_rid))"
+    )
 }
 
 /// The `COLLATE` clause for a hidden-table key column, empty for the

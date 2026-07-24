@@ -31,19 +31,19 @@ test matview-vdbe-stateless-version-marker {
       SELECT id FROM versioned_base WHERE enabled <> 0;
     SELECT type, name, tbl_name
       FROM sqlite_schema
-     WHERE name = '__turso_internal_dbsp_metadata_v12_versioned_stateless';
+     WHERE name = '__turso_internal_dbsp_metadata_v13_versioned_stateless';
     SELECT COUNT(*)
       FROM sqlite_schema
-     WHERE tbl_name = '__turso_internal_dbsp_metadata_v12_versioned_stateless';
+     WHERE tbl_name = '__turso_internal_dbsp_metadata_v13_versioned_stateless';
     INSERT INTO versioned_base VALUES (1, 1);
     SELECT * FROM versioned_stateless;
     DROP VIEW versioned_stateless;
     SELECT COUNT(*)
       FROM sqlite_schema
-     WHERE name = '__turso_internal_dbsp_metadata_v12_versioned_stateless';
+     WHERE name = '__turso_internal_dbsp_metadata_v13_versioned_stateless';
 }
 expect {
-    table|__turso_internal_dbsp_metadata_v12_versioned_stateless|__turso_internal_dbsp_metadata_v12_versioned_stateless
+    table|__turso_internal_dbsp_metadata_v13_versioned_stateless|__turso_internal_dbsp_metadata_v13_versioned_stateless
     1
     1
     0
@@ -1586,15 +1586,30 @@ expect {
     n|3|3
 }
 
-# One multiset table stores every MIN/MAX and DISTINCT aggregate's values,
-# so its value column carries a single collation; aggregates whose arguments
-# compare under different collations are rejected.
-test matview-vdbe-collated-multiset-mismatch-rejected {
+# Each aggregate owns its value multiset, so its index can use the argument's
+# collation independently of every other aggregate in the same node.
+test matview-vdbe-collated-multisets-independent {
     CREATE TABLE t56(a TEXT, b TEXT COLLATE NOCASE);
-    CREATE MATERIALIZED VIEW bad56 AS SELECT MIN(a), COUNT(DISTINCT b) FROM t56;
+    INSERT INTO t56 VALUES ('Z', 'A'), ('a', 'a'), ('B', 'B'), ('z', 'c');
+    CREATE MATERIALIZED VIEW v56 AS
+      SELECT MIN(a COLLATE BINARY), COUNT(DISTINCT b COLLATE NOCASE) FROM t56;
+    SELECT * FROM v56;
+    SELECT COUNT(*) FROM sqlite_schema
+      WHERE name LIKE '__turso_internal_dbsp_multiset_v13_v56__n%__a%';
+    DELETE FROM t56 WHERE a = 'B';
+    SELECT * FROM v56;
+    DELETE FROM t56 WHERE a = 'Z';
+    SELECT * FROM v56;
+    DROP VIEW v56;
+    SELECT COUNT(*) FROM sqlite_schema
+      WHERE name LIKE '__turso_internal_dbsp_multiset_v13_v56__n%__a%';
 }
-expect error {
-    materialized views with different collations across MIN/MAX or DISTINCT aggregate arguments are not yet supported
+expect {
+    B|3
+    2
+    Z|2
+    a|2
+    0
 }
 
 test matview-vdbe-distinct-over-aggregates-rejected {
@@ -2512,11 +2527,11 @@ test matview-vdbe-filtered-derived-input-arrangement {
     SELECT * FROM arranged_join ORDER BY 1;
     SELECT COUNT(*)
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_arrangement_v12_arranged_join__n%';
+     WHERE name LIKE '__turso_internal_dbsp_arrangement_v13_arranged_join__n%';
     DROP VIEW arranged_join;
     SELECT COUNT(*)
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_arrangement_v12_arranged_join__n%';
+     WHERE name LIKE '__turso_internal_dbsp_arrangement_v13_arranged_join__n%';
 }
 expect {
     1|ten
@@ -2876,17 +2891,17 @@ test matview-vdbe-node-owned-hidden-state {
       SELECT node_a.k FROM node_a JOIN node_b ON node_a.k = node_b.k;
     SELECT name
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_state_v12_node_catalog__n%'
-        OR name LIKE '__turso_internal_dbsp_arrangement_v12_node_catalog__n%'
+     WHERE name LIKE '__turso_internal_dbsp_state_v13_node_catalog__n%'
+        OR name LIKE '__turso_internal_dbsp_arrangement_v13_node_catalog__n%'
      ORDER BY name;
     DROP VIEW node_catalog;
     SELECT COUNT(*)
       FROM sqlite_schema
-     WHERE name LIKE '__turso_internal_dbsp_state_v12_node_catalog__n%';
+     WHERE name LIKE '__turso_internal_dbsp_state_v13_node_catalog__n%';
 }
 expect {
-    __turso_internal_dbsp_arrangement_v12_node_catalog__n8
-    __turso_internal_dbsp_state_v12_node_catalog__n1
+    __turso_internal_dbsp_arrangement_v13_node_catalog__n8
+    __turso_internal_dbsp_state_v13_node_catalog__n1
     0
 }
 

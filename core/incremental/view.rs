@@ -57,7 +57,10 @@ use turso_parser::{
 /// v12: every materialized view owns an explicit version marker, including
 /// stateless views with no operator state. Absence of the current marker is
 /// incompatible rather than being treated as an implicitly current layout.
-pub const DBSP_CIRCUIT_VERSION: u32 = 12;
+///
+/// v13: aggregate value multisets are stored per aggregate, so each index
+/// carries the collation of that aggregate's argument.
+pub const DBSP_CIRCUIT_VERSION: u32 = 13;
 
 pub(crate) fn dbsp_version_marker_table_name(view_name: &str) -> String {
     format!(
@@ -68,7 +71,8 @@ pub(crate) fn dbsp_version_marker_table_name(view_name: &str) -> String {
 
 /// Whether a version-stripped hidden-state key belongs to `view_name`.
 ///
-/// Current keys are `<view>__n<decimal-node-id>`; legacy branch state used
+/// Current keys are `<view>__n<decimal-node-id>` with an optional
+/// `__a<decimal-aggregate-id>` suffix; legacy branch state used
 /// `<view>__b<decimal-branch-id>`, and the oldest layout used exactly the view
 /// name. Parsing the entire suffix is important: a prefix check would make
 /// dropping `v` steal state from a distinct view named `v__n1`.
@@ -79,13 +83,29 @@ pub(crate) fn state_key_belongs_to_view(key: &str, view_name: &str) -> bool {
     let Some(suffix) = key.strip_prefix(view_name) else {
         return false;
     };
-    let node_id = suffix
-        .strip_prefix("__n")
-        .or_else(|| suffix.strip_prefix("__b"));
-    node_id.is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+    if let Some(branch_id) = suffix.strip_prefix("__b") {
+        return !branch_id.is_empty() && branch_id.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    let Some(node_suffix) = suffix.strip_prefix("__n") else {
+        return false;
+    };
+    let node_id_len = node_suffix
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if node_id_len == 0 {
+        return false;
+    }
+    let remainder = &node_suffix[node_id_len..];
+    if remainder.is_empty() {
+        return true;
+    }
+    remainder.strip_prefix("__a").is_some_and(|aggregate_id| {
+        !aggregate_id.is_empty() && aggregate_id.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
-/// Whether a complete hidden state/multiset table name belongs to a view,
+/// Whether a complete hidden metadata or operator table belongs to a view,
 /// independent of the storage version embedded in that table name.
 pub(crate) fn state_table_belongs_to_view(table_name: &str, view_name: &str) -> bool {
     if let Some((_, stored_view_name)) = table_name
@@ -909,6 +929,21 @@ mod tests {
     };
     use crate::sync::Arc;
     use turso_parser::ast;
+
+    #[test]
+    fn hidden_state_ownership_parses_aggregate_suffixes() {
+        assert!(state_key_belongs_to_view("orders__n12__a3", "orders"));
+        assert!(!state_key_belongs_to_view("orders__n12__a", "orders"));
+        assert!(!state_key_belongs_to_view(
+            "orders__n12__a3_extra",
+            "orders"
+        ));
+        assert!(!state_key_belongs_to_view("orders__n12__n3__a4", "orders"));
+        assert!(state_key_belongs_to_view(
+            "orders__n12__n3__a4",
+            "orders__n12"
+        ));
+    }
 
     #[test]
     fn transaction_change_log_captures_once_for_multiple_views() {

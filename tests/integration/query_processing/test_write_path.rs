@@ -2110,17 +2110,19 @@ fn test_matview_join_both_sides_one_txn(tmp_db: TempDatabase) -> anyhow::Result<
     Ok(())
 }
 
-/// Aggregate view state (per-group payloads in the internal state table)
-/// must survive closing and reopening the database: maintenance after reopen
-/// resumes from the persisted state.
+/// Aggregate payloads and independently collated value multisets must survive
+/// closing and reopening the database.
 #[turso_macros::test(views)]
 fn test_matview_aggregate_state_survives_reopen(tmp_db: TempDatabase) -> anyhow::Result<()> {
     {
         let conn = tmp_db.connect_limbo();
-        conn.execute("CREATE TABLE t (g TEXT, x INTEGER)")?;
-        conn.execute("INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 10)")?;
+        conn.execute("CREATE TABLE t (g TEXT, x INTEGER, y TEXT COLLATE NOCASE)")?;
+        conn.execute("INSERT INTO t VALUES ('a', 1, 'A'), ('a', 2, 'a'), ('b', 10, 'B')")?;
         conn.execute(
-            "CREATE MATERIALIZED VIEW v AS SELECT g, COUNT(*) AS cnt, SUM(x) AS sx, MIN(x) AS mn FROM t GROUP BY g",
+            "CREATE MATERIALIZED VIEW v AS
+             SELECT g, COUNT(*) AS cnt, SUM(x) AS sx, MIN(x) AS mn,
+                    COUNT(DISTINCT y) AS distinct_y
+             FROM t GROUP BY g",
         )?;
         conn.close()?;
     }
@@ -2135,20 +2137,20 @@ fn test_matview_aggregate_state_survives_reopen(tmp_db: TempDatabase) -> anyhow:
     )?;
     let conn = db2.connect()?;
 
-    // Maintenance after reopen must resume from the persisted group state,
-    // including the MIN/MAX multiset (deleting x=1 retracts group a's
-    // current minimum, whose replacement comes from the persisted multiset).
-    conn.execute("INSERT INTO t VALUES ('a', 100)")?;
+    // Deleting x=1 retracts the current minimum. Its NOCASE value is a
+    // duplicate of the surviving "a", so the distinct count stays at two.
+    conn.execute("INSERT INTO t VALUES ('a', 100, 'C')")?;
     conn.execute("DELETE FROM t WHERE x = 10")?;
     conn.execute("DELETE FROM t WHERE x = 1")?;
 
-    let rows = limbo_exec_rows(&conn, "SELECT g, cnt, sx, mn FROM v ORDER BY g");
+    let rows = limbo_exec_rows(&conn, "SELECT g, cnt, sx, mn, distinct_y FROM v ORDER BY g");
     assert_eq!(
         rows,
         vec![vec![
             RValue::Text("a".into()),
             RValue::Integer(2),
             RValue::Integer(102),
+            RValue::Integer(2),
             RValue::Integer(2),
         ]]
     );

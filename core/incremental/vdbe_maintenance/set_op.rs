@@ -320,7 +320,7 @@ fn emit_deduplicating_set_op(
         })?;
     // Trailing UNION ALL rows preserve source identity in the auxiliary table.
     let (append_table_name, append_table, append_index) = if materializes_append {
-        let name = operator_state.auxiliary_table_name()?.to_string();
+        let name = operator_state.set_op_identity_table_name()?.to_string();
         let table = schema.get_btree_table(&name).ok_or_else(|| {
             LimboError::InternalError(format!(
                 "append table {name} of materialized view {view_name} not found"

@@ -168,7 +168,10 @@ pub enum OpNode {
         group_collations: Vec<CollationSeq>,
         /// `aggregates[0]` is the hidden liveness `COUNT(*)`.
         aggregates: Vec<Aggregate>,
-        multiset_collation: CollationSeq,
+        /// Value-key collation for each aggregate-owned multiset. Entries are
+        /// aligned with `aggregates`; `None` means the aggregate has no
+        /// per-value state.
+        multiset_collations: Vec<Option<CollationSeq>>,
         scalar: bool,
     },
 
