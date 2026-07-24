@@ -228,7 +228,7 @@ pub(super) fn emit_project(
     view_name: &str,
     node_id: dag::NodeId,
     input: &EphemeralDelta,
-    projections: &[(ast::Expr, Option<String>)],
+    projections: &[ast::Expr],
     output_contract: &NodeOutputContract,
     schema: &Schema,
     connection: &Arc<Connection>,
@@ -249,7 +249,7 @@ pub(super) fn emit_project(
 fn emit_project_rows(
     program: &mut ProgramBuilder,
     input: &EphemeralDelta,
-    projections: &[(ast::Expr, Option<String>)],
+    projections: &[ast::Expr],
     output: &EphemeralDelta,
     schema: &Schema,
     connection: &Arc<Connection>,
@@ -301,7 +301,7 @@ fn emit_project_rows(
     }
     let out_start = program.alloc_registers(num_output_columns + 1);
     let new_weight_reg = out_start + num_output_columns;
-    for (index, (expr, _)) in projections.iter().enumerate() {
+    for (index, expr) in projections.iter().enumerate() {
         let bound = remap_bound_expr(expr, &binding_remap)?;
         translate_expr_no_constant_opt(
             program,
