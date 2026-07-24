@@ -1,12 +1,10 @@
-use super::dbsp::Delta;
+use crate::io::{Buffer, Completion, File, TempFile, IO};
 use crate::schema::{BTreeTable, Schema};
-use crate::sync::Arc;
-use crate::types::Value;
+use crate::sync::{Arc, Mutex};
+use crate::types::{IOCompletions, IOResult, ImmutableRecord, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
-use crate::{LimboError, Result};
+use crate::{LimboError, Result, TempStore};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::cell::RefCell;
-use std::rc::Rc;
 use turso_parser::ast;
 use turso_parser::{
     ast::{Cmd, Stmt},
@@ -21,7 +19,61 @@ use turso_parser::{
 /// v2: maintenance compiled to VDBE programs. Filter/project views have no
 /// state table at all; GROUP BY views use a typed state table (group keys,
 /// view rowid, aggregate payloads) instead of v1's generic blob layout.
-pub const DBSP_CIRCUIT_VERSION: u32 = 2;
+///
+/// v3: pure UNION ALL is stateless branch composition. Its view-row identity
+/// is derived directly from `(branch, source rowid)` rather than a hidden
+/// state-table rowid.
+///
+/// v4: hidden state is owned and named by DAG node (`__n<node_id>`), rather
+/// than inferred from a root shape or UNION ALL branch. This permits multiple
+/// stateful operators in one maintenance circuit without name collisions.
+///
+/// v5: trailing UNION ALL identity keys store the complete source-identity
+/// tuple, not a single rowid.
+///
+/// v6: aggregate state rows also persist each finalized aggregate value. The
+/// state table is therefore the aggregate node's output arrangement and can
+/// publish `-old/+new` typed deltas to downstream operators.
+///
+/// v7: mixed deduplicating/UNION ALL set operators always keep their trailing
+/// source-identity map, including when their output feeds another operator.
+/// This makes the set-op's stable identity part of its typed delta contract
+/// rather than a terminal-view-only implementation detail.
+///
+/// v8: a non-native operator output consumed by a join owns an explicit
+/// `(source identity, values, multiplicity)` arrangement. Its rowid is the
+/// stable identity published to the downstream join.
+pub const DBSP_CIRCUIT_VERSION: u32 = 9;
+
+/// Whether a version-stripped hidden-state key belongs to `view_name`.
+///
+/// Current keys are `<view>__n<decimal-node-id>`; legacy branch state used
+/// `<view>__b<decimal-branch-id>`, and the oldest layout used exactly the view
+/// name. Parsing the entire suffix is important: a prefix check would make
+/// dropping `v` steal state from a distinct view named `v__n1`.
+pub(crate) fn state_key_belongs_to_view(key: &str, view_name: &str) -> bool {
+    if key == view_name {
+        return true;
+    }
+    let Some(suffix) = key.strip_prefix(view_name) else {
+        return false;
+    };
+    let node_id = suffix
+        .strip_prefix("__n")
+        .or_else(|| suffix.strip_prefix("__b"));
+    node_id.is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Whether a complete hidden state/multiset table name belongs to a view,
+/// independent of the storage version embedded in that table name.
+pub(crate) fn state_table_belongs_to_view(table_name: &str, view_name: &str) -> bool {
+    table_name
+        .strip_prefix(crate::schema::DBSP_TABLE_PREFIX)
+        .or_else(|| table_name.strip_prefix(crate::schema::DBSP_MULTISET_TABLE_PREFIX))
+        .or_else(|| table_name.strip_prefix(crate::schema::DBSP_ARRANGEMENT_TABLE_PREFIX))
+        .and_then(|suffix| suffix.split_once('_'))
+        .is_some_and(|(_, key)| state_key_belongs_to_view(key, view_name))
+}
 
 /// The automatic primary-key index of a view's internal state table, derived
 /// from the state table's PRIMARY KEY (the group columns).
@@ -67,157 +119,625 @@ pub fn create_dbsp_state_index(
     })
 }
 
-/// Per-connection transaction state for incremental views
-#[derive(Debug, Clone, Default)]
-pub struct ViewTransactionState {
-    // Per-table deltas for uncommitted changes
-    // Maps table_name -> Delta for that table
-    // Using RefCell for interior mutability
-    table_deltas: RefCell<HashMap<String, Delta>>,
+/// Stable identity of a changed table within a schema epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum TableChangeId {
+    RootPage(i64),
+    #[cfg(test)]
+    Name(String),
 }
 
-impl ViewTransactionState {
-    /// Create a new transaction state
-    pub fn new() -> Self {
+#[derive(Debug, Clone)]
+pub(crate) struct ChangeEvent {
+    pub(crate) table_id: TableChangeId,
+    pub(crate) rowid: i64,
+    pub(crate) values: Vec<Value>,
+    pub(crate) weight: isize,
+}
+
+#[derive(Debug)]
+struct ChangeBuffer {
+    tail: Arc<Vec<ChangeEvent>>,
+    in_memory_bytes: usize,
+    spilled: Vec<SpillSegment>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SpillSegment {
+    pub(crate) offset: u64,
+    pub(crate) len: usize,
+    /// Stable table identities present in this segment. Individual event
+    /// identities spill with their row images; only this segment-level routing
+    /// index stays resident.
+    pub(crate) table_ids: Arc<HashSet<TableChangeId>>,
+    /// Logical event prefix visible after savepoint rewinds.
+    pub(crate) rows: usize,
+}
+
+/// A snapshot consumed by a maintenance cursor. Spilled segments precede the
+/// in-memory tail and therefore preserve transaction capture order.
+#[derive(Clone)]
+pub(crate) struct CapturedDelta {
+    pub(crate) file: Option<Arc<dyn File>>,
+    pub(crate) spilled: Vec<SpillSegment>,
+    pub(crate) tail: Arc<Vec<ChangeEvent>>,
+    pub(crate) table_id: Option<TableChangeId>,
+}
+
+impl CapturedDelta {
+    pub(crate) fn empty() -> Self {
         Self {
-            table_deltas: RefCell::new(HashMap::default()),
+            file: None,
+            spilled: Vec::new(),
+            tail: Arc::new(Vec::new()),
+            table_id: None,
         }
     }
 
-    /// Insert a row into the delta for a specific table
-    pub fn insert(&self, table_name: &str, key: i64, values: Vec<Value>) {
-        let mut deltas = self.table_deltas.borrow_mut();
-        let delta = deltas.entry(table_name.to_string()).or_default();
-        delta.insert(key, values);
-    }
-
-    /// Delete a row from the delta for a specific table
-    pub fn delete(&self, table_name: &str, key: i64, values: Vec<Value>) {
-        let mut deltas = self.table_deltas.borrow_mut();
-        let delta = deltas.entry(table_name.to_string()).or_default();
-        delta.delete(key, values);
-    }
-
-    /// Clear all changes in the delta
-    pub fn clear(&self) {
-        self.table_deltas.borrow_mut().clear();
-    }
-
-    /// Get deltas organized by table
-    pub fn get_table_deltas(&self) -> HashMap<String, Delta> {
-        self.table_deltas.borrow().clone()
-    }
-
-    /// Check if the delta is empty
-    pub fn is_empty(&self) -> bool {
-        self.table_deltas.borrow().values().all(|d| d.is_empty())
-    }
-
-    /// Returns how many elements exist in the delta.
-    pub fn len(&self) -> usize {
-        self.table_deltas.borrow().values().map(|d| d.len()).sum()
-    }
-
-    /// Per-table delta lengths, recorded at statement start so a statement
-    /// rollback can rewind captures made by the aborted statement.
-    pub fn table_delta_lens(&self) -> HashMap<String, usize> {
-        self.table_deltas
-            .borrow()
+    #[cfg(test)]
+    fn contains_table(&self, table_id: &TableChangeId) -> bool {
+        self.spilled
             .iter()
-            .map(|(table, delta)| (table.clone(), delta.len()))
+            .any(|segment| segment.rows > 0 && segment.table_ids.contains(table_id))
+            || self.tail.iter().any(|event| &event.table_id == table_id)
+    }
+}
+
+const CHANGE_LOG_SPILL_THRESHOLD: usize = 256 * 1024;
+
+#[derive(Debug)]
+struct PendingSpill {
+    table_id: TableChangeId,
+    completion: Completion,
+    segment: SpillSegment,
+    /// Identity of the capture that crossed the threshold. A resumed opcode
+    /// presents this change again; a different change (UPDATE delete followed
+    /// by insert) must be appended after finishing the pending batch.
+    triggering_key: i64,
+    triggering_values: Vec<Value>,
+    triggering_weight: isize,
+}
+
+enum PendingSpillStatus {
+    None,
+    Waiting(Completion),
+    Finished(PendingSpill),
+}
+
+/// One globally ordered transaction change log. Row images are owned by this
+/// stream exactly once; consumers retain only stable table-identity indexes.
+struct SharedChangeLog {
+    changes: Mutex<ChangeBuffer>,
+    subscriptions: Mutex<HashMap<String, HashSet<TableChangeId>>>,
+    /// Monotonic content revision for read-your-own-writes cursors.
+    /// A row count is insufficient: rewind followed by different changes can
+    /// produce the same length with different contents.
+    revision: Mutex<u64>,
+    io: Arc<dyn IO>,
+    temp_file: Mutex<Option<TempFile>>,
+    next_spill_offset: Mutex<u64>,
+    pending_spill: Mutex<Option<PendingSpill>>,
+}
+
+impl SharedChangeLog {
+    fn new(io: Arc<dyn IO>) -> Self {
+        Self {
+            changes: Mutex::new(ChangeBuffer {
+                tail: Arc::new(Vec::new()),
+                in_memory_bytes: 0,
+                spilled: Vec::new(),
+            }),
+            subscriptions: Mutex::new(HashMap::default()),
+            revision: Mutex::new(0),
+            io,
+            temp_file: Mutex::new(None),
+            next_spill_offset: Mutex::new(0),
+            pending_spill: Mutex::new(None),
+        }
+    }
+
+    fn subscribe_views(&self, view_names: &[String], table_id: &TableChangeId) {
+        let mut subscriptions = self.subscriptions.lock();
+        for view_name in view_names {
+            subscriptions
+                .entry(view_name.clone())
+                .or_default()
+                .insert(table_id.clone());
+        }
+    }
+
+    fn bump_revision(&self) {
+        let mut revision = self.revision.lock();
+        *revision = revision.wrapping_add(1);
+    }
+
+    fn record_insert(
+        &self,
+        table_id: TableChangeId,
+        key: i64,
+        values: Vec<Value>,
+        temp_store: TempStore,
+    ) -> Result<IOResult<()>> {
+        self.record_change(table_id, key, values, 1, temp_store)
+    }
+
+    fn record_delete(
+        &self,
+        table_id: TableChangeId,
+        key: i64,
+        values: Vec<Value>,
+        temp_store: TempStore,
+    ) -> Result<IOResult<()>> {
+        self.record_change(table_id, key, values, -1, temp_store)
+    }
+
+    fn record_change(
+        &self,
+        table_id: TableChangeId,
+        key: i64,
+        values: Vec<Value>,
+        weight: isize,
+        temp_store: TempStore,
+    ) -> Result<IOResult<()>> {
+        match self.finish_pending_spill()? {
+            PendingSpillStatus::None => {}
+            PendingSpillStatus::Waiting(completion) => {
+                return Ok(IOResult::IO(IOCompletions::Single(completion)));
+            }
+            PendingSpillStatus::Finished(pending) => {
+                let is_resumed_trigger = pending.table_id == table_id
+                    && pending.triggering_key == key
+                    && pending.triggering_weight == weight
+                    && pending.triggering_values == values;
+                if is_resumed_trigger {
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+
+        let record_bytes = serialized_change_size(&table_id, key, weight, &values)?;
+        {
+            let mut changes = self.changes.lock();
+            Arc::make_mut(&mut changes.tail).push(ChangeEvent {
+                table_id: table_id.clone(),
+                rowid: key,
+                values: values.clone(),
+                weight,
+            });
+            changes.in_memory_bytes = changes.in_memory_bytes.saturating_add(record_bytes);
+            self.bump_revision();
+            if changes.in_memory_bytes < CHANGE_LOG_SPILL_THRESHOLD {
+                return Ok(IOResult::Done(()));
+            }
+        }
+
+        self.start_spill(table_id, key, values, weight, temp_store)
+    }
+
+    /// Complete an outstanding append. Returns its identity so the resumed
+    /// opcode can distinguish "same capture, already appended" from the next
+    /// capture in an UPDATE pair.
+    fn finish_pending_spill(&self) -> Result<PendingSpillStatus> {
+        let Some(pending) = self.pending_spill.lock().take() else {
+            return Ok(PendingSpillStatus::None);
+        };
+        if !pending.completion.finished() {
+            let completion = pending.completion.clone();
+            *self.pending_spill.lock() = Some(pending);
+            return Ok(PendingSpillStatus::Waiting(completion));
+        }
+        if let Some(error) = pending.completion.get_error() {
+            return Err(LimboError::CompletionError(error));
+        }
+        let mut changes = self.changes.lock();
+        Arc::make_mut(&mut changes.tail).drain(..pending.segment.rows);
+        changes.in_memory_bytes = 0;
+        changes.spilled.push(pending.segment.clone());
+        Ok(PendingSpillStatus::Finished(pending))
+    }
+
+    fn start_spill(
+        &self,
+        table_id: TableChangeId,
+        key: i64,
+        values: Vec<Value>,
+        weight: isize,
+        temp_store: TempStore,
+    ) -> Result<IOResult<()>> {
+        let (buffer, table_ids, rows) = {
+            let changes = self.changes.lock();
+            (
+                serialize_change_events(&changes.tail)?,
+                Arc::new(
+                    changes
+                        .tail
+                        .iter()
+                        .map(|event| event.table_id.clone())
+                        .collect::<HashSet<_>>(),
+                ),
+                changes.tail.len(),
+            )
+        };
+        let len = buffer.len();
+        let offset = {
+            let mut next = self.next_spill_offset.lock();
+            let offset = *next;
+            *next = next.saturating_add(len as u64);
+            offset
+        };
+        let file = {
+            let mut temp_file = self.temp_file.lock();
+            if temp_file.is_none() {
+                *temp_file = Some(TempFile::with_temp_store(&self.io, temp_store)?);
+            }
+            temp_file
+                .as_ref()
+                .expect("temp file initialized above")
+                .file
+                .clone()
+        };
+        let completion = Completion::new_write(|_| {});
+        let completion = file.pwrite(offset, Arc::new(Buffer::new(buffer)), completion)?;
+        *self.pending_spill.lock() = Some(PendingSpill {
+            table_id,
+            completion: completion.clone(),
+            segment: SpillSegment {
+                offset,
+                len,
+                table_ids,
+                rows,
+            },
+            triggering_key: key,
+            triggering_values: values,
+            triggering_weight: weight,
+        });
+        Ok(IOResult::IO(IOCompletions::Single(completion)))
+    }
+
+    fn snapshot(&self, table_id: &TableChangeId) -> CapturedDelta {
+        let changes = self.changes.lock();
+        CapturedDelta {
+            file: self
+                .temp_file
+                .lock()
+                .as_ref()
+                .map(|temp_file| temp_file.file.clone()),
+            spilled: changes.spilled.clone(),
+            tail: changes.tail.clone(),
+            table_id: Some(table_id.clone()),
+        }
+    }
+}
+
+impl std::fmt::Debug for SharedChangeLog {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransactionChangeLog")
+            .field("events", &self.changes.lock().tail.len())
+            .field("subscriptions", &self.subscriptions.lock().len())
+            .field("has_spill_file", &self.temp_file.lock().is_some())
+            .finish()
+    }
+}
+
+fn serialized_change_size(
+    table_id: &TableChangeId,
+    key: i64,
+    weight: isize,
+    values: &[Value],
+) -> Result<usize> {
+    let mut record_values = Vec::with_capacity(values.len() + 3);
+    record_values.push(table_id_value(table_id));
+    record_values.push(Value::from_i64(key));
+    record_values.push(Value::from_i64(weight as i64));
+    record_values.extend_from_slice(values);
+    Ok(
+        8 + ImmutableRecord::from_values(&record_values, record_values.len())?
+            .get_payload()
+            .len(),
+    )
+}
+
+fn serialize_change_events(events: &[ChangeEvent]) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    for event in events {
+        let mut values = Vec::with_capacity(event.values.len() + 3);
+        values.push(table_id_value(&event.table_id));
+        values.push(Value::from_i64(event.rowid));
+        values.push(Value::from_i64(event.weight as i64));
+        values.extend_from_slice(&event.values);
+        let record = ImmutableRecord::from_values(&values, values.len())?;
+        let payload = record.get_payload();
+        output.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        output.extend_from_slice(payload);
+    }
+    Ok(output)
+}
+
+fn table_id_value(table_id: &TableChangeId) -> Value {
+    match table_id {
+        TableChangeId::RootPage(root_page) => Value::from_i64(*root_page),
+        #[cfg(test)]
+        TableChangeId::Name(name) => Value::Text(crate::types::Text::new(name.clone())),
+    }
+}
+
+/// Per-view subscription into the connection's transaction-wide change log.
+#[derive(Debug, Clone)]
+pub struct ViewChangeSubscription {
+    view_name: String,
+    change_log: Arc<SharedChangeLog>,
+}
+
+impl ViewChangeSubscription {
+    fn new(view_name: String, change_log: Arc<SharedChangeLog>) -> Self {
+        Self {
+            view_name,
+            change_log,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn insert(&self, table_name: &str, key: i64, values: Vec<Value>) {
+        let table_id = TableChangeId::Name(table_name.to_string());
+        self.change_log
+            .subscribe_views(std::slice::from_ref(&self.view_name), &table_id);
+        let mut changes = self.change_log.changes.lock();
+        Arc::make_mut(&mut changes.tail).push(ChangeEvent {
+            table_id,
+            rowid: key,
+            values,
+            weight: 1,
+        });
+        self.change_log.bump_revision();
+    }
+
+    #[cfg(test)]
+    pub fn delete(&self, table_name: &str, key: i64, values: Vec<Value>) {
+        let table_id = TableChangeId::Name(table_name.to_string());
+        self.change_log
+            .subscribe_views(std::slice::from_ref(&self.view_name), &table_id);
+        let mut changes = self.change_log.changes.lock();
+        Arc::make_mut(&mut changes.tail).push(ChangeEvent {
+            table_id,
+            rowid: key,
+            values,
+            weight: -1,
+        });
+        self.change_log.bump_revision();
+    }
+
+    /// Clone only the requested table's stream, rather than every delta
+    /// captured for the view.
+    pub(crate) fn table_delta(&self, table: &BTreeTable) -> CapturedDelta {
+        let root_id = TableChangeId::RootPage(table.root_page);
+        let captured = self.change_log.snapshot(&root_id);
+        #[cfg(test)]
+        {
+            if !captured.contains_table(&root_id) {
+                return self
+                    .change_log
+                    .snapshot(&TableChangeId::Name(table.name.clone()));
+            }
+        }
+        captured
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let subscriptions = self.change_log.subscriptions.lock();
+        let Some(table_ids) = subscriptions.get(&self.view_name) else {
+            return true;
+        };
+        let changes = self.change_log.changes.lock();
+        !changes.spilled.iter().any(|segment| {
+            segment.rows > 0 && segment.table_ids.iter().any(|id| table_ids.contains(id))
+        }) && !changes
+            .tail
+            .iter()
+            .any(|event| table_ids.contains(&event.table_id))
+    }
+}
+
+/// Global event position recorded at a statement or named-savepoint boundary.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChangeLogMark(usize);
+
+/// Connection-scoped transaction change stream and its consumer subscriptions.
+#[derive(Debug, Clone)]
+pub struct TransactionChanges {
+    change_log: Arc<SharedChangeLog>,
+}
+crate::assert::assert_send_sync!(TransactionChanges);
+
+impl TransactionChanges {
+    /// Create a transaction-wide change stream.
+    pub fn new() -> Self {
+        Self::with_io(Arc::new(crate::MemoryIO::new()))
+    }
+
+    pub(crate) fn with_io(io: Arc<dyn IO>) -> Self {
+        Self {
+            change_log: Arc::new(SharedChangeLog::new(io)),
+        }
+    }
+
+    /// Construct a lightweight handle over this transaction's shared log.
+    pub fn view_subscription(&self, view_name: &str) -> Arc<ViewChangeSubscription> {
+        Arc::new(ViewChangeSubscription::new(
+            view_name.to_string(),
+            self.change_log.clone(),
+        ))
+    }
+
+    /// Get a handle only when the view has subscribed to at least one table.
+    pub fn get(&self, view_name: &str) -> Option<Arc<ViewChangeSubscription>> {
+        self.change_log
+            .subscriptions
+            .lock()
+            .contains_key(view_name)
+            .then(|| self.view_subscription(view_name))
+    }
+
+    /// Clear the transaction-wide stream and all subscriptions.
+    pub fn clear(&self) {
+        let mut changes = self.change_log.changes.lock();
+        changes.tail = Arc::new(Vec::new());
+        changes.in_memory_bytes = 0;
+        changes.spilled.clear();
+        drop(changes);
+        self.change_log.subscriptions.lock().clear();
+        self.change_log.pending_spill.lock().take();
+        self.change_log.temp_file.lock().take();
+        *self.change_log.next_spill_offset.lock() = 0;
+        *self.change_log.revision.lock() = 0;
+    }
+
+    /// Check if the shared transaction log has no captured changes.
+    pub fn is_empty(&self) -> bool {
+        let changes = self.change_log.changes.lock();
+        changes.spilled.iter().all(|segment| segment.rows == 0) && changes.tail.is_empty()
+    }
+
+    /// Monotonic revision of the transaction-wide logical change log.
+    ///
+    /// Materialized-view cursors use this global generation rather than only
+    /// their direct subscription length: a downstream view has no direct
+    /// delta until its upstream view is maintained, but a read must still
+    /// drive the dependency-ordered maintenance batch inside the transaction.
+    pub fn change_revision(&self) -> u64 {
+        *self.change_log.revision.lock()
+    }
+
+    /// Get all views subscribed to the transaction stream.
+    pub fn get_view_names(&self) -> Vec<String> {
+        self.change_log
+            .subscriptions
+            .lock()
+            .keys()
+            .cloned()
             .collect()
     }
 
-    /// Rewind each table's delta to the length recorded in `marks` (zero for
-    /// tables that had no delta when the marks were taken).
-    pub fn rewind_to_marks(&self, marks: &HashMap<String, usize>) {
-        let mut deltas = self.table_deltas.borrow_mut();
-        for (table, delta) in deltas.iter_mut() {
-            delta.truncate(marks.get(table).copied().unwrap_or(0));
+    /// Record an insertion once and subscribe every dependent view.
+    pub fn insert(
+        &self,
+        table: &BTreeTable,
+        view_names: &[String],
+        key: i64,
+        values: Vec<Value>,
+        temp_store: TempStore,
+    ) -> Result<IOResult<()>> {
+        let table_id = TableChangeId::RootPage(table.root_page);
+        self.change_log.subscribe_views(view_names, &table_id);
+        self.change_log
+            .record_insert(table_id, key, values, temp_store)
+    }
+
+    /// Record a deletion once and subscribe every dependent view.
+    pub fn delete(
+        &self,
+        table: &BTreeTable,
+        view_names: &[String],
+        key: i64,
+        values: Vec<Value>,
+        temp_store: TempStore,
+    ) -> Result<IOResult<()>> {
+        let table_id = TableChangeId::RootPage(table.root_page);
+        self.change_log.subscribe_views(view_names, &table_id);
+        self.change_log
+            .record_delete(table_id, key, values, temp_store)
+    }
+
+    /// Record an arbitrary signed contribution once and subscribe every
+    /// dependent view. Materialized-view records use their trailing physical
+    /// multiplicity as this logical weight.
+    pub fn change(
+        &self,
+        table: &BTreeTable,
+        view_names: &[String],
+        key: i64,
+        values: Vec<Value>,
+        weight: isize,
+        temp_store: TempStore,
+    ) -> Result<IOResult<()>> {
+        if weight == 0 {
+            return Ok(IOResult::Done(()));
         }
-    }
-}
-
-/// Per-view, per-table delta lengths recorded at statement start, used to
-/// rewind captures made by an aborted statement subtransaction.
-pub type ViewDeltaMarks = HashMap<String, HashMap<String, usize>>;
-
-/// Container for all view transaction states within a connection
-/// Provides interior mutability for the map of view states
-#[derive(Debug, Clone, Default)]
-pub struct AllViewsTxState {
-    states: Rc<RefCell<HashMap<String, Arc<ViewTransactionState>>>>,
-}
-
-// SAFETY: This needs to be audited for thread safety.
-// See: https://github.com/tursodatabase/turso/issues/1552
-unsafe impl Send for AllViewsTxState {}
-unsafe impl Sync for AllViewsTxState {}
-crate::assert::assert_send_sync!(AllViewsTxState);
-
-impl AllViewsTxState {
-    /// Create a new container for view transaction states
-    pub fn new() -> Self {
-        Self {
-            states: Rc::new(RefCell::new(HashMap::default())),
-        }
+        let table_id = TableChangeId::RootPage(table.root_page);
+        self.change_log.subscribe_views(view_names, &table_id);
+        self.change_log
+            .record_change(table_id, key, values, weight, temp_store)
     }
 
-    /// Get or create a transaction state for a view
-    #[allow(clippy::arc_with_non_send_sync)]
-    pub fn get_or_create(&self, view_name: &str) -> Arc<ViewTransactionState> {
-        let mut states = self.states.borrow_mut();
-        // ViewTransactionState uses RefCell (not Sync), but AllViewsTxState is
-        // single-threaded (Rc-based). Arc is used for shared ownership, not
-        // cross-thread sharing.
-        states
-            .entry(view_name.to_string())
-            .or_insert_with(|| Arc::new(ViewTransactionState::new()))
-            .clone()
-    }
-
-    /// Get a transaction state for a view if it exists
-    pub fn get(&self, view_name: &str) -> Option<Arc<ViewTransactionState>> {
-        self.states.borrow().get(view_name).cloned()
-    }
-
-    /// Clear all transaction states
-    pub fn clear(&self) {
-        self.states.borrow_mut().clear();
-    }
-
-    /// Check if there are no transaction states
-    pub fn is_empty(&self) -> bool {
-        self.states.borrow().is_empty()
-    }
-
-    /// Get all view names that have transaction states
-    pub fn get_view_names(&self) -> Vec<String> {
-        self.states.borrow().keys().cloned().collect()
-    }
-
-    /// Snapshot per-view, per-table delta lengths at statement start.
+    /// Snapshot the global event position at statement start.
     ///
     /// Delta capture happens inside `op_insert`/`op_delete` as rows are
     /// written, so when a statement subtransaction rolls back, captures made
     /// by the aborted statement must be rewound or they would be applied to
-    /// the views at commit as phantom changes.
-    pub fn delta_marks(&self) -> ViewDeltaMarks {
-        self.states
-            .borrow()
-            .iter()
-            .map(|(view, state)| (view.clone(), state.table_delta_lens()))
-            .collect()
+    /// the views as phantom changes.
+    pub fn change_log_mark(&self) -> ChangeLogMark {
+        let changes = self.change_log.changes.lock();
+        ChangeLogMark(
+            changes
+                .spilled
+                .iter()
+                .map(|segment| segment.rows)
+                .sum::<usize>()
+                + changes.tail.len(),
+        )
     }
 
-    /// Rewind all captured deltas to the recorded statement-start marks.
-    pub fn rewind_to_marks(&self, marks: &ViewDeltaMarks) {
-        static EMPTY: std::sync::LazyLock<HashMap<String, usize>> =
-            std::sync::LazyLock::new(HashMap::default);
-        for (view, state) in self.states.borrow().iter() {
-            let view_marks = marks.get(view).unwrap_or(&EMPTY);
-            state.rewind_to_marks(view_marks);
+    /// Rewind the ordered event stream to a statement or savepoint boundary.
+    pub fn rewind_to_mark(&self, mark: ChangeLogMark) -> Result<()> {
+        if self.change_log.pending_spill.lock().is_some() {
+            return Err(LimboError::InternalError(
+                "cannot rewind a transaction change log with pending spill I/O".to_string(),
+            ));
         }
+        let mut changes = self.change_log.changes.lock();
+        let spilled_rows = changes
+            .spilled
+            .iter()
+            .map(|segment| segment.rows)
+            .sum::<usize>();
+        let current_len = spilled_rows + changes.tail.len();
+        if mark.0 > current_len {
+            return Err(LimboError::InternalError(format!(
+                "transaction change-log mark {} is ahead of current length {current_len}",
+                mark.0
+            )));
+        }
+        if mark.0 >= spilled_rows {
+            Arc::make_mut(&mut changes.tail).truncate(mark.0 - spilled_rows);
+        } else {
+            let mut remaining = mark.0;
+            changes.spilled.retain_mut(|segment| {
+                if remaining == 0 {
+                    return false;
+                }
+                if segment.rows <= remaining {
+                    remaining -= segment.rows;
+                    true
+                } else {
+                    // Spill bytes are immutable. Restrict the segment to its
+                    // logical prefix and reclaim the unreachable suffix when
+                    // the transaction log is cleared.
+                    segment.rows = remaining;
+                    remaining = 0;
+                    true
+                }
+            });
+            Arc::make_mut(&mut changes.tail).clear();
+        }
+        changes.in_memory_bytes = serialize_change_events(&changes.tail)?.len();
+        self.change_log.bump_revision();
+        Ok(())
+    }
+}
+
+impl Default for TransactionChanges {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -225,95 +745,25 @@ impl AllViewsTxState {
 ///
 /// Maintenance is performed by compiled VDBE programs (see
 /// `incremental::vdbe_maintenance`): the transaction's captured deltas are
-/// merged into the view's btree at commit, initial population runs the same
-/// program over the base table, and uncommitted same-transaction reads run it
-/// in emit mode to overlay the btree contents.
+/// merged into the view's btree at statement completion (or lazily before a
+/// view read reached inside the write statement), and initial population runs
+/// the same program over the base table.
 #[derive(Debug)]
 pub struct IncrementalView {
     name: String,
     // The SELECT statement that defines how to transform input data
     pub select_stmt: ast::Select,
 
-    // All tables referenced by this view (from FROM clause and JOINs)
-    referenced_tables: Vec<Arc<BTreeTable>>,
-    // Mapping from table aliases to actual table names (e.g., "c" -> "customers").
-    // Feeds populate-query generation, currently exercised only by tests.
-    #[cfg_attr(not(test), allow(dead_code))]
-    table_aliases: HashMap<String, String>,
-    // Mapping from table name to fully qualified name (e.g., "customers" -> "main.customers")
-    // This preserves database qualification from the original query
-    #[cfg_attr(not(test), allow(dead_code))]
-    qualified_table_names: HashMap<String, String>,
-    // WHERE conditions for each table (accumulated from all occurrences)
-    // Multiple conditions from UNION branches or duplicate references are stored as a vector
-    #[cfg_attr(not(test), allow(dead_code))]
-    table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
     // The view's column schema with table relationships
     pub column_schema: ViewColumnSchema,
     // Root page of the btree storing the materialized state (0 for unmaterialized)
     root_page: i64,
 }
 
-// SAFETY: This needs to be audited for thread safety.
-// See: https://github.com/tursodatabase/turso/issues/1552
-unsafe impl Send for IncrementalView {}
-unsafe impl Sync for IncrementalView {}
 crate::assert::assert_send_sync!(IncrementalView);
 
 impl IncrementalView {
-    /// Get an iterator over column names, using enumerated naming for unnamed columns
-    pub fn column_names(&self) -> impl Iterator<Item = String> + '_ {
-        self.column_schema
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(i, vc)| {
-                vc.column
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("column{}", i + 1))
-            })
-    }
-
-    /// Check if this view has the same SQL definition as the provided SQL string
-    pub fn has_same_sql(&self, sql: &str) -> bool {
-        // Parse the SQL to extract just the SELECT statement
-        if let Ok(Some(Cmd::Stmt(Stmt::CreateMaterializedView { select, .. }))) =
-            Parser::new(sql.as_bytes()).next_cmd()
-        {
-            // Compare the SELECT statements as SQL strings
-            return self.select_stmt == select;
-        }
-        false
-    }
-
-    /// Validate a SELECT statement and extract the columns it would produce
-    /// This is used during CREATE MATERIALIZED VIEW to validate the view before storing it
-    pub fn validate_and_extract_columns(
-        select: &ast::Select,
-        schema: &Schema,
-        resolver: &crate::translate::emitter::Resolver,
-    ) -> Result<ViewColumnSchema> {
-        crate::util::validate_select_for_unsupported_features(select)?;
-        // Views are maintained by compiled VDBE programs; shapes the codegen
-        // cannot maintain yet are rejected at CREATE rather than silently
-        // mis-maintained (and the rejection must happen HERE, at translate
-        // time: failing later inside the CREATE program aborts the statement
-        // after btree pages were allocated and leaves stale in-memory schema
-        // entries behind, which corrupts the database once those pages are
-        // reused). The supported set grows as operator codegen lands.
-        crate::incremental::vdbe_maintenance::classify_view(select, schema, resolver)?;
-        // Use the shared function to extract columns with full table context
-        extract_view_columns(select, schema)
-    }
-
-    pub fn from_sql(
-        sql: &str,
-        schema: &Schema,
-        main_data_root: i64,
-        internal_state_root: i64,
-        internal_state_index_root: i64,
-    ) -> Result<Self> {
+    pub fn from_sql(sql: &str, schema: &Schema, main_data_root: i64) -> Result<Self> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         let cmd = cmd.expect("View is an empty statement");
@@ -323,85 +773,19 @@ impl IncrementalView {
                 view_name,
                 columns: _,
                 select,
-            }) => IncrementalView::from_stmt(
-                view_name,
-                select,
-                schema,
-                main_data_root,
-                internal_state_root,
-                internal_state_index_root,
-            ),
+            }) => {
+                let column_schema = extract_view_columns(&select, schema)?;
+                Ok(Self {
+                    name: view_name.name.as_str().to_string(),
+                    select_stmt: select,
+                    column_schema,
+                    root_page: main_data_root,
+                })
+            }
             _ => Err(LimboError::ParseError(format!(
                 "View is not a CREATE MATERIALIZED VIEW statement: {sql}"
             ))),
         }
-    }
-
-    pub fn from_stmt(
-        view_name: ast::QualifiedName,
-        select: ast::Select,
-        schema: &Schema,
-        main_data_root: i64,
-        internal_state_root: i64,
-        internal_state_index_root: i64,
-    ) -> Result<Self> {
-        let name = view_name.name.as_str().to_string();
-
-        // Extract output columns using the shared function
-        let column_schema = extract_view_columns(&select, schema)?;
-
-        let mut referenced_tables = Vec::new();
-        let mut table_aliases = HashMap::default();
-        let mut qualified_table_names = HashMap::default();
-        let mut table_conditions = HashMap::default();
-        Self::extract_all_tables(
-            &select,
-            schema,
-            &mut referenced_tables,
-            &mut table_aliases,
-            &mut qualified_table_names,
-            &mut table_conditions,
-        )?;
-
-        Self::new(
-            name,
-            select.clone(),
-            referenced_tables,
-            table_aliases,
-            qualified_table_names,
-            table_conditions,
-            column_schema,
-            schema,
-            main_data_root,
-            internal_state_root,
-            internal_state_index_root,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        name: String,
-        select_stmt: ast::Select,
-        referenced_tables: Vec<Arc<BTreeTable>>,
-        table_aliases: HashMap<String, String>,
-        qualified_table_names: HashMap<String, String>,
-        table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
-        column_schema: ViewColumnSchema,
-        _schema: &Schema,
-        main_data_root: i64,
-        _internal_state_root: i64,
-        _internal_state_index_root: i64,
-    ) -> Result<Self> {
-        Ok(Self {
-            name,
-            select_stmt,
-            referenced_tables,
-            table_aliases,
-            qualified_table_names,
-            table_conditions,
-            column_schema,
-            root_page: main_data_root,
-        })
     }
 
     pub fn name(&self) -> &str {
@@ -413,713 +797,79 @@ impl IncrementalView {
         self.root_page
     }
 
-    /// Get all table names referenced by this view
-    pub fn get_referenced_table_names(&self) -> Vec<String> {
-        self.referenced_tables
-            .iter()
-            .map(|t| t.name.clone())
-            .collect()
-    }
-
-    /// Get all tables referenced by this view
-    pub fn get_referenced_tables(&self) -> Vec<Arc<BTreeTable>> {
-        self.referenced_tables.clone()
-    }
-
-    /// Process a single table reference from a FROM or JOIN clause
-    fn process_table_reference(
-        name: &ast::QualifiedName,
-        alias: &Option<ast::As>,
-        schema: &Schema,
-        table_map: &mut HashMap<String, Arc<BTreeTable>>,
-        aliases: &mut HashMap<String, String>,
-        qualified_names: &mut HashMap<String, String>,
-        cte_names: &HashSet<String>,
-    ) -> Result<()> {
-        let table_name = name.name.as_str();
-
-        // Build the fully qualified name
-        let qualified_name = if let Some(ref db) = name.db_name {
-            format!("{db}.{table_name}")
-        } else {
-            table_name.to_string()
-        };
-
-        // Skip CTEs - they're not real tables
-        if !cte_names.contains(table_name) {
-            if let Some(table) = schema.get_btree_table(table_name) {
-                table_map.insert(table_name.to_string(), table);
-                qualified_names.insert(table_name.to_string(), qualified_name);
-
-                // Store the alias mapping if there is an alias
-                if let Some(alias_enum) = alias {
-                    aliases.insert(
-                        alias_enum.name().as_str().to_string(),
-                        table_name.to_string(),
-                    );
+    /// Syntactic relation dependencies, independent of schema load order.
+    ///
+    /// Schema reconstruction uses this to order persisted materialized views
+    /// before binding them. The executable DAG is still produced by the main
+    /// bound planner; this walker is identity metadata only.
+    pub(crate) fn referenced_table_names(select: &ast::Select) -> Vec<String> {
+        fn collect_source(
+            source: &ast::SelectTable,
+            cte_names: &HashSet<String>,
+            tables: &mut HashSet<String>,
+        ) {
+            match source {
+                ast::SelectTable::Table(name, _, _) => {
+                    if cte_names
+                        .iter()
+                        .any(|cte| cte.eq_ignore_ascii_case(name.name.as_str()))
+                    {
+                        return;
+                    }
+                    tables.insert(crate::util::normalize_ident(name.name.as_str()));
                 }
-            } else {
-                return Err(LimboError::ParseError(format!(
-                    "Table '{table_name}' not found in schema"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    fn extract_one_statement(
-        select: &ast::OneSelect,
-        schema: &Schema,
-        table_map: &mut HashMap<String, Arc<BTreeTable>>,
-        aliases: &mut HashMap<String, String>,
-        qualified_names: &mut HashMap<String, String>,
-        table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
-        cte_names: &HashSet<String>,
-    ) -> Result<()> {
-        if let ast::OneSelect::Select {
-            from: Some(ref from),
-            ..
-        } = select
-        {
-            // Get the main table from FROM clause
-            if let ast::SelectTable::Table(name, alias, _) = from.select.as_ref() {
-                Self::process_table_reference(
-                    name,
-                    alias,
-                    schema,
-                    table_map,
-                    aliases,
-                    qualified_names,
-                    cte_names,
-                )?;
-            }
-
-            // Get all tables from JOIN clauses
-            for join in &from.joins {
-                if let ast::SelectTable::Table(name, alias, _) = join.table.as_ref() {
-                    Self::process_table_reference(
-                        name,
-                        alias,
-                        schema,
-                        table_map,
-                        aliases,
-                        qualified_names,
-                        cte_names,
-                    )?;
+                ast::SelectTable::Select(select, _) => collect_select(select, cte_names, tables),
+                ast::SelectTable::Sub(from, _) => {
+                    collect_source(&from.select, cte_names, tables);
+                    for join in &from.joins {
+                        collect_source(&join.table, cte_names, tables);
+                    }
                 }
-            }
-        }
-        // Extract WHERE conditions for this SELECT
-        let where_expr = if let ast::OneSelect::Select {
-            where_clause: Some(ref where_expr),
-            ..
-        } = select
-        {
-            Some(where_expr.as_ref().clone())
-        } else {
-            None
-        };
-
-        // Ensure all tables have an entry in table_conditions (even if empty)
-        for table_name in table_map.keys() {
-            table_conditions.entry(table_name.clone()).or_default();
-        }
-
-        // Extract and store table-specific conditions from the WHERE clause
-        if let Some(ref where_expr) = where_expr {
-            for table_name in table_map.keys() {
-                let all_tables: Vec<String> = table_map.keys().cloned().collect();
-                let table_specific_condition = Self::extract_conditions_for_table(
-                    where_expr,
-                    table_name,
-                    aliases,
-                    &all_tables,
-                    schema,
-                );
-                // Only add if there's actually a condition for this table
-                if let Some(condition) = table_specific_condition {
-                    let conditions = table_conditions.get_mut(table_name).ok_or_else(|| {
-                        LimboError::InternalError(
-                            "table_conditions should have entry for table_name".to_string(),
-                        )
-                    })?;
-                    conditions.push(Some(condition));
-                }
-            }
-        } else {
-            // No WHERE clause - push None for all tables in this SELECT. It is a way
-            // of signaling that we need all rows in the table. It is important we signal this
-            // explicitly, because the same table may appear in many conditions - some of which
-            // have filters that would otherwise be applied.
-            for table_name in table_map.keys() {
-                let conditions = table_conditions.get_mut(table_name).ok_or_else(|| {
-                    LimboError::InternalError(
-                        "table_conditions should have entry for table_name".to_string(),
-                    )
-                })?;
-                conditions.push(None);
+                ast::SelectTable::TableCall(_, _, _) => {}
             }
         }
 
-        Ok(())
-    }
-
-    /// Extract all tables and their aliases from the SELECT statement, handling CTEs
-    /// Deduplicates tables and accumulates WHERE conditions
-    fn extract_all_tables(
-        select: &ast::Select,
-        schema: &Schema,
-        tables: &mut Vec<Arc<BTreeTable>>,
-        aliases: &mut HashMap<String, String>,
-        qualified_names: &mut HashMap<String, String>,
-        table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
-    ) -> Result<()> {
-        let mut table_map = HashMap::default();
-        Self::extract_all_tables_inner(
-            select,
-            schema,
-            &mut table_map,
-            aliases,
-            qualified_names,
-            table_conditions,
-            &HashSet::default(),
-        )?;
-
-        // Convert deduplicated table map to vector
-        for (_name, table) in table_map {
-            tables.push(table);
-        }
-
-        Ok(())
-    }
-
-    fn extract_all_tables_inner(
-        select: &ast::Select,
-        schema: &Schema,
-        table_map: &mut HashMap<String, Arc<BTreeTable>>,
-        aliases: &mut HashMap<String, String>,
-        qualified_names: &mut HashMap<String, String>,
-        table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
-        parent_cte_names: &HashSet<String>,
-    ) -> Result<()> {
-        let mut cte_names = parent_cte_names.clone();
-
-        // First, collect CTE names and process any CTEs (WITH clauses)
-        if let Some(ref with) = select.with {
-            // First pass: collect all CTE names (needed for recursive CTEs)
-            for cte in &with.ctes {
-                cte_names.insert(cte.tbl_name.as_str().to_string());
-            }
-
-            // Second pass: extract tables from each CTE's SELECT statement
-            for cte in &with.ctes {
-                // Recursively extract tables from each CTE's SELECT statement
-                Self::extract_all_tables_inner(
-                    &cte.select,
-                    schema,
-                    table_map,
-                    aliases,
-                    qualified_names,
-                    table_conditions,
-                    &cte_names,
-                )?;
-            }
-        }
-
-        // Then process the main SELECT body
-        Self::extract_one_statement(
-            &select.body.select,
-            schema,
-            table_map,
-            aliases,
-            qualified_names,
-            table_conditions,
-            &cte_names,
-        )?;
-
-        // Process any compound selects (UNION, etc.)
-        for c in &select.body.compounds {
-            let ast::CompoundSelect { select, .. } = c;
-            Self::extract_one_statement(
-                select,
-                schema,
-                table_map,
-                aliases,
-                qualified_names,
-                table_conditions,
-                &cte_names,
-            )?;
-        }
-
-        Ok(())
-    }
-
-    /// Generate SQL queries for populating the view from each source table.
-    /// Retained for tests of populate-query generation.
-    #[cfg(test)]
-    fn sql_for_populate(&self) -> crate::Result<Vec<String>> {
-        Self::generate_populate_queries(
-            &self.select_stmt,
-            &self.referenced_tables,
-            &self.table_aliases,
-            &self.qualified_table_names,
-            &self.table_conditions,
-        )
-    }
-
-    pub fn generate_populate_queries(
-        select_stmt: &ast::Select,
-        referenced_tables: &[Arc<BTreeTable>],
-        table_aliases: &HashMap<String, String>,
-        qualified_table_names: &HashMap<String, String>,
-        table_conditions: &HashMap<String, Vec<Option<ast::Expr>>>,
-    ) -> crate::Result<Vec<String>> {
-        if referenced_tables.is_empty() {
-            return Err(LimboError::ParseError(
-                "No tables to populate from".to_string(),
-            ));
-        }
-
-        let mut queries = Vec::new();
-
-        for table in referenced_tables {
-            // Check if the table has a rowid alias (INTEGER PRIMARY KEY column)
-            let has_rowid_alias = table.columns().iter().any(|col| col.is_rowid_alias());
-
-            // Select all columns. The circuit will handle filtering and projection
-            // If there's a rowid alias, we don't need to select rowid separately
-            let select_clause = if has_rowid_alias {
-                "*".to_string()
-            } else {
-                "*, rowid".to_string()
+        fn collect_one(
+            select: &ast::OneSelect,
+            cte_names: &HashSet<String>,
+            tables: &mut HashSet<String>,
+        ) {
+            let ast::OneSelect::Select {
+                from: Some(from), ..
+            } = select
+            else {
+                return;
             };
-
-            // Get accumulated WHERE conditions for this table
-            let where_clause = if let Some(conditions) = table_conditions.get(&table.name) {
-                // Combine multiple conditions with OR if there are multiple occurrences
-                Self::combine_conditions(
-                    select_stmt,
-                    conditions,
-                    &table.name,
-                    referenced_tables,
-                    table_aliases,
-                )?
-            } else {
-                String::new()
-            };
-
-            // Use the qualified table name if available, otherwise just the table name
-            let table_name = qualified_table_names
-                .get(&table.name)
-                .cloned()
-                .unwrap_or_else(|| table.name.clone());
-
-            // Construct the query for this table
-            let query = if where_clause.is_empty() {
-                format!("SELECT {select_clause} FROM {table_name}")
-            } else {
-                format!("SELECT {select_clause} FROM {table_name} WHERE {where_clause}")
-            };
-            tracing::debug!("populating materialized view with `{query}`");
-            queries.push(query);
+            for source in std::iter::once(from.select.as_ref())
+                .chain(from.joins.iter().map(|join| join.table.as_ref()))
+            {
+                collect_source(source, cte_names, tables);
+            }
         }
 
-        Ok(queries)
-    }
-
-    fn combine_conditions(
-        _select_stmt: &ast::Select,
-        conditions: &[Option<ast::Expr>],
-        table_name: &str,
-        _referenced_tables: &[Arc<BTreeTable>],
-        table_aliases: &HashMap<String, String>,
-    ) -> crate::Result<String> {
-        // Check if any conditions are None (SELECTs without WHERE)
-        let has_none = conditions.iter().any(|c| c.is_none());
-        let non_empty: Vec<_> = conditions.iter().filter_map(|c| c.as_ref()).collect();
-
-        // If we have both Some and None conditions, that means in some of the expressions where
-        // this table appear we want all rows. So we need to fetch all rows.
-        if has_none && !non_empty.is_empty() {
-            return Ok(String::new());
-        }
-
-        if non_empty.is_empty() {
-            return Ok(String::new());
-        }
-
-        if non_empty.len() == 1 {
-            // Unqualify the expression before converting to string
-            let unqualified = Self::unqualify_expression(non_empty[0], table_name, table_aliases);
-            return Ok(unqualified.to_string());
-        }
-
-        // Multiple conditions - combine with OR
-        // This happens in UNION ALL when the same table appears multiple times
-        let mut combined_parts = Vec::new();
-        for condition in non_empty {
-            let unqualified = Self::unqualify_expression(condition, table_name, table_aliases);
-            // Wrap each condition in parentheses to preserve precedence
-            combined_parts.push(format!("({unqualified})"));
-        }
-
-        // Join all conditions with OR
-        Ok(combined_parts.join(" OR "))
-    }
-    /// Resolve a table alias to the actual table name
-    /// Check if an expression is a simple comparison that can be safely extracted
-    /// This excludes subqueries, CASE expressions, function calls, etc.
-    fn is_simple_comparison(expr: &ast::Expr) -> bool {
-        match expr {
-            // Simple column references and literals are OK
-            ast::Expr::Column { .. } | ast::Expr::Literal(_) => true,
-
-            // Simple binary operations between simple expressions are OK
-            ast::Expr::Binary(left, op, right) => {
-                match op {
-                    // Logical operators
-                    ast::Operator::And | ast::Operator::Or => {
-                        Self::is_simple_comparison(left) && Self::is_simple_comparison(right)
-                    }
-                    // Comparison operators
-                    ast::Operator::Equals
-                    | ast::Operator::NotEquals
-                    | ast::Operator::Less
-                    | ast::Operator::LessEquals
-                    | ast::Operator::Greater
-                    | ast::Operator::GreaterEquals
-                    | ast::Operator::Is
-                    | ast::Operator::IsNot => {
-                        Self::is_simple_comparison(left) && Self::is_simple_comparison(right)
-                    }
-                    // String concatenation and other operations are NOT simple
-                    ast::Operator::Concat => false,
-                    // Arithmetic might be OK if operands are simple
-                    ast::Operator::Add
-                    | ast::Operator::Subtract
-                    | ast::Operator::Multiply
-                    | ast::Operator::Divide
-                    | ast::Operator::Modulus => {
-                        Self::is_simple_comparison(left) && Self::is_simple_comparison(right)
-                    }
-                    _ => false,
+        fn collect_select(
+            select: &ast::Select,
+            inherited_ctes: &HashSet<String>,
+            tables: &mut HashSet<String>,
+        ) {
+            let mut cte_names = inherited_ctes.clone();
+            if let Some(with) = &select.with {
+                for cte in &with.ctes {
+                    cte_names.insert(crate::util::normalize_ident(cte.tbl_name.as_str()));
+                }
+                for cte in &with.ctes {
+                    collect_select(&cte.select, &cte_names, tables);
                 }
             }
-
-            // Unary operations might be OK
-            ast::Expr::Unary(
-                ast::UnaryOperator::Not
-                | ast::UnaryOperator::Negative
-                | ast::UnaryOperator::Positive,
-                inner,
-            ) => Self::is_simple_comparison(inner),
-            ast::Expr::Unary(_, _) => false,
-
-            // Complex expressions are NOT simple
-            ast::Expr::Case { .. } => false,
-            ast::Expr::Cast { .. } => false,
-            ast::Expr::Collate { .. } => false,
-            ast::Expr::Exists(_) => false,
-            ast::Expr::FunctionCall { .. } => false,
-            ast::Expr::InList { .. } => false,
-            ast::Expr::InSelect { .. } => false,
-            ast::Expr::Like { .. } => false,
-            ast::Expr::NotNull(_) => true, // IS NOT NULL is simple enough
-            ast::Expr::Parenthesized(exprs) => {
-                // Parenthesized expression can contain multiple expressions
-                // Only consider it simple if it has exactly one simple expression
-                exprs.len() == 1 && Self::is_simple_comparison(&exprs[0])
-            }
-            ast::Expr::Subquery(_) => false,
-
-            // BETWEEN might be OK if all operands are simple
-            ast::Expr::Between { .. } => {
-                // BETWEEN has a different structure, for safety just exclude it
-                false
-            }
-
-            // Qualified references are simple
-            ast::Expr::DoublyQualified(..) => true,
-            ast::Expr::Qualified(_, _) => true,
-
-            // These are simple
-            ast::Expr::Id(_) => true,
-            ast::Expr::Name(_) => true,
-
-            // Anything else is not simple
-            _ => false,
-        }
-    }
-
-    /// Extract conditions from a WHERE clause that apply to a specific table
-    fn extract_conditions_for_table(
-        expr: &ast::Expr,
-        table_name: &str,
-        aliases: &HashMap<String, String>,
-        all_tables: &[String],
-        schema: &Schema,
-    ) -> Option<ast::Expr> {
-        match expr {
-            ast::Expr::Binary(left, op, right) => {
-                match op {
-                    ast::Operator::And => {
-                        // For AND, we can extract conditions independently
-                        let left_cond = Self::extract_conditions_for_table(
-                            left, table_name, aliases, all_tables, schema,
-                        );
-                        let right_cond = Self::extract_conditions_for_table(
-                            right, table_name, aliases, all_tables, schema,
-                        );
-
-                        match (left_cond, right_cond) {
-                            (Some(l), Some(r)) => Some(ast::Expr::Binary(
-                                Box::new(l),
-                                ast::Operator::And,
-                                Box::new(r),
-                            )),
-                            (Some(l), None) => Some(l),
-                            (None, Some(r)) => Some(r),
-                            (None, None) => None,
-                        }
-                    }
-                    ast::Operator::Or => {
-                        // For OR, both sides must reference only our table
-                        let left_tables =
-                            Self::get_tables_in_expr(left, aliases, all_tables, schema);
-                        let right_tables =
-                            Self::get_tables_in_expr(right, aliases, all_tables, schema);
-
-                        if left_tables.len() == 1
-                            && left_tables.contains(&table_name.to_string())
-                            && right_tables.len() == 1
-                            && right_tables.contains(&table_name.to_string())
-                            && Self::is_simple_comparison(expr)
-                        {
-                            Some(expr.clone())
-                        } else {
-                            None
-                        }
-                    }
-                    _ => {
-                        // For comparison operators, check if this condition only references our table
-                        let referenced_tables =
-                            Self::get_tables_in_expr(expr, aliases, all_tables, schema);
-                        if referenced_tables.len() == 1
-                            && referenced_tables.contains(&table_name.to_string())
-                            && Self::is_simple_comparison(expr)
-                        {
-                            Some(expr.clone())
-                        } else {
-                            None
-                        }
-                    }
-                }
-            }
-            _ => {
-                // For other expressions, check if they only reference our table
-                let referenced_tables = Self::get_tables_in_expr(expr, aliases, all_tables, schema);
-                if referenced_tables.len() == 1
-                    && referenced_tables.contains(&table_name.to_string())
-                    && Self::is_simple_comparison(expr)
-                {
-                    Some(expr.clone())
-                } else {
-                    None
-                }
+            collect_one(&select.body.select, &cte_names, tables);
+            for compound in &select.body.compounds {
+                collect_one(&compound.select, &cte_names, tables);
             }
         }
-    }
 
-    /// Unqualify column references in an expression
-    /// Removes table/alias prefixes from qualified column names
-    fn unqualify_expression(
-        expr: &ast::Expr,
-        table_name: &str,
-        aliases: &HashMap<String, String>,
-    ) -> ast::Expr {
-        match expr {
-            ast::Expr::Binary(left, op, right) => ast::Expr::Binary(
-                Box::new(Self::unqualify_expression(left, table_name, aliases)),
-                *op,
-                Box::new(Self::unqualify_expression(right, table_name, aliases)),
-            ),
-            ast::Expr::Qualified(table_or_alias, column) => {
-                // Check if this qualification refers to our table
-                let table_str = table_or_alias.as_str();
-                let actual_table = if let Some(actual) = aliases.get(table_str) {
-                    actual.clone()
-                } else if table_str.contains('.') {
-                    // Handle database.table format
-                    table_str
-                        .split('.')
-                        .next_back()
-                        .unwrap_or(table_str)
-                        .to_string()
-                } else {
-                    table_str.to_string()
-                };
-
-                if actual_table == table_name {
-                    // Remove the qualification
-                    ast::Expr::Id(column.clone())
-                } else {
-                    // Keep the qualification (shouldn't happen if extraction worked correctly)
-                    expr.clone()
-                }
-            }
-            ast::Expr::DoublyQualified(_database, table, column) => {
-                // Check if this refers to our table
-                if table.as_str() == table_name {
-                    // Remove the qualification, keep just the column
-                    ast::Expr::Id(column.clone())
-                } else {
-                    // Keep the qualification (shouldn't happen if extraction worked correctly)
-                    expr.clone()
-                }
-            }
-            ast::Expr::Unary(op, inner) => ast::Expr::Unary(
-                *op,
-                Box::new(Self::unqualify_expression(inner, table_name, aliases)),
-            ),
-            ast::Expr::FunctionCall {
-                name,
-                args,
-                distinctness,
-                filter_over,
-                order_by,
-                within_group,
-            } => ast::Expr::FunctionCall {
-                name: name.clone(),
-                args: args
-                    .iter()
-                    .map(|arg| Box::new(Self::unqualify_expression(arg, table_name, aliases)))
-                    .collect(),
-                distinctness: *distinctness,
-                filter_over: filter_over.clone(),
-                order_by: order_by.clone(),
-                within_group: within_group.clone(),
-            },
-            ast::Expr::InList { lhs, not, rhs } => ast::Expr::InList {
-                lhs: Box::new(Self::unqualify_expression(lhs, table_name, aliases)),
-                not: *not,
-                rhs: rhs
-                    .iter()
-                    .map(|item| Box::new(Self::unqualify_expression(item, table_name, aliases)))
-                    .collect(),
-            },
-            ast::Expr::Between {
-                lhs,
-                not,
-                start,
-                end,
-            } => ast::Expr::Between {
-                lhs: Box::new(Self::unqualify_expression(lhs, table_name, aliases)),
-                not: *not,
-                start: Box::new(Self::unqualify_expression(start, table_name, aliases)),
-                end: Box::new(Self::unqualify_expression(end, table_name, aliases)),
-            },
-            _ => expr.clone(),
-        }
-    }
-
-    /// Get all tables referenced in an expression
-    fn get_tables_in_expr(
-        expr: &ast::Expr,
-        aliases: &HashMap<String, String>,
-        all_tables: &[String],
-        schema: &Schema,
-    ) -> Vec<String> {
-        let mut tables = Vec::new();
-        Self::collect_tables_in_expr(expr, aliases, all_tables, schema, &mut tables);
-        tables.sort();
-        tables.dedup();
-        tables
-    }
-
-    /// Recursively collect table references from an expression
-    fn collect_tables_in_expr(
-        expr: &ast::Expr,
-        aliases: &HashMap<String, String>,
-        all_tables: &[String],
-        schema: &Schema,
-        tables: &mut Vec<String>,
-    ) {
-        match expr {
-            ast::Expr::Binary(left, _, right) => {
-                Self::collect_tables_in_expr(left, aliases, all_tables, schema, tables);
-                Self::collect_tables_in_expr(right, aliases, all_tables, schema, tables);
-            }
-            ast::Expr::Qualified(table_or_alias, _) => {
-                // Handle database.table or just table/alias
-                let table_str = table_or_alias.as_str();
-                let table_name = if let Some(actual_table) = aliases.get(table_str) {
-                    // It's an alias
-                    actual_table.clone()
-                } else if table_str.contains('.') {
-                    // It might be database.table format, extract just the table name
-                    table_str
-                        .split('.')
-                        .next_back()
-                        .unwrap_or(table_str)
-                        .to_string()
-                } else {
-                    // It's a direct table name
-                    table_str.to_string()
-                };
-                tables.push(table_name);
-            }
-            ast::Expr::DoublyQualified(_database, table, _column) => {
-                // For database.table.column, extract the table name
-                tables.push(table.to_string());
-            }
-            ast::Expr::Id(column) => {
-                // Unqualified column - try to find which table has this column
-                if all_tables.len() == 1 {
-                    tables.push(all_tables[0].clone());
-                } else {
-                    // Check which table has this column
-                    for table_name in all_tables {
-                        if let Some(table) = schema.get_btree_table(table_name) {
-                            if table
-                                .columns()
-                                .iter()
-                                .any(|col| col.name.as_deref() == Some(column.as_str()))
-                            {
-                                tables.push(table_name.clone());
-                                break; // Found the table, stop looking
-                            }
-                        }
-                    }
-                }
-            }
-            ast::Expr::FunctionCall { args, .. } => {
-                for arg in args {
-                    Self::collect_tables_in_expr(arg, aliases, all_tables, schema, tables);
-                }
-            }
-            ast::Expr::InList { lhs, rhs, .. } => {
-                Self::collect_tables_in_expr(lhs, aliases, all_tables, schema, tables);
-                for item in rhs {
-                    Self::collect_tables_in_expr(item, aliases, all_tables, schema, tables);
-                }
-            }
-            ast::Expr::InSelect { lhs, .. } => {
-                Self::collect_tables_in_expr(lhs, aliases, all_tables, schema, tables);
-            }
-            ast::Expr::Between {
-                lhs, start, end, ..
-            } => {
-                Self::collect_tables_in_expr(lhs, aliases, all_tables, schema, tables);
-                Self::collect_tables_in_expr(start, aliases, all_tables, schema, tables);
-                Self::collect_tables_in_expr(end, aliases, all_tables, schema, tables);
-            }
-            ast::Expr::Unary(_, expr) => {
-                Self::collect_tables_in_expr(expr, aliases, all_tables, schema, tables);
-            }
-            _ => {
-                // Literals, etc. don't reference tables
-            }
-        }
+        let mut tables = HashSet::default();
+        collect_select(select, &HashSet::default(), &mut tables);
+        tables.into_iter().collect()
     }
 }
 
@@ -1132,7 +882,243 @@ mod tests {
     };
     use crate::sync::Arc;
     use turso_parser::ast;
-    use turso_parser::parser::Parser;
+
+    #[test]
+    fn transaction_change_log_captures_once_for_multiple_views() {
+        let schema = create_test_schema();
+        let table = schema.get_btree_table("customers").unwrap();
+        let states = TransactionChanges::new();
+        let views = vec!["first".to_string(), "second".to_string()];
+
+        let result = states.insert(
+            &table,
+            &views,
+            7,
+            vec![Value::from_i64(7), Value::build_text("Ada")],
+            TempStore::Memory,
+        );
+        assert!(matches!(result, Ok(IOResult::Done(()))));
+
+        let changes = states.change_log.changes.lock();
+        assert_eq!(changes.tail.len(), 1, "the base row is captured only once");
+        drop(changes);
+        let first = states.get("first").unwrap().table_delta(&table);
+        let second = states.get("second").unwrap().table_delta(&table);
+        assert_eq!(first.tail.len(), 1);
+        assert_eq!(second.tail.len(), 1);
+        assert!(
+            Arc::ptr_eq(&first.tail, &second.tail),
+            "subscribers must share the in-memory transaction-log tail"
+        );
+
+        let mark = states.change_log_mark();
+        let result = states.delete(
+            &table,
+            &views,
+            7,
+            vec![Value::from_i64(7), Value::build_text("Ada")],
+            TempStore::Memory,
+        );
+        assert!(matches!(result, Ok(IOResult::Done(()))));
+        states.rewind_to_mark(mark).unwrap();
+        assert_eq!(
+            states.get("first").unwrap().table_delta(&table).tail.len(),
+            1
+        );
+        assert_eq!(
+            states.get("second").unwrap().table_delta(&table).tail.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn transaction_change_log_preserves_non_unit_weights() {
+        let schema = create_test_schema();
+        let table = schema.get_btree_table("customers").unwrap();
+        let states = TransactionChanges::new();
+        let views = vec!["downstream".to_string()];
+        let values = vec![Value::from_i64(7), Value::build_text("Ada")];
+
+        assert!(matches!(
+            states.change(&table, &views, 7, values.clone(), 3, TempStore::Memory,),
+            Ok(IOResult::Done(()))
+        ));
+        let captured = states.get("downstream").unwrap().table_delta(&table);
+        assert_eq!(captured.tail.len(), 1);
+        assert_eq!(captured.tail[0].rowid, 7);
+        assert_eq!(captured.tail[0].values, values);
+        assert_eq!(captured.tail[0].weight, 3);
+    }
+
+    #[test]
+    fn transaction_change_log_orders_tables_globally_and_projects_by_identity() {
+        let schema = create_test_schema();
+        let customers = schema.get_btree_table("customers").unwrap();
+        let orders = schema.get_btree_table("orders").unwrap();
+        let states = TransactionChanges::new();
+        let views = vec!["joined_view".to_string()];
+
+        assert!(matches!(
+            states.insert(
+                &customers,
+                &views,
+                1,
+                vec![Value::from_i64(1), Value::build_text("Ada")],
+                TempStore::Memory,
+            ),
+            Ok(IOResult::Done(()))
+        ));
+        assert!(matches!(
+            states.insert(
+                &orders,
+                &views,
+                10,
+                vec![Value::from_i64(10), Value::from_i64(1), Value::from_i64(50)],
+                TempStore::Memory,
+            ),
+            Ok(IOResult::Done(()))
+        ));
+        assert!(matches!(
+            states.delete(
+                &customers,
+                &views,
+                1,
+                vec![Value::from_i64(1), Value::build_text("Ada")],
+                TempStore::Memory,
+            ),
+            Ok(IOResult::Done(()))
+        ));
+
+        let changes = states.change_log.changes.lock();
+        assert_eq!(changes.tail.len(), 3);
+        assert_eq!(
+            changes.tail[0].table_id,
+            TableChangeId::RootPage(customers.root_page)
+        );
+        assert_eq!(
+            changes.tail[1].table_id,
+            TableChangeId::RootPage(orders.root_page)
+        );
+        assert_eq!(
+            changes.tail[2].table_id,
+            TableChangeId::RootPage(customers.root_page)
+        );
+        drop(changes);
+
+        let state = states.get("joined_view").unwrap();
+        let customers_delta = state.table_delta(&customers);
+        let orders_delta = state.table_delta(&orders);
+        assert_eq!(
+            customers_delta
+                .tail
+                .iter()
+                .filter(|event| event.table_id == TableChangeId::RootPage(customers.root_page))
+                .count(),
+            2
+        );
+        assert_eq!(
+            orders_delta
+                .tail
+                .iter()
+                .filter(|event| event.table_id == TableChangeId::RootPage(orders.root_page))
+                .count(),
+            1
+        );
+        assert!(
+            Arc::ptr_eq(&customers_delta.tail, &orders_delta.tail),
+            "table projections must share the canonical event stream"
+        );
+
+        let mut customers_cursor = crate::incremental::vdbe_maintenance::DeltaCursor::new(
+            customers_delta,
+            customers.columns().len(),
+        );
+        assert!(matches!(
+            customers_cursor.rewind(),
+            Ok(IOResult::Done(true))
+        ));
+        assert_eq!(customers_cursor.rowid(), 1);
+        assert_eq!(
+            customers_cursor.column(customers.columns().len()),
+            Value::from_i64(1)
+        );
+        assert!(matches!(customers_cursor.next(), Ok(IOResult::Done(true))));
+        assert_eq!(
+            customers_cursor.column(customers.columns().len()),
+            Value::from_i64(-1)
+        );
+        assert!(matches!(customers_cursor.next(), Ok(IOResult::Done(false))));
+    }
+
+    #[test]
+    fn spilled_change_log_rewinds_to_a_logical_segment_prefix() {
+        let schema = create_test_schema();
+        let table = schema.get_btree_table("customers").unwrap();
+        let orders = schema.get_btree_table("orders").unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        let states = TransactionChanges::with_io(io.clone());
+        let views = vec!["customers_view".to_string()];
+
+        let first = vec![Value::from_i64(1), Value::build_text("kept")];
+        assert!(matches!(
+            states.insert(&table, &views, 1, first.clone(), TempStore::Memory),
+            Ok(IOResult::Done(()))
+        ));
+        let mark = states.change_log_mark();
+
+        let large = vec![
+            Value::from_i64(2),
+            Value::from_i64(1),
+            Value::Blob(vec![b'x'; CHANGE_LOG_SPILL_THRESHOLD]),
+        ];
+        let completion = match states
+            .insert(&orders, &views, 2, large.clone(), TempStore::Memory)
+            .unwrap()
+        {
+            IOResult::IO(completions) => completions,
+            IOResult::Done(()) => panic!("large capture did not spill"),
+        };
+        completion.wait(io.as_ref()).unwrap();
+        assert!(matches!(
+            states.insert(&orders, &views, 2, large, TempStore::Memory),
+            Ok(IOResult::Done(()))
+        ));
+
+        states.rewind_to_mark(mark).unwrap();
+        let captured = states.get("customers_view").unwrap().table_delta(&table);
+        assert_eq!(captured.spilled.len(), 1);
+        assert_eq!(captured.spilled[0].rows, 1);
+        let orders_captured = states.get("customers_view").unwrap().table_delta(&orders);
+        let mut orders_cursor = crate::incremental::vdbe_maintenance::DeltaCursor::new(
+            orders_captured,
+            orders.columns().len(),
+        );
+        loop {
+            match orders_cursor.rewind().unwrap() {
+                IOResult::Done(has_row) => {
+                    assert!(!has_row);
+                    break;
+                }
+                IOResult::IO(completions) => completions.wait(io.as_ref()).unwrap(),
+            }
+        }
+
+        let mut cursor =
+            crate::incremental::vdbe_maintenance::DeltaCursor::new(captured, table.columns().len());
+        loop {
+            match cursor.rewind().unwrap() {
+                IOResult::Done(has_row) => {
+                    assert!(has_row);
+                    break;
+                }
+                IOResult::IO(completions) => completions.wait(io.as_ref()).unwrap(),
+            }
+        }
+        assert_eq!(cursor.rowid(), 1);
+        assert_eq!(cursor.column(1), first[1]);
+        assert_eq!(cursor.column(table.columns().len()), Value::from_i64(1));
+        assert!(matches!(cursor.next(), Ok(IOResult::Done(false))));
+    }
 
     // Helper function to create a test schema with multiple tables
     fn create_test_schema() -> Schema {
@@ -1311,1130 +1297,5 @@ mod tests {
             .expect("Test setup: failed to add logs table");
 
         schema
-    }
-
-    // Helper to parse SQL and extract the SELECT statement
-    fn parse_select(sql: &str) -> ast::Select {
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next().unwrap().unwrap();
-        match cmd {
-            ast::Cmd::Stmt(ast::Stmt::Select(select)) => select,
-            _ => panic!("Expected SELECT statement"),
-        }
-    }
-
-    // Type alias for the complex return type of extract_all_tables
-    type ExtractedTableInfo = (
-        Vec<Arc<BTreeTable>>,
-        HashMap<String, String>,
-        HashMap<String, String>,
-        HashMap<String, Vec<Option<ast::Expr>>>,
-    );
-
-    fn extract_all_tables(select: &ast::Select, schema: &Schema) -> Result<ExtractedTableInfo> {
-        let mut referenced_tables = Vec::new();
-        let mut table_aliases = HashMap::default();
-        let mut qualified_table_names = HashMap::default();
-        let mut table_conditions = HashMap::default();
-        IncrementalView::extract_all_tables(
-            select,
-            schema,
-            &mut referenced_tables,
-            &mut table_aliases,
-            &mut qualified_table_names,
-            &mut table_conditions,
-        )?;
-        Ok((
-            referenced_tables,
-            table_aliases,
-            qualified_table_names,
-            table_conditions,
-        ))
-    }
-
-    #[test]
-    fn test_extract_single_table() {
-        let schema = create_test_schema();
-        let select = parse_select("SELECT * FROM customers");
-
-        let (tables, _, _, _table_conditions) = extract_all_tables(&select, &schema).unwrap();
-
-        assert_eq!(tables.len(), 1);
-        assert_eq!(tables[0].name, "customers");
-    }
-
-    #[test]
-    fn test_tables_from_union() {
-        let schema = create_test_schema();
-        let select = parse_select("SELECT name FROM customers union SELECT name from products");
-
-        let (tables, _, _, table_conditions) = extract_all_tables(&select, &schema).unwrap();
-
-        assert_eq!(tables.len(), 2);
-        assert!(table_conditions.contains_key("customers"));
-        assert!(table_conditions.contains_key("products"));
-    }
-
-    #[test]
-    fn test_extract_tables_from_inner_join() {
-        let schema = create_test_schema();
-        let select = parse_select(
-            "SELECT * FROM customers INNER JOIN orders ON customers.id = orders.customer_id",
-        );
-
-        let (tables, _, _, table_conditions) = extract_all_tables(&select, &schema).unwrap();
-
-        assert_eq!(tables.len(), 2);
-        assert!(table_conditions.contains_key("customers"));
-        assert!(table_conditions.contains_key("orders"));
-    }
-
-    #[test]
-    fn test_extract_tables_from_multiple_joins() {
-        let schema = create_test_schema();
-        let select = parse_select(
-            "SELECT * FROM customers
-             INNER JOIN orders ON customers.id = orders.customer_id
-             INNER JOIN products ON orders.id = products.id",
-        );
-
-        let (tables, _, _, table_conditions) = extract_all_tables(&select, &schema).unwrap();
-
-        assert_eq!(tables.len(), 3);
-        assert!(table_conditions.contains_key("customers"));
-        assert!(table_conditions.contains_key("orders"));
-        assert!(table_conditions.contains_key("products"));
-    }
-
-    #[test]
-    fn test_extract_tables_from_left_join() {
-        let schema = create_test_schema();
-        let select = parse_select(
-            "SELECT * FROM customers LEFT JOIN orders ON customers.id = orders.customer_id",
-        );
-
-        let (tables, _, _, table_conditions) = extract_all_tables(&select, &schema).unwrap();
-
-        assert_eq!(tables.len(), 2);
-        assert!(table_conditions.contains_key("customers"));
-        assert!(table_conditions.contains_key("orders"));
-    }
-
-    #[test]
-    fn test_extract_tables_from_cross_join() {
-        let schema = create_test_schema();
-        let select = parse_select("SELECT * FROM customers CROSS JOIN orders");
-
-        let (tables, _, _, table_conditions) = extract_all_tables(&select, &schema).unwrap();
-
-        assert_eq!(tables.len(), 2);
-        assert!(table_conditions.contains_key("customers"));
-        assert!(table_conditions.contains_key("orders"));
-    }
-
-    #[test]
-    fn test_extract_tables_with_aliases() {
-        let schema = create_test_schema();
-        let select =
-            parse_select("SELECT * FROM customers c INNER JOIN orders o ON c.id = o.customer_id");
-
-        let (tables, aliases, _, _table_conditions) = extract_all_tables(&select, &schema).unwrap();
-
-        // Should still extract the actual table names, not aliases
-        assert_eq!(tables.len(), 2);
-        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
-        assert!(table_names.contains(&"customers"));
-        assert!(table_names.contains(&"orders"));
-
-        // Check that aliases are correctly mapped
-        assert_eq!(aliases.get("c"), Some(&"customers".to_string()));
-        assert_eq!(aliases.get("o"), Some(&"orders".to_string()));
-    }
-
-    #[test]
-    fn test_extract_tables_nonexistent_table_error() {
-        let schema = create_test_schema();
-        let select = parse_select("SELECT * FROM nonexistent");
-
-        let result = extract_all_tables(&select, &schema).map(|(tables, _, _, _)| tables);
-
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Table 'nonexistent' not found"));
-    }
-
-    #[test]
-    fn test_extract_tables_nonexistent_join_table_error() {
-        let schema = create_test_schema();
-        let select = parse_select(
-            "SELECT * FROM customers INNER JOIN nonexistent ON customers.id = nonexistent.id",
-        );
-
-        let result = extract_all_tables(&select, &schema).map(|(tables, _, _, _)| tables);
-
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Table 'nonexistent' not found"));
-    }
-
-    #[test]
-    fn test_sql_for_populate_simple_query_no_where() {
-        // Test simple query with no WHERE clause
-        let schema = create_test_schema();
-        let select = parse_select("SELECT * FROM customers");
-
-        let (tables, aliases, qualified_names, table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-        let view = IncrementalView::new(
-            "test_view".to_string(),
-            select.clone(),
-            tables,
-            aliases,
-            qualified_names,
-            table_conditions,
-            extract_view_columns(&select, &schema).unwrap(),
-            &schema,
-            1, // main_data_root
-            2, // internal_state_root
-            3, // internal_state_index_root
-        )
-        .unwrap();
-
-        let queries = view.sql_for_populate().unwrap();
-
-        assert_eq!(queries.len(), 1);
-        // customers has id as rowid alias, so no need for explicit rowid
-        assert_eq!(queries[0], "SELECT * FROM customers");
-    }
-
-    #[test]
-    fn test_sql_for_populate_simple_query_with_where() {
-        // Test simple query with WHERE clause
-        let schema = create_test_schema();
-        let select = parse_select("SELECT * FROM customers WHERE id > 10");
-
-        let (tables, aliases, qualified_names, table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-        let view = IncrementalView::new(
-            "test_view".to_string(),
-            select.clone(),
-            tables,
-            aliases,
-            qualified_names,
-            table_conditions,
-            extract_view_columns(&select, &schema).unwrap(),
-            &schema,
-            1, // main_data_root
-            2, // internal_state_root
-            3, // internal_state_index_root
-        )
-        .unwrap();
-
-        let queries = view.sql_for_populate().unwrap();
-
-        assert_eq!(queries.len(), 1);
-        // For single-table queries, we should get the full WHERE clause
-        assert_eq!(queries[0], "SELECT * FROM customers WHERE id > 10");
-    }
-
-    #[test]
-    fn test_sql_for_populate_join_with_where_on_both_tables() {
-        // Test JOIN query with WHERE conditions on both tables
-        let schema = create_test_schema();
-        let select = parse_select(
-            "SELECT * FROM customers c \
-             JOIN orders o ON c.id = o.customer_id \
-             WHERE c.id > 10 AND o.total > 100",
-        );
-
-        let (tables, aliases, qualified_names, table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-        let view = IncrementalView::new(
-            "test_view".to_string(),
-            select.clone(),
-            tables,
-            aliases,
-            qualified_names,
-            table_conditions,
-            extract_view_columns(&select, &schema).unwrap(),
-            &schema,
-            1, // main_data_root
-            2, // internal_state_root
-            3, // internal_state_index_root
-        )
-        .unwrap();
-
-        let queries = view.sql_for_populate().unwrap();
-
-        assert_eq!(queries.len(), 2);
-
-        // With per-table WHERE extraction:
-        // - customers table gets: c.id > 10
-        // - orders table gets: o.total > 100
-        assert!(queries
-            .iter()
-            .any(|q| q == "SELECT * FROM customers WHERE id > 10"));
-        assert!(queries
-            .iter()
-            .any(|q| q == "SELECT * FROM orders WHERE total > 100"));
-    }
-
-    #[test]
-    fn test_sql_for_populate_complex_join_with_mixed_conditions() {
-        // Test complex JOIN with WHERE conditions mixing both tables
-        let schema = create_test_schema();
-        let select = parse_select(
-            "SELECT * FROM customers c \
-             JOIN orders o ON c.id = o.customer_id \
-             WHERE c.id > 10 AND o.total > 100 AND c.name = 'John' \
-             AND o.customer_id = 5 AND (c.id = 15 OR o.total = 200)",
-        );
-
-        let (tables, aliases, qualified_names, table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-        let view = IncrementalView::new(
-            "test_view".to_string(),
-            select.clone(),
-            tables,
-            aliases,
-            qualified_names,
-            table_conditions,
-            extract_view_columns(&select, &schema).unwrap(),
-            &schema,
-            1, // main_data_root
-            2, // internal_state_root
-            3, // internal_state_index_root
-        )
-        .unwrap();
-
-        let queries = view.sql_for_populate().unwrap();
-
-        assert_eq!(queries.len(), 2);
-
-        // With per-table WHERE extraction:
-        // - customers gets: c.id > 10 AND c.name = 'John'
-        // - orders gets: o.total > 100 AND o.customer_id = 5
-        // Note: The OR condition (c.id = 15 OR o.total = 200) involves both tables,
-        // so it cannot be extracted to either table individually
-        // Check both queries exist (order doesn't matter)
-        assert!(queries
-            .contains(&"SELECT * FROM customers WHERE id > 10 AND name = 'John'".to_string()));
-        assert!(queries
-            .contains(&"SELECT * FROM orders WHERE total > 100 AND customer_id = 5".to_string()));
-    }
-
-    #[test]
-    fn test_sql_for_populate_table_without_rowid_alias() {
-        let schema = create_test_schema();
-        let select = parse_select("SELECT * FROM logs WHERE level > 2");
-
-        let (tables, aliases, qualified_names, table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-        let view = IncrementalView::new(
-            "test_view".to_string(),
-            select.clone(),
-            tables,
-            aliases,
-            qualified_names,
-            table_conditions,
-            extract_view_columns(&select, &schema).unwrap(),
-            &schema,
-            1, // main_data_root
-            2, // internal_state_root
-            3, // internal_state_index_root
-        )
-        .unwrap();
-
-        let queries = view.sql_for_populate().unwrap();
-
-        assert_eq!(queries.len(), 1);
-        // logs table has no rowid alias, so we need to explicitly select rowid
-        assert_eq!(queries[0], "SELECT *, rowid FROM logs WHERE level > 2");
-    }
-
-    #[test]
-    fn test_sql_for_populate_join_with_and_without_rowid_alias() {
-        // Test JOIN between a table with rowid alias and one without
-        let schema = create_test_schema();
-        let select = parse_select(
-            "SELECT * FROM customers c \
-             JOIN logs l ON c.id = l.level \
-             WHERE c.id > 10 AND l.level > 2",
-        );
-
-        let (tables, aliases, qualified_names, table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-        let view = IncrementalView::new(
-            "test_view".to_string(),
-            select.clone(),
-            tables,
-            aliases,
-            qualified_names,
-            table_conditions,
-            extract_view_columns(&select, &schema).unwrap(),
-            &schema,
-            1, // main_data_root
-            2, // internal_state_root
-            3, // internal_state_index_root
-        )
-        .unwrap();
-
-        let queries = view.sql_for_populate().unwrap();
-
-        assert_eq!(queries.len(), 2);
-        // customers has rowid alias (id), logs doesn't
-        assert!(queries.contains(&"SELECT * FROM customers WHERE id > 10".to_string()));
-        assert!(queries.contains(&"SELECT *, rowid FROM logs WHERE level > 2".to_string()));
-    }
-
-    #[test]
-    fn test_sql_for_populate_with_database_qualified_names() {
-        // Test that database.table.column references are handled correctly
-        // The table name in FROM should keep the database prefix,
-        // but column names in WHERE should be unqualified
-        let schema = create_test_schema();
-
-        // Test with single table using database qualification
-        let select = parse_select("SELECT * FROM main.customers WHERE main.customers.id > 10");
-
-        let (tables, aliases, qualified_names, table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-        let view = IncrementalView::new(
-            "test_view".to_string(),
-            select.clone(),
-            tables,
-            aliases,
-            qualified_names,
-            table_conditions,
-            extract_view_columns(&select, &schema).unwrap(),
-            &schema,
-            1, // main_data_root
-            2, // internal_state_root
-            3, // internal_state_index_root
-        )
-        .unwrap();
-
-        let queries = view.sql_for_populate().unwrap();
-
-        assert_eq!(queries.len(), 1);
-        // The FROM clause should preserve the database qualification,
-        // but the WHERE clause should have unqualified column names
-        assert_eq!(queries[0], "SELECT * FROM main.customers WHERE id > 10");
-    }
-
-    #[test]
-    fn test_sql_for_populate_join_with_database_qualified_names() {
-        // Test JOIN with database-qualified table and column references
-        let schema = create_test_schema();
-
-        let select = parse_select(
-            "SELECT * FROM main.customers c \
-             JOIN main.orders o ON c.id = o.customer_id \
-             WHERE main.customers.id > 10 AND main.orders.total > 100",
-        );
-
-        let (tables, aliases, qualified_names, table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-        let view = IncrementalView::new(
-            "test_view".to_string(),
-            select.clone(),
-            tables,
-            aliases,
-            qualified_names,
-            table_conditions,
-            extract_view_columns(&select, &schema).unwrap(),
-            &schema,
-            1, // main_data_root
-            2, // internal_state_root
-            3, // internal_state_index_root
-        )
-        .unwrap();
-
-        let queries = view.sql_for_populate().unwrap();
-
-        assert_eq!(queries.len(), 2);
-        // The FROM clauses should preserve database qualification,
-        // but WHERE clauses should have unqualified column names
-        assert!(queries.contains(&"SELECT * FROM main.customers WHERE id > 10".to_string()));
-        assert!(queries.contains(&"SELECT * FROM main.orders WHERE total > 100".to_string()));
-    }
-
-    #[test]
-    fn test_where_extraction_for_three_tables_with_aliases() {
-        // Test that WHERE clause extraction correctly separates conditions for 3+ tables
-        // This addresses the concern about conditions "piling up" as joins increase
-        let schema = create_test_schema();
-        let select = parse_select(
-            "SELECT * FROM customers c
-             JOIN orders o ON c.id = o.customer_id
-             JOIN products p ON p.id = o.product_id
-             WHERE c.id > 10 AND o.total > 100 AND p.price > 50",
-        );
-
-        let (tables, aliases, qualified_names, table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-
-        // Verify we extracted all three tables
-        assert_eq!(tables.len(), 3);
-        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
-        assert!(table_names.contains(&"customers"));
-        assert!(table_names.contains(&"orders"));
-        assert!(table_names.contains(&"products"));
-
-        // Verify aliases are correctly mapped
-        assert_eq!(aliases.get("c"), Some(&"customers".to_string()));
-        assert_eq!(aliases.get("o"), Some(&"orders".to_string()));
-        assert_eq!(aliases.get("p"), Some(&"products".to_string()));
-
-        // Generate populate queries to verify each table gets its own conditions
-        let queries = IncrementalView::generate_populate_queries(
-            &select,
-            &tables,
-            &aliases,
-            &qualified_names,
-            &table_conditions,
-        )
-        .unwrap();
-
-        assert_eq!(queries.len(), 3);
-
-        // Verify the exact queries generated for each table
-        // The order might vary, so check all possibilities
-        let expected_queries = vec![
-            "SELECT * FROM customers WHERE id > 10",
-            "SELECT * FROM orders WHERE total > 100",
-            "SELECT * FROM products WHERE price > 50",
-        ];
-
-        for expected in &expected_queries {
-            assert!(
-                queries.contains(&expected.to_string()),
-                "Missing expected query: {expected}. Got: {queries:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_sql_for_populate_complex_expressions_not_included() {
-        // Test that complex expressions (subqueries, CASE, string concat) are NOT included in populate queries
-        let schema = create_test_schema();
-        let select = parse_select(
-            "SELECT * FROM customers
-             WHERE id > (SELECT MAX(customer_id) FROM orders)
-               AND name || ' Customer' = 'John Customer'
-               AND CASE WHEN id > 10 THEN 1 ELSE 0 END = 1
-               AND EXISTS (SELECT 1 FROM orders WHERE customer_id = customers.id)",
-        );
-
-        let (tables, aliases, qualified_names, table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-
-        let queries = IncrementalView::generate_populate_queries(
-            &select,
-            &tables,
-            &aliases,
-            &qualified_names,
-            &table_conditions,
-        )
-        .unwrap();
-
-        assert_eq!(queries.len(), 1);
-        // Since customers table has an INTEGER PRIMARY KEY (id), we should get SELECT *
-        // without rowid and without WHERE clause (all conditions are complex)
-        assert_eq!(queries[0], "SELECT * FROM customers");
-    }
-
-    #[test]
-    fn test_sql_for_populate_unambiguous_unqualified_column() {
-        // Test that unambiguous unqualified columns ARE extracted
-        let schema = create_test_schema();
-        let select = parse_select(
-            "SELECT * FROM customers c \
-             JOIN orders o ON c.id = o.customer_id \
-             WHERE total > 100", // 'total' only exists in orders table
-        );
-
-        let (tables, aliases, qualified_names, table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-        let view = IncrementalView::new(
-            "test_view".to_string(),
-            select.clone(),
-            tables,
-            aliases,
-            qualified_names,
-            table_conditions,
-            extract_view_columns(&select, &schema).unwrap(),
-            &schema,
-            1, // main_data_root
-            2, // internal_state_root
-            3, // internal_state_index_root
-        )
-        .unwrap();
-
-        let queries = view.sql_for_populate().unwrap();
-
-        assert_eq!(queries.len(), 2);
-
-        // 'total' is unambiguous (only in orders), so it should be extracted
-        assert!(queries.contains(&"SELECT * FROM customers".to_string()));
-        assert!(queries.contains(&"SELECT * FROM orders WHERE total > 100".to_string()));
-    }
-
-    #[test]
-    fn test_database_qualified_table_names() {
-        let schema = create_test_schema();
-
-        // Test with database-qualified table names
-        let select = parse_select(
-            "SELECT c.id, c.name, o.id, o.total
-             FROM main.customers c
-             JOIN main.orders o ON c.id = o.customer_id
-             WHERE c.id > 10",
-        );
-
-        let (tables, aliases, qualified_names, table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-
-        // Check that qualified names are preserved
-        assert!(qualified_names.contains_key("customers"));
-        assert_eq!(qualified_names.get("customers").unwrap(), "main.customers");
-        assert!(qualified_names.contains_key("orders"));
-        assert_eq!(qualified_names.get("orders").unwrap(), "main.orders");
-
-        let view = IncrementalView::new(
-            "test_view".to_string(),
-            select.clone(),
-            tables,
-            aliases,
-            qualified_names,
-            table_conditions,
-            extract_view_columns(&select, &schema).unwrap(),
-            &schema,
-            1, // main_data_root
-            2, // internal_state_root
-            3, // internal_state_index_root
-        )
-        .unwrap();
-
-        let queries = view.sql_for_populate().unwrap();
-
-        assert_eq!(queries.len(), 2);
-
-        // The FROM clause should contain the database-qualified name
-        // But the WHERE clause should use unqualified column names
-        assert!(queries.contains(&"SELECT * FROM main.customers WHERE id > 10".to_string()));
-        assert!(queries.contains(&"SELECT * FROM main.orders".to_string()));
-    }
-
-    #[test]
-    fn test_mixed_qualified_unqualified_tables() {
-        let schema = create_test_schema();
-
-        // Test with a mix of qualified and unqualified table names
-        let select = parse_select(
-            "SELECT c.id, c.name, o.id, o.total
-             FROM main.customers c
-             JOIN orders o ON c.id = o.customer_id
-             WHERE c.id > 10 AND o.total < 1000",
-        );
-
-        let (tables, aliases, qualified_names, table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-
-        // Check that qualified names are preserved where specified
-        assert_eq!(qualified_names.get("customers").unwrap(), "main.customers");
-        // Unqualified tables should not have an entry (or have the bare name)
-        assert!(
-            !qualified_names.contains_key("orders")
-                || qualified_names.get("orders").unwrap() == "orders"
-        );
-
-        let view = IncrementalView::new(
-            "test_view".to_string(),
-            select.clone(),
-            tables,
-            aliases,
-            qualified_names,
-            table_conditions,
-            extract_view_columns(&select, &schema).unwrap(),
-            &schema,
-            1, // main_data_root
-            2, // internal_state_root
-            3, // internal_state_index_root
-        )
-        .unwrap();
-
-        let queries = view.sql_for_populate().unwrap();
-
-        assert_eq!(queries.len(), 2);
-
-        // The FROM clause should preserve qualification where specified
-        assert!(queries.contains(&"SELECT * FROM main.customers WHERE id > 10".to_string()));
-        assert!(queries.contains(&"SELECT * FROM orders WHERE total < 1000".to_string()));
-    }
-
-    #[test]
-    fn test_extract_tables_with_simple_cte() {
-        let schema = create_test_schema();
-        let select = parse_select(
-            "WITH customer_totals AS (
-                SELECT c.id, c.name, SUM(o.total) as total_spent
-                FROM customers c
-                JOIN orders o ON c.id = o.customer_id
-                GROUP BY c.id, c.name
-            )
-            SELECT * FROM customer_totals WHERE total_spent > 1000",
-        );
-
-        let (tables, aliases, _qualified_names, _table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-
-        // Check that we found both tables from the CTE
-        assert_eq!(tables.len(), 2);
-        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
-        assert!(table_names.contains(&"customers"));
-        assert!(table_names.contains(&"orders"));
-
-        // Check aliases from the CTE
-        assert_eq!(aliases.get("c"), Some(&"customers".to_string()));
-        assert_eq!(aliases.get("o"), Some(&"orders".to_string()));
-    }
-
-    #[test]
-    fn test_extract_tables_with_multiple_ctes() {
-        let schema = create_test_schema();
-        let select = parse_select(
-            "WITH
-            high_value_customers AS (
-                SELECT id, name
-                FROM customers
-                WHERE id IN (SELECT customer_id FROM orders WHERE total > 500)
-            ),
-            recent_orders AS (
-                SELECT id, customer_id, total
-                FROM orders
-                WHERE id > 100
-            )
-            SELECT hvc.name, ro.total
-            FROM high_value_customers hvc
-            JOIN recent_orders ro ON hvc.id = ro.customer_id",
-        );
-
-        let (tables, _aliases, _qualified_names, _table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-
-        // Check that we found both tables from both CTEs
-        assert_eq!(tables.len(), 2);
-        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
-        assert!(table_names.contains(&"customers"));
-        assert!(table_names.contains(&"orders"));
-    }
-
-    #[test]
-    fn test_sql_for_populate_union_mixed_conditions() {
-        // Test UNION where same table appears with and without WHERE clause
-        // This should drop ALL conditions to ensure we get all rows
-        let schema = create_test_schema();
-
-        let select = parse_select(
-            "SELECT * FROM customers WHERE id > 10
-             UNION ALL
-             SELECT * FROM customers",
-        );
-
-        let (tables, aliases, qualified_names, table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-
-        let view = IncrementalView::new(
-            "union_view".to_string(),
-            select.clone(),
-            tables,
-            aliases,
-            qualified_names,
-            table_conditions,
-            extract_view_columns(&select, &schema).unwrap(),
-            &schema,
-            1, // main_data_root
-            2, // internal_state_root
-            3, // internal_state_index_root
-        )
-        .unwrap();
-
-        let queries = view.sql_for_populate().unwrap();
-
-        assert_eq!(queries.len(), 1);
-        // When the same table appears with and without WHERE conditions in a UNION,
-        // we must fetch ALL rows (no WHERE clause) because the conditions are incompatible
-        assert_eq!(
-            queries[0], "SELECT * FROM customers",
-            "UNION with mixed conditions (some with WHERE, some without) should fetch ALL rows"
-        );
-    }
-
-    #[test]
-    fn test_extract_tables_with_nested_cte() {
-        let schema = create_test_schema();
-        let select = parse_select(
-            "WITH RECURSIVE customer_hierarchy AS (
-                SELECT id, name, 0 as level
-                FROM customers
-                WHERE id = 1
-                UNION ALL
-                SELECT c.id, c.name, ch.level + 1
-                FROM customers c
-                JOIN orders o ON c.id = o.customer_id
-                JOIN customer_hierarchy ch ON o.customer_id = ch.id
-                WHERE ch.level < 3
-            )
-            SELECT * FROM customer_hierarchy",
-        );
-
-        let (tables, _aliases, _qualified_names, _table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-
-        // Check that we found the tables referenced in the recursive CTE
-        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
-
-        // We're finding duplicates because "customers" appears twice in the recursive CTE
-        // Let's deduplicate
-        let unique_tables: HashSet<&str> = table_names.iter().cloned().collect();
-        assert_eq!(unique_tables.len(), 2);
-        assert!(unique_tables.contains("customers"));
-        assert!(unique_tables.contains("orders"));
-    }
-
-    #[test]
-    fn test_extract_tables_with_cte_and_main_query() {
-        let schema = create_test_schema();
-        let select = parse_select(
-            "WITH customer_stats AS (
-                SELECT customer_id, COUNT(*) as order_count
-                FROM orders
-                GROUP BY customer_id
-            )
-            SELECT c.name, cs.order_count, p.name as product_name
-            FROM customers c
-            JOIN customer_stats cs ON c.id = cs.customer_id
-            JOIN products p ON p.id = 1",
-        );
-
-        let (tables, aliases, _qualified_names, _table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-
-        // Check that we found tables from both the CTE and the main query
-        assert_eq!(tables.len(), 3);
-        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
-        assert!(table_names.contains(&"customers"));
-        assert!(table_names.contains(&"orders"));
-        assert!(table_names.contains(&"products"));
-
-        // Check aliases from main query
-        assert_eq!(aliases.get("c"), Some(&"customers".to_string()));
-        assert_eq!(aliases.get("p"), Some(&"products".to_string()));
-    }
-
-    #[test]
-    fn test_sql_for_populate_simple_union() {
-        let schema = create_test_schema();
-        let select = parse_select(
-            "SELECT * FROM orders WHERE total > 1000
-             UNION ALL
-             SELECT * FROM orders WHERE total < 100",
-        );
-
-        let (tables, aliases, qualified_names, table_conditions) =
-            extract_all_tables(&select, &schema).unwrap();
-
-        // Generate populate queries
-        let queries = IncrementalView::generate_populate_queries(
-            &select,
-            &tables,
-            &aliases,
-            &qualified_names,
-            &table_conditions,
-        )
-        .unwrap();
-
-        // We should have deduplicated to a single table
-        assert_eq!(tables.len(), 1, "Should have one unique table");
-        assert_eq!(tables[0].name, "orders"); // Single table, order doesn't matter
-
-        // Should have collected two conditions
-        assert_eq!(table_conditions.get("orders").unwrap().len(), 2);
-
-        // Should combine multiple conditions with OR
-        assert_eq!(queries.len(), 1);
-        // Conditions are combined with OR
-        assert_eq!(
-            queries[0],
-            "SELECT * FROM orders WHERE (total > 1000) OR (total < 100)"
-        );
-    }
-
-    #[test]
-    fn test_sql_for_populate_with_union_and_filters() {
-        let schema = create_test_schema();
-
-        // Test UNION with different WHERE conditions on the same table
-        let select = parse_select(
-            "SELECT * FROM orders WHERE total > 1000
-             UNION ALL
-             SELECT * FROM orders WHERE total < 100",
-        );
-
-        let view = IncrementalView::from_stmt(
-            ast::QualifiedName {
-                db_name: None,
-                name: ast::Name::exact("test_view".to_string()),
-                alias: None,
-            },
-            select,
-            &schema,
-            1,
-            2,
-            3,
-        )
-        .unwrap();
-
-        let queries = view.sql_for_populate().unwrap();
-
-        // We deduplicate tables, so we get 1 query for orders
-        assert_eq!(queries.len(), 1);
-
-        // Multiple conditions on the same table are combined with OR
-        assert_eq!(
-            queries[0],
-            "SELECT * FROM orders WHERE (total > 1000) OR (total < 100)"
-        );
-    }
-
-    #[test]
-    fn test_sql_for_populate_with_union_mixed_tables() {
-        let schema = create_test_schema();
-
-        // Test UNION with different tables
-        let select = parse_select(
-            "SELECT id, name FROM customers WHERE id > 10
-             UNION ALL
-             SELECT customer_id as id, 'Order' as name FROM orders WHERE total > 500",
-        );
-
-        let view = IncrementalView::from_stmt(
-            ast::QualifiedName {
-                db_name: None,
-                name: ast::Name::exact("test_view".to_string()),
-                alias: None,
-            },
-            select,
-            &schema,
-            1,
-            2,
-            3,
-        )
-        .unwrap();
-
-        let queries = view.sql_for_populate().unwrap();
-
-        assert_eq!(queries.len(), 2, "Should have one query per table");
-
-        // Check that each table gets its appropriate WHERE clause
-        let customers_query = queries
-            .iter()
-            .find(|q| q.contains("FROM customers"))
-            .unwrap();
-        let orders_query = queries.iter().find(|q| q.contains("FROM orders")).unwrap();
-
-        assert!(customers_query.contains("WHERE id > 10"));
-        assert!(orders_query.contains("WHERE total > 500"));
-    }
-
-    #[test]
-    fn test_sql_for_populate_duplicate_tables_conflicting_filters() {
-        // This tests what happens when we have duplicate table references with different filters
-        // We need to manually construct a view to simulate what would happen with CTEs
-        let schema = create_test_schema();
-
-        // Get the orders table twice (simulating what would happen with CTEs)
-        let orders_table = schema.get_btree_table("orders").unwrap();
-
-        let referenced_tables = std::vec![orders_table.clone(), orders_table];
-
-        // Create a SELECT that would have conflicting WHERE conditions
-        let select = parse_select(
-            "SELECT * FROM orders WHERE total > 1000", // This is just for the AST
-        );
-
-        let view = IncrementalView::new(
-            "test_view".to_string(),
-            select.clone(),
-            referenced_tables,
-            HashMap::default(),
-            HashMap::default(),
-            HashMap::default(),
-            extract_view_columns(&select, &schema).unwrap(),
-            &schema,
-            1,
-            2,
-            3,
-        )
-        .unwrap();
-
-        let queries = view.sql_for_populate().unwrap();
-
-        // With duplicates, we should get 2 identical queries
-        assert_eq!(queries.len(), 2);
-
-        // Both should be the same since they're from the same table reference
-        assert_eq!(queries[0], queries[1]);
-    }
-
-    #[test]
-    fn test_table_extraction_with_nested_ctes_complex_conditions() {
-        let schema = create_test_schema();
-        let select = parse_select(
-            "WITH
-            customer_orders AS (
-                SELECT c.*, o.total
-                FROM customers c
-                JOIN orders o ON c.id = o.customer_id
-                WHERE c.name LIKE 'A%' AND o.total > 100
-            ),
-            top_customers AS (
-                SELECT * FROM customer_orders WHERE total > 500
-            )
-            SELECT * FROM top_customers",
-        );
-
-        // Test table extraction directly without creating a view
-        let mut tables = Vec::new();
-        let mut aliases = HashMap::default();
-        let mut qualified_names = HashMap::default();
-        let mut table_conditions = HashMap::default();
-
-        IncrementalView::extract_all_tables(
-            &select,
-            &schema,
-            &mut tables,
-            &mut aliases,
-            &mut qualified_names,
-            &mut table_conditions,
-        )
-        .unwrap();
-
-        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
-
-        // Should have one reference to each table
-        assert_eq!(table_names.len(), 2, "Should have 2 table references");
-        assert!(table_names.contains(&"customers"));
-        assert!(table_names.contains(&"orders"));
-
-        // Check aliases
-        assert_eq!(aliases.get("c"), Some(&"customers".to_string()));
-        assert_eq!(aliases.get("o"), Some(&"orders".to_string()));
-    }
-
-    #[test]
-    fn test_union_all_populate_queries() {
-        // Test that UNION ALL generates correct populate queries
-        let schema = create_test_schema();
-
-        // Create a UNION ALL query that references the same table twice with different WHERE conditions
-        let sql = "
-            SELECT id, name FROM customers WHERE id < 5
-            UNION ALL
-            SELECT id, name FROM customers WHERE id > 10
-        ";
-
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd().unwrap();
-        let select_stmt = match cmd.unwrap() {
-            turso_parser::ast::Cmd::Stmt(ast::Stmt::Select(select)) => select,
-            _ => panic!("Expected SELECT statement"),
-        };
-
-        // Extract tables and conditions
-        let (tables, aliases, qualified_names, conditions) =
-            extract_all_tables(&select_stmt, &schema).unwrap();
-
-        // Generate populate queries
-        let queries = IncrementalView::generate_populate_queries(
-            &select_stmt,
-            &tables,
-            &aliases,
-            &qualified_names,
-            &conditions,
-        )
-        .unwrap();
-
-        // Expected query - assuming customers table has INTEGER PRIMARY KEY
-        // so we don't need to select rowid separately
-        let expected = "SELECT * FROM customers WHERE (id < 5) OR (id > 10)";
-
-        assert_eq!(
-            queries.len(),
-            1,
-            "Should generate exactly 1 query for UNION ALL with same table"
-        );
-        assert_eq!(queries[0], expected, "Query should match expected format");
-    }
-
-    #[test]
-    fn test_union_all_different_tables_populate_queries() {
-        // Test UNION ALL with different tables
-        let schema = create_test_schema();
-
-        let sql = "
-            SELECT id, name FROM customers WHERE id < 5
-            UNION ALL
-            SELECT id, product_name FROM orders WHERE amount > 100
-        ";
-
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next_cmd().unwrap();
-        let select_stmt = match cmd.unwrap() {
-            turso_parser::ast::Cmd::Stmt(ast::Stmt::Select(select)) => select,
-            _ => panic!("Expected SELECT statement"),
-        };
-
-        // Extract tables and conditions
-        let (tables, aliases, qualified_names, conditions) =
-            extract_all_tables(&select_stmt, &schema).unwrap();
-
-        // Generate populate queries
-        let queries = IncrementalView::generate_populate_queries(
-            &select_stmt,
-            &tables,
-            &aliases,
-            &qualified_names,
-            &conditions,
-        )
-        .unwrap();
-
-        // Should generate separate queries for each table
-        assert_eq!(
-            queries.len(),
-            2,
-            "Should generate 2 queries for different tables"
-        );
-
-        // Check we have queries for both tables
-        let has_customers = queries.iter().any(|q| q.contains("customers"));
-        let has_orders = queries.iter().any(|q| q.contains("orders"));
-        assert!(has_customers, "Should have a query for customers table");
-        assert!(has_orders, "Should have a query for orders table");
-
-        // Verify the customers query has its WHERE clause
-        let customers_query = queries
-            .iter()
-            .find(|q| q.contains("customers"))
-            .expect("Should have customers query");
-        assert!(
-            customers_query.contains("WHERE"),
-            "Customers query should have WHERE clause"
-        );
     }
 }

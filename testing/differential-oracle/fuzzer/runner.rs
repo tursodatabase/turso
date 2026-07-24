@@ -22,7 +22,9 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::Database;
 
-use crate::generate::{GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator};
+use crate::generate::{
+    GeneratedStatement, GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator,
+};
 use crate::ivm::{IvmCreateOutcome, IvmState};
 use crate::memory::{MemorySimIO, SimIO};
 use crate::oracle::{DifferentialOracle, OracleResult, QueryResult, check_differential};
@@ -376,7 +378,7 @@ impl Fuzzer {
                         ivm.try_create_view(&self.turso_conn, &schema, &mut rng)
                     };
                     match outcome {
-                        Some(IvmCreateOutcome::Created { sql }) => {
+                        Some(IvmCreateOutcome::Created { sql, leaf_probes }) => {
                             tracing::info!("IVM: created view: {sql}");
                             executed_sql.push("-- IVM (turso-only)".to_string());
                             executed_sql.push(sql.clone());
@@ -391,10 +393,62 @@ impl Fuzzer {
                                     "IVM initial population failure after: {sql}\n{reason}"
                                 ));
                             }
+                            // Drive every possible base-table leaf through the
+                            // maintenance graph at least once. A no-op UPDATE
+                            // still captures a delete/insert pair for each row,
+                            // exercising identity, arrangement, and
+                            // cancellation paths without perturbing the
+                            // generator's data distribution.
+                            for probe_sql in leaf_probes {
+                                let probe = GeneratedStatement {
+                                    sql: probe_sql.clone(),
+                                    is_ddl: false,
+                                    mutates_data: true,
+                                    has_unordered_limit: false,
+                                    unordered_limit_reason: None,
+                                };
+                                let result = check_differential(
+                                    &self.turso_conn,
+                                    &self.sqlite_conn,
+                                    &schema,
+                                    &probe,
+                                );
+                                if let OracleResult::Fail(reason) = result {
+                                    stats.oracle_failures += 1;
+                                    executed_sql
+                                        .push(format!("-- IVM LEAF PROBE FAILED: {probe_sql}"));
+                                    return Err(anyhow::anyhow!(
+                                        "IVM leaf mutation probe failed: {probe_sql}\n{reason}"
+                                    ));
+                                }
+                                executed_sql.push("-- IVM leaf mutation probe".to_string());
+                                executed_sql.push(probe_sql.clone());
+                                if let OracleResult::Fail(reason) =
+                                    ivm.check_views(&self.turso_conn)
+                                {
+                                    stats.oracle_failures += 1;
+                                    executed_sql.push(format!(
+                                        "-- IVM FAILED after leaf probe: {probe_sql}"
+                                    ));
+                                    return Err(anyhow::anyhow!(
+                                        "IVM invariant failed after leaf mutation probe: {probe_sql}\n{reason}"
+                                    ));
+                                }
+                            }
                         }
-                        Some(IvmCreateOutcome::Rejected { sql, error }) => {
+                        Some(IvmCreateOutcome::Rejected {
+                            sql,
+                            error,
+                            must_create,
+                        }) => {
                             tracing::warn!("IVM: view creation rejected: {sql}: {error}");
                             executed_sql.push(format!("-- IVM view rejected ({error}): {sql}"));
+                            if must_create {
+                                stats.oracle_failures += 1;
+                                return Err(anyhow::anyhow!(
+                                    "IVM composition unexpectedly rejected: {sql}\n{error}"
+                                ));
+                            }
                         }
                         None => {}
                     }

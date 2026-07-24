@@ -1,11 +1,8 @@
+#[cfg(test)]
+use crate::incremental::view::ViewChangeSubscription;
 use crate::numeric::Numeric;
 use crate::sync::Arc;
-use crate::sync::Mutex;
 use crate::{
-    incremental::{
-        dbsp::{Delta, HashableRow, RowKeyZSet},
-        view::{IncrementalView, ViewTransactionState},
-    },
     return_if_io,
     storage::btree::CursorTrait,
     types::{IOResult, SeekKey, SeekOp, SeekResult, Value},
@@ -18,7 +15,7 @@ enum SeekState {
     /// Initial state before seeking
     Init,
 
-    /// Actively seeking with btree and uncommitted iterators
+    /// Actively seeking the view btree.
     Seek {
         /// The row we are trying to find
         target: i64,
@@ -26,8 +23,6 @@ enum SeekState {
 
     /// Btree seek returned TryAdvance, now advancing with next()/prev()
     Advancing {
-        /// The row we are trying to find
-        target: i64,
         /// The seek operation (determines direction of advance)
         op: SeekOp,
     },
@@ -36,29 +31,18 @@ enum SeekState {
     Done,
 }
 
-/// Cursor for reading materialized views that combines:
-/// 1. Persistent btree data (committed state)
-/// 2. Transaction-specific DBSP deltas (uncommitted changes)
-///
-/// Works like a regular table cursor - reads from disk on-demand
-/// and overlays transaction changes as needed.
+/// Cursor for a transactionally maintained materialized-view btree.
 pub struct MaterializedViewCursor {
     // Core components
     btree_cursor: Box<dyn CursorTrait>,
-    view: Arc<Mutex<IncrementalView>>,
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
 
-    // Current changes that are uncommitted
-    uncommitted: RowKeyZSet,
-
-    // Reference to shared transaction state for this specific view - shared with Connection
-    tx_state: Arc<ViewTransactionState>,
-
-    // The transaction state always grows. It never gets reduced. That is in the very nature of
-    // DBSP, because deletions are just appends with weight < 0. So we will use the length of the
-    // state to check if we have to recompute the transaction state
-    last_tx_state_len: usize,
+    // The transaction-wide change-log revision this cursor has applied.
+    // This must be global rather than the direct view subscription revision so
+    // reads through a chain of materialized views see base changes before
+    // commit scheduling has produced the downstream delta.
+    last_change_log_revision: u64,
 
     // Current row cache - only cache the current row we're looking at
     current_row: Option<(i64, Vec<Value>)>,
@@ -68,297 +52,80 @@ pub struct MaterializedViewCursor {
     // Cleared by any repositioning, mirroring BTreeCursor.
     null_flag: bool,
 
-    // In-progress overlay computation, parked across I/O yields.
-    overlay_build: OverlayBuild,
+    // In-progress maintenance batch, parked across I/O yields when a view is
+    // read before its enclosing write statement reaches Halt.
+    view_delta_state: crate::vdbe::ViewDeltaApplyState,
 
     // State machine for seek operations
     seek_state: SeekState,
 }
 
-/// State machine for computing the uncommitted-changes overlay.
-///
-/// Filter/project views run their maintenance program in emit mode over the
-/// transaction's captured deltas and collect the transformed rows.
-///
-/// Aggregate views cannot be overlaid from deltas without mutating their
-/// persisted group state, so they recompute: run the defining query (which
-/// sees the transaction's uncommitted base-table changes on this connection)
-/// collecting each result row with a synthetic rowid, then scan the view
-/// btree emitting a cancelling `-1` for every committed row. Merged with the
-/// btree by the read path, the committed rows vanish and exactly the fresh
-/// result remains.
-enum OverlayBuild {
-    Idle,
-    /// Stepping a statement: the emit-mode maintenance program
-    /// (filter/project) or the defining query (aggregate; `cancel_btree`).
-    RunningStatement {
-        stmt: Box<crate::Statement>,
-        rows: Delta,
-        pending_len: usize,
-        cancel_btree: bool,
-        next_synthetic_rowid: i64,
-    },
-    /// Aggregate recompute phase 2: emitting -1 for each committed view row.
-    ScanningBtree {
-        rows: Delta,
-        pending_len: usize,
-        rewound: bool,
-    },
-}
-
-/// Synthetic rowids for recomputed aggregate view rows live far above any
-/// rowid NewRowid would allocate, so they cannot collide with committed rows.
-const SYNTHETIC_ROWID_BASE: i64 = 1 << 62;
-
 impl MaterializedViewCursor {
     pub fn new(
         btree_cursor: Box<dyn CursorTrait>,
-        view: Arc<Mutex<IncrementalView>>,
         pager: Arc<Pager>,
         connection: Arc<crate::Connection>,
-        tx_state: Arc<ViewTransactionState>,
     ) -> Result<Self> {
         Ok(Self {
             btree_cursor,
-            view,
             pager,
             connection,
-            uncommitted: RowKeyZSet::new(),
-            tx_state,
-            last_tx_state_len: 0,
+            last_change_log_revision: 0,
             current_row: None,
             null_flag: false,
-            overlay_build: OverlayBuild::Idle,
+            view_delta_state: crate::vdbe::ViewDeltaApplyState::NotStarted,
             seek_state: SeekState::Init,
         })
     }
 
-    /// Compute transaction changes lazily on first access; see
-    /// [`OverlayBuild`] for the two strategies.
+    /// Apply pending transaction changes before reading the view.
+    ///
+    /// This invokes the same dependency-ordered maintenance programs used at
+    /// statement completion and commit. It exists for reads reached from
+    /// inside a still-running write statement; ordinary later statements see
+    /// an already-maintained btree and take the fast path.
     fn ensure_tx_changes_computed(&mut self) -> Result<IOResult<()>> {
-        use crate::vdbe::StepResult;
+        let current_revision = self.connection.transaction_changes.change_revision();
+        if current_revision == self.last_change_log_revision {
+            return Ok(IOResult::Done(()));
+        }
 
-        loop {
-            if matches!(self.overlay_build, OverlayBuild::Idle) {
-                let current_len = self.tx_state.len();
-                if current_len == self.last_tx_state_len {
-                    return Ok(IOResult::Done(()));
-                }
-
-                let (view_name, select, num_view_columns) = {
-                    let view_guard = self.view.lock();
-                    (
-                        view_guard.name().to_string(),
-                        view_guard.select_stmt.clone(),
-                        view_guard.column_schema.flat_columns().len(),
-                    )
-                };
-                let shape = {
-                    let schema = self.connection.schema.read();
-                    crate::incremental::vdbe_maintenance::classify_view_for_connection(
-                        &select,
-                        &schema,
-                        &self.connection,
-                    )?
-                };
-                self.overlay_build = match shape {
-                    crate::incremental::vdbe_maintenance::ViewShape::FilterProject => {
-                        let program = {
-                            let schema = self.connection.schema.read();
-                            crate::incremental::vdbe_maintenance::compile_maintenance_program(
-                                &view_name,
-                                &select,
-                                0, // emit mode writes no btree
-                                num_view_columns,
-                                crate::incremental::vdbe_maintenance::MaintenanceInput::TransactionDelta,
-                                crate::incremental::vdbe_maintenance::MaintenanceOutput::EmitRows,
-                                &schema,
-                                &self.connection,
-                            )?
-                        };
-                        OverlayBuild::RunningStatement {
-                            stmt: Box::new(crate::Statement::new_with_origin(
-                                program,
-                                self.pager.clone(),
-                                crate::QueryMode::Normal,
-                                0,
-                                crate::statement::StatementOrigin::Subprogram,
-                                false,
-                            )),
-                            rows: Delta::new(),
-                            pending_len: current_len,
-                            cancel_btree: false,
-                            next_synthetic_rowid: SYNTHETIC_ROWID_BASE,
-                        }
-                    }
-                    crate::incremental::vdbe_maintenance::ViewShape::GroupAggregate { .. }
-                    | crate::incremental::vdbe_maintenance::ViewShape::Join { .. }
-                    | crate::incremental::vdbe_maintenance::ViewShape::Compound { .. }
-                    | crate::incremental::vdbe_maintenance::ViewShape::CompoundAll { .. } => {
-                        // Recompute: the defining query runs on this
-                        // connection and therefore sees the transaction's
-                        // uncommitted base-table changes. prepare_internal
-                        // takes the nested-statement guard so the inner
-                        // statement cannot commit the outer transaction.
-                        let sql = format!("{select}");
-                        OverlayBuild::RunningStatement {
-                            stmt: Box::new(self.connection.prepare_internal(&sql)?),
-                            rows: Delta::new(),
-                            pending_len: current_len,
-                            cancel_btree: true,
-                            next_synthetic_rowid: SYNTHETIC_ROWID_BASE,
-                        }
-                    }
-                };
-            }
-
-            match &mut self.overlay_build {
-                OverlayBuild::Idle => unreachable!("Idle was replaced above"),
-
-                OverlayBuild::RunningStatement {
-                    stmt,
-                    rows,
-                    pending_len,
-                    cancel_btree,
-                    next_synthetic_rowid,
-                } => match if *cancel_btree {
-                    // A normally-prepared statement: step() runs its full
-                    // busy/reprepare handling (the InitCdcVersion precedent).
-                    stmt.step()?
-                } else {
-                    stmt.step_subprogram()?
-                } {
-                    StepResult::Row => {
-                        let row = stmt.row().expect("Row step result must carry a row");
-                        let mut values: Vec<Value> = row.get_values().cloned().collect();
-                        if *cancel_btree {
-                            // Defining-query row: synthetic rowid, weight +1.
-                            let rowid = *next_synthetic_rowid;
-                            *next_synthetic_rowid += 1;
-                            rows.changes
-                                .push((HashableRow::new(rowid, values.into_iter().collect()), 1));
-                        } else {
-                            // Emit-mode program row: (rowid, columns.., weight).
-                            let weight = match values.pop() {
-                                Some(Value::Numeric(Numeric::Integer(w))) => w as isize,
-                                other => {
-                                    return Err(crate::LimboError::InternalError(format!(
-                                        "view overlay row has non-integer weight: {other:?}"
-                                    )))
-                                }
-                            };
-                            let rowid = match values.first() {
-                                Some(Value::Numeric(Numeric::Integer(rowid))) => *rowid,
-                                other => {
-                                    return Err(crate::LimboError::InternalError(format!(
-                                        "view overlay row has non-integer rowid: {other:?}"
-                                    )))
-                                }
-                            };
-                            values.remove(0);
-                            rows.changes.push((
-                                HashableRow::new(rowid, values.into_iter().collect()),
-                                weight,
-                            ));
-                        }
-                    }
-                    StepResult::IO | StepResult::Yield => {
-                        let Some(io) = stmt.take_io_completions() else {
-                            continue;
-                        };
-                        return Ok(IOResult::IO(io));
-                    }
-                    StepResult::Done => {
-                        let rows = std::mem::take(rows);
-                        let pending_len = *pending_len;
-                        if *cancel_btree {
-                            self.overlay_build = OverlayBuild::ScanningBtree {
-                                rows,
-                                pending_len,
-                                rewound: false,
-                            };
-                        } else {
-                            self.uncommitted = RowKeyZSet::from_delta(&rows);
-                            self.last_tx_state_len = pending_len;
-                            self.overlay_build = OverlayBuild::Idle;
-                            return Ok(IOResult::Done(()));
-                        }
-                    }
-                    StepResult::Busy => return Err(crate::LimboError::Busy),
-                    StepResult::Interrupt => return Err(crate::LimboError::Interrupt),
-                },
-
-                OverlayBuild::ScanningBtree {
-                    rows,
-                    pending_len,
-                    rewound,
-                } => {
-                    if !*rewound {
-                        return_if_io!(self.btree_cursor.rewind());
-                        *rewound = true;
-                    }
-                    loop {
-                        if self.btree_cursor.is_empty() {
-                            break;
-                        }
-                        let Some(rowid) = return_if_io!(self.btree_cursor.rowid()) else {
-                            break;
-                        };
-                        let record =
-                            return_if_io!(self.btree_cursor.record()).ok_or_else(|| {
-                                crate::LimboError::InternalError(
-                                    "materialized view row has a rowid but no record".to_string(),
-                                )
-                            })?;
-                        let mut values = record.get_values_owned()?;
-                        let weight = match values.pop() {
-                            Some(Value::Numeric(Numeric::Integer(w))) => w as isize,
-                            other => {
-                                return Err(crate::LimboError::InternalError(format!(
-                                    "materialized view row has non-integer weight: {other:?}"
-                                )))
-                            }
-                        };
-                        // Cancel the committed row so only the fresh result
-                        // remains after the merge.
-                        rows.changes.push((
-                            HashableRow::new(rowid, values.into_iter().collect()),
-                            -weight,
-                        ));
-                        return_if_io!(self.btree_cursor.next());
-                    }
-                    self.uncommitted = RowKeyZSet::from_delta(rows);
-                    self.last_tx_state_len = *pending_len;
-                    self.overlay_build = OverlayBuild::Idle;
-                    return Ok(IOResult::Done(()));
-                }
+        match crate::vdbe::step_view_delta_batch(
+            &self.connection,
+            &mut self.view_delta_state,
+            false,
+            &self.pager,
+        )? {
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+            IOResult::Done(()) => {
+                self.view_delta_state = crate::vdbe::ViewDeltaApplyState::NotStarted;
+                self.last_change_log_revision =
+                    self.connection.transaction_changes.change_revision();
+                Ok(IOResult::Done(()))
             }
         }
     }
 
-    // Read the current btree entry as a vector (empty if no current position)
-    fn read_btree_delta_entry(&mut self) -> Result<IOResult<Vec<(HashableRow, isize)>>> {
-        let btree_rowid = return_if_io!(self.btree_cursor.rowid());
-        let rowid = match btree_rowid {
-            None => return Ok(IOResult::Done(Vec::new())),
-            Some(rowid) => rowid,
+    /// Load the physical row under the btree cursor into the SQL-facing cache.
+    fn load_btree_row(&mut self) -> Result<IOResult<bool>> {
+        let Some(rowid) = return_if_io!(self.btree_cursor.rowid()) else {
+            self.current_row = None;
+            return Ok(IOResult::Done(false));
         };
 
-        let btree_record = return_if_io!(self.btree_cursor.record()).ok_or_else(|| {
+        let record = return_if_io!(self.btree_cursor.record()).ok_or_else(|| {
             crate::LimboError::InternalError(
                 "Invalid data in materialized view: found a rowid, but not the row!".to_string(),
             )
         })?;
-        let mut btree_values = btree_record.get_values_owned()?;
+        let mut values = record.get_values_owned()?;
 
-        // The last column should be the weight
-        let weight_value = btree_values.pop().ok_or_else(|| {
+        let weight_value = values.pop().ok_or_else(|| {
             crate::LimboError::InternalError(
                 "Invalid data in materialized view: no weight column found".to_string(),
             )
         })?;
 
-        // Convert the Value to isize weight
         let weight = match weight_value {
             Value::Numeric(Numeric::Integer(w)) => w as isize,
             _ => {
@@ -374,73 +141,8 @@ impl MaterializedViewCursor {
             )));
         }
 
-        // TODO: std boundary conversion; adjust once incremental uses the
-        // allocator with fallible allocations everywhere.
-        Ok(IOResult::Done(vec![(
-            HashableRow::new(rowid, btree_values.into_iter().collect()),
-            weight,
-        )]))
-    }
-
-    /// Process btree changes: merge with uncommitted, build zset, and determine result.
-    /// Returns the next state action: either Done with a result, or updates seek_state for another iteration.
-    fn process_btree_changes(
-        &mut self,
-        target: i64,
-        target_rowid: i64,
-        op: SeekOp,
-        changes: Vec<(HashableRow, isize)>,
-    ) -> Result<IOResult<()>> {
-        let mut btree_entries = Delta { changes };
-        let changes = self.uncommitted.seek(target, op);
-
-        let uncommitted_entries = Delta { changes };
-        btree_entries.merge(&uncommitted_entries);
-
-        // if empty pre-zset, means nothing was found. Empty post-zset can mean that
-        // we just canceled weights.
-        if btree_entries.is_empty() {
-            self.seek_state = SeekState::Done;
-            return Ok(IOResult::Done(()));
-        }
-
-        let min_seen = btree_entries
-            .changes
-            .first()
-            .expect("cannot be empty, we just tested for it")
-            .0
-            .rowid;
-        let max_seen = btree_entries
-            .changes
-            .last()
-            .expect("cannot be empty, we just tested for it")
-            .0
-            .rowid;
-
-        let zset = RowKeyZSet::from_delta(&btree_entries);
-        let ret = zset.seek(target_rowid, op);
-
-        if !ret.is_empty() {
-            let (row, _) = &ret[0];
-            self.current_row = Some((row.rowid, row.values.clone()));
-            self.seek_state = SeekState::Done;
-            return Ok(IOResult::Done(()));
-        }
-
-        let new_target = match op {
-            SeekOp::GT => Some(max_seen),
-            SeekOp::GE { eq_only: false } => Some(max_seen + 1),
-            SeekOp::LT => Some(min_seen),
-            SeekOp::LE { eq_only: false } => Some(min_seen - 1),
-            SeekOp::LE { eq_only: true } | SeekOp::GE { eq_only: true } => None,
-        };
-
-        if let Some(target) = new_target {
-            self.seek_state = SeekState::Seek { target };
-        } else {
-            self.seek_state = SeekState::Done;
-        }
-        Ok(IOResult::Done(()))
+        self.current_row = Some((rowid, values.into_iter().collect()));
+        Ok(IOResult::Done(true))
     }
 
     /// Internal seek implementation that doesn't check preconditions
@@ -460,33 +162,31 @@ impl MaterializedViewCursor {
                     let btree_result =
                         return_if_io!(self.btree_cursor.seek(SeekKey::TableRowId(target), op));
 
-                    let changes = match btree_result {
-                        SeekResult::Found => return_if_io!(self.read_btree_delta_entry()),
+                    match btree_result {
+                        SeekResult::Found => {
+                            let found = return_if_io!(self.load_btree_row());
+                            self.seek_state = SeekState::Done;
+                            return Ok(IOResult::Done(if found {
+                                SeekResult::Found
+                            } else {
+                                SeekResult::NotFound
+                            }));
+                        }
                         SeekResult::TryAdvance => {
                             // Transition to Advancing state before calling next/prev.
                             // This ensures that if next/prev returns IO, we resume in
                             // Advancing state and don't redundantly call seek again.
-                            self.seek_state = SeekState::Advancing { target, op };
+                            self.seek_state = SeekState::Advancing { op };
                             continue;
                         }
-                        SeekResult::NotFound => Vec::new(),
-                    };
-
-                    return_if_io!(self.process_btree_changes(target, target_rowid, op, changes));
-
-                    // Check if we're done or need to continue seeking
-                    if matches!(self.seek_state, SeekState::Done) {
-                        let result = if self.current_row.is_some() {
-                            SeekResult::Found
-                        } else {
-                            SeekResult::NotFound
-                        };
-                        return Ok(IOResult::Done(result));
+                        SeekResult::NotFound => {
+                            self.current_row = None;
+                            self.seek_state = SeekState::Done;
+                            return Ok(IOResult::Done(SeekResult::NotFound));
+                        }
                     }
-                    // Otherwise state is Seek with new target, loop continues
                 }
-                SeekState::Advancing { target, op } => {
-                    let target = *target;
+                SeekState::Advancing { op } => {
                     let op = *op;
 
                     // Cursor is positioned at the leaf but current entry doesn't match.
@@ -499,21 +199,13 @@ impl MaterializedViewCursor {
                             return_if_io!(self.btree_cursor.prev())
                         }
                     };
-                    // read_btree_delta_entry handles the case where cursor is at end
-                    let changes = return_if_io!(self.read_btree_delta_entry());
-
-                    return_if_io!(self.process_btree_changes(target, target_rowid, op, changes));
-
-                    // Check if we're done or need to continue seeking
-                    if matches!(self.seek_state, SeekState::Done) {
-                        let result = if self.current_row.is_some() {
-                            SeekResult::Found
-                        } else {
-                            SeekResult::NotFound
-                        };
-                        return Ok(IOResult::Done(result));
-                    }
-                    // Otherwise state is Seek with new target, loop continues
+                    let found = return_if_io!(self.load_btree_row());
+                    self.seek_state = SeekState::Done;
+                    return Ok(IOResult::Done(if found {
+                        SeekResult::Found
+                    } else {
+                        SeekResult::NotFound
+                    }));
                 }
                 SeekState::Done => {
                     // We always return before setting the state to done. Meaning if we got here,
@@ -649,7 +341,7 @@ mod tests {
         conn: &Arc<Connection>,
     ) -> Result<(
         MaterializedViewCursor,
-        Arc<ViewTransactionState>,
+        Arc<ViewChangeSubscription>,
         Arc<Pager>,
     )> {
         // Get the schema and view
@@ -675,16 +367,10 @@ mod tests {
         let btree_cursor = Box::new(BTreeCursor::new(pager.clone(), root_page, num_columns));
 
         // Get or create transaction state for this view
-        let tx_state = conn.view_transaction_states.get_or_create("test_view");
+        let tx_state = conn.transaction_changes.view_subscription("test_view");
 
         // Create the materialized view cursor
-        let cursor = MaterializedViewCursor::new(
-            btree_cursor,
-            view_mutex.clone(),
-            pager.clone(),
-            conn.clone(),
-            tx_state.clone(),
-        )?;
+        let cursor = MaterializedViewCursor::new(btree_cursor, pager.clone(), conn.clone())?;
 
         Ok((cursor, tx_state, pager))
     }
@@ -698,9 +384,9 @@ mod tests {
         Ok(())
     }
 
-    /// Helper to apply changes through ViewTransactionState
+    /// Helper to apply changes through a view's shared-log subscription.
     fn apply_changes_to_tx_state(
-        tx_state: &ViewTransactionState,
+        tx_state: &ViewChangeSubscription,
         changes: Vec<(i64, Vec<Value>, isize)>,
     ) {
         for (rowid, values, weight) in changes {
@@ -2145,16 +1831,7 @@ mod tests {
         fn test_seek_not_repeated_after_io_during_try_advance() -> Result<()> {
             let conn = create_test_connection()?;
 
-            // Get the view for creating a cursor
-            let view_mutex = conn
-                .schema
-                .read()
-                .get_materialized_view("test_view")
-                .ok_or_else(|| crate::LimboError::InternalError("View not found".to_string()))?;
-
             let pager = conn.get_pager();
-            let tx_state = conn.view_transaction_states.get_or_create("test_view");
-
             // Create mock cursor that returns TryAdvance from seek and IO from next
             let mock_cursor = MockBTreeCursor::new();
             let mock_cursor_box: Box<dyn CursorTrait> = Box::new(mock_cursor);
@@ -2163,8 +1840,7 @@ mod tests {
             // We need to use Any::downcast to access the mock's methods
             let mock_ptr = mock_cursor_box.as_ref() as *const dyn CursorTrait;
 
-            let mut cursor =
-                MaterializedViewCursor::new(mock_cursor_box, view_mutex, pager, conn, tx_state)?;
+            let mut cursor = MaterializedViewCursor::new(mock_cursor_box, pager, conn)?;
 
             // Use LE so that rowid=1 satisfies the condition (1 <= 5)
             let seek_op = SeekOp::LE { eq_only: false };

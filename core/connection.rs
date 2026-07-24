@@ -23,12 +23,12 @@ use crate::{
     translate,
     translate::collate::CollationSeq,
     util::IOExt,
-    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
-    BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
-    Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
-    EncryptionKey, EncryptionOpts, IOResult, IndexMethod, LimboError, MvStore, OpenFlags, PageSize,
-    Pager, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
-    Trigger, Value, VirtualTable, WalAutoActions,
+    vdbe, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler, BusyHandlerCallback,
+    CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion,
+    ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration, EncryptionKey,
+    EncryptionOpts, IOResult, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
+    Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, Trigger,
+    Value, VirtualTable, WalAutoActions,
 };
 use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
@@ -125,6 +125,9 @@ pub(crate) struct NamedSavepointFrame {
     pub(crate) name: String,
     pub(crate) starts_transaction: bool,
     pub(crate) deferred_fk_violations: isize,
+    /// Global change-log position at SAVEPOINT begin. Named savepoints are
+    /// independent of statement subtransaction marks.
+    pub(crate) change_log_mark: crate::incremental::view::ChangeLogMark,
     /// Snapshot of `conn.schema` taken at SAVEPOINT begin. Used by
     /// ROLLBACK TO to restore the in-memory main schema without re-
     /// reading sqlite_schema from disk — disk reparse from inside a
@@ -153,6 +156,7 @@ pub(crate) struct RollbackFrameInfo {
     pub(crate) main_schema_snapshot: Arc<Schema>,
     pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+    pub(crate) change_log_mark: crate::incremental::view::ChangeLogMark,
 }
 
 struct SchemaReparseGuard {
@@ -428,9 +432,12 @@ pub struct Connection {
     #[cfg(any(test, injected_yields))]
     pub(super) yield_instance_id_counter: AtomicU64,
 
-    /// Per-connection view transaction states for uncommitted changes. This represents
-    /// one entry per view that was touched in the transaction.
-    pub(crate) view_transaction_states: AllViewsTxState,
+    /// Ordered row changes captured once per connection transaction, with
+    /// consumer indexes for materialized-view maintenance.
+    pub(crate) transaction_changes: crate::incremental::view::TransactionChanges,
+    /// Prepared IVM bytecode keyed by schema epoch and physical view layout.
+    pub(crate) maintenance_program_cache:
+        crate::incremental::vdbe_maintenance::MaintenanceProgramCache,
     /// Connection-level metrics aggregation
     pub metrics: RwLock<ConnectionMetrics>,
     /// Greater than zero if connection executes a program within a program
@@ -4809,6 +4816,7 @@ impl Connection {
             main_schema_snapshot: frame.main_schema_snapshot.clone(),
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
             staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
+            change_log_mark: frame.change_log_mark,
         };
         // ROLLBACK TO keeps the target savepoint itself on the stack;
         // only nested savepoints above it are discarded.
@@ -4848,7 +4856,7 @@ impl Connection {
         // The entire transaction is being rolled back, so every materialized
         // view delta captured within it is void. Leaving them behind would
         // apply phantom changes to the views at the next successful commit.
-        self.view_transaction_states.clear();
+        self.transaction_changes.clear();
     }
 
     /// Roll back transaction state for helpers that start a manual `BEGIN`

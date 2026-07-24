@@ -386,7 +386,7 @@ pub fn translate_insert(
         }
         if !resolver
             .schema()
-            .get_dependent_materialized_views(table_name.as_str())
+            .get_dependent_materialized_views(&btree_table.name)
             .is_empty()
         {
             crate::bail_parse_error!(
@@ -947,7 +947,9 @@ pub fn translate_insert(
         key_reg: insertion.key_register(),
         record_reg: insertion.record_register(),
         flag: insert_flags,
-        table_name: table_name.to_string(),
+        // Runtime change attribution must use the resolved table identity,
+        // not the SQL token spelling (`"t"`, `[t]`, aliases, case, ...).
+        table_name: btree_table.name.clone(),
     });
 
     // Fire AFTER INSERT triggers
