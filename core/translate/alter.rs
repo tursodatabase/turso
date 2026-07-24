@@ -2307,6 +2307,14 @@ pub fn translate_alter_table(
     Ok(())
 }
 
+// Return the indexes whose persisted entries may become stale after ALTER COLUMN,
+// rewritten to match the post-ALTER table metadata. We consider both the old and
+// new generated-column dependency graphs so direct indexes, expression indexes,
+// partial-index WHERE clauses, and indexes on dependent generated columns are
+// rebuilt when their computed keys can change.
+// Example: `x NUMERIC -> y TEXT` requires rebuilding `INDEX ON t(x)` with TEXT
+// keys; `g AS ('old:' || a) -> g AS ('new:' || a)` requires rebuilding
+// `INDEX ON t(g)` even though `g` is virtual and table rows are not rewritten.
 fn indexes_affected_by_column_rewrite(
     original_table: &BTreeTable,
     rewritten_table: &BTreeTable,
@@ -2364,6 +2372,12 @@ fn affected_column_names(
     names
 }
 
+// Return true if this index observes any column whose value may change under the
+// rewritten table schema. Direct index columns are checked by column position,
+// while expression-index terms and partial-index WHERE clauses are checked by
+// resolving their column dependencies.
+// Example: `INDEX ON t(z) WHERE typeof(x) = 'text'` must be rebuilt when
+// `x NUMERIC -> y TEXT`, even though `x` is not part of the stored index key.
 fn index_references_rewritten_column(
     index: &Index,
     table: &BTreeTable,
@@ -2397,6 +2411,12 @@ fn expr_references_any_affected_column(
         .any(|name| affected_names.contains(name))
 }
 
+// Build the post-ALTER index metadata used when refilling an affected index.
+// Expression-index terms and partial-index WHERE clauses need identifier
+// rewrites, while direct index columns need to be refreshed from the rewritten
+// table so renamed columns and generated-column expressions stay in sync.
+// Example: after `x NUMERIC -> y TEXT`, `INDEX ON t(typeof(x)) WHERE x IS NOT NULL`
+// must be refilled as `INDEX ON t(typeof(y)) WHERE y IS NOT NULL`.
 fn rewrite_index_for_column_rewrite(
     index: &Index,
     rewritten_table: &BTreeTable,
