@@ -1232,12 +1232,13 @@ fn parse_table(
         schema.get_materialized_view(table_name.as_str())
     });
     if let Some(view) = view {
-        // First check if the DBSP state table exists with the correct version
-        let has_compatible_state = resolver.with_schema(database_id, |schema| {
-            schema.has_compatible_dbsp_state_table(table_name.as_str())
+        // Every materialized view carries an explicit storage-version marker,
+        // including circuits with no stateful operators.
+        let has_compatible_storage = resolver.with_schema(database_id, |schema| {
+            schema.has_compatible_materialized_view_storage(table_name.as_str())
         });
 
-        if !has_compatible_state {
+        if !has_compatible_storage {
             use crate::incremental::view::DBSP_CIRCUIT_VERSION;
             return Err(crate::LimboError::InternalError(format!(
                 "Materialized view '{table_name}' has an incompatible version. \n\

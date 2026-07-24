@@ -53,7 +53,18 @@ use turso_parser::{
 /// v11: SQL binding-rowid provenance is stored independently from operator
 /// transport identity in ephemeral streams, arrangements, and LEFT-join
 /// padded-row state.
-pub const DBSP_CIRCUIT_VERSION: u32 = 11;
+///
+/// v12: every materialized view owns an explicit version marker, including
+/// stateless views with no operator state. Absence of the current marker is
+/// incompatible rather than being treated as an implicitly current layout.
+pub const DBSP_CIRCUIT_VERSION: u32 = 12;
+
+pub(crate) fn dbsp_version_marker_table_name(view_name: &str) -> String {
+    format!(
+        "{}{DBSP_CIRCUIT_VERSION}_{view_name}",
+        crate::schema::DBSP_METADATA_TABLE_PREFIX
+    )
+}
 
 /// Whether a version-stripped hidden-state key belongs to `view_name`.
 ///
@@ -77,6 +88,12 @@ pub(crate) fn state_key_belongs_to_view(key: &str, view_name: &str) -> bool {
 /// Whether a complete hidden state/multiset table name belongs to a view,
 /// independent of the storage version embedded in that table name.
 pub(crate) fn state_table_belongs_to_view(table_name: &str, view_name: &str) -> bool {
+    if let Some((_, stored_view_name)) = table_name
+        .strip_prefix(crate::schema::DBSP_METADATA_TABLE_PREFIX)
+        .and_then(|suffix| suffix.split_once('_'))
+    {
+        return stored_view_name == view_name;
+    }
     table_name
         .strip_prefix(crate::schema::DBSP_TABLE_PREFIX)
         .or_else(|| table_name.strip_prefix(crate::schema::DBSP_MULTISET_TABLE_PREFIX))
