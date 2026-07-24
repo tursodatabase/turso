@@ -120,9 +120,6 @@ fn validate_stream_expr(
 /// ([`resolve_window_and_aggregate_functions`]); this is only the IVM gate on
 /// top of it.
 fn validate_supported_aggregate(agg: &Aggregate) -> Result<()> {
-    if agg.filter_expr.is_some() {
-        return unsupported("FILTER clauses on aggregates");
-    }
     match agg.func {
         AggFunc::Count0
         | AggFunc::Count

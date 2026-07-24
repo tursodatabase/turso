@@ -566,6 +566,138 @@ expect {
     1
 }
 
+# FILTER gates each aggregate's contribution independently of group
+# liveness. Predicate crossings and retractions must also gate the aggregate's
+# private DISTINCT/MIN multiset.
+test matview-vdbe-grouped-aggregate-filter {
+    CREATE TABLE aggregate_filter_grouped(
+      id INTEGER PRIMARY KEY,
+      g TEXT,
+      x INTEGER,
+      enabled INTEGER
+    );
+    INSERT INTO aggregate_filter_grouped VALUES
+      (1, 'a', 10, 1),
+      (2, 'a', 20, 0),
+      (3, 'a', 30, NULL),
+      (4, 'b', 5, 0);
+    CREATE MATERIALIZED VIEW aggregate_filter_grouped_view AS
+      SELECT
+        g,
+        COUNT(*) AS all_rows,
+        COUNT(*) FILTER (WHERE enabled) AS enabled_rows,
+        SUM(x) FILTER (WHERE enabled) AS enabled_sum,
+        COUNT(DISTINCT x) FILTER (WHERE enabled) AS enabled_distinct,
+        MIN(x) FILTER (WHERE enabled) AS enabled_min
+      FROM aggregate_filter_grouped
+      GROUP BY g;
+    SELECT * FROM aggregate_filter_grouped_view ORDER BY g;
+    INSERT INTO aggregate_filter_grouped VALUES (5, 'a', 10, 1);
+    SELECT * FROM aggregate_filter_grouped_view WHERE g = 'a';
+    UPDATE aggregate_filter_grouped SET enabled = 1 WHERE id = 2;
+    SELECT * FROM aggregate_filter_grouped_view WHERE g = 'a';
+    DELETE FROM aggregate_filter_grouped WHERE id IN (1, 5);
+    SELECT * FROM aggregate_filter_grouped_view WHERE g = 'a';
+    UPDATE aggregate_filter_grouped SET g = 'b' WHERE id = 2;
+    SELECT * FROM aggregate_filter_grouped_view ORDER BY g;
+    DELETE FROM aggregate_filter_grouped WHERE id = 3;
+    SELECT * FROM aggregate_filter_grouped_view ORDER BY g;
+}
+expect {
+    a|3|1|10|1|10
+    b|1|0||0|
+    a|4|2|20|1|10
+    a|4|3|40|2|10
+    a|2|1|20|1|20
+    a|1|0||0|
+    b|2|1|20|1|20
+    b|2|1|20|1|20
+}
+
+# Scalar aggregates retain their always-present row. An empty input and a
+# non-empty input for which FILTER is never true have the same filtered
+# aggregate values, while the unfiltered count still observes every row.
+test matview-vdbe-scalar-aggregate-filter {
+    CREATE TABLE aggregate_filter_scalar(
+      id INTEGER PRIMARY KEY,
+      x INTEGER,
+      enabled INTEGER
+    );
+    CREATE MATERIALIZED VIEW aggregate_filter_scalar_view AS
+      SELECT
+        COUNT(*) AS all_rows,
+        COUNT(*) FILTER (WHERE enabled) AS enabled_rows,
+        SUM(x) FILTER (WHERE enabled) AS enabled_sum,
+        COUNT(DISTINCT x) FILTER (WHERE enabled) AS enabled_distinct,
+        MAX(x) FILTER (WHERE enabled) AS enabled_max
+      FROM aggregate_filter_scalar;
+    SELECT * FROM aggregate_filter_scalar_view;
+    INSERT INTO aggregate_filter_scalar VALUES (1, 1, 0), (2, 2, NULL);
+    SELECT * FROM aggregate_filter_scalar_view;
+    INSERT INTO aggregate_filter_scalar VALUES (3, 4, 1), (4, 4, 2);
+    SELECT * FROM aggregate_filter_scalar_view;
+    UPDATE aggregate_filter_scalar SET x = 7, enabled = 1 WHERE id = 1;
+    SELECT * FROM aggregate_filter_scalar_view;
+    DELETE FROM aggregate_filter_scalar WHERE id = 3;
+    SELECT * FROM aggregate_filter_scalar_view;
+    UPDATE aggregate_filter_scalar SET enabled = NULL WHERE id = 1;
+    SELECT * FROM aggregate_filter_scalar_view;
+    DELETE FROM aggregate_filter_scalar;
+    SELECT * FROM aggregate_filter_scalar_view;
+}
+expect {
+    0|0||0|
+    2|0||0|
+    4|2|8|1|4
+    4|3|15|2|7
+    3|2|11|2|7
+    3|1|4|1|4
+    0|0||0|
+}
+
+# A filtered aggregate over a join resolves its predicate from the same typed
+# delta contract as its argument. Updates on either side can cross the filter
+# without a second expression evaluator.
+test matview-vdbe-join-aggregate-filter {
+    CREATE TABLE aggregate_filter_orders(
+      id INTEGER PRIMARY KEY,
+      customer_id INTEGER,
+      amount INTEGER
+    );
+    CREATE TABLE aggregate_filter_customers(
+      id INTEGER PRIMARY KEY,
+      active INTEGER
+    );
+    INSERT INTO aggregate_filter_customers VALUES (1, 1), (2, 0);
+    INSERT INTO aggregate_filter_orders VALUES
+      (1, 1, 5),
+      (2, 1, 7),
+      (3, 2, 9);
+    CREATE MATERIALIZED VIEW aggregate_filter_join_view AS
+      SELECT
+        o.customer_id,
+        COUNT(*) AS matched_rows,
+        SUM(o.amount) FILTER (WHERE c.active AND o.amount > 5) AS active_sum,
+        COUNT(*) FILTER (WHERE c.active AND o.amount > 5) AS active_count
+      FROM aggregate_filter_orders AS o
+      JOIN aggregate_filter_customers AS c ON o.customer_id = c.id
+      GROUP BY o.customer_id;
+    SELECT * FROM aggregate_filter_join_view ORDER BY customer_id;
+    UPDATE aggregate_filter_customers SET active = NOT active;
+    SELECT * FROM aggregate_filter_join_view ORDER BY customer_id;
+    UPDATE aggregate_filter_orders SET amount = 10 WHERE id = 1;
+    UPDATE aggregate_filter_customers SET active = 1 WHERE id = 1;
+    SELECT * FROM aggregate_filter_join_view ORDER BY customer_id;
+}
+expect {
+    1|2|7|1
+    2|1||0
+    1|2||0
+    2|1|9|1
+    1|2|17|2
+    2|1|9|1
+}
+
 # HAVING without GROUP BY gates the single row: over an empty table the
 # predicate sees empty-input aggregates and typically suppresses it.
 test matview-vdbe-scalar-having {
