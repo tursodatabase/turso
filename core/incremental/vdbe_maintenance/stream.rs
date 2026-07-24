@@ -168,12 +168,6 @@ pub(super) fn base_arrangement(
     )
 }
 
-/// Persistent materialized-view table at the root of a maintenance circuit.
-pub(super) struct ViewSink {
-    pub(super) root_page: i64,
-    pub(super) num_columns: usize,
-}
-
 pub(super) fn open_ephemeral_delta(
     program: &mut ProgramBuilder,
     name: &str,
