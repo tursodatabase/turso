@@ -32,3 +32,33 @@ fn root_exports_match_module_definitions() {
     fn takes_connection(_: turso_serverless::connection::Connection) {}
     let _ = takes_connection;
 }
+
+/// Pins the transaction API surface shared with the embedded driver:
+/// `DropBehavior`, `Transaction::{new, new_unchecked, prepare,
+/// drop_behavior, set_drop_behavior, finish}`, and
+/// `Connection::{unchecked_transaction, set_transaction_behavior}`.
+#[allow(dead_code)]
+async fn transaction_api_surface(
+    conn: &mut turso_serverless::Connection,
+) -> turso_serverless::Result<()> {
+    use turso_serverless::transaction::{DropBehavior, Transaction, TransactionBehavior};
+
+    conn.set_transaction_behavior(TransactionBehavior::Immediate);
+    {
+        let tx = conn.unchecked_transaction().await?;
+        let _stmt: turso_serverless::Statement = tx.prepare("SELECT 1").await?;
+        tx.finish().await?;
+    }
+    let mut tx = Transaction::new(conn, TransactionBehavior::Deferred).await?;
+    let _: DropBehavior = tx.drop_behavior();
+    tx.set_drop_behavior(DropBehavior::Commit);
+    tx.commit().await?;
+    let tx = Transaction::new_unchecked(&*conn, TransactionBehavior::Deferred).await?;
+    tx.rollback().await?;
+    Ok(())
+}
+
+#[test]
+fn transaction_api_surface_compiles() {
+    let _ = transaction_api_surface;
+}

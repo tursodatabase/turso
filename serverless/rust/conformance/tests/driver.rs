@@ -4,6 +4,7 @@
 //! Requires `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`; every test skips
 //! when they are not set.
 
+use turso_serverless::transaction::{DropBehavior, TransactionBehavior};
 use turso_serverless::{named_params, Builder, Connection, Error, Value};
 use turso_serverless_conformance::{config_or_skip, unique_name};
 
@@ -354,6 +355,131 @@ async fn dropped_transaction_rolls_back() {
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 0);
     assert!(conn.is_autocommit().unwrap());
+
+    drop_table(&conn, &table).await;
+}
+
+#[tokio::test]
+async fn dropped_transaction_with_commit_drop_behavior_commits() {
+    let config = config_or_skip!();
+    let mut conn = connect(&config.url, &config.auth_token).await;
+    let table = unique_name("t_txdc");
+
+    conn.execute(format!("CREATE TABLE {table} (x INTEGER)"), ())
+        .await
+        .unwrap();
+
+    {
+        let mut tx = conn.transaction().await.unwrap();
+        assert_eq!(tx.drop_behavior(), DropBehavior::Rollback);
+        tx.execute(format!("INSERT INTO {table} VALUES (1)"), ())
+            .await
+            .unwrap();
+        tx.set_drop_behavior(DropBehavior::Commit);
+        // Dropped without commit; the drop behavior commits on next use.
+    }
+
+    let mut rows = conn
+        .query(format!("SELECT count(*) FROM {table}"), ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+    assert!(conn.is_autocommit().unwrap());
+
+    drop_table(&conn, &table).await;
+}
+
+#[tokio::test]
+async fn transaction_finish_applies_drop_behavior() {
+    let config = config_or_skip!();
+    let mut conn = connect(&config.url, &config.auth_token).await;
+    let table = unique_name("t_txf");
+
+    conn.execute(format!("CREATE TABLE {table} (x INTEGER)"), ())
+        .await
+        .unwrap();
+
+    // Default drop behavior: finish rolls back.
+    let tx = conn.transaction().await.unwrap();
+    tx.execute(format!("INSERT INTO {table} VALUES (1)"), ())
+        .await
+        .unwrap();
+    tx.finish().await.unwrap();
+    assert!(conn.is_autocommit().unwrap());
+
+    // Commit drop behavior: finish commits.
+    let mut tx = conn.transaction().await.unwrap();
+    tx.execute(format!("INSERT INTO {table} VALUES (2)"), ())
+        .await
+        .unwrap();
+    tx.set_drop_behavior(DropBehavior::Commit);
+    tx.finish().await.unwrap();
+
+    let mut rows = conn
+        .query(format!("SELECT sum(x) FROM {table}"), ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 2);
+
+    drop_table(&conn, &table).await;
+}
+
+#[tokio::test]
+async fn unchecked_transaction_rejects_nesting_at_runtime() {
+    let config = config_or_skip!();
+    let conn = connect(&config.url, &config.auth_token).await;
+    let table = unique_name("t_txu");
+
+    conn.execute(format!("CREATE TABLE {table} (x INTEGER)"), ())
+        .await
+        .unwrap();
+
+    let tx = conn.unchecked_transaction().await.unwrap();
+    tx.execute(format!("INSERT INTO {table} VALUES (1)"), ())
+        .await
+        .unwrap();
+    // A nested transaction fails at runtime without disturbing the outer
+    // transaction.
+    tx.unchecked_transaction().await.unwrap_err();
+    tx.execute(format!("INSERT INTO {table} VALUES (2)"), ())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut rows = conn
+        .query(format!("SELECT sum(x) FROM {table}"), ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 3);
+
+    drop_table(&conn, &table).await;
+}
+
+#[tokio::test]
+async fn set_transaction_behavior_applies_to_new_transactions() {
+    let config = config_or_skip!();
+    let mut conn = connect(&config.url, &config.auth_token).await;
+    let table = unique_name("t_txb");
+
+    conn.execute(format!("CREATE TABLE {table} (x INTEGER)"), ())
+        .await
+        .unwrap();
+
+    conn.set_transaction_behavior(TransactionBehavior::Immediate);
+    let tx = conn.transaction().await.unwrap();
+    let mut stmt = tx.prepare(&format!("INSERT INTO {table} VALUES (?)")).await.unwrap();
+    stmt.execute((1,)).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let mut rows = conn
+        .query(format!("SELECT count(*) FROM {table}"), ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
 
     drop_table(&conn, &table).await;
 }

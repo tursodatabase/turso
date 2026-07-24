@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -8,7 +8,7 @@ use crate::protocol::{encode_value, NamedArg, Stmt, StreamRequest, StreamRespons
 use crate::rows::{Row, Rows};
 use crate::session::{Session, SharedState};
 use crate::statement::Statement;
-use crate::transaction::{Transaction, TransactionBehavior};
+use crate::transaction::{DropBehavior, Transaction, TransactionBehavior};
 use crate::{Column, Error, Result};
 
 /// A connection to a remote database.
@@ -21,7 +21,14 @@ use crate::{Column, Error, Result};
 pub struct Connection {
     session: Arc<Mutex<Session>>,
     shared: Arc<SharedState>,
-    needs_rollback: Arc<AtomicBool>,
+    transaction_behavior: TransactionBehavior,
+    /// If a [`Transaction`] was dropped without being finished, this holds
+    /// the [`DropBehavior`] to apply, and the corresponding action runs
+    /// before the connection's next statement. The work is deferred
+    /// because `Drop` cannot perform an HTTP request. [`DropBehavior::Ignore`]
+    /// means there is nothing to do. Shared across clones because clones
+    /// share the stream that carries the transaction.
+    dangling_tx: Arc<AtomicU8>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -61,7 +68,8 @@ impl Connection {
         Self {
             session: Arc::new(Mutex::new(session)),
             shared,
-            needs_rollback: Arc::new(AtomicBool::new(false)),
+            transaction_behavior: TransactionBehavior::Deferred,
+            dangling_tx: Arc::new(AtomicU8::new(DropBehavior::Ignore.into())),
         }
     }
 
@@ -69,7 +77,7 @@ impl Connection {
     pub async fn query(&self, sql: impl AsRef<str>, params: impl IntoParams) -> Result<Rows> {
         let stmt = build_stmt(sql.as_ref(), params.into_params()?, true)?;
         let mut session = self.session.lock().await;
-        self.rollback_if_needed(&mut session).await;
+        self.maybe_handle_dangling_tx(&mut session).await?;
         let output = session.execute_cursor_stmt(stmt).await?;
         Ok(Rows::new(output.columns, output.rows))
     }
@@ -78,7 +86,7 @@ impl Connection {
     pub async fn execute(&self, sql: impl AsRef<str>, params: impl IntoParams) -> Result<u64> {
         let stmt = build_stmt(sql.as_ref(), params.into_params()?, false)?;
         let mut session = self.session.lock().await;
-        self.rollback_if_needed(&mut session).await;
+        self.maybe_handle_dangling_tx(&mut session).await?;
         let results = session
             .pipeline(vec![StreamRequest::Execute { stmt }], true)
             .await?;
@@ -108,7 +116,7 @@ impl Connection {
     /// Execution stops at the first statement that fails.
     pub async fn execute_batch(&self, sql: impl AsRef<str>) -> Result<()> {
         let mut session = self.session.lock().await;
-        self.rollback_if_needed(&mut session).await;
+        self.maybe_handle_dangling_tx(&mut session).await?;
         let results = session
             .pipeline(
                 vec![StreamRequest::Sequence {
@@ -133,7 +141,7 @@ impl Connection {
     pub async fn prepare(&self, sql: impl AsRef<str>) -> Result<Statement> {
         let sql = sql.as_ref();
         let mut session = self.session.lock().await;
-        self.rollback_if_needed(&mut session).await;
+        self.maybe_handle_dangling_tx(&mut session).await?;
         let results = session
             .pipeline(
                 vec![StreamRequest::Describe {
@@ -164,9 +172,11 @@ impl Connection {
         }
     }
 
-    /// Begin a new transaction with the default behavior (DEFERRED).
+    /// Begin a new transaction with the connection's default behavior
+    /// (DEFERRED unless changed with
+    /// [`set_transaction_behavior`](Connection::set_transaction_behavior)).
     pub async fn transaction(&mut self) -> Result<Transaction<'_>> {
-        self.transaction_with_behavior(TransactionBehavior::Deferred)
+        self.transaction_with_behavior(self.transaction_behavior)
             .await
     }
 
@@ -176,6 +186,29 @@ impl Connection {
         behavior: TransactionBehavior,
     ) -> Result<Transaction<'_>> {
         Transaction::new(self, behavior).await
+    }
+
+    /// Begin a new transaction with the connection's default behavior.
+    ///
+    /// An attempt to open a nested transaction will result in an error.
+    /// [`Connection::transaction`] prevents this at compile time by taking
+    /// `&mut self`, but `Connection::unchecked_transaction()` may be used
+    /// to defer the checking until runtime.
+    ///
+    /// See [`Connection::transaction`] and [`Transaction::new_unchecked`]
+    /// (which can be used if the default transaction behavior is
+    /// undesirable).
+    pub async fn unchecked_transaction(&self) -> Result<Transaction<'_>> {
+        Transaction::new_unchecked(self, self.transaction_behavior).await
+    }
+
+    /// Set the default transaction behavior for the connection.
+    ///
+    /// This will only apply to transactions initiated by
+    /// [`transaction`](Connection::transaction) or
+    /// [`unchecked_transaction`](Connection::unchecked_transaction).
+    pub fn set_transaction_behavior(&mut self, behavior: TransactionBehavior) {
+        self.transaction_behavior = behavior;
     }
 
     /// Execute a PRAGMA query and call a closure for each result row.
@@ -232,23 +265,43 @@ impl Connection {
         Ok(())
     }
 
-    pub(crate) fn set_needs_rollback(&self) {
-        self.needs_rollback.store(true, Ordering::Relaxed);
+    pub(crate) fn set_dangling_tx(&self, behavior: DropBehavior) {
+        self.dangling_tx.store(behavior.into(), Ordering::SeqCst);
     }
 
-    /// Roll back a transaction left open by a dropped [`Transaction`].
-    /// Runs before the next statement so the statement does not silently
-    /// join (or commit as part of) an abandoned transaction. Errors are
-    /// ignored: if the stream is already gone, the server rolled back.
-    async fn rollback_if_needed(&self, session: &mut Session) {
-        if !self.needs_rollback.swap(false, Ordering::Relaxed) {
-            return;
+    /// Complete a transaction left open by a dropped [`Transaction`],
+    /// applying its [`DropBehavior`]. Runs before the next statement so
+    /// the statement does not silently join (or commit as part of) an
+    /// abandoned transaction. Rollback errors are ignored: if the stream
+    /// is already gone, the server rolled back. Commit errors propagate,
+    /// because silently losing a commit would be a durability violation.
+    async fn maybe_handle_dangling_tx(&self, session: &mut Session) -> Result<()> {
+        let behavior: DropBehavior = self.dangling_tx.load(Ordering::SeqCst).into();
+        let sql = match behavior {
+            DropBehavior::Ignore => return Ok(()),
+            DropBehavior::Panic => panic!("Transaction dropped unexpectedly."),
+            DropBehavior::Rollback => "ROLLBACK",
+            DropBehavior::Commit => "COMMIT",
+        };
+        self.set_dangling_tx(DropBehavior::Ignore);
+        if self.shared.autocommit.load(Ordering::Relaxed) {
+            return Ok(());
         }
-        if !self.shared.autocommit.load(Ordering::Relaxed) {
-            let stmt = Stmt::new("ROLLBACK", false);
-            let _ = session
-                .pipeline(vec![StreamRequest::Execute { stmt }], true)
-                .await;
+        let stmt = Stmt::new(sql, false);
+        let results = session
+            .pipeline(vec![StreamRequest::Execute { stmt }], true)
+            .await;
+        if behavior == DropBehavior::Commit {
+            match results?.into_iter().next() {
+                Some(StreamResult::Ok { .. }) => {}
+                Some(StreamResult::Error { error }) => return Err(error.into()),
+                None => {
+                    return Err(Error::Http(
+                        "missing execute result in pipeline response".to_string(),
+                    ))
+                }
+            }
         }
+        Ok(())
     }
 }
