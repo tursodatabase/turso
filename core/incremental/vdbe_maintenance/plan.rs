@@ -355,24 +355,8 @@ fn build_select_plan_dag(
         }
     }
 
-    let is_distinct = plan.distinctness.is_distinct();
-    if is_distinct && (plan.group_by.is_some() || !plan.aggregates.is_empty()) {
-        return unsupported("DISTINCT over aggregates");
-    }
-    let is_aggregate = plan.group_by.is_some() || !plan.aggregates.is_empty() || is_distinct;
-    if is_aggregate {
-        let (group_exprs, group_collations, scalar) = if is_distinct {
-            let mut exprs = Vec::with_capacity(plan.result_columns.len());
-            let mut collations = Vec::with_capacity(plan.result_columns.len());
-            for column in &plan.result_columns {
-                collations.push(
-                    plan_expr_collation(&column.expr, &plan.table_references, resolver)?
-                        .unwrap_or(CollationSeq::Binary),
-                );
-                exprs.push(column.expr.clone());
-            }
-            (exprs, collations, false)
-        } else if plan
+    if plan.group_by.is_some() || !plan.aggregates.is_empty() {
+        let (group_exprs, group_collations, scalar) = if plan
             .group_by
             .as_ref()
             .is_some_and(|group_by| !group_by.exprs.is_empty())
@@ -400,14 +384,7 @@ fn build_select_plan_dag(
         for aggregate in &plan.aggregates {
             let mut normalized = aggregate.clone();
             normalized.fraction_reg = None;
-            if !aggregates.iter().any(|existing| {
-                crate::util::exprs_are_equivalent(
-                    &existing.original_expr,
-                    &normalized.original_expr,
-                )
-            }) {
-                aggregates.push(normalized);
-            }
+            aggregates.push(normalized);
         }
         let mut multiset_collations = Vec::with_capacity(aggregates.len());
         for aggregate in &aggregates {
@@ -448,15 +425,39 @@ fn build_select_plan_dag(
         }
     }
 
-    let projections = plan
+    let result_exprs = plan
         .result_columns
         .iter()
         .map(|column| column.expr.clone())
-        .collect();
-    builder.push(dag::OpNode::Project {
+        .collect::<Vec<_>>();
+    node = builder.push(dag::OpNode::Project {
         input: node,
-        projections,
-    })
+        projections: result_exprs.clone(),
+    })?;
+
+    if plan.distinctness.is_distinct() {
+        let group_collations = result_exprs
+            .iter()
+            .map(|expr| {
+                Ok(plan_expr_collation(expr, &plan.table_references, resolver)?
+                    .unwrap_or(CollationSeq::Binary))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        node = builder.push(dag::OpNode::Aggregate {
+            input: node,
+            group_exprs: result_exprs.clone(),
+            group_collations,
+            aggregates: hidden_count_aggregate(resolver)?,
+            multiset_collations: vec![None],
+            scalar: false,
+        })?;
+        node = builder.push(dag::OpNode::Project {
+            input: node,
+            projections: result_exprs,
+        })?;
+    }
+
+    Ok(node)
 }
 
 fn combine_predicates(mut predicates: Vec<ast::Expr>) -> Option<ast::Expr> {
