@@ -15098,34 +15098,6 @@ pub fn op_alter_column(
             panic!("only btree tables can be altered");
         };
         let btree = Arc::make_mut(btree_arc);
-        let existing_column_name = btree
-            .columns()
-            .get(*column_index)
-            .expect("column being ALTERed should be in schema");
-        let existing_column_name = existing_column_name
-            .name
-            .as_ref()
-            .expect("btree column should be named")
-            .clone();
-
-        // Update this table's indexes that reference the old column.
-        if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
-            for idx in idxs {
-                let idx = Arc::make_mut(idx);
-                for ic in &mut idx.columns {
-                    if let Some(expr) = &mut ic.expr {
-                        rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
-                        ic.name = expr.to_string();
-                    } else if ic.name.eq_ignore_ascii_case(&existing_column_name) {
-                        ic.name.clone_from(&new_name);
-                    }
-                }
-                // Update partial index WHERE clause column references
-                if let Some(ref mut wc) = idx.where_clause {
-                    rename_identifiers(wc, &old_column_name, &new_name);
-                }
-            }
-        }
         let clears_autoincrement_sequence = !*rename
             && btree.has_autoincrement
             && btree
@@ -15154,6 +15126,38 @@ pub fn op_alter_column(
         }
 
         btree.prepare_generated_columns()?;
+
+        // Update this table's indexes that reference the old column.
+        if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
+            for idx in idxs {
+                let idx = Arc::make_mut(idx);
+                for ic in &mut idx.columns {
+                    if let Some(expr) = &mut ic.expr {
+                        rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
+                        if ic.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL {
+                            ic.name = expr.to_string();
+                        }
+                    }
+                    if ic.pos_in_table != crate::schema::EXPR_INDEX_SENTINEL {
+                        let table_column = btree
+                            .columns()
+                            .get(ic.pos_in_table)
+                            .expect("indexed column position should exist");
+                        if let Some(name) = &table_column.name {
+                            ic.name.clone_from(name);
+                        }
+                        ic.default.clone_from(&table_column.default);
+                        ic.expr = table_column
+                            .generated_expr()
+                            .map(|expr| Box::new(expr.clone()));
+                    }
+                }
+                // Update partial index WHERE clause column references
+                if let Some(ref mut wc) = idx.where_clause {
+                    rename_identifiers(wc, &old_column_name, &new_name);
+                }
+            }
+        }
 
         // Keep primary_key_columns consistent (names may change on rename)
         for (pk_name, _ord) in &mut btree.primary_key_columns {
