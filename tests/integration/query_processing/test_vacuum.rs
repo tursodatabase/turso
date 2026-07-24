@@ -46,7 +46,10 @@ fn canonicalize_schema_sql(sql: &str) -> String {
         return normalize_sql_whitespace(sql);
     }
     match cmd {
-        Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt) => stmt.to_string(),
+        Cmd::Stmt(stmt)
+        | Cmd::Explain(stmt)
+        | Cmd::ExplainQueryPlan(stmt)
+        | Cmd::ExplainPostgres(stmt) => stmt.to_string(),
     }
 }
 
