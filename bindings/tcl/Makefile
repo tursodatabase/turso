@@ -19,7 +19,7 @@
 #   make clean
 
 ROOT_DIR  := $(shell cd ../.. && pwd)
-TURSO_LIB := $(ROOT_DIR)/target/debug
+TURSO_LIB := $(shell $(ROOT_DIR)/scripts/cargo-target-dir)/debug
 SRC       := $(ROOT_DIR)/bindings/tcl/turso_tcl.c
 INCLUDE   := $(ROOT_DIR)/bindings/c/include
 
