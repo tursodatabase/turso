@@ -96,10 +96,7 @@ pub enum SpillResult {
 /// Sweep order follows next: tail (LRU) -> head (MRU) -> .. -> tail
 /// New pages are inserted after the clock hand in the `next` direction,
 /// which places them at head (MRU) (i.e. `tail.next` is the head).
-#[cfg_attr(
-    feature = "aristo-instr",
-    derive(aristo::instrument::Inspect)
-)]
+#[cfg_attr(feature = "aristo-instr", derive(aristo::instrument::Inspect))]
 pub struct PageCache {
     /// Capacity in pages
     capacity: usize,
