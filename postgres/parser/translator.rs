@@ -3478,11 +3478,18 @@ impl PostgreSQLTranslator {
                         _ => None, // Default or undefined
                     };
 
-                    sorted_columns.push(ast::SortedColumn {
-                        expr,
-                        order,
-                        nulls: None,
-                    });
+                    let nulls =
+                        match pg_query::protobuf::SortByNulls::try_from(sort_by.sortby_nulls) {
+                            Ok(pg_query::protobuf::SortByNulls::SortbyNullsFirst) => {
+                                Some(ast::NullsOrder::First)
+                            }
+                            Ok(pg_query::protobuf::SortByNulls::SortbyNullsLast) => {
+                                Some(ast::NullsOrder::Last)
+                            }
+                            _ => None,
+                        };
+
+                    sorted_columns.push(ast::SortedColumn { expr, order, nulls });
                 }
                 _ => {
                     return Err(ParseError::ParseError(format!(
@@ -6558,6 +6565,104 @@ mod tests {
         } else {
             panic!("Expected Select statement");
         }
+    }
+
+    #[test]
+    fn test_order_by_nulls_ordering() {
+        let translator = PostgreSQLTranslator::new();
+
+        let cases = [
+            ("SELECT * FROM t ORDER BY a", None),
+            (
+                "SELECT * FROM t ORDER BY a NULLS FIRST",
+                Some(ast::NullsOrder::First),
+            ),
+            (
+                "SELECT * FROM t ORDER BY a NULLS LAST",
+                Some(ast::NullsOrder::Last),
+            ),
+            (
+                "SELECT * FROM t ORDER BY a DESC NULLS FIRST",
+                Some(ast::NullsOrder::First),
+            ),
+            (
+                "SELECT * FROM t ORDER BY a ASC NULLS LAST",
+                Some(ast::NullsOrder::Last),
+            ),
+        ];
+
+        for (sql, expected_nulls) in cases {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parsed).unwrap();
+            let ast::Stmt::Select(select) = translated else {
+                panic!("expected Select statement for {sql}");
+            };
+            assert_eq!(select.order_by.len(), 1, "for {sql}");
+            assert_eq!(select.order_by[0].nulls, expected_nulls, "for {sql}");
+        }
+    }
+
+    #[test]
+    fn test_compound_select_order_by_nulls_ordering() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT a FROM t1 UNION SELECT a FROM t2 ORDER BY a NULLS LAST";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        let ast::Stmt::Select(select) = translated else {
+            panic!("expected Select statement");
+        };
+        assert_eq!(select.body.compounds.len(), 1, "expected one UNION arm");
+        assert_eq!(select.order_by.len(), 1);
+        assert_eq!(select.order_by[0].nulls, Some(ast::NullsOrder::Last));
+    }
+
+    #[test]
+    fn test_values_order_by_nulls_ordering() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "VALUES (1), (NULL), (2) ORDER BY 1 NULLS LAST";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        let ast::Stmt::Select(select) = translated else {
+            panic!("expected Select statement");
+        };
+        assert!(
+            matches!(select.body.select, ast::OneSelect::Values(_)),
+            "expected a VALUES body, got {:?}",
+            select.body.select
+        );
+        assert_eq!(select.order_by.len(), 1);
+        assert_eq!(select.order_by[0].nulls, Some(ast::NullsOrder::Last));
+    }
+
+    #[test]
+    fn test_window_order_by_nulls_ordering() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT ROW_NUMBER() OVER (ORDER BY salary NULLS LAST) FROM t";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        let ast::Stmt::Select(select) = translated else {
+            panic!("expected Select statement");
+        };
+        let ast::OneSelect::Select { columns, .. } = &select.body.select else {
+            panic!("expected Select body");
+        };
+        let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
+            panic!("expected expression result column");
+        };
+        let ast::Expr::FunctionCall { filter_over, .. } = expr.as_ref() else {
+            panic!("expected function call expression, got {expr:?}");
+        };
+        let Some(ast::Over::Window(window)) = &filter_over.over_clause else {
+            panic!(
+                "expected inline OVER window, got {:?}",
+                filter_over.over_clause
+            );
+        };
+        assert_eq!(window.order_by.len(), 1);
+        assert_eq!(window.order_by[0].nulls, Some(ast::NullsOrder::Last));
     }
 
     #[test]
