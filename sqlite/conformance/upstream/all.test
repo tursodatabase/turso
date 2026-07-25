@@ -29,7 +29,7 @@ source $testdir/selectF.test
 # FIXME: source $testdir/insert2.test
 # FIXME: source $testdir/insert3.test
 # FIXME: source $testdir/insert4.test
-# FIXME: source $testdir/insert5.test
+source $testdir/insert5.test
 
 # FIXME: source $testdir/join.test
 # FIXME: source $testdir/join2.test
