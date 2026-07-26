@@ -234,7 +234,7 @@ impl DatabaseStorage for DatabaseFile {
         match &io_ctx.page_transform {
             PageTransform::Encryption(ctx) => {
                 let encryption_ctx = ctx.clone();
-                let read_buffer = Arc::new(Buffer::new_temporary(r.buf_arc().len()));
+                let read_buffer = r.buf_arc();
                 let original_c = c.clone();
                 let decrypt_complete =
                     Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
@@ -246,10 +246,12 @@ impl DatabaseStorage for DatabaseFile {
                                 return original_c.get_error();
                             }
                         };
-                        // A zero-byte read is the expected probe result for an
-                        // empty database; only complete page images are decryptable.
                         if bytes_read == 0 {
-                            original_c.complete(bytes_read);
+                            original_c.error(CompletionError::ShortRead {
+                                page_idx,
+                                expected: buf.len(),
+                                actual: 0,
+                            });
                             return original_c.get_error();
                         }
                         turso_assert_greater_than!(
@@ -299,10 +301,12 @@ impl DatabaseStorage for DatabaseFile {
                                 return original_c.get_error();
                             }
                         };
-                        // A zero-byte read is the expected probe result for an
-                        // empty database; only complete page images are decodable.
                         if bytes_read == 0 {
-                            original_c.complete(bytes_read);
+                            original_c.error(CompletionError::ShortRead {
+                                page_idx,
+                                expected: buf.len(),
+                                actual: 0,
+                            });
                             return original_c.get_error();
                         }
                         turso_assert_greater_than!(
@@ -691,7 +695,7 @@ mod page_codec_tests {
     }
 
     #[test]
-    fn page_codec_empty_database_read_completes_without_decoding() {
+    fn page_codec_zero_byte_read_reports_short_read() {
         let db_file = DatabaseFile {
             file: Arc::new(MockFile {
                 read_result: Ok(0),
@@ -700,11 +704,31 @@ mod page_codec_tests {
         };
         let mut io_ctx = IOContext::default();
         io_ctx.set_page_codec(Arc::new(XorPageCodec(0xa5)));
+        let page_idx = 9usize;
         let original = Completion::new_read(Arc::new(Buffer::new_temporary(4096)), |_| None);
 
-        let wrapped = db_file.read_page(9, &io_ctx, original.clone()).unwrap();
-        MemoryIO::new().wait_for_completion(wrapped).unwrap();
-        assert!(original.succeeded());
+        let wrapped = db_file
+            .read_page(page_idx, &io_ctx, original.clone())
+            .unwrap();
+        let err = MemoryIO::new()
+            .wait_for_completion(wrapped)
+            .expect_err("a zero-byte transformed page read must fail");
+        assert!(matches!(
+            err,
+            LimboError::CompletionError(CompletionError::ShortRead {
+                page_idx: 9,
+                expected: 4096,
+                actual: 0,
+            })
+        ));
+        assert!(matches!(
+            original.get_error(),
+            Some(CompletionError::ShortRead {
+                page_idx: 9,
+                expected: 4096,
+                actual: 0,
+            })
+        ));
     }
 
     #[test]
