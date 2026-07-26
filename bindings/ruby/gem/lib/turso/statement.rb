@@ -108,7 +108,7 @@ module Turso
         @native.bind_double(position, value)
       when String
         if value.encoding == Encoding::ASCII_8BIT
-          @native.bind_blob(position, value.b)
+          @native.bind_blob(position, value.bytes)
         else
           @native.bind_text(position, value)
         end
