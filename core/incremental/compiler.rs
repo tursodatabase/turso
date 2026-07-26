@@ -9,8 +9,9 @@ use crate::incremental::aggregate_operator::AggregateOperator;
 use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::operator::{
-    create_dbsp_state_index, DbspStateCursors, EvalState, FilterOperator, FilterPredicate,
-    IncrementalOperator, InputOperator, JoinOperator, JoinType, ProjectOperator,
+    create_dbsp_state_index, install_dbsp_yield_context, DbspStateCursors, EvalState,
+    FilterOperator, FilterPredicate, IncrementalOperator, InputOperator, JoinOperator, JoinType,
+    ProjectOperator,
 };
 use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
@@ -506,15 +507,17 @@ impl DbspCircuit {
     ) -> Result<IOResult<Delta>> {
         if let Some(root_id) = self.root {
             // Create temporary cursors for execute (non-commit) operations
-            let table_cursor =
+            let mut table_cursor =
                 BTreeCursor::new_table(pager.clone(), self.internal_state_root, OPERATOR_COLUMNS);
+            install_dbsp_yield_context(&mut table_cursor, &pager);
             let index_def = create_dbsp_state_index(self.internal_state_index_root);
-            let index_cursor = BTreeCursor::new_index(
+            let mut index_cursor = BTreeCursor::new_index(
                 pager.clone(),
                 self.internal_state_index_root,
                 &index_def,
                 3,
             )?;
+            install_dbsp_yield_context(&mut index_cursor, &pager);
             let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
             self.execute_node(root_id, pager, execute_state, false, &mut cursors)
         } else {
@@ -557,18 +560,20 @@ impl DbspCircuit {
             match &mut state {
                 CommitState::Init => {
                     // Create state cursors when entering CommitOperators state
-                    let state_table_cursor = BTreeCursor::new_table(
+                    let mut state_table_cursor = BTreeCursor::new_table(
                         pager.clone(),
                         self.internal_state_root,
                         OPERATOR_COLUMNS,
                     );
+                    install_dbsp_yield_context(&mut state_table_cursor, &pager);
                     let index_def = create_dbsp_state_index(self.internal_state_index_root);
-                    let state_index_cursor = BTreeCursor::new_index(
+                    let mut state_index_cursor = BTreeCursor::new_index(
                         pager.clone(),
                         self.internal_state_index_root,
                         &index_def,
                         3, // Index on first 3 columns
                     )?;
+                    install_dbsp_yield_context(&mut state_index_cursor, &pager);
 
                     let state_cursors = Box::new(DbspStateCursors::new(
                         state_table_cursor,
@@ -593,11 +598,12 @@ impl DbspCircuit {
                     );
 
                     // Create view cursor when entering UpdateView state
-                    let view_cursor = Box::new(BTreeCursor::new_table(
-                        pager.clone(),
-                        main_data_root,
-                        num_columns,
-                    ));
+                    let view_cursor = {
+                        let mut cursor =
+                            BTreeCursor::new_table(pager.clone(), main_data_root, num_columns);
+                        install_dbsp_yield_context(&mut cursor, &pager);
+                        Box::new(cursor)
+                    };
 
                     self.commit_state = CommitState::UpdateView {
                         delta,
@@ -622,11 +628,10 @@ impl DbspCircuit {
                         // If we're starting a new row (GetRecord state), we need a fresh cursor
                         // due to btree cursor state machine limitations
                         if matches!(write_row_state, WriteRowView::GetRecord) {
-                            *view_cursor = Box::new(BTreeCursor::new_table(
-                                pager.clone(),
-                                main_data_root,
-                                num_columns,
-                            ));
+                            let mut cursor =
+                                BTreeCursor::new_table(pager.clone(), main_data_root, num_columns);
+                            install_dbsp_yield_context(&mut cursor, &pager);
+                            *view_cursor = Box::new(cursor);
                         }
 
                         // Build the view row format: row values + weight
@@ -647,14 +652,12 @@ impl DbspCircuit {
                         // Move to next row
                         let delta = std::mem::take(delta);
                         // Take ownership of view_cursor - we'll create a new one for next row if needed
-                        let view_cursor = std::mem::replace(
-                            view_cursor,
-                            Box::new(BTreeCursor::new_table(
-                                pager.clone(),
-                                main_data_root,
-                                num_columns,
-                            )),
-                        );
+                        let view_cursor = std::mem::replace(view_cursor, {
+                            let mut cursor =
+                                BTreeCursor::new_table(pager.clone(), main_data_root, num_columns);
+                            install_dbsp_yield_context(&mut cursor, &pager);
+                            Box::new(cursor)
+                        });
 
                         self.commit_state = CommitState::UpdateView {
                             delta,
@@ -744,18 +747,20 @@ impl DbspCircuit {
                         let (input_node_id, input_state) = &mut input_states[*current_index];
 
                         // Create temporary cursors for the recursive call
-                        let temp_table_cursor = BTreeCursor::new_table(
+                        let mut temp_table_cursor = BTreeCursor::new_table(
                             pager.clone(),
                             self.internal_state_root,
                             OPERATOR_COLUMNS,
                         );
+                        install_dbsp_yield_context(&mut temp_table_cursor, &pager);
                         let index_def = create_dbsp_state_index(self.internal_state_index_root);
-                        let temp_index_cursor = BTreeCursor::new_index(
+                        let mut temp_index_cursor = BTreeCursor::new_index(
                             pager.clone(),
                             self.internal_state_index_root,
                             &index_def,
                             3,
                         )?;
+                        install_dbsp_yield_context(&mut temp_index_cursor, &pager);
                         let mut temp_cursors =
                             DbspStateCursors::new(temp_table_cursor, temp_index_cursor);
 
