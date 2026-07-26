@@ -358,9 +358,6 @@ in step order. For each step, exactly one of the following holds:
 A failed step does not abort the batch by itself. Later steps run or are
 skipped purely according to their conditions.
 
-The batch result also carries a `replication_index` field, which is
-reserved (section 8.4); clients MAY ignore it.
-
 #### 6.2.1 Conditions
 
 Step indices in conditions are zero-based and MUST refer to an earlier step
@@ -642,17 +639,18 @@ entry, for example when it fails mid-stream. A response body that ends
 without a terminating `error` or `replication_index` entry MUST be treated
 by the client as a fatal error for both the batch and the stream.
 
-#### 7.2.6 `replication_index`
+#### 7.2.6 `replication_index` (terminator)
 
-The final entry of a successfully completed cursor:
+The final entry of a successfully completed cursor. Its only purpose is to
+mark the end of the stream; the entry type name is historical:
 
 ```json
 { "type": "replication_index", "replication_index": null }
 ```
 
-The `replication_index` value is reserved and may be a string, a number, or
-`null`. Clients MAY ignore this entry. Clients MUST ignore entry types they
-do not recognize, to allow future extensions.
+Clients MUST NOT interpret the `replication_index` value; they only need to
+recognize the entry as the successful terminator (section 7.2.5). Clients
+MUST ignore entry types they do not recognize, to allow future extensions.
 
 ## 8. Data types
 
@@ -726,7 +724,6 @@ A successful statement execution produces:
 | `rows_read`          | `integer`        | Number of rows read during execution.  |
 | `rows_written`       | `integer`        | Number of rows written during execution. |
 | `query_duration_ms`  | `number`         | Server-side execution time in milliseconds. |
-| `replication_index`  | `string \| null` | Reserved. Clients MAY ignore it.       |
 
 ## 9. Errors
 
