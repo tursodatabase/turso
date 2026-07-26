@@ -1839,13 +1839,41 @@ mod tests {
                 *output = *input ^ self.mask;
             }
         }
+
+        fn stable_config_fingerprint(&self) -> [u8; 16] {
+            fn mix(mut hash: u64, byte: u8) -> u64 {
+                hash ^= byte as u64;
+                hash.wrapping_mul(0x0000_0100_0000_01b3)
+            }
+
+            let mut hash1 = 0xcbf2_9ce4_8422_2325;
+            for byte in b"turso-sdk-xor-page-codec-v1" {
+                hash1 = mix(hash1, *byte);
+            }
+            hash1 = mix(hash1, b'm');
+            hash1 = mix(hash1, self.mask);
+            hash1 = mix(hash1, b'r');
+            hash1 = mix(hash1, self.reserved_bytes);
+
+            let mut hash2 = 0x9ae1_6a3b_2f90_404f;
+            for byte in b"turso-sdk-xor-page-codec-v1".iter().rev() {
+                hash2 = mix(hash2, *byte);
+            }
+            hash2 = mix(hash2, b'r');
+            hash2 = mix(hash2, self.reserved_bytes);
+            hash2 = mix(hash2, b'm');
+            hash2 = mix(hash2, self.mask);
+
+            let mut id = [0; 16];
+            id[..8].copy_from_slice(&hash1.to_le_bytes());
+            id[8..].copy_from_slice(&hash2.to_le_bytes());
+            id
+        }
     }
 
     impl PageCodec for XorPageCodec {
         fn codec_id(&self) -> PageCodecId {
-            let mut id = *b"sdk-xor-codec---";
-            id[15] = self.mask;
-            PageCodecId::new(id)
+            PageCodecId::new(self.stable_config_fingerprint())
         }
 
         fn bootstrap_page_info(
@@ -1898,6 +1926,28 @@ mod tests {
             self.transform(page, output);
             Ok(())
         }
+    }
+
+    #[test]
+    pub fn page_codec_id_tracks_full_test_codec_configuration() {
+        let base = XorPageCodec {
+            mask: 0xa5,
+            reserved_bytes: 1,
+        }
+        .codec_id();
+        let different_mask = XorPageCodec {
+            mask: 0x5a,
+            reserved_bytes: 1,
+        }
+        .codec_id();
+        let different_reserved_bytes = XorPageCodec {
+            mask: 0xa5,
+            reserved_bytes: 2,
+        }
+        .codec_id();
+
+        assert_ne!(base, different_mask);
+        assert_ne!(base, different_reserved_bytes);
     }
 
     fn open_database_with_page_codec(path: &str, codec: Arc<dyn PageCodec>) -> Arc<TursoDatabase> {
