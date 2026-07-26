@@ -587,6 +587,17 @@ pub fn op_checkpoint(
         },
         insn
     );
+    if !program.connection.is_nested_stmt()
+        && program
+            .connection
+            .n_active_root_statements
+            .load(Ordering::SeqCst)
+            != 1
+    {
+        return Err(LimboError::StatementsInProgress(
+            "cannot checkpoint while another statement is active",
+        ));
+    }
     if !program.connection.auto_commit.load(Ordering::SeqCst) {
         // TODO: sqlite returns "Runtime error: database table is locked (6)" when a table is in use
         // when a checkpoint is attempted. We don't have table locks, so return TableLocked for any
