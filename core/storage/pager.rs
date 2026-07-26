@@ -5676,11 +5676,6 @@ impl Pager {
             .map(EncryptionContext::required_reserved_bytes)
     }
 
-    #[deprecated(note = "renamed to has_encryption")]
-    pub fn is_encryption_ctx_set(&self) -> bool {
-        self.has_encryption()
-    }
-
     pub fn has_page_codec(&self) -> bool {
         self.io_ctx.read().has_page_codec()
     }
