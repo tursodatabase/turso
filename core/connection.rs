@@ -2969,6 +2969,9 @@ impl Connection {
 
     #[cfg(any(test, injected_yields))]
     pub fn set_yield_injector(&self, injector: Option<Arc<dyn YieldInjector>>) {
+        // Mirror onto the pager: cursors built outside the VDBE (IVM/DBSP)
+        // have no `Connection` in scope and take their injector from there.
+        self.pager.load().set_yield_injector(injector.clone());
         let mut slot = self.yield_injector.write();
         match injector {
             Some(injector) => {
