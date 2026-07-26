@@ -16,6 +16,10 @@ pub enum TransactionBehavior {
     /// EXCLUSIVE prevents other database connections from reading the database
     /// while the transaction is underway.
     Exclusive,
+    /// CONCURRENT allows multiple write transactions to proceed in parallel,
+    /// with conflicts detected at commit time. Requires the database to be in
+    /// MVCC mode (`PRAGMA journal_mode = 'mvcc'`).
+    Concurrent,
 }
 
 /// Options for how a Transaction should behave when it is dropped.
@@ -117,6 +121,7 @@ impl Transaction<'_> {
             TransactionBehavior::Deferred => "BEGIN DEFERRED",
             TransactionBehavior::Immediate => "BEGIN IMMEDIATE",
             TransactionBehavior::Exclusive => "BEGIN EXCLUSIVE",
+            TransactionBehavior::Concurrent => "BEGIN CONCURRENT",
         };
         // TODO: Use execute_batch instead
         conn.execute(query, ()).await.map(move |_| Transaction {
@@ -348,7 +353,7 @@ impl Connection {
 mod test {
     use crate::{Builder, Connection, Error, Result};
 
-    use super::DropBehavior;
+    use super::{DropBehavior, TransactionBehavior};
 
     async fn checked_memory_handle() -> Result<Connection> {
         let db = Builder::new_local(":memory:").build().await?;
@@ -483,6 +488,40 @@ mod test {
             .query_row(())
             .await?;
         assert_eq!(2, result.get::<i32>(0)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_transactions() -> Result<()> {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Builder::new_local(tmp.path().to_str().unwrap())
+            .build()
+            .await?;
+        let conn = db.connect()?;
+        conn.pragma_update("journal_mode", "'mvcc'").await?;
+        conn.execute("CREATE TABLE foo (x INTEGER)", ()).await?;
+
+        let mut conn1 = db.connect()?;
+        let mut conn2 = db.connect()?;
+
+        // Two concurrent write transactions may be open at the same time.
+        let tx1 = conn1
+            .transaction_with_behavior(TransactionBehavior::Concurrent)
+            .await?;
+        let tx2 = conn2
+            .transaction_with_behavior(TransactionBehavior::Concurrent)
+            .await?;
+        tx1.execute("INSERT INTO foo VALUES (?)", &[1]).await?;
+        tx2.execute("INSERT INTO foo VALUES (?)", &[2]).await?;
+        tx1.commit().await?;
+        tx2.commit().await?;
+
+        let result = conn
+            .prepare("SELECT SUM(x) FROM foo")
+            .await?
+            .query_row(())
+            .await?;
+        assert_eq!(3, result.get::<i32>(0)?);
         Ok(())
     }
 
