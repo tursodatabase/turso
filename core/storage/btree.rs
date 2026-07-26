@@ -1137,6 +1137,15 @@ impl BTreeCursor {
         self.yield_instance_id = connection.next_yield_instance_id();
     }
 
+    /// Same as `install_yield_context`, for cursors created where no
+    /// `Connection` is in scope (the IVM/DBSP circuit's own state and view
+    /// cursors). The pager mirrors its connection's injector.
+    #[cfg(any(test, injected_yields))]
+    pub(crate) fn install_yield_context_from_pager(&mut self, pager: &Pager) {
+        self.yield_injector = pager.yield_injector();
+        self.yield_instance_id = pager.next_yield_instance_id();
+    }
+
     pub fn new_table(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
         Self::new(pager, root_page, num_columns)
     }
