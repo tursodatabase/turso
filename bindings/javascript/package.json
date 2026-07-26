@@ -16,6 +16,7 @@
     "sync/packages/wasm"
   ],
   "resolutions": {
+    "playwright": "1.61.0",
     "emnapi": "1.4.5",
     "@emnapi/core": "1.8.1",
     "@emnapi/runtime": "1.8.1",
