@@ -107,6 +107,66 @@ pub const LIBSQL_STMTSTATUS_BASE: ffi::c_int = 1024;
 pub const LIBSQL_STMTSTATUS_ROWS_READ: ffi::c_int = LIBSQL_STMTSTATUS_BASE + 1;
 pub const LIBSQL_STMTSTATUS_ROWS_WRITTEN: ffi::c_int = LIBSQL_STMTSTATUS_BASE + 2;
 
+/* authorizer callback return codes */
+pub const SQLITE_DENY: ffi::c_int = 1;
+pub const SQLITE_IGNORE: ffi::c_int = 2;
+
+/* authorizer action codes */
+pub const SQLITE_COPY: ffi::c_int = 0;
+pub const SQLITE_CREATE_INDEX: ffi::c_int = 1;
+pub const SQLITE_CREATE_TABLE: ffi::c_int = 2;
+pub const SQLITE_CREATE_TEMP_INDEX: ffi::c_int = 3;
+pub const SQLITE_CREATE_TEMP_TABLE: ffi::c_int = 4;
+pub const SQLITE_CREATE_TEMP_TRIGGER: ffi::c_int = 5;
+pub const SQLITE_CREATE_TEMP_VIEW: ffi::c_int = 6;
+pub const SQLITE_CREATE_TRIGGER: ffi::c_int = 7;
+pub const SQLITE_CREATE_VIEW: ffi::c_int = 8;
+pub const SQLITE_DELETE: ffi::c_int = 9;
+pub const SQLITE_DROP_INDEX: ffi::c_int = 10;
+pub const SQLITE_DROP_TABLE: ffi::c_int = 11;
+pub const SQLITE_DROP_TEMP_INDEX: ffi::c_int = 12;
+pub const SQLITE_DROP_TEMP_TABLE: ffi::c_int = 13;
+pub const SQLITE_DROP_TEMP_TRIGGER: ffi::c_int = 14;
+pub const SQLITE_DROP_TEMP_VIEW: ffi::c_int = 15;
+pub const SQLITE_DROP_TRIGGER: ffi::c_int = 16;
+pub const SQLITE_DROP_VIEW: ffi::c_int = 17;
+pub const SQLITE_INSERT: ffi::c_int = 18;
+pub const SQLITE_PRAGMA: ffi::c_int = 19;
+pub const SQLITE_READ: ffi::c_int = 20;
+pub const SQLITE_SELECT: ffi::c_int = 21;
+pub const SQLITE_TRANSACTION: ffi::c_int = 22;
+pub const SQLITE_UPDATE: ffi::c_int = 23;
+pub const SQLITE_ATTACH: ffi::c_int = 24;
+pub const SQLITE_DETACH: ffi::c_int = 25;
+pub const SQLITE_ALTER_TABLE: ffi::c_int = 26;
+pub const SQLITE_REINDEX: ffi::c_int = 27;
+pub const SQLITE_ANALYZE: ffi::c_int = 28;
+pub const SQLITE_CREATE_VTABLE: ffi::c_int = 29;
+pub const SQLITE_DROP_VTABLE: ffi::c_int = 30;
+pub const SQLITE_FUNCTION: ffi::c_int = 31;
+pub const SQLITE_SAVEPOINT: ffi::c_int = 32;
+pub const SQLITE_RECURSIVE: ffi::c_int = 33;
+
+/* sqlite3_db_config operations */
+pub const SQLITE_DBCONFIG_MAINDBNAME: ffi::c_int = 1000;
+pub const SQLITE_DBCONFIG_LOOKASIDE: ffi::c_int = 1001;
+pub const SQLITE_DBCONFIG_ENABLE_FKEY: ffi::c_int = 1002;
+pub const SQLITE_DBCONFIG_ENABLE_TRIGGER: ffi::c_int = 1003;
+pub const SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER: ffi::c_int = 1004;
+pub const SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION: ffi::c_int = 1005;
+pub const SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE: ffi::c_int = 1006;
+pub const SQLITE_DBCONFIG_ENABLE_QPSG: ffi::c_int = 1007;
+pub const SQLITE_DBCONFIG_TRIGGER_EQP: ffi::c_int = 1008;
+pub const SQLITE_DBCONFIG_RESET_DATABASE: ffi::c_int = 1009;
+pub const SQLITE_DBCONFIG_DEFENSIVE: ffi::c_int = 1010;
+pub const SQLITE_DBCONFIG_WRITABLE_SCHEMA: ffi::c_int = 1011;
+pub const SQLITE_DBCONFIG_LEGACY_ALTER_TABLE: ffi::c_int = 1012;
+pub const SQLITE_DBCONFIG_DQS_DML: ffi::c_int = 1013;
+pub const SQLITE_DBCONFIG_DQS_DDL: ffi::c_int = 1014;
+pub const SQLITE_DBCONFIG_ENABLE_VIEW: ffi::c_int = 1015;
+pub const SQLITE_DBCONFIG_LEGACY_FILE_FORMAT: ffi::c_int = 1016;
+pub const SQLITE_DBCONFIG_TRUSTED_SCHEMA: ffi::c_int = 1017;
+
 pub struct sqlite3 {
     pub(crate) inner: Arc<Mutex<sqlite3Inner>>,
 }
@@ -136,7 +196,9 @@ impl sqlite3 {
             _db: db,
             conn,
             err_code: SQLITE_OK,
-            err_mask: 0xFFFFFFFFu32 as i32,
+            // Extended result codes are disabled by default, as in SQLite;
+            // sqlite3_extended_result_codes() widens the mask.
+            err_mask: 0xff,
             malloc_failed: false,
             e_open_state: SQLITE_STATE_OPEN,
             p_err: std::ptr::null_mut(),
@@ -791,13 +853,33 @@ pub unsafe extern "C" fn sqlite3_busy_timeout(db: *mut sqlite3, ms: ffi::c_int) 
     SQLITE_OK
 }
 
+/// Callback type for sqlite3_set_authorizer: (userData, actionCode, arg1,
+/// arg2, database, trigger-or-view) -> SQLITE_OK / SQLITE_DENY / SQLITE_IGNORE.
+pub type sqlite3_authorizer_callback = unsafe extern "C" fn(
+    *mut ffi::c_void,
+    ffi::c_int,
+    *const ffi::c_char,
+    *const ffi::c_char,
+    *const ffi::c_char,
+    *const ffi::c_char,
+) -> ffi::c_int;
+
+/// Refused with SQLITE_ERROR: turso_core has no prepare-time authorization
+/// hook, so a stored callback would never be invoked and callers (e.g. PHP,
+/// which routes its open_basedir checks through the authorizer) would
+/// silently lose the enforcement they registered for. PHP ignores this
+/// return value when it installs its authorizer at open, so refusing does
+/// not break it. Implement for real once core grows an authorization hook.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_set_authorizer(
-    _db: *mut sqlite3,
-    _callback: Option<unsafe extern "C" fn() -> ffi::c_int>,
+    db: *mut sqlite3,
+    _callback: Option<sqlite3_authorizer_callback>,
     _context: *mut ffi::c_void,
 ) -> ffi::c_int {
-    stub!();
+    if db.is_null() {
+        return SQLITE_MISUSE;
+    }
+    SQLITE_ERROR
 }
 
 #[no_mangle]
@@ -1403,9 +1485,66 @@ pub unsafe extern "C" fn sqlite3_interrupt(db: *mut sqlite3) {
     inner.conn.interrupt();
 }
 
+extern "C" {
+    /// Variadic implementation in varargs.c; decodes the va_list and calls
+    /// turso_db_config_int below. Declared argument-less because it is only
+    /// referenced as a `sym` jump target, never called from Rust.
+    fn turso_sqlite3_db_config_va();
+}
+
+/// Exported trampoline for the variadic sqlite3_db_config. rustc exports
+/// only Rust items from cdylibs (version script on ELF, exported-symbols
+/// list on Apple), so the public symbol must be defined here; the tail jump
+/// hands the untouched variadic call frame to the C implementation, whose
+/// own prologue then performs va_start as for a direct call. This also
+/// pins varargs.c's object into the link. Once rustc can export
+/// native-library symbols from cdylibs (rust-lang/rust#155697), this
+/// trampoline can be deleted and the C function renamed sqlite3_db_config.
+#[unsafe(naked)]
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_db_config(_db: *mut sqlite3, _op: ffi::c_int) -> ffi::c_int {
-    stub!();
+pub unsafe extern "C" fn sqlite3_db_config(_db: *mut ffi::c_void, _op: ffi::c_int) -> ffi::c_int {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    core::arch::naked_asm!("jmp {}", sym turso_sqlite3_db_config_va);
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    core::arch::naked_asm!("b {}", sym turso_sqlite3_db_config_va);
+}
+
+/// Non-variadic backend for sqlite3_db_config. The variadic C entry point in
+/// varargs.c decodes the (int value, int *pOut) argument shape shared by all
+/// boolean DBCONFIG ops and forwards here. For boolean ops, a negative value
+/// queries the current setting without changing it, and the resulting state
+/// is written through `p_out` when non-NULL, as in SQLite.
+#[no_mangle]
+#[deny(unsafe_op_in_unsafe_fn)]
+pub unsafe extern "C" fn turso_db_config_int(
+    db: *mut sqlite3,
+    op: ffi::c_int,
+    value: ffi::c_int,
+    p_out: *mut ffi::c_int,
+) -> ffi::c_int {
+    if db.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let _ = (value, p_out);
+    match op {
+        // Refused rather than accepted-and-ignored, so a caller that checks
+        // the return cannot be misled into believing it toggled anything.
+        // The protections DEFENSIVE stands for are unconditionally on in
+        // turso_core today:
+        //   - sqlite_schema DML is rejected with no writable_schema unlock
+        //     (core/schema.rs, allow_user_dml)
+        //   - PRAGMA schema_version=N is a deliberate no-op
+        //     (core/translate/pragma.rs, SchemaVersion write arm)
+        //   - PRAGMA journal_mode=OFF is unsupported and silently kept as-is
+        //     (core/storage/journal_mode.rs, JournalMode::supported)
+        //   - there are no SQLite-style shadow tables
+        // Callers that need file-corruption protection therefore already
+        // have it; PHP's ext/sqlite3 ignores this return value. Switching to
+        // accept + enforce is safe only if every feature above gains a
+        // per-connection defensive gate in core first.
+        SQLITE_DBCONFIG_DEFENSIVE => SQLITE_ERROR,
+        _ => SQLITE_ERROR,
+    }
 }
 
 #[no_mangle]
@@ -1466,6 +1605,30 @@ pub unsafe extern "C" fn sqlite3_errcode(db: *mut sqlite3) -> ffi::c_int {
         return SQLITE_NOMEM;
     }
     db.err_code & db.err_mask
+}
+
+/// Enables or disables extended result codes for the connection. When
+/// disabled (the default), sqlite3_errcode and statement results report only
+/// the primary result code; sqlite3_extended_errcode always reports the
+/// extended code either way.
+#[no_mangle]
+#[deny(unsafe_op_in_unsafe_fn)]
+pub unsafe extern "C" fn sqlite3_extended_result_codes(
+    db: *mut sqlite3,
+    onoff: ffi::c_int,
+) -> ffi::c_int {
+    if db.is_null() {
+        return SQLITE_MISUSE;
+    }
+    // SAFETY: db checked non-null just above; caller guarantees it points to a
+    // live sqlite3 for the duration of the call.
+    let db: &sqlite3 = unsafe { &*db };
+    let mut inner = match db.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => return SQLITE_MISUSE,
+    };
+    inner.err_mask = if onoff != 0 { -1 } else { 0xff };
+    SQLITE_OK
 }
 
 #[no_mangle]
@@ -2758,7 +2921,9 @@ pub unsafe extern "C" fn sqlite3_extended_errcode(db: *mut sqlite3) -> ffi::c_in
     if db.malloc_failed {
         return SQLITE_NOMEM;
     }
-    db.err_code & db.err_mask
+    // The extended code is reported regardless of the
+    // sqlite3_extended_result_codes() setting; only sqlite3_errcode masks.
+    db.err_code
 }
 
 #[no_mangle]

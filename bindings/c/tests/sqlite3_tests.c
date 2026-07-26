@@ -21,6 +21,9 @@ void test_sqlite3_column_decltype();
 void test_sqlite3_next_stmt();
 void test_sqlite3_table_column_metadata();
 void test_sqlite3_insert_returning();
+void test_sqlite3_set_authorizer();
+void test_sqlite3_db_config();
+void test_sqlite3_extended_result_codes();
 
 int allocated = 0;
 
@@ -41,6 +44,9 @@ int main(void)
     test_sqlite3_next_stmt();
     test_sqlite3_table_column_metadata();
     test_sqlite3_insert_returning();
+    test_sqlite3_set_authorizer();
+    test_sqlite3_db_config();
+    test_sqlite3_extended_result_codes();
     return 0;
 }
 
@@ -791,4 +797,174 @@ void test_sqlite3_insert_returning()
     sqlite3_close(db);
 
     printf("test_sqlite3_insert_retuning test passed\n");
+}
+/*
+** Authorizer registration contract. SQLite accepts registrations: one
+** authorizer per connection, each call replaces the previous one, NULL
+** clears it. Turso refuses with SQLITE_ERROR (no prepare-time
+** authorization hook exists, and a stored-but-never-invoked callback would
+** silently drop the enforcement callers registered for). Either way,
+** statement execution must be unaffected. Enforcement cases (DENY/IGNORE)
+** arrive together with the core authorization hook.
+*/
+static int authorizer_allow(void *user_data, int action,
+                            const char *arg1, const char *arg2,
+                            const char *database, const char *trigger)
+{
+    (void)user_data; (void)action; (void)arg1; (void)arg2;
+    (void)database; (void)trigger;
+    return SQLITE_OK;
+}
+
+static int authorizer_allow2(void *user_data, int action,
+                             const char *arg1, const char *arg2,
+                             const char *database, const char *trigger)
+{
+    (void)user_data; (void)action; (void)arg1; (void)arg2;
+    (void)database; (void)trigger;
+    return SQLITE_OK;
+}
+
+void test_sqlite3_set_authorizer()
+{
+    sqlite3 *db;
+    char *err_msg = NULL;
+    int rc;
+
+    rc = sqlite3_open(":memory:", &db);
+    assert(rc == SQLITE_OK);
+
+    /* Registration is either accepted (SQLite) or refused (Turso); this is
+    ** the call PHP makes unconditionally at open, discarding the return. */
+    rc = sqlite3_set_authorizer(db, authorizer_allow, NULL);
+    assert(rc == SQLITE_OK || rc == SQLITE_ERROR);
+
+    /* A permissive (or refused) authorizer must not disturb execution. */
+    rc = sqlite3_exec(db, "CREATE TABLE auth_t(a, b)", NULL, NULL, &err_msg);
+    assert(rc == SQLITE_OK);
+    if (err_msg) { sqlite3_free(err_msg); err_msg = NULL; }
+
+    /* Each registration replaces the previous authorizer. */
+    rc = sqlite3_set_authorizer(db, authorizer_allow2, (void *)&db);
+    assert(rc == SQLITE_OK || rc == SQLITE_ERROR);
+
+    rc = sqlite3_exec(db, "INSERT INTO auth_t VALUES (1, 2)", NULL, NULL, &err_msg);
+    assert(rc == SQLITE_OK);
+    if (err_msg) { sqlite3_free(err_msg); err_msg = NULL; }
+
+    /* A NULL callback clears the authorizer. */
+    rc = sqlite3_set_authorizer(db, NULL, NULL);
+    assert(rc == SQLITE_OK || rc == SQLITE_ERROR);
+
+    rc = sqlite3_exec(db, "SELECT a FROM auth_t", NULL, NULL, &err_msg);
+    assert(rc == SQLITE_OK);
+    if (err_msg) { sqlite3_free(err_msg); err_msg = NULL; }
+
+    sqlite3_close(db);
+    printf("test_sqlite3_set_authorizer test passed\n");
+}
+
+void test_sqlite3_db_config()
+{
+    sqlite3 *db;
+    int value;
+    int rc;
+
+    rc = sqlite3_open(":memory:", &db);
+    assert(rc == SQLITE_OK);
+
+    /* SQLite accepts DEFENSIVE and reports state through the out-pointer.
+    ** Turso refuses it (SQLITE_ERROR, out-pointer untouched): its engine is
+    ** unconditionally defensive, so there is nothing to toggle — see
+    ** turso_db_config_int. Either way the out-pointer must never hold
+    ** garbage. */
+    value = -99;
+    rc = sqlite3_db_config(db, SQLITE_DBCONFIG_DEFENSIVE, 1, &value);
+    assert(rc == SQLITE_OK || rc == SQLITE_ERROR);
+    if (rc == SQLITE_OK) {
+        assert(value == 1);
+
+        /* A negative value queries the current state without changing it. */
+        value = -99;
+        rc = sqlite3_db_config(db, SQLITE_DBCONFIG_DEFENSIVE, -1, &value);
+        assert(rc == SQLITE_OK);
+        assert(value == 1);
+
+        /* Turning it back off. */
+        value = -99;
+        rc = sqlite3_db_config(db, SQLITE_DBCONFIG_DEFENSIVE, 0, &value);
+        assert(rc == SQLITE_OK);
+        assert(value == 0);
+    } else {
+        assert(value == -99);
+    }
+
+    /* A NULL out-pointer must be tolerated whatever the answer; this is the
+    ** exact call PHP's ext/sqlite3 makes at open when sqlite3.defensive=1,
+    ** and PHP ignores the return value. */
+    rc = sqlite3_db_config(db, SQLITE_DBCONFIG_DEFENSIVE, 1, (int *)0);
+    assert(rc == SQLITE_OK || rc == SQLITE_ERROR);
+
+    /* Unknown ops are rejected. */
+    rc = sqlite3_db_config(db, 9999, 0, (int *)0);
+    assert(rc == SQLITE_ERROR);
+
+    sqlite3_close(db);
+    printf("test_sqlite3_db_config test passed\n");
+}
+
+void test_sqlite3_extended_result_codes()
+{
+    sqlite3 *db;
+    sqlite3_stmt *stmt;
+    char *err_msg = NULL;
+    int rc;
+
+    rc = sqlite3_open(":memory:", &db);
+    assert(rc == SQLITE_OK);
+
+    rc = sqlite3_exec(db, "CREATE TABLE erc_t(a INTEGER PRIMARY KEY, b UNIQUE)",
+                      NULL, NULL, &err_msg);
+    assert(rc == SQLITE_OK);
+    if (err_msg) { sqlite3_free(err_msg); err_msg = NULL; }
+    rc = sqlite3_exec(db, "INSERT INTO erc_t VALUES (1, 1)", NULL, NULL, &err_msg);
+    assert(rc == SQLITE_OK);
+    if (err_msg) { sqlite3_free(err_msg); err_msg = NULL; }
+
+    /* Extended result codes are disabled by default: sqlite3_errcode
+    ** reports only the primary code after a constraint violation. */
+    rc = sqlite3_prepare_v2(db, "INSERT INTO erc_t VALUES (2, 1)", -1, &stmt, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_step(stmt);
+    assert((rc & 0xff) == SQLITE_CONSTRAINT);
+    sqlite3_finalize(stmt);
+    assert(sqlite3_errcode(db) == SQLITE_CONSTRAINT);
+    /* sqlite3_extended_errcode reports the extended code regardless of the
+    ** setting; its primary part is the constraint code either way. */
+    assert((sqlite3_extended_errcode(db) & 0xff) == SQLITE_CONSTRAINT);
+
+    /* Enabling widens what sqlite3_errcode reports; the primary part of
+    ** whatever it returns is still the constraint code. */
+    rc = sqlite3_extended_result_codes(db, 1);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_prepare_v2(db, "INSERT INTO erc_t VALUES (3, 1)", -1, &stmt, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_step(stmt);
+    assert((rc & 0xff) == SQLITE_CONSTRAINT);
+    sqlite3_finalize(stmt);
+    assert((sqlite3_errcode(db) & 0xff) == SQLITE_CONSTRAINT);
+    assert((sqlite3_extended_errcode(db) & 0xff) == SQLITE_CONSTRAINT);
+
+    /* Disabling narrows sqlite3_errcode back to the primary code. */
+    rc = sqlite3_extended_result_codes(db, 0);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_prepare_v2(db, "INSERT INTO erc_t VALUES (4, 1)", -1, &stmt, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_step(stmt);
+    assert((rc & 0xff) == SQLITE_CONSTRAINT);
+    sqlite3_finalize(stmt);
+    assert(sqlite3_errcode(db) == SQLITE_CONSTRAINT);
+
+    sqlite3_close(db);
+    printf("test_sqlite3_extended_result_codes test passed\n");
 }
