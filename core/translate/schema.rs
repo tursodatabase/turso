@@ -1091,6 +1091,8 @@ fn emit_ctas_insert(
     program.preassign_label_to_next_insn(loop_end);
     program.preassign_label_to_next_insn(halt_label);
 
+    program.result_columns.clear();
+
     Ok(())
 }
 
