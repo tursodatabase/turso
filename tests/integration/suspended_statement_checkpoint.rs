@@ -111,3 +111,53 @@ fn test_wal_checkpoint_with_suspended_write_statement_keeps_statement_resumable(
         assert_eq!(integrity[0][0].to_string(), "ok", "target_io={target_io}");
     }
 }
+
+#[test]
+fn test_suspended_wal_checkpoint_rejects_new_statement() {
+    let io = Arc::new(MemoryYieldIO::new());
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("checkpoint-before-insert.db");
+    let path = path.to_str().unwrap();
+
+    seed_freelist_db(&io, path);
+    open_conn(io.clone(), path)
+        .execute("UPDATE t SET b = zeroblob(51000) WHERE id = 1")
+        .unwrap();
+
+    let conn = open_conn(io.clone(), path);
+    let mut checkpoint = conn.prepare("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    loop {
+        match checkpoint.step().unwrap() {
+            StepResult::IO if checkpoint.get_pager().is_checkpointing() => break,
+            StepResult::IO => io.step().unwrap(),
+            StepResult::Yield => {}
+            other => panic!("checkpoint completed before suspension: {other:?}"),
+        }
+    }
+
+    let mut insert = conn
+        .prepare("INSERT INTO t VALUES (100, zeroblob(50000))")
+        .unwrap();
+    let err = insert
+        .step()
+        .expect_err("suspended checkpoint must reject a new statement");
+    assert!(
+        matches!(err, LimboError::StatementsInProgress(_)),
+        "unexpected INSERT error: {err:?}"
+    );
+    drop(insert);
+
+    loop {
+        match checkpoint.step().unwrap() {
+            StepResult::IO => io.step().unwrap(),
+            StepResult::Row | StepResult::Yield => {}
+            StepResult::Done => break,
+            other => panic!("unexpected checkpoint result: {other:?}"),
+        }
+    }
+    drop(checkpoint);
+    assert!(!conn.get_pager().is_checkpointing());
+
+    conn.execute("INSERT INTO t VALUES (100, zeroblob(50000))")
+        .unwrap();
+}
