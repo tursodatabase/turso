@@ -101,15 +101,15 @@ jobs:
               yarn workspace @tursodatabase/database-wasm-common build
               yarn workspace @tursodatabase/sync-common build
               yarn workspace @tursodatabase/sync-wasm build
-    name: ${{ matrix.settings.artifact }} - node@20
+    name: ${{ matrix.settings.artifact }} - node@24
     runs-on: ${{ matrix.settings.host }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         if: ${{ !matrix.settings.docker }}
         with:
-          node-version: 20
+          node-version: 24
       - name: Install
         uses: dtolnay/rust-toolchain@stable
         if: ${{ !matrix.settings.docker }}
@@ -141,10 +141,10 @@ jobs:
       - name: Build common
         run: yarn workspace @tursodatabase/database-common build
       - name: Setup node x86
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         if: matrix.settings.target == 'x86_64-pc-windows-msvc'
         with:
-          node-version: 20
+          node-version: 24
           architecture: x64
       - name: Build in docker
         if: ${{ matrix.settings.docker }}
@@ -182,7 +182,8 @@ jobs:
       fail-fast: false
       matrix:
         node:
-          - "20"
+          - "22"
+          - "24"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -214,12 +215,13 @@ jobs:
       fail-fast: false
       matrix:
         node:
-          - "20"
+          - "22"
+          - "24"
     runs-on: blacksmith-4vcpu-windows-2025
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
           architecture: x64
@@ -239,15 +241,10 @@ jobs:
       - name: Test bindings
         run: yarn workspace @tursodatabase/database test
   test-db-wasm-binding:
-    name: Test DB bindings on browser@${{ matrix.node }}
+    name: Test DB bindings on browser
     timeout-minutes: 30
     needs:
       - build
-    strategy:
-      fail-fast: false
-      matrix:
-        node:
-          - "20"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     # Image ships node 20 + chromium + firefox + system deps. Bump the tag
     # whenever the `playwright` dep in bindings/javascript/yarn.lock changes.
@@ -285,7 +282,8 @@ jobs:
       fail-fast: false
       matrix:
         node:
-          - "20"
+          - "22"
+          - "24"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -339,12 +337,13 @@ jobs:
       fail-fast: false
       matrix:
         node:
-          - "20"
+          - "22"
+          - "24"
     runs-on: blacksmith-4vcpu-windows-2025
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
           architecture: x64
@@ -384,15 +383,10 @@ jobs:
           LOCAL_SYNC_SERVER: ${{ github.workspace }}/target/debug/tursodb
         run: yarn workspace @tursodatabase/sync test
   test-sync-wasm-binding:
-    name: Test sync bindings on browser@${{ matrix.node }}
+    name: Test sync bindings on browser
     timeout-minutes: 30
     needs:
       - build
-    strategy:
-      fail-fast: false
-      matrix:
-        node:
-          - "20"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     # Image ships node 20 + chromium + firefox + system deps. Bump the tag
     # whenever the `playwright` dep in bindings/javascript/yarn.lock changes.
@@ -462,9 +456,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
       - name: Update npm
         run: npm install -g npm@11
       - name: Download all DB artifacts
