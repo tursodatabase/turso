@@ -122,8 +122,14 @@ impl PostgreSQLTranslator {
         // All other statements have no prerequisites
         let stmt = match &node.0 {
             NodeRef::SelectStmt(select) => {
-                let select_ast = self.translate_select(select)?;
-                ast::Stmt::Select(select_ast)
+                // Top-level SELECT ... INTO is PG's legacy spelling of
+                // CREATE TABLE AS.
+                if select.into_clause.is_some() {
+                    self.translate_select_into(select)?
+                } else {
+                    let select_ast = self.translate_select(select)?;
+                    ast::Stmt::Select(select_ast)
+                }
             }
             NodeRef::InsertStmt(insert) => self.translate_insert(insert)?,
             NodeRef::UpdateStmt(update) => self.translate_update(update)?,
@@ -1020,8 +1026,8 @@ impl PostgreSQLTranslator {
         })
     }
 
-    /// Translate CREATE MATERIALIZED VIEW (parsed by PG as CreateTableAsStmt
-    /// with objtype = ObjectMatview).
+    /// Translate CREATE MATERIALIZED VIEW and CREATE TABLE AS (both parsed
+    /// by PG as CreateTableAsStmt, distinguished by objtype).
     fn translate_create_table_as(
         &self,
         ctas: &pg_query::protobuf::CreateTableAsStmt,
@@ -1031,15 +1037,37 @@ impl PostgreSQLTranslator {
         let objtype = ObjectType::try_from(ctas.objtype)
             .map_err(|_| ParseError::ParseError("CREATE TABLE AS: invalid object type".into()))?;
 
-        if objtype != ObjectType::ObjectMatview {
-            return Err(ParseError::ParseError(
-                "CREATE TABLE AS SELECT is not supported; use CREATE MATERIALIZED VIEW".into(),
-            ));
-        }
+        let label = match objtype {
+            ObjectType::ObjectMatview => "CREATE MATERIALIZED VIEW",
+            ObjectType::ObjectTable => "CREATE TABLE AS",
+            _ => {
+                return Err(ParseError::ParseError(
+                    "CREATE TABLE AS: unsupported object type".into(),
+                ));
+            }
+        };
 
-        let into_clause = ctas.into.as_ref().ok_or_else(|| {
-            ParseError::ParseError("CREATE MATERIALIZED VIEW: missing INTO clause".into())
-        })?;
+        let into_clause = ctas
+            .into
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError(format!("{label}: missing INTO clause")))?;
+
+        let query_node = ctas
+            .query
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError(format!("{label}: missing query")))?;
+        let select_stmt = match &query_node.node {
+            Some(pg_query::protobuf::node::Node::SelectStmt(s)) => s,
+            _ => {
+                return Err(ParseError::ParseError(format!(
+                    "{label}: expected SELECT statement"
+                )));
+            }
+        };
+
+        if objtype == ObjectType::ObjectTable {
+            return self.translate_ctas_table(into_clause, select_stmt, ctas.if_not_exists);
+        }
 
         let relation = into_clause.rel.as_ref().ok_or_else(|| {
             ParseError::ParseError("CREATE MATERIALIZED VIEW: missing view name".into())
@@ -1060,18 +1088,6 @@ impl PostgreSQLTranslator {
             })
             .collect();
 
-        // Translate the query
-        let query_node = ctas.query.as_ref().ok_or_else(|| {
-            ParseError::ParseError("CREATE MATERIALIZED VIEW: missing query".into())
-        })?;
-        let select_stmt = match &query_node.node {
-            Some(pg_query::protobuf::node::Node::SelectStmt(s)) => s,
-            _ => {
-                return Err(ParseError::ParseError(
-                    "CREATE MATERIALIZED VIEW: expected SELECT statement".into(),
-                ));
-            }
-        };
         let select = self.translate_select(select_stmt)?;
 
         Ok(ast::Stmt::CreateMaterializedView {
@@ -1080,6 +1096,66 @@ impl PostgreSQLTranslator {
             columns,
             select,
         })
+    }
+
+    /// Translate CREATE TABLE AS / SELECT INTO into Turso's
+    /// `CREATE TABLE ... AS SELECT`. The new table's schema is derived from
+    /// the SELECT by the engine. TEMP is silently ignored (the table is
+    /// persistent), like in CREATE TABLE.
+    fn translate_ctas_table(
+        &self,
+        into_clause: &pg_query::protobuf::IntoClause,
+        select_stmt: &pg_query::protobuf::SelectStmt,
+        if_not_exists: bool,
+    ) -> Result<ast::Stmt, ParseError> {
+        let relation = into_clause
+            .rel
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("CREATE TABLE AS: missing table name".into()))?;
+        let tbl_name = self.qualified_name_from_range_var(relation);
+
+        // The engine names the new table's columns after the SELECT's output
+        // columns and has no way to override them, so reject an explicit
+        // column list rather than silently misname columns.
+        if !into_clause.col_names.is_empty() {
+            return Err(ParseError::ParseError(
+                "CREATE TABLE AS: explicit column list is not supported".into(),
+            ));
+        }
+
+        let mut select = self.translate_select(select_stmt)?;
+
+        // WITH NO DATA: create the table from the SELECT's shape without
+        // copying rows. LIMIT 0 keeps schema derivation intact while
+        // guaranteeing an empty result.
+        if into_clause.skip_data {
+            select.limit = Some(ast::Limit {
+                expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))),
+                offset: None,
+            });
+        }
+
+        Ok(ast::Stmt::CreateTable {
+            temporary: false,
+            if_not_exists,
+            tbl_name,
+            body: ast::CreateTableBody::AsSelect(select),
+        })
+    }
+
+    /// Translate top-level `SELECT ... INTO table FROM ...`, which PG parses
+    /// as a SelectStmt carrying an IntoClause and treats as CREATE TABLE AS.
+    fn translate_select_into(
+        &self,
+        select: &pg_query::protobuf::SelectStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        let into_clause = select
+            .into_clause
+            .as_ref()
+            .expect("caller checked into_clause");
+        let mut inner = select.clone();
+        inner.into_clause = None;
+        self.translate_ctas_table(into_clause, &inner, false)
     }
 
     fn translate_insert(
@@ -1340,6 +1416,15 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Select, ParseError> {
         use pg_query::protobuf::SetOperation;
 
+        // Top-level SELECT INTO is intercepted (and its IntoClause stripped)
+        // before translation, so an INTO seen here is in a nested position,
+        // which PG rejects during parse analysis.
+        if select.into_clause.is_some() {
+            return Err(ParseError::ParseError(
+                "SELECT ... INTO is not allowed here".into(),
+            ));
+        }
+
         // Check if this is a UNION/INTERSECT/EXCEPT (set operation)
         let set_op = select.op();
         if set_op != SetOperation::SetopNone && set_op != SetOperation::Undefined {
@@ -1523,6 +1608,15 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::OneSelect, ParseError> {
+        // Compound-select leaves carry their own IntoClause. PG allows INTO
+        // only on the first leaf of a top-level compound; reject all of them
+        // rather than implement that form.
+        if select.into_clause.is_some() {
+            return Err(ParseError::ParseError(
+                "SELECT ... INTO is not allowed here".into(),
+            ));
+        }
+
         let from_clause = if !select.from_clause.is_empty() {
             Some(self.translate_from_items(&select.from_clause)?)
         } else {
