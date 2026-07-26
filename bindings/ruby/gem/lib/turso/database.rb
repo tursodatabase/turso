@@ -13,7 +13,8 @@ module Turso
 
     def initialize(path = ":memory:", **options)
       options[:experimental_features] = normalize_experimental_features(options[:experimental_features])
-      @native = NativeDatabase.new(path, options)
+      native_opts = options.each_with_object({}) { |(k, v), h| h[k.to_s] = v }
+      @native = NativeDatabase.new(path, native_opts)
       @closed = false
     end
 
