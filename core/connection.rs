@@ -8,7 +8,7 @@ use crate::sync::{
     atomic::{
         AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8, Ordering,
     },
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
 };
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
@@ -342,6 +342,30 @@ pub enum SyncRowStep {
     Upsert { stmt: Box<Statement> },
 }
 
+#[derive(Default)]
+pub(crate) struct StatementActivity {
+    explicit_checkpoint_active: bool,
+}
+
+pub(crate) struct ExplicitCheckpointGuard {
+    activity: Arc<Mutex<StatementActivity>>,
+    pager: Arc<Pager>,
+}
+
+impl Drop for ExplicitCheckpointGuard {
+    fn drop(&mut self) {
+        if self.pager.is_checkpointing() {
+            self.pager.cleanup_after_checkpoint_failure();
+        }
+        let mut activity = self.activity.lock();
+        turso_assert!(
+            activity.explicit_checkpoint_active,
+            "dropping an inactive explicit checkpoint guard"
+        );
+        activity.explicit_checkpoint_active = false;
+    }
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -483,6 +507,8 @@ pub struct Connection {
     /// (`db->nVdbeActive`) for user statements, excluding internal helpers and
     /// subprogram execution.
     pub(crate) n_active_root_statements: AtomicI32,
+    /// Prevents root statements and explicit checkpoints from overlapping on this connection.
+    pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
@@ -4695,6 +4721,36 @@ impl Connection {
         if self.n_active_root_statements.load(Ordering::SeqCst) == 0 {
             self.interrupt_requested.store(false, Ordering::SeqCst);
         }
+    }
+
+    pub(crate) fn start_root_statement(&self) -> Result<()> {
+        let activity = self.statement_activity.lock();
+        if activity.explicit_checkpoint_active {
+            return Err(LimboError::StatementsInProgress(
+                "cannot start a statement while a checkpoint is active",
+            ));
+        }
+        self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(crate) fn begin_explicit_checkpoint(
+        &self,
+        pager: Arc<Pager>,
+    ) -> Result<ExplicitCheckpointGuard> {
+        let mut activity = self.statement_activity.lock();
+        if activity.explicit_checkpoint_active
+            || self.n_active_root_statements.load(Ordering::SeqCst) != 1
+        {
+            return Err(LimboError::StatementsInProgress(
+                "cannot checkpoint while another statement is active",
+            ));
+        }
+        activity.explicit_checkpoint_active = true;
+        Ok(ExplicitCheckpointGuard {
+            activity: self.statement_activity.clone(),
+            pager,
+        })
     }
 
     pub(crate) fn set_tx_state(&self, state: TransactionState) {

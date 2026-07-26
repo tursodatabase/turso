@@ -587,17 +587,6 @@ pub fn op_checkpoint(
         },
         insn
     );
-    if !program.connection.is_nested_stmt()
-        && program
-            .connection
-            .n_active_root_statements
-            .load(Ordering::SeqCst)
-            != 1
-    {
-        return Err(LimboError::StatementsInProgress(
-            "cannot checkpoint while another statement is active",
-        ));
-    }
     if !program.connection.auto_commit.load(Ordering::SeqCst) {
         // TODO: sqlite returns "Runtime error: database table is locked (6)" when a table is in use
         // when a checkpoint is attempted. We don't have table locks, so return TableLocked for any
@@ -616,6 +605,13 @@ pub fn op_checkpoint(
         set_not_in_wal_result(state, *dest);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
+    }
+    if !program.connection.is_nested_stmt() && state.explicit_checkpoint_guard.is_none() {
+        state.explicit_checkpoint_guard = Some(
+            program
+                .connection
+                .begin_explicit_checkpoint(pager.clone())?,
+        );
     }
 
     // In autocommit mode, this statement can still hold an implicit read tx.
@@ -670,6 +666,7 @@ pub fn op_checkpoint(
         // 3rd col: # pages moved to db after checkpoint
         state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
 
+        state.explicit_checkpoint_guard = None;
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -688,6 +685,7 @@ pub fn op_checkpoint(
             // 3rd col: # pages moved to db after checkpoint
             state.registers[*dest + 2].set_int(wal_total_backfilled as i64);
 
+            state.explicit_checkpoint_guard = None;
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
@@ -695,6 +693,7 @@ pub fn op_checkpoint(
         Err(err) => {
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
             pager.clear_checkpoint_state();
+            state.explicit_checkpoint_guard = None;
             state.registers[*dest].set_int(1);
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
