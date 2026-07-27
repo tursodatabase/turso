@@ -1,0 +1,48 @@
+# Regression test for https://github.com/tursodatabase/turso/issues/7758
+# json_insert(), json_replace(), and the jsonb_* variants require an odd
+# number of arguments (document + path/value pairs). A path without a value
+# must be rejected, matching SQLite.
+
+@database :memory:
+
+test json-insert-path-only-errors {
+    SELECT json_insert('{}', '$.a');
+}
+expect error {
+    json_insert\(\) needs an odd number of arguments
+}
+
+test json-replace-path-only-errors {
+    SELECT json_replace('{}', '$.a');
+}
+expect error {
+    json_replace\(\) needs an odd number of arguments
+}
+
+test jsonb-insert-path-only-errors {
+    SELECT jsonb_insert('{}', '$.a');
+}
+expect error {
+    json_insert\(\) needs an odd number of arguments
+}
+
+test jsonb-replace-path-only-errors {
+    SELECT jsonb_replace('{}', '$.a');
+}
+expect error {
+    json_replace\(\) needs an odd number of arguments
+}
+
+test json-insert-pair-still-works {
+    SELECT json_insert('{}', '$.a', 1);
+}
+expect {
+    {"a":1}
+}
+
+test json-replace-pair-still-works {
+    SELECT json_replace('{"a":2}', '$.a', 1);
+}
+expect {
+    {"a":1}
+}
