@@ -22,7 +22,7 @@ use crate::{
         select::emit_simple_count,
         subquery::{emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at},
         values::emit_values,
-        window::{emit_window_results, EmitWindow},
+        window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
     },
     vdbe::insn::Insn,
@@ -285,7 +285,7 @@ pub fn emit_query<'a>(
         // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
         emit_ungrouped_aggregation(program, t_ctx, plan)?;
     } else if plan.window.is_some() {
-        emit_window_results(program, t_ctx, plan)?;
+        emit_window_flush(program, t_ctx, plan)?;
     }
 
     // Process ORDER BY results if needed

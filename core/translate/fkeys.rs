@@ -370,7 +370,7 @@ where
 ///
 /// Used when an FK parent-side probe needs the matching child rowid, for
 /// example to ignore the row currently being updated in a self-referential FK.
-fn index_scan_match_any<F>(
+pub(super) fn index_scan_match_any<F>(
     program: &mut ProgramBuilder,
     icur: usize,
     probe_start: usize,
@@ -429,7 +429,7 @@ where
     Ok(())
 }
 
-fn emit_skip_if_any_null(
+pub(super) fn emit_skip_if_any_null(
     program: &mut ProgramBuilder,
     reg_start: usize,
     nregs: usize,

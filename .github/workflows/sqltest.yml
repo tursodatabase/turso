@@ -81,7 +81,7 @@ jobs:
       - name: Setup node
         uses: useblacksmith/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
       - name: Install JS dependencies
         run: yarn install
       - name: Build common package
