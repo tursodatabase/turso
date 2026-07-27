@@ -1,0 +1,1766 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+# UPSERT updates are captured as an ordered retraction and insertion. Moving a
+# row between groups must update both groups while the insert arm creates a new
+# group normally.
+test matview-parity-upsert-group-transition {
+    CREATE TABLE upsert_accounts(
+      id INTEGER PRIMARY KEY,
+      region TEXT,
+      amount INTEGER
+    );
+    INSERT INTO upsert_accounts VALUES
+      (1, 'north', 10),
+      (2, 'north', 20),
+      (3, 'south', 5);
+    CREATE MATERIALIZED VIEW upsert_totals AS
+      SELECT region, COUNT(*) AS n, SUM(amount) AS total
+      FROM upsert_accounts
+      GROUP BY region;
+    SELECT 'init', * FROM upsert_totals ORDER BY region;
+    INSERT INTO upsert_accounts VALUES (2, 'south', 40)
+      ON CONFLICT(id) DO UPDATE SET
+        region = excluded.region,
+        amount = excluded.amount;
+    SELECT 'moved', * FROM upsert_totals ORDER BY region;
+    INSERT INTO upsert_accounts VALUES (4, 'west', 7)
+      ON CONFLICT(id) DO UPDATE SET amount = excluded.amount;
+    INSERT INTO upsert_accounts VALUES (1, 'north', 5)
+      ON CONFLICT(id) DO UPDATE SET
+        amount = upsert_accounts.amount + excluded.amount;
+    SELECT 'final', * FROM upsert_totals ORDER BY region;
+}
+expect {
+    init|north|2|30
+    init|south|1|5
+    moved|north|1|10
+    moved|south|2|45
+    final|north|1|15
+    final|south|2|45
+    final|west|1|7
+}
+
+# REPLACE may delete a different row through a secondary UNIQUE constraint,
+# or replace the row named by the primary key. Both old images must reach IVM
+# before the replacement image.
+test matview-parity-replace-secondary-unique {
+    CREATE TABLE replace_contacts(
+      id INTEGER PRIMARY KEY,
+      email TEXT UNIQUE,
+      bucket TEXT,
+      score INTEGER
+    );
+    INSERT INTO replace_contacts VALUES
+      (1, 'a@example', 'A', 10),
+      (2, 'b@example', 'B', 20),
+      (4, 'd@example', 'B', 5);
+    CREATE MATERIALIZED VIEW replace_totals AS
+      SELECT bucket, COUNT(*) AS n, SUM(score) AS total
+      FROM replace_contacts
+      GROUP BY bucket;
+    REPLACE INTO replace_contacts VALUES (3, 'b@example', 'C', 30);
+    SELECT 'unique', * FROM replace_totals ORDER BY bucket;
+    INSERT OR REPLACE INTO replace_contacts VALUES (4, 'e@example', 'A', 40);
+    SELECT 'primary', * FROM replace_totals ORDER BY bucket;
+}
+expect {
+    unique|A|1|10
+    unique|B|1|5
+    unique|C|1|30
+    primary|A|2|50
+    primary|C|1|30
+}
+
+# Conflict-ignore paths must not publish changes for rejected rows in a
+# multi-row statement, while later non-conflicting rows still reach the view.
+test matview-parity-conflict-ignore-batch {
+    CREATE TABLE ignore_source(
+      id INTEGER PRIMARY KEY,
+      key TEXT UNIQUE,
+      value INTEGER
+    );
+    INSERT INTO ignore_source VALUES (1, 'a', 1), (2, 'b', 2);
+    CREATE MATERIALIZED VIEW ignore_view AS
+      SELECT key, value FROM ignore_source;
+    INSERT OR IGNORE INTO ignore_source VALUES
+      (3, 'a', 30),
+      (2, 'c', 20),
+      (4, 'd', 4);
+    INSERT INTO ignore_source VALUES (5, 'b', 50)
+      ON CONFLICT(key) DO NOTHING;
+    SELECT * FROM ignore_view ORDER BY key;
+}
+expect {
+    a|1
+    b|2
+    d|4
+}
+
+# Nested savepoint rewinds apply to every level in a materialized-view
+# dependency chain. The outer rollback must discard changes made before and
+# after an inner savepoint without leaving stale downstream aggregate state.
+test matview-parity-nested-savepoint-dependency {
+    CREATE TABLE savepoint_base(
+      id INTEGER PRIMARY KEY,
+      g TEXT,
+      x INTEGER
+    );
+    INSERT INTO savepoint_base VALUES (1, 'a', 10), (2, 'a', 20);
+    CREATE MATERIALIZED VIEW savepoint_rows AS
+      SELECT id, g, x FROM savepoint_base WHERE x > 0;
+    CREATE MATERIALIZED VIEW savepoint_totals AS
+      SELECT g, COUNT(*) AS n, SUM(x) AS total
+      FROM savepoint_rows
+      GROUP BY g;
+    BEGIN;
+    INSERT INTO savepoint_base VALUES (3, 'b', 5);
+    SAVEPOINT outer_changes;
+    UPDATE savepoint_base SET g = 'b', x = 15 WHERE id = 1;
+    SAVEPOINT inner_changes;
+    DELETE FROM savepoint_base WHERE id = 2;
+    SELECT 'inner', * FROM savepoint_totals ORDER BY g;
+    ROLLBACK TO inner_changes;
+    RELEASE inner_changes;
+    INSERT INTO savepoint_base VALUES (4, 'a', 7);
+    SELECT 'outer', * FROM savepoint_totals ORDER BY g;
+    ROLLBACK TO outer_changes;
+    RELEASE outer_changes;
+    COMMIT;
+    SELECT 'final', * FROM savepoint_totals ORDER BY g;
+}
+expect {
+    inner|b|2|20
+    outer|a|2|27
+    outer|b|2|20
+    final|a|2|30
+    final|b|1|5
+}
+
+# A non-equality LEFT JOIN must create and retract its NULL-padded row as the
+# first and last range match appears or disappears.
+test matview-parity-left-non-equality-transitions {
+    CREATE TABLE range_source(
+      id INTEGER PRIMARY KEY,
+      lo INTEGER,
+      hi INTEGER
+    );
+    CREATE TABLE point_source(
+      id INTEGER PRIMARY KEY,
+      value INTEGER
+    );
+    INSERT INTO range_source VALUES (1, 0, 5), (2, 10, 20);
+    INSERT INTO point_source VALUES (1, 3), (2, 15), (3, 18);
+    CREATE MATERIALIZED VIEW range_matches AS
+      SELECT r.id AS range_id, p.id AS point_id, p.value
+      FROM range_source AS r
+      LEFT JOIN point_source AS p
+        ON p.value >= r.lo AND p.value <= r.hi;
+    SELECT 'init', * FROM range_matches ORDER BY range_id, point_id;
+    DELETE FROM point_source WHERE id = 1;
+    INSERT INTO point_source VALUES (4, 4);
+    UPDATE point_source SET value = 7 WHERE id = 2;
+    DELETE FROM point_source WHERE id = 3;
+    SELECT 'final', * FROM range_matches ORDER BY range_id, point_id;
+}
+expect {
+    init|1|1|3
+    init|2|2|15
+    init|2|3|18
+    final|1|4|4
+    final|2||
+}
+
+# RIGHT JOIN lowering must remain composable with aggregation. Matching an
+# orphan and later removing a dimension row changes the exact grouping key
+# from NULL to text and back again.
+test matview-parity-right-join-aggregate {
+    CREATE TABLE right_departments(
+      id INTEGER PRIMARY KEY,
+      name TEXT
+    );
+    CREATE TABLE right_employees(
+      id INTEGER PRIMARY KEY,
+      department_id INTEGER,
+      salary INTEGER
+    );
+    INSERT INTO right_departments VALUES (1, 'Sales'), (2, 'Engineering');
+    INSERT INTO right_employees VALUES
+      (1, 1, 10),
+      (2, 1, 15),
+      (3, 2, 20),
+      (4, 3, 7);
+    CREATE MATERIALIZED VIEW right_payroll AS
+      SELECT e.department_id, d.name, COUNT(*) AS n, SUM(e.salary) AS payroll
+      FROM right_departments AS d
+      RIGHT JOIN right_employees AS e ON d.id = e.department_id
+      GROUP BY e.department_id, d.name;
+    SELECT 'init', * FROM right_payroll ORDER BY department_id;
+    INSERT INTO right_departments VALUES (3, 'Operations');
+    UPDATE right_employees SET department_id = 3 WHERE id = 3;
+    DELETE FROM right_departments WHERE id = 1;
+    SELECT 'final', * FROM right_payroll ORDER BY department_id;
+}
+expect {
+    init|1|Sales|2|25
+    init|2|Engineering|1|20
+    init|3||1|7
+    final|1||2|25
+    final|3|Operations|2|27
+}
+
+# A CROSS JOIN drives one aggregate group per right row. Mutating both sides
+# in a transaction exercises all cross-generation pairs, then rollback must
+# restore both the visible view and its hidden aggregate state.
+test matview-parity-cross-join-aggregate-rollback {
+    CREATE TABLE cross_products(
+      id INTEGER PRIMARY KEY,
+      price INTEGER
+    );
+    CREATE TABLE cross_taxes(
+      region TEXT PRIMARY KEY,
+      rate INTEGER
+    );
+    INSERT INTO cross_products VALUES (1, 100), (2, 200);
+    INSERT INTO cross_taxes VALUES ('EU', 20), ('US', 10);
+    CREATE MATERIALIZED VIEW cross_totals AS
+      SELECT
+        t.region,
+        COUNT(*) AS n,
+        SUM((p.price * (100 + t.rate)) / 100) AS taxed_total
+      FROM cross_products AS p
+      CROSS JOIN cross_taxes AS t
+      GROUP BY t.region;
+    SELECT 'init', * FROM cross_totals ORDER BY region;
+    BEGIN;
+    INSERT INTO cross_products VALUES (3, 50);
+    UPDATE cross_taxes SET rate = 25 WHERE region = 'EU';
+    DELETE FROM cross_taxes WHERE region = 'US';
+    SELECT 'txn', * FROM cross_totals ORDER BY region;
+    ROLLBACK;
+    SELECT 'final', * FROM cross_totals ORDER BY region;
+}
+expect {
+    init|EU|2|360
+    init|US|2|330
+    txn|EU|3|437
+    final|EU|2|360
+    final|US|2|330
+}
+
+# The same base-table change can flow through both arms of a dependency
+# diamond before reaching one downstream compound view. Each arm must be
+# scheduled once and UNION ALL must preserve their independent identities.
+test matview-parity-dependency-diamond {
+    CREATE TABLE diamond_base(
+      id INTEGER PRIMARY KEY,
+      x INTEGER
+    );
+    INSERT INTO diamond_base VALUES (1, 1), (2, 2), (3, 3);
+    CREATE MATERIALIZED VIEW diamond_even AS
+      SELECT x FROM diamond_base WHERE x % 2 = 0;
+    CREATE MATERIALIZED VIEW diamond_high AS
+      SELECT x FROM diamond_base WHERE x >= 2;
+    CREATE MATERIALIZED VIEW diamond_result AS
+      SELECT 'even' AS arm, x FROM diamond_even
+      UNION ALL
+      SELECT 'high' AS arm, x FROM diamond_high;
+    SELECT 'init', * FROM diamond_result ORDER BY arm, x;
+    BEGIN;
+    UPDATE diamond_base SET x = 4 WHERE id = 1;
+    DELETE FROM diamond_base WHERE id = 2;
+    INSERT INTO diamond_base VALUES (4, 0);
+    COMMIT;
+    SELECT 'final', * FROM diamond_result ORDER BY arm, x;
+}
+expect {
+    init|even|2
+    init|high|2
+    init|high|3
+    final|even|0
+    final|even|4
+    final|high|3
+    final|high|4
+}
+
+# Set-operation state keys must retain storage-class identity. NULL, integer
+# zero, text "00", and blob 0x00 are different values even when their printed
+# forms are easy to confuse.
+test matview-parity-typed-intersect-transitions {
+    CREATE TABLE typed_left(value);
+    CREATE TABLE typed_right(value);
+    INSERT INTO typed_left VALUES
+      (NULL), (x'00'), (x'00'), ('00'), (0);
+    INSERT INTO typed_right VALUES (NULL), (x'00'), (0);
+    CREATE MATERIALIZED VIEW typed_common AS
+      SELECT value FROM typed_left
+      INTERSECT
+      SELECT value FROM typed_right;
+    SELECT 'init', typeof(value), quote(value)
+      FROM typed_common
+      ORDER BY typeof(value);
+    DELETE FROM typed_right WHERE typeof(value) = 'blob';
+    INSERT INTO typed_right VALUES ('00');
+    SELECT 'final', typeof(value), quote(value)
+      FROM typed_common
+      ORDER BY typeof(value);
+}
+expect {
+    init|blob|X'00'
+    init|integer|0
+    init|null|NULL
+    final|integer|0
+    final|null|NULL
+    final|text|'00'
+}
+
+# Aggregate -> join -> UNION is a three-stateful-node composition. NOCASE
+# representatives may change after retraction, but the visible view must still
+# exactly match a fresh execution of the defining query.
+test matview-parity-collated-aggregate-join-union {
+    CREATE TABLE composed_sales(
+      team TEXT COLLATE NOCASE,
+      amount INTEGER
+    );
+    CREATE TABLE composed_targets(
+      team TEXT COLLATE NOCASE
+    );
+    CREATE TABLE composed_extras(
+      team TEXT COLLATE NOCASE,
+      total INTEGER
+    );
+    INSERT INTO composed_sales VALUES ('a', 10), ('A', 20), ('b', 5);
+    INSERT INTO composed_targets VALUES ('A'), ('b');
+    INSERT INTO composed_extras VALUES ('b', 5), ('c', 7);
+    CREATE MATERIALIZED VIEW composed_result AS
+      SELECT grouped.team, grouped.total
+      FROM (
+        SELECT team, SUM(amount) AS total
+        FROM composed_sales
+        GROUP BY team
+      ) AS grouped
+      JOIN composed_targets AS target ON grouped.team = target.team
+      UNION
+      SELECT team, total FROM composed_extras;
+    SELECT 'init', lower(team), total FROM composed_result ORDER BY 2, 3;
+    DELETE FROM composed_sales
+      WHERE team = 'a' COLLATE BINARY AND amount = 10;
+    UPDATE composed_targets SET team = 'a' WHERE team = 'A' COLLATE BINARY;
+    INSERT INTO composed_sales VALUES ('C', 11);
+    INSERT INTO composed_targets VALUES ('c');
+    SELECT 'final', lower(team), total FROM composed_result ORDER BY 2, 3;
+}
+expect {
+    init|a|30
+    init|b|5
+    init|c|7
+    final|a|20
+    final|b|5
+    final|c|7
+    final|c|11
+}
+
+# A no-op update still emits signed deltas. When a self-join arrangement feeds
+# a LEFT JOIN, those contributions can temporarily remove and recreate the
+# same arranged identity. The outer-join match state must follow the published
+# arrangement identities without retaining a dangling auxiliary index entry.
+test matview-parity-arranged-self-join-left-join-noop-update {
+    CREATE TABLE noop_source(x INTEGER PRIMARY KEY);
+    CREATE TABLE noop_right(a INTEGER PRIMARY KEY, b INTEGER);
+    CREATE TABLE noop_empty(c INTEGER);
+    INSERT INTO noop_source VALUES (1), (2);
+    INSERT INTO noop_right VALUES (10, 20);
+    CREATE MATERIALIZED VIEW noop_nested AS
+      SELECT outer_left.value
+      FROM (
+        SELECT inner_left.value
+        FROM (
+          SELECT self_left.value
+          FROM (SELECT x AS value FROM noop_source) AS self_left
+          JOIN (SELECT x AS value FROM noop_source) AS self_right
+            ON self_left.value = self_right.value
+        ) AS inner_left
+        LEFT JOIN (SELECT b AS value FROM noop_right) AS inner_right
+          ON inner_left.value = inner_right.value
+      ) AS outer_left
+      JOIN (
+        SELECT value
+        FROM (
+          SELECT empty_left.value
+          FROM (SELECT a AS value FROM noop_right) AS empty_left
+          JOIN (SELECT c AS value FROM noop_empty) AS empty_right
+            ON empty_left.value = empty_right.value
+        ) AS filtered
+        WHERE value IS NOT NULL
+      ) AS outer_right ON outer_left.value = outer_right.value;
+    SELECT COUNT(*) FROM noop_nested;
+    UPDATE noop_source SET x = x;
+    SELECT COUNT(*) FROM noop_nested;
+}
+expect {
+    0
+    0
+}
+
+# ---------------------------------------------------------------------------
+# Collation metadata across stateful boundaries
+# ---------------------------------------------------------------------------
+
+# A column's implicit collation must survive a filter and projection before it
+# becomes the probe key of a join.
+test matview-parity-collation-filter-project-join {
+    CREATE TABLE rune_words(
+      id INTEGER PRIMARY KEY,
+      word TEXT COLLATE NOCASE,
+      active INTEGER,
+      power INTEGER
+    );
+    CREATE TABLE rune_catalog(word TEXT COLLATE BINARY);
+    INSERT INTO rune_words VALUES
+      (1, 'Ember', 1, 10),
+      (2, 'FROST', 0, 20),
+      (3, 'storm', 1, 30);
+    INSERT INTO rune_catalog VALUES ('ember'), ('frost'), ('STORM');
+    CREATE MATERIALIZED VIEW rune_matches AS
+      SELECT filtered.id, filtered.word, filtered.power
+      FROM (
+        SELECT id, word, power
+        FROM rune_words
+        WHERE active = 1
+      ) AS filtered
+      JOIN rune_catalog AS catalog ON filtered.word = catalog.word;
+    SELECT 'init', id, lower(word), power FROM rune_matches ORDER BY id;
+    UPDATE rune_words SET active = 1, word = 'Frost' WHERE id = 2;
+    UPDATE rune_words SET active = 0 WHERE id = 1;
+    SELECT 'final', id, lower(word), power FROM rune_matches ORDER BY id;
+}
+expect {
+    init|1|ember|10
+    init|3|storm|30
+    final|2|frost|20
+    final|3|storm|30
+}
+
+# A collation-sensitive aggregate result can itself become a downstream join
+# key. Representative changes must preserve MIN's comparison semantics.
+test matview-parity-collated-min-to-join {
+    CREATE TABLE familiar_names(
+      school TEXT,
+      name TEXT COLLATE NOCASE
+    );
+    CREATE TABLE exact_familiars(name TEXT COLLATE BINARY);
+    INSERT INTO familiar_names VALUES ('north', 'A'), ('north', 'a');
+    INSERT INTO exact_familiars VALUES ('a');
+    CREATE MATERIALIZED VIEW chosen_familiars AS
+      SELECT grouped.school, grouped.chosen
+      FROM (
+        SELECT school, MIN(name) AS chosen
+        FROM familiar_names
+        GROUP BY school
+      ) AS grouped
+      JOIN exact_familiars AS exact ON grouped.chosen = exact.name;
+    SELECT 'init', * FROM chosen_familiars;
+    DELETE FROM familiar_names WHERE name = 'A' COLLATE BINARY;
+    SELECT 'after-delete', * FROM chosen_familiars;
+    INSERT INTO familiar_names VALUES ('north', 'A');
+    SELECT 'after-restore', * FROM chosen_familiars;
+}
+expect {
+    init|north|A
+    after-delete|north|a
+    after-restore|north|a
+}
+
+# Explicit COLLATE on a derived expression has precedence over the binary
+# lookup column and must remain attached after CAST and projection.
+test matview-parity-explicit-collation-cast-join {
+    CREATE TABLE spell_aliases(
+      id INTEGER PRIMARY KEY,
+      alias TEXT
+    );
+    CREATE TABLE spell_book(alias TEXT COLLATE BINARY);
+    INSERT INTO spell_aliases VALUES (1, 'FireBall'), (2, 'Blink');
+    INSERT INTO spell_book VALUES ('fireball'), ('BLINK');
+    CREATE MATERIALIZED VIEW resolved_spells AS
+      SELECT derived.id, derived.alias
+      FROM (
+        SELECT id, CAST(alias AS TEXT) COLLATE NOCASE AS alias
+        FROM spell_aliases
+      ) AS derived
+      JOIN spell_book AS book ON derived.alias = book.alias;
+    SELECT 'init', id, lower(alias) FROM resolved_spells ORDER BY id;
+    DELETE FROM spell_book WHERE alias = 'BLINK';
+    INSERT INTO spell_book VALUES ('blink');
+    UPDATE spell_aliases SET alias = 'FIREBALL' WHERE id = 1;
+    SELECT 'final', id, lower(alias) FROM resolved_spells ORDER BY id;
+}
+expect {
+    init|1|fireball
+    init|2|blink
+    final|1|fireball
+    final|2|blink
+}
+
+# Conversely, an explicit BINARY override on the left side must defeat an
+# implicit NOCASE collation on the lookup table.
+test matview-parity-explicit-binary-overrides-right-nocase {
+    CREATE TABLE sigils(
+      id INTEGER PRIMARY KEY,
+      mark TEXT COLLATE NOCASE
+    );
+    CREATE TABLE sigil_registry(mark TEXT COLLATE NOCASE);
+    INSERT INTO sigils VALUES (1, 'Moon'), (2, 'sun');
+    INSERT INTO sigil_registry VALUES ('moon'), ('sun');
+    CREATE MATERIALIZED VIEW exact_sigils AS
+      SELECT projected.id, projected.mark
+      FROM (
+        SELECT id, mark COLLATE BINARY AS mark
+        FROM sigils
+      ) AS projected
+      JOIN sigil_registry AS registry ON projected.mark = registry.mark;
+    SELECT 'init', * FROM exact_sigils ORDER BY id;
+    UPDATE sigils SET mark = 'moon' WHERE id = 1;
+    UPDATE sigil_registry SET mark = 'SUN' WHERE mark = 'sun';
+    SELECT 'final', * FROM exact_sigils ORDER BY id;
+}
+expect {
+    init|2|sun
+    final|1|moon
+}
+
+# RTRIM grouping equality must remain the equality used by a downstream join,
+# even though the lookup table itself is BINARY.
+test matview-parity-rtrim-group-to-join {
+    CREATE TABLE scroll_fragments(
+      title TEXT COLLATE RTRIM,
+      pages INTEGER
+    );
+    CREATE TABLE scroll_index(title TEXT COLLATE BINARY);
+    INSERT INTO scroll_fragments VALUES ('Atlas ', 2), ('Atlas', 3), ('Bestiary  ', 4);
+    INSERT INTO scroll_index VALUES ('Atlas'), ('Bestiary');
+    CREATE MATERIALIZED VIEW indexed_scrolls AS
+      SELECT grouped.title, grouped.pages
+      FROM (
+        SELECT title, SUM(pages) AS pages
+        FROM scroll_fragments
+        GROUP BY title
+      ) AS grouped
+      JOIN scroll_index AS idx ON grouped.title = idx.title;
+    SELECT 'init', rtrim(title), pages FROM indexed_scrolls ORDER BY 2;
+    DELETE FROM scroll_fragments
+      WHERE title = 'Atlas ' COLLATE BINARY AND pages = 2;
+    INSERT INTO scroll_fragments VALUES ('Bestiary', 6);
+    SELECT 'final', rtrim(title), pages FROM indexed_scrolls ORDER BY 2;
+}
+expect {
+    init|Atlas|5
+    init|Bestiary|4
+    final|Atlas|3
+    final|Bestiary|10
+}
+
+# The leftmost arm defines UNION collation. That metadata is also needed after
+# UNION has materialized its own deduplication state and feeds a join.
+test matview-parity-union-collation-to-join {
+    CREATE TABLE portal_alpha(name TEXT COLLATE NOCASE);
+    CREATE TABLE portal_beta(name TEXT COLLATE BINARY);
+    CREATE TABLE portal_destinations(name TEXT COLLATE BINARY);
+    INSERT INTO portal_alpha VALUES ('North');
+    INSERT INTO portal_beta VALUES ('north'), ('South');
+    INSERT INTO portal_destinations VALUES ('NORTH'), ('south');
+    CREATE MATERIALIZED VIEW open_portals AS
+      SELECT paths.name
+      FROM (
+        SELECT name FROM portal_alpha
+        UNION
+        SELECT name FROM portal_beta
+      ) AS paths
+      JOIN portal_destinations AS destinations
+        ON paths.name = destinations.name;
+    SELECT 'init', lower(name) FROM open_portals ORDER BY 2;
+    DELETE FROM portal_alpha;
+    SELECT 'without-left', lower(name) FROM open_portals ORDER BY 2;
+    INSERT INTO portal_alpha VALUES ('SOUTH');
+    SELECT 'restored-left', lower(name) FROM open_portals ORDER BY 2;
+}
+expect {
+    init|north
+    init|south
+    without-left|north
+    without-left|south
+    restored-left|north
+    restored-left|south
+}
+
+# SELECT DISTINCT has its own representative state. Its output column must
+# keep the source collation when used by a downstream join.
+test matview-parity-distinct-collation-to-join {
+    CREATE TABLE potion_labels(
+      label TEXT COLLATE NOCASE,
+      batch INTEGER
+    );
+    CREATE TABLE potion_orders(label TEXT COLLATE BINARY);
+    INSERT INTO potion_labels VALUES ('Heal', 1), ('HEAL', 2), ('Mana', 3);
+    INSERT INTO potion_orders VALUES ('heal'), ('MANA');
+    CREATE MATERIALIZED VIEW ordered_potions AS
+      SELECT labels.label
+      FROM (
+        SELECT DISTINCT label FROM potion_labels
+      ) AS labels
+      JOIN potion_orders AS orders ON labels.label = orders.label;
+    SELECT 'init', lower(label) FROM ordered_potions ORDER BY 2;
+    DELETE FROM potion_labels WHERE batch = 1;
+    DELETE FROM potion_labels WHERE batch = 2;
+    INSERT INTO potion_labels VALUES ('hEaL', 4);
+    SELECT 'final', lower(label) FROM ordered_potions ORDER BY 2;
+}
+expect {
+    init|heal
+    init|mana
+    final|heal
+    final|mana
+}
+
+# Two independently collated keys must not collapse into one metadata choice
+# when a grouped derived input feeds a composite-key join.
+test matview-parity-mixed-collation-composite-key {
+    CREATE TABLE planar_routes(
+      realm TEXT COLLATE NOCASE,
+      gate TEXT COLLATE RTRIM,
+      travelers INTEGER
+    );
+    CREATE TABLE planar_ledger(
+      realm TEXT COLLATE BINARY,
+      gate TEXT COLLATE BINARY
+    );
+    INSERT INTO planar_routes VALUES
+      ('Fey', 'Oak ', 2),
+      ('fey', 'Oak', 3),
+      ('Shadow', 'Bone  ', 4);
+    INSERT INTO planar_ledger VALUES ('FEY', 'Oak'), ('shadow', 'Bone');
+    CREATE MATERIALIZED VIEW planar_totals AS
+      SELECT grouped.realm, grouped.gate, grouped.travelers
+      FROM (
+        SELECT realm, gate, SUM(travelers) AS travelers
+        FROM planar_routes
+        GROUP BY realm, gate
+      ) AS grouped
+      JOIN planar_ledger AS ledger
+        ON grouped.realm = ledger.realm
+       AND grouped.gate = ledger.gate;
+    SELECT 'init', lower(realm), rtrim(gate), travelers
+      FROM planar_totals ORDER BY 2;
+    UPDATE planar_routes SET travelers = 5
+      WHERE realm = 'Fey' COLLATE BINARY AND gate = 'Oak ' COLLATE BINARY;
+    DELETE FROM planar_ledger WHERE realm = 'shadow';
+    SELECT 'final', lower(realm), rtrim(gate), travelers
+      FROM planar_totals ORDER BY 2;
+}
+expect {
+    init|fey|Oak|5
+    init|shadow|Bone|4
+    final|fey|Oak|8
+}
+
+# Column-like wrappers preserve implicit collation through parentheses, unary
+# plus, and CAST; all three appear in real normalized expression trees.
+test matview-parity-collation-through-column-wrappers {
+    CREATE TABLE oracle_words(
+      id INTEGER PRIMARY KEY,
+      word TEXT COLLATE NOCASE
+    );
+    CREATE TABLE oracle_answers(word TEXT COLLATE BINARY);
+    INSERT INTO oracle_words VALUES (1, 'YES'), (2, 'No');
+    INSERT INTO oracle_answers VALUES ('yes'), ('NO');
+    CREATE MATERIALIZED VIEW oracle_matches AS
+      SELECT wrapped.id, wrapped.word
+      FROM (
+        SELECT id, CAST(((+word)) AS TEXT) AS word
+        FROM oracle_words
+      ) AS wrapped
+      JOIN oracle_answers AS answers ON wrapped.word = answers.word;
+    SELECT 'init', id, lower(word) FROM oracle_matches ORDER BY id;
+    UPDATE oracle_words SET word = 'Maybe' WHERE id = 2;
+    INSERT INTO oracle_answers VALUES ('MAYBE');
+    SELECT 'final', id, lower(word) FROM oracle_matches ORDER BY id;
+}
+expect {
+    init|1|yes
+    init|2|no
+    final|1|yes
+    final|2|maybe
+}
+
+# A collated grouping representative may change spelling while remaining the
+# same logical key. Downstream join state must follow the replacement row.
+test matview-parity-collated-representative-churn-downstream {
+    CREATE TABLE dragon_sightings(
+      species TEXT COLLATE NOCASE,
+      count INTEGER
+    );
+    CREATE TABLE dragon_registry(species TEXT COLLATE BINARY);
+    INSERT INTO dragon_sightings VALUES ('Wyrm', 2), ('wyrm', 3);
+    INSERT INTO dragon_registry VALUES ('WYRM');
+    CREATE MATERIALIZED VIEW registered_dragons AS
+      SELECT grouped.species, grouped.total
+      FROM (
+        SELECT species, SUM(count) AS total
+        FROM dragon_sightings
+        GROUP BY species
+      ) AS grouped
+      JOIN dragon_registry AS registry
+        ON grouped.species = registry.species;
+    SELECT 'init', lower(species), total FROM registered_dragons;
+    DELETE FROM dragon_sightings
+      WHERE species = 'Wyrm' COLLATE BINARY;
+    SELECT 'after-delete', lower(species), total FROM registered_dragons;
+    INSERT INTO dragon_sightings VALUES ('WyRm', 7);
+    SELECT 'final', lower(species), total FROM registered_dragons;
+}
+expect {
+    init|wyrm|5
+    after-delete|wyrm|3
+    final|wyrm|10
+}
+
+# ---------------------------------------------------------------------------
+# Arrangement identity and signed-delta churn
+# ---------------------------------------------------------------------------
+
+# A self-join feeding a LEFT JOIN exercises an arrangement with both matched
+# and NULL-padded outputs while a no-op update retracts and reinserts every key.
+test matview-parity-arrangement-noop-with-visible-outer-rows {
+    CREATE TABLE mirror_stones(value INTEGER PRIMARY KEY);
+    CREATE TABLE mirror_marks(value INTEGER PRIMARY KEY, mark TEXT);
+    INSERT INTO mirror_stones VALUES (1), (2);
+    INSERT INTO mirror_marks VALUES (1, 'lit');
+    CREATE MATERIALIZED VIEW marked_mirrors AS
+      SELECT mirrored.value, marks.mark
+      FROM (
+        SELECT left_stone.value
+        FROM mirror_stones AS left_stone
+        JOIN mirror_stones AS right_stone
+          ON left_stone.value = right_stone.value
+      ) AS mirrored
+      LEFT JOIN mirror_marks AS marks ON mirrored.value = marks.value;
+    SELECT 'init', * FROM marked_mirrors ORDER BY value;
+    UPDATE mirror_stones SET value = value;
+    SELECT 'noop', * FROM marked_mirrors ORDER BY value;
+    UPDATE mirror_marks SET mark = 'bright' WHERE value = 1;
+    INSERT INTO mirror_marks VALUES (2, 'dim');
+    SELECT 'final', * FROM marked_mirrors ORDER BY value;
+}
+expect {
+    init|1|lit
+    init|2|
+    noop|1|lit
+    noop|2|
+    final|1|bright
+    final|2|dim
+}
+
+# Moving a primary key away and back inside a savepoint repeatedly recreates
+# the same logical arrangement key. Rolling back the second move must restore
+# the first move's state, not an older physical row identity.
+test matview-parity-arrangement-key-away-back-savepoint {
+    CREATE TABLE phase_crystals(value INTEGER PRIMARY KEY);
+    CREATE TABLE phase_targets(value INTEGER PRIMARY KEY);
+    INSERT INTO phase_crystals VALUES (1), (2);
+    INSERT INTO phase_targets VALUES (1), (2), (3);
+    CREATE MATERIALIZED VIEW phased_pairs AS
+      SELECT mirrored.value
+      FROM (
+        SELECT a.value
+        FROM phase_crystals AS a
+        JOIN phase_crystals AS b ON a.value = b.value
+      ) AS mirrored
+      JOIN phase_targets AS targets ON mirrored.value = targets.value;
+    BEGIN;
+    UPDATE phase_crystals SET value = 3 WHERE value = 1;
+    SELECT 'moved', * FROM phased_pairs ORDER BY value;
+    SAVEPOINT return_home;
+    UPDATE phase_crystals SET value = 1 WHERE value = 3;
+    SELECT 'returned', * FROM phased_pairs ORDER BY value;
+    ROLLBACK TO return_home;
+    RELEASE return_home;
+    COMMIT;
+    SELECT 'final', * FROM phased_pairs ORDER BY value;
+}
+expect {
+    moved|2
+    moved|3
+    returned|1
+    returned|2
+    final|2
+    final|3
+}
+
+# Delete and reinsert of one primary key in a transaction must update a
+# downstream aggregate without retaining the old join contribution.
+test matview-parity-arrangement-delete-reinsert-downstream-aggregate {
+    CREATE TABLE phoenixes(
+      id INTEGER PRIMARY KEY,
+      aerie TEXT,
+      flame INTEGER
+    );
+    CREATE TABLE aeries(name TEXT PRIMARY KEY);
+    INSERT INTO phoenixes VALUES (1, 'east', 10), (2, 'west', 20);
+    INSERT INTO aeries VALUES ('east'), ('west');
+    CREATE MATERIALIZED VIEW aerie_flame AS
+      SELECT joined.aerie, COUNT(*) AS n, SUM(joined.flame) AS flame
+      FROM (
+        SELECT p.id, p.aerie, p.flame
+        FROM phoenixes AS p
+        JOIN aeries AS a ON p.aerie = a.name
+      ) AS joined
+      GROUP BY joined.aerie;
+    BEGIN;
+    DELETE FROM phoenixes WHERE id = 1;
+    INSERT INTO phoenixes VALUES (1, 'west', 7);
+    SELECT 'txn', * FROM aerie_flame ORDER BY aerie;
+    COMMIT;
+    DELETE FROM phoenixes WHERE id = 2;
+    SELECT 'final', * FROM aerie_flame ORDER BY aerie;
+}
+expect {
+    txn|west|2|27
+    final|west|1|7
+}
+
+# Updating both inputs of a join in one transaction creates intermediate
+# cross-generation pairs. Only the final matching pairs may survive.
+test matview-parity-arrangement-both-sides-key-rotation {
+    CREATE TABLE constellation_left(
+      id INTEGER PRIMARY KEY,
+      star TEXT
+    );
+    CREATE TABLE constellation_right(
+      id INTEGER PRIMARY KEY,
+      star TEXT
+    );
+    INSERT INTO constellation_left VALUES (1, 'a'), (2, 'b');
+    INSERT INTO constellation_right VALUES (10, 'a'), (20, 'b');
+    CREATE MATERIALIZED VIEW constellation_pairs AS
+      SELECT l.id AS left_id, r.id AS right_id, l.star
+      FROM constellation_left AS l
+      JOIN constellation_right AS r ON l.star = r.star;
+    BEGIN;
+    UPDATE constellation_left
+      SET star = CASE star WHEN 'a' THEN 'b' ELSE 'a' END;
+    UPDATE constellation_right
+      SET star = CASE star WHEN 'a' THEN 'b' ELSE 'a' END;
+    SELECT 'rotated', * FROM constellation_pairs ORDER BY left_id;
+    COMMIT;
+    UPDATE constellation_left SET star = star;
+    SELECT 'noop', * FROM constellation_pairs ORDER BY left_id;
+}
+expect {
+    rotated|1|10|b
+    rotated|2|20|a
+    noop|1|10|b
+    noop|2|20|a
+}
+
+# Duplicate contributions from two UNION ALL arms feed one aggregate. A row
+# update must retract each arm's old multiplicity independently.
+test matview-parity-arrangement-union-all-duplicate-aggregate {
+    CREATE TABLE echo_shards(
+      id INTEGER PRIMARY KEY,
+      value INTEGER
+    );
+    INSERT INTO echo_shards VALUES (1, 1), (2, 1), (3, 2);
+    CREATE MATERIALIZED VIEW echo_power AS
+      SELECT COUNT(*) AS n, SUM(value) AS total
+      FROM (
+        SELECT value FROM echo_shards WHERE value <= 1
+        UNION ALL
+        SELECT value FROM echo_shards WHERE value >= 1
+      ) AS echoes;
+    SELECT 'init', * FROM echo_power;
+    UPDATE echo_shards SET value = 2 WHERE id = 1;
+    SELECT 'updated', * FROM echo_power;
+    DELETE FROM echo_shards WHERE id = 2;
+    SELECT 'final', * FROM echo_power;
+}
+expect {
+    init|5|6
+    updated|4|6
+    final|2|4
+}
+
+# One multi-row statement can create the first and second matches of an outer
+# row, and the next statement can remove both. NULL-row transitions must occur
+# only at the zero/nonzero boundaries.
+test matview-parity-arrangement-left-join-multirow-boundaries {
+    CREATE TABLE moon_gates(
+      id INTEGER PRIMARY KEY,
+      key INTEGER
+    );
+    CREATE TABLE moon_keys(
+      id INTEGER PRIMARY KEY,
+      key INTEGER
+    );
+    INSERT INTO moon_gates VALUES (1, 1);
+    INSERT INTO moon_keys VALUES (10, 2), (20, 3);
+    CREATE MATERIALIZED VIEW gate_keys AS
+      SELECT gates.id AS gate_id, keys.id AS key_id
+      FROM moon_gates AS gates
+      LEFT JOIN moon_keys AS keys ON gates.key = keys.key;
+    SELECT 'empty', * FROM gate_keys;
+    UPDATE moon_keys SET key = 1;
+    SELECT 'matched', * FROM gate_keys ORDER BY key_id;
+    UPDATE moon_keys SET key = key + 10;
+    SELECT 'empty-again', * FROM gate_keys;
+}
+expect {
+    empty|1|
+    matched|1|10
+    matched|1|20
+    empty-again|1|
+}
+
+# RIGHT JOIN uses the opposite preserved side, but its arrangement identity
+# faces the same no-op and first/last-match transitions.
+test matview-parity-arrangement-right-join-churn {
+    CREATE TABLE gryphon_riders(
+      id INTEGER PRIMARY KEY,
+      nest INTEGER,
+      name TEXT
+    );
+    CREATE TABLE gryphon_nests(
+      id INTEGER PRIMARY KEY,
+      name TEXT
+    );
+    INSERT INTO gryphon_riders VALUES
+      (1, 1, 'Arin'),
+      (2, 3, 'Bela');
+    INSERT INTO gryphon_nests VALUES (1, 'Peak'), (2, 'Cliff');
+    CREATE MATERIALIZED VIEW rider_roster AS
+      SELECT riders.id, nests.name AS nest_name
+      FROM gryphon_nests AS nests
+      RIGHT JOIN gryphon_riders AS riders ON nests.id = riders.nest;
+    SELECT 'init', * FROM rider_roster ORDER BY id;
+    UPDATE gryphon_riders SET nest = nest;
+    INSERT INTO gryphon_nests VALUES (3, 'Cloud');
+    DELETE FROM gryphon_nests WHERE id = 1;
+    SELECT 'final', * FROM rider_roster ORDER BY id;
+}
+expect {
+    init|1|Peak
+    init|2|
+    final|1|
+    final|2|Cloud
+}
+
+# Join multiplicity feeds DISTINCT state. Removing one of several identical
+# join outputs must not remove the representative until the last copy leaves.
+test matview-parity-arrangement-join-to-distinct-multiplicity {
+    CREATE TABLE illusion_sources(
+      id INTEGER PRIMARY KEY,
+      shape TEXT
+    );
+    CREATE TABLE illusion_lenses(
+      id INTEGER PRIMARY KEY,
+      shape TEXT
+    );
+    INSERT INTO illusion_sources VALUES (1, 'orb'), (2, 'orb'), (3, 'cube');
+    INSERT INTO illusion_lenses VALUES (10, 'orb'), (20, 'cube');
+    CREATE MATERIALIZED VIEW seen_shapes AS
+      SELECT DISTINCT joined.shape
+      FROM (
+        SELECT sources.shape
+        FROM illusion_sources AS sources
+        JOIN illusion_lenses AS lenses ON sources.shape = lenses.shape
+      ) AS joined;
+    SELECT 'init', * FROM seen_shapes ORDER BY shape;
+    DELETE FROM illusion_sources WHERE id = 1;
+    SELECT 'one-orb', * FROM seen_shapes ORDER BY shape;
+    DELETE FROM illusion_sources WHERE id = 2;
+    SELECT 'no-orb', * FROM seen_shapes ORDER BY shape;
+}
+expect {
+    init|cube
+    init|orb
+    one-orb|cube
+    one-orb|orb
+    no-orb|cube
+}
+
+# A join feeding another join owns two arrangements. A mass no-op update must
+# preserve every identity across both levels.
+test matview-parity-arrangement-two-level-join-noop {
+    CREATE TABLE quest_heroes(
+      id INTEGER PRIMARY KEY,
+      guild INTEGER
+    );
+    CREATE TABLE quest_guilds(
+      id INTEGER PRIMARY KEY,
+      realm INTEGER
+    );
+    CREATE TABLE quest_realms(
+      id INTEGER PRIMARY KEY,
+      name TEXT
+    );
+    INSERT INTO quest_heroes VALUES (1, 10), (2, 10), (3, 20);
+    INSERT INTO quest_guilds VALUES (10, 100), (20, 200);
+    INSERT INTO quest_realms VALUES (100, 'Dawn'), (200, 'Dusk');
+    CREATE MATERIALIZED VIEW hero_realms AS
+      SELECT guilded.hero_id, realms.name
+      FROM (
+        SELECT heroes.id AS hero_id, guilds.realm
+        FROM quest_heroes AS heroes
+        JOIN quest_guilds AS guilds ON heroes.guild = guilds.id
+      ) AS guilded
+      JOIN quest_realms AS realms ON guilded.realm = realms.id;
+    SELECT 'init', * FROM hero_realms ORDER BY hero_id;
+    UPDATE quest_heroes SET guild = guild;
+    UPDATE quest_guilds SET realm = realm;
+    SELECT 'noop', * FROM hero_realms ORDER BY hero_id;
+}
+expect {
+    init|1|Dawn
+    init|2|Dawn
+    init|3|Dusk
+    noop|1|Dawn
+    noop|2|Dawn
+    noop|3|Dusk
+}
+
+# Updating an INTEGER PRIMARY KEY changes the physical row identity visible to
+# every self-join arm. A downstream aggregate must see one retraction and one
+# insertion, not a duplicate or a lost row.
+test matview-parity-arrangement-primary-key-mutation {
+    CREATE TABLE time_loops(
+      tick INTEGER PRIMARY KEY,
+      era TEXT
+    );
+    INSERT INTO time_loops VALUES (1, 'old'), (2, 'new');
+    CREATE MATERIALIZED VIEW loop_counts AS
+      SELECT mirrored.era, COUNT(*) AS n
+      FROM (
+        SELECT a.tick, a.era
+        FROM time_loops AS a
+        JOIN time_loops AS b ON a.tick = b.tick
+      ) AS mirrored
+      GROUP BY mirrored.era;
+    UPDATE time_loops SET tick = 3 WHERE tick = 1;
+    SELECT 'moved', * FROM loop_counts ORDER BY era;
+    UPDATE time_loops SET tick = tick;
+    SELECT 'noop', * FROM loop_counts ORDER BY era;
+}
+expect {
+    moved|new|1
+    moved|old|1
+    noop|new|1
+    noop|old|1
+}
+
+# ---------------------------------------------------------------------------
+# NULL, empty-state, and multiplicity boundaries
+# ---------------------------------------------------------------------------
+
+# A scalar aggregate always has one row, including over an empty input. That
+# row and its NULL payload must remain valid through a materialized dependency.
+test matview-parity-empty-scalar-aggregate-dependency {
+    CREATE TABLE void_essence(value INTEGER);
+    CREATE MATERIALIZED VIEW void_summary AS
+      SELECT COUNT(*) AS n, SUM(value) AS total, AVG(value) AS mean
+      FROM void_essence;
+    CREATE MATERIALIZED VIEW void_report AS
+      SELECT n, total, mean FROM void_summary WHERE n >= 0;
+    SELECT 'empty', n, quote(total), quote(mean) FROM void_report;
+    INSERT INTO void_essence VALUES (10), (NULL), (20);
+    SELECT 'filled', n, quote(total), quote(mean) FROM void_report;
+    DELETE FROM void_essence;
+    SELECT 'empty-again', n, quote(total), quote(mean) FROM void_report;
+}
+expect {
+    empty|0|NULL|NULL
+    filled|3|30|15.0
+    empty-again|0|NULL|NULL
+}
+
+# A grouped aggregate row disappears with its last input and later reappears.
+# A dependent UNION must retract and recreate only that arm's contribution.
+test matview-parity-group-disappear-reappear-through-union {
+    CREATE TABLE elemental_dust(
+      id INTEGER PRIMARY KEY,
+      element TEXT,
+      amount INTEGER
+    );
+    CREATE TABLE fixed_elements(
+      element TEXT,
+      amount INTEGER
+    );
+    INSERT INTO elemental_dust VALUES (1, 'fire', 4), (2, 'water', 7);
+    INSERT INTO fixed_elements VALUES ('earth', 9);
+    CREATE MATERIALIZED VIEW dust_totals AS
+      SELECT element, SUM(amount) AS amount
+      FROM elemental_dust
+      GROUP BY element;
+    CREATE MATERIALIZED VIEW elemental_totals AS
+      SELECT element, amount FROM dust_totals
+      UNION ALL
+      SELECT element, amount FROM fixed_elements;
+    DELETE FROM elemental_dust WHERE element = 'fire';
+    SELECT 'gone', * FROM elemental_totals ORDER BY element;
+    INSERT INTO elemental_dust VALUES (3, 'fire', 6);
+    SELECT 'returned', * FROM elemental_totals ORDER BY element;
+}
+expect {
+    gone|earth|9
+    gone|water|7
+    returned|earth|9
+    returned|fire|6
+    returned|water|7
+}
+
+# NULL never equals NULL in a join. A LEFT JOIN must move between its padded
+# row and a real match when the preserved key crosses the NULL boundary.
+test matview-parity-left-join-null-key-transitions {
+    CREATE TABLE spirit_calls(
+      id INTEGER PRIMARY KEY,
+      spirit_id INTEGER
+    );
+    CREATE TABLE spirits(
+      id INTEGER,
+      name TEXT
+    );
+    INSERT INTO spirit_calls VALUES (1, NULL), (2, 2);
+    INSERT INTO spirits VALUES (NULL, 'Nameless'), (2, 'Echo');
+    CREATE MATERIALIZED VIEW answered_calls AS
+      SELECT calls.id, calls.spirit_id, spirits.name
+      FROM spirit_calls AS calls
+      LEFT JOIN spirits ON calls.spirit_id = spirits.id;
+    SELECT 'init', * FROM answered_calls ORDER BY id;
+    UPDATE spirit_calls SET spirit_id = 2 WHERE id = 1;
+    DELETE FROM spirits WHERE id = 2;
+    UPDATE spirit_calls SET spirit_id = NULL WHERE id = 2;
+    SELECT 'final', * FROM answered_calls ORDER BY id;
+}
+expect {
+    init|1||
+    init|2|2|Echo
+    final|1|2|
+    final|2||
+}
+
+# COUNT(DISTINCT) ignores NULL while maintaining multiplicities for duplicate
+# non-NULL values. Crossing both boundaries in one group stresses its state.
+test matview-parity-count-distinct-null-boundaries {
+    CREATE TABLE enchanted_tokens(
+      id INTEGER PRIMARY KEY,
+      circle TEXT,
+      token INTEGER
+    );
+    INSERT INTO enchanted_tokens VALUES
+      (1, 'a', NULL),
+      (2, 'a', NULL),
+      (3, 'a', 1),
+      (4, 'a', 1);
+    CREATE MATERIALIZED VIEW token_kinds AS
+      SELECT circle, COUNT(DISTINCT token) AS kinds
+      FROM enchanted_tokens
+      GROUP BY circle;
+    SELECT 'init', * FROM token_kinds;
+    UPDATE enchanted_tokens SET token = 2 WHERE id = 1;
+    DELETE FROM enchanted_tokens WHERE token = 1;
+    SELECT 'middle', * FROM token_kinds;
+    UPDATE enchanted_tokens SET token = NULL WHERE id = 1;
+    SELECT 'final', * FROM token_kinds;
+}
+expect {
+    init|a|1
+    middle|a|1
+    final|a|0
+}
+
+# AVG distinguishes an all-NULL nonempty group from a missing group. HAVING
+# can hide and reveal that group without losing aggregate state.
+test matview-parity-avg-all-null-having-transitions {
+    CREATE TABLE seer_scores(
+      id INTEGER PRIMARY KEY,
+      coven TEXT,
+      score INTEGER
+    );
+    INSERT INTO seer_scores VALUES (1, 'mist', NULL), (2, 'mist', NULL);
+    CREATE MATERIALIZED VIEW seer_averages AS
+      SELECT coven, AVG(score) AS mean, COUNT(score) AS scored
+      FROM seer_scores
+      GROUP BY coven
+      HAVING COUNT(*) >= 2;
+    SELECT 'nulls', coven, quote(mean), scored FROM seer_averages;
+    UPDATE seer_scores SET score = 8 WHERE id = 1;
+    SELECT 'scored', coven, quote(mean), scored FROM seer_averages;
+    DELETE FROM seer_scores WHERE id = 2;
+    SELECT COUNT(*) FROM seer_averages;
+    INSERT INTO seer_scores VALUES (3, 'mist', 4);
+    SELECT 'visible', coven, quote(mean), scored FROM seer_averages;
+}
+expect {
+    nulls|mist|NULL|0
+    scored|mist|8.0|1
+    0
+    visible|mist|6.0|2
+}
+
+# MIN and MAX ignore NULL but must retain duplicate extrema until the last
+# copy is removed, then recover correctly from an all-NULL group.
+test matview-parity-minmax-duplicate-to-all-null {
+    CREATE TABLE relic_ranks(
+      id INTEGER PRIMARY KEY,
+      vault TEXT,
+      rank INTEGER
+    );
+    INSERT INTO relic_ranks VALUES
+      (1, 'deep', 1),
+      (2, 'deep', 1),
+      (3, 'deep', 9),
+      (4, 'deep', NULL);
+    CREATE MATERIALIZED VIEW relic_extrema AS
+      SELECT vault, MIN(rank) AS lo, MAX(rank) AS hi
+      FROM relic_ranks
+      GROUP BY vault;
+    DELETE FROM relic_ranks WHERE id = 1;
+    SELECT 'one-min', * FROM relic_extrema;
+    DELETE FROM relic_ranks WHERE rank IS NOT NULL;
+    SELECT 'null-only', vault, quote(lo), quote(hi) FROM relic_extrema;
+    INSERT INTO relic_ranks VALUES (5, 'deep', 4);
+    SELECT 'restored', * FROM relic_extrema;
+}
+expect {
+    one-min|deep|1|9
+    null-only|deep|NULL|NULL
+    restored|deep|4|4
+}
+
+# INTERSECT is presence-based: duplicate NULL rows on either side still yield
+# one NULL, which disappears only when one side loses its last copy.
+test matview-parity-intersect-null-last-copy {
+    CREATE TABLE dream_left(id INTEGER PRIMARY KEY, value);
+    CREATE TABLE dream_right(id INTEGER PRIMARY KEY, value);
+    INSERT INTO dream_left VALUES (1, NULL), (2, NULL), (3, 7);
+    INSERT INTO dream_right VALUES (10, NULL), (20, 7);
+    CREATE MATERIALIZED VIEW shared_dreams AS
+      SELECT value FROM dream_left
+      INTERSECT
+      SELECT value FROM dream_right;
+    DELETE FROM dream_left WHERE id = 1;
+    SELECT 'one-null', typeof(value), quote(value)
+      FROM shared_dreams ORDER BY typeof(value);
+    DELETE FROM dream_left WHERE id = 2;
+    SELECT 'no-null', typeof(value), quote(value)
+      FROM shared_dreams ORDER BY typeof(value);
+    INSERT INTO dream_left VALUES (4, NULL);
+    SELECT 'restored', typeof(value), quote(value)
+      FROM shared_dreams ORDER BY typeof(value);
+}
+expect {
+    one-null|integer|7
+    one-null|null|NULL
+    no-null|integer|7
+    restored|integer|7
+    restored|null|NULL
+}
+
+# EXCEPT also treats NULL as a comparable set value. Duplicate blockers on the
+# right keep the left NULL suppressed until the final blocker is removed.
+test matview-parity-except-null-blocker-multiplicity {
+    CREATE TABLE prophecy_all(id INTEGER PRIMARY KEY, value);
+    CREATE TABLE prophecy_blocked(id INTEGER PRIMARY KEY, value);
+    INSERT INTO prophecy_all VALUES (1, NULL), (2, 5);
+    INSERT INTO prophecy_blocked VALUES (10, NULL), (20, NULL);
+    CREATE MATERIALIZED VIEW allowed_prophecies AS
+      SELECT value FROM prophecy_all
+      EXCEPT
+      SELECT value FROM prophecy_blocked;
+    SELECT 'blocked', typeof(value), quote(value) FROM allowed_prophecies;
+    DELETE FROM prophecy_blocked WHERE id = 10;
+    SELECT 'one-blocker', typeof(value), quote(value) FROM allowed_prophecies;
+    DELETE FROM prophecy_blocked WHERE id = 20;
+    SELECT 'released', typeof(value), quote(value)
+      FROM allowed_prophecies ORDER BY typeof(value);
+}
+expect {
+    blocked|integer|5
+    one-blocker|integer|5
+    released|integer|5
+    released|null|NULL
+}
+
+# Set membership must distinguish INTEGER, REAL, TEXT, BLOB, and NULL while
+# each storage class independently crosses its last-copy boundary.
+test matview-parity-union-storage-class-boundaries {
+    CREATE TABLE alchemy_left(id INTEGER PRIMARY KEY, value);
+    CREATE TABLE alchemy_right(id INTEGER PRIMARY KEY, value);
+    INSERT INTO alchemy_left VALUES
+      (1, NULL), (2, 1), (3, 1.0), (4, '1'), (5, x'31');
+    INSERT INTO alchemy_right VALUES
+      (10, NULL), (20, 1), (30, '1');
+    CREATE MATERIALIZED VIEW alchemy_values AS
+      SELECT value FROM alchemy_left
+      UNION
+      SELECT value FROM alchemy_right;
+    SELECT 'init', typeof(value), quote(value)
+      FROM alchemy_values ORDER BY typeof(value);
+    DELETE FROM alchemy_left WHERE typeof(value) = 'blob';
+    DELETE FROM alchemy_left WHERE typeof(value) = 'real';
+    DELETE FROM alchemy_right WHERE typeof(value) = 'text';
+    SELECT 'final', typeof(value), quote(value)
+      FROM alchemy_values ORDER BY typeof(value);
+}
+expect {
+    init|blob|X'31'
+    init|integer|1
+    init|null|NULL
+    init|text|'1'
+    final|integer|1
+    final|null|NULL
+    final|text|'1'
+}
+
+# FILTER aggregates retain a group even when every row is excluded, and the
+# group itself disappears only after its final input row is deleted.
+test matview-parity-aggregate-filter-empty-subset {
+    CREATE TABLE ward_attempts(
+      id INTEGER PRIMARY KEY,
+      mage TEXT,
+      success INTEGER,
+      power INTEGER
+    );
+    INSERT INTO ward_attempts VALUES
+      (1, 'Iris', 0, 3),
+      (2, 'Iris', 0, 5);
+    CREATE MATERIALIZED VIEW ward_success AS
+      SELECT
+        mage,
+        COUNT(*) FILTER (WHERE success = 1) AS wins,
+        SUM(power) FILTER (WHERE success = 1) AS power
+      FROM ward_attempts
+      GROUP BY mage;
+    SELECT 'none', mage, wins, quote(power) FROM ward_success;
+    UPDATE ward_attempts SET success = 1 WHERE id = 1;
+    SELECT 'one', mage, wins, quote(power) FROM ward_success;
+    DELETE FROM ward_attempts;
+    SELECT COUNT(*) FROM ward_success;
+}
+expect {
+    none|Iris|0|NULL
+    one|Iris|1|3
+    0
+}
+
+# ---------------------------------------------------------------------------
+# Deep compositions, conflicts, and transactional scheduling
+# ---------------------------------------------------------------------------
+
+# Four materialized levels combine filtering, aggregation, joining, and UNION
+# ALL. One base mutation must be scheduled through every dependency exactly
+# once and in topological order.
+test matview-parity-four-level-dependency-chain {
+    CREATE TABLE guild_quests(
+      id INTEGER PRIMARY KEY,
+      guild TEXT,
+      reward INTEGER,
+      completed INTEGER
+    );
+    CREATE TABLE guild_titles(
+      guild TEXT PRIMARY KEY,
+      title TEXT
+    );
+    CREATE TABLE royal_grants(
+      title TEXT,
+      reward INTEGER
+    );
+    INSERT INTO guild_quests VALUES
+      (1, 'mages', 10, 1),
+      (2, 'mages', 20, 0),
+      (3, 'rangers', 7, 1);
+    INSERT INTO guild_titles VALUES
+      ('mages', 'Arcane'),
+      ('rangers', 'Wild');
+    INSERT INTO royal_grants VALUES ('Crown', 100);
+    CREATE MATERIALIZED VIEW completed_quests AS
+      SELECT id, guild, reward FROM guild_quests WHERE completed = 1;
+    CREATE MATERIALIZED VIEW guild_rewards AS
+      SELECT guild, COUNT(*) AS n, SUM(reward) AS reward
+      FROM completed_quests
+      GROUP BY guild;
+    CREATE MATERIALIZED VIEW titled_rewards AS
+      SELECT titles.title, rewards.n, rewards.reward
+      FROM guild_rewards AS rewards
+      JOIN guild_titles AS titles ON rewards.guild = titles.guild;
+    CREATE MATERIALIZED VIEW realm_rewards AS
+      SELECT title, n, reward FROM titled_rewards
+      UNION ALL
+      SELECT title, 1 AS n, reward FROM royal_grants;
+    UPDATE guild_quests SET completed = 1, reward = 25 WHERE id = 2;
+    UPDATE guild_titles SET title = 'Verdant' WHERE guild = 'rangers';
+    DELETE FROM guild_quests WHERE id = 1;
+    SELECT * FROM realm_rewards ORDER BY title;
+}
+expect {
+    Arcane|1|25
+    Crown|1|100
+    Verdant|1|7
+}
+
+# A dependency diamond converges through deduplicating UNION and then an
+# aggregate. Nested savepoint rollback must unwind both arms before recomputing
+# the downstream multiplicity.
+test matview-parity-diamond-union-aggregate-savepoints {
+    CREATE TABLE ley_numbers(
+      id INTEGER PRIMARY KEY,
+      value INTEGER
+    );
+    INSERT INTO ley_numbers VALUES (1, 1), (2, 2), (3, 3), (4, 4);
+    CREATE MATERIALIZED VIEW even_ley AS
+      SELECT value FROM ley_numbers WHERE value % 2 = 0;
+    CREATE MATERIALIZED VIEW high_ley AS
+      SELECT value FROM ley_numbers WHERE value >= 3;
+    CREATE MATERIALIZED VIEW special_ley AS
+      SELECT value FROM even_ley
+      UNION
+      SELECT value FROM high_ley;
+    CREATE MATERIALIZED VIEW ley_summary AS
+      SELECT COUNT(*) AS n, SUM(value) AS total FROM special_ley;
+    BEGIN;
+    UPDATE ley_numbers SET value = 6 WHERE id = 1;
+    SAVEPOINT inner_ley;
+    DELETE FROM ley_numbers WHERE id IN (2, 3);
+    SELECT 'inner', * FROM ley_summary;
+    ROLLBACK TO inner_ley;
+    RELEASE inner_ley;
+    SELECT 'outer', * FROM ley_summary;
+    ROLLBACK;
+    SELECT 'final', * FROM ley_summary;
+}
+expect {
+    inner|2|10
+    outer|4|15
+    final|3|9
+}
+
+# UPSERT can move a fact between join keys while changing its aggregate value.
+# The old joined image must be retracted before the new image is inserted.
+test matview-parity-upsert-through-join-aggregate {
+    CREATE TABLE adventurers(
+      id INTEGER PRIMARY KEY,
+      guild_id INTEGER,
+      renown INTEGER
+    );
+    CREATE TABLE adventurer_guilds(
+      id INTEGER PRIMARY KEY,
+      name TEXT
+    );
+    INSERT INTO adventurer_guilds VALUES (1, 'Silver'), (2, 'Gold');
+    INSERT INTO adventurers VALUES (1, 1, 10), (2, 1, 5);
+    CREATE MATERIALIZED VIEW guild_renown AS
+      SELECT guilds.name, COUNT(*) AS n, SUM(heroes.renown) AS renown
+      FROM adventurers AS heroes
+      JOIN adventurer_guilds AS guilds ON heroes.guild_id = guilds.id
+      GROUP BY guilds.name;
+    INSERT INTO adventurers VALUES (2, 2, 20)
+      ON CONFLICT(id) DO UPDATE SET
+        guild_id = excluded.guild_id,
+        renown = excluded.renown;
+    INSERT INTO adventurers VALUES (3, 2, 7)
+      ON CONFLICT(id) DO UPDATE SET renown = excluded.renown;
+    SELECT * FROM guild_renown ORDER BY name;
+}
+expect {
+    Gold|2|27
+    Silver|1|10
+}
+
+# REPLACE through a secondary UNIQUE constraint deletes an unseen primary key.
+# That implicit delete must traverse a projection dependency before aggregation.
+test matview-parity-replace-through-dependency-chain {
+    CREATE TABLE enchanted_inventory(
+      id INTEGER PRIMARY KEY,
+      rune TEXT UNIQUE,
+      vault TEXT,
+      value INTEGER
+    );
+    INSERT INTO enchanted_inventory VALUES
+      (1, 'sun', 'red', 10),
+      (2, 'moon', 'blue', 20),
+      (3, 'star', 'blue', 5);
+    CREATE MATERIALIZED VIEW valued_inventory AS
+      SELECT id, rune, vault, value
+      FROM enchanted_inventory
+      WHERE value > 0;
+    CREATE MATERIALIZED VIEW vault_values AS
+      SELECT vault, COUNT(*) AS n, SUM(value) AS total
+      FROM valued_inventory
+      GROUP BY vault;
+    REPLACE INTO enchanted_inventory
+      VALUES (4, 'moon', 'green', 30);
+    INSERT OR REPLACE INTO enchanted_inventory
+      VALUES (3, 'nova', 'red', 8);
+    SELECT * FROM vault_values ORDER BY vault;
+}
+expect {
+    green|1|30
+    red|2|18
+}
+
+# Rejected rows from multiple conflict mechanisms must contribute nothing to
+# a downstream UNION ALL aggregate while accepted rows from the same statement
+# still propagate.
+test matview-parity-conflict-ignore-through-union-aggregate {
+    CREATE TABLE accepted_gems(
+      id INTEGER PRIMARY KEY,
+      name TEXT UNIQUE,
+      value INTEGER
+    );
+    CREATE TABLE bonus_gems(value INTEGER);
+    INSERT INTO accepted_gems VALUES (1, 'ruby', 10), (2, 'opal', 5);
+    INSERT INTO bonus_gems VALUES (100);
+    CREATE MATERIALIZED VIEW gem_wealth AS
+      SELECT COUNT(*) AS n, SUM(value) AS total
+      FROM (
+        SELECT value FROM accepted_gems
+        UNION ALL
+        SELECT value FROM bonus_gems
+      ) AS all_gems;
+    INSERT OR IGNORE INTO accepted_gems VALUES
+      (3, 'ruby', 30),
+      (2, 'pearl', 20),
+      (4, 'jade', 7);
+    INSERT INTO accepted_gems VALUES (5, 'opal', 50)
+      ON CONFLICT(name) DO NOTHING;
+    SELECT * FROM gem_wealth;
+}
+expect {
+    4|122
+}
+
+# Mutating both sides of a join and its dimension inside a transaction changes
+# several groups. Full rollback must restore visible rows and hidden aggregate
+# state together.
+test matview-parity-rollback-both-join-sides-aggregate {
+    CREATE TABLE tower_mages(
+      id INTEGER PRIMARY KEY,
+      tower INTEGER,
+      mana INTEGER
+    );
+    CREATE TABLE towers(
+      id INTEGER PRIMARY KEY,
+      school TEXT
+    );
+    INSERT INTO towers VALUES (1, 'Air'), (2, 'Earth');
+    INSERT INTO tower_mages VALUES (1, 1, 10), (2, 1, 20), (3, 2, 7);
+    CREATE MATERIALIZED VIEW school_mana AS
+      SELECT towers.school, COUNT(*) AS n, SUM(mages.mana) AS mana
+      FROM tower_mages AS mages
+      JOIN towers ON mages.tower = towers.id
+      GROUP BY towers.school;
+    BEGIN;
+    UPDATE tower_mages SET tower = 2, mana = 30 WHERE id = 1;
+    UPDATE towers SET school = 'Stone' WHERE id = 2;
+    DELETE FROM tower_mages WHERE id = 2;
+    INSERT INTO towers VALUES (3, 'Void');
+    INSERT INTO tower_mages VALUES (4, 3, 99);
+    SELECT 'txn', * FROM school_mana ORDER BY school;
+    ROLLBACK;
+    SELECT 'final', * FROM school_mana ORDER BY school;
+}
+expect {
+    txn|Stone|2|37
+    txn|Void|1|99
+    final|Air|2|30
+    final|Earth|1|7
+}
+
+# Non-equality RIGHT JOIN must create and retract NULL-padded preserved rows as
+# ranges begin and cease matching, including multiple simultaneous matches.
+test matview-parity-right-non-equality-transitions {
+    CREATE TABLE aura_bands(
+      id INTEGER PRIMARY KEY,
+      lo INTEGER,
+      hi INTEGER
+    );
+    CREATE TABLE aura_readings(
+      id INTEGER PRIMARY KEY,
+      value INTEGER
+    );
+    INSERT INTO aura_bands VALUES (1, 0, 5), (2, 4, 10);
+    INSERT INTO aura_readings VALUES (10, 3), (20, 7), (30, 20);
+    CREATE MATERIALIZED VIEW classified_auras AS
+      SELECT readings.id AS reading_id, bands.id AS band_id
+      FROM aura_bands AS bands
+      RIGHT JOIN aura_readings AS readings
+        ON readings.value >= bands.lo AND readings.value <= bands.hi;
+    SELECT 'init', * FROM classified_auras ORDER BY reading_id, band_id;
+    UPDATE aura_readings SET value = 5 WHERE id = 30;
+    DELETE FROM aura_bands WHERE id = 1;
+    UPDATE aura_readings SET value = 11 WHERE id = 20;
+    SELECT 'final', * FROM classified_auras ORDER BY reading_id, band_id;
+}
+expect {
+    init|10|1
+    init|20|2
+    init|30|
+    final|10|
+    final|20|
+    final|30|2
+}
+
+# A CROSS JOIN aggregate moves between empty and nonempty products as either
+# side gains or loses its first/last row. Scalar aggregate output still exists
+# at every point.
+test matview-parity-cross-join-empty-product-transitions {
+    CREATE TABLE cauldron_bases(
+      id INTEGER PRIMARY KEY,
+      power INTEGER
+    );
+    CREATE TABLE cauldron_catalysts(
+      id INTEGER PRIMARY KEY,
+      multiplier INTEGER
+    );
+    INSERT INTO cauldron_bases VALUES (1, 3), (2, 5);
+    CREATE MATERIALIZED VIEW cauldron_output AS
+      SELECT COUNT(*) AS n, SUM(bases.power * catalysts.multiplier) AS power
+      FROM cauldron_bases AS bases
+      CROSS JOIN cauldron_catalysts AS catalysts;
+    SELECT 'empty', n, quote(power) FROM cauldron_output;
+    INSERT INTO cauldron_catalysts VALUES (10, 2), (20, 4);
+    SELECT 'active', n, quote(power) FROM cauldron_output;
+    DELETE FROM cauldron_bases;
+    SELECT 'empty-again', n, quote(power) FROM cauldron_output;
+    INSERT INTO cauldron_bases VALUES (3, 7);
+    SELECT 'restored', n, quote(power) FROM cauldron_output;
+}
+expect {
+    empty|0|NULL
+    active|4|48
+    empty-again|0|NULL
+    restored|2|42
+}
+
+# A four-way composition combines LEFT, INNER, and CROSS joins. Changes on
+# each input exercise preserved rows, filtering joins, and fanout generation.
+test matview-parity-four-way-mixed-join-composition {
+    CREATE TABLE quest_parties(
+      id INTEGER PRIMARY KEY,
+      guide_id INTEGER
+    );
+    CREATE TABLE quest_guides(
+      id INTEGER PRIMARY KEY,
+      region_id INTEGER,
+      name TEXT
+    );
+    CREATE TABLE quest_regions(
+      id INTEGER PRIMARY KEY,
+      name TEXT
+    );
+    CREATE TABLE quest_seasons(name TEXT PRIMARY KEY);
+    INSERT INTO quest_parties VALUES (1, 10), (2, NULL);
+    INSERT INTO quest_guides VALUES (10, 100, 'Lark');
+    INSERT INTO quest_regions VALUES (100, 'North');
+    INSERT INTO quest_seasons VALUES ('summer'), ('winter');
+    CREATE MATERIALIZED VIEW quest_departures AS
+      SELECT
+        parties.id AS party_id,
+        guides.name AS guide,
+        regions.name AS region,
+        seasons.name AS season
+      FROM quest_parties AS parties
+      LEFT JOIN quest_guides AS guides ON parties.guide_id = guides.id
+      LEFT JOIN quest_regions AS regions ON guides.region_id = regions.id
+      CROSS JOIN quest_seasons AS seasons;
+    SELECT 'init', * FROM quest_departures
+      ORDER BY party_id, season;
+    INSERT INTO quest_guides VALUES (20, 100, 'Moth');
+    UPDATE quest_parties SET guide_id = 20 WHERE id = 2;
+    DELETE FROM quest_regions WHERE id = 100;
+    DELETE FROM quest_seasons WHERE name = 'winter';
+    SELECT 'final', * FROM quest_departures
+      ORDER BY party_id, season;
+}
+expect {
+    init|1|Lark|North|summer
+    init|1|Lark|North|winter
+    init|2|||summer
+    init|2|||winter
+    final|1|Lark||summer
+    final|2|Moth||summer
+}
+
+# One nonrecursive CTE is referenced by two compound arms and then aggregated.
+# The compiler must preserve the two arm identities while scheduling each base
+# change only once through the shared logical input.
+test matview-parity-cte-fanout-compound-aggregate {
+    CREATE TABLE grimoire_pages(
+      id INTEGER PRIMARY KEY,
+      chapter TEXT,
+      words INTEGER,
+      sealed INTEGER
+    );
+    INSERT INTO grimoire_pages VALUES
+      (1, 'fire', 10, 0),
+      (2, 'fire', 20, 1),
+      (3, 'ice', 7, 0);
+    CREATE MATERIALIZED VIEW grimoire_totals AS
+      WITH readable AS (
+        SELECT chapter, words
+        FROM grimoire_pages
+        WHERE sealed = 0
+      )
+      SELECT chapter, COUNT(*) AS n, SUM(words) AS words
+      FROM (
+        SELECT chapter, words FROM readable
+        UNION ALL
+        SELECT chapter, words * 2 FROM readable
+      ) AS echoes
+      GROUP BY chapter;
+    SELECT 'init', * FROM grimoire_totals ORDER BY chapter;
+    UPDATE grimoire_pages SET sealed = 0, words = 5 WHERE id = 2;
+    DELETE FROM grimoire_pages WHERE id = 3;
+    SELECT 'final', * FROM grimoire_totals ORDER BY chapter;
+}
+expect {
+    init|fire|2|30
+    init|ice|2|21
+    final|fire|4|45
+}
+
+# A DISTINCT input feeding a multiplicity-producing LEFT JOIN can retract one
+# representative while every right-side duplicate changes in the same update.
+# The outer DISTINCT must see one logical old value and one logical new value.
+test matview-parity-distinct-left-join-mass-update {
+    CREATE TABLE polymorphs(
+      id INTEGER PRIMARY KEY,
+      form INTEGER
+    );
+    INSERT INTO polymorphs VALUES
+      (1, 10),
+      (2, 10),
+      (3, 10),
+      (4, 10),
+      (5, 10);
+    CREATE MATERIALIZED VIEW polymorph_forms AS
+      SELECT DISTINCT value
+      FROM (
+        SELECT left_forms.value
+        FROM (
+          SELECT DISTINCT form AS value
+          FROM polymorphs
+        ) AS left_forms
+        LEFT JOIN (
+          SELECT form AS value
+          FROM polymorphs
+          WHERE form IS NOT NULL
+        ) AS right_forms ON left_forms.value = right_forms.value
+      ) AS joined_forms;
+    SELECT 'init', * FROM polymorph_forms;
+    UPDATE polymorphs SET form = 20;
+    SELECT 'final', * FROM polymorph_forms;
+}
+expect {
+    init|10
+    final|20
+}

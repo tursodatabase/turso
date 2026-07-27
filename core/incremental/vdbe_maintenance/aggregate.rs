@@ -441,7 +441,13 @@ fn emit_group_aggregate_rows(
         program.preassign_label_to_next_insn(pass_ok_label);
     }
 
-    seed_ephemeral_stream_cache(program, channel, &binding_remap, &mut resolver)?;
+    seed_ephemeral_stream_cache(
+        program,
+        channel,
+        &binding_remap,
+        &table_references,
+        &mut resolver,
+    )?;
 
     for (i, group_expr) in group_exprs.iter().enumerate() {
         let bound = remap_bound_expr(group_expr, &binding_remap)?;
