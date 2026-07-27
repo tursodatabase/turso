@@ -10,10 +10,11 @@ The branch currently has one unreleased hidden-storage format,
 `DBSP_CIRCUIT_VERSION = 2`. Development changes that format in place; it must
 not be bumped for each intermediate branch revision.
 
-The operator-DAG rewrite is implemented. The current uncommitted slice adds
-exact representative provenance for built-in collations. All six annotated
-IVM files pass 267 of 267 cases with exact invariant checking. Broad workspace
-checks still need to be completed before the slice is committed.
+The operator-DAG rewrite and exact representative provenance for built-in
+collations are implemented. The annotated IVM conformance corpus and the
+differential fuzzer check the exact materialized-view equivalence invariant.
+See [IVM_COMPAT.md](../IVM_COMPAT.md) for the current user-facing feature
+matrix.
 
 ## The architectural boundary
 
