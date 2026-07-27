@@ -10,17 +10,17 @@
 //! pinned to SQLite semantics transitively, because the base tables it reads
 //! are covered by the regular differential oracle.
 //!
-//! Row comparison goes through `SqlValue`, whose equality is type-strict
+//! Row comparison goes through `QueryValue`, whose equality is type-strict
 //! (`Integer(30) != Real(30.0)`), so divergences like an aggregate losing
 //! SQLite's integer result typing are caught, not coerced away.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use query_result_oracle::diff_result_sets;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use sql_gen::{ColumnDef, DataType, Schema, Table};
-use sql_gen_prop::result::diff_results;
 
 use crate::oracle::{DifferentialOracle, OracleResult, QueryResult};
 
@@ -153,6 +153,7 @@ impl IvmState {
     /// contents (as a user would read them) must equal a fresh evaluation of
     /// the defining query, as multisets.
     pub fn check_views(&self, turso_conn: &Arc<turso_core::Connection>) -> OracleResult {
+        let mut failures = Vec::new();
         for view in &self.views {
             let view_sql = format!("SELECT * FROM \"{}\"", view.name);
             let view_result = DifferentialOracle::execute_turso(turso_conn, &view_sql);
@@ -160,32 +161,62 @@ impl IvmState {
 
             let (view_rows, query_rows) = match (view_result, query_result) {
                 (QueryResult::Rows(v), QueryResult::Rows(q)) => (v, q),
-                (QueryResult::Ok, QueryResult::Ok) => continue,
-                (QueryResult::Rows(v), QueryResult::Ok) => (v, Vec::new()),
-                (QueryResult::Ok, QueryResult::Rows(q)) => (Vec::new(), q),
                 (QueryResult::Error(e), _) => {
-                    return OracleResult::Fail(format!(
+                    failures.push(format!(
                         "IVM check: reading materialized view {} failed: {e}\n  definition: {}",
                         view.name, view.definition
                     ));
+                    continue;
                 }
                 (_, QueryResult::Error(e)) => {
-                    return OracleResult::Fail(format!(
+                    failures.push(format!(
                         "IVM check: re-evaluating defining query of {} failed: {e}\n  definition: {}",
                         view.name, view.definition
                     ));
+                    continue;
+                }
+                (QueryResult::Ok, QueryResult::Ok) => {
+                    failures.push(format!(
+                        "IVM check: both SELECTs for {} returned no result columns\n  definition: {}",
+                        view.name, view.definition
+                    ));
+                    continue;
+                }
+                (QueryResult::Rows(rows), QueryResult::Ok) => {
+                    failures.push(format!(
+                        "IVM check: materialized view {} returned {} columns but its defining SELECT returned no result columns\n  definition: {}",
+                        view.name,
+                        rows.column_count(),
+                        view.definition
+                    ));
+                    continue;
+                }
+                (QueryResult::Ok, QueryResult::Rows(rows)) => {
+                    failures.push(format!(
+                        "IVM check: materialized view {} returned no result columns but its defining SELECT returned {}\n  definition: {}",
+                        view.name,
+                        rows.column_count(),
+                        view.definition
+                    ));
+                    continue;
                 }
             };
 
-            let diff = diff_results(&view_rows, &query_rows);
+            let diff = diff_result_sets(&view_rows, &query_rows);
             if !diff.is_empty() {
-                return OracleResult::Fail(format!(
-                    "IVM invariant violated for {}:\n  definition: {}\n  only in materialized view: {:?}\n  only in fresh query: {:?}",
-                    view.name, view.definition, diff.only_in_first, diff.only_in_second
+                failures.push(format!(
+                    "IVM invariant violated for {}:\n  definition: {}\n{}",
+                    view.name,
+                    view.definition,
+                    diff.describe("materialized view", "fresh query", 20)
                 ));
             }
         }
-        OracleResult::Pass
+        if failures.is_empty() {
+            OracleResult::Pass
+        } else {
+            OracleResult::Fail(failures.join("\n\n"))
+        }
     }
 }
 
@@ -1000,6 +1031,62 @@ mod tests {
         // exercises the comparison itself.
         state.views[0].definition = "SELECT id, num FROM t WHERE num >= 40".into();
         assert!(state.check_views(&conn).is_fail());
+    }
+
+    #[test]
+    fn check_views_reports_every_exact_mismatch() {
+        let conn = open_turso_with_views("ivm-exact-mismatch-test.db");
+        for sql in [
+            "CREATE TABLE t(x INTEGER)",
+            "INSERT INTO t VALUES (1), (1)",
+            "CREATE MATERIALIZED VIEW v_multiplicity AS SELECT x FROM t",
+            "CREATE MATERIALIZED VIEW v_null AS SELECT NULL AS value FROM t",
+            "CREATE MATERIALIZED VIEW v_type AS SELECT x FROM t",
+            "CREATE MATERIALIZED VIEW v_arity AS SELECT x FROM t WHERE 0",
+        ] {
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "setup failed: {sql}"
+            );
+        }
+
+        let mut state = IvmState::new();
+        state.views.extend([
+            IvmView {
+                name: "v_multiplicity".into(),
+                definition: "SELECT DISTINCT x FROM t".into(),
+            },
+            IvmView {
+                name: "v_null".into(),
+                definition: "SELECT '' FROM t".into(),
+            },
+            IvmView {
+                name: "v_type".into(),
+                definition: "SELECT CAST(x AS REAL) FROM t".into(),
+            },
+            IvmView {
+                name: "v_arity".into(),
+                definition: "SELECT x, x FROM t WHERE 0".into(),
+            },
+        ]);
+
+        let OracleResult::Fail(failure) = state.check_views(&conn) else {
+            panic!("exact mismatches unexpectedly passed");
+        };
+        for name in ["v_multiplicity", "v_null", "v_type", "v_arity"] {
+            assert!(
+                failure.contains(name),
+                "missing failure for {name}: {failure}"
+            );
+        }
+        assert!(failure.contains("1 row occurrence(s)"));
+        assert!(failure.contains("null"));
+        assert!(failure.contains("text(\"\")"));
+        assert!(failure.contains("integer(1)"));
+        assert!(failure.contains("real(1.0)"));
+        assert!(
+            failure.contains("column count differs: materialized view has 1, fresh query has 2")
+        );
     }
 
     #[test]

@@ -10,7 +10,11 @@ use crate::sync::Arc;
 use crate::translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{expr_contains_nondeterministic_scalar_function, WalkControl};
-use crate::translate::plan::{Aggregate, Plan, QueryDestination, SelectPlan, TableReferences};
+use crate::translate::optimizer::optimize_plan;
+use crate::translate::plan::{
+    Aggregate, IterationDirection, Operation, Plan, QueryDestination, Scan, Search, SelectPlan,
+    TableReferences,
+};
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::select::prepare_select_plan;
 use crate::util::walk_expr_with_subqueries;
@@ -66,6 +70,9 @@ fn validate_stream_expr(
                     }
                     return unsupported("expressions over aggregate results");
                 }
+                if published_value {
+                    return Ok(WalkControl::SkipChildren);
+                }
             }
             ast::Expr::FunctionCallStar { name, .. } => {
                 if matches!(
@@ -76,6 +83,9 @@ fn validate_stream_expr(
                         return Ok(WalkControl::SkipChildren);
                     }
                     return unsupported("expressions over aggregate results");
+                }
+                if published_value {
+                    return Ok(WalkControl::SkipChildren);
                 }
             }
             ast::Expr::Variable(_) => {
@@ -230,6 +240,16 @@ fn build_select_plan_dag(
     plan: &SelectPlan,
     resolver: &Resolver,
 ) -> Result<dag::NodeId> {
+    let input_direction = plan
+        .joined_tables()
+        .first()
+        .map(|table| match &table.op {
+            Operation::Scan(Scan::BTreeTable { iter_dir, .. })
+            | Operation::Scan(Scan::Subquery { iter_dir }) => *iter_dir,
+            Operation::Search(Search::Seek { seek_def, .. }) => seek_def.iter_dir,
+            _ => IterationDirection::Forwards,
+        })
+        .unwrap_or(IterationDirection::Forwards);
     if !plan.order_by.is_empty() {
         return unsupported("ORDER BY");
     }
@@ -407,6 +427,7 @@ fn build_select_plan_dag(
             group_collations,
             aggregates,
             multiset_collations,
+            input_direction,
             scalar,
         })?;
 
@@ -449,6 +470,7 @@ fn build_select_plan_dag(
             group_collations,
             aggregates: hidden_count_aggregate(resolver)?,
             multiset_collations: vec![None],
+            input_direction,
             scalar: false,
         })?;
         node = builder.push(dag::OpNode::Project {
@@ -536,8 +558,10 @@ pub(crate) struct HiddenTableDef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuxiliaryStatePurpose {
     AggregateMultiset { aggregate_index: usize },
+    AggregateGroupRepresentatives,
     LeftJoinMatches,
     SetOpIdentity,
+    SetOpRepresentatives,
 }
 
 #[derive(Debug, Clone)]
@@ -597,12 +621,20 @@ impl OperatorStateDef {
         self.auxiliary_table_name(AuxiliaryStatePurpose::AggregateMultiset { aggregate_index })
     }
 
+    pub(super) fn aggregate_group_representatives_table_name(&self) -> Result<&str> {
+        self.auxiliary_table_name(AuxiliaryStatePurpose::AggregateGroupRepresentatives)
+    }
+
     pub(super) fn left_join_matches_table_name(&self) -> Result<&str> {
         self.auxiliary_table_name(AuxiliaryStatePurpose::LeftJoinMatches)
     }
 
     pub(super) fn set_op_identity_table_name(&self) -> Result<&str> {
         self.auxiliary_table_name(AuxiliaryStatePurpose::SetOpIdentity)
+    }
+
+    pub(super) fn set_op_representatives_table_name(&self) -> Result<&str> {
+        self.auxiliary_table_name(AuxiliaryStatePurpose::SetOpRepresentatives)
     }
 
     fn hidden_tables(&self) -> impl Iterator<Item = &HiddenTableDef> {
@@ -686,7 +718,7 @@ pub(crate) fn plan_view(
         None,
         ProgramBuilderOpts::new(8, 32, 8),
     );
-    let relational_plan = prepare_select_plan(
+    let mut relational_plan = prepare_select_plan(
         select.clone(),
         resolver,
         &mut planner_program,
@@ -694,6 +726,11 @@ pub(crate) fn plan_view(
         QueryDestination::ResultRows,
         connection,
     )?;
+    // Representative selection depends on the same access direction as the
+    // defining query (for example, simple MAX over an ascending index scans
+    // backwards). Keep IVM lowering on the normal prepare+optimize pipeline
+    // instead of deriving physical semantics from the unoptimized plan.
+    optimize_plan(&mut planner_program, &mut relational_plan, resolver)?;
     let dag = build_dag_from_plan(&relational_plan, resolver)?;
     let operator_states = plan_operator_states(view_name, &dag, resolver)?;
     let output_arity = dag.root_schema().len();
@@ -1089,6 +1126,7 @@ fn plan_operator_states(
             node,
             dag.output_schema(node_id).len(),
             &output.binding_rowids,
+            &catalog.nodes,
         );
         let arrangement_table =
             if node_requires_output_arrangement(dag, node_id, output.emitted_identity) {
@@ -1146,6 +1184,7 @@ fn plan_auxiliary_tables(
     node: &dag::OpNode,
     output_width: usize,
     binding_rowids: &[bool],
+    prior_states: &[OperatorStateDef],
 ) -> Vec<AuxiliaryTableDef> {
     use crate::incremental::view::DBSP_CIRCUIT_VERSION;
 
@@ -1166,25 +1205,52 @@ fn plan_auxiliary_tables(
 
     match node {
         dag::OpNode::Aggregate {
+            input,
             group_collations,
             multiset_collations,
+            aggregates,
             ..
-        } => multiset_collations
-            .iter()
-            .enumerate()
-            .filter_map(|(aggregate_index, collation)| {
-                collation.map(|collation| {
-                    let table_name = table_name(&format!("__a{aggregate_index}"));
-                    let create_sql =
-                        aggregate_multiset_table_sql(&table_name, group_collations, collation);
-                    table(
-                        AuxiliaryStatePurpose::AggregateMultiset { aggregate_index },
-                        table_name,
-                        create_sql,
-                    )
+        } => {
+            let identity_width = prior_states[*input].output.emitted_identity.width();
+            let mut tables = multiset_collations
+                .iter()
+                .enumerate()
+                .filter_map(|(aggregate_index, collation)| {
+                    collation.map(|collation| {
+                        let table_name = table_name(&format!("__a{aggregate_index}"));
+                        let create_sql = aggregate_multiset_table_sql(
+                            &table_name,
+                            group_collations,
+                            collation,
+                            &aggregates[aggregate_index],
+                            identity_width,
+                        );
+                        table(
+                            AuxiliaryStatePurpose::AggregateMultiset { aggregate_index },
+                            table_name,
+                            create_sql,
+                        )
+                    })
                 })
-            })
-            .collect(),
+                .collect::<Vec<_>>();
+            if group_collations
+                .iter()
+                .any(|collation| !matches!(collation, CollationSeq::Binary | CollationSeq::Unset))
+            {
+                let table_name = table_name("__g");
+                let create_sql = aggregate_group_representatives_table_sql(
+                    &table_name,
+                    group_collations,
+                    identity_width,
+                );
+                tables.push(table(
+                    AuxiliaryStatePurpose::AggregateGroupRepresentatives,
+                    table_name,
+                    create_sql,
+                ));
+            }
+            tables
+        }
         dag::OpNode::Join {
             kind: dag::JoinKind::LeftOuter,
             ..
@@ -1204,14 +1270,30 @@ fn plan_auxiliary_tables(
         dag::OpNode::SetOp {
             operators,
             prefix_len,
+            key_collations,
             ..
-        } if *prefix_len > 0 && *prefix_len < operators.len() + 1 => {
-            let table_name = table_name("");
-            vec![table(
-                AuxiliaryStatePurpose::SetOpIdentity,
-                table_name.clone(),
-                set_op_identity_table_sql(&table_name),
-            )]
+        } if *prefix_len > 0 => {
+            let mut tables = Vec::new();
+            if *prefix_len < operators.len() + 1 {
+                let table_name = table_name("");
+                tables.push(table(
+                    AuxiliaryStatePurpose::SetOpIdentity,
+                    table_name.clone(),
+                    set_op_identity_table_sql(&table_name),
+                ));
+            }
+            if key_collations
+                .iter()
+                .any(|collation| !matches!(collation, CollationSeq::Binary | CollationSeq::Unset))
+            {
+                let table_name = table_name("__r");
+                tables.push(table(
+                    AuxiliaryStatePurpose::SetOpRepresentatives,
+                    table_name.clone(),
+                    set_op_representatives_table_sql(&table_name, key_collations),
+                ));
+            }
+            tables
         }
         _ => Vec::new(),
     }
@@ -1344,6 +1426,8 @@ fn aggregate_multiset_table_sql(
     multiset_table_name: &str,
     group_collations: &[CollationSeq],
     value_collation: CollationSeq,
+    aggregate: &Aggregate,
+    input_identity_width: usize,
 ) -> String {
     let multiset_table_ident = crate::util::quote_identifier(multiset_table_name);
     let mut columns = Vec::with_capacity(group_collations.len() + 2);
@@ -1354,9 +1438,57 @@ fn aggregate_multiset_table_sql(
     }
     columns.push(format!("val{}", collate_clause(value_collation)));
     key.push("val".to_string());
+    if matches!(aggregate.func, AggFunc::Min | AggFunc::Max) {
+        for i in 0..input_identity_width {
+            columns.push(format!("i{i}"));
+            key.push(format!("i{i}"));
+        }
+        // The collated `val` is the equivalence/order key. Keeping the same
+        // value under BINARY as the final tie-breaker lets one source identity
+        // change between collation-equivalent byte representations without
+        // collapsing its delete/insert pair.
+        columns.push("raw_val COLLATE BINARY".to_string());
+        key.push("raw_val".to_string());
+    }
     columns.push("mult".to_string());
     format!(
         "CREATE TABLE {multiset_table_ident} ({}, PRIMARY KEY ({}))",
+        columns.join(", "),
+        key.join(", ")
+    )
+}
+
+/// Source rows retained for choosing the exact GROUP BY / DISTINCT key bytes.
+///
+/// SQL grouping equality may collapse byte-distinct values. The defining query
+/// displays the first surviving input row's representation, so a count per
+/// equivalence class is insufficient after that row is deleted. The collated
+/// group prefix locates the class, the source identity preserves input order,
+/// and the duplicated BINARY group values keep an update's old and new images
+/// distinct even when they compare equal under the grouping collation.
+fn aggregate_group_representatives_table_sql(
+    table_name: &str,
+    group_collations: &[CollationSeq],
+    input_identity_width: usize,
+) -> String {
+    let table_ident = crate::util::quote_identifier(table_name);
+    let mut columns = Vec::with_capacity(group_collations.len() * 2 + input_identity_width + 1);
+    let mut key = Vec::with_capacity(group_collations.len() * 2 + input_identity_width);
+    for (i, collation) in group_collations.iter().enumerate() {
+        columns.push(format!("g{i}{}", collate_clause(*collation)));
+        key.push(format!("g{i}"));
+    }
+    for i in 0..input_identity_width {
+        columns.push(format!("i{i}"));
+        key.push(format!("i{i}"));
+    }
+    for i in 0..group_collations.len() {
+        columns.push(format!("raw_g{i} COLLATE BINARY"));
+        key.push(format!("raw_g{i}"));
+    }
+    columns.push("mult".to_string());
+    format!(
+        "CREATE TABLE {table_ident} ({}, PRIMARY KEY ({}))",
         columns.join(", "),
         key.join(", ")
     )
@@ -1369,6 +1501,35 @@ fn set_op_identity_table_sql(table_name: &str) -> String {
     let table_ident = crate::util::quote_identifier(table_name);
     format!(
         "CREATE TABLE {table_ident} (branch, source_identity, mult, PRIMARY KEY (branch, source_identity))"
+    )
+}
+
+/// Exact source rows behind one collated compound-result equivalence class.
+///
+/// The main state table stores membership counts, while this table retains the
+/// branch and source identity needed to reproduce the byte representation that
+/// SQLite's left-associative compound evaluation displays.
+fn set_op_representatives_table_sql(table_name: &str, key_collations: &[CollationSeq]) -> String {
+    let table_ident = crate::util::quote_identifier(table_name);
+    let mut columns = Vec::with_capacity(key_collations.len() * 2 + 4);
+    let mut key = Vec::with_capacity(key_collations.len() * 2 + 3);
+    for (i, collation) in key_collations.iter().enumerate() {
+        columns.push(format!("c{i}{}", collate_clause(*collation)));
+        key.push(format!("c{i}"));
+    }
+    columns.push("branch".to_string());
+    key.push("branch".to_string());
+    columns.push("source_identity".to_string());
+    key.push("source_identity".to_string());
+    for i in 0..key_collations.len() {
+        columns.push(format!("raw_c{i} COLLATE BINARY"));
+        key.push(format!("raw_c{i}"));
+    }
+    columns.push("mult".to_string());
+    format!(
+        "CREATE TABLE {table_ident} ({}, PRIMARY KEY ({}))",
+        columns.join(", "),
+        key.join(", ")
     )
 }
 
@@ -1432,6 +1593,25 @@ mod tests {
         }
     }
 
+    fn abs_expr(column: usize) -> ast::Expr {
+        ast::Expr::FunctionCall {
+            name: ast::Name::exact("abs".to_string()),
+            distinctness: None,
+            args: vec![Box::new(ast::Expr::Column {
+                database: None,
+                table: TableInternalId::from(1),
+                column,
+                is_rowid_alias: false,
+            })],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        }
+    }
+
     #[test]
     fn expression_validation_depends_only_on_published_values() {
         let sum = sum_expr(0);
@@ -1456,6 +1636,22 @@ mod tests {
         assert!(error
             .to_string()
             .contains("expressions over aggregate results"));
+    }
+
+    #[test]
+    fn expression_validation_stops_at_published_scalar_functions() {
+        let published = abs_expr(0);
+        let input = NodeOutputContract {
+            schema: Arc::new(dag::StreamSchema {
+                columns: vec![Some(published.clone())],
+                bindings: Vec::new(),
+            }),
+            binding_rowids: Vec::<bool>::new().into(),
+            emitted_identity: DeltaIdentity::OperatorRowid,
+            published_identity: DeltaIdentity::OperatorRowid,
+        };
+
+        validate_stream_expr(&published, &input, "unpublished value").unwrap();
     }
 
     #[test]

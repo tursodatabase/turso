@@ -16,7 +16,7 @@ use crate::translate::expr::{
     translate_condition_expr, translate_expr_no_constant_opt, ConditionMetadata,
     NoConstantOptReason,
 };
-use crate::translate::plan::Aggregate;
+use crate::translate::plan::{Aggregate, IterationDirection};
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
@@ -39,6 +39,7 @@ pub(super) fn emit_group_aggregate(
     group_exprs: &[ast::Expr],
     group_collations: &[CollationSeq],
     aggregates: &[Aggregate],
+    input_direction: IterationDirection,
     scalar: bool,
     input: MaintenanceInput,
     output_contract: &NodeOutputContract,
@@ -61,6 +62,7 @@ pub(super) fn emit_group_aggregate(
         group_exprs,
         group_collations,
         aggregates,
+        input_direction,
         scalar,
         &output,
         input,
@@ -99,6 +101,7 @@ fn emit_group_aggregate_rows(
     group_exprs: &[ast::Expr],
     group_collations: &[CollationSeq],
     aggregates: &[Aggregate],
+    input_direction: IterationDirection,
     scalar: bool,
     output: &EphemeralDelta,
     input: MaintenanceInput,
@@ -108,13 +111,10 @@ fn emit_group_aggregate_rows(
 ) -> Result<()> {
     use crate::function::AccumulatorFunc;
     let num_view_columns = output.width;
-    // With a collated key, values that compare equal can differ in bytes.
-    // The stored key is the group's first-seen representative: reloading it
-    // on every lookup keeps the state row, its index entry, and the view row
-    // byte-identical, and matches the value batch GROUP BY displays. With
-    // binary keys a matched lookup implies byte equality, so the reload is
-    // skipped.
-    let reload_stored_group = group_collations
+    // A collated group needs source-row provenance in addition to its
+    // equivalence-class count: deleting the displayed source row can change
+    // the exact bytes returned by a fresh GROUP BY while the group survives.
+    let tracks_group_representative = group_collations
         .iter()
         .any(|c| !matches!(c, CollationSeq::Binary | CollationSeq::Unset));
 
@@ -237,8 +237,52 @@ fn emit_group_aggregate_rows(
             index_name: mm_index.name.clone(),
         }));
     }
+    let group_representative_cursors = if tracks_group_representative {
+        let table_name = operator_state
+            .aggregate_group_representatives_table_name()?
+            .to_string();
+        let table = schema.get_btree_table(&table_name).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "group representative table {table_name} of materialized view {view_name} not found"
+            ))
+        })?;
+        let index = schema
+            .get_indices(&table_name)
+            .next()
+            .cloned()
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "group representative table {table_name} of materialized view {view_name} has no index"
+                ))
+            })?;
+        let table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: table_cursor_id,
+            root_page: RegisterOrLiteral::Literal(table.root_page),
+            db: 0,
+        });
+        let index_cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: index_cursor_id,
+            root_page: RegisterOrLiteral::Literal(index.root_page),
+            db: 0,
+        });
+        Some(AggregateMultisetCursors {
+            table_name,
+            table_cursor_id,
+            index_cursor_id,
+            index_name: index.name.clone(),
+        })
+    } else {
+        None
+    };
 
     // Register layout.
+    let identity_width = channel.identity_width();
+    turso_assert!(
+        identity_width > 0,
+        "aggregate input must publish a stable source identity"
+    );
     let weight_reg = program.alloc_register();
     let null_arg_reg = program.alloc_register(); // stays NULL: COUNT(*) argument
     let zero_reg = program.alloc_register();
@@ -246,6 +290,7 @@ fn emit_group_aggregate_rows(
     let cnt_reg = program.alloc_register();
     let prev_rowid_scratch = program.alloc_register();
     let arg_reg = program.alloc_register();
+    let source_identity_start = program.alloc_registers(identity_width);
     // Accumulators, one per aggregate (index 0 = hidden liveness COUNT(*)).
     let acc_start = program.alloc_registers(aggregates.len());
     // State record image: [g.., finalized aggregate values, payloads..].
@@ -253,6 +298,9 @@ fn emit_group_aggregate_rows(
     // scannable as the aggregate node's arrangement.
     let state_rec_start = program.alloc_registers(k + total_payload + aggregates.len());
     let group_start = state_rec_start;
+    // Preserve the current input row's exact group bytes even when a lookup
+    // reloads the old displayed representative into `group_start`.
+    let incoming_group_start = program.alloc_registers(k);
     let persisted_value_start = state_rec_start + k;
     let payload_start = persisted_value_start + aggregates.len();
     // Index key image: [g.., state_rowid], contiguous for IdxInsert/IdxDelete.
@@ -270,14 +318,33 @@ fn emit_group_aggregate_rows(
     let old_out_weight_reg = old_out_start + k + aggregates.len();
     let state_record_reg = program.alloc_register();
     let index_record_reg = program.alloc_register();
-    // Per-aggregate multiset record image: [g.., val, mult-or-rowid].
-    let mm_rec_start = program.alloc_registers(k + 2);
-    let mm_val_reg = mm_rec_start + k;
-    let mm_last_reg = mm_rec_start + k + 1;
+    // DISTINCT multiset image: [g.., val, mult-or-rowid].
+    let distinct_rec_start = program.alloc_registers(k + 2);
+    let distinct_val_reg = distinct_rec_start + k;
+    let distinct_last_reg = distinct_rec_start + k + 1;
+    // MIN/MAX provenance image:
+    // [g.., collated value, source identity.., raw value, mult-or-rowid].
+    let minmax_key_width = k + 1 + identity_width + 1;
+    let minmax_rec_start = program.alloc_registers(minmax_key_width + 1);
+    let minmax_val_reg = minmax_rec_start + k;
+    let minmax_identity_start = minmax_val_reg + 1;
+    let minmax_raw_val_reg = minmax_identity_start + identity_width;
+    let minmax_last_reg = minmax_raw_val_reg + 1;
     let mm_rowid_reg = program.alloc_register();
     let mm_mult_reg = program.alloc_register();
     let mm_record_reg = program.alloc_register();
     let mm_found_reg = program.alloc_register();
+    // Group representative provenance image:
+    // [collated group.., source identity.., raw group.., mult-or-rowid].
+    let group_rep_key_width = k + identity_width + k;
+    let group_rep_rec_start = program.alloc_registers(group_rep_key_width + 1);
+    let group_rep_identity_start = group_rep_rec_start + k;
+    let group_rep_raw_start = group_rep_identity_start + identity_width;
+    let group_rep_last_reg = group_rep_raw_start + k;
+    let group_rep_rowid_reg = program.alloc_register();
+    let group_rep_mult_reg = program.alloc_register();
+    let group_rep_record_reg = program.alloc_register();
+    let group_rep_found_reg = program.alloc_register();
 
     program.emit_insn(Insn::Null {
         dest: null_arg_reg,
@@ -332,6 +399,14 @@ fn emit_group_aggregate_rows(
         dest: weight_reg,
         default: None,
     });
+    for column in 0..identity_width {
+        program.emit_insn(Insn::Column {
+            cursor_id: input_cursor_id,
+            column,
+            dest: source_identity_start + column,
+            default: None,
+        });
+    }
     // Pass filter: pass 0 skips negative contributions, pass 1 skips
     // positive ones.
     if let Some(pass_reg) = pass_reg {
@@ -371,11 +446,16 @@ fn emit_group_aggregate_rows(
             program,
             Some(&table_references),
             &bound,
-            group_start + i,
+            incoming_group_start + i,
             &resolver,
             NoConstantOptReason::RegisterReuse,
         )?;
     }
+    program.emit_insn(Insn::Copy {
+        src_reg: incoming_group_start,
+        dst_reg: group_start,
+        extra_amount: k.saturating_sub(1),
+    });
 
     // Group lookup via the state table's primary-key index.
     let found_label = program.allocate_label();
@@ -440,7 +520,7 @@ fn emit_group_aggregate_rows(
         src_reg: state_rowid_reg,
         target_pc: corrupt_label,
     });
-    if reload_stored_group {
+    if tracks_group_representative {
         for i in 0..k {
             program.emit_insn(Insn::Column {
                 cursor_id: state_cursor_id,
@@ -496,6 +576,201 @@ fn emit_group_aggregate_rows(
     );
 
     program.preassign_label_to_next_insn(apply_label);
+    if let Some(representatives) = &group_representative_cursors {
+        let representative_found_label = program.allocate_label();
+        let representative_upsert_label = program.allocate_label();
+        let representative_select_label = program.allocate_label();
+        let representative_selected_label = program.allocate_label();
+        let representative_skip_index_label = program.allocate_label();
+
+        program.emit_insn(Insn::Copy {
+            src_reg: incoming_group_start,
+            dst_reg: group_rep_rec_start,
+            extra_amount: k.saturating_sub(1),
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: source_identity_start,
+            dst_reg: group_rep_identity_start,
+            extra_amount: identity_width - 1,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: incoming_group_start,
+            dst_reg: group_rep_raw_start,
+            extra_amount: k.saturating_sub(1),
+        });
+        program.emit_insn(Insn::Found {
+            cursor_id: representatives.index_cursor_id,
+            target_pc: representative_found_label,
+            record_reg: group_rep_rec_start,
+            num_regs: group_rep_key_width,
+        });
+        // A known group retracting an unknown source identity would make the
+        // displayed representative and the aggregate count disagree.
+        program.emit_insn(Insn::Lt {
+            lhs: weight_reg,
+            rhs: zero_reg,
+            target_pc: corrupt_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_int(0, group_rep_found_reg);
+        program.emit_insn(Insn::NewRowid {
+            cursor: representatives.table_cursor_id,
+            rowid_reg: group_rep_rowid_reg,
+            prev_largest_reg: prev_rowid_scratch,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: weight_reg,
+            dst_reg: group_rep_last_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: representative_upsert_label,
+        });
+
+        program.preassign_label_to_next_insn(representative_found_label);
+        program.emit_int(1, group_rep_found_reg);
+        program.emit_insn(Insn::IdxRowId {
+            cursor_id: representatives.index_cursor_id,
+            dest: group_rep_rowid_reg,
+        });
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: representatives.table_cursor_id,
+            src_reg: group_rep_rowid_reg,
+            target_pc: corrupt_label,
+        });
+        program.emit_insn(Insn::Column {
+            cursor_id: representatives.table_cursor_id,
+            column: group_rep_key_width,
+            dest: group_rep_mult_reg,
+            default: None,
+        });
+        program.emit_insn(Insn::Add {
+            lhs: weight_reg,
+            rhs: group_rep_mult_reg,
+            dest: group_rep_last_reg,
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: group_rep_last_reg,
+            rhs: zero_reg,
+            target_pc: representative_upsert_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: group_rep_rowid_reg,
+            dst_reg: group_rep_last_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::IdxDelete {
+            start_reg: group_rep_rec_start,
+            num_regs: group_rep_key_width + 1,
+            cursor_id: representatives.index_cursor_id,
+            raise_error_if_no_matching_entry: true,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: representatives.table_cursor_id,
+            table_name: representatives.table_name.clone(),
+            is_part_of_update: true,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: representative_select_label,
+        });
+
+        program.preassign_label_to_next_insn(representative_upsert_label);
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: group_rep_rec_start as u16,
+            count: (group_rep_key_width + 1) as u16,
+            dest_reg: group_rep_record_reg as u16,
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: representatives.table_cursor_id,
+            key_reg: group_rep_rowid_reg,
+            record_reg: group_rep_record_reg,
+            flag: InsertFlags(
+                InsertFlags::REQUIRE_SEEK
+                    | InsertFlags::SKIP_LAST_ROWID
+                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+            ),
+            table_name: representatives.table_name.clone(),
+        });
+        program.emit_insn(Insn::If {
+            reg: group_rep_found_reg,
+            target_pc: representative_skip_index_label,
+            jump_if_null: false,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: group_rep_rowid_reg,
+            dst_reg: group_rep_last_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: group_rep_rec_start as u16,
+            count: (group_rep_key_width + 1) as u16,
+            dest_reg: group_rep_record_reg as u16,
+            index_name: Some(representatives.index_name.clone()),
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: representatives.index_cursor_id,
+            record_reg: group_rep_record_reg,
+            unpacked_start: Some(group_rep_rec_start),
+            unpacked_count: Some((group_rep_key_width + 1) as u16),
+            flags: IdxInsertFlags::new(),
+        });
+        program.preassign_label_to_next_insn(representative_skip_index_label);
+
+        // The primary key orders every live source in this equivalence class
+        // by its transport identity. Its duplicated raw group columns are the
+        // exact bytes a fresh grouped scan displays.
+        program.preassign_label_to_next_insn(representative_select_label);
+        match input_direction {
+            IterationDirection::Forwards => {
+                program.emit_insn(Insn::SeekGE {
+                    is_index: true,
+                    cursor_id: representatives.index_cursor_id,
+                    start_reg: incoming_group_start,
+                    num_regs: k,
+                    target_pc: representative_selected_label,
+                    eq_only: false,
+                });
+                program.emit_insn(Insn::IdxGT {
+                    cursor_id: representatives.index_cursor_id,
+                    start_reg: incoming_group_start,
+                    num_regs: k,
+                    target_pc: representative_selected_label,
+                });
+            }
+            IterationDirection::Backwards => {
+                program.emit_insn(Insn::SeekLE {
+                    is_index: true,
+                    cursor_id: representatives.index_cursor_id,
+                    start_reg: incoming_group_start,
+                    num_regs: k,
+                    target_pc: representative_selected_label,
+                    eq_only: false,
+                });
+                program.emit_insn(Insn::IdxLT {
+                    cursor_id: representatives.index_cursor_id,
+                    start_reg: incoming_group_start,
+                    num_regs: k,
+                    target_pc: representative_selected_label,
+                });
+            }
+        }
+        for i in 0..k {
+            program.emit_insn(Insn::Column {
+                cursor_id: representatives.index_cursor_id,
+                column: k + identity_width + i,
+                dest: group_start + i,
+                default: None,
+            });
+        }
+        program.preassign_label_to_next_insn(representative_selected_label);
+    }
+
     for (i, agg) in aggregates.iter().enumerate() {
         let is_minmax = matches!(agg.func, AggFunc::Min | AggFunc::Max);
         let is_distinct = tracks_distinct_values(agg);
@@ -552,22 +827,52 @@ fn emit_group_aggregate_rows(
                 reg: col_reg,
                 target_pc: aggregate_done_label,
             });
-            // Key image: [g.., val].
+            let (multiset_rec_start, multiset_val_reg, multiset_last_reg, key_width) = if is_minmax
+            {
+                (
+                    minmax_rec_start,
+                    minmax_val_reg,
+                    minmax_last_reg,
+                    minmax_key_width,
+                )
+            } else {
+                (
+                    distinct_rec_start,
+                    distinct_val_reg,
+                    distinct_last_reg,
+                    k + 1,
+                )
+            };
+            // DISTINCT uses one row per SQL-equivalent value. MIN/MAX retain
+            // one row per source identity and exact byte representation so
+            // retracting the displayed variant exposes the next live source.
             program.emit_insn(Insn::Copy {
                 src_reg: group_start,
-                dst_reg: mm_rec_start,
+                dst_reg: multiset_rec_start,
                 extra_amount: k.saturating_sub(1),
             });
             program.emit_insn(Insn::Copy {
                 src_reg: col_reg,
-                dst_reg: mm_val_reg,
+                dst_reg: multiset_val_reg,
                 extra_amount: 0,
             });
+            if is_minmax {
+                program.emit_insn(Insn::Copy {
+                    src_reg: source_identity_start,
+                    dst_reg: minmax_identity_start,
+                    extra_amount: identity_width - 1,
+                });
+                program.emit_insn(Insn::Copy {
+                    src_reg: col_reg,
+                    dst_reg: minmax_raw_val_reg,
+                    extra_amount: 0,
+                });
+            }
             program.emit_insn(Insn::Found {
                 cursor_id: mm.index_cursor_id,
                 target_pc: mm_found_label,
-                record_reg: mm_rec_start,
-                num_regs: k + 1,
+                record_reg: multiset_rec_start,
+                num_regs: key_width,
             });
             // Not found: retraction of an unknown value is a no-op.
             program.emit_insn(Insn::Lt {
@@ -585,14 +890,14 @@ fn emit_group_aggregate_rows(
             });
             program.emit_insn(Insn::Copy {
                 src_reg: weight_reg,
-                dst_reg: mm_last_reg,
+                dst_reg: multiset_last_reg,
                 extra_amount: 0,
             });
             if is_distinct {
                 // First occurrence of this value in the group.
                 program.emit_insn(Insn::AggStep {
                     acc_reg: acc_start + i,
-                    col: mm_val_reg,
+                    col: multiset_val_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(agg.func.clone()),
                     comparator: None,
@@ -615,17 +920,17 @@ fn emit_group_aggregate_rows(
             });
             program.emit_insn(Insn::Column {
                 cursor_id: mm.table_cursor_id,
-                column: k + 1,
+                column: key_width,
                 dest: mm_mult_reg,
                 default: None,
             });
             program.emit_insn(Insn::Add {
                 lhs: weight_reg,
                 rhs: mm_mult_reg,
-                dest: mm_last_reg,
+                dest: multiset_last_reg,
             });
             program.emit_insn(Insn::Ne {
-                lhs: mm_last_reg,
+                lhs: multiset_last_reg,
                 rhs: zero_reg,
                 target_pc: mm_upsert_label,
                 flags: CmpInsFlags::default(),
@@ -636,7 +941,7 @@ fn emit_group_aggregate_rows(
                 // Last occurrence of this value left the group.
                 program.emit_insn(Insn::AggInverse {
                     acc_reg: acc_start + i,
-                    col: mm_val_reg,
+                    col: multiset_val_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(agg.func.clone()),
                     comparator: None,
@@ -644,12 +949,12 @@ fn emit_group_aggregate_rows(
             }
             program.emit_insn(Insn::Copy {
                 src_reg: mm_rowid_reg,
-                dst_reg: mm_last_reg,
+                dst_reg: multiset_last_reg,
                 extra_amount: 0,
             });
             program.emit_insn(Insn::IdxDelete {
-                start_reg: mm_rec_start,
-                num_regs: k + 2,
+                start_reg: multiset_rec_start,
+                num_regs: key_width + 1,
                 cursor_id: mm.index_cursor_id,
                 raise_error_if_no_matching_entry: true,
             });
@@ -666,8 +971,8 @@ fn emit_group_aggregate_rows(
             // gets an index entry (g.., val, rowid).
             program.preassign_label_to_next_insn(mm_upsert_label);
             program.emit_insn(Insn::MakeRecord {
-                start_reg: mm_rec_start as u16,
-                count: (k + 2) as u16,
+                start_reg: multiset_rec_start as u16,
+                count: (key_width + 1) as u16,
                 dest_reg: mm_record_reg as u16,
                 index_name: None,
                 affinity_str: None,
@@ -693,12 +998,12 @@ fn emit_group_aggregate_rows(
             });
             program.emit_insn(Insn::Copy {
                 src_reg: mm_rowid_reg,
-                dst_reg: mm_last_reg,
+                dst_reg: multiset_last_reg,
                 extra_amount: 0,
             });
             program.emit_insn(Insn::MakeRecord {
-                start_reg: mm_rec_start as u16,
-                count: (k + 2) as u16,
+                start_reg: multiset_rec_start as u16,
+                count: (key_width + 1) as u16,
                 dest_reg: mm_record_reg as u16,
                 index_name: Some(mm.index_name.clone()),
                 affinity_str: None,
@@ -706,8 +1011,8 @@ fn emit_group_aggregate_rows(
             program.emit_insn(Insn::IdxInsert {
                 cursor_id: mm.index_cursor_id,
                 record_reg: mm_record_reg,
-                unpacked_start: Some(mm_rec_start),
-                unpacked_count: Some((k + 2) as u16),
+                unpacked_start: Some(multiset_rec_start),
+                unpacked_count: Some((key_width + 1) as u16),
                 flags: IdxInsertFlags::new(),
             });
             program.preassign_label_to_next_insn(mm_skip_idx_label);
@@ -865,8 +1170,9 @@ fn emit_group_aggregate_rows(
         for (i, agg) in aggregates.iter().enumerate() {
             let value_reg = agg_value_start + i;
             if matches!(agg.func, AggFunc::Min | AggFunc::Max) {
-                // The group's extreme is the first (MIN) or last (MAX)
-                // entry in this aggregate's multiset with the group prefix.
+                // The value collation selects the extreme equivalence class;
+                // source identity then selects the first surviving input row
+                // within that class, matching a batch aggregate scan.
                 let mm = mm_cursors[i]
                     .as_ref()
                     .expect("MIN/MAX aggregates own a multiset table");
@@ -874,7 +1180,7 @@ fn emit_group_aggregate_rows(
                 let have_label = program.allocate_label();
                 program.emit_insn(Insn::Copy {
                     src_reg: group_start,
-                    dst_reg: mm_rec_start,
+                    dst_reg: minmax_rec_start,
                     extra_amount: k.saturating_sub(1),
                 });
                 match agg.func {
@@ -882,7 +1188,7 @@ fn emit_group_aggregate_rows(
                         program.emit_insn(Insn::SeekGE {
                             is_index: true,
                             cursor_id: mm.index_cursor_id,
-                            start_reg: mm_rec_start,
+                            start_reg: minmax_rec_start,
                             num_regs: k,
                             target_pc: empty_label,
                             eq_only: false,
@@ -890,7 +1196,7 @@ fn emit_group_aggregate_rows(
                         // Positioned past the group: no values.
                         program.emit_insn(Insn::IdxGT {
                             cursor_id: mm.index_cursor_id,
-                            start_reg: mm_rec_start,
+                            start_reg: minmax_rec_start,
                             num_regs: k,
                             target_pc: empty_label,
                         });
@@ -899,7 +1205,7 @@ fn emit_group_aggregate_rows(
                         program.emit_insn(Insn::SeekLE {
                             is_index: true,
                             cursor_id: mm.index_cursor_id,
-                            start_reg: mm_rec_start,
+                            start_reg: minmax_rec_start,
                             num_regs: k,
                             target_pc: empty_label,
                             eq_only: false,
@@ -907,16 +1213,65 @@ fn emit_group_aggregate_rows(
                         // Positioned before the group: no values.
                         program.emit_insn(Insn::IdxLT {
                             cursor_id: mm.index_cursor_id,
-                            start_reg: mm_rec_start,
+                            start_reg: minmax_rec_start,
                             num_regs: k,
                             target_pc: empty_label,
                         });
                     }
                     _ => unreachable!(),
                 }
+                let needs_identity_reseek = (matches!(&agg.func, AggFunc::Min)
+                    && input_direction == IterationDirection::Backwards)
+                    || (matches!(&agg.func, AggFunc::Max)
+                        && input_direction == IterationDirection::Forwards);
+                if needs_identity_reseek {
+                    // The extremum seek picks the value class. Re-seek that
+                    // class when its first source identity lies at the other
+                    // end from the extremum seek direction.
+                    program.emit_insn(Insn::Column {
+                        cursor_id: mm.index_cursor_id,
+                        column: k,
+                        dest: minmax_val_reg,
+                        default: None,
+                    });
+                    match input_direction {
+                        IterationDirection::Forwards => {
+                            program.emit_insn(Insn::SeekGE {
+                                is_index: true,
+                                cursor_id: mm.index_cursor_id,
+                                start_reg: minmax_rec_start,
+                                num_regs: k + 1,
+                                target_pc: empty_label,
+                                eq_only: false,
+                            });
+                            program.emit_insn(Insn::IdxGT {
+                                cursor_id: mm.index_cursor_id,
+                                start_reg: minmax_rec_start,
+                                num_regs: k + 1,
+                                target_pc: empty_label,
+                            });
+                        }
+                        IterationDirection::Backwards => {
+                            program.emit_insn(Insn::SeekLE {
+                                is_index: true,
+                                cursor_id: mm.index_cursor_id,
+                                start_reg: minmax_rec_start,
+                                num_regs: k + 1,
+                                target_pc: empty_label,
+                                eq_only: false,
+                            });
+                            program.emit_insn(Insn::IdxLT {
+                                cursor_id: mm.index_cursor_id,
+                                start_reg: minmax_rec_start,
+                                num_regs: k + 1,
+                                target_pc: empty_label,
+                            });
+                        }
+                    }
+                }
                 program.emit_insn(Insn::Column {
                     cursor_id: mm.index_cursor_id,
-                    column: k,
+                    column: k + 1 + identity_width,
                     dest: value_reg,
                     default: None,
                 });

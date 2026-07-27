@@ -118,6 +118,9 @@ pub struct Requirement {
 pub struct TestFile {
     /// Database configurations to run tests against
     pub databases: Vec<DatabaseConfig>,
+    /// Verify every materialized view against its defining SELECT after each
+    /// successful test statement on backends that preserve typed results.
+    pub verify_materialized_views: bool,
     /// Named setup blocks that can be composed
     pub setups: HashMap<String, String>,
     /// Test cases

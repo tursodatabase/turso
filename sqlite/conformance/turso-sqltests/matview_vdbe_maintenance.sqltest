@@ -1,6 +1,7 @@
 @database :memory:
 @requires-file materialized_views ""
 @skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
 
 # Materialized views are maintained by compiled VDBE programs (filter/project
 # shapes). These tests pin the maintenance semantics: population, insert,
@@ -262,6 +263,25 @@ test matview-vdbe-aggregate-null-group-key {
 expect {
     |1|2
     a|1|3
+}
+
+# A projected scalar GROUP BY expression is one published aggregate output,
+# not an attempt to read its source column through the aggregate boundary.
+test matview-vdbe-scalar-group-key-projection {
+    CREATE TABLE scalar_group_source(x INTEGER);
+    INSERT INTO scalar_group_source VALUES (-1), (1);
+    CREATE MATERIALIZED VIEW scalar_group_view AS
+      SELECT abs(x) AS key, COUNT(*) AS n
+      FROM scalar_group_source
+      GROUP BY key;
+    SELECT * FROM scalar_group_view;
+    INSERT INTO scalar_group_source VALUES (-2);
+    SELECT * FROM scalar_group_view ORDER BY key;
+}
+expect {
+    1|2
+    1|2
+    2|1
 }
 
 # Aggregate views serve same-transaction reads through the same maintenance
@@ -1576,49 +1596,28 @@ test matview-vdbe-join-distinct-aggregate {
     CREATE TABLE jr8(y INTEGER);
     INSERT INTO jl8 VALUES (1), (1), (2);
     INSERT INTO jr8 VALUES (1), (1), (2);
-    CREATE VIEW regular_vda8 AS
-      SELECT DISTINCT COUNT(*) AS c
-      FROM jl8 JOIN jr8 ON x = y
-      GROUP BY x;
     CREATE MATERIALIZED VIEW vda8 AS
       SELECT DISTINCT COUNT(*) AS c
       FROM jl8 JOIN jr8 ON x = y
       GROUP BY x;
-    CREATE VIEW vda8_parity AS
-      WITH
-        missing AS (SELECT * FROM regular_vda8 EXCEPT SELECT * FROM vda8),
-        extra AS (SELECT * FROM vda8 EXCEPT SELECT * FROM regular_vda8)
-      SELECT
-        (SELECT COUNT(*) FROM missing) + (SELECT COUNT(*) FROM extra)
-          AS mismatches;
     SELECT * FROM vda8 ORDER BY c;
-    SELECT 'parity', * FROM vda8_parity;
     DELETE FROM jl8 WHERE rowid = 1;
     SELECT * FROM vda8 ORDER BY c;
-    SELECT 'parity', * FROM vda8_parity;
     INSERT INTO jr8 VALUES (2);
     SELECT * FROM vda8 ORDER BY c;
-    SELECT 'parity', * FROM vda8_parity;
     DELETE FROM jl8 WHERE x = 1;
     SELECT * FROM vda8 ORDER BY c;
-    SELECT 'parity', * FROM vda8_parity;
     DELETE FROM jr8 WHERE y = 2;
     SELECT COUNT(*) FROM vda8;
-    SELECT 'parity', * FROM vda8_parity;
 }
 expect {
     1
     4
-    parity|0
     1
     2
-    parity|0
     2
-    parity|0
     2
-    parity|0
     0
-    parity|0
 }
 
 # SELECT DISTINCT is maintained as GROUP BY over every result column: one
@@ -1641,9 +1640,37 @@ expect {
 }
 
 # Hidden state tables carry the key's comparison collation, so grouping over
-# a collated column merges exactly like the defining query: NOCASE puts 'a'
-# and 'A' in one group, whose displayed key is the first-seen representative
-# (matching batch GROUP BY output), stable while the group survives.
+# a collated column merges exactly like the defining query.
+test matview-vdbe-collated-group-representative-retraction {
+    CREATE TABLE collated_group_source(value TEXT COLLATE NOCASE);
+    INSERT INTO collated_group_source VALUES ('a'), ('A');
+    CREATE MATERIALIZED VIEW collated_group_view AS
+        SELECT value, COUNT(*) FROM collated_group_source GROUP BY value;
+    SELECT * FROM collated_group_view;
+    DELETE FROM collated_group_source WHERE rowid = 1;
+    SELECT * FROM collated_group_view;
+}
+expect {
+    a|2
+    A|1
+}
+
+# When GROUP BY is satisfied by scanning a descending index backwards, its
+# first collation-equivalent source has the largest rowid.
+test matview-vdbe-collated-group-index-representative {
+    CREATE TABLE collated_group_index_source(value TEXT COLLATE NOCASE);
+    INSERT INTO collated_group_index_source VALUES ('a'), ('A');
+    CREATE INDEX collated_group_index ON collated_group_index_source(value DESC);
+    CREATE MATERIALIZED VIEW collated_group_index_view AS
+        SELECT value, COUNT(*) FROM collated_group_index_source GROUP BY value;
+    SELECT * FROM collated_group_index_view;
+}
+expect {
+    A|2
+}
+
+# NOCASE puts case variants in one group; the displayed key is the first
+# surviving input representative selected by the batch GROUP BY.
 test matview-vdbe-collated-group-key {
     CREATE TABLE t34(g TEXT COLLATE NOCASE, x INTEGER);
     INSERT INTO t34 VALUES ('a', 1), ('A', 2), ('b', 10);
@@ -1664,10 +1691,53 @@ expect {
     died|c|7
 }
 
+# A collation-equivalent value must not keep the bytes of a source row that no
+# longer exists. The comparison key says these rows share one minimum; it does
+# not make the first row's payload permanent.
+test matview-vdbe-collated-min-representative-retraction {
+    CREATE TABLE collated_min_source(value TEXT COLLATE NOCASE);
+    INSERT INTO collated_min_source VALUES ('a'), ('A');
+    CREATE MATERIALIZED VIEW collated_min_view AS SELECT MIN(value) FROM collated_min_source;
+    SELECT * FROM collated_min_view;
+    DELETE FROM collated_min_source WHERE rowid = 1;
+    SELECT * FROM collated_min_view;
+}
+expect {
+    a
+    A
+}
+
+# A simple MAX query may scan a compatible ascending index backwards, so the
+# first source identity in its maximum equivalence class is the largest rowid.
+test matview-vdbe-collated-max-index-representative {
+    CREATE TABLE collated_max_index_source(value TEXT COLLATE NOCASE);
+    INSERT INTO collated_max_index_source VALUES ('a'), ('A');
+    CREATE INDEX collated_max_index ON collated_max_index_source(value);
+    CREATE MATERIALIZED VIEW collated_max_index_view AS
+        SELECT MAX(value) FROM collated_max_index_source;
+    SELECT * FROM collated_max_index_view;
+}
+expect {
+    A
+}
+
+# Reversing the physical index direction reverses the rowid tie-break used by
+# the simple MIN/MAX fast path.
+test matview-vdbe-collated-min-desc-index-representative {
+    CREATE TABLE collated_min_desc_source(value TEXT COLLATE NOCASE);
+    INSERT INTO collated_min_desc_source VALUES ('a'), ('A');
+    CREATE INDEX collated_min_desc_index ON collated_min_desc_source(value DESC);
+    CREATE MATERIALIZED VIEW collated_min_desc_view AS
+        SELECT MIN(value) FROM collated_min_desc_source;
+    SELECT * FROM collated_min_desc_view;
+}
+expect {
+    A
+}
+
 # MIN/MAX and DISTINCT aggregates over a collated argument compare through
-# the multiset table's collated value column: case variants share one
-# multiset entry, so retracting one of them does not disturb the count or
-# the extreme.
+# the multiset table's collated value column. Case variants share one SQL
+# equivalence class, while the displayed extreme follows a surviving input.
 test matview-vdbe-collated-minmax-distinct {
     CREATE TABLE t50(g TEXT COLLATE NOCASE);
     INSERT INTO t50 VALUES ('a'), ('A'), ('b');
@@ -1683,7 +1753,7 @@ test matview-vdbe-collated-minmax-distinct {
 expect {
     init|b|a|2
     shrunk|a|a|1
-    variant|a|a|1
+    variant|A|A|1
     empty|1|1|0
 }
 
@@ -1702,6 +1772,20 @@ expect {
 }
 
 # SELECT DISTINCT over a collated column dedups under that collation.
+test matview-vdbe-collated-distinct-representative-retraction {
+    CREATE TABLE collated_distinct_source(value TEXT COLLATE NOCASE);
+    INSERT INTO collated_distinct_source VALUES ('a'), ('A');
+    CREATE MATERIALIZED VIEW collated_distinct_view AS
+        SELECT DISTINCT value FROM collated_distinct_source;
+    SELECT * FROM collated_distinct_view;
+    DELETE FROM collated_distinct_source WHERE rowid = 1;
+    SELECT * FROM collated_distinct_view;
+}
+expect {
+    a
+    A
+}
+
 test matview-vdbe-collated-select-distinct {
     CREATE TABLE t52(g TEXT COLLATE NOCASE);
     INSERT INTO t52 VALUES ('a'), ('A'), ('b');
@@ -1716,9 +1800,87 @@ expect {
     b
 }
 
-# UNION dedup keys take the left-most branch's collation, like compound
-# dedup indexes: a NOCASE left column merges case variants from both
-# branches.
+# UNION uses the left-most branch's collation for deduplication, but SQLite's
+# compound index replaces the payload when a later branch contributes a
+# collation-equivalent row.
+test matview-vdbe-collated-union-representative-population {
+    CREATE TABLE collated_union_left(value TEXT COLLATE NOCASE);
+    CREATE TABLE collated_union_right(value TEXT);
+    INSERT INTO collated_union_left VALUES ('a');
+    INSERT INTO collated_union_right VALUES ('A');
+    CREATE MATERIALIZED VIEW collated_union_view AS
+        SELECT value FROM collated_union_left
+        UNION
+        SELECT value FROM collated_union_right;
+    SELECT * FROM collated_union_view;
+}
+expect {
+    A
+}
+
+# Removing the right branch's representative falls back to the first live
+# source in the accumulated left result.
+test matview-vdbe-collated-union-representative-fallback {
+    CREATE TABLE collated_union_fallback_left(value TEXT COLLATE NOCASE);
+    CREATE TABLE collated_union_fallback_right(value TEXT);
+    INSERT INTO collated_union_fallback_left VALUES ('a');
+    INSERT INTO collated_union_fallback_right VALUES ('A');
+    CREATE MATERIALIZED VIEW collated_union_fallback_view AS
+        SELECT value FROM collated_union_fallback_left
+        UNION
+        SELECT value FROM collated_union_fallback_right;
+    SELECT * FROM collated_union_fallback_view;
+    DELETE FROM collated_union_fallback_right;
+    SELECT * FROM collated_union_fallback_view;
+}
+expect {
+    A
+    a
+}
+
+# INTERSECT uses the accumulated left payload; the right branch contributes
+# membership only.
+test matview-vdbe-collated-intersect-representative {
+    CREATE TABLE collated_intersect_left(value TEXT COLLATE NOCASE);
+    CREATE TABLE collated_intersect_right(value TEXT);
+    INSERT INTO collated_intersect_left VALUES ('a');
+    INSERT INTO collated_intersect_right VALUES ('A');
+    CREATE MATERIALIZED VIEW collated_intersect_view AS
+        SELECT value FROM collated_intersect_left
+        INTERSECT
+        SELECT value FROM collated_intersect_right;
+    SELECT * FROM collated_intersect_view;
+    UPDATE collated_intersect_left SET value = 'A';
+    SELECT * FROM collated_intersect_view;
+}
+expect {
+    a
+    A
+}
+
+# EXCEPT likewise retains the left payload when a filtering right-side row
+# leaves the equivalence class.
+test matview-vdbe-collated-except-representative {
+    CREATE TABLE collated_except_left(value TEXT COLLATE NOCASE);
+    CREATE TABLE collated_except_right(value TEXT);
+    INSERT INTO collated_except_left VALUES ('a');
+    INSERT INTO collated_except_right VALUES ('z');
+    CREATE MATERIALIZED VIEW collated_except_view AS
+        SELECT value FROM collated_except_left
+        EXCEPT
+        SELECT value FROM collated_except_right;
+    SELECT * FROM collated_except_view;
+    INSERT INTO collated_except_right VALUES ('A');
+    DELETE FROM collated_except_right WHERE value = 'A';
+    SELECT * FROM collated_except_view;
+}
+expect {
+    a
+    a
+}
+
+# A deduplicated row continues to use the representative selected by the
+# defining compound query as branch membership changes.
 test matview-vdbe-collated-union {
     CREATE TABLE t53(g TEXT COLLATE NOCASE);
     CREATE TABLE t54(h TEXT);
@@ -1727,17 +1889,15 @@ test matview-vdbe-collated-union {
     CREATE MATERIALIZED VIEW v53 AS SELECT g FROM t53 UNION SELECT h FROM t54;
     SELECT * FROM v53 ORDER BY 1;
     DELETE FROM t53 WHERE g = 'a';
-    -- The row survives through t54's 'A'; the view keeps showing the stored
-    -- first-seen representative 'a'.
     SELECT * FROM v53 ORDER BY 1;
     DELETE FROM t54 WHERE h = 'A';
     SELECT * FROM v53 ORDER BY 1;
 }
 expect {
-    a
+    A
     b
     c
-    a
+    A
     b
     c
     b
@@ -1797,52 +1957,31 @@ test matview-vdbe-distinct-over-aggregates {
       (2, 'b', 20),
       (3, 'c', 30),
       (4, 'c', 40);
-    CREATE VIEW regular_v35 AS
-      SELECT DISTINCT COUNT(*) AS c FROM t35 GROUP BY g;
     CREATE MATERIALIZED VIEW v35 AS
       SELECT DISTINCT COUNT(*) AS c FROM t35 GROUP BY g;
-    CREATE VIEW v35_parity AS
-      WITH
-        missing AS (SELECT * FROM regular_v35 EXCEPT SELECT * FROM v35),
-        extra AS (SELECT * FROM v35 EXCEPT SELECT * FROM regular_v35)
-      SELECT
-        (SELECT COUNT(*) FROM missing) + (SELECT COUNT(*) FROM extra)
-          AS mismatches;
     SELECT * FROM v35 ORDER BY c;
-    SELECT 'parity', * FROM v35_parity;
     INSERT INTO t35 VALUES (5, 'a', 50);
     SELECT * FROM v35 ORDER BY c;
-    SELECT 'parity', * FROM v35_parity;
     INSERT INTO t35 VALUES (6, 'b', 60);
     SELECT * FROM v35 ORDER BY c;
-    SELECT 'parity', * FROM v35_parity;
     DELETE FROM t35 WHERE id = 4;
     SELECT * FROM v35 ORDER BY c;
-    SELECT 'parity', * FROM v35_parity;
     DELETE FROM t35 WHERE id IN (1, 5);
     SELECT * FROM v35 ORDER BY c;
-    SELECT 'parity', * FROM v35_parity;
     DELETE FROM t35 WHERE id = 3;
     SELECT * FROM v35 ORDER BY c;
-    SELECT 'parity', * FROM v35_parity;
 }
 expect {
     1
     2
-    parity|0
     1
     2
-    parity|0
     2
-    parity|0
     1
     2
-    parity|0
     1
     2
-    parity|0
     2
-    parity|0
 }
 
 # A pair can be retracted by the delta phases before its insertion arrives

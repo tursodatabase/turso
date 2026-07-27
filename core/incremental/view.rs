@@ -55,9 +55,11 @@ pub(crate) fn state_key_belongs_to_view(key: &str, view_name: &str) -> bool {
     if remainder.is_empty() {
         return true;
     }
-    remainder.strip_prefix("__a").is_some_and(|aggregate_id| {
-        !aggregate_id.is_empty() && aggregate_id.bytes().all(|byte| byte.is_ascii_digit())
-    })
+    remainder == "__g"
+        || remainder == "__r"
+        || remainder.strip_prefix("__a").is_some_and(|aggregate_id| {
+            !aggregate_id.is_empty() && aggregate_id.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 /// Whether a complete hidden metadata or operator table belongs to a view,
@@ -888,7 +890,11 @@ mod tests {
     #[test]
     fn hidden_state_ownership_parses_aggregate_suffixes() {
         assert!(state_key_belongs_to_view("orders__n12__a3", "orders"));
+        assert!(state_key_belongs_to_view("orders__n12__g", "orders"));
+        assert!(state_key_belongs_to_view("orders__n12__r", "orders"));
         assert!(!state_key_belongs_to_view("orders__n12__a", "orders"));
+        assert!(!state_key_belongs_to_view("orders__n12__g_extra", "orders"));
+        assert!(!state_key_belongs_to_view("orders__n12__r3", "orders"));
         assert!(!state_key_belongs_to_view(
             "orders__n12__a3_extra",
             "orders"

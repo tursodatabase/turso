@@ -1,6 +1,7 @@
 @database :memory:
 @requires-file materialized_views ""
 @skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
 
 # Reproducer: CREATE MATERIALIZED VIEW fails with "no such table" when the
 # source table was created in the same transaction.

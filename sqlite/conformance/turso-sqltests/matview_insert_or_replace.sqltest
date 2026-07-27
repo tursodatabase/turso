@@ -1,6 +1,7 @@
 @database :memory:
 @requires-file materialized_views ""
 @skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
 
 # Reproducer: INSERT OR REPLACE on a table with a dependent materialized view
 # panics with "to capture old record accurately, we must be located at the

@@ -4,8 +4,9 @@
 //! graph of incremental operators (scan, filter/project, join, aggregate, set
 //! operation). Each node consumes the delta stream(s) of its input node(s) and
 //! produces its own delta stream; the root node's stream is the view's change.
-//! This is the DBSP circuit model — see `docs/ivm-delta-flow-design.md` — and
-//! it is the replacement boundary for the deleted per-shape classifier.
+//! This is the DBSP circuit model described in
+//! `docs/ivm-vdbe-rewrite-writeup.md`, and it is the replacement boundary for
+//! the deleted per-shape classifier.
 //!
 //! This module owns only the *structure*. Delta-stream wiring, validation,
 //! hidden-state derivation, and bytecode emission live in
@@ -22,7 +23,7 @@ use turso_parser::ast;
 
 use crate::schema::BTreeTable;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::Aggregate;
+use crate::translate::plan::{Aggregate, IterationDirection};
 use crate::{error::LimboError, Result};
 use turso_parser::ast::TableInternalId;
 
@@ -165,6 +166,10 @@ pub enum OpNode {
         /// aligned with `aggregates`; `None` means the aggregate has no
         /// per-value state.
         multiset_collations: Vec<Option<CollationSeq>>,
+        /// Direction in which the batch plan consumes this node's source.
+        /// Collation-equivalent values expose the first physical source row,
+        /// so representative provenance must use the same direction.
+        input_direction: IterationDirection,
         scalar: bool,
     },
 
@@ -453,6 +458,7 @@ mod tests {
                 group_collations: vec![CollationSeq::Binary],
                 aggregates: vec![aggregate(), aggregate()],
                 multiset_collations: vec![None, None],
+                input_direction: IterationDirection::Forwards,
                 scalar: false,
             })
             .unwrap();

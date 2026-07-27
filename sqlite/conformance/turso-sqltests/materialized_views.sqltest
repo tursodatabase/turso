@@ -1,6 +1,7 @@
 @database :memory:
 @requires-file materialized_views ""
 @skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
 
 # Test that INSERT with reused primary keys maintains correct aggregate counts
 # When a row is deleted and a new row is inserted with the same primary key
@@ -2442,7 +2443,7 @@ expect {
     4
 }
 
-# Test that dropping a materialized view cleans up the DBSP state table
+# Test that dropping a materialized view cleans up its node-owned state table.
 test matview-drop-cleans-up-dbsp-table {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER);
     INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
@@ -2452,18 +2453,16 @@ test matview-drop-cleans-up-dbsp-table {
     GROUP BY val;
     -- Verify the view exists
     SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name='v';
-    -- Verify the DBSP state table exists (name pattern: __turso_internal_dbsp_state_v*_v)
-    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_v';
-    -- Verify the DBSP state index exists
-    SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'sqlite_autoindex___turso_internal_dbsp_state_v%_v_1';
+    -- Verify the aggregate node's state table and index exist.
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_v__n%';
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'sqlite_autoindex___turso_internal_dbsp_state_v%_v__n%_1';
     -- Drop the materialized view
     DROP VIEW v;
     -- Verify the view is gone
     SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name='v';
-    -- Verify the DBSP state table is gone
-    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_v';
-    -- Verify the DBSP state index is gone
-    SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'sqlite_autoindex___turso_internal_dbsp_state_v%_v_1';
+    -- Verify the node-owned state is gone.
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_v__n%';
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'sqlite_autoindex___turso_internal_dbsp_state_v%_v__n%_1';
 }
 expect {
     1

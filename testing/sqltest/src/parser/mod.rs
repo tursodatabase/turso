@@ -102,6 +102,7 @@ impl Parser {
         let mut snapshots = Vec::new();
         let mut global_skip = Vec::new();
         let mut global_requires = Vec::new();
+        let mut verify_materialized_views = false;
 
         while !self.is_at_end() {
             self.skip_newlines_and_comments();
@@ -124,6 +125,14 @@ impl Parser {
                 // Global @requires-file: applies to all tests in the file
                 Some(Token::AtRequiresFile) => {
                     global_requires.push(self.parse_global_requires()?);
+                }
+                Some(Token::AtVerifyMaterializedViews) => {
+                    if verify_materialized_views {
+                        return Err(self
+                            .error("duplicate @verify-materialized-views directive".to_string()));
+                    }
+                    self.advance();
+                    verify_materialized_views = true;
                 }
                 Some(Token::Setup) => {
                     let (name, sql) = self.parse_setup()?;
@@ -159,6 +168,7 @@ impl Parser {
 
         let test_file = TestFile {
             databases,
+            verify_materialized_views,
             setups,
             tests,
             snapshots,
@@ -840,6 +850,47 @@ expect {
         assert_eq!(file.databases[0].location, DatabaseLocation::Memory);
         assert_eq!(file.tests.len(), 1);
         assert_eq!(file.tests[0].name, "select-1");
+    }
+
+    #[test]
+    fn test_parse_materialized_view_verification_directive() {
+        let input = r#"
+@database :memory:
+@verify-materialized-views
+
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert!(file.verify_materialized_views);
+    }
+
+    #[test]
+    fn test_reject_duplicate_materialized_view_verification_directive() {
+        let input = r#"
+@database :memory:
+@verify-materialized-views
+@verify-materialized-views
+
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let error = parse(input).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate @verify-materialized-views directive")
+        );
     }
 
     #[test]

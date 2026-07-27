@@ -12,6 +12,13 @@ use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, Register
 use crate::{LimboError, Result};
 use turso_parser::ast;
 
+struct SetOpRepresentativeCursors {
+    table_name: String,
+    table_cursor_id: usize,
+    index_cursor_id: usize,
+    index_name: String,
+}
+
 /// Emit one compound-query node from its already-materialized branch deltas.
 ///
 /// Pure UNION ALL is a stateless identity-namespacing map. Any deduplicating
@@ -237,6 +244,41 @@ fn emit_visibility_fold(
     }
 }
 
+/// Select the branch whose first live source row supplies the compound
+/// result's exact payload. UNION and UNION ALL replace the accumulated
+/// representative when their right branch is present; INTERSECT and EXCEPT
+/// only filter the accumulated left result.
+fn emit_representative_branch(
+    program: &mut ProgramBuilder,
+    operators: &[ast::CompoundOperator],
+    prefix_len: usize,
+    cnt_start: usize,
+    zero_reg: usize,
+    scratch_reg: usize,
+    dest: usize,
+) {
+    program.emit_int(-1, dest);
+    for branch in 0..prefix_len {
+        let can_replace = branch == 0
+            || matches!(
+                operators[branch - 1],
+                ast::CompoundOperator::Union | ast::CompoundOperator::UnionAll
+            );
+        if !can_replace {
+            continue;
+        }
+        let skip = program.allocate_label();
+        emit_presence(program, cnt_start + branch, zero_reg, scratch_reg);
+        program.emit_insn(Insn::IfNot {
+            reg: scratch_reg,
+            target_pc: skip,
+            jump_if_null: true,
+        });
+        program.emit_int(branch as i64, dest);
+        program.preassign_label_to_next_insn(skip);
+    }
+}
+
 /// Emit the view rowid for a state rowid in `srid_reg` into `dst`. When the
 /// view keeps both content rows and append rows, their state rowids come
 /// from two independent tables, so they map to disjoint view rowids:
@@ -295,11 +337,10 @@ fn emit_deduplicating_set_op(
     let materializes_append = has_append;
     // Width of the content key: every output column.
     let k = num_view_columns;
-    // With a collated dedup key, values that compare equal can differ in
-    // bytes; the stored key is the row's first-seen representative (see the
-    // matching reload in the group-aggregate program). The output columns
-    // ARE the key, so the reload refreshes both.
-    let reload_stored_key = key_collations
+    // Collated equality can collapse byte-distinct source rows. Membership
+    // counts alone cannot recover the branch/source representative selected by
+    // a fresh compound query after that representative changes.
+    let tracks_representative = key_collations
         .iter()
         .any(|c| !matches!(c, CollationSeq::Binary | CollationSeq::Unset));
 
@@ -370,6 +411,45 @@ fn emit_deduplicating_set_op(
     } else {
         None
     };
+    let representative_cursors = if tracks_representative {
+        let table_name = operator_state
+            .set_op_representatives_table_name()?
+            .to_string();
+        let table = schema.get_btree_table(&table_name).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "representative table {table_name} of materialized view {view_name} not found"
+            ))
+        })?;
+        let index = schema
+            .get_indices(&table_name)
+            .next()
+            .cloned()
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "representative table {table_name} of materialized view {view_name} has no index"
+                ))
+            })?;
+        let table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: table_cursor_id,
+            root_page: RegisterOrLiteral::Literal(table.root_page),
+            db: 0,
+        });
+        let index_cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: index_cursor_id,
+            root_page: RegisterOrLiteral::Literal(index.root_page),
+            db: 0,
+        });
+        Some(SetOpRepresentativeCursors {
+            table_name,
+            table_cursor_id,
+            index_cursor_id,
+            index_name: index.name.clone(),
+        })
+    } else {
+        None
+    };
     // Register layout, shared by all branches.
     let zero_reg = program.alloc_register();
     let two_reg = program.alloc_register();
@@ -378,6 +458,7 @@ fn emit_deduplicating_set_op(
     // [outputs.., weight], contiguous for MakeRecord.
     let out_start = program.alloc_registers(num_view_columns + 1);
     let out_weight_reg = out_start + num_view_columns;
+    let old_out_start = program.alloc_registers(num_view_columns);
     let w_reg = program.alloc_register();
     let view_rowid_reg = program.alloc_register();
     // Content-merge registers: [key.., state_rowid] contiguous for
@@ -393,6 +474,22 @@ fn emit_deduplicating_set_op(
     let p_scratch_reg = program.alloc_register();
     let c_state_record_reg = program.alloc_register();
     let c_index_record_reg = program.alloc_register();
+    // Collated representative provenance:
+    // [equivalence key.., branch, packed source identity, raw outputs..,
+    //  multiplicity-or-rowid].
+    let representative_key_width = k + 2 + k;
+    let representative_rec_start = program.alloc_registers(representative_key_width + 1);
+    let representative_branch_reg = representative_rec_start + k;
+    let representative_identity_reg = representative_branch_reg + 1;
+    let representative_raw_start = representative_identity_reg + 1;
+    let representative_last_reg = representative_raw_start + k;
+    let representative_rowid_reg = program.alloc_register();
+    let representative_mult_reg = program.alloc_register();
+    let representative_record_reg = program.alloc_register();
+    let representative_found_reg = program.alloc_register();
+    let representative_choice_reg = program.alloc_register();
+    // Prefix for selecting the first source identity of one chosen branch.
+    let representative_prefix_start = program.alloc_registers(k + 1);
     // Append-merge registers: [branch, rid, state_rowid] and the
     // (branch, rid, mult) state row image.
     let a_return_reg = program.alloc_register();
@@ -434,6 +531,136 @@ fn emit_deduplicating_set_op(
         let not_all_zero_label = program.allocate_label();
         let insert_label = program.allocate_label();
         let ret_label = program.allocate_label();
+
+        if let Some(representatives) = &representative_cursors {
+            let representative_found_label = program.allocate_label();
+            let representative_upsert_label = program.allocate_label();
+            let representative_done_label = program.allocate_label();
+            let representative_skip_index_label = program.allocate_label();
+
+            program.emit_insn(Insn::Found {
+                cursor_id: representatives.index_cursor_id,
+                target_pc: representative_found_label,
+                record_reg: representative_rec_start,
+                num_regs: representative_key_width,
+            });
+            program.emit_insn(Insn::Lt {
+                lhs: w_reg,
+                rhs: zero_reg,
+                target_pc: corrupt_label,
+                flags: CmpInsFlags::default(),
+                collation: None,
+            });
+            program.emit_int(0, representative_found_reg);
+            program.emit_insn(Insn::NewRowid {
+                cursor: representatives.table_cursor_id,
+                rowid_reg: representative_rowid_reg,
+                prev_largest_reg: prev_rowid_scratch,
+            });
+            program.emit_insn(Insn::Copy {
+                src_reg: w_reg,
+                dst_reg: representative_last_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: representative_upsert_label,
+            });
+
+            program.preassign_label_to_next_insn(representative_found_label);
+            program.emit_int(1, representative_found_reg);
+            program.emit_insn(Insn::IdxRowId {
+                cursor_id: representatives.index_cursor_id,
+                dest: representative_rowid_reg,
+            });
+            program.emit_insn(Insn::SeekRowid {
+                cursor_id: representatives.table_cursor_id,
+                src_reg: representative_rowid_reg,
+                target_pc: corrupt_label,
+            });
+            program.emit_insn(Insn::Column {
+                cursor_id: representatives.table_cursor_id,
+                column: representative_key_width,
+                dest: representative_mult_reg,
+                default: None,
+            });
+            program.emit_insn(Insn::Add {
+                lhs: w_reg,
+                rhs: representative_mult_reg,
+                dest: representative_last_reg,
+            });
+            program.emit_insn(Insn::Ne {
+                lhs: representative_last_reg,
+                rhs: zero_reg,
+                target_pc: representative_upsert_label,
+                flags: CmpInsFlags::default(),
+                collation: None,
+            });
+            program.emit_insn(Insn::Copy {
+                src_reg: representative_rowid_reg,
+                dst_reg: representative_last_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: representative_rec_start,
+                num_regs: representative_key_width + 1,
+                cursor_id: representatives.index_cursor_id,
+                raise_error_if_no_matching_entry: true,
+            });
+            program.emit_insn(Insn::Delete {
+                cursor_id: representatives.table_cursor_id,
+                table_name: representatives.table_name.clone(),
+                is_part_of_update: true,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: representative_done_label,
+            });
+
+            program.preassign_label_to_next_insn(representative_upsert_label);
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: representative_rec_start as u16,
+                count: (representative_key_width + 1) as u16,
+                dest_reg: representative_record_reg as u16,
+                index_name: None,
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::Insert {
+                cursor: representatives.table_cursor_id,
+                key_reg: representative_rowid_reg,
+                record_reg: representative_record_reg,
+                flag: InsertFlags(
+                    InsertFlags::REQUIRE_SEEK
+                        | InsertFlags::SKIP_LAST_ROWID
+                        | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+                ),
+                table_name: representatives.table_name.clone(),
+            });
+            program.emit_insn(Insn::If {
+                reg: representative_found_reg,
+                target_pc: representative_skip_index_label,
+                jump_if_null: false,
+            });
+            program.emit_insn(Insn::Copy {
+                src_reg: representative_rowid_reg,
+                dst_reg: representative_last_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: representative_rec_start as u16,
+                count: (representative_key_width + 1) as u16,
+                dest_reg: representative_record_reg as u16,
+                index_name: Some(representatives.index_name.clone()),
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: representatives.index_cursor_id,
+                record_reg: representative_record_reg,
+                unpacked_start: Some(representative_rec_start),
+                unpacked_count: Some((representative_key_width + 1) as u16),
+                flags: IdxInsertFlags::new(),
+            });
+            program.preassign_label_to_next_insn(representative_skip_index_label);
+            program.preassign_label_to_next_insn(representative_done_label);
+        }
 
         program.emit_insn(Insn::Found {
             cursor_id: state_index_cursor_id,
@@ -507,7 +734,7 @@ fn emit_deduplicating_set_op(
             src_reg: c_srid_reg,
             target_pc: corrupt_label,
         });
-        if reload_stored_key {
+        if tracks_representative {
             for i in 0..k {
                 program.emit_insn(Insn::Column {
                     cursor_id: state_cursor_id,
@@ -519,6 +746,11 @@ fn emit_deduplicating_set_op(
             program.emit_insn(Insn::Copy {
                 src_reg: key_start,
                 dst_reg: out_start,
+                extra_amount: k.saturating_sub(1),
+            });
+            program.emit_insn(Insn::Copy {
+                src_reg: out_start,
+                dst_reg: old_out_start,
                 extra_amount: k.saturating_sub(1),
             });
         }
@@ -569,6 +801,65 @@ fn emit_deduplicating_set_op(
         });
 
         program.preassign_label_to_next_insn(not_all_zero_label);
+        if let Some(representatives) = &representative_cursors {
+            let no_representative_label = program.allocate_label();
+            emit_representative_branch(
+                program,
+                operators,
+                prefix_len,
+                cnt_start,
+                zero_reg,
+                p_scratch_reg,
+                representative_choice_reg,
+            );
+            // An invisible INTERSECT/EXCEPT state may have rows only in a
+            // filtering branch and therefore no accumulated-left payload yet.
+            program.emit_insn(Insn::Lt {
+                lhs: representative_choice_reg,
+                rhs: zero_reg,
+                target_pc: no_representative_label,
+                flags: CmpInsFlags::default(),
+                collation: None,
+            });
+            program.emit_insn(Insn::Copy {
+                src_reg: key_start,
+                dst_reg: representative_prefix_start,
+                extra_amount: k.saturating_sub(1),
+            });
+            program.emit_insn(Insn::Copy {
+                src_reg: representative_choice_reg,
+                dst_reg: representative_prefix_start + k,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::SeekGE {
+                is_index: true,
+                cursor_id: representatives.index_cursor_id,
+                start_reg: representative_prefix_start,
+                num_regs: k + 1,
+                target_pc: corrupt_label,
+                eq_only: false,
+            });
+            program.emit_insn(Insn::IdxGT {
+                cursor_id: representatives.index_cursor_id,
+                start_reg: representative_prefix_start,
+                num_regs: k + 1,
+                target_pc: corrupt_label,
+            });
+            for i in 0..k {
+                program.emit_insn(Insn::Column {
+                    cursor_id: representatives.index_cursor_id,
+                    column: k + 2 + i,
+                    dest: key_start + i,
+                    default: None,
+                });
+                program.emit_insn(Insn::Copy {
+                    src_reg: key_start + i,
+                    dst_reg: out_start + i,
+                    extra_amount: 0,
+                });
+            }
+            program.preassign_label_to_next_insn(no_representative_label);
+        }
         program.emit_insn(Insn::Copy {
             src_reg: key_start,
             dst_reg: state_rec_start,
@@ -603,48 +894,90 @@ fn emit_deduplicating_set_op(
             p_scratch_reg,
             v_new_reg,
         );
-        // Publish only visibility transitions. A row that stays visible keeps
-        // its stored first-seen content, so there is nothing to emit.
-        program.emit_insn(Insn::Eq {
-            lhs: v_old_reg,
-            rhs: v_new_reg,
-            target_pc: ret_label,
-            flags: CmpInsFlags::default(),
-            collation: None,
-        });
-        program.emit_insn(Insn::If {
-            reg: v_new_reg,
-            target_pc: insert_label,
-            jump_if_null: false,
-        });
-        // Visible before, not now: publish one retraction.
-        program.emit_int(-1, out_weight_reg);
-        emit_split_view_rowid(
-            program,
-            has_append,
-            c_srid_reg,
-            two_reg,
-            one_reg,
-            view_rowid_reg,
-            false,
-        );
-        emit_operator_rowid_delta(program, output, view_rowid_reg, out_start, out_weight_reg);
-        program.emit_insn(Insn::Goto {
-            target_pc: ret_label,
-        });
+        if tracks_representative {
+            let skip_old_label = program.allocate_label();
+            program.emit_insn(Insn::IfNot {
+                reg: v_old_reg,
+                target_pc: skip_old_label,
+                jump_if_null: true,
+            });
+            program.emit_int(-1, out_weight_reg);
+            emit_split_view_rowid(
+                program,
+                has_append,
+                c_srid_reg,
+                two_reg,
+                one_reg,
+                view_rowid_reg,
+                false,
+            );
+            emit_operator_rowid_delta(
+                program,
+                output,
+                view_rowid_reg,
+                old_out_start,
+                out_weight_reg,
+            );
+            program.preassign_label_to_next_insn(skip_old_label);
+            program.emit_insn(Insn::IfNot {
+                reg: v_new_reg,
+                target_pc: ret_label,
+                jump_if_null: true,
+            });
+            program.emit_int(1, out_weight_reg);
+            emit_split_view_rowid(
+                program,
+                has_append,
+                c_srid_reg,
+                two_reg,
+                one_reg,
+                view_rowid_reg,
+                false,
+            );
+            emit_operator_rowid_delta(program, output, view_rowid_reg, out_start, out_weight_reg);
+        } else {
+            // Binary keys have one exact representation, so only visibility
+            // transitions can change the compound output.
+            program.emit_insn(Insn::Eq {
+                lhs: v_old_reg,
+                rhs: v_new_reg,
+                target_pc: ret_label,
+                flags: CmpInsFlags::default(),
+                collation: None,
+            });
+            program.emit_insn(Insn::If {
+                reg: v_new_reg,
+                target_pc: insert_label,
+                jump_if_null: false,
+            });
+            program.emit_int(-1, out_weight_reg);
+            emit_split_view_rowid(
+                program,
+                has_append,
+                c_srid_reg,
+                two_reg,
+                one_reg,
+                view_rowid_reg,
+                false,
+            );
+            emit_operator_rowid_delta(program, output, view_rowid_reg, out_start, out_weight_reg);
+            program.emit_insn(Insn::Goto {
+                target_pc: ret_label,
+            });
 
-        program.preassign_label_to_next_insn(insert_label);
-        program.emit_int(1, out_weight_reg);
-        emit_split_view_rowid(
-            program,
-            has_append,
-            c_srid_reg,
-            two_reg,
-            one_reg,
-            view_rowid_reg,
-            false,
-        );
-        emit_operator_rowid_delta(program, output, view_rowid_reg, out_start, out_weight_reg);
+            program.preassign_label_to_next_insn(insert_label);
+            program.emit_int(1, out_weight_reg);
+            emit_split_view_rowid(
+                program,
+                has_append,
+                c_srid_reg,
+                two_reg,
+                one_reg,
+                view_rowid_reg,
+                false,
+            );
+            emit_operator_rowid_delta(program, output, view_rowid_reg, out_start, out_weight_reg);
+        }
         program.preassign_label_to_next_insn(ret_label);
         program.emit_insn(Insn::Return {
             return_reg: c_return_reg,
@@ -920,10 +1253,22 @@ fn emit_deduplicating_set_op(
         let branch_done_label = program.allocate_label();
         let loop_label = program.allocate_label();
         let next_label = program.allocate_label();
+        let pass_reg = stream.requires_positive_first.then(|| {
+            let reg = program.alloc_register();
+            program.emit_int(0, reg);
+            reg
+        });
+        let pass_start_label = program.allocate_label();
+        let pass_done_label = if pass_reg.is_some() {
+            program.allocate_label()
+        } else {
+            branch_done_label
+        };
 
+        program.preassign_label_to_next_insn(pass_start_label);
         program.emit_insn(Insn::Rewind {
             cursor_id: stream.cursor_id,
-            pc_if_empty: branch_done_label,
+            pc_if_empty: pass_done_label,
         });
         program.preassign_label_to_next_insn(loop_label);
 
@@ -941,6 +1286,34 @@ fn emit_deduplicating_set_op(
             dest: w_reg,
             default: None,
         });
+        if let Some(pass_reg) = pass_reg {
+            let negative_pass_label = program.allocate_label();
+            let pass_ok_label = program.allocate_label();
+            program.emit_insn(Insn::If {
+                reg: pass_reg,
+                target_pc: negative_pass_label,
+                jump_if_null: false,
+            });
+            program.emit_insn(Insn::Lt {
+                lhs: w_reg,
+                rhs: zero_reg,
+                target_pc: next_label,
+                flags: CmpInsFlags::default(),
+                collation: None,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: pass_ok_label,
+            });
+            program.preassign_label_to_next_insn(negative_pass_label);
+            program.emit_insn(Insn::Gt {
+                lhs: w_reg,
+                rhs: zero_reg,
+                target_pc: next_label,
+                flags: CmpInsFlags::default(),
+                collation: None,
+            });
+            program.preassign_label_to_next_insn(pass_ok_label);
+        }
 
         // Row identity: output content for dedup-prefix branches,
         // (branch, source identity record) for trailing UNION ALL branches.
@@ -950,6 +1323,39 @@ fn emit_deduplicating_set_op(
                 dst_reg: key_start,
                 extra_amount: k.saturating_sub(1),
             });
+            if tracks_representative {
+                turso_assert!(
+                    stream.identity_width() > 0,
+                    "collated set-operation input requires a stable source identity"
+                );
+                program.emit_insn(Insn::Copy {
+                    src_reg: out_start,
+                    dst_reg: representative_rec_start,
+                    extra_amount: k.saturating_sub(1),
+                });
+                program.emit_int(branch_idx as i64, representative_branch_reg);
+                let identity_start = program.alloc_registers(stream.identity_width());
+                for column in 0..stream.identity_width() {
+                    program.emit_insn(Insn::Column {
+                        cursor_id: stream.cursor_id,
+                        column,
+                        dest: identity_start + column,
+                        default: None,
+                    });
+                }
+                program.emit_insn(Insn::MakeRecord {
+                    start_reg: identity_start as u16,
+                    count: stream.identity_width() as u16,
+                    dest_reg: representative_identity_reg as u16,
+                    index_name: None,
+                    affinity_str: None,
+                });
+                program.emit_insn(Insn::Copy {
+                    src_reg: out_start,
+                    dst_reg: representative_raw_start,
+                    extra_amount: k.saturating_sub(1),
+                });
+            }
             program.emit_insn(Insn::Gosub {
                 target_pc: content_merge_labels[branch_idx],
                 return_reg: c_return_reg,
@@ -988,6 +1394,18 @@ fn emit_deduplicating_set_op(
             cursor_id: stream.cursor_id,
             pc_if_next: loop_label,
         });
+        if let Some(pass_reg) = pass_reg {
+            program.preassign_label_to_next_insn(pass_done_label);
+            program.emit_insn(Insn::If {
+                reg: pass_reg,
+                target_pc: branch_done_label,
+                jump_if_null: false,
+            });
+            program.emit_int(1, pass_reg);
+            program.emit_insn(Insn::Goto {
+                target_pc: pass_start_label,
+            });
+        }
         program.preassign_label_to_next_insn(branch_done_label);
     }
 
