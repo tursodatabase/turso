@@ -1764,3 +1764,31 @@ expect {
     init|10
     final|20
 }
+
+# An attached table may have the same name and root page as a main table that
+# feeds a materialized view. Its writes belong to the attached database and
+# must never enter main's maintenance change log.
+test matview-parity-ignore-attached-homonym {
+    CREATE TABLE route_source(
+      id INTEGER PRIMARY KEY,
+      value INTEGER
+    );
+    INSERT INTO route_source VALUES (1, 10);
+    CREATE MATERIALIZED VIEW route_totals AS
+      SELECT COUNT(*) AS n, SUM(value) AS total
+      FROM route_source;
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.route_source(
+      id INTEGER PRIMARY KEY,
+      value INTEGER
+    );
+    INSERT INTO aux.route_source VALUES (2, 20);
+    UPDATE aux.route_source SET value = 30 WHERE id = 2;
+    DELETE FROM aux.route_source WHERE id = 2;
+    SELECT 'main', * FROM route_totals;
+    SELECT 'aux', COUNT(*), TOTAL(value) FROM aux.route_source;
+}
+expect {
+    main|1|10
+    aux|0|0.0
+}

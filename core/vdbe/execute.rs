@@ -1158,6 +1158,7 @@ pub fn op_open_read(
 
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
+    state.cursor_databases[*cursor_id] = Some(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if state.cursors[*cursor_id].is_none() {
@@ -1671,6 +1672,7 @@ pub fn op_open_pseudo(
         },
         insn
     );
+    state.cursor_databases[*cursor_id] = None;
     {
         let cursors = &mut state.cursors;
         let cursor = PseudoCursor::new(*content_reg);
@@ -10796,7 +10798,17 @@ struct ChangeLogRoute {
 
 /// Resolve change-log routing from the btree being written, never from the
 /// SQL spelling carried in the opcode for tracing/update hooks.
-fn change_log_route(program: &Program, cursor_id: usize) -> Result<Option<ChangeLogRoute>> {
+fn change_log_route(
+    program: &Program,
+    state: &ProgramState,
+    cursor_id: usize,
+) -> Result<Option<ChangeLogRoute>> {
+    // Materialized views currently live in main. Writes to temp or attached
+    // databases must not be resolved through main's schema just because a
+    // table there happens to have the same name or root page.
+    if state.cursor_databases.get(cursor_id).copied().flatten() != Some(MAIN_DB_ID) {
+        return Ok(None);
+    }
     let cursor_table = match program.cursor_ref.get(cursor_id) {
         Some((_, CursorType::BTreeTable(table)))
         | Some((_, CursorType::MaterializedView(table, _))) => table.clone(),
@@ -10959,7 +10971,7 @@ pub fn op_insert(
     loop {
         match state.active_op_state.insert().sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
-                let has_change_log_subscribers = change_log_route(program, *cursor_id)?
+                let has_change_log_subscribers = change_log_route(program, state, *cursor_id)?
                     .is_some_and(|route| !route.dependent_views.is_empty());
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because
@@ -11002,7 +11014,7 @@ pub fn op_insert(
                 )? {
                     return Ok(InsnFunctionStepResult::IO(io));
                 }
-                let has_change_log_subscribers = change_log_route(program, *cursor_id)?
+                let has_change_log_subscribers = change_log_route(program, state, *cursor_id)?
                     .is_some_and(|route| !route.dependent_views.is_empty());
                 let needs_capture =
                     has_change_log_subscribers && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
@@ -11037,7 +11049,7 @@ pub fn op_insert(
                         if let Some(record) = maybe_record {
                             let values = record.get_values_owned()?;
                             let route =
-                                change_log_route(program, *cursor_id)?.ok_or_else(|| {
+                                change_log_route(program, state, *cursor_id)?.ok_or_else(|| {
                                     LimboError::InternalError(format!(
                                         "changed btree for {table_name} missing from schema"
                                     ))
@@ -11197,7 +11209,7 @@ pub fn op_insert(
                         state.record_statement_change();
                     }
                 }
-                let has_change_log_subscribers = change_log_route(program, *cursor_id)?
+                let has_change_log_subscribers = change_log_route(program, state, *cursor_id)?
                     .is_some_and(|route| !route.dependent_views.is_empty());
                 if has_change_log_subscribers {
                     if !has_rowid {
@@ -11216,7 +11228,7 @@ pub fn op_insert(
                     state.active_op_state.insert().old_record = None;
                     break;
                 }
-                let route = change_log_route(program, *cursor_id)?.ok_or_else(|| {
+                let route = change_log_route(program, state, *cursor_id)?.ok_or_else(|| {
                     LimboError::InternalError(format!(
                         "changed btree for {table_name} missing from schema"
                     ))
@@ -11366,7 +11378,7 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
-                let Some(route) = change_log_route(program, *cursor_id)? else {
+                let Some(route) = change_log_route(program, state, *cursor_id)? else {
                     state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                     continue;
                 };
@@ -11409,7 +11421,7 @@ pub fn op_delete(
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.record_rows_written(1);
-                let has_change_log_subscribers = change_log_route(program, *cursor_id)?
+                let has_change_log_subscribers = change_log_route(program, state, *cursor_id)?
                     .is_some_and(|route| !route.dependent_views.is_empty());
                 if !has_change_log_subscribers {
                     break;
@@ -11418,7 +11430,7 @@ pub fn op_delete(
                 continue;
             }
             OpDeleteSubState::ApplyViewChange => {
-                let route = change_log_route(program, *cursor_id)?.ok_or_else(|| {
+                let route = change_log_route(program, state, *cursor_id)?.ok_or_else(|| {
                     LimboError::InternalError(format!(
                         "changed btree for {table_name} missing from schema"
                     ))
@@ -12251,6 +12263,7 @@ pub fn op_open_write(
     }
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
+    state.cursor_databases[*cursor_id] = Some(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if state.cursors[*cursor_id].is_none() {
@@ -13557,6 +13570,7 @@ pub fn op_close(
         .get_mut(*cursor_id)
         .expect("cursor_id should be valid")
         .take();
+    state.cursor_databases[*cursor_id] = None;
     if let Some(deferred_seek) = state.deferred_seeks.get_mut(*cursor_id) {
         deferred_seek.take();
     }
@@ -14597,6 +14611,7 @@ pub fn op_open_ephemeral(
         Insn::OpenAutoindex { cursor_id } => (*cursor_id, false),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
+    state.cursor_databases[cursor_id] = None;
     let mv_store = program.connection.mv_store();
     match state.active_op_state.open_ephemeral() {
         OpOpenEphemeralState::Start => {
@@ -14792,6 +14807,7 @@ pub fn op_open_dup(
         },
         insn
     );
+    state.cursor_databases[*new_cursor_id] = state.cursor_databases[*original_cursor_id];
     let mv_store = program.connection.mv_store();
 
     let original_cursor = state.get_cursor(*original_cursor_id);

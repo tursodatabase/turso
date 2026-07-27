@@ -919,6 +919,9 @@ pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
+    /// Database id associated with each opened cursor. Ephemeral and pseudo
+    /// cursors have no database id.
+    cursor_databases: Vec<Option<usize>>,
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
     /// Trace state: register snapshot for diffing.
@@ -1043,12 +1046,14 @@ crate::assert::assert_send_sync!(ProgramState);
 impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
+        let cursor_databases = vec![None; max_cursors];
         let cursor_seqs = vec![0i64; max_cursors];
         let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
         Self {
             io_completions: None,
             pc: 0,
             cursors,
+            cursor_databases,
             cursor_seqs,
             registers,
             pre_op_registers: None,
@@ -1154,6 +1159,7 @@ impl ProgramState {
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
+            self.cursor_databases.resize(max_cursors, None);
             self.cursor_seqs.resize(max_cursors, 0);
             self.deferred_seeks.resize(max_cursors, None);
         }
@@ -1169,6 +1175,7 @@ impl ProgramState {
         self.cursors.iter_mut().for_each(|c| {
             let _ = c.take();
         });
+        self.cursor_databases.fill(None);
         for r in self.registers.iter_mut() {
             match r {
                 Register::Value(v) => *v = Value::Null,
