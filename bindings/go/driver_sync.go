@@ -86,6 +86,11 @@ type TursoSyncDbConfig struct {
 	// in chunks. 0 (default) bootstraps in a single round-trip. no-op when partial sync uses the
 	// query bootstrap strategy.
 	PullBytesThreshold int
+
+	// when true, forces incremental pulls to use the MVCC logical-log stream.
+	// false (default) auto-detects the remote's protocol from the first pull
+	// response and persists it, so this only needs to be set as an escape hatch.
+	LogicalMvccPull bool
 }
 
 // statistics for the synced database.
@@ -172,6 +177,7 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 		PartialBootstrapPrefetch:       config.PartialSyncExperimental.Prefetch,
 		PushOperationsThreshold:        config.PushOperationsThreshold,
 		PullBytesThreshold:             config.PullBytesThreshold,
+		LogicalMvccPull:                config.LogicalMvccPull,
 	}
 	sdb, err := turso_sync_database_new(dbCfg, syncCfg)
 	if err != nil {

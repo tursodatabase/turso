@@ -432,6 +432,7 @@ def connect_sync(
     remote_encryption_cipher: Optional[RemoteEncryptionCipher] = None,
     push_operations_threshold: Optional[int] = None,
     pull_bytes_threshold: Optional[int] = None,
+    logical_mvcc_pull: Optional[bool] = None,
 ) -> ConnectionSync:
     """
     Create and open a synchronized database connection.
@@ -453,6 +454,9 @@ def connect_sync(
     - pull_bytes_threshold: optional hint, in bytes, that splits the bootstrap download into multiple
       pull-updates HTTP requests of >= this many bytes each. None (default) bootstraps in a single
       round-trip; no-op when partial sync uses the query bootstrap strategy
+    - logical_mvcc_pull: sync-protocol override. None (default) auto-detects the remote protocol
+      from the first pull-updates response and persists it; True forces the MVCC logical-log
+      stream; False forces page streams. Only needed for tests or as an escape hatch
     """
     # Resolve client name
     cname = client_name or "turso-sync-py"
@@ -497,6 +501,7 @@ def connect_sync(
         remote_encryption_cipher=remote_encryption_cipher,
         push_operations_threshold=push_operations_threshold,
         pull_bytes_threshold=pull_bytes_threshold,
+        logical_mvcc_pull=logical_mvcc_pull,
     )
 
     # Create sync database holder

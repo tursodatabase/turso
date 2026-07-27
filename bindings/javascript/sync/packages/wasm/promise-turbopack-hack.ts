@@ -101,6 +101,7 @@ class Database extends DatabasePromise {
             partialSyncOpts: partialSyncOpts,
             pushOperationsThreshold: opts.pushOperationsThreshold,
             pullBytesThreshold: opts.pullBytesThreshold,
+            logicalMvccPull: opts.logicalMvccPull,
         });
 
         let headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>);

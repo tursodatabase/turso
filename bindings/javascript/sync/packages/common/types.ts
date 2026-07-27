@@ -141,6 +141,15 @@ export interface DatabaseOpts {
      */
     pullBytesThreshold?: number,
     /**
+     * sync-protocol override for incremental pulls.
+     * unset (default) auto-detects the remote's protocol (WAL page streams vs
+     * MVCC logical-log streams) from the first pull response and persists it —
+     * no configuration is needed to sync with MVCC-mode remotes.
+     * true forces MVCC logical-log streams; false forces page streams.
+     * only needed for tests or as an escape hatch.
+     */
+    logicalMvccPull?: boolean,
+    /**
      * optional fetch override used for every HTTP request made by the sync engine
      * (push, pull, wait-for-changes). drop-in replacement for `globalThis.fetch`.
      * use cases:

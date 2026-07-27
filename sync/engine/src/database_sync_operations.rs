@@ -30,15 +30,15 @@ use crate::{
     io_operations::IoOperations,
     server_proto::{
         self, Batch, BatchCond, BatchStep, BatchStreamReq, PageData, PageUpdatesEncodingReq,
-        PullUpdatesApplyMode, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
-        PullUpdatesStreamKind, Stmt, StmtResult, StreamRequest,
+        PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody,
+        PullUpdatesRespProtoBody, PullUpdatesStreamKind, Stmt, StmtResult, StreamRequest,
     },
     types::{
         parse_bin_record, Coro, DatabasePullRevision, DatabaseRowMutation,
         DatabaseRowTransformResult, DatabaseSchemaKind, DatabaseSchemaReplay,
         DatabaseStatementReplay, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
         DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus,
-        PartialBootstrapStrategy, PartialSyncOpts, SyncEngineIoResult,
+        PartialBootstrapStrategy, PartialSyncOpts, RemotePullProtocol, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -125,6 +125,35 @@ fn pull_updates_apply_mode(header: &PullUpdatesRespProtoBody) -> Result<PullUpda
             header.apply_mode
         ))
     })
+}
+
+/// Detects the remote's sync protocol from a pull-updates response header.
+///
+/// Prefers the explicit `protocol` field. For servers that predate it, falls
+/// back to the revision shape: MVCC revisions serialize as
+/// `{"generation":..,"log_offset":..}` while WAL diskless revisions use
+/// `{"generation":..,"wal_fragment_no":..}` (and legacy revisions are not
+/// JSON objects at all).
+pub(crate) fn detect_remote_pull_protocol(header: &PullUpdatesRespProtoBody) -> RemotePullProtocol {
+    match PullUpdatesProtocol::try_from(header.protocol) {
+        Ok(PullUpdatesProtocol::Pages) => return RemotePullProtocol::Pages,
+        Ok(PullUpdatesProtocol::MvccLogical) => return RemotePullProtocol::MvccLogical,
+        Ok(PullUpdatesProtocol::Unspecified) | Err(_) => {}
+    }
+    #[derive(serde::Deserialize)]
+    struct MvccRevisionProbe {
+        #[serde(rename = "generation")]
+        _generation: u64,
+        #[serde(rename = "log_offset")]
+        _log_offset: u64,
+    }
+    if header.server_revision.is_empty() {
+        RemotePullProtocol::Unknown
+    } else if serde_json::from_str::<MvccRevisionProbe>(&header.server_revision).is_ok() {
+        RemotePullProtocol::MvccLogical
+    } else {
+        RemotePullProtocol::Pages
+    }
 }
 
 fn ensure_page_stream(header: &PullUpdatesRespProtoBody, context: &str) -> Result<()> {
@@ -1817,7 +1846,11 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
     revision: &str,
     long_poll_timeout: Option<std::time::Duration>,
     logical_updates: bool,
-) -> Result<(DatabasePullRevision, PullUpdatesV1Result)> {
+) -> Result<(
+    DatabasePullRevision,
+    PullUpdatesV1Result,
+    RemotePullProtocol,
+)> {
     tracing::info!(
         "pull_updates_v1: remote_url={:?} revision={} logical_updates={} long_poll_timeout_ms={}",
         ctx.remote_url,
@@ -1884,6 +1917,7 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
     let next_revision = DatabasePullRevision::V1 {
         revision: header.server_revision.clone(),
     };
+    let remote_protocol = detect_remote_pull_protocol(&header);
     let apply_mode = pull_updates_apply_mode(&header)?;
     match pull_updates_stream_kind(&header)? {
         PullUpdatesStreamKind::Pages => {
@@ -1948,7 +1982,11 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
                 next_revision,
                 replace_base
             );
-            Ok((next_revision, PullUpdatesV1Result::Pages { replace_base }))
+            Ok((
+                next_revision,
+                PullUpdatesV1Result::Pages { replace_base },
+                remote_protocol,
+            ))
         }
         PullUpdatesStreamKind::MvccLogicalLog => {
             if matches!(apply_mode, PullUpdatesApplyMode::ReplaceBase) {
@@ -1976,7 +2014,11 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
                 txns,
                 ops
             );
-            Ok((next_revision, PullUpdatesV1Result::Logical { txns, ops }))
+            Ok((
+                next_revision,
+                PullUpdatesV1Result::Logical { txns, ops },
+                remote_protocol,
+            ))
         }
     }
 }
@@ -2382,6 +2424,28 @@ fn convert_to_args(
             },
         })
         .collect()
+}
+
+/// Lists user-created tables (i.e. anything beyond sqlite/turso internals).
+/// Used to decide whether local data exists that a replace-base apply would
+/// need to preserve.
+pub async fn list_user_tables<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'turso_%' AND name NOT LIKE '\\_\\_turso\\_%' ESCAPE '\\'",
+    )?;
+    let mut names = Vec::new();
+    while let Some(row) = run_stmt_once(coro, &mut stmt).await? {
+        let name = row
+            .get_value(0)
+            .to_text()
+            .ok_or_else(|| Error::DatabaseSyncEngineError("unexpected column type".to_string()))?
+            .to_string();
+        names.push(name);
+    }
+    Ok(names)
 }
 
 pub async fn has_table<Ctx>(
@@ -3190,7 +3254,7 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
     protocol: DatabaseSyncEngineProtocolVersion,
     partial_sync: Option<PartialSyncOpts>,
     pull_bytes_threshold: Option<usize>,
-) -> Result<DatabasePullRevision> {
+) -> Result<(DatabasePullRevision, RemotePullProtocol)> {
     match protocol {
         DatabaseSyncEngineProtocolVersion::Legacy => {
             if partial_sync.is_some() {
@@ -3198,7 +3262,9 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
                     "can't bootstrap prefix of database with legacy protocol".to_string(),
                 ));
             }
-            bootstrap_db_file_legacy(ctx, io, main_db_path).await
+            // The legacy wire protocol has no MVCC variant; it is pages by definition.
+            let revision = bootstrap_db_file_legacy(ctx, io, main_db_path).await?;
+            Ok((revision, RemotePullProtocol::Pages))
         }
         DatabaseSyncEngineProtocolVersion::V1 => {
             bootstrap_db_file_v1(ctx, io, main_db_path, partial_sync, pull_bytes_threshold).await
@@ -3327,7 +3393,7 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     main_db_path: &str,
     partial_sync: Option<PartialSyncOpts>,
     pull_bytes_threshold: Option<usize>,
-) -> Result<DatabasePullRevision> {
+) -> Result<(DatabasePullRevision, RemotePullProtocol)> {
     if let Some(PartialSyncOpts {
         bootstrap_strategy: None,
         ..
@@ -3416,9 +3482,13 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     // with unflushed pages while the metadata claims a completed bootstrap.
     sync_file(ctx.coro, &file).await?;
 
-    Ok(DatabasePullRevision::V1 {
-        revision: header.server_revision,
-    })
+    let remote_protocol = detect_remote_pull_protocol(&header);
+    Ok((
+        DatabasePullRevision::V1 {
+            revision: header.server_revision,
+        },
+        remote_protocol,
+    ))
 }
 
 fn decode_page(header: &PullUpdatesRespProtoBody, page_data: PageData) -> Result<Vec<u8>> {
@@ -3837,10 +3907,10 @@ mod tests {
         database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
         database_sync_operations::{
             apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats,
-            ensure_incremental_page_stream, ensure_page_stream, is_logically_replayable_table,
-            logical_txn_to_tape_operations, pull_pages_v1, pull_updates_v1, should_push_change,
-            should_replay_local_change, wait_proto_message, wal_pull_to_file_v1,
-            PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
+            detect_remote_pull_protocol, ensure_incremental_page_stream, ensure_page_stream,
+            is_logically_replayable_table, logical_txn_to_tape_operations, pull_pages_v1,
+            pull_updates_v1, should_push_change, should_replay_local_change, wait_proto_message,
+            wal_pull_to_file_v1, PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
         },
         database_tape::{run_stmt_once, DatabaseReplaySessionOpts, DatabaseTape},
         server_proto,
@@ -4419,6 +4489,7 @@ mod tests {
             raw_mvcc_log_frame_with_crc(77, &portable_payload, &recovery_payload, 2, initial_crc);
         let end_offset = (log_header.len() + frame.len()) as u64;
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: format!("g1:o{end_offset}"),
             db_size: 0,
             raw_encoding: None,
@@ -4496,6 +4567,7 @@ mod tests {
         let range_start = super::MVCC_LOG_HEADER_SIZE as u64;
         let range_end = range_start + raw_frame.len() as u64;
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: format!("g1:o{range_end}"),
             db_size: 0,
             raw_encoding: None,
@@ -4543,7 +4615,8 @@ mod tests {
                     Some("https://example.com".to_string()),
                     None,
                 );
-                let (revision, result) = pull_updates_v1(&ctx, &file, "g1:o56", None, true).await?;
+                let (revision, result, _) =
+                    pull_updates_v1(&ctx, &file, "g1:o56", None, true).await?;
                 let DatabasePullRevision::V1 { revision } = revision else {
                     panic!("expected V1 revision");
                 };
@@ -4578,6 +4651,7 @@ mod tests {
     fn pull_updates_v1_accepts_page_stream_when_logical_pull_is_requested() {
         let page = vec![7u8; super::PAGE_SIZE];
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: "g1:o45".to_string(),
             db_size: 1,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -4619,7 +4693,8 @@ mod tests {
                     Some("https://example.com".to_string()),
                     None,
                 );
-                let (revision, result) = pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
+                let (revision, result, _) =
+                    pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
                 let DatabasePullRevision::V1 { revision } = revision else {
                     panic!("expected V1 revision");
                 };
@@ -4662,6 +4737,7 @@ mod tests {
     fn pull_updates_v1_preserves_replace_base_page_fallback() {
         let page = vec![9u8; super::PAGE_SIZE];
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: "g1:o80".to_string(),
             db_size: 1,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -4703,7 +4779,8 @@ mod tests {
                     Some("https://example.com".to_string()),
                     None,
                 );
-                let (revision, result) = pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
+                let (revision, result, _) =
+                    pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
                 let DatabasePullRevision::V1 { revision } = revision else {
                     panic!("expected V1 revision");
                 };
@@ -4734,6 +4811,7 @@ mod tests {
     #[test]
     fn wal_pull_to_file_v1_rejects_replace_base_page_stream() {
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: "g1:o80".to_string(),
             db_size: 1,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -4799,6 +4877,7 @@ mod tests {
     fn pull_pages_v1_accepts_replace_base_page_stream_for_revision_pinned_reads() {
         let page = vec![11u8; super::PAGE_SIZE];
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: "g1:o80".to_string(),
             db_size: 3,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -4927,6 +5006,7 @@ mod tests {
         let range_start = super::MVCC_LOG_HEADER_SIZE as u64;
         let range_end = range_start + frame.len() as u64;
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: format!("g1:o{range_end}"),
             db_size: 0,
             raw_encoding: None,
@@ -4970,6 +5050,7 @@ mod tests {
         log_header[super::MVCC_LOG_HEADER_CRC_START] ^= 0x01;
         let end_offset = (log_header.len() + frame.len()) as u64;
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: format!("g1:o{end_offset}"),
             db_size: 0,
             raw_encoding: None,
@@ -5004,6 +5085,7 @@ mod tests {
         frame[super::MVCC_TX_EXT_HEADER_SIZE + super::MVCC_EXTENSION_RECORD_HEADER_SIZE] ^= 0x01;
         let end_offset = (log_header.len() + frame.len()) as u64;
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: format!("g1:o{end_offset}"),
             db_size: 0,
             raw_encoding: None,
@@ -5284,7 +5366,7 @@ mod tests {
             remote_encryption_key: None,
             push_operations_threshold: None,
             pull_bytes_threshold: None,
-            logical_mvcc_pull: true,
+            logical_mvcc_pull: Some(true),
         };
         let internal_schema_change = DatabaseTapeRowChange {
             change_id: 1,
@@ -5365,6 +5447,7 @@ mod tests {
 
     fn page_header(stream_kind: i32, apply_mode: i32) -> PullUpdatesRespProtoBody {
         PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: "rev".to_string(),
             db_size: 1,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -5465,5 +5548,86 @@ mod tests {
         assert!(super::rewrite_create_ddl_as_if_not_exists("ALTER TABLE q ADD COLUMN w").is_none());
         assert!(super::rewrite_create_ddl_as_if_not_exists("DROP TABLE q").is_none());
         assert!(super::rewrite_create_ddl_as_if_not_exists("not valid sql").is_none());
+    }
+
+    #[test]
+    fn detect_remote_pull_protocol_prefers_explicit_field() {
+        use crate::server_proto::PullUpdatesProtocol;
+        use crate::types::RemotePullProtocol;
+
+        let header = |protocol: i32, revision: &str| PullUpdatesRespProtoBody {
+            server_revision: revision.to_string(),
+            db_size: 0,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: None,
+            protocol,
+        };
+
+        // Explicit field wins even when the revision shape disagrees.
+        assert_eq!(
+            detect_remote_pull_protocol(&header(
+                PullUpdatesProtocol::Pages as i32,
+                r#"{"generation":1,"log_offset":9}"#
+            )),
+            RemotePullProtocol::Pages
+        );
+        assert_eq!(
+            detect_remote_pull_protocol(&header(
+                PullUpdatesProtocol::MvccLogical as i32,
+                r#"{"generation":1,"wal_fragment_no":9}"#
+            )),
+            RemotePullProtocol::MvccLogical
+        );
+    }
+
+    #[test]
+    fn detect_remote_pull_protocol_falls_back_to_revision_shape_for_old_servers() {
+        use crate::server_proto::PullUpdatesProtocol;
+        use crate::types::RemotePullProtocol;
+
+        let header = |protocol: i32, revision: &str| PullUpdatesRespProtoBody {
+            server_revision: revision.to_string(),
+            db_size: 0,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: None,
+            protocol,
+        };
+        let unspecified = PullUpdatesProtocol::Unspecified as i32;
+
+        // MVCC revisions carry log_offset; WAL diskless revisions carry
+        // wal_fragment_no; legacy revisions are not JSON objects at all.
+        assert_eq!(
+            detect_remote_pull_protocol(&header(
+                unspecified,
+                r#"{"generation":4,"log_offset":128}"#
+            )),
+            RemotePullProtocol::MvccLogical
+        );
+        assert_eq!(
+            detect_remote_pull_protocol(&header(
+                unspecified,
+                r#"{"generation":4,"wal_fragment_no":7}"#
+            )),
+            RemotePullProtocol::Pages
+        );
+        assert_eq!(
+            detect_remote_pull_protocol(&header(unspecified, "g142")),
+            RemotePullProtocol::Pages
+        );
+        assert_eq!(
+            detect_remote_pull_protocol(&header(unspecified, "")),
+            RemotePullProtocol::Unknown
+        );
+        // Unknown enum values from newer servers degrade to the fallback.
+        assert_eq!(
+            detect_remote_pull_protocol(&header(99, r#"{"generation":4,"log_offset":128}"#)),
+            RemotePullProtocol::MvccLogical
+        );
     }
 }

@@ -17,16 +17,16 @@ use crate::{
         acquire_slot,
         apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats,
         apply_transformation, bootstrap_db_file, connect_untracked, count_local_changes, has_table,
-        is_logically_replayable_table, max_local_change_id, pull_updates_v1, push_logical_changes,
-        read_last_change_id, read_logical_replay_table_map, read_wal_salt, reset_wal_file,
-        should_replay_local_change, sync_file, update_last_change_id, wait_all_results,
-        wal_apply_from_file, wal_pull_to_file, PullUpdatesV1Result, SyncEngineIoStats,
-        SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        is_logically_replayable_table, list_user_tables, max_local_change_id, pull_updates_v1,
+        push_logical_changes, read_last_change_id, read_logical_replay_table_map, read_wal_salt,
+        reset_wal_file, should_replay_local_change, sync_file, update_last_change_id,
+        wait_all_results, wal_apply_from_file, wal_pull_to_file, PullUpdatesV1Result,
+        SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
     database_tape::{
-        try_wal_watermark_read_page, DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts,
-        DatabaseReplaySession, DatabaseReplaySessionOpts, DatabaseTape, DatabaseTapeOpts,
-        DatabaseWalSession, CDC_PRAGMA_NAME,
+        run_stmt_ignore_rows, try_wal_watermark_read_page, DatabaseChangesIteratorMode,
+        DatabaseChangesIteratorOpts, DatabaseReplaySession, DatabaseReplaySessionOpts,
+        DatabaseTape, DatabaseTapeOpts, DatabaseWalSession, CDC_PRAGMA_NAME,
     },
     errors::Error,
     io_operations::IoOperations,
@@ -34,7 +34,8 @@ use crate::{
         Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowTransformResult,
         DatabaseSavedConfiguration, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
         DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbChangesStatus, DbChangesStreamKind,
-        PartialSyncOpts, SyncEngineIoResult, SyncEngineStats, DATABASE_METADATA_VERSION,
+        PartialSyncOpts, RemotePullProtocol, SyncEngineIoResult, SyncEngineStats,
+        DATABASE_METADATA_VERSION,
     },
     wal_session::WalSession,
     Result,
@@ -79,10 +80,14 @@ pub struct DatabaseSyncEngineOpts {
     /// `Query` bootstrap strategy** — the server picks the page set, so the
     /// client can't chunk it locally.
     pub pull_bytes_threshold: Option<usize>,
-    /// Opt into raw MVCC logical-log pull-updates streams when the server and
-    /// local configuration can support them. Call sites should keep this
-    /// `false` until logical apply is wired end to end.
-    pub logical_mvcc_pull: bool,
+    /// Sync-protocol override for incremental pulls.
+    ///
+    /// `None` (default) auto-detects the remote protocol from the first
+    /// pull-updates response and persists it in the metadata. `Some(true)`
+    /// forces raw MVCC logical-log streams; `Some(false)` forces page streams.
+    /// Explicit values exist for tests and as an escape hatch — users should
+    /// not need to set this.
+    pub logical_mvcc_pull: Option<bool>,
 }
 
 pub struct DataStats {
@@ -101,10 +106,10 @@ mod tests {
     use super::{
         create_main_db_log_path, create_main_db_wal_path, create_meta_path,
         create_replace_base_marker_path, create_revert_db_wal_path,
-        ensure_stream_kind_can_use_legacy_page_apply, logical_mvcc_pull_disable_reason,
+        ensure_logical_mvcc_pull_supported, ensure_stream_kind_can_use_legacy_page_apply,
         replace_base_backup_path, resolve_local_replay_floor_change_id,
-        should_replay_raw_pages_on_sql_conn, should_request_logical_pull,
-        should_use_logical_mvcc_pull, stream_kind_applies_remote_pages,
+        resolve_remote_pull_protocol, should_replay_raw_pages_on_sql_conn,
+        should_request_logical_pull, stream_kind_applies_remote_pages,
         stream_kind_for_pull_updates_v1_result, synced_change_id_after_remote_apply,
         use_pushed_change_hint_for_local_replay, DatabaseSyncEngine, DatabaseSyncEngineOpts,
         ReplaceBaseApplyGuard, REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER,
@@ -122,13 +127,13 @@ mod tests {
         errors::Error,
         io_operations::IoOperations,
         server_proto::{
-            PullUpdatesApplyMode, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
-            PullUpdatesStreamKind,
+            PageData, PageSetRawEncodingProto, PullUpdatesApplyMode, PullUpdatesProtocol,
+            PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, PullUpdatesStreamKind,
         },
         types::{
             Coro, DatabaseMetadata, DatabasePullRevision, DatabaseSavedConfiguration,
             DatabaseSyncEngineProtocolVersion, DbChangesStatus, DbChangesStreamKind,
-            PartialSyncOpts, SyncEngineIoResult, DATABASE_METADATA_VERSION,
+            PartialSyncOpts, RemotePullProtocol, SyncEngineIoResult, DATABASE_METADATA_VERSION,
         },
         Result,
     };
@@ -142,36 +147,39 @@ mod tests {
     use turso_core::SqliteDialect;
 
     #[test]
-    fn logical_mvcc_pull_disabled_by_config_falls_back_to_page_pull() {
-        assert_eq!(
-            logical_mvcc_pull_disable_reason(false, false, None),
-            Some("logical MVCC pull is disabled by configuration")
-        );
-        assert!(!should_use_logical_mvcc_pull(false, false, None));
+    fn explicit_override_wins_over_persisted_protocol() {
+        for persisted in [
+            RemotePullProtocol::Unknown,
+            RemotePullProtocol::Pages,
+            RemotePullProtocol::MvccLogical,
+        ] {
+            assert_eq!(
+                resolve_remote_pull_protocol(Some(true), persisted),
+                RemotePullProtocol::MvccLogical
+            );
+            assert_eq!(
+                resolve_remote_pull_protocol(Some(false), persisted),
+                RemotePullProtocol::Pages
+            );
+            assert_eq!(resolve_remote_pull_protocol(None, persisted), persisted);
+        }
     }
 
     #[test]
-    fn logical_mvcc_pull_with_partial_sync_falls_back_to_page_pull() {
-        assert_eq!(
-            logical_mvcc_pull_disable_reason(true, true, None),
-            Some("partial sync is active")
-        );
-        assert!(!should_use_logical_mvcc_pull(true, true, None));
+    fn logical_mvcc_pull_with_partial_sync_is_a_hard_error() {
+        // Silent downgrade to page pull would just defer the failure to an
+        // opaque server-side protocol error on every incremental pull.
+        assert!(ensure_logical_mvcc_pull_supported(true, None).is_err());
     }
 
     #[test]
-    fn logical_mvcc_pull_with_remote_encryption_falls_back_to_page_pull() {
-        assert_eq!(
-            logical_mvcc_pull_disable_reason(true, false, Some("key")),
-            Some("remote encryption is enabled; MVCC logical sync is unsupported for encrypted remotes")
-        );
-        assert!(!should_use_logical_mvcc_pull(true, false, Some("key")));
+    fn logical_mvcc_pull_with_remote_encryption_is_a_hard_error() {
+        assert!(ensure_logical_mvcc_pull_supported(false, Some("key")).is_err());
     }
 
     #[test]
     fn logical_mvcc_pull_remains_enabled_for_plain_full_sync() {
-        assert_eq!(logical_mvcc_pull_disable_reason(true, false, None), None);
-        assert!(should_use_logical_mvcc_pull(true, false, None));
+        assert!(ensure_logical_mvcc_pull_supported(false, None).is_ok());
     }
 
     #[test]
@@ -520,6 +528,59 @@ mod tests {
         fn step_io_callbacks(&self) {}
     }
 
+    /// Serves canned HTTP responses in order; panics if the engine makes more
+    /// requests than responses were queued.
+    struct QueuedSyncEngineIo {
+        responses: Mutex<std::collections::VecDeque<Vec<u8>>>,
+    }
+
+    impl SyncEngineIo for QueuedSyncEngineIo {
+        type DataCompletionBytes = EmptyCompletion<u8>;
+        type DataCompletionTransform = EmptyCompletion<crate::types::DatabaseRowTransformResult>;
+
+        fn full_read(&self, path: &str) -> Result<Self::DataCompletionBytes> {
+            let data = std::fs::read(path).unwrap_or_default();
+            Ok(EmptyCompletion::with_data(data))
+        }
+
+        fn full_write(&self, path: &str, content: Vec<u8>) -> Result<Self::DataCompletionBytes> {
+            std::fs::write(path, content).map_err(|error| {
+                crate::errors::Error::DatabaseSyncEngineError(format!(
+                    "test full_write failed for {path}: {error}"
+                ))
+            })?;
+            Ok(EmptyCompletion::empty())
+        }
+
+        fn transform(
+            &self,
+            _mutations: Vec<crate::types::DatabaseRowMutation>,
+        ) -> Result<Self::DataCompletionTransform> {
+            Ok(EmptyCompletion::empty())
+        }
+
+        fn http(
+            &self,
+            _url: Option<&str>,
+            _method: &str,
+            _path: &str,
+            _body: Option<Vec<u8>>,
+            _headers: &[(&str, &str)],
+        ) -> Result<Self::DataCompletionBytes> {
+            let response = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("engine made more HTTP requests than queued responses");
+            Ok(EmptyCompletion::with_data(response))
+        }
+
+        fn add_io_callback(&self, _callback: Box<dyn FnMut() -> bool + Send>) {}
+
+        fn step_io_callbacks(&self) {}
+    }
+
     fn record(values: &[turso_core::Value]) -> Bytes {
         Bytes::from(
             turso_core::types::ImmutableRecord::from_values(values, values.len())
@@ -552,7 +613,7 @@ mod tests {
             remote_encryption_key: None,
             push_operations_threshold: None,
             pull_bytes_threshold: None,
-            logical_mvcc_pull: true,
+            logical_mvcc_pull: Some(true),
         }
     }
 
@@ -838,6 +899,7 @@ mod tests {
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             logical_mvcc_pull_active: true,
+            remote_pull_protocol: RemotePullProtocol::MvccLogical,
             logical_table_names_by_stable_id: Default::default(),
             saved_configuration: Some(DatabaseSavedConfiguration {
                 remote_url: Some("https://example.com".to_string()),
@@ -848,6 +910,7 @@ mod tests {
         std::fs::write(create_meta_path(&main_path), meta.dump().unwrap()).unwrap();
 
         let header = PullUpdatesRespProtoBody {
+            protocol: 0,
             server_revision: "g1:o10".to_string(),
             db_size: 0,
             raw_encoding: None,
@@ -863,7 +926,7 @@ mod tests {
         let sync_stats = SyncEngineIoStats::new(sync_io.clone());
         let mut opts = default_test_opts();
         opts.remote_url = Some("https://example.com".to_string());
-        opts.logical_mvcc_pull = true;
+        opts.logical_mvcc_pull = Some(true);
 
         let mut gen = genawaiter::sync::Gen::new({
             let io = io.clone();
@@ -987,6 +1050,7 @@ mod tests {
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             logical_mvcc_pull_active: true,
+            remote_pull_protocol: RemotePullProtocol::MvccLogical,
             logical_table_names_by_stable_id: Default::default(),
             saved_configuration: Some(DatabaseSavedConfiguration {
                 remote_url: None,
@@ -1161,6 +1225,7 @@ mod tests {
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             logical_mvcc_pull_active: true,
+            remote_pull_protocol: RemotePullProtocol::MvccLogical,
             logical_table_names_by_stable_id: Default::default(),
             saved_configuration: Some(DatabaseSavedConfiguration {
                 remote_url: None,
@@ -1447,6 +1512,275 @@ mod tests {
                     result.unwrap();
                     break;
                 }
+            }
+        }
+    }
+
+    /// Full-fidelity page-stream response: header (with the given protocol
+    /// hint) followed by one PageData message per page of `db_bytes`.
+    fn encoded_page_stream_response(
+        db_bytes: &[u8],
+        server_revision: &str,
+        protocol: PullUpdatesProtocol,
+    ) -> Vec<u8> {
+        assert_eq!(db_bytes.len() % super::PAGE_SIZE, 0);
+        let header = PullUpdatesRespProtoBody {
+            server_revision: server_revision.to_string(),
+            db_size: (db_bytes.len() / super::PAGE_SIZE) as u64,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: None,
+            protocol: protocol as i32,
+        };
+        let mut bytes = header.encode_length_delimited_to_vec();
+        for (page_idx, page) in db_bytes.chunks_exact(super::PAGE_SIZE).enumerate() {
+            let page_data = PageData {
+                page_id: page_idx as u64,
+                encoded_page: Bytes::copy_from_slice(page),
+            };
+            bytes.extend_from_slice(&page_data.encode_length_delimited_to_vec());
+        }
+        bytes
+    }
+
+    /// Deferred-bootstrap replica ("converted to cloud sync later"): a local
+    /// WAL-mode database with local writes meets an MVCC-protocol remote on
+    /// first contact. The engine must detect the protocol, convert the local
+    /// database to MVCC journal mode, apply the remote base as replace-base,
+    /// replay the local changes on top, and stay MVCC across a reopen.
+    #[test]
+    fn deferred_first_contact_converts_wal_replica_to_mvcc_and_applies_base() {
+        let main_file = NamedTempFile::new().unwrap();
+        let remote_file = NamedTempFile::new().unwrap();
+        let main_path = main_file.path().to_str().unwrap().to_string();
+        let remote_path = remote_file.path().to_str().unwrap().to_string();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let remote_db =
+            turso_core::Database::open_file(io.clone(), &remote_path, Arc::new(SqliteDialect))
+                .unwrap();
+        let remote_conn = remote_db.connect().unwrap();
+        remote_conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        assert!(remote_conn.mvcc_enabled());
+        remote_conn
+            .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        remote_conn
+            .execute("INSERT INTO items VALUES (1, 'remote-a'), (2, 'remote-b')")
+            .unwrap();
+        let remote_wal_state = remote_conn.wal_state().unwrap();
+        remote_conn
+            .checkpoint(turso_core::CheckpointMode::Truncate {
+                upper_bound_inclusive: Some(remote_wal_state.max_frame),
+            })
+            .unwrap();
+        drop(remote_conn);
+        drop(remote_db);
+        let remote_bytes = std::fs::read(&remote_path).unwrap();
+        assert!(!remote_bytes.is_empty());
+
+        let server_revision = "g1:o0";
+        let first_contact_response = encoded_page_stream_response(
+            &remote_bytes,
+            server_revision,
+            PullUpdatesProtocol::MvccLogical,
+        );
+        // The replace-base apply issues one follow-up logical pull from the
+        // new revision; serve it an empty logical stream.
+        let followup_logical_response = PullUpdatesRespProtoBody {
+            server_revision: server_revision.to_string(),
+            db_size: (remote_bytes.len() / super::PAGE_SIZE) as u64,
+            raw_encoding: Some(PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+            mvcc_log: None,
+            protocol: PullUpdatesProtocol::MvccLogical as i32,
+        }
+        .encode_length_delimited_to_vec();
+        let sync_io = Arc::new(QueuedSyncEngineIo {
+            responses: Mutex::new(
+                vec![first_contact_response, followup_logical_response]
+                    .into_iter()
+                    .collect(),
+            ),
+        });
+        let sync_engine_io = SyncEngineIoStats::new(sync_io);
+
+        let mut opts = default_test_opts();
+        opts.remote_url = Some("https://example.com".to_string());
+        opts.bootstrap_if_empty = false;
+        opts.logical_mvcc_pull = None; // auto-detect
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let main_path = main_path.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let engine = DatabaseSyncEngine::create_db(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &main_path,
+                    opts,
+                )
+                .await
+                .map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test create_db failed: {error}"))
+                })?;
+                assert_eq!(
+                    engine.meta().remote_pull_protocol,
+                    RemotePullProtocol::Unknown
+                );
+
+                // Local writes before ever contacting the server.
+                let conn = engine.connect_rw(&coro).await.map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test connect_rw failed: {error}"))
+                })?;
+                assert!(!conn.mvcc_enabled());
+                conn.execute("CREATE TABLE local_notes(id INTEGER PRIMARY KEY, note TEXT)")?;
+                conn.execute("INSERT INTO local_notes VALUES (1, 'kept-across-conversion')")?;
+                let base_change_id = max_local_change_id(&coro, &conn).await?.unwrap_or(0);
+                update_last_change_id(&coro, &conn, &engine.client_unique_id, 1, base_change_id)
+                    .await?;
+                drop(conn);
+
+                // First contact: detection, conversion, replace-base pull.
+                let status = engine.wait_changes_from_remote(&coro).await?;
+                assert!(matches!(
+                    status.stream_kind,
+                    DbChangesStreamKind::ReplaceBasePages
+                ));
+                assert!(status.file_slot.is_some());
+                assert_eq!(
+                    engine.meta().remote_pull_protocol,
+                    RemotePullProtocol::MvccLogical
+                );
+                assert!(engine.meta().logical_mvcc_pull_active);
+
+                engine.apply_changes_from_remote(&coro, status).await?;
+                assert_eq!(
+                    engine.meta().synced_revision,
+                    Some(DatabasePullRevision::V1 {
+                        revision: server_revision.to_string(),
+                    })
+                );
+
+                // Remote base and replayed local data both present, on an
+                // MVCC-mode connection.
+                let conn = engine.connect_rw(&coro).await.map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test reconnect failed: {error}"))
+                })?;
+                assert!(conn.mvcc_enabled());
+                let mut stmt = conn.prepare("SELECT value FROM items ORDER BY id")?;
+                let mut values = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await? {
+                    values.push(row.get_value(0).to_text().unwrap().to_string());
+                }
+                assert_eq!(values, vec!["remote-a".to_string(), "remote-b".to_string()]);
+                let mut stmt = conn.prepare("SELECT note FROM local_notes")?;
+                let row = run_stmt_once(&coro, &mut stmt).await?.unwrap();
+                assert_eq!(
+                    row.get_value(0).to_text().unwrap(),
+                    "kept-across-conversion"
+                );
+                assert!(run_stmt_once(&coro, &mut stmt).await?.is_none());
+                drop(stmt);
+                drop(conn);
+                drop(engine);
+
+                // The conversion must survive a reopen: header version and
+                // logical log agree, so a fresh open comes up in MVCC mode
+                // with the same data.
+                let verify_db = turso_core::Database::open_file(
+                    io.clone(),
+                    &main_path,
+                    Arc::new(SqliteDialect),
+                )
+                .map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test verify open failed: {error}"))
+                })?;
+                let verify_conn = verify_db.connect().map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test verify connect failed: {error}"))
+                })?;
+                assert!(verify_conn.mvcc_enabled());
+                let mut stmt = verify_conn.prepare("SELECT COUNT(*) FROM items")?;
+                let row = run_stmt_once(&coro, &mut stmt).await?.unwrap();
+                assert_eq!(row.get_value(0).as_int(), Some(2));
+                Result::Ok(())
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
+    }
+
+    /// A database file that lived outside the sync engine has rows without
+    /// CDC provenance; replace-base replay would silently drop them, so the
+    /// MVCC conversion must refuse instead.
+    #[test]
+    fn first_contact_mvcc_conversion_rejects_local_data_without_cdc_history() {
+        let main_file = NamedTempFile::new().unwrap();
+        let main_path = main_file.path().to_str().unwrap().to_string();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let foreign_db =
+            turso_core::Database::open_file(io.clone(), &main_path, Arc::new(SqliteDialect))
+                .unwrap();
+        let foreign_conn = foreign_db.connect().unwrap();
+        foreign_conn
+            .execute("CREATE TABLE orphaned(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        foreign_conn
+            .execute("INSERT INTO orphaned VALUES (1)")
+            .unwrap();
+        drop(foreign_conn);
+        drop(foreign_db);
+
+        let sync_engine_io = SyncEngineIoStats::new(Arc::new(NoopSyncEngineIo));
+        let mut opts = default_test_opts();
+        opts.remote_url = Some("https://example.com".to_string());
+        opts.bootstrap_if_empty = false;
+        opts.logical_mvcc_pull = None;
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let main_path = main_path.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let engine = DatabaseSyncEngine::create_db(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &main_path,
+                    opts,
+                )
+                .await
+                .map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!("test create_db failed: {error}"))
+                })?;
+                let err = engine
+                    .ensure_local_mvcc_journal_mode(&coro)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    format!("{err:#}").contains("without CDC history"),
+                    "{err:#}"
+                );
+                Result::Ok(())
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
             }
         }
     }
@@ -1914,36 +2248,39 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
     }
 }
 
-fn should_use_logical_mvcc_pull(
-    logical_mvcc_pull_requested: bool,
-    partial_sync_active: bool,
-    remote_encryption_key: Option<&str>,
-) -> bool {
-    logical_mvcc_pull_disable_reason(
-        logical_mvcc_pull_requested,
-        partial_sync_active,
-        remote_encryption_key,
-    )
-    .is_none()
+/// Applies the explicit `logical_mvcc_pull` override on top of the persisted
+/// (detected) remote protocol. `None` (auto) defers entirely to detection.
+fn resolve_remote_pull_protocol(
+    logical_mvcc_pull_override: Option<bool>,
+    persisted: RemotePullProtocol,
+) -> RemotePullProtocol {
+    match logical_mvcc_pull_override {
+        Some(true) => RemotePullProtocol::MvccLogical,
+        Some(false) => RemotePullProtocol::Pages,
+        None => persisted,
+    }
 }
 
-fn logical_mvcc_pull_disable_reason(
-    logical_mvcc_pull_requested: bool,
+/// MVCC logical sync is incompatible with partial sync and encrypted remotes.
+/// This used to silently downgrade to page pulls, but the server rejects page
+/// incremental pulls for MVCC databases, so a silent downgrade just defers the
+/// failure to an opaque protocol error on every pull. Fail fast and loudly
+/// instead. Never called for page-mode (legacy) replicas.
+fn ensure_logical_mvcc_pull_supported(
     partial_sync_active: bool,
     remote_encryption_key: Option<&str>,
-) -> Option<&'static str> {
-    if !logical_mvcc_pull_requested {
-        return Some("logical MVCC pull is disabled by configuration");
-    }
+) -> Result<()> {
     if partial_sync_active {
-        return Some("partial sync is active");
+        return Err(Error::DatabaseSyncEngineError(
+            "MVCC logical sync does not support partial sync; disable partialSyncExperimental for this database".to_string(),
+        ));
     }
     if remote_encryption_key.is_some() {
-        return Some(
-            "remote encryption is enabled; MVCC logical sync is unsupported for encrypted remotes",
-        );
+        return Err(Error::DatabaseSyncEngineError(
+            "MVCC logical sync does not support encrypted remote databases".to_string(),
+        ));
     }
-    None
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2283,17 +2620,16 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let meta_path = create_meta_path(main_db_path);
         let partial_sync_opts = opts.partial_sync_opts.clone();
         let partial = partial_sync_opts.is_some();
-        let logical_mvcc_pull_active = should_use_logical_mvcc_pull(
-            opts.logical_mvcc_pull,
-            partial,
-            opts.remote_encryption_key.as_deref(),
-        );
-        if let Some(reason) = logical_mvcc_pull_disable_reason(
-            opts.logical_mvcc_pull,
-            partial,
-            opts.remote_encryption_key.as_deref(),
-        ) {
-            tracing::debug!("logical MVCC pull disabled: {reason}");
+        // Explicit override for tests / escape hatch. None (the default)
+        // auto-detects the remote protocol from the first pull-updates
+        // response and persists it in the metadata.
+        let forced_protocol = match opts.logical_mvcc_pull {
+            Some(true) => Some(RemotePullProtocol::MvccLogical),
+            Some(false) => Some(RemotePullProtocol::Pages),
+            None => None,
+        };
+        if forced_protocol == Some(RemotePullProtocol::MvccLogical) {
+            ensure_logical_mvcc_pull_supported(partial, opts.remote_encryption_key.as_deref())?;
         }
 
         let configuration = DatabaseSavedConfiguration {
@@ -2304,6 +2640,22 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let meta = match meta {
             Some(mut meta) => {
                 let mut metadata_changed = meta.update_configuration(configuration);
+                if let Some(forced) = forced_protocol {
+                    if meta.remote_pull_protocol != forced {
+                        meta.remote_pull_protocol = forced;
+                        metadata_changed = true;
+                    }
+                }
+                // A replica already syncing logically must fail fast if the
+                // configuration drifted into an unsupported combination.
+                if meta.remote_pull_protocol == RemotePullProtocol::MvccLogical {
+                    ensure_logical_mvcc_pull_supported(
+                        partial,
+                        opts.remote_encryption_key.as_deref(),
+                    )?;
+                }
+                let logical_mvcc_pull_active =
+                    meta.remote_pull_protocol == RemotePullProtocol::MvccLogical;
                 if meta.logical_mvcc_pull_active != logical_mvcc_pull_active {
                     meta.logical_mvcc_pull_active = logical_mvcc_pull_active;
                     metadata_changed = true;
@@ -2323,7 +2675,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
             None if opts.bootstrap_if_empty => {
                 let client_unique_id = format!("{}-{}", opts.client_name, uuid::Uuid::new_v4());
-                let revision = bootstrap_db_file(
+                let (revision, detected_protocol) = bootstrap_db_file(
                     &SyncOperationCtx::new(
                         coro,
                         &sync_engine_io,
@@ -2337,6 +2689,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     opts.pull_bytes_threshold,
                 )
                 .await?;
+                let remote_pull_protocol = forced_protocol.unwrap_or(detected_protocol);
+                if remote_pull_protocol == RemotePullProtocol::MvccLogical {
+                    ensure_logical_mvcc_pull_supported(
+                        partial,
+                        opts.remote_encryption_key.as_deref(),
+                    )?;
+                }
                 let meta = DatabaseMetadata {
                     version: DATABASE_METADATA_VERSION.to_string(),
                     client_unique_id,
@@ -2354,7 +2713,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         None
                     },
                     fresh_bootstrap_pending_cdc_ack: false,
-                    logical_mvcc_pull_active,
+                    logical_mvcc_pull_active: remote_pull_protocol
+                        == RemotePullProtocol::MvccLogical,
+                    remote_pull_protocol,
                     logical_table_names_by_stable_id: Default::default(),
                     saved_configuration: Some(configuration),
                 };
@@ -2384,6 +2745,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     ));
                 }
                 let client_unique_id = format!("{}-{}", opts.client_name, uuid::Uuid::new_v4());
+                // Deferred bootstrap: the remote's protocol is unknowable
+                // until the first server contact; the first pull resolves it.
+                let remote_pull_protocol = forced_protocol.unwrap_or(RemotePullProtocol::Unknown);
                 let meta = DatabaseMetadata {
                     version: DATABASE_METADATA_VERSION.to_string(),
                     client_unique_id,
@@ -2397,7 +2761,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: None,
                     fresh_bootstrap_pending_cdc_ack: false,
-                    logical_mvcc_pull_active,
+                    logical_mvcc_pull_active: remote_pull_protocol
+                        == RemotePullProtocol::MvccLogical,
+                    remote_pull_protocol,
                     logical_table_names_by_stable_id: Default::default(),
                     saved_configuration: Some(configuration),
                 };
@@ -2900,6 +3266,66 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         Ok(())
     }
 
+    /// Converts the local database to MVCC journal mode when the remote
+    /// speaks the MVCC logical-log protocol but the local database is still
+    /// in WAL mode.
+    ///
+    /// This happens for deferred-bootstrap replicas ("converted to cloud
+    /// sync later"): a fresh bootstrap inherits MVCC-ness from the base
+    /// image's page-1 header, but a deferred replica opened its WAL database
+    /// before ever contacting the server. Applying an MVCC page base into a
+    /// WAL-mode process would leave the file header and the in-process
+    /// journal mode disagreeing — this process would keep WAL semantics (no
+    /// logical log, WAL checkpoint path) while the next open reads the MVCC
+    /// header and starts an empty MvStore, an uncoordinated mode flip.
+    /// Converting up front via `PRAGMA journal_mode = 'mvcc'` (WAL
+    /// checkpoint, header rewrite, MvStore bootstrap over the existing
+    /// btree) puts the replica on the same footing as a fresh MVCC bootstrap
+    /// before the replace-base apply runs.
+    async fn ensure_local_mvcc_journal_mode<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
+        // The pragma rejects connections with CDC capture enabled, so use an
+        // untracked connection (the tape connection has capture on).
+        let main_conn = connect_untracked(&self.main_tape)?;
+        if main_conn.mvcc_enabled() {
+            return Ok(());
+        }
+        // Replace-base preserves local data by replaying the CDC log on top
+        // of the new base. Changes without CDC provenance (a database file
+        // that lived outside the sync engine) would be silently dropped —
+        // reject loudly instead. This runs only before the first sync, when
+        // nothing has been pruned from the CDC log yet, so "user tables exist
+        // but the CDC log is empty" reliably means foreign data. (The
+        // turso_cdc table itself is created eagerly by the capture pragma,
+        // so its existence proves nothing.)
+        let cdc_high_water = max_local_change_id(coro, &main_conn).await?.unwrap_or(0);
+        if cdc_high_water == 0 {
+            let user_tables = list_user_tables(coro, &main_conn).await?;
+            if !user_tables.is_empty() {
+                return Err(Error::DatabaseSyncEngineError(format!(
+                    "local database contains tables without CDC history ({}); the sync engine cannot preserve their data across the initial sync with an MVCC-mode remote (create the local database through the sync engine, or start from an empty local file)",
+                    user_tables.join(", "),
+                )));
+            }
+        }
+        tracing::info!(
+            "ensure_local_mvcc_journal_mode(path={}): converting local database to MVCC journal mode for MVCC-protocol remote",
+            self.main_db_path
+        );
+        let mut stmt = main_conn.prepare("PRAGMA journal_mode = 'mvcc'")?;
+        run_stmt_ignore_rows(coro, &mut stmt)
+            .await
+            .map_err(|error| {
+                Error::DatabaseSyncEngineError(format!(
+                    "failed to convert local database to MVCC journal mode: {error}"
+                ))
+            })?;
+        assert!(
+            main_conn.mvcc_enabled(),
+            "journal_mode=mvcc pragma succeeded but MvStore is not open"
+        );
+        Ok(())
+    }
+
     pub async fn wait_changes_from_remote<Ctx>(&self, coro: &Coro<Ctx>) -> Result<DbChangesStatus> {
         tracing::info!("wait_changes(path={})", self.main_db_path);
 
@@ -2919,82 +3345,143 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             } else {
                 DbChangesStreamKind::Pages
             };
-        let logical_mvcc_pull_active = self.meta().logical_mvcc_pull_active;
-        let next_revision = if logical_mvcc_pull_active {
-            match &revision {
-                Some(DatabasePullRevision::V1 { revision }) => {
-                    match pull_updates_v1(
-                        ctx,
-                        &file.value,
-                        revision,
-                        self.opts.long_poll_timeout,
-                        true,
-                    )
-                    .await?
-                    {
-                        (next_revision, result @ PullUpdatesV1Result::Logical { txns, ops }) => {
-                            tracing::info!(
-                                "wait_changes(path={}): logical pull returned {} transactions / {} ops",
-                                self.main_db_path,
-                                txns,
-                                ops
-                            );
-                            stream_kind = stream_kind_for_pull_updates_v1_result(&result);
-                            next_revision
-                        }
-                        (next_revision, result @ PullUpdatesV1Result::Pages { replace_base }) => {
-                            tracing::info!(
-                                "wait_changes(path={}): logical pull returned a page stream fallback; replace_base={replace_base}",
-                                self.main_db_path,
-                            );
-                            stream_kind = stream_kind_for_pull_updates_v1_result(&result);
-                            next_revision
-                        }
+        let remote_pull_protocol = resolve_remote_pull_protocol(
+            self.opts.logical_mvcc_pull,
+            self.meta().remote_pull_protocol,
+        );
+        let next_revision = match (remote_pull_protocol, &revision) {
+            (RemotePullProtocol::MvccLogical, Some(DatabasePullRevision::V1 { revision })) => {
+                match pull_updates_v1(
+                    ctx,
+                    &file.value,
+                    revision,
+                    self.opts.long_poll_timeout,
+                    true,
+                )
+                .await?
+                {
+                    (next_revision, result @ PullUpdatesV1Result::Logical { txns, ops }, _) => {
+                        tracing::info!(
+                            "wait_changes(path={}): logical pull returned {} transactions / {} ops",
+                            self.main_db_path,
+                            txns,
+                            ops
+                        );
+                        stream_kind = stream_kind_for_pull_updates_v1_result(&result);
+                        next_revision
+                    }
+                    (next_revision, result @ PullUpdatesV1Result::Pages { replace_base }, _) => {
+                        tracing::info!(
+                            "wait_changes(path={}): logical pull returned a page stream fallback; replace_base={replace_base}",
+                            self.main_db_path,
+                        );
+                        stream_kind = stream_kind_for_pull_updates_v1_result(&result);
+                        next_revision
                     }
                 }
-                None => {
-                    let (next_revision, result) =
-                        pull_updates_v1(ctx, &file.value, "", self.opts.long_poll_timeout, false)
-                            .await?;
-                    tracing::info!(
-                        "wait_changes(path={}): initial logical MVCC sync returned page base",
-                        self.main_db_path,
-                    );
-                    stream_kind = match result {
-                        PullUpdatesV1Result::Pages { .. } => DbChangesStreamKind::ReplaceBasePages,
-                        PullUpdatesV1Result::Logical { txns, ops } => {
-                            tracing::info!(
-                                "wait_changes(path={}): initial logical MVCC sync returned logical stream with {} transactions / {} ops",
-                                self.main_db_path,
-                                txns,
-                                ops
-                            );
-                            DbChangesStreamKind::Logical
-                        }
-                    };
-                    next_revision
-                }
-                Some(DatabasePullRevision::Legacy { .. }) => {
-                    stream_kind = DbChangesStreamKind::LegacyPages;
-                    wal_pull_to_file(
-                        ctx,
-                        &file.value,
-                        &revision,
-                        self.opts.wal_pull_batch_size,
-                        self.opts.long_poll_timeout,
-                    )
-                    .await?
-                }
             }
-        } else {
-            wal_pull_to_file(
-                ctx,
-                &file.value,
-                &revision,
-                self.opts.wal_pull_batch_size,
-                self.opts.long_poll_timeout,
-            )
-            .await?
+            (RemotePullProtocol::MvccLogical, None) => {
+                let (next_revision, result, _) =
+                    pull_updates_v1(ctx, &file.value, "", self.opts.long_poll_timeout, false)
+                        .await?;
+                tracing::info!(
+                    "wait_changes(path={}): initial logical MVCC sync returned page base",
+                    self.main_db_path,
+                );
+                // Deferred replicas may still be in WAL mode locally; the
+                // MVCC page base must be applied to an MVCC-mode database.
+                self.ensure_local_mvcc_journal_mode(coro).await?;
+                stream_kind = match result {
+                    PullUpdatesV1Result::Pages { .. } => DbChangesStreamKind::ReplaceBasePages,
+                    PullUpdatesV1Result::Logical { txns, ops } => {
+                        tracing::info!(
+                            "wait_changes(path={}): initial logical MVCC sync returned logical stream with {} transactions / {} ops",
+                            self.main_db_path,
+                            txns,
+                            ops
+                        );
+                        DbChangesStreamKind::Logical
+                    }
+                };
+                next_revision
+            }
+            (RemotePullProtocol::MvccLogical, Some(DatabasePullRevision::Legacy { .. })) => {
+                stream_kind = DbChangesStreamKind::LegacyPages;
+                wal_pull_to_file(
+                    ctx,
+                    &file.value,
+                    &revision,
+                    self.opts.wal_pull_batch_size,
+                    self.opts.long_poll_timeout,
+                )
+                .await?
+            }
+            // First server contact of an auto-mode replica whose remote
+            // protocol is not yet known (deferred bootstrap). The request is
+            // identical on the wire to the page path's no-revision request;
+            // the response header tells us which protocol the remote speaks.
+            (RemotePullProtocol::Unknown, None) => {
+                let (next_revision, result, detected) =
+                    pull_updates_v1(ctx, &file.value, "", self.opts.long_poll_timeout, false)
+                        .await?;
+                if detected == RemotePullProtocol::MvccLogical {
+                    ensure_logical_mvcc_pull_supported(
+                        self.opts.partial_sync_opts.is_some(),
+                        self.opts.remote_encryption_key.as_deref(),
+                    )?;
+                    // Deferred replicas may still be in WAL mode locally; the
+                    // MVCC page base must be applied to an MVCC-mode database.
+                    self.ensure_local_mvcc_journal_mode(coro).await?;
+                }
+                if detected != RemotePullProtocol::Unknown {
+                    tracing::info!(
+                        "wait_changes(path={}): detected remote pull protocol {:?} on first contact",
+                        self.main_db_path,
+                        detected
+                    );
+                    self.update_meta(coro, |m| {
+                        m.remote_pull_protocol = detected;
+                        m.logical_mvcc_pull_active = detected == RemotePullProtocol::MvccLogical;
+                    })
+                    .await?;
+                }
+                stream_kind = match (detected, &result) {
+                    // Page-protocol remote: mirror the page path exactly,
+                    // including its rejection of replace-base streams.
+                    (
+                        RemotePullProtocol::Pages | RemotePullProtocol::Unknown,
+                        PullUpdatesV1Result::Pages { replace_base },
+                    ) => {
+                        if *replace_base {
+                            return Err(Error::DatabaseSyncEngineError(
+                                "wait_changes_from_remote does not support replace-base page streams yet".to_string(),
+                            ));
+                        }
+                        DbChangesStreamKind::Pages
+                    }
+                    // MVCC remote: the page base applies as replace-base so
+                    // local (deferred) changes are preserved and replayed.
+                    (RemotePullProtocol::MvccLogical, PullUpdatesV1Result::Pages { .. }) => {
+                        DbChangesStreamKind::ReplaceBasePages
+                    }
+                    (_, PullUpdatesV1Result::Logical { .. }) => {
+                        return Err(Error::DatabaseSyncEngineError(
+                            "server returned a logical stream for a page-stream first-contact request".to_string(),
+                        ));
+                    }
+                };
+                next_revision
+            }
+            (RemotePullProtocol::Pages | RemotePullProtocol::Unknown, _) => {
+                wal_pull_to_file(
+                    ctx,
+                    &file.value,
+                    &revision,
+                    self.opts.wal_pull_batch_size,
+                    self.opts.long_poll_timeout,
+                )
+                .await?
+            }
         };
 
         if file.value.size()? == 0 {
@@ -3685,7 +4172,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                 self.opts.remote_encryption_key.as_deref(),
                             );
                             match pull_updates_v1(ctx, changes_file, revision, None, true).await? {
-                                (next_revision, PullUpdatesV1Result::Logical { txns, ops }) => {
+                                (next_revision, PullUpdatesV1Result::Logical { txns, ops }, _) => {
                                     tracing::info!(
                                         "apply_changes(path={}): replace-base follow-up logical pull returned {} transactions / {} ops",
                                         self.main_db_path,
@@ -3725,7 +4212,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                         })?;
                                     }
                                 }
-                                (_, PullUpdatesV1Result::Pages { replace_base }) => {
+                                (_, PullUpdatesV1Result::Pages { replace_base }, _) => {
                                     return Err(Error::DatabaseSyncEngineError(format!(
                                         "replace-base follow-up logical pull unexpectedly returned a page stream: replace_base={replace_base}"
                                     )));
