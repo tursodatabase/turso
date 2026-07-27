@@ -18,6 +18,31 @@ const SIZE_MARKER_32BIT: u8 = 14;
 const MAX_JSON_DEPTH: usize = 1000;
 const INFINITY_CHAR_COUNT: u8 = 8;
 
+/// Position of the first byte `<= 0x1F` (JSON control character), if any.
+///
+/// Chunked OR-accumulation instead of `iter().position` so LLVM can vectorize
+/// the scan; `memchr` cannot express a byte-range search.
+fn find_control_byte(bytes: &[u8]) -> Option<usize> {
+    const CHUNK: usize = 32;
+    let mut offset = 0;
+    let mut chunks = bytes.chunks_exact(CHUNK);
+    for chunk in &mut chunks {
+        let mut any = 0u8;
+        for &b in chunk {
+            any |= u8::from(b <= 0x1F);
+        }
+        if any != 0 {
+            return chunk.iter().position(|&b| b <= 0x1F).map(|p| offset + p);
+        }
+        offset += CHUNK;
+    }
+    chunks
+        .remainder()
+        .iter()
+        .position(|&b| b <= 0x1F)
+        .map(|p| offset + p)
+}
+
 const fn make_whitespace_table() -> [u8; 256] {
     let mut table = [0u8; 256];
 
@@ -1020,7 +1045,7 @@ impl Jsonb {
             }
             ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXT5 | ElementType::TEXTRAW => {
                 let payload = &self.data[payload_start..payload_end];
-                std::str::from_utf8(payload).map_err(|_| {
+                simdutf8::basic::from_utf8(payload).map_err(|_| {
                     LimboError::ParseError("Invalid UTF-8 in text payload".to_string())
                 })?;
                 Ok(())
@@ -1250,36 +1275,43 @@ impl Jsonb {
 
         match kind {
             ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ => {
-                let word = from_utf8(word_slice).map_err(|_| {
+                let word = simdutf8::basic::from_utf8(word_slice).map_err(|_| {
                     LimboError::ParseError("Failed to serialize string!".to_string())
                 })?;
 
+                // Only control bytes need escaping for TEXTJ (its payload
+                // already carries JSON escape sequences verbatim); TEXT also
+                // escapes quotes and backslashes. Jump between escape sites
+                // with SIMD search instead of testing every byte.
+                let textj = *kind == ElementType::TEXTJ;
+                let find_escape = |bytes: &[u8]| -> Option<usize> {
+                    if textj {
+                        return find_control_byte(bytes);
+                    }
+                    let special = memchr::memchr2(b'"', b'\\', bytes);
+                    let limit = special.unwrap_or(bytes.len());
+                    find_control_byte(&bytes[..limit]).or(special)
+                };
+
                 let mut last_end = 0;
                 let bytes = word.as_bytes();
-                for i in 0..bytes.len() {
+                while let Some(off) = find_escape(&bytes[last_end..]) {
+                    let i = last_end + off;
                     let b = bytes[i];
-                    let needs_escape = if *kind == ElementType::TEXTJ {
-                        b <= 0x1F
-                    } else {
-                        b == b'"' || b == b'\\' || b <= 0x1F
-                    };
-
-                    if needs_escape {
-                        string.push_str(&word[last_end..i]);
-                        match b {
-                            b'"' => string.push_str("\\\""),
-                            b'\\' => string.push_str("\\\\"),
-                            0x08 => string.push_str("\\b"),
-                            0x0C => string.push_str("\\f"),
-                            b'\n' => string.push_str("\\n"),
-                            b'\r' => string.push_str("\\r"),
-                            b'\t' => string.push_str("\\t"),
-                            c => {
-                                let _ = write!(string, "\\u{c:04x}");
-                            }
+                    string.push_str(&word[last_end..i]);
+                    match b {
+                        b'"' => string.push_str("\\\""),
+                        b'\\' => string.push_str("\\\\"),
+                        0x08 => string.push_str("\\b"),
+                        0x0C => string.push_str("\\f"),
+                        b'\n' => string.push_str("\\n"),
+                        b'\r' => string.push_str("\\r"),
+                        b'\t' => string.push_str("\\t"),
+                        c => {
+                            let _ = write!(string, "\\u{c:04x}");
                         }
-                        last_end = i + 1;
                     }
+                    last_end = i + 1;
                 }
                 string.push_str(&word[last_end..]);
             }
@@ -1788,39 +1820,31 @@ impl Jsonb {
         let mut len = 0;
 
         if quoted {
-            // Try to find the closing quote and check for simple string
-            let mut end_pos = pos;
-            let is_simple = true;
+            // Simple string fast path: the string is simple if the closing
+            // quote appears before any backslash or control byte. memchr2
+            // finds the first quote/backslash with SIMD; the skipped span is
+            // then checked for control bytes.
+            if let Some(off) = memchr::memchr2(quote, b'\\', &input[pos..]) {
+                let end_pos = pos + off;
+                if input[end_pos] == quote && find_control_byte(&input[pos..end_pos]).is_none() {
+                    let len = end_pos - pos;
+                    let header_pos = self.data.len();
 
-            while end_pos < input.len() {
-                let c = input[end_pos];
-                if c == quote {
-                    // Found end of string - check if it's simple
-                    if is_simple {
-                        let len = end_pos - pos;
-                        let header_pos = self.data.len();
-
-                        // Write header and content
-                        if len <= 11 {
-                            self.data
-                                .push((ElementType::TEXT as u8) | ((len as u8) << 4));
-                        } else {
-                            self.write_element_header(header_pos, ElementType::TEXT, len, false)
-                                .map_err(|_| PError::Message {
-                                    msg: "Failed to write header".to_string(),
-                                    location: Some(pos),
-                                })?;
-                        }
-
-                        self.data.extend_from_slice(&input[pos..end_pos]);
-                        return Ok(end_pos + 1); // Skip past closing quote
+                    // Write header and content
+                    if len <= 11 {
+                        self.data
+                            .push((ElementType::TEXT as u8) | ((len as u8) << 4));
+                    } else {
+                        self.write_element_header(header_pos, ElementType::TEXT, len, false)
+                            .map_err(|_| PError::Message {
+                                msg: "Failed to write header".to_string(),
+                                location: Some(pos),
+                            })?;
                     }
-                    break;
-                } else if c == b'\\' || c < 32 {
-                    // Not a simple string
-                    break;
+
+                    self.data.extend_from_slice(&input[pos..end_pos]);
+                    return Ok(end_pos + 1); // Skip past closing quote
                 }
-                end_pos += 1;
             }
         }
 
