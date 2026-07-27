@@ -46,14 +46,13 @@ fn find_control_byte(bytes: &[u8]) -> Option<usize> {
         .map(|p| offset + p)
 }
 
-/// Position of the first byte that terminates or complicates a JSON string:
-/// the closing `quote`, a backslash, or a control byte (`< 0x20`).
+/// Position of the first byte a JSON string rendering must escape or stop at:
+/// `quote`, a backslash, or a control byte (`< 0x20`).
 ///
-/// Most JSON strings are short keys/values whose terminator sits within the
-/// first few bytes, so the prefix is scanned scalar with per-byte early exit;
-/// only long strings continue into the chunked OR-accumulated scan that LLVM
-/// autovectorizes. `memchr2` cannot fold in the control-byte range test, and
-/// a chunk-first scan wastes work on the short-string common case.
+/// The prefix is scanned scalar with per-byte early exit — escapes near the
+/// start are common enough that chunk-first scanning wastes work — and only
+/// longer clean runs continue into the chunked OR-accumulated scan that LLVM
+/// autovectorizes. `memchr2` cannot fold in the control-byte range test.
 #[inline]
 fn find_string_special(bytes: &[u8], quote: u8) -> Option<usize> {
     const SCALAR_PREFIX: usize = 16;
@@ -1920,10 +1919,26 @@ impl Jsonb {
 
         if quoted {
             // Simple string fast path: the string is simple if the closing
-            // quote appears before any backslash or control byte.
-            if let Some(off) = find_string_special(&input[pos..], quote) {
-                let end_pos = pos + off;
-                if input[end_pos] == quote {
+            // quote appears before any backslash or control byte. This stays
+            // a scalar per-byte loop on purpose: parsed JSON strings are
+            // overwhelmingly short keys/values, and benchmarks showed both a
+            // memchr2 two-pass scan and a chunked vectorized scan losing to
+            // it here (see find_string_special, which serialization does use
+            // for its longer, rarer-escape payloads).
+            let mut end_pos = pos;
+            let mut found = false;
+            while end_pos < input.len() {
+                let c = input[end_pos];
+                if c == quote {
+                    found = true;
+                    break;
+                } else if c == b'\\' || c < 32 {
+                    break;
+                }
+                end_pos += 1;
+            }
+            if end_pos < input.len() {
+                if found {
                     let len = end_pos - pos;
                     let header_pos = self.data.len();
 
