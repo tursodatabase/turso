@@ -34,6 +34,7 @@ pub enum ValueBlobAllocationSite {
     CloneFrom,
     RecordBuild,
     RecordCopy,
+    AggAccumulate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
