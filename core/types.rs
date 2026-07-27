@@ -2503,6 +2503,7 @@ pub fn cmp_in_column(a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
 }
 
 /// Outputs a modified [Ordering] that takes into account the sort order and the NULLS order.
+#[must_use]
 pub fn cmp_with_sort(cmp: Ordering, a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
     if cmp != Ordering::Equal {
         let involves_null = matches!(a, ValueRef::Null) || matches!(b, ValueRef::Null);

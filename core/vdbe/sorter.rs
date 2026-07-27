@@ -1078,7 +1078,10 @@ impl BoxedSortableRecord {
                     _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
                 }
             };
-            cmp_with_sort(cmp, &self_val, &other_val, key_info);
+            let cmp = cmp_with_sort(cmp, &self_val, &other_val, key_info);
+            if cmp != Ordering::Equal {
+                return cmp;
+            }
         }
         Ordering::Equal
     }
@@ -1403,6 +1406,57 @@ mod tests {
                 .expect("Failed to get the next record");
         }
         assert_eq!(idx, expected.len());
+    }
+
+    #[test]
+    fn spilled_sort_orders_secondary_key_across_chunks() {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc, SortOrder::Asc],
+            try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![None, None].unwrap(),
+            try_vec![None, None].unwrap(),
+            // Tiny buffer so the sorter spills to multiple chunk files.
+            256,
+            64,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+
+        let n = 200;
+        // Equal first key, ascending second key on insert.
+        for x in 0..n {
+            let values = try_vec![Value::from_i64(1), Value::from_i64(x)].unwrap();
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            io.block(|| sorter.insert(&record))
+                .expect("Failed to insert the record");
+        }
+
+        io.block(|| sorter.sort())
+            .expect("Failed to sort the records");
+        assert!(
+            !sorter.chunks.is_empty(),
+            "test requires the sorter to have spilled to chunks"
+        );
+
+        let mut idx = 0;
+        while sorter.has_more() {
+            {
+                let record = sorter.record().unwrap();
+                let vals = record.get_values().unwrap();
+                assert_eq!(vals[0], ValueRef::from_i64(1));
+                assert_eq!(
+                    vals[1],
+                    ValueRef::from_i64(idx),
+                    "secondary key out of order at position {idx}"
+                );
+            }
+            idx += 1;
+            io.block(|| sorter.next())
+                .expect("Failed to get the next record");
+        }
+        assert_eq!(idx, n);
     }
 
     #[test]
