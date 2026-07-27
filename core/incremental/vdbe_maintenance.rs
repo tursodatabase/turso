@@ -396,6 +396,7 @@ fn emit_plan_nodes(
                 group_exprs,
                 group_collations,
                 aggregates,
+                input_direction,
                 scalar,
                 ..
             } => {
@@ -415,6 +416,7 @@ fn emit_plan_nodes(
                     group_exprs,
                     group_collations,
                     aggregates,
+                    *input_direction,
                     *scalar,
                     input,
                     output_contract,

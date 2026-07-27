@@ -29,7 +29,7 @@ fn brief(result: &QueryResult) -> String {
         QueryResult::Error(e) => format!("error: {}", e.lines().next().unwrap_or("")),
         QueryResult::Rows(rows) => {
             let mut out = format!("{} row(s): ", rows.len());
-            for (i, row) in rows.iter().take(4).enumerate() {
+            for (i, row) in rows.rows().iter().take(4).enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }

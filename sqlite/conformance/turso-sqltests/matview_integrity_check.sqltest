@@ -1,6 +1,7 @@
 @database :memory:
 @requires-file materialized_views ""
 @skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
 
 # Reproducer: integrity_check reports "Page N: never used" for DBSP state index pages.
 # The DBSP state index root page was not registered in schema.indexes,

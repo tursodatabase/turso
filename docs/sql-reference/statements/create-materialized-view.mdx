@@ -35,9 +35,16 @@ When you modify data in a table that underlies a materialized view, Turso increm
 
 ## Current Limitations
 
-- Not all SQL functions are supported in materialized view definitions.
-- A materialized view cannot reference another view or materialized view.
+- Supported aggregate functions are `COUNT`, `SUM`, `TOTAL`, `AVG`, `MIN`, and `MAX`, including `DISTINCT` arguments and `FILTER (WHERE ...)`. Other aggregate functions are not yet supported.
+- `FULL OUTER JOIN`, window functions, and `ORDER BY`, `LIMIT`, or `OFFSET` in the defining query are not yet supported.
+- Scalar and correlated subqueries are not yet supported. FROM-clause derived tables and non-recursive CTEs are supported.
+- Virtual-table sources, virtual generated columns, non-deterministic expressions, bound parameters, and custom collations on grouping or deduplication keys are not yet supported.
+- Materialized views on attached databases and materialized views under experimental MVCC mode are not yet supported.
 - The `TEMPORARY` modifier is not supported for materialized views.
+
+A materialized view may reference another materialized view. Turso maintains
+the dependency chain in transaction order and prevents an upstream object from
+being dropped while a dependent materialized view exists.
 
 ## Examples
 
