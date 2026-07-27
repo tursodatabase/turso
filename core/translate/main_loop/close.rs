@@ -141,6 +141,7 @@ impl CloseLoop {
                                 });
                             }
                         }
+                        Scan::RecursiveCteInput => {}
                     }
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
                 }

@@ -175,11 +175,12 @@ pub fn bind_and_rewrite_expr<'a>(
                     if match_result.is_none() {
                         let mut matched_scope_depth = None;
                         for outer_ref in referenced_tables.outer_query_refs().iter() {
-                            // CTEs (FromClauseSubquery) in outer_query_refs are only for table
-                            // lookup (e.g., FROM cte1), not for column resolution. Columns from
-                            // CTEs should only be accessible when the CTE is explicitly in the
-                            // FROM clause, not as implicit outer references.
-                            if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
+                            // These entries let a FROM clause find a CTE by name. The CTE's
+                            // columns are visible only after that FROM clause adds the table.
+                            if matches!(
+                                outer_ref.table,
+                                Table::FromClauseSubquery(_) | Table::RecursiveCteInput(_)
+                            ) {
                                 continue;
                             }
                             // Skip refs from deeper scopes once we found a match
