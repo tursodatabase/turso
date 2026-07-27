@@ -614,6 +614,49 @@ pub fn insn_to_row(
                     ),
                 )
             }
+            Insn::ColumnRange {
+                cursor_id,
+                start_column,
+                dest,
+                defaults,
+            } => {
+                let count = defaults.len();
+                let cursor_type = &program.cursor_ref[*cursor_id].1;
+                let column_name = |column: usize| -> String {
+                    let name: Option<&String> = match cursor_type {
+                        CursorType::BTreeTable(table) => {
+                            table.columns().get(column).and_then(|v| v.name.as_ref())
+                        }
+                        CursorType::BTreeIndex(index) => index.columns.get(column).map(|c| &c.name),
+                        CursorType::MaterializedView(table, _) => {
+                            table.columns().get(column).and_then(|v| v.name.as_ref())
+                        }
+                        CursorType::Pseudo(_) | CursorType::Sorter | CursorType::IndexMethod(..) => {
+                            None
+                        }
+                        CursorType::VirtualTable(v) => {
+                            v.columns.get(column).and_then(|c| c.name.as_ref())
+                        }
+                    };
+                    name.map_or_else(|| format!("column {column}"), |name| name.to_string())
+                };
+                (
+                    "ColumnRange",
+                    *cursor_id as i64,
+                    *start_column as i64,
+                    *dest as i64,
+                    Value::from_i64(count as i64),
+                    0,
+                    format!(
+                        "r[{}..{}]={}.{}..{}",
+                        dest,
+                        dest + count - 1,
+                        get_table_or_index_name(*cursor_id),
+                        column_name(*start_column),
+                        column_name(*start_column + count - 1),
+                    ),
+                )
+            }
             Insn::ColumnHasField {
                 cursor_id,
                 column,

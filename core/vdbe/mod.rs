@@ -3103,6 +3103,30 @@ impl Row {
     }
 }
 
+/// Test-only counter of serial-type varint decodes performed by the record
+/// header walk in `nth_into_register`. Lets tests assert that fetching every
+/// column of a row costs O(columns) decodes rather than O(columns^2).
+#[cfg(test)]
+pub(crate) mod serial_decode_stats {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SERIAL_TYPE_DECODES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub fn reset() {
+        SERIAL_TYPE_DECODES.with(|c| c.set(0));
+    }
+
+    pub fn count() -> u64 {
+        SERIAL_TYPE_DECODES.with(|c| c.get())
+    }
+
+    pub(super) fn bump() {
+        SERIAL_TYPE_DECODES.with(|c| c.set(c.get() + 1));
+    }
+}
+
 /// Extension trait for `ValueIterator` that allows writing directly to a `Register`
 /// without allocating intermediate `ValueRef` values.
 pub trait ValueIteratorExt {
@@ -3110,6 +3134,13 @@ pub trait ValueIteratorExt {
     /// Returns `Some(Ok(()))` on success, `Some(Err(...))` on parse error,
     /// or `None` if there are fewer than `n+1` elements.
     fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>>;
+
+    /// Skips `skip` elements, then decodes one value into each register of
+    /// `dests` in order, advancing through the header so each value costs a
+    /// single serial-type decode. Returns the number of registers filled,
+    /// which is less than `dests.len()` when the record has fewer elements;
+    /// registers past the returned count are left untouched.
+    fn fill_n_into_registers(&mut self, skip: usize, dests: &mut [Register]) -> Result<usize>;
 }
 
 impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
@@ -3128,6 +3159,8 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 return None;
             }
 
+            #[cfg(test)]
+            serial_decode_stats::bump();
             let (serial_type, bytes_read) = match read_varint(header) {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
@@ -3152,6 +3185,8 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
             return None;
         }
 
+        #[cfg(test)]
+        serial_decode_stats::bump();
         let (serial_type, bytes_read) = match read_varint(header) {
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
@@ -3324,12 +3359,68 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
 
         Some(Ok(()))
     }
+
+    #[inline]
+    fn fill_n_into_registers(&mut self, skip: usize, dests: &mut [Register]) -> Result<usize> {
+        for (i, dest) in dests.iter_mut().enumerate() {
+            // The iterator advances as it decodes, so only the first fetch
+            // skips; every following column is "the next one".
+            let n = if i == 0 { skip } else { 0 };
+            match self.nth_into_register(n, dest) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => return Err(e),
+                None => return Ok(i),
+            }
+        }
+        Ok(dests.len())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    /// The record header must be walked once per row, not once per column:
+    /// a SELECT * over N columns costs N serial-type decodes per row. The
+    /// unfused per-column walk re-parses the header from the start for every
+    /// column, which would cost sum(i+1 for i in 0..N) = N*(N+1)/2 decodes
+    /// per row (55 for the 10 columns here).
+    #[test]
+    fn select_star_serial_type_decodes_are_linear_in_columns() {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE t(c0 INTEGER, c1 TEXT, c2 INTEGER, c3 TEXT, c4 INTEGER, \
+             c5 TEXT, c6 INTEGER, c7 TEXT, c8 INTEGER, c9 TEXT)",
+        )
+        .unwrap();
+        for i in 0..3 {
+            conn.execute(
+                format!(
+                    "INSERT INTO t VALUES ({i}, 'a{i}', {i}, 'b{i}', {i}, 'c{i}', {i}, 'd{i}', {i}, 'e{i}')"
+                )
+                .as_str(),
+            )
+            .unwrap();
+        }
+
+        let mut stmt = conn.prepare("SELECT * FROM t").unwrap();
+        serial_decode_stats::reset();
+        let mut rows = 0i64;
+        stmt.run_with_row_callback(|row| {
+            assert_eq!(row.len(), 10);
+            assert_eq!(row.get::<i64>(0).unwrap(), rows);
+            assert_eq!(row.get::<String>(9).unwrap(), format!("e{rows}"));
+            rows += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, 3);
+        assert_eq!(serial_decode_stats::count(), 3 * 10);
+    }
 
     #[test]
     fn active_opcode_helpers_initialize_defaults() {

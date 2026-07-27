@@ -593,6 +593,21 @@ pub enum Insn {
         default: Option<Value>,
     },
 
+    /// Read `defaults.len()` consecutive columns starting at `start_column`
+    /// from the current row of the cursor into consecutive registers starting
+    /// at `dest`, parsing the record header only once.
+    ///
+    /// Runs of `Column` instructions with ascending consecutive columns and
+    /// destinations are fused into this at emit time; `defaults[i]` is what
+    /// the i-th fused `Column`'s `default` would have been, applied when the
+    /// record has fewer than `start_column + i + 1` fields.
+    ColumnRange {
+        cursor_id: CursorID,
+        start_column: usize,
+        dest: usize,
+        defaults: Vec<Option<Value>>,
+    },
+
     /// Jump to `target_pc` if the cursor's current record contains a field at
     /// the given column index.  Falls through when the record has fewer fields
     /// (a "short record" from before ALTER TABLE ADD COLUMN).
@@ -2065,6 +2080,7 @@ impl InsnVariants {
             InsnVariants::Rewind => execute::op_rewind,
             InsnVariants::Last => execute::op_last,
             InsnVariants::Column => execute::op_column,
+            InsnVariants::ColumnRange => execute::op_column_range,
             InsnVariants::ColumnHasField => execute::op_column_has_field,
             InsnVariants::TypeCheck => execute::op_type_check,
             InsnVariants::ArrayEncode => execute::op_array_encode,
