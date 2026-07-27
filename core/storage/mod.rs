@@ -16,12 +16,6 @@ pub(crate) mod checksum;
 pub mod database;
 pub(crate) mod encryption;
 pub(crate) mod journal_mode;
-// The aretta-books page-cache differential-testing harness needs to name
-// `PageCache` / `PageCacheKey` and read the `inspect_*` accessors from an
-// external crate. The module is `pub(crate)` by default; the
-// `aristo-instr` feature widens it to `pub` so the verification
-// crate can reach those (already-`pub`) types. No behaviour change without
-// the feature.
 #[cfg(feature = "aristo-instr")]
 pub mod page_cache;
 #[cfg(not(feature = "aristo-instr"))]

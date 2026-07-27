@@ -3434,36 +3434,18 @@ impl Pager {
         Ok(page_cache.resize(capacity))
     }
 
-    /// Verification-only accessor: hand back a clone of the shared
-    /// page-cache handle so the aretta-books harness can read the `inspect_*`
-    /// accessors on the very `PageCache` that `add_dirty` mutates. Exposed
-    /// publicly through `expose_pub` as `inspect_page_cache_handle`
-    /// (aretta-books accessor A-13). NEVER use in production.
     #[cfg(feature = "aristo-instr")]
     #[aristo::instrument::expose_pub(as = "inspect_page_cache_handle")]
     fn page_cache_handle(&self) -> crate::sync::Arc<crate::sync::RwLock<PageCache>> {
         self.page_cache.clone()
     }
 
-    /// Verification-only constructor: builds a minimal in-memory
-    /// `Pager` mirroring the test-only `test_pager_setup` (MemoryIO +
-    /// DatabaseFile + BufferPool + page-1 seed; WAL omitted — see body),
-    /// using items (`default_page1`, `ArcSwapOption`, `Mutex`) that are
-    /// in-scope here but not reachable from an external verification crate.
-    /// Exposed publicly through `expose_pub` as `inspect_new_test_pager`
-    /// (aretta-books accessor A-11) so the aretta-books page-cache harness
-    /// can drive the real `add_dirty` path. NEVER use in production.
     #[cfg(feature = "aristo-instr")]
     #[aristo::instrument::expose_pub(as = "inspect_new_test_pager")]
     fn new_for_differential_test() -> Self {
         Self::new_for_differential_test_with_capacity(64)
     }
 
-    /// Like [`new_for_differential_test`] but with an explicit page-cache
-    /// capacity, so the harness can drive capacity-pressure scenarios (the
-    /// `needs_spill` fast path) at a small, controlled capacity. Exposed
-    /// publicly through `expose_pub` as `inspect_new_test_pager_with_capacity`
-    /// (aretta-books accessor A-12). NEVER use in production.
     #[cfg(feature = "aristo-instr")]
     #[aristo::instrument::expose_pub(as = "inspect_new_test_pager_with_capacity")]
     fn new_for_differential_test_with_capacity(cache_capacity: usize) -> Self {
@@ -3477,11 +3459,6 @@ impl Pager {
             io.open_file("test.db", OpenFlags::Create, true).unwrap(),
         ));
         let buffer_pool = BufferPool::begin_init(&io, (pages * page_size) as usize);
-        // No WAL needed: the `add_dirty` path (dirty-set + cache notify +
-        // `set_dirty`) never touches the WAL, and the non-test
-        // `WalFileShared` constructor is `#[cfg(test)]`-gated. Page 1 is
-        // seeded so the pager is well-formed; the conformance scenario
-        // operates on page id 2.
         let init_page_1 = Arc::new(ArcSwapOption::new(Some(default_page1(None))));
         Pager::new(
             db_file,

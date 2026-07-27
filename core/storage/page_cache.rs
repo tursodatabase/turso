@@ -107,14 +107,10 @@ pub struct PageCache {
     /// Clock hand cursor for SIEVE eviction (pointer to an entry in the queue, or null)
     clock_hand: *mut PageCacheEntry,
     /// Threshold number of pages at which we start spilling dirty pages.
-    // `#[inspect]` exposes a read-only clone as `inspect_spill_threshold()` for
-    // the aretta-books harness (accessor A-30); verification-only.
     #[cfg_attr(feature = "aristo-instr", inspect)]
     spill_threshold: usize,
     spill_enabled: bool,
     /// Conservative estimation of pages that are evictable based on dirty/spilled state.
-    // `#[inspect]` exposes a read-only clone as `inspect_evictable_count()` for
-    // the aretta-books harness (accessor A-07); verification-only.
     #[cfg_attr(feature = "aristo-instr", inspect)]
     evictable_count: usize,
 }
