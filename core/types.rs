@@ -2030,6 +2030,31 @@ impl<'a> Iterator for ValueIterator<'a> {
         acc
     }
 
+    /// Returns the final value, decoding only that value.
+    ///
+    /// The default implementation calls `next` once per column, which
+    /// materializes a `ValueRef` for every column just to reach the last one.
+    /// Walking the header is enough to locate it: only the serial types are
+    /// needed to skip forward, so this decodes exactly one value.
+    ///
+    /// Hot on index scans, where `last_value` reads the rowid from the trailing
+    /// column of every index record.
+    #[inline]
+    fn last(mut self) -> Option<Self::Item> {
+        let mut remaining = 0usize;
+        let mut header = self.header_section.get();
+        while !header.is_empty() {
+            let Ok((_, bytes_read)) = read_varint(header) else {
+                // Corrupt header; let `next` report it (and fuse the iterator).
+                return self.next();
+            };
+            remaining += 1;
+            header = &header[bytes_read..];
+        }
+        // `nth` skips `remaining - 1` values, then `next` yields the last one.
+        remaining.checked_sub(1).and_then(|skip| self.nth(skip))
+    }
+
     /// Returns the nth element of the iterator.
     #[inline(always)]
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
@@ -2087,6 +2112,13 @@ impl<'a> Iterator for ValueIterator<'a> {
             Ok(v) => v,
             Err(e) => {
                 mark_unlikely();
+                // Consume the rest of the header so the iterator fuses. A
+                // truncated serial-type varint is not recoverable, and leaving
+                // the header intact would make every subsequent `next` report
+                // the same error without consuming input -- an infinite loop
+                // for any `while let Some(..) = next()` consumer (notably the
+                // default `Iterator::last`, reached from `last_value`).
+                self.header_section.set(&[]);
                 return Some(Err(e));
             }
         };
@@ -4819,5 +4851,79 @@ mod tests {
         for value in values {
             assert_eq!(value.try_clone().unwrap(), value);
         }
+    }
+}
+
+#[cfg(test)]
+mod value_iterator_corrupt_header_tests {
+    use super::*;
+
+    /// A record header whose final serial-type varint is truncated by
+    /// `header_size`: header_section is non-empty but `read_varint` cannot
+    /// complete. Payload is [header_size=3][0x80][0x80].
+    /// `header_size` is 3, so the header section is the two bytes `80 80`.
+    /// Both carry a continuation bit, so the serial-type varint runs off the
+    /// end of the header and `read_varint` fails on a non-empty header.
+    const TRUNCATED_HEADER_RECORD: [u8; 3] = [0x03, 0x80, 0x80];
+
+    /// Three 1-byte integer columns (serial type 1) holding 10, 11, 12.
+    /// Header is `[size=4][1][1][1]`, data is `[0A][0B][0C]`.
+    const THREE_INT_RECORD: [u8; 7] = [0x04, 0x01, 0x01, 0x01, 0x0A, 0x0B, 0x0C];
+
+    fn as_int(v: Option<Result<ValueRef<'_>>>) -> i64 {
+        match v {
+            Some(Ok(ValueRef::Numeric(Numeric::Integer(i)))) => i,
+            other => panic!("expected an integer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn next_fuses_on_truncated_header_varint() {
+        let mut it = ValueIterator::new(&TRUNCATED_HEADER_RECORD).expect("header bounds are valid");
+        assert!(matches!(it.next(), Some(Err(_))), "expected corrupt error");
+        // Must terminate rather than report the same error forever: a
+        // non-consuming `next` makes `while let Some(..)` loops spin.
+        assert!(it.next().is_none(), "iterator must fuse after corruption");
+    }
+
+    #[test]
+    fn last_terminates_on_truncated_header_varint() {
+        // Before the fuse fix this looped forever rather than returning.
+        let it = ValueIterator::new(&TRUNCATED_HEADER_RECORD).expect("header bounds are valid");
+        assert!(matches!(it.last(), Some(Err(_))), "expected corrupt error");
+    }
+
+    #[test]
+    fn last_returns_final_value() {
+        let it = ValueIterator::new(&THREE_INT_RECORD).expect("valid record");
+        assert_eq!(as_int(it.last()), 12);
+    }
+
+    #[test]
+    fn last_matches_nth_and_full_iteration() {
+        let by_nth = {
+            let mut it = ValueIterator::new(&THREE_INT_RECORD).expect("valid record");
+            as_int(it.nth(2))
+        };
+        let by_iteration = {
+            let it = ValueIterator::new(&THREE_INT_RECORD).expect("valid record");
+            let all: Vec<_> = it.collect();
+            assert_eq!(all.len(), 3, "record has three columns");
+            as_int(all.into_iter().next_back())
+        };
+        let by_last = {
+            let it = ValueIterator::new(&THREE_INT_RECORD).expect("valid record");
+            as_int(it.last())
+        };
+        assert_eq!(by_last, by_nth);
+        assert_eq!(by_last, by_iteration);
+    }
+
+    #[test]
+    fn last_on_empty_header_is_none() {
+        // header_size == header varint length: zero columns.
+        let payload = [0x01u8];
+        let it = ValueIterator::new(&payload).expect("valid empty record");
+        assert!(it.last().is_none());
     }
 }
