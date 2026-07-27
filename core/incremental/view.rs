@@ -286,7 +286,7 @@ impl SharedChangeLog {
         match self.finish_pending_spill()? {
             PendingSpillStatus::None => {}
             PendingSpillStatus::Waiting(completion) => {
-                return Ok(IOResult::IO(IOCompletions::Single(completion)));
+                return Ok(IOResult::IO(IOCompletions(completion)));
             }
             PendingSpillStatus::Finished(pending) => {
                 let is_resumed_trigger = pending.table_id == table_id
@@ -395,7 +395,7 @@ impl SharedChangeLog {
             triggering_values: values,
             triggering_weight: weight,
         });
-        Ok(IOResult::IO(IOCompletions::Single(completion)))
+        Ok(IOResult::IO(IOCompletions(completion)))
     }
 
     fn snapshot(&self, table_id: &TableChangeId) -> CapturedDelta {

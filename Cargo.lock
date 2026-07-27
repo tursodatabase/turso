@@ -4982,7 +4982,7 @@ dependencies = [
 
 [[package]]
 name = "query-result-oracle"
-version = "0.8.0-pre.1"
+version = "0.8.0-pre.2"
 
 [[package]]
 name = "quick-error"

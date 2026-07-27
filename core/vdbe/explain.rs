@@ -1319,15 +1319,6 @@ pub fn insn_to_row(
                 0,
                 format!("accum=r[{}] dest=r[{}]", *acc_reg, *dest_reg),
             ),
-            Insn::AggInverse { acc_reg, col, func, .. } => (
-                "AggInverse",
-                *acc_reg as i64,
-                *col as i64,
-                0,
-                Value::build_text(func.as_str()),
-                0,
-                format!("accum=r[{}] retract r[{}]", *acc_reg, *col),
-            ),
             Insn::AggContextLoad { acc_reg, payload_start_reg, func } => (
                 "AggContextLoad",
                 *acc_reg as i64,

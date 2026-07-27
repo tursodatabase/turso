@@ -494,6 +494,7 @@ fn emit_group_aggregate_rows(
             delimiter: 0,
             func: AccumulatorFunc::Agg(agg.func.clone()),
             comparator: None,
+            collation: None,
         });
         if matches!(agg.func, AggFunc::Count0) {
             program.emit_insn(Insn::AggInverse {
@@ -901,6 +902,7 @@ fn emit_group_aggregate_rows(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(agg.func.clone()),
                     comparator: None,
+                    collation: None,
                 });
             }
             program.emit_insn(Insn::Goto {
@@ -1046,6 +1048,7 @@ fn emit_group_aggregate_rows(
             delimiter: 0,
             func: AccumulatorFunc::Agg(agg.func.clone()),
             comparator: None,
+            collation: None,
         });
         program.preassign_label_to_next_insn(after_label);
         program.preassign_label_to_next_insn(aggregate_done_label);
@@ -1406,6 +1409,7 @@ fn emit_group_aggregate_rows(
                 delimiter: 0,
                 func: AccumulatorFunc::Agg(agg.func.clone()),
                 comparator: None,
+                collation: None,
             });
             if matches!(agg.func, AggFunc::Count0) {
                 program.emit_insn(Insn::AggInverse {

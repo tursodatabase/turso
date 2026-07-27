@@ -103,7 +103,7 @@ impl DeltaCursor {
                 if !pending.completion.finished() {
                     let completion = pending.completion.clone();
                     self.pending_read = Some(pending);
-                    return Ok(IOResult::IO(IOCompletions::Single(completion)));
+                    return Ok(IOResult::IO(IOCompletions(completion)));
                 }
                 if let Some(error) = pending.completion.get_error() {
                     return Err(LimboError::CompletionError(error));
@@ -158,7 +158,7 @@ impl DeltaCursor {
                     buffer,
                 });
                 if !completion.finished() {
-                    return Ok(IOResult::IO(IOCompletions::Single(completion)));
+                    return Ok(IOResult::IO(IOCompletions(completion)));
                 }
                 continue;
             }
