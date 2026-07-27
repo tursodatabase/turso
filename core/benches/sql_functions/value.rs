@@ -1050,3 +1050,76 @@ fn exec_randomblob_large(bencher: Bencher) {
         )
     });
 }
+
+// =============================================================================
+// Long-Input String Functions (SIMD-sensitive sizes)
+// =============================================================================
+
+fn long_text_haystack() -> String {
+    "the quick brown fox jumps over the lazy dog. ".repeat(100)
+}
+
+#[turso_macros::divan_bench]
+fn instr_long_text_found_late(bencher: Bencher) {
+    let mut text = long_text_haystack();
+    text.push_str("needle in the haystack");
+    let value = Value::build_text(text);
+    let pattern = Value::build_text("needle");
+    bencher.bench_local(|| black_box(black_box(&value).exec_instr(black_box(&pattern))));
+}
+
+#[turso_macros::divan_bench]
+fn instr_long_text_not_found(bencher: Bencher) {
+    let value = Value::build_text(long_text_haystack());
+    let pattern = Value::build_text("needle");
+    bencher.bench_local(|| black_box(black_box(&value).exec_instr(black_box(&pattern))));
+}
+
+#[turso_macros::divan_bench]
+fn instr_long_blob(bencher: Bencher) {
+    let mut blob = vec![0xABu8; 4096];
+    blob.extend_from_slice(&[1, 2, 3, 4]);
+    let value = Value::from_slice(&blob).expect(turso_core::alloc::ALLOC_ERR_MSG);
+    let pattern = Value::from_slice(&[1, 2, 3, 4]).expect(turso_core::alloc::ALLOC_ERR_MSG);
+    bencher.bench_local(|| black_box(black_box(&value).exec_instr(black_box(&pattern))));
+}
+
+#[turso_macros::divan_bench]
+fn replace_long_text(bencher: Bencher) {
+    let source = Value::build_text(long_text_haystack());
+    let pattern = Value::build_text("fox");
+    let replacement = Value::build_text("cat");
+    bencher.bench_local(|| {
+        black_box(Value::exec_replace(
+            black_box(&source),
+            black_box(&pattern),
+            black_box(&replacement),
+        ))
+    });
+}
+
+#[turso_macros::divan_bench]
+fn quote_long_text_no_quotes(bencher: Bencher) {
+    let value = Value::build_text(long_text_haystack());
+    bencher.bench_local(|| black_box(black_box(&value).exec_quote()));
+}
+
+#[turso_macros::divan_bench]
+fn quote_long_blob(bencher: Bencher) {
+    let blob = vec![0x5Au8; 4096];
+    let value = Value::from_slice(&blob).expect(turso_core::alloc::ALLOC_ERR_MSG);
+    bencher.bench_local(|| black_box(black_box(&value).exec_quote()));
+}
+
+#[turso_macros::divan_bench]
+fn hex_long_blob(bencher: Bencher) {
+    let blob = vec![0x5Au8; 4096];
+    let value = Value::from_slice(&blob).expect(turso_core::alloc::ALLOC_ERR_MSG);
+    bencher.bench_local(|| black_box(black_box(&value).exec_hex()));
+}
+
+#[turso_macros::divan_bench]
+fn unhex_long_text(bencher: Bencher) {
+    let value = Value::build_text("5A".repeat(4096));
+    bencher.bench_local(|| black_box(black_box(&value).exec_unhex(None)));
+}
