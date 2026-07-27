@@ -1077,6 +1077,18 @@ pub enum Insn {
         collation: Option<CollationSeq>,
     },
 
+    /// Mirror-image of AggStep: fires when a row crosses the frame-start
+    /// cursor on its way out of the frame. The runtime arm undoes the
+    /// matching xStep — sum subtracts, count decrements, position
+    /// counters advance.
+    AggInverse {
+        acc_reg: usize,
+        col: usize,
+        delimiter: usize,
+        func: AccumulatorFunc,
+        comparator: Option<SortComparatorType>,
+    },
+
     AggFinal {
         register: usize,
         func: AccumulatorFunc,
@@ -2099,6 +2111,7 @@ impl InsnVariants {
             InsnVariants::IdxLT => execute::op_idx_lt,
             InsnVariants::DecrJumpZero => execute::op_decr_jump_zero,
             InsnVariants::AggStep => execute::op_agg_step,
+            InsnVariants::AggInverse => execute::op_agg_inverse,
             InsnVariants::AggFinal | InsnVariants::AggValue => execute::op_agg_final,
             InsnVariants::SorterOpen => execute::op_sorter_open,
             InsnVariants::SorterInsert => execute::op_sorter_insert,

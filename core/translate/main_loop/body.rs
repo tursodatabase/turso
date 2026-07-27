@@ -441,7 +441,7 @@ fn emit_loop_source<'a>(
             Ok(())
         }
         LoopEmitTarget::Window => {
-            EmitWindow::emit_window_loop_source(program, t_ctx, plan)?;
+            EmitWindow::emit_window_step(program, t_ctx, plan)?;
 
             Ok(())
         }
