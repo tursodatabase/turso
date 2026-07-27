@@ -57,6 +57,8 @@ pub struct SimConfig {
     /// entirely; values up to 1.0 weight the SELECT list heavily toward
     /// `func(...) OVER (...)` projections.
     pub window_function_probability: f64,
+    /// Generate SELECT-only workloads whose CTE definitions are all recursive.
+    pub recursive_cte_focus: bool,
 }
 
 impl Default for SimConfig {
@@ -73,6 +75,7 @@ impl Default for SimConfig {
             tree_mode: TreeMode::default(),
             mvcc: false,
             window_function_probability: 0.0,
+            recursive_cte_focus: false,
         }
     }
 }
@@ -352,7 +355,10 @@ impl Fuzzer {
                     self.rng.borrow_mut().fill_bytes(&mut bytes);
                     bytes
                 };
-                Box::new(PropTestBackend::new(seed_bytes))
+                Box::new(PropTestBackend::new(
+                    seed_bytes,
+                    self.config.recursive_cte_focus,
+                ))
             }
         };
 
@@ -658,6 +664,7 @@ mod tests {
             tree_mode: TreeMode::default(),
             mvcc: false,
             window_function_probability: 0.0,
+            recursive_cte_focus: false,
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());

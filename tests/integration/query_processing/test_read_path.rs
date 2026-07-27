@@ -35,6 +35,27 @@ fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test]
+fn recursive_cte_with_bound_termination_predicate(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let mut stmt = conn.prepare(
+        "SELECT (
+            WITH RECURSIVE seq(x) AS (
+                VALUES(1)
+                UNION ALL
+                SELECT x + 1 FROM seq WHERE x < ?
+            )
+            SELECT count(*) FROM seq
+        )",
+    )?;
+    stmt.bind_at(1.try_into()?, Value::from_i64(100))?;
+    stmt.run_with_row_callback(|row| {
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(100));
+        Ok(())
+    })?;
+    Ok(())
+}
+
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
