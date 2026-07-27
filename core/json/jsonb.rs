@@ -1937,26 +1937,24 @@ impl Jsonb {
                 }
                 end_pos += 1;
             }
-            if end_pos < input.len() {
-                if found {
-                    let len = end_pos - pos;
-                    let header_pos = self.data.len();
+            if found {
+                let len = end_pos - pos;
+                let header_pos = self.data.len();
 
-                    // Write header and content
-                    if len <= 11 {
-                        self.data
-                            .push((ElementType::TEXT as u8) | ((len as u8) << 4));
-                    } else {
-                        self.write_element_header(header_pos, ElementType::TEXT, len, false)
-                            .map_err(|_| PError::Message {
-                                msg: "Failed to write header".to_string(),
-                                location: Some(pos),
-                            })?;
-                    }
-
-                    self.data.extend_from_slice(&input[pos..end_pos]);
-                    return Ok(end_pos + 1); // Skip past closing quote
+                // Write header and content
+                if len <= 11 {
+                    self.data
+                        .push((ElementType::TEXT as u8) | ((len as u8) << 4));
+                } else {
+                    self.write_element_header(header_pos, ElementType::TEXT, len, false)
+                        .map_err(|_| PError::Message {
+                            msg: "Failed to write header".to_string(),
+                            location: Some(pos),
+                        })?;
                 }
+
+                self.data.extend_from_slice(&input[pos..end_pos]);
+                return Ok(end_pos + 1); // Skip past closing quote
             }
         }
 
