@@ -44,8 +44,18 @@ pub fn spec_col_types() -> Vec<&'static str> {
         .map(|v| v.as_str().unwrap())
         .collect()
 }
+/// Value spec entries that are not disabled. An entry carries a `disabled`
+/// field while a known server bug makes it fail differentially.
+pub fn spec_values() -> Vec<&'static JsonValue> {
+    spec()["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v.get("disabled").is_none())
+        .collect()
+}
 pub fn spec_num_values() -> u8 {
-    spec()["values"].as_array().unwrap().len() as u8
+    spec_values().len() as u8
 }
 pub fn spec_num_ops() -> u8 {
     spec()["ops"].as_array().unwrap().len() as u8
@@ -179,8 +189,8 @@ pub fn table_name(tc: &TestCase, prefix: u32) -> String {
 
 pub fn gen_value(tc: &TestCase) -> Val {
     let variant: u8 = tc.draw(gs::integers::<u8>());
-    let values = spec()["values"].as_array().unwrap();
-    let entry = &values[(variant % spec_num_values()) as usize];
+    let values = spec_values();
+    let entry = values[(variant % spec_num_values()) as usize];
     let id = entry["id"].as_str().unwrap();
 
     match id {
