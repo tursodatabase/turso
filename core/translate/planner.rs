@@ -776,6 +776,17 @@ fn link_with_window(
     }
     expr_vector_size(expr)?;
     if let Some(windows) = windows {
+        // An inline `OVER (base ...)` chains to a named window from the
+        // SELECT's WINDOW clause (sqlite3WindowUpdate, window.c:676). Any
+        // named window is a candidate here, and a missing base is an error
+        // — unlike WINDOW-clause chaining, which only sees earlier defs.
+        let over_effective: std::borrow::Cow<'_, ast::Over> = match over_clause {
+            ast::Over::Window(window) if window.base.is_some() => std::borrow::Cow::Owned(
+                ast::Over::Window(chain_inline_window_base(window, named_windows, windows)?),
+            ),
+            _ => std::borrow::Cow::Borrowed(over_clause),
+        };
+        let over_clause: &ast::Over = &over_effective;
         // Pick each function's effective frame (sqlite3WindowUpdate,
         // window.c:687-725):
         // - Built-ins with a coerced frame (rank, row_number, ...) ignore
@@ -946,6 +957,64 @@ fn reject_unsupported_frame(frame: &crate::translate::plan::Frame) -> Result<()>
 /// their OVER clauses are equivalent AND their coerced frames match —
 /// functions with the same OVER but conflicting frames get separate
 /// `Window` entries so each compiles to its own ephemeral-table pass.
+/// Merge an inline `OVER (base ...)` window spec with its named base
+/// window (sqlite3WindowChain, window.c:1276). The spec may not:
+/// - have its own PARTITION BY,
+/// - add ORDER BY when the base already has one,
+/// - chain to a base that carries an explicit frame.
+///
+/// The result inherits the base's PARTITION BY (and its ORDER BY when the
+/// spec has none), keeps its own frame clause, and drops the base ref.
+fn chain_inline_window_base(
+    window: &ast::Window,
+    named_windows: &[crate::translate::plan::NamedWindowDef],
+    windows: &[Window],
+) -> Result<ast::Window> {
+    let base = window.base.as_ref().expect("caller checked base.is_some()");
+    let base_name = normalize_ident(base.as_str());
+    let Some(base_def) = named_windows.iter().rfind(|d| d.name == base_name) else {
+        crate::bail_parse_error!("no such window: {}", base_name);
+    };
+    if !window.partition_by.is_empty() {
+        crate::bail_parse_error!("cannot override PARTITION clause of window: {}", base_name);
+    }
+    // The base's bound clauses move into the first `Window` attached under
+    // its name, so read them from wherever they currently live.
+    let (base_partition, base_order) = match base_def.bound.as_ref() {
+        Some(bound) => (bound.partition_by.clone(), bound.order_by.clone()),
+        None => {
+            let sister = windows
+                .iter()
+                .rfind(|w| w.name.as_deref() == Some(base_name.as_str()))
+                .expect("sister Window must exist after the named def's bound was taken");
+            (sister.partition_by.clone(), sister.order_by.clone())
+        }
+    };
+    if !base_order.is_empty() && !window.order_by.is_empty() {
+        crate::bail_parse_error!("cannot override ORDER BY clause of window: {}", base_name);
+    }
+    if base_def.user_frame_clause.is_some() {
+        crate::bail_parse_error!(
+            "cannot override frame specification of window: {}",
+            base_name
+        );
+    }
+    let mut merged = window.clone();
+    merged.base = None;
+    merged.partition_by = base_partition.into_iter().map(Box::new).collect();
+    if merged.order_by.is_empty() {
+        merged.order_by = base_order
+            .into_iter()
+            .map(|(expr, order, nulls)| ast::SortedColumn {
+                expr: Box::new(expr),
+                order: Some(order),
+                nulls,
+            })
+            .collect();
+    }
+    Ok(merged)
+}
+
 fn resolve_window<'a>(
     windows: &'a mut Vec<Window>,
     named_windows: &mut [crate::translate::plan::NamedWindowDef],
@@ -953,68 +1022,11 @@ fn resolve_window<'a>(
     frame: crate::translate::plan::Frame,
 ) -> Result<&'a mut Window> {
     match over_clause {
-        Over::Window(window) if window.base.is_none() => {
+        Over::Window(window) => {
             if let Some(idx) = windows.iter().position(|w| w.is_equivalent(window, &frame)) {
                 return Ok(&mut windows[idx]);
             }
             windows.push(Window::new_unnamed(window, frame)?);
-            Ok(windows.last_mut().expect("just pushed, so must exist"))
-        }
-        Over::Window(window) => {
-            // User-written FRAME clauses aren't supported yet. Still call
-            // the validator so SQLite-invalid shapes get the matching
-            // error; for anything else, bail.
-            if let Some(_user_frame) = crate::translate::plan::validate_frame_clause(
-                &window.frame_clause,
-                window.order_by.len(),
-            )? {
-                crate::bail_parse_error!("user-specified frame clauses are not supported");
-            }
-            let base_name = normalize_ident(
-                window
-                    .base
-                    .as_ref()
-                    .expect("guarded by the preceding match arm")
-                    .as_str(),
-            );
-            let def = named_windows
-                .iter()
-                .rfind(|definition| definition.name == base_name)
-                .ok_or_else(|| {
-                    crate::LimboError::ParseError(format!("no such window: {base_name}"))
-                })?;
-            if !window.partition_by.is_empty() {
-                crate::bail_parse_error!("cannot override PARTITION clause of window: {base_name}");
-            }
-            if def.has_frame_clause {
-                crate::bail_parse_error!(
-                    "cannot override frame specification of window: {base_name}"
-                );
-            }
-            let mut bound = clone_named_window_bound(windows, def);
-            if !bound.order_by.is_empty() && !window.order_by.is_empty() {
-                crate::bail_parse_error!("cannot override ORDER BY clause of window: {base_name}");
-            }
-            if bound.order_by.is_empty() {
-                bound.order_by = window
-                    .order_by
-                    .iter()
-                    .map(|column| {
-                        (
-                            *column.expr.clone(),
-                            column.order.unwrap_or(ast::SortOrder::Asc),
-                            column.nulls,
-                        )
-                    })
-                    .collect();
-            }
-            if let Some(idx) = windows
-                .iter()
-                .position(|candidate| candidate.is_equivalent_to_bound(&bound, &frame))
-            {
-                return Ok(&mut windows[idx]);
-            }
-            windows.push(Window::from_unnamed_bound(bound, frame));
             Ok(windows.last_mut().expect("just pushed, so must exist"))
         }
         Over::Name(name) => {
@@ -1055,25 +1067,6 @@ fn resolve_window<'a>(
             };
             windows.push(Window::from_named_bound(window_name, bound, frame));
             Ok(windows.last_mut().expect("just pushed, so must exist"))
-        }
-    }
-}
-
-fn clone_named_window_bound(
-    windows: &[Window],
-    def: &crate::translate::plan::NamedWindowDef,
-) -> NamedWindowBound {
-    match def.bound.as_ref() {
-        Some(bound) => bound.clone(),
-        None => {
-            let sister = windows
-                .iter()
-                .rfind(|window| window.name.as_ref() == Some(&def.name))
-                .expect("sister Window must exist after the named def was taken");
-            NamedWindowBound {
-                partition_by: sister.partition_by.clone(),
-                order_by: sister.order_by.clone(),
-            }
         }
     }
 }
