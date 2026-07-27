@@ -1310,84 +1310,45 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
     }
 }
 
-/// Per-byte continuation flags of a SQLite varint (high bit of each byte).
-const VARINT_CONT_MASK: u64 = 0x8080_8080_8080_8080;
-/// Per-byte payload bits of a SQLite varint (low 7 bits of each byte).
-const VARINT_DATA_MASK: u64 = 0x7f7f_7f7f_7f7f_7f7f;
-
-/// Fold 7-bit groups packed one per byte (least significant group in byte 0,
-/// every byte `<= 0x7f`) into one contiguous integer.
-#[inline(always)]
-fn fold_varint_groups(x: u64) -> u64 {
-    let x = ((x & 0x7f00_7f00_7f00_7f00) >> 1) | (x & 0x007f_007f_007f_007f);
-    let x = ((x & 0x3fff_0000_3fff_0000) >> 2) | (x & 0x0000_3fff_0000_3fff);
-    ((x & 0x0fff_ffff_0000_0000) >> 4) | (x & 0x0000_0000_0fff_ffff)
-}
-
-/// Decode a varint of 1-8 bytes from an 8-byte little-endian window, or
-/// return `None` when all 8 bytes carry continuation bits (a 9-byte varint;
-/// the caller must consume the 9th byte).
-///
-/// The word trick replaces the byte-at-a-time loop, whose data-dependent exit
-/// branch mispredicts on the mixed varint lengths found in record headers:
-/// the length falls out of one `trailing_zeros`, and the value is assembled
-/// branch-free by reversing the on-disk big-endian group order with a byte
-/// swap and folding the 8-bit-spaced groups down to 7-bit spacing.
-#[inline(always)]
-fn decode_varint_window(word: u64) -> Option<(u64, usize)> {
-    let stops = !word & VARINT_CONT_MASK;
-    if stops == 0 {
-        return None;
-    }
-    let len = stops.trailing_zeros() as usize / 8 + 1;
-    let x = (word & VARINT_DATA_MASK).swap_bytes() >> (8 * (8 - len));
-    Some((fold_varint_groups(x), len))
-}
-
-/// Complete a 9-byte varint: `word` holds the first 8 bytes (all with
-/// continuation bits), `c` is the 9th byte, which contributes all 8 bits.
-#[inline(always)]
-fn complete_varint9(word: u64, c: u8) -> Result<(u64, usize)> {
-    let v = fold_varint_groups((word & VARINT_DATA_MASK).swap_bytes());
-    // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
-    // Since the final value is `(v<<8) + c`, the top 8 bits (v >> 48) must not be 0.
-    // If those are zero, this should be treated as corrupt.
-    // Perf? the comparison + branching happens only in parsing 9-byte varint which is rare.
-    if unlikely((v >> 48) == 0) {
-        bail_corrupt_error!("Invalid varint");
-    }
-    Ok(((v << 8) + c as u64, 9))
-}
-
-/// Scalar decode for buffers shorter than a full 8-byte window (typically the
-/// tail of a record header). Buffers this short can never hold a 9-byte
-/// varint, so running out of bytes before a terminator is corruption.
-fn read_varint_short(buf: &[u8]) -> Result<(u64, usize)> {
-    debug_assert!(buf.len() < 8);
-    let mut v: u64 = 0;
-    for (i, &c) in buf.iter().enumerate() {
-        v = (v << 7) + (c & 0x7f) as u64;
-        if (c & 0x80) == 0 {
-            return Ok((v, i + 1));
-        }
-    }
-    mark_unlikely();
-    bail_corrupt_error!("Invalid varint")
-}
-
 /// Reads varint integer from the buffer.
 /// This function is similar to `sqlite3GetVarint32`
+///
+/// NOTE: a branchless word-at-a-time decoder (u64 load + trailing_zeros over
+/// the continuation bits) was tried here and measured 17-27% SLOWER on TPC-H
+/// scans: record headers are dominated by single-byte serial-type varints,
+/// so this loop's exit branch predicts near-perfectly and the word trick's
+/// unconditional setup work costs more than the mispredictions it removes.
+/// Even a hybrid (scalar 1-byte early exit + word path for longer varints)
+/// only reached parity. Don't "optimize" this without re-measuring.
 #[inline(always)]
 pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
-    let Some(window) = buf.first_chunk::<8>() else {
-        return read_varint_short(buf);
-    };
-    let word = u64::from_le_bytes(*window);
-    if let Some(decoded) = decode_varint_window(word) {
-        return Ok(decoded);
+    let mut v: u64 = 0;
+    for i in 0..8 {
+        match buf.get(i) {
+            Some(c) => {
+                v = (v << 7) + (c & 0x7f) as u64;
+                if (c & 0x80) == 0 {
+                    return Ok((v, i + 1));
+                }
+            }
+            None => {
+                mark_unlikely();
+                crate::bail_corrupt_error!("Invalid varint");
+            }
+        }
     }
     match buf.get(8) {
-        Some(&c) => complete_varint9(word, c),
+        Some(&c) => {
+            // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
+            // Since the final value is `(v<<8) + c`, the top 8 bits (v >> 48) must not be 0.
+            // If those are zero, this should be treated as corrupt.
+            // Perf? the comparison + branching happens only in parsing 9-byte varint which is rare.
+            if unlikely((v >> 48) == 0) {
+                bail_corrupt_error!("Invalid varint");
+            }
+            v = (v << 8) + c as u64;
+            Ok((v, 9))
+        }
         None => {
             mark_unlikely();
             bail_corrupt_error!("Invalid varint");
@@ -1398,26 +1359,24 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
 #[inline(always)]
 /// Reads a varint from the buffer, returning None if more data is needed.
 pub fn read_varint_partial(buf: &[u8]) -> Result<Option<(u64, usize)>> {
-    let Some(window) = buf.first_chunk::<8>() else {
-        // Short buffer: decode what is there; running out of bytes before a
-        // terminator means more data is needed.
-        let mut v: u64 = 0;
-        for (i, &c) in buf.iter().enumerate() {
-            v = (v << 7) + (c & 0x7f) as u64;
-            if (c & 0x80) == 0 {
-                return Ok(Some((v, i + 1)));
-            }
+    let mut v: u64 = 0;
+    for i in 0..8 {
+        let Some(&c) = buf.get(i) else {
+            return Ok(None);
+        };
+        v = (v << 7) + (c & 0x7f) as u64;
+        if (c & 0x80) == 0 {
+            return Ok(Some((v, i + 1)));
         }
+    }
+    let Some(&c) = buf.get(8) else {
         return Ok(None);
     };
-    let word = u64::from_le_bytes(*window);
-    if let Some(decoded) = decode_varint_window(word) {
-        return Ok(Some(decoded));
+    if unlikely((v >> 48) == 0) {
+        bail_corrupt_error!("Invalid varint");
     }
-    match buf.get(8) {
-        Some(&c) => complete_varint9(word, c).map(Some),
-        None => Ok(None),
-    }
+    v = (v << 8) + c as u64;
+    Ok(Some((v, 9)))
 }
 
 /// Compute the length of a varint encoding for a given u64 value.
