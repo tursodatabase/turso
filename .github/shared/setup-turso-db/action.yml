@@ -1,0 +1,56 @@
+name: "Provision Turso scratch database"
+description: "Creates a scratch Turso Cloud database and exports TURSO_DATABASE_URL and TURSO_AUTH_TOKEN for later steps"
+
+inputs:
+  database-name:
+    description: "Name of the scratch database to create"
+    required: true
+  api-token:
+    description: "Turso platform API token (TURSO_API_TOKEN secret)"
+    required: true
+  org:
+    description: "Turso organization slug (TURSO_ORG secret)"
+    required: true
+  group:
+    description: "Turso database group (TURSO_GROUP secret)"
+    required: true
+
+outputs:
+  created:
+    description: "true once the scratch database has been created"
+    value: ${{ steps.create.outputs.created }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Turso CLI
+      shell: bash
+      run: |
+        curl -sSfL https://get.tur.so/install.sh | bash
+        echo "$HOME/.turso" >> "$GITHUB_PATH"
+
+    - name: Create scratch database
+      id: create
+      shell: bash
+      env:
+        TURSO_API_TOKEN: ${{ inputs.api-token }}
+        TURSO_ORG: ${{ inputs.org }}
+        TURSO_GROUP: ${{ inputs.group }}
+        TURSO_DATABASE_NAME: ${{ inputs.database-name }}
+      run: |
+        for var in TURSO_API_TOKEN TURSO_ORG TURSO_GROUP; do
+          if [ -z "${!var}" ]; then
+            echo "::error::$var is not configured"
+            exit 1
+          fi
+        done
+
+        turso org switch "$TURSO_ORG"
+        turso db create "$TURSO_DATABASE_NAME" --group "$TURSO_GROUP" --wait
+        echo "created=true" >> "$GITHUB_OUTPUT"
+
+        database_url="$(turso db show "$TURSO_DATABASE_NAME" --url)"
+        database_token="$(turso db tokens create "$TURSO_DATABASE_NAME" --expiration 1d)"
+        echo "::add-mask::$database_token"
+        echo "TURSO_DATABASE_URL=$database_url" >> "$GITHUB_ENV"
+        echo "TURSO_AUTH_TOKEN=$database_token" >> "$GITHUB_ENV"
