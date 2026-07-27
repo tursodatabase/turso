@@ -52,6 +52,8 @@ pub struct SimConfig {
     pub tree_mode: TreeMode,
     /// Whether to enable MVCC mode.
     pub mvcc: bool,
+    /// Generate SELECT-only workloads whose CTE definitions are all recursive.
+    pub recursive_cte_focus: bool,
 }
 
 impl Default for SimConfig {
@@ -67,6 +69,7 @@ impl Default for SimConfig {
             coverage: false,
             tree_mode: TreeMode::default(),
             mvcc: false,
+            recursive_cte_focus: false,
         }
     }
 }
@@ -343,7 +346,10 @@ impl Fuzzer {
                     self.rng.borrow_mut().fill_bytes(&mut bytes);
                     bytes
                 };
-                Box::new(PropTestBackend::new(seed_bytes))
+                Box::new(PropTestBackend::new(
+                    seed_bytes,
+                    self.config.recursive_cte_focus,
+                ))
             }
         };
 
@@ -648,6 +654,7 @@ mod tests {
             coverage: false,
             tree_mode: TreeMode::default(),
             mvcc: false,
+            recursive_cte_focus: false,
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());

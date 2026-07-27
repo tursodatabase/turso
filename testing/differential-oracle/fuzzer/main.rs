@@ -58,6 +58,10 @@ struct Args {
     /// Enable experimental MVCC mode.
     #[arg(long)]
     mvcc: bool,
+
+    /// Focus sql-gen-prop on bounded recursive CTE SELECT workloads.
+    #[arg(long, requires = "generator")]
+    recursive_cte_focus: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -94,6 +98,7 @@ struct ConfigRecord {
     num_statements: usize,
     generator: String,
     mvcc: bool,
+    recursive_cte_focus: bool,
 }
 
 /// Summary written to the JSON report file.
@@ -112,6 +117,7 @@ impl ConfigRecord {
             num_statements: args.num_statements,
             generator: format!("{:?}", args.generator),
             mvcc: args.mvcc,
+            recursive_cte_focus: args.recursive_cte_focus,
         }
     }
 }
@@ -225,6 +231,9 @@ fn main() -> Result<()> {
 /// Run a single fuzzer iteration, returning stats on success.
 /// Does NOT call `process::exit` — the caller decides what to do with failures.
 fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
+    if args.recursive_cte_focus && !matches!(args.generator, GeneratorKind::SqlGenProp) {
+        anyhow::bail!("--recursive-cte-focus requires --generator sql-gen-prop");
+    }
     let config = SimConfig {
         seed: args.seed,
         num_tables: args.num_tables,
@@ -240,6 +249,7 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
             TreeMode::Simplified
         },
         mvcc: args.mvcc,
+        recursive_cte_focus: args.recursive_cte_focus,
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);
