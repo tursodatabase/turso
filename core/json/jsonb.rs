@@ -46,6 +46,38 @@ fn find_control_byte(bytes: &[u8]) -> Option<usize> {
         .map(|p| offset + p)
 }
 
+/// Position of the first byte that terminates or complicates a JSON string:
+/// the closing `quote`, a backslash, or a control byte (`< 0x20`).
+///
+/// One fused chunked pass that LLVM autovectorizes. `memchr2` cannot fold in
+/// the control-byte range test, and a separate second pass costs more than it
+/// saves on the short strings typical of JSON keys and values.
+#[inline]
+fn find_string_special(bytes: &[u8], quote: u8) -> Option<usize> {
+    const CHUNK: usize = 16;
+    let is_special = |b: u8| (b == quote) | (b == b'\\') | (b < 0x20);
+    let mut offset = 0;
+    let mut chunks = bytes.chunks_exact(CHUNK);
+    for chunk in &mut chunks {
+        let mut any = false;
+        for &b in chunk {
+            any |= is_special(b);
+        }
+        if any {
+            return chunk
+                .iter()
+                .position(|&b| is_special(b))
+                .map(|p| offset + p);
+        }
+        offset += CHUNK;
+    }
+    chunks
+        .remainder()
+        .iter()
+        .position(|&b| is_special(b))
+        .map(|p| offset + p)
+}
+
 const fn make_whitespace_table() -> [u8; 256] {
     let mut table = [0u8; 256];
 
@@ -1326,15 +1358,14 @@ impl Jsonb {
                 // Only control bytes need escaping for TEXTJ (its payload
                 // already carries JSON escape sequences verbatim); TEXT also
                 // escapes quotes and backslashes. Jump between escape sites
-                // with SIMD search instead of testing every byte.
+                // with a vectorized scan instead of testing every byte.
                 let textj = *kind == ElementType::TEXTJ;
                 let find_escape = |bytes: &[u8]| -> Option<usize> {
                     if textj {
-                        return find_control_byte(bytes);
+                        find_control_byte(bytes)
+                    } else {
+                        find_string_special(bytes, b'"')
                     }
-                    let special = memchr::memchr2(b'"', b'\\', bytes);
-                    let limit = special.unwrap_or(bytes.len());
-                    find_control_byte(&bytes[..limit]).or(special)
                 };
 
                 let mut last_end = 0;
@@ -1865,12 +1896,10 @@ impl Jsonb {
 
         if quoted {
             // Simple string fast path: the string is simple if the closing
-            // quote appears before any backslash or control byte. memchr2
-            // finds the first quote/backslash with SIMD; the skipped span is
-            // then checked for control bytes.
-            if let Some(off) = memchr::memchr2(quote, b'\\', &input[pos..]) {
+            // quote appears before any backslash or control byte.
+            if let Some(off) = find_string_special(&input[pos..], quote) {
                 let end_pos = pos + off;
-                if input[end_pos] == quote && find_control_byte(&input[pos..end_pos]).is_none() {
+                if input[end_pos] == quote {
                     let len = end_pos - pos;
                     let header_pos = self.data.len();
 
