@@ -12,9 +12,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
-use crate::translate::index::{
-    reject_explicit_nulls, resolve_index_method_parameters, resolve_sorted_columns,
-};
+use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
 use crate::types::{IOResult, ImmutableRecord};
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -4479,7 +4477,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     conflict_clause,
                 } = &c.constraint
                 {
-                    reject_explicit_nulls(columns)?;
                     let mut unique_columns = Vec::try_with_capacity_ext(columns.len())?;
                     for column in columns {
                         let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
@@ -4496,7 +4493,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             name: col_name,
                             sort_order: column.order.unwrap_or(SortOrder::Asc),
                             collation,
-                            nulls_order: None,
+                            nulls_order: column.nulls,
                         })?;
                     }
                     let unique_set = UniqueSet {
@@ -5920,7 +5917,7 @@ impl Index {
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col.name.as_ref().unwrap()),
                     order: *sort_order,
-                    nulls_order: None,
+                    nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
                     collation: constraint_columns
                         .get(i)

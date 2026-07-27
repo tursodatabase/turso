@@ -797,8 +797,73 @@ expect {
     5|1
 }
 
-test unique-table-constraint-nulls-still-rejected {
-    CREATE TABLE t(a, UNIQUE(a NULLS LAST));
+test unique-constraint-schema-roundtrip {
+    CREATE TABLE t(a INT, b, UNIQUE(a NULLS LAST), UNIQUE(b DESC NULLS FIRST));
+    SELECT sql FROM sqlite_schema WHERE type='table';
+}
+expect {
+    CREATE TABLE t (a INT, b, UNIQUE (a NULLS LAST), UNIQUE (b DESC NULLS FIRST))
+}
+
+test unique-constraint-nulls-last-ordering-elided {
+    CREATE TABLE t(a INT, b, UNIQUE(a NULLS LAST));
+    INSERT INTO t VALUES (NULL, 1), (3, 2), (1, 3), (NULL, 4), (2, 5);
+    SELECT ifnull(a, 'null') FROM t ORDER BY a NULLS LAST LIMIT 3;
+}
+expect {
+    1
+    2
+    3
+}
+
+test unique-constraint-eqp-elide-order-by {
+    CREATE TABLE t(a INT, b, UNIQUE(a NULLS LAST));
+    EXPLAIN QUERY PLAN SELECT a FROM t ORDER BY a NULLS LAST;
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX sqlite_autoindex_t_1
+}
+
+test unique-constraint-nulls-remain-distinct {
+    CREATE TABLE t(a INT, b, UNIQUE(a NULLS LAST));
+    INSERT INTO t VALUES (NULL, 1), (NULL, 2), (5, 3);
+    SELECT count(*) FROM t;
+}
+expect {
+    3
+}
+
+test unique-constraint-duplicate-non-null-rejected {
+    CREATE TABLE t(a INT, b, UNIQUE(a NULLS LAST));
+    INSERT INTO t VALUES (5, 1);
+    INSERT INTO t VALUES (5, 2);
+}
+expect error {
+}
+
+test unique-constraint-range-seek-excludes-null-block {
+    CREATE TABLE t(a INT, b, UNIQUE(a NULLS LAST));
+    INSERT INTO t VALUES (NULL, 1), (3, 2), (1, 3), (NULL, 4), (2, 5);
+    SELECT count(*) FROM t WHERE a > 1;
+}
+expect {
+    2
+}
+
+test unique-constraint-upsert-plain-target {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b, UNIQUE(a NULLS LAST));
+    INSERT INTO t VALUES (1, 5, 0);
+    INSERT INTO t(id, a, b) VALUES (2, 5, 1) ON CONFLICT(a) DO UPDATE SET b = excluded.b;
+    SELECT id, a, b FROM t;
+}
+expect {
+    1|5|1
+}
+
+test upsert-explicit-nulls-conflict-target-rejected {
+    CREATE TABLE t(a INT, b, UNIQUE(a NULLS LAST));
+    INSERT INTO t VALUES (5, 1);
+    INSERT INTO t VALUES (5, 2) ON CONFLICT(a NULLS LAST) DO NOTHING;
 }
 expect error {
     NULLS
