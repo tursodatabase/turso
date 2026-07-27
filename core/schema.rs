@@ -314,6 +314,9 @@ pub struct FunctionDef {
     pub returns: Option<String>,
     /// Parsed Starlark body.
     pub body: crate::udf::StarlarkBody,
+    /// `(name, arg_count)` of every function the body calls, used for
+    /// transitive determinism classification.
+    pub calls: std::vec::Vec<(String, usize)>,
     /// Canonical `CREATE FUNCTION` SQL for round-trip persistence.
     pub sql: String,
 }
@@ -349,11 +352,14 @@ impl FunctionDef {
             param_names.push(param_name);
         }
         let parsed_body = crate::udf::parse_body(body)?;
+        let mut calls = std::vec::Vec::new();
+        crate::udf::collect_called_functions(&parsed_body.stmts, &mut calls);
         Ok(Self {
             name,
             params: param_names,
             returns: returns.map(|ty| ty.name.clone()),
             body: parsed_body,
+            calls,
             sql,
         })
     }

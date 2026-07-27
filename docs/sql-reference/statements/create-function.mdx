@@ -85,6 +85,12 @@ Because bodies compile to bytecode operating on SQL values, runtime semantics ar
 
 Unsupported Starlark constructs (`def`, `lambda`, lists, dicts, methods, keyword arguments, chained comparisons, `**`) are rejected with an error when the function is created.
 
+## Determinism
+
+Starlark is deterministic by design: a function body has no access to ambient state, so non-determinism can only enter through the SQL functions a body calls. Turso classifies each UDF transitively — a function is deterministic exactly when every function it calls (built-in or user-defined) is deterministic.
+
+The classification is used for optimization: a deterministic UDF called with constant arguments is evaluated **once per statement** rather than once per row, and deterministic UDFs are eligible for the same repeated-expression sharing as deterministic built-ins. A body that calls `random()` or `datetime('now')` (directly or through another UDF) is evaluated on every row, like the built-ins themselves.
+
 ## Errors
 
 - Creating a function whose name matches a built-in function is an error.

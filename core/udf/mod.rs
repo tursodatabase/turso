@@ -158,6 +158,72 @@ pub fn collect_assigned_names(stmts: &[UdfStmt], out: &mut Vec<String>) {
     }
 }
 
+/// Collect every `(name, arg_count)` pair called anywhere in the body,
+/// deduplicated. Starlark itself is deterministic by design, so a function's
+/// determinism depends only on the functions its body calls; the compiler
+/// uses this to classify UDFs (see `translate::udf::udf_is_deterministic`).
+pub fn collect_called_functions(stmts: &[UdfStmt], out: &mut Vec<(String, usize)>) {
+    fn walk_expr(expr: &UdfExpr, out: &mut Vec<(String, usize)>) {
+        match expr {
+            UdfExpr::Call { name, args } => {
+                if !out.iter().any(|(n, c)| n == name && *c == args.len()) {
+                    out.push((name.clone(), args.len()));
+                }
+                for arg in args {
+                    walk_expr(arg, out);
+                }
+            }
+            UdfExpr::Binary(_, lhs, rhs) => {
+                walk_expr(lhs, out);
+                walk_expr(rhs, out);
+            }
+            UdfExpr::Unary(_, inner) => walk_expr(inner, out),
+            UdfExpr::Ternary { cond, then, else_ } => {
+                walk_expr(cond, out);
+                walk_expr(then, out);
+                walk_expr(else_, out);
+            }
+            UdfExpr::Int(_)
+            | UdfExpr::Float(_)
+            | UdfExpr::Str(_)
+            | UdfExpr::Bool(_)
+            | UdfExpr::None
+            | UdfExpr::Var(_) => {}
+        }
+    }
+    for stmt in stmts {
+        match stmt {
+            UdfStmt::Assign { value, .. } => walk_expr(value, out),
+            UdfStmt::Expr(value) => walk_expr(value, out),
+            UdfStmt::Return(Some(value)) => walk_expr(value, out),
+            UdfStmt::Return(None) => {}
+            UdfStmt::If { arms, else_body } => {
+                for (cond, body) in arms {
+                    walk_expr(cond, out);
+                    collect_called_functions(body, out);
+                }
+                if let Some(body) = else_body {
+                    collect_called_functions(body, out);
+                }
+            }
+            UdfStmt::While { cond, body } => {
+                walk_expr(cond, out);
+                collect_called_functions(body, out);
+            }
+            UdfStmt::For {
+                start, stop, body, ..
+            } => {
+                if let Some(start) = start {
+                    walk_expr(start, out);
+                }
+                walk_expr(stop, out);
+                collect_called_functions(body, out);
+            }
+            UdfStmt::Break | UdfStmt::Continue | UdfStmt::Pass => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

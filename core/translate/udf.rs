@@ -15,11 +15,13 @@
 //! comparisons and truthiness are exactly SQL semantics, and any SQL scalar
 //! function (or another UDF) is callable from a function body.
 
+use crate::function::Deterministic;
 use crate::schema::{BTreeTable, FunctionDef, TURSO_FUNCTIONS_TABLE_NAME};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
+use crate::translate::optimizer::Optimizable;
 use crate::translate::plan::TableReferences;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
@@ -323,6 +325,26 @@ pub fn emit_udf_call(
         );
     }
 
+    // Starlark bodies are deterministic by construction, so a deterministic
+    // call (deterministic callees, constant arguments) always produces the
+    // same value within a statement. Guard such calls with Once so the body
+    // runs once per program execution instead of once per row; re-entry jumps
+    // past the body and reads the result register. The general constant
+    // hoisting machinery cannot be used here: the inlined expansion contains
+    // register references, which would truncate an enclosing constant span
+    // mid-body.
+    let once_label = if udf_is_deterministic(resolver, func)
+        && args.iter().all(|arg| arg.is_constant(resolver))
+    {
+        let label = program.allocate_label();
+        program.emit_insn(Insn::Once {
+            target_pc_when_reentered: label,
+        });
+        Some(label)
+    } else {
+        None
+    };
+
     // Bind parameters: evaluate each argument into a fresh register. This
     // happens in the caller's context, before entering the callee's frame, so
     // a nested call like f(f(x)) is not mistaken for recursion. Hoisting must
@@ -356,7 +378,51 @@ pub fn emit_udf_call(
         .pop()
         .expect("stack pushed just above");
     result?;
+    if let Some(label) = once_label {
+        program.preassign_label_to_next_insn(label);
+    }
     Ok(target_register)
+}
+
+/// Report whether a user-defined function is deterministic.
+///
+/// The Starlark subset itself is deterministic by design (no ambient state,
+/// reproducible evaluation), so a UDF is deterministic exactly when every
+/// function its body calls is: built-ins report through the [`Deterministic`]
+/// trait and other UDFs are checked transitively. Unknown callees are
+/// conservatively treated as non-deterministic (calling them errors at
+/// translation time anyway).
+pub fn udf_is_deterministic(resolver: &Resolver, func: &FunctionDef) -> bool {
+    let mut visited: Vec<String> = vec![func.name.clone()];
+    let mut worklist: Vec<(String, usize)> = func.calls.clone();
+    while let Some((name, arg_count)) = worklist.pop() {
+        // These names are lowered to CAST / length() by `lower_expr`, all
+        // deterministic; they do not resolve as SQL function names.
+        if matches!(name.as_str(), "str" | "int" | "float" | "len") && arg_count == 1 {
+            continue;
+        }
+        match resolver.resolve_function(&name, arg_count) {
+            Ok(Some(builtin)) => {
+                if !builtin.is_deterministic() {
+                    return false;
+                }
+            }
+            Ok(None) => match resolver.schema().get_function(&name) {
+                Some(callee) => {
+                    if visited.contains(&callee.name) {
+                        continue;
+                    }
+                    visited.push(callee.name.clone());
+                    worklist.extend(callee.calls.iter().cloned());
+                }
+                None => return false,
+            },
+            // A known name with a mismatched arity; the call site errors at
+            // translation time.
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 struct LoopLabels {
@@ -886,5 +952,73 @@ $$",
             })
             .unwrap();
         assert_eq!(rows, vec![6, 6, 6], "accumulator state leaked across rows");
+    }
+
+    fn count_once(conn: &Arc<crate::Connection>, sql: &str) -> usize {
+        let statement = conn.prepare(sql).unwrap();
+        statement
+            .get_program()
+            .insns
+            .iter()
+            .filter(|(insn, _)| matches!(insn, Insn::Once { .. }))
+            .count()
+    }
+
+    /// Starlark bodies are deterministic by design, so a deterministic call
+    /// with constant arguments is evaluated once per statement (guarded by
+    /// Once), while column arguments or non-deterministic callees keep
+    /// per-row evaluation.
+    #[test]
+    fn deterministic_constant_udf_calls_evaluate_once_per_statement() {
+        let conn = udf_test_connection();
+        conn.execute("CREATE FUNCTION det(x INTEGER) LANGUAGE starlark AS 'return x + 1'")
+            .unwrap();
+        conn.execute("CREATE FUNCTION viadet(x INTEGER) LANGUAGE starlark AS 'return det(x) * 2'")
+            .unwrap();
+        conn.execute("CREATE FUNCTION rnd(x INTEGER) LANGUAGE starlark AS 'return random() + x'")
+            .unwrap();
+        conn.execute("CREATE FUNCTION viarnd(x INTEGER) LANGUAGE starlark AS 'return rnd(x) * 2'")
+            .unwrap();
+        conn.execute("CREATE TABLE items(x INTEGER)").unwrap();
+
+        // Deterministic callee chain + constant argument: once per statement.
+        assert_eq!(count_once(&conn, "SELECT det(1) FROM items"), 1);
+        assert_eq!(count_once(&conn, "SELECT viadet(1) FROM items"), 1);
+        // Column argument: must run per row.
+        assert_eq!(count_once(&conn, "SELECT det(x) FROM items"), 0);
+        // Non-deterministic callee (random()), directly or transitively:
+        // must run per row even with constant arguments.
+        assert_eq!(count_once(&conn, "SELECT rnd(1) FROM items"), 0);
+        assert_eq!(count_once(&conn, "SELECT viarnd(1) FROM items"), 0);
+    }
+
+    /// The Once guard must not change results: a loop-carrying body with
+    /// constant arguments returns the same (correct) value on every row.
+    #[test]
+    fn once_guarded_udf_returns_correct_value_on_every_row() {
+        let conn = udf_test_connection();
+        conn.execute(
+            "CREATE FUNCTION s(n INTEGER) LANGUAGE starlark AS $$
+total = 0
+for i in range(1, n + 1):
+    total += i
+return total
+$$",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE items(x INTEGER)").unwrap();
+        conn.execute("INSERT INTO items VALUES (1), (2), (3)")
+            .unwrap();
+
+        assert_eq!(count_once(&conn, "SELECT s(3) FROM items"), 1);
+        let mut rows: Vec<i64> = Vec::new();
+        conn.prepare("SELECT s(3) FROM items")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                rows.push(row.get::<i64>(0)?);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows, vec![6, 6, 6]);
     }
 }
